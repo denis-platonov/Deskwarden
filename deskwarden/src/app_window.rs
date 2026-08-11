@@ -490,6 +490,22 @@ pub struct StartupOutcome<P> {
     /// sign-in it re-arms autofill against a vault the user just locked,
     /// which is exactly what `stand_down_after_unlock` had disarmed.
     pub tore_the_session_down: bool,
+    /// **Whether a lock in this window found its teardown ALREADY SPENT**
+    /// -- the second lock of one startup session.
+    ///
+    /// Not a weaker [`Self::tore_the_session_down`]: the two are never both
+    /// true of the same lock, and this one means the exact opposite of it.
+    /// A lock that tore nothing down leaves the session live -- `bw serve`
+    /// still holding it, the item cache still full, autofill still armed --
+    /// while the window has already ended the vault frame and cleared
+    /// [`Self::token`]. Without this flag `main` sees only the missing token,
+    /// takes its "closed without a session" branch, and calls
+    /// `std::process::exit(1)` with no dialog: the user presses Lock a
+    /// second time and the app disappears without a word.
+    ///
+    /// **The caller owes this flag a real teardown**, not just a message.
+    /// See `main`'s `the_second_lock_takes_the_session_down_and_says_so`.
+    pub locked_without_a_teardown: bool,
 }
 
 /// **The one place this module puts an OS window on the screen**, and the one
@@ -706,6 +722,18 @@ struct InWindowLock<T, B> {
     /// two measured survivors that shape cost, and
     /// [`lock_stage::LockStage`] for why lowering it does not compile.
     stage: LockStage,
+    /// **What the last caught lock DID**, for the host that has to tell
+    /// the two apart.
+    ///
+    /// `teardown.is_none()` cannot answer this: the FIRST lock takes the
+    /// `FnOnce` too, so from the frame after it the field reads exactly the
+    /// same as it does for a second lock that found nothing to take. The
+    /// answer therefore has to be recorded at the moment the take is
+    /// attempted, which is the one place the two are distinguishable.
+    ///
+    /// `None` until a lock is caught at all. Read only through
+    /// [`InWindowLock::the_teardown_was_already_spent`].
+    caught: Option<LockProgress>,
     /// The PRE-LOCK session's outcome, written by the lock catch and read by
     /// the rebuild and by [`finish_the_locked_session`].
     result: Rc<RefCell<Option<vault_window::VaultWindowResult>>>,
@@ -739,6 +767,7 @@ where
             token_tx: Some(token_tx),
             token_rx: Some(token_rx),
             stage: LockStage::fresh(),
+            caught: None,
             result,
             relocked,
             vault_handles,
@@ -813,11 +842,34 @@ where
                 } else {
                     LockProgress::TeardownAlreadySpent
                 };
+                // **Recorded, not derived.** The host above has to send a
+                // spent-teardown lock somewhere other than the working
+                // stage, and by the time it asks, `self.teardown` is `None`
+                // on both paths.
+                self.caught = Some(progress);
                 let was = *self.relocked.borrow();
                 *self.relocked.borrow_mut() = session_torn_down(was, progress);
                 true
             }
         }
+    }
+
+    /// **Did the lock just caught find its `FnOnce` teardown already
+    /// spent** -- the second lock of one session.
+    ///
+    /// Answers about the LAST catch and nothing else, so it is only
+    /// meaningful on the frame [`Self::catch_the_lock`] answered `true`.
+    /// `false` before any lock, which is the answer that keeps every
+    /// non-lock frame on the ordinary path.
+    ///
+    /// **Why a host needs it.** A lock that tore nothing down must not be
+    /// sent into the working stage: there is no worker, so the step channel
+    /// is `Disconnected` from the first poll, the stage gives up, and the
+    /// window closes having cleared the token -- which on the startup host
+    /// is `main`'s no-session branch and a bare `exit(1)` with no dialog.
+    /// See the startup arm below.
+    fn the_teardown_was_already_spent(&self) -> bool {
+        self.caught == Some(LockProgress::TeardownAlreadySpent)
     }
 
     /// The card produced a master password; down the channel the worker is
@@ -1068,12 +1120,21 @@ where
     // see `StartupOutcome::tore_the_session_down` for why a rebuild clears
     // the one and must not clear the other.
     let tore_down: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    // **Did a lock in this window find its teardown already spent.** The
+    // second lock of one startup session: the `FnOnce` was taken by the
+    // first, so this one tears nothing down and there is no worker to wait
+    // on. Distinct from both flags above -- `tore_down` is false here
+    // because nothing WAS torn down, and `relocked` is unchanged for the
+    // same reason -- and read by `main` so the exit that follows is an
+    // explained one. See `StartupOutcome::locked_without_a_teardown`.
+    let locked_without_a_teardown: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     let token_for_closure = token.clone();
     let prepared_for_closure = prepared.clone();
     let vault_handles_for_closure = vault_handles.clone();
     let stages_for_closure = stages.clone();
     let tore_down_for_closure = tore_down.clone();
+    let spent_for_closure = locked_without_a_teardown.clone();
 
     // **In an `Option`, and handed to the worker whole.** It used to be cloned
     // into the thread, which left the original alive inside the closure for the
@@ -1403,21 +1464,47 @@ where
                     // The post-lock card writes the new one; a post-lock card
                     // the user closes leaves `None` here.
                     *token_for_closure.borrow_mut() = None;
-                    // Set whether or not the teardown is later rebuilt: see
-                    // `StartupOutcome::tore_the_session_down`.
-                    *tore_down_for_closure.borrow_mut() = true;
-                    // The first card's frame is spent; the next one is fresh.
-                    login = None;
-                    // **The one write of the mode local.**
-                    working_on = WorkingOn::TheLocksTeardown;
-                    if let Next::Show(next) = advance(stage, Event::Locked) {
-                        stage = next;
-                        if next == Stage::Working {
-                            working_message = LOCK_MESSAGE;
-                            working_since = Some(Instant::now());
+                    // **THE SECOND LOCK OF ONE SESSION, SENT SOMEWHERE
+                    // OTHER THAN THE WORKING STAGE.** The `FnOnce` teardown
+                    // was spent by the first lock, so this one started no
+                    // worker. Taken down the arm below it, the stage would
+                    // drain a channel that is `Disconnected` from its first
+                    // poll, give up, and close the window with no token --
+                    // and `main`'s no-session branch is `exit(1)` with no
+                    // dialog at all. From the user's side: press Lock, sign
+                    // back in, press Lock, and the whole app vanishes.
+                    //
+                    // Nothing here pretends a teardown ran. `tore_down` stays
+                    // false, the drain is never switched, no card is built,
+                    // and the window closes deliberately -- `main` reads the
+                    // flag, performs the teardown this lock did not get, says
+                    // so, and exits 0.
+                    if lock.the_teardown_was_already_spent() {
+                        log::warn!(
+                            "a second lock in one startup window found its teardown \
+                             already spent, so nothing was torn down here; closing so \
+                             the session can be taken down outside the window"
+                        );
+                        *spent_for_closure.borrow_mut() = true;
+                        close_this_window(ui.ctx(), &mut closing);
+                        ui.ctx().request_repaint();
+                    } else {
+                        // Set whether or not the teardown is later rebuilt: see
+                        // `StartupOutcome::tore_the_session_down`.
+                        *tore_down_for_closure.borrow_mut() = true;
+                        // The first card's frame is spent; the next one is fresh.
+                        login = None;
+                        // **The one write of the mode local.**
+                        working_on = WorkingOn::TheLocksTeardown;
+                        if let Next::Show(next) = advance(stage, Event::Locked) {
+                            stage = next;
+                            if next == Stage::Working {
+                                working_message = LOCK_MESSAGE;
+                                working_since = Some(Instant::now());
+                            }
                         }
+                        ui.ctx().request_repaint();
                     }
-                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -1445,7 +1532,15 @@ where
     let token = token.borrow_mut().take();
     let prepared = prepared.borrow_mut().take();
     let tore_the_session_down = *tore_down.borrow();
-    StartupOutcome { token, prepared, vault, stages, tore_the_session_down }
+    let locked_without_a_teardown = *locked_without_a_teardown.borrow();
+    StartupOutcome {
+        token,
+        prepared,
+        vault,
+        stages,
+        tore_the_session_down,
+        locked_without_a_teardown,
+    }
 }
 
 /// What the spinner says while a lock's teardown runs.

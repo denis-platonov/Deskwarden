@@ -555,8 +555,10 @@ fn main() {
     // has to answer the very first readiness probe regardless of the setting.
     //
     // Declared without a value, for the same reason `session_token` below is:
-    // both arms now decide it outright (the single-window arm by claiming the
-    // startup handoff -- see `StartupChildHandoff`), and a `= None` seed here
+    // both arms now decide it outright (the single-window arm by destructuring
+    // the estate the window ran against, into which the worker armed
+    // `est.child` through `EstatePark::with` at the instant it spawned
+    // `bw serve`), and a `= None` seed here
     // would let a future arm silently skip that decision and carry on with
     // "no backend running", which is precisely the false belief that made the
     // deadline path kill the app on its own orphan.
@@ -649,11 +651,16 @@ fn main() {
     //   card's in the other, where it does not exist until `app_window::run`
     //   has returned it. The note on `session_token` just above says why an
     //   empty string here must not be spellable.
-    // * `child` is `start_backend`'s in the cached-session arm and the startup
-    //   handoff's in the other, where the claim off that handoff happens after
-    //   the window. A `None` seeded before that is the exact false belief
-    //   `StartupChildHandoff` exists to remove. The claim is spelled once, in
-    //   code, and a guard counts it -- so this note does not spell it again.
+    // * `child` is `start_backend`'s in the cached-session arm and, in the
+    //   other, the one `StartupWork::produce` armed into the PARKED estate
+    //   through `EstatePark::with` at the instant it spawned `bw serve` --
+    //   read back here by the destructure of the estate `park_and_work`
+    //   brings home, on the deadline path exactly as on the happy one. A
+    //   `None` seeded before that is the exact false belief that made the
+    //   deadline path kill the app on its own orphan: a window that gave up
+    //   would come home holding "no backend running" while a real `bw serve`
+    //   was still listening. The arming is spelled once, in code, and a guard
+    //   counts it -- so this note does not spell it again.
     //
     // Two of the ten are not decided by either arm and both seed `None`. That
     // is the value they have always held at this point in the launch, and the
@@ -997,6 +1004,20 @@ fn main() {
     // writes the new one, so a lock followed by a declined sign-in arrives
     // here as `None` -- a session that really is gone -- instead of the first
     // sign-in's token, which would have carried a dead session into the tray.
+    // **THE SECOND LOCK OF ONE SESSION, ANSWERED BEFORE THE BRANCH BELOW.**
+    // It arrives here looking exactly like a closed sign-in card -- the lock
+    // arm cleared the token -- and until this branch existed it WAS one: the
+    // `else` below fired and the process called `exit(1)` with no dialog,
+    // while nothing had been torn down. The order matters and is the whole
+    // of it, which is why the two facts are read by one rule rather than by
+    // two `if`s that could be swapped.
+    if how_the_startup_window_ended(outcome.token.is_some(), outcome.locked_without_a_teardown)
+        == StartupWindowEnd::LockedWithoutATeardown
+    {
+        // Diverges, so the moves out of `engine` and `bw_serve_child` here
+        // do not reach the continuation below.
+        the_second_lock_takes_the_session_down_and_says_so(&cache, engine, bw_serve_child);
+    }
     let Some(token) = outcome.token else {
         log::error!("the startup window was closed without producing a session token; exiting");
         std::process::exit(1);
@@ -3074,6 +3095,129 @@ fn stand_down_after_unlock(engine: &mut MatchEngine, reason: &str) {
     );
 }
 
+/// **How a startup window ENDED**, decided in one place rather than by the
+/// order of two `if`s in `main`.
+///
+/// The two facts it reads used to be answered by one of them:
+/// `outcome.token` being `None` meant "the card was closed" and nothing
+/// else, so the SECOND lock of one session -- which clears the token and
+/// starts no teardown -- arrived at the same branch and took the same
+/// `std::process::exit(1)`, with no dialog and no teardown. The user
+/// pressed Lock, signed back in, pressed Lock again, and the app vanished.
+///
+/// A pure total function over both, so the third answer cannot be reached
+/// by accident and cannot be lost by a reordering. See
+/// [`app_window::StartupOutcome::locked_without_a_teardown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupWindowEnd {
+    /// The window came home holding a session. The ordinary launch.
+    WithASession,
+    /// **A lock in the window found its `FnOnce` teardown already spent.**
+    /// Nothing was torn down, so the session is still LIVE -- `bw serve`
+    /// still holding it, the item cache still full, the match engine still
+    /// armed -- while the window has already ended the vault frame. The
+    /// caller owes this one a real teardown and an explanation, in that
+    /// order.
+    ///
+    /// **This answer wins over a token**, on the combination that is
+    /// unreachable today (the arm that sets the flag clears the token on the
+    /// same frame): a token alongside it belongs to a session the user has
+    /// asked to end, and carrying it on would be the dead-session bug in a
+    /// new place.
+    LockedWithoutATeardown,
+    /// No session and no such lock: the sign-in card was closed. Nothing is
+    /// running, nothing has to be taken down, and there is no tray, hotkey
+    /// or window to preserve -- so this one really does just end.
+    WithoutASession,
+}
+
+/// The rule behind [`StartupWindowEnd`]. Driven by
+/// `how_a_startup_window_can_end_is_a_total_rule_over_both_facts`.
+fn how_the_startup_window_ended(
+    has_a_token: bool,
+    locked_without_a_teardown: bool,
+) -> StartupWindowEnd {
+    match (locked_without_a_teardown, has_a_token) {
+        (true, _) => StartupWindowEnd::LockedWithoutATeardown,
+        (false, true) => StartupWindowEnd::WithASession,
+        (false, false) => StartupWindowEnd::WithoutASession,
+    }
+}
+
+/// **The teardown a second lock never got**, run outside the window.
+///
+/// The same three effects `resettle_session_with` opens with -- empty the
+/// item cache, stop `bw serve`, disarm the match engine -- and no
+/// authentication, because there is no session to come back to: the process
+/// is ending immediately after. Separated from the exit so that it can be
+/// driven by a test at all; a `-> !` body is unreachable from a test runner
+/// by construction, and "the vault is actually locked" is the half of this
+/// that matters.
+///
+/// Killing the process would take `bw serve` down too (the kill-on-close
+/// job object sees to that) and clear the cache with the address space. That
+/// is a backstop and not a teardown: it depends on the job object having
+/// been created at all -- `main` logs a warning when it was not -- and it
+/// leaves the ordering to the OS. This says it outright instead.
+fn take_the_session_down_after_a_second_lock(
+    cache: &VaultCache,
+    engine: &mut MatchEngine,
+    bw_serve_child: &mut Option<Child>,
+) {
+    cache.clear();
+    if let Some(child) = bw_serve_child.as_mut() {
+        bw_serve::stop_bw_serve(child);
+    }
+    *bw_serve_child = None;
+    stand_down_after_unlock(
+        engine,
+        "a second lock in the startup window found its teardown already spent, so the \
+         session is taken down out here instead",
+    );
+}
+
+/// **The second lock of one startup session: torn down, EXPLAINED, and
+/// exited 0.**
+///
+/// What this replaces is the defect: the window closed with no token, `main`
+/// took its "closed without a session" branch, and the process called
+/// `std::process::exit(1)` -- no dialog, no log the user will ever read, no
+/// tray left behind. Pressing one button twice made the whole app disappear.
+///
+/// **It is still an exit, and that is the honest floor rather than a fix for
+/// the underlying limit.** The teardown, the rebuild and the worker are each
+/// one-shot for one window (`FnOnce`, one `lock_rx.recv()`, a `LockStage`
+/// that only ever advances), so there is no second teardown for this window
+/// to run and making one requires re-arming all three. What is fixed here is
+/// that the user is told, that the vault is taken down deliberately rather
+/// than by the OS reaping the process, and that `exit(1)` -- which means
+/// "Deskwarden failed" -- is no longer what pressing Lock twice produces.
+///
+/// Not [`fatal_startup_error`]: nothing failed, the exit is 0, and the text
+/// must not say the app cannot start.
+fn the_second_lock_takes_the_session_down_and_says_so(
+    cache: &VaultCache,
+    mut engine: MatchEngine,
+    mut bw_serve_child: Option<Child>,
+) -> ! {
+    take_the_session_down_after_a_second_lock(cache, &mut engine, &mut bw_serve_child);
+    log::warn!(
+        "the startup window was locked a second time and had no teardown left to run; \
+         the session has been taken down here and Deskwarden is exiting cleanly"
+    );
+    message_box("Deskwarden", SECOND_LOCK_EXIT_MESSAGE, MB_ICONWARNING | MB_OK);
+    std::process::exit(0);
+}
+
+/// What the second lock of one startup session says before it exits.
+///
+/// A constant so the words are reachable from a test: the whole point of
+/// this path is that the app no longer disappears without saying anything,
+/// and "it says something" is only a property while something checks it.
+/// It has to name the state the vault is in and the way back.
+const SECOND_LOCK_EXIT_MESSAGE: &str = "Your vault is locked and Deskwarden has closed.\n\n\
+     Start Deskwarden again to sign back in.";
+
 /// Rebuilds the tray's "Accounts" submenu after the vault window has closed.
 ///
 /// **`open_vault_window` can switch accounts and cannot rebuild the menu
@@ -3404,9 +3548,10 @@ impl EstatePark {
     /// here rather than at every call site, because a worker that keeps going
     /// after this is a bug in the caller and the log is where it will be read.
     fn with<R>(&self, edit: impl FnOnce(&mut SessionEstate) -> R) -> Option<R> {
-        // `unwrap_or_else(PoisonError::into_inner)`, exactly as
-        // `StartupChildHandoff` does: see this type's poisoning note on
-        // `reclaim`.
+        // `unwrap_or_else(PoisonError::into_inner)`, exactly as `reclaim`
+        // does: a worker that panicked mid-edit poisons this mutex, and
+        // propagating that here would take the frame thread down with it.
+        // See this type's poisoning note on `reclaim`.
         let mut held = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         match held.as_mut() {
             Some(live) => Some(edit(live)),
@@ -6931,7 +7076,9 @@ fn try_start_backend(
     // all: nothing kills this process's `bw serve` if we lose the handle, so
     // an orphan survives the app and holds `BW_SERVE_PORT` against every
     // later launch. Every path that can drop a handle -- most of all the
-    // startup window's `WORKING_DEADLINE`, see `StartupChildHandoff` -- has
+    // startup window's `WORKING_DEADLINE`, where the handle lives in the
+    // PARKED estate and `EstatePark::reclaim` is what takes it back from a
+    // worker that is still running -- has
     // to be exact about ownership, and when a report says "could not start
     // its Bitwarden backend" this line is how the log says whether the
     // process now holding the port could have been ours.
@@ -7982,9 +8129,11 @@ mod tests {
     }
 
     /// `StartupWork` must not also carry the handle. Two owners for one
-    /// process is the ambiguity the handoff exists to remove, and a `Child`
-    /// back in this struct would restore the arm-only delivery that the
-    /// deadline throws away.
+    /// process is the ambiguity the parked estate exists to remove -- it is
+    /// the single slot the handle lives in -- and a `Child` back in this
+    /// struct would restore the arm-only delivery that the deadline throws
+    /// away: a result is only ever read on the arm where the worker
+    /// ANSWERED, and the deadline path is the one where it did not.
     #[test]
     fn the_startup_work_result_carries_no_child_handle() {
         let production = production_half_of_this_file();
@@ -7999,7 +8148,8 @@ mod tests {
         assert!(
             fields.contains(concat!("child: Result<(), ", "String>")),
             "`StartupWork::child` must report only whether the backend started; the handle \
-             travels through `StartupChildHandoff`"
+             is armed straight into the parked estate by `StartupWork::produce`, through \
+             `EstatePark::with`, at the instant `bw serve` is spawned"
         );
         assert!(
             !fields.contains(concat!("Result<Child", ",")),
@@ -8748,6 +8898,128 @@ mod tests {
             vec![SETUP_MESSAGE, SETUP_RETRY_MESSAGE],
             "the retry has to look different from the window the user just closed \
              (review 13's Minor 4)"
+        );
+    }
+
+    /// **A user pressing Lock twice must not exit the app in silence**, and
+    /// for one release it did.
+    ///
+    /// The second lock of one startup session finds its `FnOnce` teardown
+    /// already spent, so no worker starts -- but the lock arm had already
+    /// cleared the token and switched the working stage to the teardown
+    /// channel. That channel is `Disconnected` from its first poll, the
+    /// stage gives up, the window closes with `token == None`, and `main`'s
+    /// "closed without a session" branch calls `std::process::exit(1)`: no
+    /// dialog, no teardown, nothing in the log a user will ever read.
+    ///
+    /// **Nothing caught it, because it is an ABSENCE.** There was no wrong
+    /// assertion to find -- the missing thing was a second teardown, and no
+    /// test in this crate asserted against a teardown that was not there.
+    /// This table is that assertion. Exhaustive over both facts, so the
+    /// answer cannot be lost by a reordering of the branches in `main` and
+    /// the two inputs cannot be collapsed back into one.
+    #[test]
+    fn how_a_startup_window_can_end_is_a_total_rule_over_both_facts() {
+        let expected: &[(bool, bool, StartupWindowEnd)] = &[
+            (true, false, StartupWindowEnd::WithASession),
+            (false, false, StartupWindowEnd::WithoutASession),
+            (false, true, StartupWindowEnd::LockedWithoutATeardown),
+            // Unreachable today -- the arm that sets the flag clears the
+            // token on the same frame -- and answered anyway, in the
+            // direction that does not carry a dead session into a tray.
+            (true, true, StartupWindowEnd::LockedWithoutATeardown),
+        ];
+        for &(has_a_token, locked_without_a_teardown, want) in expected {
+            assert_eq!(
+                how_the_startup_window_ended(has_a_token, locked_without_a_teardown),
+                want,
+                "a window that ended with has_a_token={has_a_token} and \
+                 locked_without_a_teardown={locked_without_a_teardown} is answered wrong"
+            );
+        }
+        // The row this finding is about, said again on its own: a second
+        // lock must NOT be answered as a closed sign-in card, which is the
+        // answer that ends in the silent `exit(1)`.
+        assert_ne!(
+            how_the_startup_window_ended(false, true),
+            StartupWindowEnd::WithoutASession,
+            "a second lock of one session is answered as a closed sign-in card again, so it \
+             falls through to the no-dialog `exit(1)`: the user presses Lock twice and the \
+             app disappears having torn nothing down"
+        );
+    }
+
+    /// **And the vault really is taken down on that path**, rather than left
+    /// to the OS reaping the process.
+    ///
+    /// Driven against the real cache and the real engine. The `bw serve`
+    /// half cannot be driven here (this suite may not spawn one), which is
+    /// exactly why the two that hold the unlocked vault IN THIS PROCESS are.
+    ///
+    /// Both are measured through their own observables rather than through
+    /// a fixture that would need a backend: the cache by its era, which
+    /// only `clear` moves, and the engine by a lookup that only a rebuild
+    /// or a clear can change.
+    #[test]
+    fn the_second_locks_teardown_empties_the_cache_and_disarms_autofill() {
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+        // **The cache is measured by its ERA, not by its contents.** Filling
+        // it goes through `populate_with`, which fetches folders over HTTP,
+        // and this suite may not do that. `clear` is the ONLY thing in the
+        // crate that begins a new era (see `VaultCache::clear`), so an era
+        // that moved is exactly the evidence that the snapshot was dropped.
+        let before = cache.epoch();
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "a-item".to_string(),
+            deskwarden::app_match::AppMatch::for_process(
+                "notepad.exe",
+                deskwarden::app_match::TriggerMode::Auto,
+            ),
+        )]);
+        // Controls: autofill really is armed and the cache really is
+        // untouched before the call, so neither assertion below can pass by
+        // having started that way.
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_some(),
+            "control: autofill was never armed"
+        );
+        assert_eq!(before, cache.epoch(), "control: nothing has touched the cache yet");
+
+        let mut no_child: Option<Child> = None;
+        take_the_session_down_after_a_second_lock(&cache, &mut engine, &mut no_child);
+
+        assert_ne!(
+            before,
+            cache.epoch(),
+            "the cache was never cleared, so a second lock exits the process with every \
+             password of the vault the user just asked to lock still in memory -- for as \
+             long as the dialog is on screen, and for as long as the OS takes to reap \
+             the pages afterwards"
+        );
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_none(),
+            "a second lock left autofill armed against a vault it was asked to lock"
+        );
+    }
+
+    /// **The exit says something, and it does not report a failure.**
+    ///
+    /// Two claims, and both were false before: the path said nothing at all,
+    /// and it said it with `exit(1)` -- which in this binary means
+    /// "Deskwarden could not start". Neither is true of a button pressed
+    /// twice.
+    #[test]
+    fn the_second_lock_says_something_before_it_goes() {
+        assert!(
+            SECOND_LOCK_EXIT_MESSAGE.contains("locked"),
+            "the second lock's message does not tell the user their vault is locked, which \
+             is the one fact they need: {SECOND_LOCK_EXIT_MESSAGE:?}"
+        );
+        assert!(
+            SECOND_LOCK_EXIT_MESSAGE.contains("again"),
+            "the message names no way back, so as far as the user is concerned the app has \
+             still just disappeared: {SECOND_LOCK_EXIT_MESSAGE:?}"
         );
     }
 
@@ -21066,6 +21338,101 @@ mod startup_shape_tests {
             body.contains(concat!("std::process::", "exit(1);")),
             "the startup window can now be closed on the sign-in card and leave this process \
              running with no session, no tray, no hotkey and no window: {body:?}"
+        );
+    }
+
+    /// **The exit above must not be reachable from a user pressing Lock
+    /// twice**, and the ORDER of the two branches is the whole of what makes
+    /// it unreachable.
+    ///
+    /// The second-lock branch placed BELOW the `let ... else` is the silent
+    /// exit restored: the `else` diverges, so nothing after it ever runs. A
+    /// guard that only checked both were present would be green on the
+    /// broken arrangement.
+    #[test]
+    fn the_second_lock_is_answered_before_the_no_session_exit() {
+        let arm = signing_in_arm();
+        const RULE: &str = concat!(
+            "how_the_startup_window_",
+            "ended(outcome.token.is_some(), outcome.locked_without_a_teardown)"
+        );
+        assert_eq!(
+            arm.matches(RULE).count(),
+            1,
+            "the signing-in arm no longer asks the rule, with BOTH facts, exactly once. \
+             With the flag dropped a second lock is indistinguishable from a closed \
+             sign-in card and takes the silent `exit(1)`: {arm}"
+        );
+        let rule_at = arm.find(RULE).expect("counted just above");
+        let else_at = arm
+            .find(concat!("let Some(token) = outcome.", "token else {"))
+            .expect("the no-session branch is pinned by the test above");
+        assert!(
+            rule_at < else_at,
+            "the second-lock branch sits BELOW the no-session `let ... else`, which \
+             diverges -- so it is dead code and pressing Lock twice still exits 1 in \
+             silence: {arm}"
+        );
+        let branch = &arm[rule_at..else_at];
+        assert!(
+            branch.contains(concat!(
+                "the_second_lock_takes_the_session_down_and_says_",
+                "so(&cache, engine, bw_serve_child);"
+            )),
+            "the branch asks the rule and then does nothing with the answer, so the second \
+             lock falls straight through to the silent exit: {branch}"
+        );
+        assert!(
+            branch.contains(concat!("StartupWindowEnd::", "LockedWithoutATeardown")),
+            "the branch no longer tests for the second-lock answer specifically, so it \
+             fires on the wrong ends of a window: {branch}"
+        );
+    }
+
+    /// **What the second lock's exit DOES**, over the function itself.
+    ///
+    /// Three separate silent failures, each of which leaves every other
+    /// guard here green: an exit with no teardown (the vault is left to the
+    /// job object and the address space), an exit with no dialog (the defect
+    /// verbatim -- the app vanishes with no explanation), and an exit that
+    /// reports a failure the user did not cause.
+    #[test]
+    fn the_second_locks_exit_tears_down_explains_itself_and_is_not_a_failure() {
+        let production = production();
+        let at = production
+            .find(concat!("fn the_second_lock_takes_the_session_down_and_says_", "so("))
+            .expect("the second lock's exit is no longer a function of its own");
+        let rest = &production[at..];
+        let end = rest.find(concat!("\n}", "")).expect("that function is never closed");
+        let body = &rest[..end];
+        for (needle, why) in [
+            (
+                concat!("take_the_session_down_after_a_second_", "lock("),
+                "the second lock exits without running the teardown it owes, so `bw serve` \
+                 is left to the kill-on-close job object and the item cache to the address \
+                 space -- a backstop, not a teardown",
+            ),
+            (
+                concat!("message_", "box(\"Deskwarden\", SECOND_LOCK_EXIT_MESSAGE"),
+                "the second lock exits without showing the user anything, which is the \
+                 finding verbatim: press Lock twice and the app vanishes with no word",
+            ),
+            (
+                concat!("std::process::", "exit(0);"),
+                "the second lock no longer exits cleanly, so pressing a button twice is \
+                 reported to the OS as Deskwarden having failed",
+            ),
+        ] {
+            assert!(body.contains(needle), "{why}: {body}");
+        }
+        assert!(
+            !body.contains(concat!("std::process::", "exit(1);")),
+            "the failure exit is back on the button-pressed-twice path: {body}"
+        );
+        assert!(
+            !body.contains(concat!("fatal_startup_", "error")),
+            "the second lock reports itself as a STARTUP failure, so the dialog tells a \
+             user who signed in an hour ago that Deskwarden cannot start: {body}"
         );
     }
 
