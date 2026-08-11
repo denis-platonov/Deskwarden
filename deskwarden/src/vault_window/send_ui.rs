@@ -2358,7 +2358,109 @@ mod source_pins {
     /// exactly `cfg`, and a bare `test` token must be reachable through
     /// nothing but `all(..)` -- any `not(..)`, `any(..)` or unknown
     /// combinator on the way makes it a maybe, and a maybe is production.
+    /// The arms of an `any(..)` that CANNOT hold in any build of this crate,
+    /// removed -- and an `any(..)` left with one arm rewritten to `all(..)`,
+    /// which is what `any(x)` and `all(x)` both mean.
+    ///
+    /// **Why this exists.** `#[cfg(any(test, unix))] mod ..` is an item that
+    /// provably does not ship: this crate depends on the `windows` crate
+    /// unconditionally and contains no `cfg(unix)`, no `target_os` and no
+    /// `target_family` anywhere, so it builds for exactly one target family.
+    /// **M-G**, measured red before this: the module was kept whole, and the
+    /// crate-wide call-site walk reported `list_sends` as called from this
+    /// file's production code. Over-reporting is the SAFE direction, which is
+    /// why this was Important and not Critical -- but a guard that accuses
+    /// production code of something untrue is a guard the next developer
+    /// weakens, and that is the expensive failure.
+    ///
+    /// **What this deliberately does NOT do.** It does not make `any(test,
+    /// ..)` a gate. That would be unsound and the reason is exact: `all()`
+    /// with zero arguments is unconditionally TRUE in `cfg`, so
+    /// `#[cfg(any(test, all()))]` really does ship, and stripping it would
+    /// delete production code from the region every guard in this module
+    /// reads. Only arms on an explicit, closed list are removed:
+    ///
+    ///  * `unix`, and `all(unix)`;
+    ///  * `not(windows)`.
+    ///
+    /// Anything else -- a feature, an unknown combinator, a `target_os` key
+    /// whose value `sanitized` has blanked -- survives, the `any` keeps two
+    /// or more arms, and the item stays in production. If this crate ever
+    /// grows a second target family, this list is the one thing to delete.
+    fn without_impossible_arms(body: &str) -> String {
+        let trimmed = body.trim();
+        let Some(open) = trimmed.find('(') else {
+            return trimmed.to_string();
+        };
+        let head = &trimmed[..open];
+        if head.is_empty() || !head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return trimmed.to_string();
+        }
+        // The `(` at `open` must be closed by the LAST byte, or this is not
+        // one combinator applied to a list and nothing here understands it.
+        let mut depth = 0usize;
+        for (at, c) in trimmed.char_indices().skip(open) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && at + 1 != trimmed.len() {
+                        return trimmed.to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return trimmed.to_string();
+        }
+        let inner = &trimmed[open + 1..trimmed.len() - 1];
+        let mut arms: Vec<String> =
+            top_level_arms(inner).iter().map(|a| without_impossible_arms(a)).collect();
+        if head == "any" {
+            arms.retain(|arm| !cannot_hold_in_any_build(arm));
+            if arms.len() == 1 {
+                return format!("all({})", arms[0]);
+            }
+        }
+        format!("{head}({})", arms.join(", "))
+    }
+
+    /// `inner` split on the commas that are not inside a nested list.
+    fn top_level_arms(inner: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut from = 0usize;
+        for (at, c) in inner.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    out.push(inner[from..at].trim().to_string());
+                    from = at + 1;
+                }
+                _ => {}
+            }
+        }
+        let last = inner[from..].trim();
+        if !last.is_empty() {
+            out.push(last.to_string());
+        }
+        out
+    }
+
+    /// Whether `arm` is false in every build this crate has. The closed list
+    /// [`without_impossible_arms`]'s doc names, and nothing else.
+    fn cannot_hold_in_any_build(arm: &str) -> bool {
+        matches!(arm, "unix" | "all(unix)" | "not(windows)")
+    }
+
     fn attribute_implies_test(body: &str) -> bool {
+        // See [`without_impossible_arms`]: this is the ONLY normalisation,
+        // and it removes arms on a closed list, never `test` and never an
+        // arm it does not recognise.
+        let normalised = without_impossible_arms(body);
+        let body = normalised.as_str();
         let b = body.as_bytes();
         // The identifier that opened each still-open `(`, outermost first.
         let mut opened: Vec<&str> = Vec::new();
@@ -2402,12 +2504,51 @@ mod source_pins {
     /// -- the offset of that closer, which is NOT consumed.
     ///
     /// The second half is the whole point; see [`production_region`]'s doc.
+    ///
+    /// **Generic parameter lists.** `,` terminates a gated item because a
+    /// gate can sit on a struct field, an enum variant or a match arm, none
+    /// of which is brace-delimited. But a `,` also occurs inside `<T, U>`,
+    /// and until this round that ended the walk in the middle of an item
+    /// header:
+    ///
+    /// ```ignore
+    /// #[cfg(test)] fn gated_generic<T, U>(_a: T) -> Option<U> { .. }
+    /// ```
+    ///
+    /// **M-D**, measured green at 2072 lib + 217 bin: the walk stopped after
+    /// `<T,`, the body stayed in the "production region", and the crate-wide
+    /// call-site walk reported that `list_sends` "is called from
+    /// `vault_window/send_ui.rs` in the crate's production code". That
+    /// sentence is FALSE -- the function is test-only -- and a guard that
+    /// accuses production code of something untrue is a guard the next
+    /// developer weakens. A gated generic test helper is an ordinary thing to
+    /// write.
+    ///
+    /// So `<`/`>` are tracked, but conservatively, because this walk's
+    /// failure modes are not symmetric: under-consuming leaves test code in
+    /// the production region and over-reports (safe, and what M-D did),
+    /// while OVER-consuming deletes real production code from the region and
+    /// blinds every guard that reads it -- which is M-1, the defect the
+    /// previous round fixed and this one must not reintroduce. Three rules
+    /// bound it:
+    ///
+    ///  * a `<` counts only when it touches the name in front of it, so
+    ///    `if a < b` and `1 < 2` open nothing;
+    ///  * `{` and `}` clear the count outright, because no brace can sit
+    ///    inside a generic parameter list;
+    ///  * `;` terminates the item whatever the count says.
+    ///
+    /// Together those mean an unbalanced `<` can delay the end of an item at
+    /// most to the end of the statement it is in, and never past a brace.
     fn gated_item_end(b: &[u8], from: usize) -> usize {
         let mut i = from;
         // Depths of what THIS walk opened. A closer while the matching depth
         // is zero belongs to the item's parent, and the item ends before it.
         let mut brace = 0usize;
         let mut round = 0usize;
+        // Generic-parameter depth -- see this function's doc for M-D, the
+        // measured mutant this exists for.
+        let mut angle = 0usize;
         while i < b.len() {
             match b[i] {
                 b'(' | b'[' => round += 1,
@@ -2417,8 +2558,30 @@ mod source_pins {
                     }
                     round = round.saturating_sub(1);
                 }
-                b'{' => brace += 1,
+                // A `<` that opens a generic list follows the name it belongs
+                // to with nothing between (`fn f<T>`, `struct S<T>`, `impl<T>`,
+                // `Foo::<T>`). A `<` with a space in front of it is a
+                // comparison, and is deliberately not counted -- see the doc.
+                b'<' if round == 0
+                    && brace == 0
+                    && matches!(
+                        i.checked_sub(1).map(|p| b[p]),
+                        Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'>' || c == b':'
+                    ) =>
+                {
+                    angle += 1;
+                }
+                b'>' if angle > 0 => angle -= 1,
+                b'{' => {
+                    // A brace cannot occur inside a generic parameter list, so
+                    // reaching one means whatever opened `angle` was not a
+                    // generic after all. Dropping it here is what bounds the
+                    // damage a miscount can do to a single item header.
+                    angle = 0;
+                    brace += 1;
+                }
                 b'}' => {
+                    angle = 0;
                     if brace == 0 {
                         return i;
                     }
@@ -2429,7 +2592,13 @@ mod source_pins {
                 }
                 // A braceless item (`use foo;`), or a gated field, variant,
                 // tuple element or match arm.
-                b';' | b',' if round == 0 && brace == 0 => return i + 1,
+                //
+                // `;` terminates whatever `angle` says, for the same reason
+                // `{` clears it: a semicolon cannot sit inside a generic list,
+                // so an unbalanced `<` can never carry this walk past the end
+                // of the statement it is in.
+                b';' if round == 0 && brace == 0 => return i + 1,
+                b',' if round == 0 && brace == 0 && angle == 0 => return i + 1,
                 _ => {}
             }
             i += 1;
@@ -2461,6 +2630,44 @@ mod source_pins {
         for dropped in ["mod t1", "mod t2", "fn inner"] {
             assert!(!region.contains(dropped), "{dropped:?} survived in {region:?}");
         }
+
+        // 1b. **M-D**: a gated GENERIC. The `,` inside `<T, U>` used to end
+        //     the walk in the middle of the item header, leaving the body in
+        //     the production region -- and the crate-wide call-site walk then
+        //     reported that `list_sends` is called from this file's
+        //     production code, which was not true. See `gated_item_end`.
+        let generic = format!(
+            "fn keep_c() {{}}\n{gate}\nfn gated_generic<T, U>(_a: T) -> Option<U> \
+             {{ list_sends(); None }}\nfn keep_d() {{}}\n"
+        );
+        let region = production_region(&generic);
+        for kept in ["keep_c", "keep_d"] {
+            assert!(region.contains(kept), "{kept:?} was dropped from {region:?}");
+        }
+        for dropped in ["gated_generic", "list_sends", "Option<U>"] {
+            assert!(
+                !region.contains(dropped),
+                "{dropped:?} survived in {region:?} -- a gated generic test helper is still \
+                 being reported as production code"
+            );
+        }
+
+        // 1c. The over-consume direction, which is the dangerous one (M-1).
+        //     A `<` used as a comparison must not swallow the production code
+        //     after the gated item.
+        let compared = format!(
+            "fn keep_e() {{}}\n{gate}\nconst SMALL: bool = 1 < 2;\nfn keep_f() \
+             {{ danger(); }}\n"
+        );
+        let region = production_region(&compared);
+        for kept in ["keep_e", "keep_f", "danger()"] {
+            assert!(
+                region.contains(kept),
+                "{kept:?} was dropped from {region:?} -- the angle tracking over-consumed, \
+                 which deletes production code from the region every guard reads"
+            );
+        }
+        assert!(!region.contains("SMALL"), "the gated const survived in {region:?}");
         // The old rule, stated here so the improvement is measured and not
         // merely asserted in prose.
         let old_cut = &interleaved[..interleaved.find(gate).expect("a gate")];
@@ -2585,6 +2792,35 @@ mod source_pins {
         let region = production_region(removed);
         assert!(region.contains("fn kept"), "{region:?}");
         assert!(!region.contains("hidden"), "`all(test, ..)` was not recognised as test-only: {region:?}");
+
+        //     And **M-G**: an `any(..)` every one of whose other arms is
+        //     false in every build this crate has. `unix` on a crate that
+        //     depends on `windows` unconditionally is an item that provably
+        //     does not ship, and keeping it whole reddened the crate walk
+        //     with a sentence that was not true. See
+        //     `without_impossible_arms` -- and note the cases just below,
+        //     which stay in production, because this is NOT a rule that
+        //     `any(test, ..)` is a gate.
+        for impossible in ["unix", "not(windows)", "all(unix)"] {
+            let source = format!(
+                "#[cfg(any(test, {impossible}))]\nmod t {{ fn hidden() {{}} }}\nfn kept() {{}}\n"
+            );
+            let region = production_region(&source);
+            assert!(region.contains("fn kept"), "{region:?}");
+            assert!(
+                !region.contains("hidden"),
+                "`any(test, {impossible})` was kept whole, so a test-only module is still \
+                 being reported as production code: {region:?}"
+            );
+        }
+        // Arms that could BOTH hold: still production, whichever way round.
+        for shipped in ["#[cfg(any(test, unix, windows))]", "#[cfg(any(test, windows))]"] {
+            let source = format!("{shipped}\nmod t {{ fn hidden() {{}} }}\nfn keeper() {{}}\n");
+            assert!(
+                production_region(&source).contains("hidden"),
+                "{shipped} was stripped, and an item that can ship is production"
+            );
+        }
         for (why, kept) in [
             ("`any(test, ..)` can hold without `test`", "#[cfg(any(test, feature_x))]\nfn shipped() { list_sends(&r); }\n"),
             ("`any(test, all())` is unconditionally true", "#[cfg(any(test, all()))]\nfn shipped() { list_sends(&r); }\n"),
@@ -3338,77 +3574,47 @@ mod source_pins {
         rest[open..end].to_string()
     }
 
-    /// **The frame closure has nothing to wait on, and no shape to wait in.**
+    /// **The Sends drain sits at the closure's own statement level.**
     ///
-    /// The stated property is that the frame does not wait, and until this
-    /// round nothing enforced it. What enforced it was two needles aimed at
-    /// the token `send_rx` and at the drain line's *indentation*, and both
-    /// were beaten by measurement on `cbe915e`, at 2068 lib + 217 bin, 0
-    /// failed:
+    /// The property that the frame does not WAIT is no longer held here. It
+    /// is held behaviourally, by running the real closure and timing it --
+    /// see `frame_promptness::the_frame_closure_returns_promptly` at the
+    /// bottom of this file. What used to be here beside this assertion was a
+    /// ban on `loop {` and a ten-word list of `std::sync::mpsc` vocabulary,
+    /// and both were DELETED in the same commit that added the harness,
+    /// because they were measured not to hold the property they claimed:
     ///
-    ///  * **M-2**, a spin loop written without re-indenting the drain:
+    ///  * **M-A** -- `let t = Instant::now(); while t.elapsed().as_secs() <
+    ///    60 { std::hint::spin_loop(); }` at the closure's own statement
+    ///    level. `while`, not `loop`; none of the ten words; drain still at
+    ///    depth 1. Sixty seconds per frame and a core burnt.
+    ///  * **M-I** -- a plain `fn settle_before_paint()` defined one line
+    ///    ABOVE the closure and called from inside it. The scan has no reach
+    ///    past the closure at all.
+    ///  * **M-B**, **M-C**, **M-13** -- `Mutex::lock` on a mutex this thread
+    ///    already holds, `JoinHandle::join` on a sixty-second thread, and
+    ///    `stdin().lock().read_line(..)`. `lock`, `join` and `read_line` are
+    ///    not `mpsc` vocabulary and were never on any list.
     ///
-    ///    ```ignore
-    ///    loop {
-    ///    if let Ok((tag, result)) = send_rx.try_recv() {
-    ///        ..
-    ///        break;
-    ///    }
-    ///    }
-    ///    ```
+    /// All five were measured green at 2072 lib + 217 bin, 0 failed. The
+    /// class of ways to make a frame wait is unbounded and text scanning
+    /// cannot enumerate it, so the list was theatre and the maintenance cost
+    /// of theatre is real. What survives here is the ONE thing the harness
+    /// does not subsume, and it earns its place because **M-E** -- the drain
+    /// moved to brace depth 2, i.e. wrapped in a `loop`/`while`/`if` -- was
+    /// measured to die on it:
     ///
-    ///    `send_rx` still occurred exactly twice and the drain line still
-    ///    matched the pinned string, spaces and all. The indentation pin held
-    ///    nothing, because indentation is a convention and a mutation is not
-    ///    obliged to follow it.
+    ///  * The drain sits at **brace depth 1**, counted, not inferred from
+    ///    leading spaces. **M-2** was a spin loop written without
+    ///    re-indenting the drain; the indentation pin it beat held nothing,
+    ///    because indentation is a convention and a mutation is not obliged
+    ///    to follow it.
     ///
-    ///  * **M-7**, which shows the drain was the wrong target altogether. The
-    ///    guards constrain the token `send_rx`; nothing stopped the closure
-    ///    making its own channel and blocking on that, under a spelling with
-    ///    no `.recv` in it to ban:
-    ///
-    ///    ```ignore
-    ///    let (park_tx, park_rx) = std::sync::mpsc::channel::<u8>();
-    ///    let _park = park_tx;
-    ///    let _ = std::sync::mpsc::Receiver::recv_timeout(
-    ///        &park_rx, std::time::Duration::from_secs(60));
-    ///    ```
-    ///
-    ///    Sixty seconds per frame. `SendListReceiver` removes the blocking
-    ///    API from *one* channel; it says nothing about a second one.
-    ///
-    /// So this asserts over the closure's own body rather than over a line:
-    ///
-    ///  1. The drain sits at **brace depth 1** -- the closure's own statement
-    ///     level -- counted, not inferred from leading spaces. A `loop`, a
-    ///     `while` or an `if` wrapped round it puts it at 2 whatever it is
-    ///     indented to, which is M-2 dead at the source.
-    ///  2. The closure contains **no unbounded `loop {`** at all. A frame
-    ///     that spins is a frame that waits with the CPU pinned, and the
-    ///     difference between that and `recv()` is invisible to the user.
-    ///  3. The closure **names no waiting primitive**: no `Receiver`, no
-    ///     `mpsc`, no `recv`, no `park`, no `sleep`, no `Condvar`, no
-    ///     `Barrier`. Every channel this window has is created *above* the
-    ///     closure and moved in, so this is an absence that is true today for
-    ///     structural reasons and not a coincidence -- and M-7 needs all
-    ///     three of `mpsc`, `Receiver` and `recv` to spell itself, under any
-    ///     path syntax, UFCS included.
-    ///
-    /// **What this is not.** It is not the behavioural hold the property
-    /// deserves -- driving the real closure in a headless `Context::run_ui`
-    /// harness and bounding the wall clock. That was designed and rejected
-    /// for this round for two reasons, both recorded rather than hidden:
-    /// `build_frame`'s second frame unconditionally calls `spawn_vault_sync`,
-    /// which shells out to the `bw` CLI, so the harness cannot run without a
-    /// spawn seam through `build_frame` that this round has no mandate to
-    /// cut; and a frame that *spins* (M-2) never returns at all, so a
-    /// wall-clock bound taken on the test's own thread would hang the suite
-    /// rather than fail it, and the closure is full of `Rc<RefCell<_>>` so it
-    /// cannot be watchdogged from another thread. The harness wants an
-    /// injectable spawner and a cooperative deadline the closure itself
-    /// checks; both are real work and belong with that seam.
+    /// A drain wrapped in a `loop` is also a frame that never returns, so
+    /// the harness kills it too. This is the cheap, precise half, and it
+    /// names the defect instead of reporting a stopwatch.
     #[test]
-    fn the_frame_closure_has_nothing_to_wait_on() {
+    fn the_sends_drain_is_at_the_closures_own_statement_level() {
         let closure = frame_closure();
         assert!(
             closure.len() > 50_000,
@@ -3434,45 +3640,6 @@ mod source_pins {
              here, precisely because a mutation is free to ignore it"
         );
 
-        for shape in [concat!("loop", " {"), concat!("loop", "\r\n")] {
-            assert!(
-                !closure.contains(shape),
-                "the frame closure contains {shape:?}. An unbounded loop inside one frame is \
-                 the freeze this whole off-thread design exists to prevent, whether it spins \
-                 on `try_recv` or blocks outright; the user cannot tell the two apart"
-            );
-        }
-
-        // Every channel this window owns is created above the closure and
-        // moved in, and the one Sends receiver is a `SendListReceiver` bound
-        // out there too -- so the closure needs none of these words, and each
-        // of them is a way to wait. M-7 needed three of them at once.
-        //
-        // Matched as a PREFIX and not as a whole word, deliberately: the
-        // suffix is where the spellings hide. `recv` alone would miss
-        // `recv_timeout` and `recv_deadline`; `mpsc` alone is dodged by
-        // `use std::sync::mpsc as chan` written above the closure, which is
-        // why `channel` and `Receiver` are here beside it. Three of these
-        // words have to be absent at once for a second channel to exist at
-        // all, and any one of them is enough to fail.
-        for word in [
-            "Receiver", "Sender", "mpsc", "channel", "recv", "park", "sleep", "Condvar",
-            "Barrier", "wait",
-        ] {
-            let found = closure.match_indices(word).any(|(at, _)| {
-                let prev = closure[..at].chars().next_back();
-                !matches!(prev, Some(c) if c.is_alphanumeric() || c == '_')
-            });
-            assert!(
-                !found,
-                "the frame closure names {word:?}. Every channel this window has is built \
-                 above the closure and moved in, so there is no honest reason for the word to \
-                 be in here -- and a channel created *inside* the frame is one no type in \
-                 `mod send_channel` constrains: `std::sync::mpsc::Receiver::recv_timeout(&rx, \
-                 Duration::from_secs(60))` is a sixty-second freeze per frame that every \
-                 needle aimed at `send_rx` and at `.recv(` misses"
-            );
-        }
     }
 
     /// **The Sends receiver has no blocking drain, by type.**
@@ -3987,4 +4154,331 @@ mod source_pins {
             "control: the walk accepted an UNGATED module below the cut, which ships"
         );
     }
+
+    /// **The frame closure behaves the same way in a test build as in the
+    /// shipped one.**
+    ///
+    /// The one thing a behavioural harness cannot measure about itself.
+    /// `frame_promptness::the_frame_closure_returns_promptly` drives the real
+    /// closure and times it, which kills every wait it can REACH -- but a
+    /// frame that asked which build it was in could return promptly for the
+    /// harness and freeze for the user:
+    ///
+    /// ```ignore
+    /// if !cfg!(test) {
+    ///     let t = Instant::now();
+    ///     while t.elapsed().as_secs() < 60 { std::hint::spin_loop(); }
+    /// }
+    /// ```
+    ///
+    /// **M-N2**, measured green against the harness at 2075 lib + 217 bin,
+    /// and green it would stay however long the wall clock were given,
+    /// because the test binary cannot execute the branch the user gets.
+    ///
+    /// This is a needle, and the previous round's needles were deleted this
+    /// same commit for being theatre -- so the difference matters. Those
+    /// enumerated an OPEN class (the ways to wait, of which there are
+    /// unboundedly many). This closes a CLOSED one: the whole vocabulary for
+    /// asking about the build configuration from inside an expression is
+    /// `cfg!`, and the whole vocabulary for asking about it from an item is
+    /// `#[cfg`. Both are here. Neither has a synonym, because the compiler
+    /// defines them, and there is nothing else for the frame to key on --
+    /// every value it holds is one the harness supplies deliberately.
+    #[test]
+    fn the_frame_closure_behaves_the_same_way_in_both_builds() {
+        let closure = frame_closure();
+        assert!(
+            closure.len() > 50_000,
+            "control: the frame closure slice is only {} bytes",
+            closure.len()
+        );
+        for asking in [concat!("cfg", "!("), concat!("#[cfg", "(")] {
+            assert!(
+                !closure.contains(asking),
+                "the frame closure contains {asking:?}, so what it does depends on which \
+                 build it is. `the_frame_closure_returns_promptly` drives it in the TEST \
+                 build and can only ever measure that half; a frame that waits in the other \
+                 half is a frozen window for the user and a green suite for whoever ships \
+                 it. The window's behaviour is decided by the values `build_frame` is \
+                 handed, never by the configuration it was compiled under"
+            );
+        }
+    }
+
+    /// **A shipping build has exactly one `VaultFrameEnv`, and it is the real
+    /// one.**
+    ///
+    /// The seam `build_frame` grew this round is what lets
+    /// `frame_promptness::the_frame_closure_returns_promptly` drive the real
+    /// frame closure without a `bw` spawn, an HTTP call or a read of the real
+    /// `settings.json`. The objection a seam like that has to answer is that
+    /// it might ALSO be a new way for production to reach a spawn nothing
+    /// guards. It is not, and the reason is in the source rather than in this
+    /// paragraph: the substitute constructor lives in a module gated to the
+    /// test configuration, so it is not compiled into the binary the user
+    /// runs, and the three fields are private, so nothing outside
+    /// `mod vault_window` can build one any other way. What is left is one
+    /// constructor whose body names the same two spawn functions the call
+    /// sites used to name directly.
+    #[test]
+    fn production_is_the_only_env_a_shipping_build_has() {
+        let production = sanitized(&production());
+        assert_eq!(
+            production.matches(concat!("impl VaultFrame", "Env {")).count(),
+            1,
+            "`VaultFrameEnv` has more than one impl block in production, so the constructors \
+             are not all where this test is looking"
+        );
+        assert_eq!(
+            production.matches(concat!("fn stub", "bed(")).count(),
+            0,
+            "`frame_env_seam::stubbed` is in the PRODUCTION region -- its gate has been \
+             removed or weakened, so the binary the user runs now contains a way to hand \
+             this window any spawn at all"
+        );
+        let opener = concat!("pub fn produc", "tion() -> Self {");
+        assert_eq!(
+            production.matches(opener).count(),
+            1,
+            "`VaultFrameEnv::production` is not in production exactly once"
+        );
+        let at = production.find(opener).expect("counted just above");
+        let body = &production[at..];
+        let body = &body[..body.find(concat!("\r\n", "    }", "\r\n")).expect("unterminated")];
+        // Past the opener, so the constructor's own signature is not
+        // counted as a definition made inside it.
+        let inside = &body[opener.len()..];
+        for named in ["spawn_vault_sync", "spawn_vault_load"] {
+            assert_eq!(
+                body.matches(named).count(),
+                1,
+                "`VaultFrameEnv::production` does not name {named:?} exactly once: {body}"
+            );
+        }
+        assert_eq!(
+            inside.matches("fn ").count(),
+            0,
+            "`VaultFrameEnv::production` defines something of its own, so what it hands the \
+             window is no longer just the two module-level spawns: {body}"
+        );
+    }
+}
+
+/// **The vault frame closure returns promptly -- measured by running it.**
+///
+/// See `the_sends_drain_is_at_the_closures_own_statement_level` for the seven
+/// rounds of source scanning this replaces and the five mutants that walked
+/// through them. The move is from asking what the closure is SPELLED with to
+/// asking what the user experiences: the frame came back, or it did not.
+///
+/// **How a frame that never returns FAILS instead of hanging the suite.**
+/// The whole vault window is built and driven on a worker thread, and the
+/// test thread waits on a bounded `recv_timeout`. The `Rc<RefCell<_>>` in
+/// the closure never crosses a thread boundary -- `build_frame` is CALLED on
+/// the worker, so every cell it makes is born there and dies there; the only
+/// thing that crosses is a `Duration` over a channel. A frame that spins,
+/// deadlocks, joins or reads stdin leaves that worker thread stuck, the
+/// `recv_timeout` expires, and the test panics with the budget it blew. The
+/// stuck thread is deliberately LEAKED rather than joined -- joining it is
+/// exactly the hang this design exists to avoid -- and the test process
+/// reaps it on exit.
+///
+/// **Why this is not vacuous.** A harness that quietly failed to enter the
+/// interesting part of the closure would pass against anything. So the two
+/// stubs COUNT their calls, and the test asserts both were called: the load
+/// spawn is reached in `build_frame`'s own body and the sync spawn is
+/// reached from inside the closure, past `styled`, past `draw_resize_handles`
+/// and past the per-frame repaint schedule. If a future edit moves the
+/// auto-sync behind something the harness does not satisfy, this test goes
+/// red rather than green-and-empty.
+#[cfg(test)]
+mod frame_promptness {
+    use super::super::frame_env_seam::stubbed;
+    use super::super::{build_frame, AccountDetails, VaultLoadFailure, VaultLoadRequest};
+    use crate::login_ui::{BwStatus, BwStatusDetails};
+    use crate::vault_cache::{VaultCache, VaultSnapshot};
+    use eframe::egui;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// How long three real frames are allowed to take, end to end, including
+    /// building the window and egui's font atlas.
+    ///
+    /// Generous on purpose. The number that matters is the gap between this
+    /// and a frame that WAITS: every mutant this harness was measured against
+    /// waits sixty seconds, and three real frames measure well under a second
+    /// on the machine this was written on. A budget in that gap fails the
+    /// mutants without turning a slow machine red.
+    const BUDGET: Duration = Duration::from_secs(20);
+
+    /// How many frames are driven. More than one because the closure's first
+    /// frame and its later ones are different code: `auto_synced` flips on
+    /// the first and the drains run on all of them.
+    const FRAMES: usize = 3;
+
+    static SYNC_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+    static LOAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Stands in for `spawn_vault_sync`, which shells out to `bw sync`.
+    fn counted_sync(_tx: mpsc::Sender<Result<(), String>>, _session_token: String) {
+        SYNC_SPAWNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Stands in for `spawn_vault_load`, which talks to `bw serve` over HTTP.
+    /// Sends nothing back, so the window stays on its loading branch -- which
+    /// is the state that reaches the auto-sync and every drain, and reaches
+    /// no row, no favicon fetch and no breach lookup.
+    fn counted_load(
+        _cache: Arc<VaultCache>,
+        _tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        _request: VaultLoadRequest,
+    ) {
+        LOAD_SPAWNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Runs `work` on its own thread and gives it `budget` to answer.
+    ///
+    /// `Err(())` is "it did not answer in time", and the thread is left
+    /// running -- see this module's doc. `work` returning is the only way to
+    /// get `Ok`, so a panic inside it arrives as `Err` too (the sender is
+    /// dropped), which is why the caller's message names both possibilities.
+    fn within(budget: Duration, work: impl FnOnce() -> Duration + Send + 'static) -> Result<Duration, ()> {
+        let (tx, rx) = mpsc::channel::<Duration>();
+        std::thread::Builder::new()
+            .name("vault-frame-harness".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let _ = tx.send(work());
+            })
+            .expect("could not start the harness thread");
+        rx.recv_timeout(budget).map_err(|_| ())
+    }
+
+    /// Builds the real vault window and drives [`FRAMES`] real frames of it
+    /// through a headless `egui::Context`, returning how long that took.
+    ///
+    /// Everything is built HERE, on whatever thread this runs on, because the
+    /// frame closure is full of `Rc` and cannot be moved between threads.
+    /// `VaultFrameHandles::finish` is deliberately NOT called: it writes the
+    /// window geometry to `settings.json`, and this test owns no real one.
+    fn drive_the_real_frame() -> Duration {
+        let scratch = std::env::temp_dir()
+            .join(format!("deskwarden-frame-harness-{}", std::process::id()));
+        let (_options, mut frame_fn, handles) = build_frame(
+            // A base URL nothing listens on. It is never dialled anyway --
+            // the only thing that would dial it is the load spawn, and that
+            // is `counted_load`.
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            // `Ready`, so no `bw status` channel and no drain waiting on one.
+            AccountDetails::Ready(BwStatusDetails {
+                status: BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                // `None`, so no favicon is fetched for any host.
+                server_url: None,
+            }),
+            "harness-session-token".to_string(),
+            scratch.join("icons"),
+            // `Never`, so the auto-lock countdown cannot end the session
+            // underneath the measurement.
+            crate::settings::AutoLock::Never,
+            // The load spawn is stubbed, so this only says the readiness wait
+            // would have been skipped.
+            true,
+            None,
+            // `true`: somebody else owns this window's first frame. That is
+            // what keeps the first frame from calling `round_window_corners`
+            // and `raise_window` on a window that does not exist -- and it
+            // means frame one runs the whole body rather than returning
+            // early, so all three frames measured are real ones.
+            true,
+            stubbed(counted_sync, counted_load, Some(scratch.join("settings.json"))),
+        );
+        let ctx = egui::Context::default();
+        // What the NON-`pre_styled` first frame would have called, and what
+        // the other host called three stages before handing this frame over:
+        // it binds the bundled Archivo faces, and every label this window
+        // paints asks for one by name. Without it the first frame panics
+        // inside epaint rather than measuring anything -- which the harness
+        // reports as a failure, correctly but unhelpfully.
+        crate::theme::apply(&ctx);
+        let started = Instant::now();
+        for _ in 0..FRAMES {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| frame_fn(ui));
+        }
+        let elapsed = started.elapsed();
+        drop(frame_fn);
+        drop(handles);
+        elapsed
+    }
+
+    #[test]
+    fn the_frame_closure_returns_promptly() {
+        let took = within(BUDGET, drive_the_real_frame).unwrap_or_else(|()| {
+            panic!(
+                "{FRAMES} frames of the vault window did not come back within {BUDGET:?}. \
+                 Either one frame is WAITING -- on a channel, a lock, a thread, a process, a \
+                 file handle, a busy spin, anything at all; the user cannot tell those apart \
+                 and neither does this test -- or the frame panicked, in which case the \
+                 panic is printed above this line. This is the whole property: the eframe \
+                 thread is the only thread this window has, and a frame that does not return \
+                 is a frozen window, no repaint and no input, for as long as it takes"
+            )
+        });
+
+        // The two controls that stop this test passing vacuously -- see the
+        // module doc. Read AFTER the run, and only on the path where the run
+        // finished, so a timeout reports the timeout rather than these.
+        assert!(
+            LOAD_SPAWNS.load(Ordering::SeqCst) >= 1,
+            "the harness built the window without reaching the initial vault load, so it is \
+             not measuring `build_frame`'s body at all"
+        );
+        assert!(
+            SYNC_SPAWNS.load(Ordering::SeqCst) >= 1,
+            "the harness ran {FRAMES} frames without reaching the auto-sync, which sits inside \
+             the closure past the `styled` guard, `draw_resize_handles` and the repaint \
+             schedule. Whatever these frames measured, it was not the closure's body -- this \
+             test would be green against a closure that waited for a minute further down"
+        );
+        assert!(
+            took < BUDGET,
+            "control: the run reported {took:?}, which is not inside the budget it was \
+             admitted under"
+        );
+    }
+
+    /// **The bound is real**, and this is the test that says so.
+    ///
+    /// Without it, `within` could return `Ok` unconditionally -- or the
+    /// budget could be raised past any wall clock -- and the test above would
+    /// stay green while holding nothing. So: a body that waits well past its
+    /// budget must come back `Err`, and it must come back at all, which is
+    /// the other half (a bound that hangs is not a bound).
+    #[test]
+    fn a_body_that_waits_past_its_budget_is_reported_rather_than_waited_for() {
+        let asked_at = Instant::now();
+        let answer = within(Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Duration::from_secs(5)
+        });
+        assert!(answer.is_err(), "a five-second body was admitted under a 200ms budget");
+        assert!(
+            asked_at.elapsed() < Duration::from_secs(4),
+            "the bound took {:?} to report -- it waited for the body instead of giving up on \
+             it, which is the suite-hanging shape this whole design exists to avoid",
+            asked_at.elapsed()
+        );
+        // And the other direction: a body that answers is not reported as a
+        // timeout, or the test above would be green for the wrong reason.
+        assert!(
+            within(Duration::from_secs(10), || Duration::from_millis(1)).is_ok(),
+            "control: an instant body was reported as an overrun"
+        );
+    }
+
 }

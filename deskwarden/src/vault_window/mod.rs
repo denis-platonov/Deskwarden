@@ -486,7 +486,16 @@ pub fn build_frame(
     // -- and the titlebar then carries no switcher.
     accounts: Option<crate::accounts::AccountsState>,
     pre_styled: bool,
+    // Everything this function reaches outside the process for. See
+    // [`VaultFrameEnv`]: production callers pass
+    // `VaultFrameEnv::production()` and have exactly the behaviour they
+    // had before this parameter existed.
+    env: VaultFrameEnv,
 ) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
+    // Copied out first -- both are `fn` pointers, so this is a copy and the
+    // closure below can take one without borrowing `env`.
+    let spawn_sync = env.sync;
+    let spawn_load = env.load;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -696,7 +705,7 @@ pub fn build_frame(
     // flight. `log::info!` and one `Instant`, i.e. free: this app's slowest
     // visible action should be able to say what it spent the time on.
     let mut initial_load_started = Some(Instant::now());
-    spawn_vault_load(
+    (spawn_load)(
         cache.clone(),
         vault_tx.clone(),
         VaultLoadRequest {
@@ -906,7 +915,7 @@ pub fn build_frame(
     // the window exists -- `Settings::load` is a small file read and every
     // failure in it (missing, partial, corrupt) already falls back to
     // defaults, so this cannot be a reason the window does not open.
-    let settings_path = crate::settings::default_path();
+    let settings_path = env.settings_path;
     let placement = initial_placement(
         settings_path
             .as_deref()
@@ -987,7 +996,7 @@ pub fn build_frame(
     // here, and it is reported once rather than every frame.
     let eframe_handoff = std::time::Instant::now();
 
-    let vault_frame_fn = move |ui: &mut egui::Ui, _frame: &mut eframe::Frame| {
+    let vault_frame_fn = move |ui: &mut egui::Ui| {
         if !styled {
             log::info!("vault window: first frame {:?} after eframe was asked", eframe_handoff.elapsed());
             theme::paint_window_background(ui);
@@ -1069,7 +1078,7 @@ pub fn build_frame(
         if !auto_synced {
             auto_synced = true;
             sync_in_progress = true;
-            spawn_vault_sync(sync_tx.clone(), session_token.clone());
+            (spawn_sync)(sync_tx.clone(), session_token.clone());
         }
 
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
@@ -1597,7 +1606,7 @@ pub fn build_frame(
                 );
                 if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                     sync_in_progress = true;
-                    spawn_vault_sync(sync_tx.clone(), session_token.clone());
+                    (spawn_sync)(sync_tx.clone(), session_token.clone());
                 }
             },
         ) {
@@ -3350,7 +3359,70 @@ pub fn build_frame(
 
 /// The vault UI's per-frame closure, boxed so it can be stored in a struct
 /// and handed to either host.
-pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
+pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
+
+/// The three things [`build_frame`] reaches OUTSIDE this process for,
+/// gathered into one value so that a test can drive the real frame closure
+/// without any of them happening.
+///
+/// **Why this exists.** The property `send_ui`'s
+/// `frame_promptness::the_frame_closure_returns_promptly` holds is that one
+/// frame RETURNS PROMPTLY, and the only honest way to hold it is to run the
+/// frame and time it. Seven rounds of source scanning were tried first and
+/// five independent mutants were measured through them (a `while` spin, a
+/// `Mutex` self-deadlock, a `JoinHandle::join`, a helper hoisted above the
+/// closure, a `read_line` on stdin); the class is unbounded and a word list
+/// cannot hold it. Running the frame needed exactly three things to stop
+/// happening: the initial `bw serve` load, the auto-sync's `bw sync`, and
+/// the read of the real `settings.json`.
+///
+/// **Why this is not a new way to spawn.** The fields are PRIVATE and the
+/// struct is a plain `struct` with no public field, so no caller outside
+/// `vault_window` can name a field or build one positionally. Inside the
+/// module there are exactly two constructors, and the only one that exists
+/// in a production build is [`VaultFrameEnv::production`], whose body names
+/// `spawn_vault_sync` and `spawn_vault_load` and nothing else. The other is
+/// `frame_env_seam::stubbed` at the very bottom of this file, inside a
+/// module gated to the test configuration: it is not compiled into the
+/// binary the user runs at all. So the set of things this seam can spawn in
+/// production is the same one-element set it was before the seam existed --
+/// the seam widens what a TEST can substitute, not what production can
+/// reach, and
+/// `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`
+/// holds that from the source.
+///
+/// **Why the substitute is not an inherent method beside**
+/// **[`VaultFrameEnv::production`].** Every source guard in this file cuts
+/// its "production slice" at the FIRST test gate in the text, so a gated
+/// item declared up here truncates that slice and blinds a dozen guards to
+/// everything below it. Measured: eleven tests red, none of them about this
+/// seam. The substitute therefore lives below every one of them.
+pub struct VaultFrameEnv {
+    /// `spawn_vault_sync` in production. Both call sites go through it: the
+    /// auto-sync on the window's first real frame and the Sync button.
+    sync: fn(mpsc::Sender<Result<(), String>>, String),
+    /// `spawn_vault_load` in production -- the window's initial load.
+    load: fn(
+        std::sync::Arc<VaultCache>,
+        mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        VaultLoadRequest,
+    ),
+    /// `settings::default_path()` in production. A test hands a path under
+    /// its own temporary directory, so no frame reads or writes the real
+    /// `%APPDATA%\Deskwarden`.
+    settings_path: Option<std::path::PathBuf>,
+}
+
+impl VaultFrameEnv {
+    /// The real world. The only constructor a shipping build has.
+    pub fn production() -> Self {
+        Self {
+            sync: spawn_vault_sync,
+            load: spawn_vault_load,
+            settings_path: crate::settings::default_path(),
+        }
+    }
+}
 
 /// The cells [`build_frame`]'s closure reports its outcome through, and the
 /// one file write that outcome implies.
@@ -3469,9 +3541,10 @@ pub fn run(
         // This host owns its window, so its first frame is the one that
         // installs the fonts, rounds the corners and raises it.
         false,
+        VaultFrameEnv::production(),
     );
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| frame_fn(ui));
 
     handles.finish()
 }
@@ -15078,7 +15151,7 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 51,
+            modules, 52,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -15095,5 +15168,33 @@ mod preferences_modal_wiring_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+/// The test-only half of [`VaultFrameEnv`]'s two constructors.
+///
+/// At the BOTTOM of the file, below every test module, for the reason given
+/// in that struct's doc: a gate written higher up truncates the production
+/// slice this file's source guards are cut from.
+#[cfg(test)]
+mod frame_env_seam {
+    use super::*;
+
+    /// A [`VaultFrameEnv`] that reaches nothing outside the process.
+    ///
+    /// `pub(super)` and not `pub(crate)`: the two spawn signatures name
+    /// `VaultLoadRequest` and `VaultLoadFailure`, which are private to
+    /// `vault_window`, so anything wider would be an item more public than
+    /// its own arguments.
+    pub(super) fn stubbed(
+        sync: fn(mpsc::Sender<Result<(), String>>, String),
+        load: fn(
+            std::sync::Arc<VaultCache>,
+            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            VaultLoadRequest,
+        ),
+        settings_path: Option<std::path::PathBuf>,
+    ) -> VaultFrameEnv {
+        VaultFrameEnv { sync, load, settings_path }
     }
 }

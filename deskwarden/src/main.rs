@@ -911,6 +911,7 @@ fn main() {
                         // fonts, rounded the corners and raised it, three
                         // stages ago.
                         true,
+                        vault_window::VaultFrameEnv::production(),
                     );
                     Some((frame, handles))
                 },
@@ -4169,6 +4170,7 @@ fn rebuild_the_vault_after_the_lock(
                 // This window was styled and raised stages
                 // ago.
                 true,
+                vault_window::VaultFrameEnv::production(),
             );
             (frame, handles)
         })
@@ -4274,6 +4276,7 @@ impl VaultOps for RealVaultOps<'_> {
             // This host owns its window, so its first frame installs the
             // fonts, rounds the corners and raises it.
             false,
+            vault_window::VaultFrameEnv::production(),
         );
 
         // **Everything the off-thread closures need, taken BEFORE the estate
@@ -7089,15 +7092,11 @@ fn try_start_backend(
             bw_serve::BW_SERVE_PORT
         );
     }
-    // Taken out of `bw_path::BareCommand` here rather than in
-    // `bw_serve_command`, so the one act of leaving the kill-on-close job's
-    // reach is written at the call site that is about to put it back into a
-    // job. `main.rs` is one of the files `job_object`'s tree walk excuses.
-    job_object::spawn_in_job(
-        job,
-        job_object::JobCommand::wrap(command.into_jobless_command()),
-    )
-    .map_err(BackendStartError::Spawn)
+    // Wrapped here rather than in `bw_serve_command`, which is also used by
+    // `spawn_bw_serve` for callers that hold no job at all. `main.rs` is one
+    // of the files `job_object`'s tree walk already excuses.
+    job_object::spawn_in_job(job, job_object::JobCommand::wrap(command))
+        .map_err(BackendStartError::Spawn)
 }
 
 /// Startup variant of [`try_start_backend`]: there is nothing to fall back to

@@ -1470,7 +1470,7 @@ where
                 // reports lock / re-auth / Preferences / switch through the
                 // handles above exactly as it does when a tray click opens it.
                 if let Some(vault_fn) = vault_fn.as_mut() {
-                    vault_fn(ui, frame);
+                    vault_fn(ui);
                 }
                 // **THE LOCK, CAUGHT IN THE STARTUP WINDOW.** Without this
                 // arm the vault frame's own `ViewportCommand::Close` is
@@ -1959,7 +1959,7 @@ where
         match stage {
             Stage::Vault => {
                 if let Some(vault_fn) = vault_fn.as_mut() {
-                    vault_fn(ui, frame);
+                    vault_fn(ui);
                 }
                 // The lock catch is [`InWindowLock::catch_the_lock`]'s; what
                 // is decided here is only where the window goes next, which is
@@ -2802,7 +2802,7 @@ mod startup_window_tests {
             ),
             (
                 concat!("Stage::Vault ", "=>"),
-                ("THE VAULT IS NEVER DRAWN", "vault_fn(ui, frame);"),
+                ("THE VAULT IS NEVER DRAWN", "vault_fn(ui);"),
             ),
         ] {
             let (why, draws) = what;
@@ -2876,7 +2876,7 @@ mod startup_window_tests {
             "control: the sliced region is not the arm that draws the spinner: {arm}"
         );
         assert!(
-            !arm.contains(concat!("vault_fn(ui, ", "frame);")),
+            !arm.contains(concat!("vault_fn(", "ui);")),
             "control: the sliced region runs on into the vault arm: {arm}"
         );
     }
@@ -4546,7 +4546,7 @@ mod lock_host_tests {
         // vault, and the call is in THAT arm rather than anywhere in the host.
         let arm = vault_arm();
         assert!(
-            arm.contains(concat!("vault_fn(ui, ", "frame);")),
+            arm.contains(concat!("vault_fn(", "ui);")),
             "control: the sliced region is not the arm that draws the vault: {arm}"
         );
         assert!(
