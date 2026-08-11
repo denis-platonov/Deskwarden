@@ -91,7 +91,15 @@ const MAX_TEXT_LEN: usize = 100_000;
 /// secret still in it is exactly what the crate's `#[global_allocator]` probe
 /// exists to catch. [`the_plans_secret_fields_and_the_built_json_all_wipe`]
 /// holds all three buffers against that probe.
-#[derive(Debug, Clone)]
+///
+/// **`Debug` is hand-written below and deliberately not derived.**
+/// `vault_bridge.rs`'s `PasswordHistoryEntry` set the precedent, and the
+/// reason applies here word for word: a new secret-carrying struct starts
+/// without the escape route rather than adding one more. `Zeroizing` is not
+/// that escape route's lock -- its own `Debug` forwards straight to the inner
+/// value, so a derived one would print the secret body and the share password
+/// in full to anyone who wrote `{plan:?}`.
+#[derive(Clone)]
 pub struct SendPlan {
     pub name: String,
     pub text: Zeroizing<String>,
@@ -113,6 +121,37 @@ impl Default for SendPlan {
             password: None,
             max_access_count: None,
         }
+    }
+}
+
+/// A stand-in for a value that must not be printed, carrying only its length.
+///
+/// A length is safe and is the one thing worth knowing from a log line: it
+/// separates "the body is there" from "the body is empty", which is the only
+/// question a `Debug` of one of these types can usefully answer.
+struct Redacted(usize);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0)
+    }
+}
+
+/// Hand-written so the two secrets never reach a formatter.
+///
+/// `name` is kept: it is the label the user typed to identify the Send to
+/// themselves, it is already on screen and in the Sends list, and redacting it
+/// would leave a `Debug` that cannot tell two plans apart.
+impl std::fmt::Debug for SendPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendPlan")
+            .field("name", &self.name)
+            .field("text", &Redacted(self.text.len()))
+            .field("hidden", &self.hidden)
+            .field("delete_in_days", &self.delete_in_days)
+            .field("password", &self.password.as_ref().map(|p| Redacted(p.len())))
+            .field("max_access_count", &self.max_access_count)
+            .finish()
     }
 }
 
@@ -262,7 +301,14 @@ pub fn expiry_wording(days: u8, now: &dyn SendClock) -> String {
 /// The fields are private and there is no public constructor but
 /// [`plan_to_invocation`]. That is the point of the type -- see the module
 /// docs on the `http_agent` precedent.
-#[derive(Debug, Clone)]
+///
+/// **`Debug` is hand-written below and deliberately not derived**, for the
+/// reason [`SendPlan`] gives. The derived one printed
+/// `session_token: Some(Zeroizing("THE-SESSION-TOKEN"))` verbatim and a
+/// base64 body that decodes to the Send's text and its share password, so a
+/// single `log::debug!("{inv:?}")` at a future call site would have put the
+/// key to the whole vault and the secret being published into the log file.
+#[derive(Clone)]
 pub struct SendInvocation {
     /// The arguments after the `bw` executable itself. **Never a secret**;
     /// see [`the_built_invocation_never_carries_a_secret_in_its_arguments`].
@@ -289,6 +335,23 @@ impl SendInvocation {
 
     pub fn session_token(&self) -> Option<&str> {
         self.session_token.as_deref().map(|s| s.as_str())
+    }
+}
+
+/// Hand-written for the reason on the type: the session token unlocks the
+/// vault and the body is the secret being published, so neither may reach a
+/// formatter. The arguments are printed in full -- they are pinned never to
+/// carry a secret, and a `Debug` that hid them would say nothing at all.
+impl std::fmt::Debug for SendInvocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendInvocation")
+            .field("args", &self.args)
+            .field("stdin_json_b64", &Redacted(self.stdin_json_b64.len()))
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|t| Redacted(t.len())),
+            )
+            .finish()
     }
 }
 
@@ -531,6 +594,13 @@ pub enum SendError {
     /// **Ambiguous in the same way as [`Self::CreatedButUnreadable`]**: the
     /// request may well have reached the server before the app stopped
     /// waiting.
+    ///
+    /// Unlike [`Self::CreatedButUnreadable`] this arm is reached from **all
+    /// three** operations -- create, list and revoke -- because
+    /// [`CliSendRunner::run`] answers it whenever the cap expires, whatever
+    /// the invocation was. Its sentence must therefore be true of a revoke
+    /// that may not have happened as well as of a create that may have; see
+    /// [`the_timeout_message_is_true_of_a_revoke_and_of_a_list_as_well`].
     TimedOut,
     /// `bw` could not be started at all. Unambiguous -- nothing ran.
     SpawnFailed(String),
@@ -554,8 +624,12 @@ impl SendError {
                  already public."
             }
             Self::TimedOut => {
-                "Bitwarden did not answer in time. A Send may have been created anyway -- \
-                 check your Sends list before trying again."
+                // Reached from create, from list AND from revoke, so it may
+                // not claim a Send was created: on a timed-out revoke that is
+                // false, and the true worry there -- the link may still be
+                // live -- went unsaid.
+                "Bitwarden did not answer in time. Check your Sends list before trying again: \
+                 a Send may now be public, or one you tried to revoke may still be live."
             }
             Self::SpawnFailed(why) => why,
         }
@@ -891,6 +965,13 @@ pub struct CliSendRunner<'a> {
     ///
     /// From the design, verbatim: an orphaned `bw` holding `BW_SESSION` after
     /// deskwarden dies is the same hazard `bw serve` is in the job for.
+    ///
+    /// Read only through [`Self::job`]. The guarantee used to rest on a
+    /// source pin over the `spawn_in_job` call, and a pin over a call says
+    /// nothing about the value flowing into it: `Self { job: job.filter(|_|
+    /// false), data_dir }` left the pinned line word-perfect, the whole suite
+    /// green and no warning emitted, while every `bw` child was spawned
+    /// outside the job.
     job: Option<&'a crate::job_object::KillOnCloseJob>,
     /// The active account's CLI profile directory, passed straight through to
     /// [`crate::bw_path::bw_command_in`] so a Send is created, listed and
@@ -904,6 +985,21 @@ impl<'a> CliSendRunner<'a> {
         data_dir: Option<&'a Path>,
     ) -> Self {
         Self { job, data_dir }
+    }
+
+    /// The job the child will be placed in, or `None` when this runner was
+    /// given none.
+    ///
+    /// **The single place [`SendRunner::run`] reads the job from**, which is
+    /// what makes an assertion about this accessor an assertion about what
+    /// the spawn actually gets. `data_dir` needs no equivalent: it reaches
+    /// the built `Command` as an environment variable, so
+    /// [`the_profile_directory_the_runner_was_given_reaches_the_child`] can
+    /// already read it back without a process. Job membership cannot be read
+    /// back that way, and this is the nearest thing to it that is still a
+    /// value rather than a line of source text.
+    pub fn job(&self) -> Option<&'a crate::job_object::KillOnCloseJob> {
+        self.job
     }
 
     /// Builds the command for one invocation, **without spawning anything**.
@@ -945,7 +1041,7 @@ impl SendRunner for CliSendRunner<'_> {
         // `job_object::spawn_in_job`, which also re-ORs `CREATE_NO_WINDOW`
         // because `creation_flags` REPLACES the flags a command holds rather
         // than adding to them.
-        let mut child = crate::job_object::spawn_in_job(self.job, command).map_err(|e| {
+        let mut child = crate::job_object::spawn_in_job(self.job(), command).map_err(|e| {
             SendError::SpawnFailed(format!(
                 "Bitwarden's command-line tool could not be started ({e}). Nothing was sent."
             ))
@@ -1225,6 +1321,143 @@ mod runner_tests {
     }
 
     #[test]
+    fn the_job_the_runner_was_given_is_the_job_the_child_is_spawned_into() {
+        // THE CRITICAL FINDING, held behaviourally rather than by a pin.
+        //
+        // Job membership is a property of a real process and no test in this
+        // crate may start one, so the guarantee was a source pin over the
+        // `spawn_in_job` call. That pin was defeated by starving its
+        // argument: `Self { job: job.filter(|_| false), data_dir }` left the
+        // pinned line untouched, every test green and no warning emitted --
+        // and a `bw` child holding an unlocked vault was spawned outside the
+        // kill-on-close job, free to outlive a panic, a `process::exit` or a
+        // Task Manager kill of this process.
+        //
+        // What is asserted is the VALUE, by pointer identity: the job at the
+        // one accessor the spawn reads from is the job the constructor was
+        // handed. A starved constructor cannot satisfy this, and neither can
+        // one that substitutes a job of its own. It is the same shape as
+        // `the_profile_directory_the_runner_was_given_reaches_the_child`,
+        // which is what already defeats this trick for `data_dir`.
+        //
+        // `KillOnCloseJob::new` creates a kernel handle. Nothing is spawned,
+        // no file is touched, no socket is opened, and the handle is dropped
+        // with nothing assigned to it.
+        let job = crate::job_object::KillOnCloseJob::new()
+            .expect("a job object is a handle, not a process");
+
+        let runner = CliSendRunner::new(Some(&job), None);
+        let reaching = runner.job().expect(
+            "the runner threw the job away between its constructor and the spawn, so a `bw` \
+             child holding an unlocked vault would not die with this process",
+        );
+        assert!(
+            std::ptr::eq(&job, reaching),
+            "the job the spawn reads is not the job the runner was constructed with"
+        );
+
+        // Control, and the reason this is not a type that cannot be empty:
+        // `KillOnCloseJob::new` can genuinely fail, and the window that lists
+        // Sends holds no job at all, so `None` has to stay expressible.
+        assert!(
+            CliSendRunner::new(None, None).job().is_none(),
+            "control: `no job at all` is still representable, so the assertion above is about \
+             a job that was really there"
+        );
+    }
+
+    #[test]
+    fn debug_printing_an_invocation_shows_neither_the_body_nor_the_session() {
+        // A `log::debug!("{inv:?}")` at any future call site is one line
+        // away, and the derived `Debug` this replaced printed
+        // `session_token: Some(Zeroizing("..."))` verbatim plus a base64 body
+        // that decodes to the Send's text and its share password.
+        let inv = create_invocation();
+        let printed = format!("{inv:?}");
+
+        assert!(
+            printed.contains("send") && printed.contains("create"),
+            "control: the arguments still print, so this Debug is not empty: {printed}"
+        );
+        assert!(
+            !printed.contains(SESSION),
+            "the session token -- the key to the whole vault -- is in the debug output: \
+             {printed}"
+        );
+        let body = inv.stdin_json_b64();
+        assert!(body.len() > 32, "control: there is a body to leak");
+        assert!(
+            !printed.contains(&body[..32]),
+            "the encoded request body is in the debug output; it decodes to the secret being \
+             published and to the share password: {printed}"
+        );
+
+        // The plan the invocation was built from, same rule.
+        let printed_plan = format!("{:?}", a_plan());
+        assert!(
+            printed_plan.contains("Wi-Fi password"),
+            "control: the plan's Debug still identifies the plan: {printed_plan}"
+        );
+        assert!(
+            !printed_plan.contains(SECRET) && !printed_plan.contains(SHARE_PASSWORD),
+            "the plan's debug output carries the secret body or the share password: \
+             {printed_plan}"
+        );
+
+        // And the control that says WHY the wrappers are not what protects
+        // these: `Zeroizing`'s own `Debug` forwards straight to the inner
+        // value, so it buys nothing at all against a format string.
+        assert!(
+            format!("{:?}", Zeroizing::new(SESSION.to_string())).contains(SESSION),
+            "control: if `Zeroizing` had started redacting on its own, the assertions above \
+             would pass without either hand-written `Debug` doing anything"
+        );
+    }
+
+    #[test]
+    fn the_timeout_message_is_true_of_a_revoke_and_of_a_list_as_well() {
+        // `TimedOut` is answered by `CliSendRunner::run` whatever the
+        // invocation was, so it reaches the user from all three operations.
+        // Its sentence used to say a Send "may have been created anyway",
+        // which is false on a timed-out revoke -- where the worry is the
+        // opposite one, and was never said.
+        struct TimingOut;
+        impl SendRunner for TimingOut {
+            fn run(&self, _inv: &SendInvocation) -> Result<RawOutput, SendError> {
+                Err(SendError::TimedOut)
+            }
+        }
+
+        assert_eq!(
+            delete_send(&TimingOut, "the-id"),
+            Err(SendError::TimedOut),
+            "a revoke that timed out must reach the user as the ambiguous failure"
+        );
+        assert_eq!(list_sends(&TimingOut), Err(SendError::TimedOut));
+        assert_eq!(
+            create_send(&TimingOut, &a_plan(), SESSION, &NOW),
+            Err(SendError::TimedOut)
+        );
+
+        let message = SendError::TimedOut.user_message().to_ascii_lowercase();
+        assert!(
+            !message.contains("created"),
+            "the timeout sentence claims something was created; it is shown for a revoke and \
+             for a list too, where that is simply false: {message:?}"
+        );
+        assert!(
+            message.contains("revoke"),
+            "the true worry on a timed-out revoke -- that the public link may still be live \
+             -- is still not said: {message:?}"
+        );
+        assert!(
+            message.contains("check your sends list"),
+            "an ambiguous failure must send the user to the list rather than offer a plain \
+             try again: {message:?}"
+        );
+    }
+
+    #[test]
     fn the_wait_loop_gives_up_only_once_the_cap_has_passed() {
         let cap = Duration::from_secs(60);
         assert_eq!(
@@ -1327,9 +1560,51 @@ mod runner_tests {
     /// out of the child and dropped before anything is read (leaving it in
     /// place deadlocks until the cap, which no test can see), and the
     /// give-up branch returning the ambiguous failure.
+    /// This file's own text, **above the first test module only**, so a
+    /// needle spelled out in a test cannot satisfy the pin looking for it.
+    ///
+    /// `vault_export.rs` and `file_picker.rs` split this way already; this
+    /// file did not, and no needle happened to be duplicated below the cut
+    /// today -- which is a fact about today rather than a property. The cut
+    /// marker is `#[cfg(test)]` followed by `mod `, because the bare
+    /// attribute also sits above `ARGV_PIN_CONTROL` near the top of the file
+    /// and splitting there would leave the pins searching sixty lines.
+    fn code_under_test() -> String {
+        // Normalised to LF once, so a needle written with `\n` matches this
+        // file whether it is stored CRLF or LF.
+        let whole = include_str!("send.rs").replace("\r\n", "\n");
+        let code = whole
+            .split(concat!("#[cfg(test)]", "\nmod "))
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            code.len() < whole.len(),
+            "the test module marker was not found; the split did nothing"
+        );
+        code
+    }
+
+    #[test]
+    fn the_source_pin_search_can_tell_present_from_absent() {
+        // The positive control every pin below depends on. Without it, a
+        // `code_under_test` that answered an empty string would make each
+        // `!contains` pin pass while asserting nothing whatsoever.
+        let code = code_under_test();
+        assert!(code.contains("pub struct CliSendRunner<'a> {"));
+        assert!(!code.contains("no such line appears anywhere in this module"));
+        // And the split really did drop the tests: this function's own name
+        // is below the cut.
+        assert!(
+            !code.contains("the_source_pin_search_can_tell_present_from_absent"),
+            "the cut did not drop the test modules, so a needle spelled in a test would \
+             satisfy the pin looking for it"
+        );
+    }
+
     #[test]
     fn the_spawn_time_properties_no_test_can_observe_are_pinned_to_the_source() {
-        let source = include_str!("send.rs");
+        let source = code_under_test();
         for (required, why) in [
             (
                 concat!("bw_path::bw_command_in(", "self.data_dir)"),
@@ -1337,9 +1612,12 @@ mod runner_tests {
                  whose signature startup verified",
             ),
             (
-                concat!("job_object::spawn_in_job(", "self.job, command)"),
+                concat!("job_object::spawn_in_job(", "self.job(), command)"),
                 "the child no longer joins the kill-on-close job: an orphaned CLI holding the \
-                 session after deskwarden dies is the same hazard `bw serve` is in the job for",
+                 session after deskwarden dies is the same hazard `bw serve` is in the job for. \
+                 This pin holds the CALL; the VALUE it is handed is held by \
+                 `the_job_the_runner_was_given_is_the_job_the_child_is_spawned_into`, because \
+                 a pin over a call is satisfied by starving its argument",
             ),
             (
                 concat!("child.stdin.", "take()"),
@@ -1357,7 +1635,14 @@ mod runner_tests {
                  that may exist would render as a clean failure",
             ),
         ] {
-            assert!(source.contains(required), "`{required}` is gone: {why}");
+            // Counted, not merely required: a presence-only needle is
+            // satisfied by construction by a second, overriding line added
+            // beside the pinned one.
+            assert_eq!(
+                source.matches(required).count(),
+                1,
+                "`{required}` no longer appears exactly once: {why}"
+            );
         }
 
         // `CREATE_NO_WINDOW` is the third, and it is not in this file at all.

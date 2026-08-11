@@ -107,15 +107,58 @@ pub struct ExportRequest {
 }
 
 /// The decided shape of one export. Nothing here has touched the disk.
+///
+/// **The fields are private and [`plan_export`] is the only way to make one.**
+/// That is not tidiness. `run_export` promotes `partial_path` over
+/// `final_path` on success and *deletes* `partial_path` on every other
+/// outcome, so a call site able to write its own struct could hand over
+/// `ExportPlan { final_path: x, partial_path: x }` -- and one failed export
+/// would then delete the user's previous backup outright, with every test in
+/// this module still green. `send::SendInvocation` is closed the same way and
+/// for the same reason; this type was the one that was still open, and the
+/// call site that would have done it (the export command's wiring) is not
+/// written yet, which is exactly why closing it costs nothing today.
+///
+/// The suffix invariant is **enforced rather than assumed**: no constructor
+/// accepts a staging path, so `partial_path` can only ever be `final_path`
+/// with [`PARTIAL_SUFFIX`] appended.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExportPlan {
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    format: &'static str,
+}
+
+impl ExportPlan {
+    /// The one constructor. Private, and it **derives** the staging path
+    /// instead of taking one, so the two paths cannot be made equal.
+    fn staged(final_path: PathBuf) -> Self {
+        let mut partial = final_path.clone().into_os_string();
+        partial.push(PARTIAL_SUFFIX);
+        Self {
+            final_path,
+            partial_path: PathBuf::from(partial),
+            format: EXPORT_FORMAT,
+        }
+    }
+
     /// Where the finished archive belongs, if it turns out to be finished.
-    pub final_path: PathBuf,
-    /// Where the CLI is actually pointed: `final_path` + [`PARTIAL_SUFFIX`].
-    pub partial_path: PathBuf,
-    /// Always [`EXPORT_FORMAT`]. A field rather than a constant at the call
-    /// site so the argv builder cannot drift from what was planned.
-    pub format: &'static str,
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    /// Where the CLI is actually pointed: [`Self::final_path`] +
+    /// [`PARTIAL_SUFFIX`]. Never equal to it.
+    pub fn partial_path(&self) -> &Path {
+        &self.partial_path
+    }
+
+    /// Always [`EXPORT_FORMAT`]. Read off the plan rather than off the
+    /// constant at the call site so the argv builder cannot drift from what
+    /// was planned.
+    pub fn format(&self) -> &'static str {
+        self.format
+    }
 }
 
 /// Why a destination was refused before anything ran.
@@ -168,14 +211,7 @@ pub fn plan_export(req: &ExportRequest, config_dir: &Path) -> Result<ExportPlan,
         return Err(ExportRefusal::IntoConfigDir);
     }
 
-    let mut partial = req.destination.clone().into_os_string();
-    partial.push(PARTIAL_SUFFIX);
-
-    Ok(ExportPlan {
-        final_path: req.destination.clone(),
-        partial_path: PathBuf::from(partial),
-        format: EXPORT_FORMAT,
-    })
+    Ok(ExportPlan::staged(req.destination.clone()))
 }
 
 /// `true` if `candidate` is `root` or sits underneath it.
@@ -209,9 +245,9 @@ pub fn export_args(plan: &ExportPlan) -> Vec<String> {
     vec![
         "export".to_string(),
         "--format".to_string(),
-        plan.format.to_string(),
+        plan.format().to_string(),
         "--output".to_string(),
-        plan.partial_path.to_string_lossy().into_owned(),
+        plan.partial_path().to_string_lossy().into_owned(),
     ]
 }
 
@@ -335,15 +371,57 @@ pub type ExportRunner = std::sync::Arc<dyn Fn(&ExportPlan, &str) -> RawExport + 
 /// the thread that starts `bw serve`, and it must outlive every child it
 /// owns. `Arc<Option<..>>` rather than `Option<Arc<..>>` so the "no job at
 /// all" case is the one `main.rs` already holds and not a second shape
-/// invented here.
+/// invented here -- **and so that the absence is expressed once, at the top,
+/// where job creation genuinely can fail, rather than silently at the spawn.**
 ///
 /// Membership of the job is not a nicety. The child is a process holding an
 /// unlocked vault, and kill-on-close is what guarantees it dies with this
 /// process however this process dies -- a panic, a `process::exit` that skips
 /// every destructor, or a Task Manager kill. Without it a crash mid-export
 /// leaves a `bw` running with the session token in its environment.
+///
+/// **This is a named struct and not a bare closure, and that is the fix for a
+/// review finding rather than a preference.** The guarantee above used to be
+/// held by a source pin over the `spawn_in_job` call alone. A pin over a call
+/// says nothing about the value flowing into it: replacing the body with
+/// `run_cli(plan, session, job.as_ref().as_ref().filter(|_| false))` left the
+/// pinned line word-perfect, every test in the crate green and no warning
+/// emitted -- and every export child spawned outside the job. The job is now
+/// a value on a type, [`CliExportRunner::job`] is the single place the spawn
+/// reads it from, and
+/// [`the_runner_spawns_into_the_very_job_it_was_constructed_with`] asserts
+/// that the job reaching that point is the one the constructor was handed.
+pub struct CliExportRunner {
+    job: Arc<Option<KillOnCloseJob>>,
+}
+
+impl CliExportRunner {
+    pub fn new(job: Arc<Option<KillOnCloseJob>>) -> Self {
+        Self { job }
+    }
+
+    /// The job the child will be assigned to, or `None` when this process
+    /// never managed to create one.
+    ///
+    /// **The only place [`Self::run`] reads the job from**, which is what
+    /// makes a test of this accessor a test of what the spawn actually gets.
+    pub fn job(&self) -> Option<&KillOnCloseJob> {
+        self.job.as_ref().as_ref()
+    }
+
+    fn run(&self, plan: &ExportPlan, session: &str) -> RawExport {
+        run_cli(plan, session, self.job())
+    }
+
+    /// Boxes this runner into the seam [`run_export`] takes.
+    pub fn into_runner(self) -> ExportRunner {
+        Arc::new(move |plan, session| self.run(plan, session))
+    }
+}
+
+/// The production [`ExportRunner`], for the one call site that wires it up.
 pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
-    Arc::new(move |plan, session| run_cli(plan, session, job.as_ref().as_ref()))
+    CliExportRunner::new(job).into_runner()
 }
 
 /// One spawn, start to finish, with nothing judged and nothing renamed.
@@ -427,7 +505,7 @@ fn nothing_ran(why: String) -> RawExport {
 /// and collapsing them here would make that arm unreachable and let a failed
 /// check render as a success one layer above.
 pub fn observe_partial(plan: &ExportPlan) -> (Result<u64, String>, Vec<u8>) {
-    let path = plan.partial_path.as_path();
+    let path = plan.partial_path();
     let written = std::fs::metadata(path)
         .map(|m| m.len())
         .map_err(|e| format!("could not check {}: {e}", path.display()));
@@ -469,8 +547,11 @@ fn read_head(path: &Path) -> Vec<u8> {
 ///    An app killed mid-export leaves one behind; it is encrypted, so this is
 ///    litter rather than exposure, but it is litter in a folder the user
 ///    chose. Same shape as [`crate::updater::cleanup_stale_downloads`].
+/// 1b. **Delete this export's own staging file**, unconditionally, whatever
+///    its age. The sweep above only takes partials older than
+///    [`STALE_PARTIAL_AGE`], so it cannot be relied on for this one.
 /// 2. **Run**, through the injected runner, which is pointed at
-///    `plan.partial_path` and never at `plan.final_path`.
+///    `plan.partial_path()` and never at `plan.final_path()`.
 /// 3. **Judge**, with [`classify`] and nothing else.
 /// 4. **Promote only on [`ExportOutcome::Written`]**, by renaming the partial
 ///    over the final path. Every other verdict deletes the partial instead.
@@ -488,12 +569,24 @@ fn read_head(path: &Path) -> Vec<u8> {
 /// for and cannot identify, and the export it holds was never promoted, so
 /// nothing is lost by removing it.
 pub fn run_export(plan: &ExportPlan, session: &str, runner: &ExportRunner) -> ExportOutcome {
-    if let Some(dir) = plan.partial_path.parent() {
+    if let Some(dir) = plan.partial_path().parent() {
         let swept = sweep_stale_partials(dir, SystemTime::now(), STALE_PARTIAL_AGE);
         if swept > 0 {
             log::info!("removed {swept} stale export partial(s) from {}", dir.display());
         }
     }
+
+    // The staging file this run is about to use is removed BEFORE the runner
+    // is invoked, and the sweep above is emphatically not enough on its own:
+    // it only takes partials that have sat for `STALE_PARTIAL_AGE`, so a
+    // leftover from a crash five minutes ago survives it. If the CLI then
+    // exits 0 having written nothing -- which is exactly the case
+    // `ExportOutcome::Unconfirmed` exists for -- `observe_partial` would stat
+    // and sample THAT file, `classify` would find a valid envelope head, and
+    // step 4 would rename an earlier run's half-finished archive over the
+    // backup the user already had. After this line the only bytes at
+    // `partial_path` are bytes this run's runner put there.
+    discard_partial(plan);
 
     let raw = runner(plan, session);
     let outcome = classify(&raw);
@@ -503,12 +596,12 @@ pub fn run_export(plan: &ExportPlan, session: &str, runner: &ExportRunner) -> Ex
         return outcome;
     }
 
-    match std::fs::rename(&plan.partial_path, &plan.final_path) {
+    match std::fs::rename(plan.partial_path(), plan.final_path()) {
         Ok(()) => ExportOutcome::Written,
         Err(e) => {
             let why = format!(
                 "The export was written but could not be renamed to {} ({e}).",
-                plan.final_path.display()
+                plan.final_path().display()
             );
             discard_partial(plan);
             ExportOutcome::Failed(why)
@@ -522,12 +615,12 @@ pub fn run_export(plan: &ExportPlan, session: &str, runner: &ExportRunner) -> Ex
 /// and the user is about to be told so, and "and also a temporary file could
 /// not be removed" is not information they can act on.
 fn discard_partial(plan: &ExportPlan) {
-    match std::fs::remove_file(&plan.partial_path) {
+    match std::fs::remove_file(plan.partial_path()) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::warn!(
             "could not delete the staged export {}: {e}",
-            plan.partial_path.display()
+            plan.partial_path().display()
         ),
     }
 }
@@ -638,19 +731,64 @@ mod tests {
     }
 
     #[test]
+    fn the_staging_file_is_never_the_users_own_file_for_any_destination() {
+        // REVIEW FINDING. `ExportPlan` used to have three `pub` fields and
+        // `run_export` takes one directly, so a call site could have written
+        // `ExportPlan { final_path: x, partial_path: x, .. }` -- and then a
+        // failed export would delete the user's previous backup outright,
+        // because `discard_partial` removes `partial_path` and nothing
+        // checked the two were different. The fields are private now and
+        // `staged` DERIVES the second from the first, so the equal-paths plan
+        // is unbuildable rather than merely untested; this holds the
+        // invariant that makes the constructor's derivation correct.
+        let names = [
+            "vault.json",
+            "vault.json.dw-partial",
+            "no-extension",
+            "two.dots.json",
+            "\u{4e2d}\u{6587}.json",
+            "a name with spaces.json",
+        ];
+        let mut ran = 0usize;
+        for name in names {
+            let plan = plan_for(&format!("C:\\Users\\nobody\\Backups\\{name}"))
+                .expect("a plain path plans");
+            assert_ne!(
+                plan.partial_path(),
+                plan.final_path(),
+                "{name}: the staging file IS the user's own file, so a failed export would \
+                 delete the backup it was meant to replace"
+            );
+            assert_eq!(
+                plan.partial_path().to_string_lossy(),
+                format!("{}{PARTIAL_SUFFIX}", plan.final_path().to_string_lossy()),
+                "{name}: the staging path is not the destination plus the suffix"
+            );
+            assert_eq!(
+                plan.partial_path().parent(),
+                plan.final_path().parent(),
+                "{name}: the promotion must be a rename within one directory, not a copy \
+                 across volumes"
+            );
+            ran += 1;
+        }
+        assert_eq!(ran, names.len(), "control: every name was planned");
+    }
+
+    #[test]
     fn a_full_file_path_plans_a_partial_beside_it() {
         let plan = plan_for("C:\\Users\\nobody\\Backups\\vault.json").expect("a plain path plans");
         assert_eq!(
-            plan.final_path,
+            plan.final_path(),
             PathBuf::from("C:\\Users\\nobody\\Backups\\vault.json")
         );
         assert_eq!(
-            plan.partial_path,
+            plan.partial_path(),
             PathBuf::from("C:\\Users\\nobody\\Backups\\vault.json.dw-partial"),
             "the partial is the final path with the suffix appended -- same directory, so the \
              promotion is a rename within one volume and not a copy"
         );
-        assert_eq!(plan.format, "encrypted_json");
+        assert_eq!(plan.format(), "encrypted_json");
     }
 
     #[test]
@@ -967,7 +1105,7 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|w| w[0] == "--output" && Path::new(&w[1]) == plan.partial_path),
+                .any(|w| w[0] == "--output" && Path::new(&w[1]) == plan.partial_path()),
             "the built command must be pointed at the PLAN's partial path, not at the final \
              path and not at a path it invented: {args:?}"
         );
@@ -1009,7 +1147,7 @@ mod tests {
     /// observes it exactly as `run_cli` does. It starts no process.
     fn writing_runner(body: &'static [u8], exit_ok: bool, stderr: &'static str) -> ExportRunner {
         Arc::new(move |plan: &ExportPlan, _session: &str| {
-            std::fs::write(&plan.partial_path, body).expect("the fake runner stages its own file");
+            std::fs::write(plan.partial_path(), body).expect("the fake runner stages its own file");
             let (written, head) = observe_partial(plan);
             RawExport {
                 exit_ok,
@@ -1047,12 +1185,12 @@ mod tests {
 
         assert_eq!(outcome, ExportOutcome::Written);
         assert_eq!(
-            std::fs::read(&plan.final_path).expect("the archive is under the chosen name"),
+            std::fs::read(plan.final_path()).expect("the archive is under the chosen name"),
             envelope_body(),
             "the promotion must move the staged bytes, not write something of its own"
         );
         assert!(
-            !plan.partial_path.exists(),
+            !plan.partial_path().exists(),
             "the staging file must not survive a successful export"
         );
     }
@@ -1097,17 +1235,17 @@ mod tests {
         for (why, runner, expected) in &rows {
             let temp = TempDir::new("failpath");
             let plan = plan_in(temp.path(), "vault.json");
-            std::fs::write(&plan.final_path, PREVIOUS).expect("the previous backup is placed");
+            std::fs::write(plan.final_path(), PREVIOUS).expect("the previous backup is placed");
 
             assert_eq!(run_export(&plan, "session", runner), *expected, "row: {why}");
 
             // Absence, asserted rather than assumed.
             assert!(
-                !plan.partial_path.exists(),
+                !plan.partial_path().exists(),
                 "row: {why} -- the staging file was left in the user's chosen folder"
             );
             assert_eq!(
-                std::fs::read(&plan.final_path).expect("the previous backup is still there"),
+                std::fs::read(plan.final_path()).expect("the previous backup is still there"),
                 PREVIOUS,
                 "row: {why} -- A FAILED EXPORT OVERWROTE THE USER'S PREVIOUS BACKUP"
             );
@@ -1124,16 +1262,16 @@ mod tests {
         // would otherwise be pointing at a file that does exist.
         let temp = TempDir::new("nothingbefore");
         let plan = plan_in(temp.path(), "vault.json");
-        assert!(!plan.final_path.exists(), "precondition");
+        assert!(!plan.final_path().exists(), "precondition");
 
         let outcome = run_export(&plan, "session", &writing_runner(b"truncated", true, ""));
 
         assert_eq!(outcome, ExportOutcome::Unconfirmed);
         assert!(
-            !plan.final_path.exists(),
+            !plan.final_path().exists(),
             "the chosen name must not exist after an export that was never confirmed"
         );
-        assert!(!plan.partial_path.exists());
+        assert!(!plan.partial_path().exists());
     }
 
     #[test]
@@ -1142,7 +1280,7 @@ mod tests {
         // succeed, and the interesting part is what is left behind.
         let temp = TempDir::new("renamefail");
         let plan = plan_in(temp.path(), "occupied.json");
-        std::fs::create_dir(&plan.final_path).expect("a directory takes the chosen name");
+        std::fs::create_dir(plan.final_path()).expect("a directory takes the chosen name");
 
         let outcome = run_export(&plan, "session", &writing_runner(envelope_body(), true, ""));
 
@@ -1151,11 +1289,11 @@ mod tests {
             "a promotion that did not happen must not be reported as Written: {outcome:?}"
         );
         assert!(
-            !plan.partial_path.exists(),
+            !plan.partial_path().exists(),
             "the staging file must not be left beside the user's backups"
         );
         assert!(
-            plan.final_path.is_dir(),
+            plan.final_path().is_dir(),
             "and whatever was already at the chosen name is untouched"
         );
     }
@@ -1168,8 +1306,8 @@ mod tests {
         // nothing -- and `classify` would then confirm it.
         let temp = TempDir::new("whichfile");
         let plan = plan_in(temp.path(), "vault.json");
-        std::fs::write(&plan.final_path, envelope_body()).expect("the previous backup");
-        std::fs::write(&plan.partial_path, b"xy").expect("the staged file");
+        std::fs::write(plan.final_path(), envelope_body()).expect("the previous backup");
+        std::fs::write(plan.partial_path(), b"xy").expect("the staged file");
 
         let (written, head) = observe_partial(&plan);
         assert_eq!(written, Ok(2), "the size is the staged file's");
@@ -1177,7 +1315,7 @@ mod tests {
 
         // And with no staged file, the size check FAILS rather than reading
         // the one that is there.
-        std::fs::remove_file(&plan.partial_path).expect("remove the staged file");
+        std::fs::remove_file(plan.partial_path()).expect("remove the staged file");
         let (written, head) = observe_partial(&plan);
         assert!(
             written.is_err(),
@@ -1191,12 +1329,12 @@ mod tests {
         let temp = TempDir::new("headlen");
         let plan = plan_in(temp.path(), "vault.json");
         let big = vec![b'z'; HEAD_BYTES * 3];
-        std::fs::write(&plan.partial_path, &big).expect("write");
+        std::fs::write(plan.partial_path(), &big).expect("write");
         let (written, head) = observe_partial(&plan);
         assert_eq!(written, Ok(big.len() as u64));
         assert_eq!(head.len(), HEAD_BYTES);
 
-        std::fs::write(&plan.partial_path, b"abc").expect("write");
+        std::fs::write(plan.partial_path(), b"abc").expect("write");
         let (_, head) = observe_partial(&plan);
         assert_eq!(head, b"abc".to_vec(), "a short file is not padded out");
     }
@@ -1280,6 +1418,113 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_leftover_partial_is_not_promoted_by_an_export_that_wrote_nothing() {
+        // REVIEW FINDING, in the shape the reviewer demonstrated it: a
+        // `.dw-partial` left by a crash MINUTES ago is younger than
+        // `STALE_PARTIAL_AGE`, so the sweep leaves it. It holds a valid
+        // envelope head. The CLI then exits 0 without writing anything.
+        // Before the unconditional delete, `observe_partial` stat'd and
+        // sampled the leftover, `classify` answered `Written`, and the
+        // promotion renamed a STRANGER'S half-finished archive over the
+        // backup the user already had -- reported as a success.
+        const PREVIOUS: &[u8] = b"the user's previous, perfectly good backup";
+        let temp = TempDir::new("freshleftover");
+        let plan = plan_in(temp.path(), "vault.json");
+        std::fs::write(plan.final_path(), PREVIOUS).expect("the previous backup is placed");
+        std::fs::write(plan.partial_path(), envelope_body()).expect("the crash leftover");
+        // Young enough that the sweep must not take it, and the sweep is not
+        // what this test is about.
+        backdate(plan.partial_path(), Duration::from_secs(60));
+
+        let outcome = run_export(&plan, "session", &barren_runner(true, ""));
+
+        assert_eq!(
+            outcome,
+            ExportOutcome::Unconfirmed,
+            "an export that wrote nothing was confirmed off an earlier run's leftover file"
+        );
+        assert_eq!(
+            std::fs::read(plan.final_path()).expect("the previous backup is still there"),
+            PREVIOUS,
+            "A LEFTOVER PARTIAL WAS PROMOTED OVER THE USER'S BACKUP by an export that wrote \
+             nothing at all"
+        );
+        assert!(
+            !plan.partial_path().exists(),
+            "the leftover survived the run as well as being read from it"
+        );
+    }
+
+    #[test]
+    fn a_fresh_leftover_partial_does_not_survive_into_a_real_export() {
+        // The other direction, so the delete above cannot be satisfied by a
+        // `run_export` that refuses everything: with a runner that really
+        // writes, the export still succeeds and the bytes under the chosen
+        // name are THIS run's, not the leftover's.
+        const LEFTOVER: &[u8] =
+            br#"{"encrypted":true,"encKeyValidation_DO_NOT_EDIT":"2.stale","items":[1]}"#;
+        let temp = TempDir::new("leftoverthenreal");
+        let plan = plan_in(temp.path(), "vault.json");
+        std::fs::write(plan.partial_path(), LEFTOVER).expect("the crash leftover");
+        backdate(plan.partial_path(), Duration::from_secs(60));
+
+        assert_eq!(
+            run_export(&plan, "session", &writing_runner(envelope_body(), true, "")),
+            ExportOutcome::Written
+        );
+        assert_eq!(
+            std::fs::read(plan.final_path()).expect("the archive is under the chosen name"),
+            envelope_body(),
+            "the promoted bytes are the leftover's, not this run's"
+        );
+    }
+
+    #[test]
+    fn the_runner_spawns_into_the_very_job_it_was_constructed_with() {
+        // THE CRITICAL FINDING, held behaviourally rather than by a pin.
+        //
+        // Job membership itself cannot be observed without a real process,
+        // and no test here may start one -- so the old guarantee was a source
+        // pin over the `spawn_in_job` call. That pin was defeated by starving
+        // its argument: `job.as_ref().as_ref().filter(|_| false)` in the
+        // constructor left the pinned line untouched, the whole suite green
+        // and no warning emitted, while every `bw` child -- a process holding
+        // an unlocked vault -- was spawned outside the kill-on-close job and
+        // could outlive a panic, a `process::exit` or a Task Manager kill.
+        //
+        // What is asserted is the VALUE: the job reaching the single accessor
+        // the spawn reads from is, by pointer identity, the one the
+        // constructor was handed. A starved constructor cannot satisfy it,
+        // and neither can one that quietly substitutes a job of its own.
+        //
+        // `KillOnCloseJob::new` creates a kernel handle. It starts no
+        // process, touches no file, opens no socket, and the handle is
+        // dropped with nothing assigned to it.
+        let job = KillOnCloseJob::new().expect("a job object is a handle, not a process");
+        let held = Arc::new(Some(job));
+        let given: &KillOnCloseJob = held.as_ref().as_ref().expect("the fixture holds one");
+
+        let runner = CliExportRunner::new(Arc::clone(&held));
+        let reaching = runner.job().expect(
+            "the runner threw the job away between its constructor and the spawn, so an \
+             export child holding an unlocked vault would not die with this process",
+        );
+        assert!(
+            std::ptr::eq(given, reaching),
+            "the job the spawn reads is not the job the runner was constructed with"
+        );
+
+        // And the absence is still expressible -- once, at the top, because
+        // `KillOnCloseJob::new` can genuinely fail and `main.rs` holds the
+        // `Arc<Option<..>>` that says so.
+        assert!(
+            CliExportRunner::new(Arc::new(None)).job().is_none(),
+            "control: `no job at all` is still representable, so the assertion above is about \
+             a job that was really there rather than about a type that cannot be empty"
+        );
+    }
+
+    #[test]
     fn run_export_really_sweeps_on_the_way_in() {
         // An absence with a witness. Nothing in the outcome of an export says
         // whether the sweep ran, so a leftover from an earlier crash is put
@@ -1299,7 +1544,7 @@ mod tests {
             !leftover.exists(),
             "run_export never swept the destination directory"
         );
-        assert!(plan.final_path.exists(), "control: the export itself still worked");
+        assert!(plan.final_path().exists(), "control: the export itself still worked");
     }
 
     // -----------------------------------------------------------------
@@ -1347,10 +1592,22 @@ mod tests {
         // makes it die with this process however this process dies, and it
         // is a property of a real process: a fake runner has none.
         let code = code_under_test();
-        assert!(
-            code.contains("crate::job_object::spawn_in_job(job, command)"),
-            "the export child is no longer spawned into the job, so a crash or a Task Manager \
-             kill would leave a `bw` running with the session token in its environment"
+        assert_eq!(
+            code.matches("crate::job_object::spawn_in_job(job, command)").count(),
+            1,
+            "the export child is no longer spawned into the job exactly once, so a crash or a \
+             Task Manager kill could leave a `bw` running with the session token in its \
+             environment. Counted rather than merely required, because a second spawn added \
+             beside the pinned one satisfies a presence-only needle by construction"
+        );
+        assert_eq!(
+            code.matches("run_cli(plan, session, self.job())").count(),
+            1,
+            "the runner no longer passes its OWN job to the spawn. This is the pin that the \
+             finding was about: pinning the `spawn_in_job` line above says nothing about the \
+             value flowing into it, and the behavioural assertion in \
+             `the_runner_spawns_into_the_very_job_it_was_constructed_with` is what holds the \
+             value. This says which line carries it"
         );
         assert!(
             !code.contains(".spawn()"),
