@@ -650,8 +650,6 @@ mod tests {
     ///   bw_path.rs  -- defines the door, and `bw_job_command_in` is the one
     ///                  production place that walks through it in order to hand
     ///                  the command straight to `JobCommand::wrap`.
-    ///   bw_serve.rs -- `bw serve` is the long-lived backend; it is owned and
-    ///                  killed by the backend policy, not by the job.
     ///   login_ui.rs -- sign-in, unlock and status run before there is a vault
     ///                  window, and so before there is a job.
     ///   main.rs     -- re-wraps into a `JobCommand` at the one call site that
@@ -665,7 +663,16 @@ mod tests {
     /// `BW_PATH_MAY_REACH` are all stale-checked. A copy that is one entry
     /// behind is a door RULE 8 has stopped refusing, and nothing would say so.
     /// There is now one list and [`door_modules`] derives the other view of it.
-    const DOOR_FILES: &[&str] = &["bw_path.rs", "bw_serve.rs", "login_ui.rs", "main.rs"];
+    ///
+    /// **`bw_serve.rs` came OFF this list**, and that direction is the only
+    /// one that is ever free. It held the exemption for `run_bw_sync`, which
+    /// opened a `BareCommand` to run `bw sync` jobless -- a child carrying
+    /// `BW_SESSION`, the token that unlocks the vault, in an environment block
+    /// any same-user process can read with `PROCESS_VM_READ`, and orphan-able
+    /// past this process's death. It now goes through `spawn_in_job` into
+    /// `bw_serve::sync_job`, so it needs no door, and the door is closed
+    /// rather than left standing for whoever edits that file next.
+    const DOOR_FILES: &[&str] = &["bw_path.rs", "login_ui.rs", "main.rs"];
 
     /// [`DOOR_FILES`] as module names -- what RULE 8 refuses to end a hop in.
     fn door_modules() -> Vec<String> {
@@ -783,39 +790,88 @@ mod tests {
              this block too; if it moved, follow it -- do not leave the walk silently reading \
              nothing, which is exactly how it went unread for thirteen rounds"
         );
-        files.push(build_rs.clone());
 
-        // AND HELD TIGHTER THAN THE WALK ALONE HOLDS IT.
+        // AND HELD BY A WHOLE-FILE PIN.
         //
-        // Measured, and SURVIVING the walk above at 2105 lib / 217 bin / 1
-        // ignored / 0 failed / 0 warnings:
+        // THE FIFTEENTH HOP, and it was won by a RENAME. `build.rs` used to
+        // carry a ban on four tokens read out of its own text. Measured
+        // against it, at 2108 lib / 217 bin / 1 ignored / 0 failed / 0
+        // warnings:
         //
-        //     let mut c = <std's process builder>::new(<the CLI>);
-        //     let f = <that same type>::spawn;   // the fn ITEM, by path
-        //     let _ = f(&mut c);
+        //     // build.rs, above `fn main`
+        //     mod icon_aid;
+        //     // first line of `fn main`
+        //         icon_aid::embed_hint();
         //
-        // (Spelled around rather than verbatim: `bw_path.rs` runs its own
-        // crate-wide scan for a `bw` started outside it, and a comment
-        // carrying the real literals trips that instead of this.)
+        //     // deskwarden/icon_aid.rs -- a NEW file, BESIDE build.rs
+        //     pub fn embed_hint() { .. <the CLI, started> .. }
         //
-        // `direct_child_starts` matches a RECEIVER followed by `.spawn(`,
-        // `.output(` or `.status(`; a function ITEM taken by path and called
-        // through a binding writes none of the three. Every file under `src/`
-        // the two runners can reach has a callee allowlist below it, which
-        // sees `spawn` under any spelling -- `build.rs` has none and cannot
-        // usefully be given one, because it is in no runtime call graph and
-        // the entire reason it is in scope is that nothing else reads it.
+        // Liveness proven: a `panic!` as that function's first statement
+        // fails the build with its message, so the child file compiles and
+        // RUNS on every build. And the ban read `build.rs` and nothing else,
+        // while every walk in this module -- including the `mod` closure that
+        // closed the FOURTEENTH hop -- is rooted at `src/`. A `.rs` file
+        // beside `build.rs` was read by NOTHING.
         //
-        // So this one file gets the blunt rule its size affords: 46 lines
-        // that embed an icon resource, and not one of the tokens out of which
-        // a child process is built. Cheaper than a fence, and strictly
-        // stronger for a file this small.
+        // The canary is the part worth keeping: the same mutant with the
+        // module named `spawn_aid` DIED on the token ban. `icon_aid` versus
+        // `spawn_aid` is a pure spelling change with zero semantic content,
+        // and it flipped KILLED to SURVIVED. That is what a denylist is: a
+        // race against spellings, run by whoever writes the next line. The
+        // commit that added the ban said exactly that about FFI in its own
+        // message and then wrote one anyway -- and indeed the NT-level
+        // process creator contains neither of the two process spellings it
+        // banned, while the shell and Win-prefixed executors carry `Exec`,
+        // not `exec`, and `str::contains` is case-sensitive.
         //
-        // Disclosed rather than claimed complete: a build script can still
-        // reach a child through some other crate that spawns on its behalf,
-        // and no token ban sees that. What it does see is every route that
-        // names the primitive itself.
-        let build_code = code_only(&std::fs::read_to_string(&build_rs).unwrap());
+        // SO THE RULE IS A WHOLE-FILE PIN, WHICH HAS NOTHING TO SPELL AROUND.
+        // `build.rs` is 46 lines that embed an icon; it changes about once a
+        // year. Pinning its exact content costs one number per legitimate
+        // edit and refuses every possible edit in between -- `mod`,
+        // `include!`, `#[path]`, an FFI declaration under any name, a call
+        // into a dependency, a spelling nobody has thought of yet. There is
+        // no denylist left to lose a race with, because there is no list.
+        //
+        // Line endings are normalised first: this is a pin on CONTENT, and a
+        // `core.autocrlf` checkout must not fail it.
+        let build_raw = std::fs::read_to_string(&build_rs).unwrap();
+        let build_pinned = build_raw.replace("\r\n", "\n");
+        assert_eq!(
+            (build_pinned.len(), fnv1a64(&build_pinned)),
+            (2318, 0x5948_1c7a_9695_4071_u64),
+            "`build.rs` is not the file this module pinned. It runs at BUILD time, outside \
+             every fence here and outside the job object entirely, and all it is supposed to \
+             do is embed an icon resource. Read the diff: if the change is genuinely an icon \
+             or metadata edit, re-pin the length and hash above and say so in the commit. Do \
+             NOT re-pin it as a reflex -- this assertion is the ONLY thing standing between \
+             this crate and a build script that starts a process, and the token ban it \
+             replaced was defeated by renaming a module from `spawn_aid` to `icon_aid`"
+        );
+
+        // CONTROLS ON THE PIN, so that it cannot be two constants agreeing
+        // with each other. The exact edit the fifteenth hop made must move
+        // the hash, and the file it is reading must be the real one.
+        assert!(
+            build_pinned.contains("fn main() {"),
+            "control: the pin is not reading `build.rs` at all -- it has no `fn main`"
+        );
+        let as_mutated = build_pinned.replace("fn main() {", "mod icon_aid;\nfn main() {");
+        assert_ne!(as_mutated, build_pinned, "control: the mutation anchor is gone");
+        assert_ne!(
+            fnv1a64(&as_mutated),
+            fnv1a64(&build_pinned),
+            "control: adding `mod icon_aid;` to `build.rs` does not move the pinned hash, so \
+             the assertion above would not have caught the fifteenth hop"
+        );
+
+        // SECONDARY, AND KNOWN DEFEATED. Kept only for the moment the pin
+        // above is legitimately re-pinned: at that moment someone is editing
+        // `build.rs` on purpose, and a second, semantic signal is worth
+        // having. It is NOT a guarantee and must never be read as one -- the
+        // mutant that beat it is written out above, and satisfies every token
+        // here while starting a child on every build. If the pin above is
+        // ever weakened, this does not take up the slack.
+        let build_code = code_only(&build_raw);
         for banned in [
             concat!("spa", "wn"),
             concat!("Comm", "and"),
@@ -826,17 +882,109 @@ mod tests {
                 !build_code.contains(banned),
                 "`build.rs` names `{banned}`. It runs at BUILD time, outside every fence in \
                  this module and outside the job object entirely, and all it does is embed an \
-                 icon -- it has no business anywhere near a child process. If it genuinely \
-                 needs one, that is a decision to write down here, not to slip past a walk \
-                 that knows only three spellings"
+                 icon -- it has no business anywhere near a child process"
             );
         }
-        assert!(
-            build_code.len() > 150,
-            "control: `build.rs` stripped to {} chars (it is mostly comment, and 204 when this \r
-             was written) -- the token ban above is reading nothing",
-            build_code.len()
+
+        // AND THE ONE DEPENDENCY THE PINNED `build.rs` CALLS INTO IS PINNED
+        // WITH IT.
+        //
+        // This is the one route past the whole-file pin, and it was found by
+        // attacking it. `build.rs` is frozen, but every line of it is a call
+        // into `winresource`, and `resource.compile()` ALREADY starts a child
+        // (`rc.exe` or `windres`) -- so the build already spawns, on the
+        // build script's behalf, and no rule about `build.rs`'s own text can
+        // see it. Re-point that name at a local path or a fork in
+        // `Cargo.toml` and the pinned `build.rs` runs arbitrary code at build
+        // time without a byte of it changing. Measured as a mutant of this
+        // very design; it is why this block exists.
+        //
+        // So the section is pinned whole, the same way the file above is: no
+        // `path = `, no `git = `, no second entry, no version drift, without
+        // any of those having to be spelled out as a denylist.
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let build_deps = manifest
+            .replace("\r\n", "\n")
+            .split("\n[build-dependencies]\n")
+            .nth(1)
+            .expect(
+                "control: `Cargo.toml` has no `[build-dependencies]` section, so the pin below \
+                 is reading nothing -- if the section was removed, `build.rs` no longer has a \
+                 dependency to be re-pointed and this block can go with it",
+            )
+            .split("\n[")
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            build_deps.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+                .collect::<Vec<_>>(),
+            vec!["winresource = \"0.1\""],
+            "the build-time dependency graph of this crate changed. `build.rs` itself is \
+             byte-pinned above, but it is nothing BUT calls into this crate: a `path = ..` or \
+             `git = ..` source, a fork, or a second build dependency runs arbitrary code at \
+             build time with the pinned `build.rs` untouched. A version bump is a normal thing \
+             to want -- re-pin it here, from a registry version, deliberately"
         );
+
+        // AND THE CRATE ROOT IS WALKED THE WAY `src/` IS.
+        //
+        // The pin above says `build.rs` pulls in no neighbour. This says
+        // there IS no neighbour -- which is the half that survives a
+        // legitimate re-pin, and the half that covers a `.rs` beside
+        // `build.rs` reached by something other than `build.rs` (a
+        // `#[path = "../x.rs"]` written anywhere under `src/`, say).
+        //
+        // A SET EQUALITY, not a scan: the crate root is not a place source
+        // files accumulate, so the honest rule is "these files and no
+        // others", and a new one is a visible edit here rather than a file
+        // that has to be caught doing something. `examples/` is in it because
+        // cargo compiles those targets during `cargo test`; they are pinned
+        // by name AND, below, scanned for direct child starts exactly like
+        // everything under `src/`, which for fifteen rounds they were not.
+        //
+        // `src/` is skipped because the recursion above already walked it,
+        // and `target/` because it is cargo's output rather than this crate's
+        // source -- generated `.rs` from every build script in the dependency
+        // graph lives there. Disclosed rather than claimed complete: a
+        // `#[path]` reaching INTO `target/` would not be seen here. Nothing
+        // in this crate writes `#[path]` at all today.
+        let mut root_files = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name == "src" || name == "target" {
+                    continue;
+                }
+                rust_sources(&path, &mut root_files);
+            } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                root_files.push(path);
+            }
+        }
+        let mut root_names: Vec<String> = root_files
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        root_names.sort();
+        assert_eq!(
+            root_names,
+            vec![
+                "build.rs",
+                "examples/field_locator_probe.rs",
+                "examples/icon_probe.rs",
+                "examples/picker_probe.rs",
+                "examples/ui_automation_probe.rs",
+                "examples/ui_preview.rs",
+                "examples/watch_windows.rs",
+            ],
+            "the set of Rust source files outside `src/` changed. A `.rs` file beside \
+             `build.rs` is compiled and RUN at build time the moment `build.rs` names it, and \
+             for fifteen rounds nothing in this crate read one. If this is a new example, add \
+             it here; if it is a new neighbour of `build.rs`, it is the fifteenth hop and the \
+             answer is no"
+        );
+        files.extend(root_files);
 
         // The walk itself, pinned: a recursion that returned nothing, or that
         // never descended into `vault_window/`, would make this vacuous.
@@ -858,15 +1006,17 @@ mod tests {
         // is the point: it is not a hole, it is a signature.
         //
         //   job_object.rs  -- the choke point itself, and its own tests.
-        //   bw_serve.rs, login_ui.rs, main.rs, updater.rs, vault_window/mod.rs
+        //   login_ui.rs, main.rs, updater.rs, vault_window/mod.rs
         //                  -- pre-existing spawns outside this change's scope.
+        //
+        // `bw_serve.rs` came off this list in the same round `bw sync` got a
+        // job: it was its last direct child start.
         //
         // Paths, not bare file names: this crate has two `mod.rs` files and
         // only one of them spawns, and a name-keyed list would have excused
         // both.
         const ALLOWED: &[&str] = &[
             "job_object.rs",
-            "bw_serve.rs",
             "login_ui.rs",
             "main.rs",
             "updater.rs",
@@ -884,10 +1034,26 @@ mod tests {
 
         // Stale entries are an error too: an entry that no longer spawns is a
         // pre-opened door for whoever edits that file next.
+        //
+        // Read through the STRIPPED view, not through `direct_child_starts`.
+        // The line pass inside that helper reads UNSTRIPPED source, so a
+        // sentence of PROSE containing one of the three needles keeps an
+        // exemption alive after the code it excused is gone. Measured on this
+        // very round: `bw_serve.rs` stopped starting any child at all, and a
+        // doc comment a hundred and fifty lines above it still spelled the
+        // `bw sync` call it used to make -- so this control stayed green over
+        // an entry that had become a pre-opened door. The stripped view has no
+        // comments in it.
         for allowed in ALLOWED {
             let text = std::fs::read_to_string(src.join(allowed)).unwrap();
+            let code = code_only(&text);
+            let starts: usize =
+                [concat!(".spa", "wn()"), concat!(".out", "put()"), concat!(".sta", "tus()")]
+                    .iter()
+                    .map(|n| code.matches(n).count())
+                    .sum();
             assert!(
-                !direct_child_starts(allowed, &text).is_empty(),
+                starts > 0,
                 "{allowed} is excused from this guard but no longer starts a child; remove it \
                  from ALLOWED rather than leaving the exemption standing"
             );
@@ -982,6 +1148,50 @@ mod tests {
             "/// The runner used to call .spawn ( ) itself; it no longer can.\r\nlet a = 1;"
         )
         .is_empty());
+    }
+
+    /// FNV-1a, 64-bit, over UTF-8 bytes. The whole-file pin's hash.
+    ///
+    /// Hand-written rather than depended on: this crate pulls in no hash
+    /// crate, and a pin needs a function whose value cannot change underneath
+    /// it. FNV-1a is nine lines, has one canonical definition, and
+    /// [`the_whole_file_hash_is_fnv1a_and_sees_every_byte`] pins it against
+    /// published vectors -- so a "tidy-up" that touched either constant fails
+    /// there rather than silently re-baselining every pin that uses it.
+    ///
+    /// **Not a cryptographic hash, and it does not need to be.** The thing
+    /// being defended against is an EDIT to a 46-line build script, made by
+    /// someone who then has to talk a reviewer into re-pinning it. It is not
+    /// an adversary computing a preimage that is simultaneously valid Rust,
+    /// compiles, embeds the icon, and is exactly 2318 bytes long. If that ever
+    /// becomes the threat, the answer is to store the file's TEXT, not a
+    /// stronger digest.
+    fn fnv1a64(text: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in text.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// **Controls on [`fnv1a64`]**, without which the `build.rs` pin could be
+    /// comparing two constants to each other.
+    #[test]
+    fn the_whole_file_hash_is_fnv1a_and_sees_every_byte() {
+        // Published FNV-1a/64 vectors. A wrong offset basis or a wrong prime
+        // is still a perfectly good hash function, and a pin built on one
+        // would go on passing while meaning nothing about FNV.
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325, "the offset basis is wrong");
+        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c, "the prime or the mixing order is wrong");
+        assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
+
+        // It sees ORDER, so a reordering edit moves it...
+        assert_ne!(fnv1a64("ab"), fnv1a64("ba"));
+        // ...and it sees every byte, including the last one, which a loop
+        // that stopped one short would not.
+        assert_ne!(fnv1a64("mod icon_aid;"), fnv1a64("mod icon_aid:"));
+        assert_ne!(fnv1a64("mod icon_aid"), fnv1a64("mod icon_aid;"));
     }
 
     /// A file's Rust source with comments and string literals removed, and
@@ -1742,7 +1952,7 @@ mod tests {
         // only way to exercise a "count is zero" rule.
         assert_eq!(
             door_modules,
-            vec!["bw_path", "bw_serve", "login_ui", "main"],
+            vec!["bw_path", "login_ui", "main"],
             "the door module list no longer derives to the modules RULE 8 must refuse; either \
              DOOR_FILES changed (in which case update this control deliberately) or the \
              derivation is broken and RULE 8 has quietly stopped refusing anything"
@@ -3886,9 +4096,30 @@ mod tests {
             while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
                 end += 1;
             }
-            // `mod x {` is an INLINE module: its body is right here, in the
-            // very text every other list reads, so it needs no fence of its
-            // own. Only `mod x;` names a second file.
+            // `mod x;` names a second file; `mod x { .. }` does not. TWO
+            // DIFFERENT PROPERTIES ride on this skip, and blending them is
+            // how one of them quietly stops being true:
+            //
+            //  (a) AN INLINE MODULE IS HARMLESS, and that is a fact about the
+            //      six checks rather than a hope. Its body sits in THIS text
+            //      -- the `code_only` view of the production half -- which is
+            //      the very same view the callee list, the site count, the
+            //      macro list, the import list and the local-path list all
+            //      read. Nothing written inside it escapes any of them, so it
+            //      needs no fence of its own. If a check is ever added that
+            //      reads something OTHER than this view, that check has to
+            //      revisit this line.
+            //
+            //  (b) A `mod y;` NESTED INSIDE AN INLINE `mod x { .. }` IS NOT
+            //      harmless, and it is NOT handled here. This scan finds
+            //      `mod` items wherever they are written, so that `mod y;` is
+            //      reported like any other -- but the closure resolves a
+            //      child against the FILE, and the real file for this one is
+            //      a directory deeper (`x/y.rs`). The closure does not guess:
+            //      it PANICS, naming both places it looked. That panic is the
+            //      whole guard for (b); this line does nothing for it, and a
+            //      measured mutant of exactly that shape, hiding an FFI
+            //      process creator, lands on it.
             if end == from || b.get(end) != Some(&b';') {
                 continue;
             }
@@ -4365,9 +4596,28 @@ mod tests {
                 let dir = file.trim_end_matches(".rs").trim_end_matches("/mod");
                 let flat = format!("{dir}/{child}.rs");
                 let nested = format!("{dir}/{child}/mod.rs");
-                let found = [flat, nested]
+                // BOTH candidates existing is refused rather than resolved.
+                // Untested until this round: `find` took the flat file
+                // first, SILENTLY, and rustc's own resolution of `mod x;`
+                // with both `x.rs` and `x/mod.rs` present is an ERROR
+                // (E0761) -- so the two would disagree about which file is
+                // even being compiled, and this closure would happily fence
+                // the one the compiler refused to use while the other sat
+                // unread. A tie is a broken tree, not a preference.
+                let present: Vec<String> = [flat, nested]
                     .into_iter()
-                    .find(|c| src_dir.join(c).is_file())
+                    .filter(|c| src_dir.join(c).is_file())
+                    .collect();
+                assert!(
+                    present.len() < 2,
+                    "production src/{file} declares `mod {child};` and BOTH {present:?} exist. \
+                     rustc refuses that outright (E0761), so this tree does not build -- and \
+                     if it somehow did, this closure would fence one file and leave the other \
+                     entirely unread. Delete whichever one is not the module"
+                );
+                let found = present
+                    .into_iter()
+                    .next()
                     .unwrap_or_else(|| {
                         panic!(
                             "production src/{file} declares `mod {child};` but neither \
@@ -4487,10 +4737,26 @@ mod tests {
 
             // (2) THE FOUR ALLOWLISTS, plus the count the sets cannot see.
             let code = code_only(&production);
+            // A RATCHET, and deliberately not a truncation guard. It sits
+            // at roughly 96% of the real figure, so what actually trips it is
+            // a LEGITIMATE deletion of a couple of functions, not a rule
+            // reading nothing -- by the time a truncation made the lists
+            // below vacuous, the four equalities would all have failed first
+            // and much louder. Its job is to make "this file got smaller"
+            // require a deliberate edit here, in the same way every other
+            // list in this fence does. The message says that, because the
+            // message it used to carry ("every list below is vacuous") would
+            // be actively WRONG on the day it fires.
             assert!(
                 code.len() > fence.min_code_len,
-                "control: production {file} stripped to {} chars, so every list below is vacuous",
-                code.len()
+                "production {file} stripped to {} chars, below the {} floor pinned for it. \
+                 This is a ratchet, not an alarm: most likely something was legitimately \
+                 deleted, in which case lower the floor in this file's `Fence` deliberately \
+                 and check that the four lists below shrank by exactly what you deleted. If \
+                 nothing was deleted, the cut moved and the lists below are reading a \
+                 truncated file",
+                code.len(),
+                fence.min_code_len
             );
             assert_eq!(
                 production_callees(&code),

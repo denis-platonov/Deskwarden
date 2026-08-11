@@ -46,7 +46,7 @@ pub const READINESS_DEADLINE: Duration = Duration::from_secs(30);
 /// Upper bound on how long a legitimate backend start or sync may take
 /// before something is treated as having gone wrong: `wait_for_port_free`
 /// (up to `PORT_RELEASE_GRACE_RESTART`, 30s) can run first, then an
-/// unbounded `bw sync` `.output()`, then node's own cold start (10-20s more)
+/// unbounded `bw sync`, then node's own cold start (10-20s more)
 /// before `bw serve` answers at all.
 ///
 /// Lives here, not `main.rs`, so it can be the *one* number both sides of
@@ -143,7 +143,7 @@ pub fn bw_serve_command(session_token: &str) -> Result<crate::bw_path::BareComma
 // directly, with no job-object protection, "for callers that have no job object
 // at all". Nothing in this crate called it, and it was a finished door out of
 // the kill-on-close job that `vault_export` or `send` could have walked through
-// while naming no command type and writing no `.spawn()` of their own -- every
+// while naming no command type and writing no direct child start of their own --
 // rule in `job_object`'s guards satisfied, a `bw` holding a live session token
 // running outside the job. The only caller that ever wanted one, `main`, holds
 // a job and goes through `job_object::spawn_in_job`. Deleted rather than
@@ -191,21 +191,53 @@ pub fn wait_for_vault_ready(
     }
 }
 
+/// The process-lifetime job object every `bw sync` child joins.
+///
+/// **Why `bw sync` needs one at all.** It used to run through
+/// `into_jobless_command`, whose comment argued that a short-lived child which
+/// is waited on right here needs no protection. Both halves of that are wrong.
+/// The child carries `BW_SESSION` -- the token that unlocks the vault -- in its
+/// environment block, and on Windows an environment block is readable by any
+/// same-user process holding `PROCESS_VM_READ` (that is exactly what Process
+/// Explorer's Environment tab does). And "waited on right here" is a statement
+/// about the happy path only: a panic, a `process::exit` or a Task Manager kill
+/// of this process during the wait leaves the child orphaned, still holding the
+/// token, with nothing left to reap it. A kill-on-close job closes both: the
+/// kernel tears the child down when this process dies, however it dies.
+///
+/// **Shaped after `vault_window::send_fetch_thread::sends_job`, deliberately.**
+/// Same `OnceLock`, same process lifetime, same `None`-on-failure degradation,
+/// for the same reasons written out there: the hazard is an orphan outliving
+/// the app rather than a child outliving a window, `KillOnCloseJob::new` is a
+/// kernel call that can genuinely fail, and `spawn_in_job` already accepts
+/// `None` -- so a job that cannot be created degrades to exactly the old
+/// behaviour rather than to a sync that refuses to run.
+///
+/// It is a job of its own rather than the vault window's: `bw sync` runs during
+/// backend startup, before any vault window (and so any window job) exists.
+fn sync_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+    static JOB: std::sync::OnceLock<Option<crate::job_object::KillOnCloseJob>> =
+        std::sync::OnceLock::new();
+    JOB.get_or_init(|| crate::job_object::KillOnCloseJob::new().ok())
+        .as_ref()
+}
+
 /// Runs `bw sync` with the given session so the local vault cache reflects the
 /// latest server state before the match engine is built.
 ///
 /// Failure is non-fatal (we can still work from the cached vault), so this
 /// returns a `Result` for the caller to log rather than propagating.
 pub fn run_bw_sync(session_token: &str) -> Result<(), String> {
-    // Jobless, as it has always been: `bw sync` is a short-lived child that is
-    // waited on right here, and `bw_serve.rs` is one of the files
-    // `job_object`'s tree walk already excuses. Taking the command out of the
-    // wrapper is the visible, greppable act of doing so.
-    let output = bw_command()?
-        .into_jobless_command()
-        .arg("sync")
+    let mut command = crate::bw_path::bw_job_command()?;
+    command
+        .args(["sync"])
         .env("BW_SESSION", session_token)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = crate::job_object::spawn_in_job(sync_job(), command)
+        .map_err(|e| format!("failed to run `bw sync`: {e}"))?
+        .wait_with_output()
         .map_err(|e| format!("failed to run `bw sync`: {e}"))?;
 
     if output.status.success() {
@@ -218,6 +250,111 @@ pub fn run_bw_sync(session_token: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`bw sync` is started INSIDE a job object, with the session in its
+    /// environment and nowhere else.**
+    ///
+    /// Behavioural, not a source pin. What this replaces was a COMMENT above
+    /// `run_bw_sync` asserting in prose that jobless was fine; five rounds of
+    /// this crate's history say a text claim about which job a spawn carries
+    /// cannot see which job it is actually looking at. So this arms
+    /// `job_object`'s spawn probe -- the recorder standing exactly where
+    /// `CreateProcess` would -- calls the PRODUCTION function, and reads back
+    /// what really arrived at the choke point.
+    ///
+    /// Three properties, each of which was a real defect before this round:
+    ///
+    ///  1. **The child is in `sync_job()`.** Compared by ADDRESS, so "some
+    ///     job" is not enough, and a jobless spawn (which records `None`)
+    ///     fails. This is the finding: `bw sync` ran outside every job, so a
+    ///     panic, a `process::exit` or a Task Manager kill during the wait
+    ///     orphaned a process holding the vault-unlocking token.
+    ///  2. **`BW_SESSION` carries the token this test passed in.** A body
+    ///     that dropped the parameter, emptied it or substituted a constant
+    ///     of its own fails here rather than being spelled right.
+    ///  3. **The token is in none of argv.** An argument vector is readable
+    ///     machine-wide far more cheaply than an environment block is.
+    ///
+    /// **No child is started.** The probe refuses the spawn before
+    /// `CreateProcess`, and `run_bw_sync` maps that refusal through its own
+    /// ordinary failure path -- so the error path is exercised too.
+    #[test]
+    fn bw_sync_is_started_in_a_job_with_the_session_it_was_given() {
+        // Ends in `=` because a real `bw` session token is base64 and does: a
+        // body that trimmed, split or percent-decoded the parameter would
+        // leave a token without one untouched.
+        const TOKEN: &str = "sync-test-session-token/9+x=";
+
+        // `bw_job_command` refuses without a verified CLI path. A path that
+        // does not exist and never will; nothing is executed, because the
+        // probe below refuses every spawn. `remember_verified_bw_exe` is
+        // first-wins, so whichever test in this binary gets there first wins
+        // and the value is irrelevant to all of them.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-testirstw.exe",
+        ));
+
+        let expected_job = sync_job().map(|j| std::ptr::from_ref(j) as usize);
+        assert!(
+            expected_job.is_some(),
+            "control: no job object could be created at all, so the identity assertion below \
+             would be satisfied by the very jobless spawn this test exists to refuse"
+        );
+
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let refused = run_bw_sync(TOKEN);
+        let attempts = probe.attempts();
+        drop(probe);
+
+        assert!(
+            refused.is_err(),
+            "control: the probe refuses every spawn, so a success here means `run_bw_sync` \
+             never reached the choke point and the attempts below are somebody else's"
+        );
+        assert_eq!(
+            attempts.len(),
+            1,
+            "control: `run_bw_sync` did not hand exactly one child to `spawn_in_job`; got \
+             {attempts:?}"
+        );
+        let attempt = &attempts[0];
+
+        assert_eq!(
+            attempt.job, expected_job,
+            "`bw sync` was handed to `spawn_in_job` with {:?}, not with `sync_job()` at {:?}. A \
+             `None` here is the finding itself: a `bw` carrying the vault-unlocking session in \
+             its environment block, outside every job object, orphan-able past this process's \
+             death",
+            attempt.job, expected_job
+        );
+
+        let args: Vec<String> =
+            attempt.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            vec!["sync".to_string()],
+            "control: the child handed over is not `bw sync` at all, so every other assertion \
+             here is about some other spawn"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains(TOKEN)),
+            "the session token is in argv ({args:?}), where any process on the machine can read \
+             it without even opening this one"
+        );
+
+        let sessions: Vec<Option<String>> = attempt
+            .envs
+            .iter()
+            .filter(|(k, _)| k == "BW_SESSION")
+            .map(|(_, v)| v.as_ref().map(|v| v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            sessions,
+            vec![Some(TOKEN.to_string())],
+            "`bw sync` did not receive exactly the session it was given in `BW_SESSION`; it \
+             would answer `Locked` and the vault cache would silently go stale"
+        );
+    }
 
     #[test]
     fn readiness_schedule_starts_short_and_backs_off() {
