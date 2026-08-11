@@ -47,6 +47,7 @@ pub mod tray;
 pub mod updater;
 pub mod vault_bridge;
 pub mod vault_cache;
+pub mod vault_export;
 pub mod vault_window;
 pub mod window_list;
 pub mod window_watch;
