@@ -1246,10 +1246,19 @@ impl SendRunner for CliSendRunner<'_> {
 /// **What this does not close, said plainly.** The mutant above was written
 /// INSIDE this file, where `CliSendRunner` is still nameable. A new
 /// `pub fn` added here could still build one and the frame could still call
-/// it. What refuses that is
-/// [`this_modules_public_surface_is_exactly_what_it_was`], an EQUALITY over
-/// every module-level `pub` item in this file's production half -- not a
-/// count of one spelling, so a differently-named helper fails it too.
+/// it. What refuses that today is a TEXT RULE and not a wall:
+/// `vault_window::send_ui::source_pins::every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`
+/// counts, over this file's production half alone, how often `CliSendRunner`,
+/// `CliSendRunner::with_session`, `CliSendRunner::new`, `list_sends` and
+/// `cli_send_list` are spelled, against the number the DEFINITIONS account
+/// for. Four mutants of that shape were measured against it and all four die:
+/// a helper using `CliSendRunner::new`, one building the runner by struct
+/// literal (naming neither constructor), a defaulted trait method, and one
+/// spelling only `cli_send_list`. It is still a count, so it is still one
+/// spelling away from a survivor; the shape that would end the argument is an
+/// EQUALITY over this module's whole public surface, the way
+/// `mod send_fetch_thread`'s export list is an equality. That is designed and
+/// not written.
 ///
 /// The session, the job and the profile directory are all parameters for the
 /// same reason they were parameters of the constructor: this function reads
