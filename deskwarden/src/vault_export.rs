@@ -359,11 +359,67 @@ const HEAD_BYTES: usize = 512;
 
 /// Runs one planned export and reports what was seen, judging nothing.
 ///
-/// A boxed closure rather than a trait so the UI can hold one in a struct
-/// field and a test can hand over a fake that writes bytes instead of
-/// starting a process. `Send + Sync` because the export runs on a worker
-/// thread while the window keeps painting.
-pub type ExportRunner = std::sync::Arc<dyn Fn(&ExportPlan, &str) -> RawExport + Send + Sync>;
+/// A seam the UI can hold in a struct field and a test can fill with a fake
+/// that writes bytes instead of starting a process. `Send + Sync` because the
+/// export runs on a worker thread while the window keeps painting.
+///
+/// **A two-variant enum and not the bare `Arc<dyn Fn ..>` it used to be, and
+/// that is the fix for a review finding rather than a preference.** A boxed
+/// closure is opaque: once [`real_runner`] had wrapped a [`CliExportRunner`]
+/// in one, nothing downstream could ask which job the child would be spawned
+/// into, so nothing could assert that `real_runner` had not thrown its
+/// argument away. Replacing that function's body with
+/// `CliExportRunner::new(Arc::new(None)).into_runner()` left every test in the
+/// crate green and no warning emitted -- and every export child spawned
+/// outside the kill-on-close job, through the one function the UI calls.
+///
+/// The `Cli` variant therefore keeps the [`CliExportRunner`] itself rather
+/// than a closure over it, so [`Self::job`] and the spawn read the SAME
+/// value. There is no second copy of the job to drift from the first:
+/// [`Self::job`] answers out of the runner that will do the spawning, which
+/// is what makes [`the_real_runner_hands_the_export_the_job_it_was_given`] a
+/// test of the production path rather than of a bookkeeping field.
+/// The boxed closure behind [`ExportRunner::Fake`]. Named only to keep the
+/// enum's own declaration readable.
+type FakeExport = Arc<dyn Fn(&ExportPlan, &str) -> RawExport + Send + Sync>;
+
+pub enum ExportRunner {
+    /// The production spawn. Holds the runner whole; see the type's own note
+    /// for why it is not a closure over it.
+    Cli(CliExportRunner),
+    /// Anything that is not a child process: the fakes in this module's tests
+    /// today, and any future seam that stages bytes itself.
+    Fake(FakeExport),
+}
+
+impl ExportRunner {
+    /// A runner that starts no process, from any closure.
+    pub fn from_fn(f: impl Fn(&ExportPlan, &str) -> RawExport + Send + Sync + 'static) -> Self {
+        Self::Fake(Arc::new(f))
+    }
+
+    /// The job the child this runner spawns will be assigned to, or `None`
+    /// when there is no child to assign -- a fake, or a process that never
+    /// managed to create a job.
+    ///
+    /// Read out of the [`CliExportRunner`] that does the spawning, not out of
+    /// a field beside it, so this cannot answer one job while the spawn uses
+    /// another.
+    pub fn job(&self) -> Option<&KillOnCloseJob> {
+        match self {
+            Self::Cli(cli) => cli.job(),
+            Self::Fake(_) => None,
+        }
+    }
+
+    /// Runs the export.
+    fn call(&self, plan: &ExportPlan, session: &str) -> RawExport {
+        match self {
+            Self::Cli(cli) => cli.run(plan, session),
+            Self::Fake(f) => f(plan, session),
+        }
+    }
+}
 
 /// The runner that really spawns the CLI.
 ///
@@ -413,13 +469,23 @@ impl CliExportRunner {
         run_cli(plan, session, self.job())
     }
 
-    /// Boxes this runner into the seam [`run_export`] takes.
+    /// Puts this runner into the seam [`run_export`] takes, whole -- so the
+    /// job it was constructed with is still readable through
+    /// [`ExportRunner::job`] afterwards.
     pub fn into_runner(self) -> ExportRunner {
-        Arc::new(move |plan, session| self.run(plan, session))
+        ExportRunner::Cli(self)
     }
 }
 
 /// The production [`ExportRunner`], for the one call site that wires it up.
+///
+/// **The only production entry point into the export**, which is why
+/// [`the_real_runner_hands_the_export_the_job_it_was_given`] asserts by
+/// pointer identity that the job reaching the returned runner is this
+/// argument. Every guarantee `CliExportRunner` carries about job membership
+/// is reachable only through this function, so a body that dropped `job` on
+/// the floor would put every export child outside the kill-on-close job while
+/// the constructor's own test went on passing.
 pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
     CliExportRunner::new(job).into_runner()
 }
@@ -588,7 +654,7 @@ pub fn run_export(plan: &ExportPlan, session: &str, runner: &ExportRunner) -> Ex
     // `partial_path` are bytes this run's runner put there.
     discard_partial(plan);
 
-    let raw = runner(plan, session);
+    let raw = runner.call(plan, session);
     let outcome = classify(&raw);
 
     if outcome != ExportOutcome::Written {
@@ -1146,7 +1212,7 @@ mod tests {
     /// A runner that writes `body` where the plan says the CLI would, then
     /// observes it exactly as `run_cli` does. It starts no process.
     fn writing_runner(body: &'static [u8], exit_ok: bool, stderr: &'static str) -> ExportRunner {
-        Arc::new(move |plan: &ExportPlan, _session: &str| {
+        ExportRunner::from_fn(move |plan: &ExportPlan, _session: &str| {
             std::fs::write(plan.partial_path(), body).expect("the fake runner stages its own file");
             let (written, head) = observe_partial(plan);
             RawExport {
@@ -1161,7 +1227,7 @@ mod tests {
     /// A runner that writes nothing at all, as a CLI that died before opening
     /// its output file would leave things.
     fn barren_runner(exit_ok: bool, stderr: &'static str) -> ExportRunner {
-        Arc::new(move |plan: &ExportPlan, _session: &str| {
+        ExportRunner::from_fn(move |plan: &ExportPlan, _session: &str| {
             let (written, head) = observe_partial(plan);
             RawExport {
                 exit_ok,
@@ -1475,7 +1541,8 @@ mod tests {
         assert_eq!(
             std::fs::read(plan.final_path()).expect("the archive is under the chosen name"),
             envelope_body(),
-            "the promoted bytes are the leftover's, not this run's"
+            "the bytes promoted under the chosen name are not the ones THIS run wrote, so an \
+             earlier crash's leftover was renamed over the user's backup"
         );
     }
 
@@ -1525,6 +1592,75 @@ mod tests {
     }
 
     #[test]
+    fn the_real_runner_hands_the_export_the_job_it_was_given() {
+        // THE SAME FINDING ONE HOP FURTHER OUT, and the hop that matters:
+        // `the_runner_spawns_into_the_very_job_it_was_constructed_with`
+        // asserts over a `CliExportRunner` a test built by hand, but the
+        // export's only production entry point is `real_runner`, and nothing
+        // asserted that IT passed its argument through. Measured on the
+        // commit before this one, a body of
+        //
+        //     let _ = job;
+        //     CliExportRunner::new(Arc::new(None)).into_runner()
+        //
+        // gave 2050 lib + 217 bin, 0 failed, 0 warnings -- and every export
+        // child spawned outside the kill-on-close job, which is exactly the
+        // hazard the constructor's test claims to have closed, reached
+        // through the one function the UI calls.
+        //
+        // What makes this assertable at all is that `ExportRunner` keeps the
+        // `CliExportRunner` whole instead of boxing a closure over it, so
+        // `ExportRunner::job` reads out of the very value that will do the
+        // spawning. There is no second copy to agree with.
+        //
+        // `KillOnCloseJob::new` creates a kernel handle. It starts no
+        // process, touches no file, opens no socket, and the handle is
+        // dropped with nothing assigned to it.
+        let job = KillOnCloseJob::new().expect("a job object is a handle, not a process");
+        let held = Arc::new(Some(job));
+        let given: &KillOnCloseJob = held.as_ref().as_ref().expect("the fixture holds one");
+
+        let runner = real_runner(Arc::clone(&held));
+        let reaching = runner.job().expect(
+            "`real_runner` threw its job away, so every export child -- a process holding an \
+             unlocked vault -- would be spawned outside the kill-on-close job and could \
+             outlive a panic, a `process::exit` or a Task Manager kill",
+        );
+        assert!(
+            std::ptr::eq(given, reaching),
+            "the job reaching the production runner is not the one `real_runner` was handed"
+        );
+
+        // Control: the accessor is not answering `given` by construction.
+        // A runner built from a DIFFERENT job must be distinguishable, or
+        // the pointer comparison above would pass for any job at all.
+        let other = Arc::new(Some(
+            KillOnCloseJob::new().expect("a second handle, still not a process"),
+        ));
+        let other_runner = real_runner(Arc::clone(&other));
+        let other_reaching = other_runner.job().expect("the second fixture holds one too");
+        assert!(
+            !std::ptr::eq(given, other_reaching),
+            "control: two runners built from two different jobs report the same job, so the \
+             pointer identity asserted above is vacuous"
+        );
+
+        // Control: the absence is still expressible end to end, so the
+        // assertion above is about a job that was really there.
+        assert!(
+            real_runner(Arc::new(None)).job().is_none(),
+            "control: `no job at all` no longer survives the trip through `real_runner`"
+        );
+
+        // Control: a fake reports no job, which is what makes `job()` a
+        // question about the spawn rather than a field every runner sets.
+        assert!(
+            writing_runner(envelope_body(), true, "").job().is_none(),
+            "control: a runner that starts no process claims a job to spawn into"
+        );
+    }
+
+    #[test]
     fn run_export_really_sweeps_on_the_way_in() {
         // An absence with a witness. Nothing in the outcome of an export says
         // whether the sweep ran, so a leftover from an earlier crash is put
@@ -1565,7 +1701,10 @@ mod tests {
         // Normalised to LF once, so a needle written with `\n` matches this
         // file whether it is stored CRLF or LF.
         let whole = include_str!("vault_export.rs").replace("\r\n", "\n");
-        let code = whole.split("#[cfg(test)]").next().unwrap().to_string();
+        // Split so this needle is not itself a second occurrence of the cut
+        // marker -- an unsplit one made `the_cut_marker_is_unique` unwritable
+        // and would have let the cut move up into a string literal.
+        let code = whole.split(CUT_MARKER).next().unwrap().to_string();
         assert!(
             code.len() < whole.len(),
             "the test module marker was not found; the split did nothing"
@@ -1660,5 +1799,223 @@ mod tests {
         // line it is.
         let code = code_under_test();
         assert!(code.contains("match export_command(plan, session)"));
+    }
+
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half no pin above reads.
+    //
+    // Every pin in this module reads `code_under_test`, which is the file
+    // ABOVE the first `cfg(test)` marker and nothing else. The two controls
+    // it already had prove the search can tell present from absent and that
+    // the cut dropped the tests. NEITHER proves the cut does not drop
+    // PRODUCTION code, and measured on the commit before this one it did not:
+    // a real `pub fn` containing a bare `command.spawn()` appended at the end
+    // of this file, below the test module, gave 2050 lib + 217 bin, 0 failed,
+    // 0 warnings. `!code.contains(".spawn()")` missed it, both `== 1` spawn
+    // counts missed it, and `bw_path`'s crate-wide spawn guard missed it too.
+    // Same shape as the control `breach.rs` already carries.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a search for the
+    /// real attribute.
+    const CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// The literal [`code_under_test`] cuts this file at. The same string as
+    /// the gate: the cut lands on the attribute, not on the module opener.
+    const CUT_MARKER: &str = CUT_GATE;
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Empty today, and controlled by the walk: a line
+    /// that stops being one fails rather than being quietly forgiven.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Exact rather than a `starts_with`: a whole
+    /// module written on one line is not a module opener here and must fail.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let rest = match t.strip_prefix("mod ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let name = match rest.strip_suffix(" {") {
+            Some(name) => name,
+            None => return false,
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk from the cut to EOF over whatever text it is handed.
+    /// Returns `(visited, modules, closes, depth)` so the caller can control
+    /// it for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison is against the line's real text
+    /// on a CRLF working tree and on an LF one alike.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = source
+            .find(CUT_MARKER)
+            .expect("the cut marker is controlled by the caller");
+        let mut depth = 0usize;
+        // The walked region BEGINS with the gate, so nothing outside it is
+        // taken on trust: the first line seen is the attribute itself.
+        let mut gated = false;
+        let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments,
+                // the gate and a module opener -- at ANY indentation, because
+                // an indented `fn` at file scope is still a top-level item
+                // and a column-0-only filter would walk straight past it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. Every pin in this module reads \
+                     only the half ABOVE the cut, so an item down here is read by none of \
+                     them: it can spawn a process, reintroduce a construct banned by name, or \
+                     duplicate a call site pinned at exactly one -- and the suite stays green. \
+                     Move it above the test module."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not test-gated, so it SHIPS -- and it \
+                     ships in the half of the file no pin here reads"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_pins_cut() {
+        let source = include_str!("vault_export.rs");
+
+        // 1. The cut lands where the pins think it does, and there is exactly
+        //    one place it could land -- so it cannot move UP into a comment or
+        //    a string and silently truncate the half every pin reads.
+        let seen = source.matches(CUT_MARKER).count();
+        assert_eq!(
+            seen, 1,
+            "the cut marker occurs {seen} times in this file. `code_under_test` takes the \
+             FIRST, so a second occurrence is a cut that can move up and vacate every pin \
+             below the truncation while their own text stays word-perfect"
+        );
+        let cut = source.find(CUT_MARKER).expect("counted exactly one just above");
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the marker was matched inside a \
+             comment or a string literal rather than at a real attribute"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half still
+        //    reaches the last production item in the file.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("could not delete the stale export ", "partial {}: {e}");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: the anchor is not in this file exactly once, so it pins nothing -- \
+             repoint it at the last production item above the test module"
+        );
+        let anchor = source.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, so the cut \
+             moved up and the production half every pin reads is truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, over an LF copy and a CRLF copy of the same text, which
+        //    must agree. Built both ways rather than compared against the
+        //    bytes on disk: this repository stores LF blobs and only
+        //    `core.autocrlf=true` makes a working tree CRLF, so a control that
+        //    asserted "this file is CRLF" would pass here and fail on Linux.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        assert_eq!(
+            walk_below_the_cut(&lf),
+            walk_below_the_cut(&crlf),
+            "the walk gives a different answer on an LF copy of this file than on a CRLF one"
+        );
+        let on_disk = walk_below_the_cut(source);
+        assert!(
+            on_disk == walk_below_the_cut(&lf) || on_disk == walk_below_the_cut(&crlf),
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = on_disk;
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a test \
+             module's worth -- the slice is empty and this test proves nothing"
+        );
+        assert_eq!(
+            (modules, closes, depth),
+            (1, 1, 0),
+            "below the cut there is no longer exactly one opened-and-closed test module: \
+             {modules} opened, {closes} closed, ending at depth {depth}"
+        );
+
+        // 5. Control on the walk itself: it really refuses production code
+        //    down there. Without this the walk could be a no-op that visits
+        //    lines and asserts nothing.
+        let with_an_appended_item = format!("{lf}\npub fn sneaked() {{}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_appended_item)).is_err(),
+            "control: the walk accepted a `pub fn` appended below the test module, which is \
+             the exact mutation it exists to catch"
+        );
+        // And an INDENTED one, which the column-0 filter this replaced missed.
+        let with_an_indented_item = format!("{lf}\n    struct Sneaked(u8);\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_indented_item)).is_err(),
+            "control: the walk accepted an INDENTED top-level item appended below the test \
+             module"
+        );
+        // And an ungated module, which ships.
+        let with_an_ungated_module = format!("{lf}\nmod shipped {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_ungated_module)).is_err(),
+            "control: the walk accepted an UNGATED module below the cut, which ships"
+        );
     }
 }

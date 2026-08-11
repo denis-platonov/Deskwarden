@@ -1682,6 +1682,238 @@ mod runner_tests {
              absence asserted is the absence of the flag spelling"
         );
     }
+
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half no pin in this module reads.
+    //
+    // Every pin here reads `code_under_test`, which is this file ABOVE the
+    // first test module and nothing else. The two controls it already had
+    // prove the search can tell present from absent and that the cut dropped
+    // the tests. NEITHER proves the cut does not drop PRODUCTION code, and
+    // measured on the commit before this one it did not: a real `pub fn`
+    // containing a bare `command.spawn()` appended at the end of this file,
+    // below both test modules, gave 2050 lib + 217 bin, 0 failed, 0 warnings
+    // -- unseen by the pins here and by `bw_path`'s crate-wide spawn guard.
+    // Same shape as the control `breach.rs` already carries.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a search for the
+    /// real attribute.
+    const CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Empty today, and controlled by the walk.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// Where [`code_under_test`] cuts this file: the FIRST [`CUT_GATE`] that
+    /// is immediately followed by a module opener.
+    ///
+    /// Written as a scan rather than as a `find` of `"#[cfg(test)]\nmod "`
+    /// because a bare `\n` needle matches NOTHING in a CRLF working tree, and
+    /// this repository stores LF blobs while `core.autocrlf=true` checks them
+    /// out as CRLF. A needle that matched nothing here would make the walk
+    /// below silently read the wrong region -- or none at all.
+    ///
+    /// The gate alone is not the cut: this file also carries one near the top,
+    /// above `ARGV_PIN_CONTROL`, and cutting there would leave every pin
+    /// searching sixty lines of imports.
+    fn cut_index(source: &str) -> usize {
+        let mut from = 0usize;
+        while let Some(hit) = source[from..].find(CUT_GATE) {
+            let at = from + hit;
+            let rest = &source[at + CUT_GATE.len()..];
+            let rest = rest.strip_prefix('\r').unwrap_or(rest);
+            if rest.starts_with("\nmod ") {
+                return at;
+            }
+            from = at + CUT_GATE.len();
+        }
+        panic!("no `cfg(test)` attribute in this file is followed by a module opener");
+    }
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Exact rather than a `starts_with`: a whole
+    /// module written on one line is not a module opener here and must fail.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let rest = match t.strip_prefix("mod ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let name = match rest.strip_suffix(" {") {
+            Some(name) => name,
+            None => return false,
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk from the cut to EOF over whatever text it is handed.
+    /// Returns `(visited, modules, closes, depth)` so the caller can control
+    /// it for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose**, both in [`cut_index`] and here:
+    /// `lines()` strips a trailing carriage return, so every comparison is
+    /// against the line's real text on a CRLF tree and on an LF one alike.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = cut_index(source);
+        let mut depth = 0usize;
+        // The walked region BEGINS with the gate, so nothing outside it is
+        // taken on trust: the first line seen is the attribute itself.
+        let mut gated = false;
+        let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments,
+                // the gate and a module opener -- at ANY indentation, because
+                // an indented `fn` at file scope is still a top-level item
+                // and a column-0-only filter would walk straight past it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. Every pin in this module reads \
+                     only the half ABOVE the cut, so an item down here is read by none of \
+                     them: it can spawn a process, reintroduce a flag banned by name, or \
+                     duplicate a call site pinned at exactly one -- and the suite stays green. \
+                     Move it above the first test module."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not test-gated, so it SHIPS -- and it \
+                     ships in the half of the file no pin here reads"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_pins_cut() {
+        let source = include_str!("send.rs");
+        let lf = source.replace("\r\n", "\n");
+
+        // 1. The cut this control walks from is the SAME byte
+        //    `code_under_test` cuts at, or the walk proves nothing about the
+        //    region the pins cannot see.
+        let cut = cut_index(&lf);
+        assert_eq!(
+            &lf[..cut],
+            code_under_test().as_str(),
+            "this control walks from a different byte than `code_under_test` cuts at, so the \
+             region it inspects is not the region the pins are blind to"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half still
+        //    reaches the last production item in the file. Were the cut to
+        //    move UP -- into a doc comment or a string that happened to spell
+        //    a gate followed by a module opener -- this anchor would fall
+        //    below it and every pin downstream would be reading nothing.
+        const LAST_PRODUCTION_ITEM: &str = concat!("None => Err(SendError::", "TimedOut),");
+        assert_eq!(
+            lf.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: the anchor is not in this file exactly once, so it pins nothing -- \
+             repoint it at the last production item above the first test module"
+        );
+        let anchor = lf.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, so the cut \
+             moved up and the production half every pin reads is truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, over an LF copy and a CRLF copy of the same text, which
+        //    must agree. Built both ways rather than compared against the
+        //    bytes on disk: this repository stores LF blobs and only
+        //    `core.autocrlf=true` makes a working tree CRLF, so a control that
+        //    asserted "this file is CRLF" would pass here and fail on Linux.
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        assert_eq!(
+            walk_below_the_cut(&lf),
+            walk_below_the_cut(&crlf),
+            "the walk gives a different answer on an LF copy of this file than on a CRLF one"
+        );
+        let on_disk = walk_below_the_cut(source);
+        assert!(
+            on_disk == walk_below_the_cut(&lf) || on_disk == walk_below_the_cut(&crlf),
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = on_disk;
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a test \
+             module's worth -- the slice is empty and this test proves nothing"
+        );
+        assert_eq!(
+            (modules, closes, depth),
+            (2, 2, 0),
+            "below the cut there are no longer exactly two opened-and-closed test modules: \
+             {modules} opened, {closes} closed, ending at depth {depth}"
+        );
+
+        // 5. Control on the walk itself: it really refuses production code
+        //    down there. Without this the walk could be a no-op that visits
+        //    lines and asserts nothing.
+        let with_an_appended_item = format!("{lf}\npub fn sneaked() {{}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_appended_item)).is_err(),
+            "control: the walk accepted a `pub fn` appended below the test modules, which is \
+             the exact mutation it exists to catch"
+        );
+        // And an INDENTED one, which a column-0-only filter would miss.
+        let with_an_indented_item = format!("{lf}\n    struct Sneaked(u8);\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_indented_item)).is_err(),
+            "control: the walk accepted an INDENTED top-level item appended below the test \
+             modules"
+        );
+        // And an ungated module, which ships.
+        let with_an_ungated_module = format!("{lf}\nmod shipped {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_ungated_module)).is_err(),
+            "control: the walk accepted an UNGATED module below the cut, which ships"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
