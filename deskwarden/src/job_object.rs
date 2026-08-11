@@ -966,7 +966,10 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
         for file in ["vault_export.rs", "send.rs"] {
-            let code = code_only(&std::fs::read_to_string(src.join(file)).unwrap());
+            let raw = std::fs::read_to_string(src.join(file))
+                .unwrap()
+                .replace("\r\n", "\n");
+            let code = code_only(&raw);
 
             // Controls FIRST: these rules are all "count is zero" shaped, and
             // a `code_only` that returned nothing, or a module that stopped
@@ -1042,15 +1045,42 @@ mod tests {
             // function in this crate returns a bare command. The single door
             // out of that wrapper is the inherent method below.
             //
-            // Why this is a fact and not another spelling race: **an inherent
-            // method cannot be aliased, re-exported or renamed in Rust.** There
-            // is no `use path::method as other`, there is no trait to reach it
-            // through (the field is private, so no foreign impl can extract
-            // it), and there is no operator sugar for it. Calling it therefore
-            // means writing this exact identifier, in code, in this file. An
-            // identifier has one spelling and `code_only` sees through
-            // whitespace, so `BareCommand :: into_jobless_command ( c )` and
+            // Why the identifier is the right thing to ban: it cannot be
+            // aliased or re-exported. There is no `use path::method as other`
+            // for an inherent method, there is no trait to reach it through
+            // (the field is private, so no foreign impl can extract it), and
+            // there is no operator sugar for it. Calling it means writing this
+            // exact identifier, in code, in SOME file. An identifier has one
+            // spelling and `code_only` sees through whitespace, so
+            // `BareCommand :: into_jobless_command ( c )` and
             // `c.into_jobless_command()` are the same string here.
+            //
+            // **"in SOME file" is not "in this file", and the eighth round's
+            // note claimed it was.** It read "an inherent method cannot be
+            // renamed", and concluded that this rule, applied to these two
+            // files, closed the door. The premise is right and the conclusion
+            // is wrong, because INHERENT IMPLS ARE NOT RESTRICTED TO THE
+            // DEFINING MODULE: any module in this crate may write
+            //
+            //     impl crate::bw_path::BareCommand {
+            //         pub fn run_it(self) { let _ = self.into_jobless_command().spawn(); }
+            //     }
+            //
+            // and inside THAT impl the banned identifier is written in a file
+            // this loop does not read. `real.run_it()` back in the runner is a
+            // method call on a local: it names no type, writes no path, and so
+            // is invisible to every rule here -- RULE 7 included, which is the
+            // hop RULE 7 exists to close, re-opened through a receiver.
+            // Measured on the parent commit: 2072 lib / 217 bin / 0 failed / 0
+            // warnings, with a jobless verified `bw.exe` on this plan's argv.
+            //
+            // So this rule is now only the local half. The crate-wide half is
+            // `only_the_files_that_must_leave_the_job_can_open_a_bare_command`
+            // below, which counts the identifier in EVERY file and refuses a
+            // foreign `impl` block on the type outright. Neither is sufficient
+            // alone: this one keeps the runner from opening the door itself,
+            // that one keeps anyone else from opening it on the runner's
+            // behalf.
             assert_eq!(
                 code.matches("into_jobless_command").count(),
                 0,
@@ -1097,11 +1127,9 @@ mod tests {
             // planted anywhere else is unreachable from here whatever it is
             // called, because the path to it cannot be written.
             //
-            // `super::` is not an escape: both files are crate-root modules,
-            // so `super::` inside their test modules names the file's own
-            // module, and `super::super::` -- which would reach the crate root
-            // and from there anything at all -- is banned outright below.
-            // Neither file contains one today.
+            // `super::` IS an escape, and this comment used to say it was
+            // not -- see RULE 7b below, which is the ninth round's fix.
+            //
             // ITEMS, not modules. A module-level allow-list was measured and
             // was not enough: `job_object.rs` is necessarily both reachable
             // (it is the choke point) and on the tree walk's ALLOWED list (it
@@ -1142,29 +1170,8 @@ mod tests {
             // all, which is a stronger guarantee than this list gives.
             const REACHABLE_TEST_ONLY: &[&str] = &["crate::login_ui::password_lifetime_tests::"];
 
-            let mut from = 0;
-            while let Some(at) = code[from..].find("crate::") {
-                let start = from + at;
-                from = start + "crate::".len();
-                let head: String = code[start..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
-                    .collect();
-                let rest = &code[start + head.len()..];
-                // `use crate::m::{A, B};` -- one occurrence, several items.
-                let named: Vec<String> = if head.ends_with("::") && rest.starts_with('{') {
-                    rest[1..]
-                        .chars()
-                        .take_while(|c| *c != '}')
-                        .collect::<String>()
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|item| format!("{head}{item}"))
-                        .collect()
-                } else {
-                    vec![head]
-                };
-                for path in named {
+            for path in crate_paths(&code) {
+                {
                     assert!(
                         REACHABLE.contains(&path.as_str())
                             || REACHABLE_TEST_ONLY.iter().any(|ok| path.starts_with(ok)),
@@ -1184,6 +1191,108 @@ mod tests {
                  from there at every module RULE 7 just refused"
             );
 
+            // RULE 7b: `super::` IS `crate::` HERE, AND RULE 7 NEVER SEES IT.
+            //
+            // RULE 7 scans for `crate::`. The comment above it used to argue
+            // that plain `super::` needed no rule, because "both files are
+            // crate-root modules, so `super::` inside their test modules names
+            // the file's own module". That is true inside `mod tests` and
+            // FALSE in production code at file top level -- which is exactly
+            // where the runner lives. There, the parent of a crate-root module
+            // IS the crate root, so:
+            //
+            //     updater.rs  (an ALLOWED file):
+            //         pub fn run_anything_jobless(args: &[String]) { .. spawn .. }
+            //     vault_export.rs, in `CliExportRunner::run`:
+            //         super::updater::run_anything_jobless(&export_args(plan));
+            //
+            // reaches any module in this crate while writing no `crate::` path
+            // at all. Measured on the parent commit: 2072 lib / 217 bin / 0
+            // failed / 0 warnings, with a second signature-verified `bw.exe`
+            // running this plan's full argv against an unlocked vault, outside
+            // the kill-on-close job. RULE 7 was not defeated -- it was never
+            // reached. `super::` is a synonym for `crate::` here, and a rule
+            // that bans one spelling of a path and not the other bans nothing.
+            //
+            // Two assertions, because the hazard has two shapes:
+            let production = raw
+                .split(concat!("#[cfg(", "test)]", "\nmod "))
+                .next()
+                .unwrap();
+            assert!(
+                production.len() < raw.len(),
+                "control: the test-module cut marker was not found in {file}, so `production` \
+                 below is the whole file and RULE 7b is being asked about the tests as well as \
+                 about the code -- which it would then fail on `use super::*;` rather than on \
+                 anything real"
+            );
+            // (a) NONE in production code, where `super::` is the crate root.
+            assert_eq!(
+                code_only(production).matches("super::").count(),
+                0,
+                "{file} writes `super::` in production code, where it names the CRATE ROOT and \
+                 not this file's own module -- so it can call a helper in any module in this \
+                 crate, one that starts a `bw` outside the kill-on-close job among them, \
+                 without writing a single `crate::` path for RULE 7 to see"
+            );
+            // (b) and the only one anywhere in the file is the glob a test
+            // module writes to see its own parent. Without this second half,
+            // `use super::*;` written at FILE scope -- which (a) does catch --
+            // is not the only way through: any `super::` below the cut that is
+            // not that glob is a path RULE 7 cannot read either, and a nested
+            // `mod` below the cut is not necessarily a test module.
+            assert_eq!(
+                code.matches("super::").count(),
+                code.matches("usesuper::*;").count(),
+                "{file} writes a `super::` path that is not a test module's `use super::*;`; \
+                 every other form of it is a path to somewhere in this crate that RULE 7 \
+                 cannot read"
+            );
+
+            // RULE 7c: A MACRO INVOCATION WRITES NO PATH EITHER.
+            //
+            // RULE 7 and RULE 7b between them close every PATH out of these
+            // two files. A `macro_rules!` in textual scope is called by bare
+            // name and is not a path at all:
+            //
+            //     lib.rs, above the module list:
+            //         macro_rules! run_it {
+            //             ($a:expr) => { $crate::login_ui::run_anything_jobless(&$a) };
+            //         }
+            //     login_ui.rs (a DOOR_FILE, above its layout cut):
+            //         pub fn run_anything_jobless(args: &[String]) { .. }
+            //     vault_export.rs:
+            //         run_it!(export_args(plan));
+            //
+            // The `$crate::` path is written in `lib.rs`, not here. Measured
+            // against every other rule in this round: 2073 lib / 217 bin / 0
+            // failed / 0 warnings, with a jobless verified `bw.exe` on this
+            // plan's argv. The helper sits in a file that is allowed to open a
+            // `BareCommand`, so the crate-wide count forgives it too; the only
+            // thing left to close is the CALL, and the call is a bare
+            // identifier.
+            //
+            // So the macros these two files may invoke are listed, exactly as
+            // their items are. Everything here is either std or `log` -- and a
+            // macro from another crate cannot name a deskwarden item, so it
+            // cannot expand into one of these helpers whatever it does.
+            // `concat!` and `include_str!` are on the list because the source
+            // pins in both files are built out of them.
+            const MACROS: &[&str] = &[
+                "assert", "assert_eq", "assert_ne", "panic", "matches", "format", "vec",
+                "write", "concat", "include_str", "log::warn", "log::debug", "log::info",
+            ];
+            for name in macro_invocations(&code) {
+                assert!(
+                    MACROS.contains(&name.as_str()),
+                    "{file} invokes the macro `{name}!`, which is not on the list of macros \
+                     these two modules may use. A `macro_rules!` in textual scope is called by \
+                     BARE NAME -- it is not a path, so neither RULE 7 nor RULE 7b can read it -- \
+                     and it can expand into a call to any item in this crate, one that starts a \
+                     `bw` outside the kill-on-close job among them"
+                );
+            }
+
             // RULE 4: the only things it may reach out of `std::process` for
             // are stream wiring and this process's own pid -- neither of which
             // can describe or start a child.
@@ -1194,6 +1303,76 @@ mod tests {
                 "{file} reaches into `std::process` for something other than `Stdio` and `id`"
             );
         }
+
+        // RULE 8: AND THE ONE MODULE THEY MAY CALL INTO IS CLOSED TOO.
+        //
+        // RULE 7 closes the set of items `vault_export.rs` and `send.rs` may
+        // NAME. It says nothing about what those items then do, and stops
+        // exactly one hop short: `bw_path::bw_job_command_in` is on REACHABLE
+        // because the runners must build their child through it, and its own
+        // body may call anywhere at all. Measured:
+        //
+        //     bw_path.rs:
+        //         pub fn bw_job_command_in(..) -> .. {
+        //             crate::login_ui::run_anything_jobless(&[..]);   // added
+        //             ..
+        //     login_ui.rs (an ALLOWED file, above its layout cut):
+        //         pub fn run_anything_jobless(args: &[String]) { .. spawn .. }
+        //
+        // 2073 lib / 217 bin / 0 failed / 0 warnings. The runners are spotless
+        // -- they call only what RULE 7 permits -- and the child still starts
+        // outside the job, because the permitted callee grew a second errand.
+        //
+        // So `bw_path.rs` gets the same treatment, and for the same reason it
+        // was put on REACHABLE in the first place: it is the one module these
+        // two are allowed to reach, so it is the one module whose reach has to
+        // be closed as well. It is a small file with a single job -- resolve
+        // the verified `bw.exe` and describe a command -- and the only thing
+        // in this crate it needs is the wrapper it hands the command to.
+        //
+        // This does NOT close the hop in general; it closes it for the one
+        // module the runners depend on. `job_object.rs`, the other REACHABLE
+        // module, is the choke point itself and is guarded by the probe and
+        // by its own tests instead.
+        const BW_PATH_MAY_REACH: &[&str] = &[
+            "crate::job_object::JobCommand",
+            "crate::job_object::JobCommand::wrap",
+            "crate::job_object::spawn_in_job",
+            "crate::bw_path::bw_command_in",
+            "crate::bw_serve::bw_serve_command",
+        ];
+        let bw_path_raw = std::fs::read_to_string(src.join("bw_path.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let bw_path_all = code_only(&bw_path_raw);
+        assert!(
+            bw_path_all.len() > 1000,
+            "control: bw_path.rs produced almost no code, so RULE 8 is vacuous"
+        );
+        assert!(
+            crate_paths(&bw_path_all).iter().any(|p| p.starts_with("crate::job_object")),
+            "control: bw_path.rs names nothing in `job_object` any more, so it has stopped              building the job-bearing command and RULE 8 is asserting about the wrong file"
+        );
+        for path in crate_paths(&bw_path_all) {
+            assert!(
+                BW_PATH_MAY_REACH.contains(&path.as_str()),
+                "bw_path.rs names `{path}`. It is on RULE 7's REACHABLE list, so                  `vault_export.rs` and `send.rs` call into it -- and anything it calls, it                  calls on their behalf, with no rule of theirs in the way. A spawner reached                  from here starts a `bw` outside the kill-on-close job while both runners stay                  spotless. If this item is genuinely needed, adding it here is the visible                  decision that it cannot spawn"
+            );
+        }
+        let bw_path_production = bw_path_raw
+            .split(concat!("#[cfg(", "test)]", "
+mod "))
+            .next()
+            .unwrap();
+        assert!(
+            bw_path_production.len() < bw_path_raw.len(),
+            "control: the test-module cut marker was not found in bw_path.rs"
+        );
+        assert_eq!(
+            code_only(bw_path_production).matches("super::").count(),
+            0,
+            "bw_path.rs writes `super::` in production code, where it names the crate root --              the same synonym for `crate::` that RULE 7b closed for the two runners, and RULE 8              above reads only `crate::`"
+        );
 
         // RULE 5 IS A "COUNT IS ZERO" RULE, so it is worth exactly nothing
         // unless the identifier it bans really is the only door out of a
@@ -1263,6 +1442,416 @@ mod tests {
         // ...and passes the honest spelling, which names only `JobCommand`.
         let honest = planted("let c = job_object::spawn_in_job(self.job(), command)?;");
         assert_eq!(honest.matches("Command").count(), 0);
+
+        // RULE 7b's controls, through the very same matcher.
+        assert_eq!(planted("super :: updater :: run_it ( )").matches("super::").count(), 1);
+        assert_eq!(planted("use super :: * ;").matches("usesuper::*;").count(), 1);
+        // The glob is forgiven only in that one exact shape: a named import
+        // through `super` is still a path, and is still seen.
+        let named_through_super = planted("use super::updater::run_it;");
+        assert_eq!(named_through_super.matches("super::").count(), 1);
+        assert_eq!(named_through_super.matches("usesuper::*;").count(), 0);
+        // And a `super::` inside a comment or a string is not one.
+        assert_eq!(planted("// super::updater\nlet a = 1;").matches("super::").count(), 0);
+
+        // RULE 7c's controls: a bare macro call is seen, in every bracket, and
+        // the things that merely sit next to a `!` are not mistaken for one.
+        assert_eq!(macro_invocations(&planted("run_it ! ( x ) ;")), vec!["run_it"]);
+        assert_eq!(macro_invocations(&planted("vec![1, 2]")), vec!["vec"]);
+        assert_eq!(macro_invocations(&planted("write!{f, \"x\"}")), vec!["write"]);
+        assert_eq!(macro_invocations(&planted("crate::run_it!(x)")), vec!["crate::run_it"]);
+        assert_eq!(macro_invocations(&planted("log::warn!(\"x\")")), vec!["log::warn"]);
+        // A lone colon is a field or an ascription, not a path separator.
+        assert_eq!(macro_invocations(&planted("S { args: vec![1] }")), vec!["vec"]);
+        assert_eq!(macro_invocations(&planted("let x: u8 = matches!(a, B);")), vec!["matches"]);
+        assert_eq!(macro_invocations(&planted("S { f: crate::run_it!(x) }")), vec!["crate::run_it"]);
+        let none: Vec<String> = Vec::new();
+        assert_eq!(macro_invocations(&planted("if a != b { }")), none);
+        assert_eq!(macro_invocations(&planted("if !(a && b) { }")), none);
+        assert_eq!(macro_invocations(&planted("while !(a) { }")), none);
+        assert_eq!(macro_invocations(&planted("return !(a);")), none);
+        assert_eq!(macro_invocations(&planted("if !flag { }")), none);
+        assert_eq!(macro_invocations(&planted("#![allow(dead_code)]")), none);
+        assert_eq!(macro_invocations(&planted("// run_it!(x)\nlet a = 1;")), none);
+    }
+
+    /// Everything above is about the two files the runner lives in. This is
+    /// about the rest of the crate, because **an inherent impl may be written
+    /// from any module in it**.
+    ///
+    /// RULE 5 bans the identifier `into_jobless_command` in `vault_export.rs`
+    /// and `send.rs`, on the sound ground that an inherent method cannot be
+    /// aliased or re-exported, so calling it means writing it. What the eighth
+    /// round took from that -- that banning it in those two files closes the
+    /// door -- does not follow. `impl crate::bw_path::BareCommand { .. }` is
+    /// legal in every file in this crate, and inside such a block the
+    /// identifier is written somewhere RULE 5 does not read; the call back in
+    /// the runner is then `real.run_it()`, which names no type and writes no
+    /// path and so is invisible to RULE 1, RULE 5 and RULE 7 alike. Measured:
+    /// 2072 lib / 217 bin / 0 failed / 0 warnings, with a signature-verified
+    /// `bw.exe` on the export's full argv running outside the job.
+    ///
+    /// So the door is counted where it can actually be opened: everywhere.
+    /// Two rules, because the hop has two halves --
+    ///
+    ///  * only the files that genuinely need a child outside the job may write
+    ///    the identifier at all, and
+    ///  * no file but `bw_path.rs` may write an `impl` block for the type,
+    ///    which is what let the door be given a second name in the first place.
+    ///
+    /// This is still a text rule, and text rules are what the last eight
+    /// rounds lost to. It is here rather than a compile-time wall because
+    /// Rust has no way to build that wall for this shape: `pub(in path)`
+    /// accepts only ANCESTOR modules, so an item in `bw_path` cannot be made
+    /// visible to its siblings and nobody else. Measured, not assumed --
+    /// `pub(in crate::bw_serve) fn into_jobless_command` on the definition
+    /// fails to compile with `E0433: could not find bw_serve in the crate
+    /// root`, even though `bw_serve` is a real crate-root module, because the
+    /// resolver looks only among ancestors. The wall exists only if the four
+    /// consumers are moved to be descendants of a common ancestor of
+    /// `bw_path`, which is a whole-crate restructure.
+    #[test]
+    fn only_the_files_that_must_leave_the_job_can_open_a_bare_command() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            files.len() > 20,
+            "control: the tree walk found {} files, so the counts below are vacuous",
+            files.len()
+        );
+
+        // The files that legitimately hold a `bw` child outside the
+        // kill-on-close job, and therefore the only ones that may write the
+        // one identifier that opens a `BareCommand`.
+        //
+        // Strictly SHORTER than the tree walk's ALLOWED list, and deliberately
+        // so: `updater.rs` and `vault_window/mod.rs` do start children, but
+        // they do not start `bw` and have no business opening this wrapper.
+        // The eighth hop's escape was planted in `updater.rs` precisely
+        // because it was excused there.
+        //
+        //   bw_path.rs  -- defines the door, and `bw_job_command_in` is the
+        //                  one production place that walks through it in order
+        //                  to hand the command straight to `JobCommand::wrap`.
+        //   bw_serve.rs -- `bw serve` is the long-lived backend; it is owned
+        //                  and killed by the backend policy, not by the job.
+        //   login_ui.rs -- sign-in, unlock and status run before there is a
+        //                  vault window, and so before there is a job.
+        //   main.rs     -- re-wraps into a `JobCommand` at the one call site
+        //                  that builds the vault window's own job.
+        const DOOR_FILES: &[&str] = &["bw_path.rs", "bw_serve.rs", "login_ui.rs", "main.rs"];
+
+        let relative = |p: &std::path::Path| {
+            p.strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+
+        let mut seen_door = Vec::new();
+        for file in &files {
+            let rel = relative(file);
+            let code = code_only(&std::fs::read_to_string(file).unwrap());
+
+            let opens = code.matches("into_jobless_command").count();
+            if DOOR_FILES.contains(&rel.as_str()) {
+                if opens > 0 {
+                    seen_door.push(rel.clone());
+                }
+            } else {
+                assert_eq!(
+                    opens, 0,
+                    "{rel} opens a `BareCommand`, which is the one way to hold a spawnable \
+                     `std::process::Command` in this crate. Wherever it is written, the \
+                     resulting child runs outside the kill-on-close job -- and if the code \
+                     around it is reachable from `vault_export.rs` or `send.rs` by any spelling, \
+                     it is a `bw` holding an unlocked vault that outlives a panic, a \
+                     `process::exit` or a Task Manager kill. If this file genuinely needs a \
+                     jobless child, adding it to DOOR_FILES is the visible decision that it does"
+                );
+            }
+
+            // AND NO ONE MAY GROW A METHOD ONTO A TYPE THE RUNNER HOLDS.
+            //
+            // A foreign inherent impl is how the door gets a second name, and
+            // counting the door's identifier is not enough to stop it -- a
+            // measured mutant proves it. `JobCommand` exposes `get_program`,
+            // `get_args` and `get_envs` so a test can assert what would be run
+            // without running it; that is enough to REBUILD the invocation
+            // without ever opening a `BareCommand`:
+            //
+            //     login_ui.rs (an ALLOWED file, above its layout cut):
+            //         impl crate::job_object::JobCommand {
+            //             pub fn run_it(&self) {
+            //                 let mut c = Command::new(self.get_program());
+            //                 c.args(self.get_args());  ..  let _ = c.spawn();
+            //             }
+            //         }
+            //     vault_export.rs, in `CliExportRunner::run`:
+            //         command.run_it();
+            //
+            // Measured against every other rule written in this round: 2073
+            // lib / 217 bin / 0 failed / 0 warnings, with a second
+            // signature-verified `bw.exe` on the export's full argv running
+            // outside the kill-on-close job. The same shape on
+            // `KillOnCloseJob` survived too. `into_jobless_command` is never
+            // written, so the count above sees nothing; `command.run_it()`
+            // names no type and writes no path, so RULE 1, RULE 5, RULE 7 and
+            // RULE 7b see nothing either.
+            //
+            // What makes the list below CLOSED rather than a guess: Rust's
+            // orphan rule already forbids an inherent impl for a type defined
+            // in another crate, so the only types anyone in this crate can
+            // grow a method onto are this crate's own. Of those, the runner
+            // can only call a method on one it holds a value of -- and RULE 7
+            // has already closed the set of items it may name. That set
+            // contains exactly four crate-local types, plus whatever the two
+            // files define themselves, which is why a foreign `impl` reaching
+            // into either module is refused as well.
+            const OWN_IMPLS_ONLY: &[(&str, &str)] = &[
+                (concat!("Bare", "Command"), "bw_path.rs"),
+                (concat!("Job", "Command"), "job_object.rs"),
+                ("KillOnCloseJob", "job_object.rs"),
+                ("SpawnProbe", "job_object.rs"),
+                ("crate::vault_export::", "vault_export.rs"),
+                ("crate::send::", "send.rs"),
+            ];
+            for (ty, home) in OWN_IMPLS_ONLY {
+                if rel == *home {
+                    continue;
+                }
+                assert_eq!(
+                    impl_blocks_for(&code, ty),
+                    0,
+                    "{rel} writes an `impl` block for `{ty}`, which is not defined here. Rust \
+                     allows an inherent impl from any module in the defining crate, so this \
+                     block grows a new method onto a value that `vault_export.rs` and `send.rs` \
+                     are allowed to hold -- and calling it is a method call on a local, which \
+                     names no type and writes no path, and so is invisible to every rule in \
+                     `the_two_job_bearing_modules_cannot_name_a_bare_command`. Keep the impl in \
+                     `{home}`, where those rules and this crate's spawn guards can read it"
+                );
+            }
+
+            // `extern crate self as x;` makes `x::` a synonym for `crate::`,
+            // which RULE 7 reads, and for `super::`, which RULE 7b reads --
+            // and `x::` is neither. One line anywhere in the crate would make
+            // both of them unreachable exactly as `super::` already did.
+            assert_eq!(
+                code.matches("externcrateselfas").count(),
+                0,
+                "{rel} aliases this crate to a second name, which is a spelling of `crate::` \
+                 that neither RULE 7 nor RULE 7b can read"
+            );
+        }
+
+        // Stale entries are an error, for the same reason they are on ALLOWED:
+        // a DOOR_FILE that no longer opens the wrapper is a door standing open
+        // for whoever edits that file next, and it makes the count above
+        // forgive a file for a reason that has stopped being true.
+        let mut missing: Vec<&str> = DOOR_FILES
+            .iter()
+            .filter(|d| !seen_door.iter().any(|s| s == *d))
+            .copied()
+            .collect();
+        missing.sort_unstable();
+        assert!(
+            missing.is_empty(),
+            "{missing:?} are excused from this guard but no longer open a `BareCommand`; remove \
+             them from DOOR_FILES rather than leaving the exemption standing"
+        );
+
+        // Controls, through the very same matcher: each half can see the thing
+        // it exists to catch, and passes the honest shapes.
+        assert_eq!(
+            code_only("let c = real . into_jobless_command ( ) ;")
+                .matches("into_jobless_command")
+                .count(),
+            1
+        );
+        const BARE: &str = concat!("Bare", "Command");
+        const JOB: &str = concat!("Job", "Command");
+        // Both spellings of an inherent impl, and a trait impl too.
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl crate::bw_path::BareCommand { pub fn run_it(self) {} }"),
+                BARE
+            ),
+            1
+        );
+        assert_eq!(
+            impl_blocks_for(&code_only("impl BareCommand { fn f(&self) {} }"), BARE),
+            1
+        );
+        assert_eq!(
+            impl_blocks_for(&code_only("impl std::fmt::Debug for BareCommand {}"), BARE),
+            1
+        );
+        // The two shapes that actually survived, each seen by its own needle.
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl crate::job_object::JobCommand { pub fn run_it(&self) {} }"),
+                JOB
+            ),
+            1
+        );
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl crate::job_object::KillOnCloseJob { pub fn run_it(&self) {} }"),
+                "KillOnCloseJob"
+            ),
+            1
+        );
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl crate::vault_export::CliExportRunner<'_> { fn r(&self) {} }"),
+                "crate::vault_export::"
+            ),
+            1
+        );
+        // ...and the needles do not see each other: `BareCommand` is not a
+        // `JobCommand`, which is what keeps the per-type home files honest.
+        assert_eq!(impl_blocks_for(&code_only("impl BareCommand {}"), JOB), 0);
+        // Merely naming the type is not an impl: `bw_serve` does it in a
+        // signature, and `vault_export` and `send` name `JobCommand` in theirs.
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("pub fn f() -> Result<crate::bw_path::BareCommand, String> { g() }"),
+                BARE
+            ),
+            0
+        );
+        assert_eq!(
+            impl_blocks_for(&code_only("let c: crate::job_object::JobCommand = x;"), JOB),
+            0
+        );
+        assert_eq!(
+            impl_blocks_for(&code_only("// impl BareCommand {\nlet a = 1;"), BARE),
+            0
+        );
+        assert_eq!(code_only("extern crate self as dw;").matches("externcrateselfas").count(), 1);
+    }
+
+    /// Every `crate::` path written in one file's `code_only` view.
+    ///
+    /// `use crate::m::{A, B};` is one occurrence naming several items, and is
+    /// expanded into one entry each -- otherwise a brace list would smuggle
+    /// every item after the first past a rule that reads only the head.
+    fn crate_paths(code: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find("crate::") {
+            let start = from + at;
+            from = start + "crate::".len();
+            let head: String = code[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            let rest = &code[start + head.len()..];
+            if head.ends_with("::") && rest.starts_with('{') {
+                out.extend(
+                    rest[1..]
+                        .chars()
+                        .take_while(|c| *c != '}')
+                        .collect::<String>()
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|item| format!("{head}{item}")),
+                );
+            } else {
+                out.push(head);
+            }
+        }
+        out
+    }
+
+    /// Every macro invoked in one file's `code_only` view, by name.
+    ///
+    /// A macro call is an identifier (or a path, for `log::warn!`) followed by
+    /// `!` and then an opening bracket. The bracket is what separates a call
+    /// from `!=` and from a negation, both of which put a `!` next to
+    /// something that is not one. An inner attribute's `#!` walks back to an
+    /// empty name and is dropped.
+    ///
+    /// Paths are kept whole, so `crate::x!` comes back as `crate::x` and fails
+    /// the list rather than passing as `x` -- and RULE 7 has already refused
+    /// the same path in its own right.
+    fn macro_invocations(code: &str) -> Vec<String> {
+        let bytes = code.as_bytes();
+        let mut out = Vec::new();
+        for (i, c) in code.char_indices() {
+            if c != '!' {
+                continue;
+            }
+            match bytes.get(i + 1) {
+                Some(b'(') | Some(b'[') | Some(b'{') => {}
+                _ => continue,
+            }
+            let name_start = code[..i]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == ':'))
+                .map(|(j, c)| j + c.len_utf8())
+                .unwrap_or(0);
+            let mut name = &code[name_start..i];
+            // Only `::` joins path segments. A LONE colon is a struct-literal
+            // field or a type ascription, and `code_only` has already dropped
+            // the space that separated it -- so `args: vec![..]` arrives here
+            // as `args:vec`, whose macro is `vec` and not `args:vec`.
+            let b = name.as_bytes();
+            if let Some(cut) = (0..b.len()).rev().find(|&p| {
+                b[p] == b':' && b.get(p + 1) != Some(&b':') && (p == 0 || b[p - 1] != b':')
+            }) {
+                name = &name[cut + 1..];
+            }
+            // A negation of a parenthesised expression puts `!` right after
+            // whatever preceded it, and `code_only` has dropped the space that
+            // separated them: `if !(a && b)` arrives here as `if!(`. A macro's
+            // name can never be a keyword, so dropping these is sound rather
+            // than a hole.
+            const NOT_A_MACRO: &[&str] = &[
+                "if", "while", "return", "break", "continue", "else", "match", "in", "let",
+            ];
+            if !name.is_empty() && !NOT_A_MACRO.contains(&name) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// The number of `impl` blocks naming `needle` in one file's `code_only`
+    /// view.
+    ///
+    /// Walks back from each occurrence of the needle over the characters a
+    /// path is made of and asks whether what it lands on begins with `impl`.
+    /// That covers `impl BareCommand`, `impl crate::bw_path::BareCommand` and
+    /// -- because `code_only` has already dropped the whitespace that would
+    /// separate them -- `impl SomeTrait for BareCommand` as well. It works
+    /// equally for a path PREFIX such as `crate::vault_export::`, because the
+    /// walk back from the `c` of `crate` picks up the same `impl`.
+    ///
+    /// Trait impls are not the hazard this rule is aimed at (a foreign module
+    /// cannot reach a private field through one either), but they are caught
+    /// for free and there are none, so they are left caught: one arriving is a
+    /// change to a guarded type's surface that deserves to be looked at.
+    fn impl_blocks_for(code: &str, needle: &str) -> usize {
+        let mut found = 0;
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let start = from + at;
+            from = start + needle.len();
+            let head_start = code[..start]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == ':'))
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            if code[head_start..start].starts_with("impl") {
+                found += 1;
+            }
+        }
+        found
     }
 
     /// The `cfg` predicates of every `not(..)` in one file's code.
