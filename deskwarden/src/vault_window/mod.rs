@@ -496,6 +496,12 @@ pub fn build_frame(
     // closure below can take one without borrowing `env`.
     let spawn_sync = env.sync;
     let spawn_load = env.load;
+    // The third spawn the closure reaches, and the reason it is here rather
+    // than named directly at its call site: `send_fetch_thread::spawn_send_list`
+    // runs a real `bw send list`, so a harness that DRIVES the Sends screen
+    // would spawn a process. Behind the seam it is a `fn` pointer like the
+    // other two, and `frame_promptness` hands one that answers instead.
+    let spawn_send_list = env.send_list;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -1805,7 +1811,7 @@ pub fn build_frame(
         // user who never opens Sends never spawns a `bw`.
         if send_fetch.wants_fetch(show_sends) {
             send_fetch.in_flight = true;
-            send_fetch_thread::spawn_send_list(
+            (spawn_send_list)(
                 ui.ctx().clone(),
                 send_tx.clone(),
                 send_fetch.generation(),
@@ -3407,6 +3413,16 @@ pub struct VaultFrameEnv {
         mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
         VaultLoadRequest,
     ),
+    /// `send_fetch_thread::spawn_send_list` in production -- the Sends
+    /// screen's one fetch, started by the frame that first draws that screen.
+    ///
+    /// Here for the same reason the other two are: it is the only remaining
+    /// way the frame closure reaches outside the process, and until it was
+    /// seamed the `VaultBodyState::Sends` arm could not be DRIVEN by a test
+    /// at all -- so the whole arm, ~70% of the closure's Sends half, was
+    /// covered by source scanning alone. See
+    /// `send_ui::frame_promptness::the_sends_screen_returns_promptly`.
+    send_list: fn(egui::Context, SendListSender, u64),
     /// `settings::default_path()` in production. A test hands a path under
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
@@ -3419,6 +3435,7 @@ impl VaultFrameEnv {
         Self {
             sync: spawn_vault_sync,
             load: spawn_vault_load,
+            send_list: send_fetch_thread::spawn_send_list,
             settings_path: crate::settings::default_path(),
         }
     }
@@ -15193,8 +15210,9 @@ mod frame_env_seam {
             mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
             VaultLoadRequest,
         ),
+        send_list: fn(egui::Context, SendListSender, u64),
         settings_path: Option<std::path::PathBuf>,
     ) -> VaultFrameEnv {
-        VaultFrameEnv { sync, load, settings_path }
+        VaultFrameEnv { sync, load, send_list, settings_path }
     }
 }

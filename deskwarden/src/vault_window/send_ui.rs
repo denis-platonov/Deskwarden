@@ -3216,14 +3216,25 @@ mod source_pins {
     /// over the **current** generation. The tag is what `apply_answer` uses to
     /// drop a late answer; a spawn that carries a constant instead would make
     /// every answer look current.
+    ///
+    /// **The call now goes through `VaultFrameEnv`**, as the vault load and
+    /// the sync already did, so that `frame_promptness` can DRIVE the Sends
+    /// screen without running a real `bw send list` -- see that module's doc
+    /// for why an undriveable arm was worth a seam. That turns one pin into
+    /// three, because the indirection is one more place the wiring can be
+    /// wrong: the frame calls the pointer, the pointer is bound from the env
+    /// once, and the env's own field is the real spawner (held next door by
+    /// `production_is_the_only_env_a_shipping_build_has`).
     #[test]
     fn the_frame_starts_the_fetch_once_and_tags_it_with_the_question_it_is_asking() {
-        let production = production();
+        // Comments blanked, so no doc comment that SPELLS one of the three
+        // needles below can stand in for the code that should carry it.
+        let production = sanitized(&production());
         // Squashed on both sides, so this is a pin on the call and not on
         // where rustfmt chose to break its arguments.
         let spawn = squashed(concat!(
-            "send_fetch_thread::spawn_send_",
-            "list( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), );"
+            "(spawn_send_",
+            "list)( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), );"
         ));
         assert_eq!(
             squashed(&production).matches(&spawn).count(),
@@ -3232,10 +3243,22 @@ mod source_pins {
              nowhere, from more than one place, or without the generation that lets a stale \
              answer be told from a current one"
         );
-        // And the entry point itself is named exactly once, so the squashed
-        // match above cannot be satisfied by a doc comment that spells the
-        // call out while the frame does something else.
-        let entry = concat!("send_fetch_thread::spawn_send_", "list(");
+        // The binding the call reads, exactly once. Without this the call
+        // above could be reading a local shadowing `env.send_list` with
+        // something else entirely.
+        let bound = concat!("let spawn_send_", "list = env.send_", "list;");
+        assert_eq!(
+            production.matches(bound).count(),
+            1,
+            "{bound:?} appears in production {} times, not once -- the pointer the frame \
+             calls is not the one the caller handed in",
+            production.matches(bound).count()
+        );
+        // And the real spawner is named exactly once in production: in
+        // `VaultFrameEnv::production`, which is the only constructor a
+        // shipping build has. A second mention is a second way to reach the
+        // `bw` spawn.
+        let entry = concat!("send_fetch_thread::spawn_send_", "list");
         assert_eq!(
             production.matches(entry).count(),
             1,
@@ -4184,6 +4207,21 @@ mod source_pins {
     /// `#[cfg`. Both are here. Neither has a synonym, because the compiler
     /// defines them, and there is nothing else for the frame to key on --
     /// every value it holds is one the harness supplies deliberately.
+    ///
+    /// **Kept, though it is redundant today, and the redundancy is stated
+    /// here rather than discovered again.** The crate-wide
+    /// `job_object::tests::nothing_in_this_crate_is_compiled_differently_when_it_is_tested`
+    /// already kills M-N2, and kills a hoisted variant
+    /// (`fn shipping_build() -> bool { !cfg!(test) }` written ABOVE the
+    /// closure) that this test cannot see, because this one only reads the
+    /// closure's own body. So it is strictly weaker and buys nothing while
+    /// that test stands. It stays for one reason: this is the only guard of
+    /// the property that lives in the file the property is about. A crate-wide
+    /// scan in another module is exactly the kind of thing that gets narrowed
+    /// by an unrelated change, and the failure mode when it is -- a frame that
+    /// freezes only for the user -- is the one this whole harness exists for.
+    /// Two cheap guards for a sixty-second dead window is the right trade; if
+    /// it is ever deleted, delete it for being wrong, not for being second.
     #[test]
     fn the_frame_closure_behaves_the_same_way_in_both_builds() {
         let closure = frame_closure();
@@ -4248,7 +4286,11 @@ mod source_pins {
         // Past the opener, so the constructor's own signature is not
         // counted as a definition made inside it.
         let inside = &body[opener.len()..];
-        for named in ["spawn_vault_sync", "spawn_vault_load"] {
+        for named in [
+            "spawn_vault_sync",
+            "spawn_vault_load",
+            concat!("send_fetch_thread::spawn_send_", "list"),
+        ] {
             assert_eq!(
                 body.matches(named).count(),
                 1,
@@ -4264,7 +4306,8 @@ mod source_pins {
     }
 }
 
-/// **The vault frame closure returns promptly -- measured by running it.**
+/// **The vault frame closure returns promptly -- measured by running it, on
+/// every screen the window has.**
 ///
 /// See `the_sends_drain_is_at_the_closures_own_statement_level` for the seven
 /// rounds of source scanning this replaces and the five mutants that walked
@@ -4276,66 +4319,333 @@ mod source_pins {
 /// test thread waits on a bounded `recv_timeout`. The `Rc<RefCell<_>>` in
 /// the closure never crosses a thread boundary -- `build_frame` is CALLED on
 /// the worker, so every cell it makes is born there and dies there; the only
-/// thing that crosses is a `Duration` over a channel. A frame that spins,
-/// deadlocks, joins or reads stdin leaves that worker thread stuck, the
-/// `recv_timeout` expires, and the test panics with the budget it blew. The
-/// stuck thread is deliberately LEAKED rather than joined -- joining it is
-/// exactly the hang this design exists to avoid -- and the test process
-/// reaps it on exit.
+/// things that cross are a `Duration` and a `Vec<String>` of painted labels.
+/// A frame that spins, deadlocks, joins or reads stdin leaves that worker
+/// thread stuck, the `recv_timeout` expires, and the test panics with the
+/// budget it blew. The stuck thread is deliberately LEAKED rather than joined
+/// -- joining it is exactly the hang this design exists to avoid -- and the
+/// test process reaps it on exit.
 ///
-/// **Why this is not vacuous.** A harness that quietly failed to enter the
-/// interesting part of the closure would pass against anything. So the two
-/// stubs COUNT their calls, and the test asserts both were called: the load
-/// spawn is reached in `build_frame`'s own body and the sync spawn is
-/// reached from inside the closure, past `styled`, past `draw_resize_handles`
-/// and past the per-frame repaint schedule. If a future edit moves the
-/// auto-sync behind something the harness does not satisfy, this test goes
-/// red rather than green-and-empty.
+/// **What was missing until this round, and why it mattered.** The first
+/// version of this harness drove ONE scenario: `pre_styled: true` over a
+/// loader that never answered. That leaves the window on `VaultBodyState::
+/// Loading`, whose arm `return`s about a third of the way down the closure --
+/// so roughly two thirds of the frame, including *both screens a user
+/// actually looks at*, was never executed by any test and was covered by
+/// source scanning alone. Two mutants were measured green against it:
+///
+///  * a sixty-second spin in the first-frame `if !styled { .. }` block, which
+///    no test entered because every test passed `pre_styled: true` while
+///    `vault_window::run` and `main.rs` both pass `false`. That block is the
+///    window's very first painted frame: a freeze there IS the reported
+///    dead-window symptom.
+///  * a sixty-second spin in the `Vault | Sends` arm -- the loaded window,
+///    where the user spends all of their time.
+///
+/// Both are killed now, by [`the_first_painted_frame_returns_promptly`] and
+/// [`the_loaded_vault_returns_promptly`] respectively.
+///
+/// **Why none of this is vacuous.** A harness that quietly failed to enter
+/// the screen it claims to drive would pass against anything, so every
+/// scenario carries a POSITIVE CONTROL that the arm really ran, and each one
+/// is a fact about the arm that no other arm produces:
+///
+///  * every scenario -- the load spawn was reached (`build_frame`'s own body)
+///    and the sync spawn was reached (inside the closure, past `styled`, past
+///    `draw_resize_handles`, past the repaint schedule).
+///  * `Loading` -- the spinner's own label is on screen.
+///  * the first painted frame -- the harness does NOT call `theme::apply`, so
+///    the ONLY way any later frame can lay out a label in the bundled Archivo
+///    faces is that the `!styled` block called it. Additionally the
+///    single-frame run must NOT reach the auto-sync, which is what proves the
+///    early `return` inside that block was taken.
+///  * `Unavailable` -- the error page's heading and *the loader's own reason
+///    string*, which this test chose, so a heading painted over some other
+///    reason is not accepted.
+///  * `Vault` -- the fixture item's name (the item list ran) AND a label only
+///    the read detail pane paints (the detail pane ran).
+///  * `Sends` -- the Sends fetch was spawned, which only the Sends screen
+///    does; the Send the stub answered with is on screen, which is the pane's
+///    `Ok` arm (the previous round's disclosed survivor M-N3); and the fixture
+///    item's name is ABSENT, which is the item list being replaced rather than
+///    merely coexisting.
+///
+/// **Nothing here leaves the process.** The three spawns are stubbed through
+/// [`VaultFrameEnv`](super::super::VaultFrameEnv)'s seam, `server_url` is
+/// `None` so no favicon is fetched, `check_breaches` defaults to `false` so
+/// no password is ever looked up, the fixture carries no TOTP seed so no code
+/// is polled, and the settings path points inside a per-process scratch
+/// directory that [`Scratch`] deletes on the way in and on the way out.
 #[cfg(test)]
 mod frame_promptness {
     use super::super::frame_env_seam::stubbed;
-    use super::super::{build_frame, AccountDetails, VaultLoadFailure, VaultLoadRequest};
+    use super::super::{
+        build_frame, AccountDetails, SendListSender, VaultLoadFailure, VaultLoadRequest,
+    };
     use crate::login_ui::{BwStatus, BwStatusDetails};
+    use crate::vault_bridge::VaultItem;
     use crate::vault_cache::{VaultCache, VaultSnapshot};
     use eframe::egui;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::Cell;
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// How long three real frames are allowed to take, end to end, including
-    /// building the window and egui's font atlas.
+    /// How long a scenario is allowed to take, end to end, including building
+    /// the window and egui's font atlas.
     ///
     /// Generous on purpose. The number that matters is the gap between this
     /// and a frame that WAITS: every mutant this harness was measured against
-    /// waits sixty seconds, and three real frames measure well under a second
-    /// on the machine this was written on. A budget in that gap fails the
-    /// mutants without turning a slow machine red.
+    /// waits sixty seconds, and the slowest scenario here measures well under
+    /// a second on the machine this was written on. A budget in that gap
+    /// fails the mutants without turning a slow machine red.
     const BUDGET: Duration = Duration::from_secs(20);
 
-    /// How many frames are driven. More than one because the closure's first
-    /// frame and its later ones are different code: `auto_synced` flips on
-    /// the first and the drains run on all of them.
+    /// How many frames a scenario drives before it looks at the result. More
+    /// than one because the closure's first frame and its later ones are
+    /// different code: `styled` and `auto_synced` both flip on the first, the
+    /// drains run on all of them, and a load answered during `build_frame` is
+    /// not applied until the frame after the one that started it.
     const FRAMES: usize = 3;
 
-    static SYNC_SPAWNS: AtomicUsize = AtomicUsize::new(0);
-    static LOAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+    /// The window the frames are laid out in. Wide enough for the sidebar,
+    /// the item list and the detail pane to all have room: a viewport too
+    /// narrow for a panel makes egui cull it, and a culled pane is an arm
+    /// that "ran" and painted nothing -- exactly the vacuity the controls
+    /// below exist to catch, arrived at by accident.
+    const VIEWPORT: egui::Vec2 = egui::vec2(1280.0, 860.0);
+
+    /// The reason [`load_that_fails`] hands back, and the reason
+    /// [`the_unavailable_body_returns_promptly`] then requires to be on
+    /// screen. Distinctive so that the error page cannot satisfy it with a
+    /// canned string of its own.
+    const HARNESS_FAILURE: &str = "the harness refused this load on purpose";
+
+    /// The fixture vault's one login. Its name is the item list's positive
+    /// control.
+    const LOGIN_NAME: &str = "Harness Login";
+    /// Its username, which the read detail pane paints and the item list row
+    /// does not. Distinct from the account email above so that a label
+    /// matching this cannot have come from the titlebar.
+    const LOGIN_USERNAME: &str = "harness-detail-username";
+    /// The one Send [`counted_send_list`] hands back, and the Sends screen's
+    /// second positive control: a row with this name on it can only have been
+    /// painted by `draw_send_pane`'s `Ok` arm.
+    const SEND_NAME: &str = "Harness Send";
+
+    // Counted per THREAD, not per process. Each scenario runs on its own
+    // freshly spawned worker and every stub below is called synchronously on
+    // that worker (the "spawns" are stubs; they spawn nothing), so a
+    // thread-local is exactly the right scope: two scenarios running in
+    // parallel under `cargo test` cannot see each other's counts, and a
+    // scenario reads its own totals inside `drive` before they cross the
+    // channel. A process-wide `AtomicUsize` could only ever support `>= 1`.
+    thread_local! {
+        static SYNC_SPAWNS: Cell<usize> = const { Cell::new(0) };
+        static LOAD_SPAWNS: Cell<usize> = const { Cell::new(0) };
+        static SEND_LIST_SPAWNS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+        counter.with(|c| c.set(c.get() + 1));
+    }
+
+    fn read(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
+        counter.with(Cell::get)
+    }
 
     /// Stands in for `spawn_vault_sync`, which shells out to `bw sync`.
     fn counted_sync(_tx: mpsc::Sender<Result<(), String>>, _session_token: String) {
-        SYNC_SPAWNS.fetch_add(1, Ordering::SeqCst);
+        bump(&SYNC_SPAWNS);
+    }
+
+    /// Stands in for `send_fetch_thread::spawn_send_list`, which runs a real
+    /// `bw send list` on a background thread.
+    ///
+    /// It **answers**, for the same reason [`load_that_answers`] does: a
+    /// silent stub leaves `send_fetch.result` at `None`, `pane_state` on its
+    /// "still asking" branch, and the pane's `Ok` arm -- the rows a user
+    /// actually reads -- unreachable by any test. That was the previous
+    /// round's disclosed survivor **M-N3**, a sleep in exactly that arm.
+    ///
+    /// Synchronous, not spawned, so the answer is on the channel before the
+    /// next frame drains it and the frame count is fixed rather than a race.
+    fn counted_send_list(_ctx: egui::Context, tx: SendListSender, generation: u64) {
+        bump(&SEND_LIST_SPAWNS);
+        let _ = tx.send((
+            generation,
+            Ok(vec![crate::send::SendSummary {
+                id: "harness-send".to_string(),
+                name: SEND_NAME.to_string(),
+                access_url: "https://send.example.invalid/harness".to_string(),
+                // Far enough out that no clock this test could run under
+                // makes it expired, which would be a different row.
+                deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                is_file: false,
+            }]),
+        ));
     }
 
     /// Stands in for `spawn_vault_load`, which talks to `bw serve` over HTTP.
     /// Sends nothing back, so the window stays on its loading branch -- which
     /// is the state that reaches the auto-sync and every drain, and reaches
     /// no row, no favicon fetch and no breach lookup.
-    fn counted_load(
+    fn load_that_never_answers(
         _cache: Arc<VaultCache>,
         _tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
         _request: VaultLoadRequest,
     ) {
-        LOAD_SPAWNS.fetch_add(1, Ordering::SeqCst);
+        bump(&LOAD_SPAWNS);
+    }
+
+    /// A loader that ANSWERS, which is what it takes to get the window off
+    /// its spinner and onto the two screens a user looks at.
+    ///
+    /// Synchronous on the caller's thread -- deliberately. The real one
+    /// spawns; this one does not need to, and not spawning means the answer
+    /// is on the channel before the first frame runs, so the frame count a
+    /// scenario needs is fixed rather than a race. It carries the request's
+    /// own `generation`, because `apply_vault_load_result` drops anything
+    /// else as superseded and the window would sit on the spinner forever --
+    /// which the controls would then catch, but as a confusing failure.
+    fn load_that_answers(
+        _cache: Arc<VaultCache>,
+        tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        request: VaultLoadRequest,
+    ) {
+        bump(&LOAD_SPAWNS);
+        let _ = tx.send((request.generation, Ok(harness_vault())));
+    }
+
+    /// The same, for a load that gave up. `Refresh` and not `Superseded`:
+    /// the latter is the vault-session-is-gone path, which tears the window
+    /// down rather than drawing the error page this scenario is about.
+    fn load_that_fails(
+        _cache: Arc<VaultCache>,
+        tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        request: VaultLoadRequest,
+    ) {
+        bump(&LOAD_SPAWNS);
+        let _ = tx.send((
+            request.generation,
+            Err(VaultLoadFailure::Refresh(HARNESS_FAILURE.to_string())),
+        ));
+    }
+
+    /// Two items and no folders.
+    ///
+    /// Built through `serde` rather than by naming fields, so a `VaultItem`
+    /// that grows one does not break this fixture -- and so the fixture is
+    /// the same shape `bw serve` actually sends. No `totp`, so no code is
+    /// polled; no `uris`, so nothing has a host a favicon could be fetched
+    /// for even if `server_url` were set.
+    fn harness_vault() -> VaultSnapshot {
+        let item = |value: serde_json::Value| -> VaultItem {
+            serde_json::from_value(value).expect("the harness fixture is not a `VaultItem`")
+        };
+        VaultSnapshot {
+            items: vec![
+                item(serde_json::json!({
+                    "id": "harness-login",
+                    "name": LOGIN_NAME,
+                    "type": 1,
+                    "login": { "username": LOGIN_USERNAME, "password": "harness-password" },
+                })),
+                item(serde_json::json!({
+                    "id": "harness-note",
+                    "name": "Harness Note",
+                    "type": 2,
+                    "notes": "nothing secret lives in a test fixture",
+                })),
+            ],
+            folders: Vec::new(),
+        }
+    }
+
+    /// A per-process scratch directory, empty on entry and **removed on the
+    /// way out**.
+    ///
+    /// The removal is the point. `FillStats::new` and the icons path both
+    /// create this directory, and the first version of this harness never
+    /// deleted it -- one abandoned `%TEMP%\deskwarden-frame-harness-<pid>`
+    /// per test process, forever. It is created and destroyed by the TEST
+    /// thread, around the worker, so a worker left stuck by a mutant does not
+    /// leave the directory behind either.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("deskwarden-frame-harness-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One end-to-end run of the real window: what it is handed, and how many
+    /// frames it is driven for.
+    #[derive(Clone, Copy)]
+    struct Scenario {
+        /// What `build_frame`'s `pre_styled` is handed. `false` is what
+        /// production passes, and it is the *only* way into the `!styled`
+        /// block -- see [`the_first_painted_frame_returns_promptly`].
+        pre_styled: bool,
+        /// The stub `VaultFrameEnv::load` is built from.
+        load: fn(
+            Arc<VaultCache>,
+            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            VaultLoadRequest,
+        ),
+        /// How many frames to drive before reading the result.
+        frames: usize,
+        /// Whether to press the sidebar's **Sends** row partway through. The
+        /// only way into `VaultBodyState::Sends`: `sends_selected` starts
+        /// `false` and `draw_sidebar` is the sole thing that writes it, so
+        /// this arm cannot be reached except by clicking.
+        press_sends: bool,
+    }
+
+    impl Scenario {
+        /// The shape every scenario starts from: production's `pre_styled`,
+        /// a loader that answers, [`FRAMES`] frames, no click.
+        fn new() -> Self {
+            Self { pre_styled: false, load: load_that_answers, frames: FRAMES, press_sends: false }
+        }
+    }
+
+    /// What crosses back from the worker. Every field is `Send`; not one
+    /// `Rc` or `egui::Context` is in here, which is what keeps the closure's
+    /// cells on the thread that made them.
+    struct Outcome {
+        elapsed: Duration,
+        /// Every label painted on the LAST frame driven.
+        painted: Vec<String>,
+        sync_spawns: usize,
+        load_spawns: usize,
+        send_list_spawns: usize,
+    }
+
+    impl Outcome {
+        fn painted(&self, needle: &str) -> bool {
+            self.painted.iter().any(|label| label.contains(needle))
+        }
+
+        /// Asserts `needle` is on screen, printing what WAS on screen if it
+        /// is not -- a positive control that fails silently is worth nothing.
+        #[track_caller]
+        fn expect_painted(&self, needle: &str, why: &str) {
+            assert!(
+                self.painted(needle),
+                "{why}: nothing on the last frame painted {needle:?}. What was painted: {:?}",
+                self.painted
+            );
+        }
     }
 
     /// Runs `work` on its own thread and gives it `budget` to answer.
@@ -4344,8 +4654,11 @@ mod frame_promptness {
     /// running -- see this module's doc. `work` returning is the only way to
     /// get `Ok`, so a panic inside it arrives as `Err` too (the sender is
     /// dropped), which is why the caller's message names both possibilities.
-    fn within(budget: Duration, work: impl FnOnce() -> Duration + Send + 'static) -> Result<Duration, ()> {
-        let (tx, rx) = mpsc::channel::<Duration>();
+    fn within<T: Send + 'static>(
+        budget: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ()> {
+        let (tx, rx) = mpsc::channel::<T>();
         std::thread::Builder::new()
             .name("vault-frame-harness".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -4356,20 +4669,50 @@ mod frame_promptness {
         rx.recv_timeout(budget).map_err(|_| ())
     }
 
-    /// Builds the real vault window and drives [`FRAMES`] real frames of it
-    /// through a headless `egui::Context`, returning how long that took.
+    fn collect_labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_labelled_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn labels_of(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect_labelled_rects(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Builds the real vault window and drives `scenario` through a headless
+    /// `egui::Context`, reporting how long that took and what ended up on
+    /// screen.
     ///
     /// Everything is built HERE, on whatever thread this runs on, because the
     /// frame closure is full of `Rc` and cannot be moved between threads.
     /// `VaultFrameHandles::finish` is deliberately NOT called: it writes the
     /// window geometry to `settings.json`, and this test owns no real one.
-    fn drive_the_real_frame() -> Duration {
-        let scratch = std::env::temp_dir()
-            .join(format!("deskwarden-frame-harness-{}", std::process::id()));
+    ///
+    /// **`theme::apply` is never called by the harness.** The closure's own
+    /// `!styled` block calls it, and letting that be the only call is what
+    /// turns "the first painted frame ran" into something a test can
+    /// observe rather than assume: without it, the bundled Archivo families
+    /// do not exist and the first label this window lays out panics inside
+    /// epaint. Scenarios that hand `pre_styled: true` therefore run one
+    /// throwaway frame against an empty `Ui` first, exactly as `sidebar.rs`
+    /// and `detail.rs` do, and call it themselves.
+    fn drive(scenario: Scenario, scratch: &std::path::Path) -> Outcome {
         let (_options, mut frame_fn, handles) = build_frame(
             // A base URL nothing listens on. It is never dialled anyway --
             // the only thing that would dial it is the load spawn, and that
-            // is `counted_load`.
+            // is one of the stubs above.
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
                 "http://127.0.0.1:1",
             ))),
@@ -4390,75 +4733,311 @@ mod frame_promptness {
             // would have been skipped.
             true,
             None,
-            // `true`: somebody else owns this window's first frame. That is
-            // what keeps the first frame from calling `round_window_corners`
-            // and `raise_window` on a window that does not exist -- and it
-            // means frame one runs the whole body rather than returning
-            // early, so all three frames measured are real ones.
-            true,
-            stubbed(counted_sync, counted_load, Some(scratch.join("settings.json"))),
+            scenario.pre_styled,
+            stubbed(
+                counted_sync,
+                scenario.load,
+                counted_send_list,
+                // Under the scratch directory, so no frame reads or writes
+                // the real `%APPDATA%\Deskwarden`. Absent on disk, so
+                // `Settings::load` returns the default -- whose
+                // `check_breaches` is `false`, which is why a fixture with a
+                // real password looks nothing up.
+                Some(scratch.join("settings.json")),
+            ),
         );
         let ctx = egui::Context::default();
-        // What the NON-`pre_styled` first frame would have called, and what
-        // the other host called three stages before handing this frame over:
-        // it binds the bundled Archivo faces, and every label this window
-        // paints asks for one by name. Without it the first frame panics
-        // inside epaint rather than measuring anything -- which the harness
-        // reports as a failure, correctly but unhelpfully.
-        crate::theme::apply(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, VIEWPORT)),
+            ..Default::default()
+        };
+        if scenario.pre_styled {
+            // Somebody else owns this window's first frame, so somebody else
+            // called `theme::apply` -- three stages before handing the frame
+            // over. Modelled the way the other painted-output tests in this
+            // crate model it: a throwaway frame, then the call, then another
+            // throwaway so the families exist from the next frame on.
+            let _ = ctx.run_ui(input(), |_ui| {});
+            crate::theme::apply(&ctx);
+            let _ = ctx.run_ui(input(), |_ui| {});
+        }
         let started = Instant::now();
-        for _ in 0..FRAMES {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| frame_fn(ui));
+        let mut output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        for _ in 1..scenario.frames {
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        if scenario.press_sends {
+            let labels = labels_of(&output);
+            let pos = labels
+                .iter()
+                .find(|(text, _)| text == super::super::sidebar::SENDS_ROW_LABEL)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the sidebar painted no {:?} row to press, so this scenario cannot \
+                         reach the Sends screen at all. What was painted: {:?}",
+                        super::super::sidebar::SENDS_ROW_LABEL,
+                        labels.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                    )
+                });
+            // A press AND a release is what egui counts as a click, and the
+            // frame that locates the row cannot be the frame that clicks it.
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), button(pos, true)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput { events: vec![button(pos, false)], ..input() },
+                |ui| frame_fn(ui),
+            );
+            // Two more settled frames, so what is read below is the Sends
+            // screen at rest rather than the frame the click landed on: the
+            // fetch is started by the frame that first draws the screen, and
+            // its answer is not drained until the frame after that.
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
         let elapsed = started.elapsed();
+        let outcome = Outcome {
+            elapsed,
+            painted: labels_of(&output).into_iter().map(|(text, _)| text).collect(),
+            sync_spawns: read(&SYNC_SPAWNS),
+            load_spawns: read(&LOAD_SPAWNS),
+            send_list_spawns: read(&SEND_LIST_SPAWNS),
+        };
         drop(frame_fn);
         drop(handles);
-        elapsed
+        outcome
     }
 
-    #[test]
-    fn the_frame_closure_returns_promptly() {
-        let took = within(BUDGET, drive_the_real_frame).unwrap_or_else(|()| {
+    /// Runs `scenario` under [`BUDGET`] and reports a timeout as the failure
+    /// this whole design exists to produce instead of a hang.
+    ///
+    /// `tag` names the scratch directory so two scenarios running in parallel
+    /// cannot delete each other's, and appears in the failure message.
+    fn measured(tag: &'static str, scenario: Scenario) -> Outcome {
+        let scratch = Scratch::new(tag);
+        let path = scratch.0.clone();
+        let outcome = within(BUDGET, move || drive(scenario, &path)).unwrap_or_else(|()| {
             panic!(
-                "{FRAMES} frames of the vault window did not come back within {BUDGET:?}. \
-                 Either one frame is WAITING -- on a channel, a lock, a thread, a process, a \
-                 file handle, a busy spin, anything at all; the user cannot tell those apart \
-                 and neither does this test -- or the frame panicked, in which case the \
-                 panic is printed above this line. This is the whole property: the eframe \
-                 thread is the only thread this window has, and a frame that does not return \
-                 is a frozen window, no repaint and no input, for as long as it takes"
+                "the {tag} scenario's {} frames of the vault window did not come back within \
+                 {BUDGET:?}. Either one frame is WAITING -- on a channel, a lock, a thread, a \
+                 process, a file handle, a busy spin, anything at all; the user cannot tell \
+                 those apart and neither does this test -- or the frame panicked, in which \
+                 case the panic is printed above this line. This is the whole property: the \
+                 eframe thread is the only thread this window has, and a frame that does not \
+                 return is a frozen window, no repaint and no input, for as long as it takes",
+                scenario.frames
             )
         });
+        assert!(
+            outcome.elapsed < BUDGET,
+            "control: the {tag} scenario reported {:?}, which is not inside the budget it was \
+             admitted under",
+            outcome.elapsed
+        );
+        assert!(
+            outcome.load_spawns >= 1,
+            "the {tag} scenario built the window without reaching the initial vault load, so \
+             it is not measuring `build_frame`'s body at all"
+        );
+        outcome
+    }
 
-        // The two controls that stop this test passing vacuously -- see the
-        // module doc. Read AFTER the run, and only on the path where the run
-        // finished, so a timeout reports the timeout rather than these.
+    /// The control every scenario that means to run a whole frame shares: the
+    /// auto-sync sits inside the closure past the `styled` guard, past
+    /// `draw_resize_handles` and past the repaint schedule, so reaching it is
+    /// proof the frame body was entered rather than returned out of.
+    #[track_caller]
+    fn assert_the_body_was_entered(tag: &str, outcome: &Outcome) {
         assert!(
-            LOAD_SPAWNS.load(Ordering::SeqCst) >= 1,
-            "the harness built the window without reaching the initial vault load, so it is \
-             not measuring `build_frame`'s body at all"
+            outcome.sync_spawns >= 1,
+            "the {tag} scenario ran its frames without reaching the auto-sync, which sits \
+             inside the closure past the `styled` guard, `draw_resize_handles` and the \
+             repaint schedule. Whatever those frames measured, it was not the closure's body \
+             -- this test would be green against a closure that waited for a minute further \
+             down"
+        );
+    }
+
+    /// **The loading screen returns promptly.** The original scenario, kept
+    /// byte-for-byte in behaviour: a loader that never answers leaves the
+    /// window on `VaultBodyState::Loading`, which is the state that reaches
+    /// the auto-sync and every drain.
+    ///
+    /// Positive control: the spinner's own label is on screen, so the frame
+    /// really did take the `Loading` arm and not one of the other three.
+    #[test]
+    fn the_loading_screen_returns_promptly() {
+        let outcome = measured(
+            "loading",
+            Scenario { pre_styled: true, load: load_that_never_answers, ..Scenario::new() },
+        );
+        assert_the_body_was_entered("loading", &outcome);
+        outcome.expect_painted(
+            "Loading your vault",
+            "the loading scenario did not reach the `VaultBodyState::Loading` arm",
+        );
+    }
+
+    /// **The window's FIRST PAINTED FRAME returns promptly** -- the one
+    /// production actually gets, and the one no test entered until now.
+    ///
+    /// `vault_window::run` and `main.rs`'s `RealVaultOps` path both pass
+    /// `pre_styled: false`, so on a fresh window the very first frame runs
+    /// the `if !styled { .. }` block: it paints the background, applies the
+    /// theme, rounds the window's corners, raises it, and returns. **M-X1**,
+    /// a sixty-second spin inserted into that block, was measured green
+    /// against the previous harness at 2076 lib + 217 bin, because every
+    /// scenario there handed `pre_styled: true` and the block was dead code
+    /// to the whole suite. A freeze there is the reported dead-window
+    /// symptom exactly: the window appears and never draws anything else.
+    ///
+    /// **Two positive controls, and they point in opposite directions.**
+    ///
+    ///  * ONE frame must NOT reach the auto-sync. The `!styled` block ends in
+    ///    a `return`, so a single frame that got past it would mean the block
+    ///    was skipped and this test is not driving what it says it is.
+    ///  * FOUR frames must reach it, and must paint the vault. The harness
+    ///    never calls `theme::apply` on this path, so the only call is the
+    ///    one inside the block -- and without it, the first label this window
+    ///    lays out panics inside epaint. A green run is therefore a statement
+    ///    that the block's body executed, not merely that the branch was
+    ///    taken.
+    #[test]
+    fn the_first_painted_frame_returns_promptly() {
+        let styling = measured("first-frame", Scenario { frames: 1, ..Scenario::new() });
+        assert_eq!(
+            styling.sync_spawns, 0,
+            "the window's first frame with `pre_styled: false` reached the auto-sync, so it \
+             did not take the `if !styled` branch and return -- this test is no longer \
+             driving the first painted frame, and M-X1 has nothing looking at it"
+        );
+
+        let settled = measured("first-frame-settled", Scenario { frames: 4, ..Scenario::new() });
+        assert_the_body_was_entered("first-frame-settled", &settled);
+        settled.expect_painted(
+            LOGIN_NAME,
+            "the frames after the styling frame painted no vault, so the `!styled` block \
+             either never ran or never handed over",
+        );
+    }
+
+    /// **The loaded vault window returns promptly** -- item list AND detail
+    /// pane, the screen the user spends all their time on.
+    ///
+    /// This is the `VaultBodyState::Vault | VaultBodyState::Sends => {}` arm
+    /// and everything below it, which is the majority of the closure by line
+    /// count and was unreachable while the harness's only loader stayed
+    /// silent. **M-X2**, a sixty-second spin in that arm, was measured green
+    /// against the previous harness at 2076 lib + 217 bin.
+    ///
+    /// Positive controls, one per pane, because "the arm ran" and "both panes
+    /// drew" are different claims and only the second is worth having:
+    ///
+    ///  * the fixture item's NAME is on screen -- `draw_item_list` ran.
+    ///  * the fixture item's USERNAME is on screen -- and the item-list row
+    ///    does not paint it, so only the read detail pane can have. Without
+    ///    this, a spin in the detail pane and a working list would look
+    ///    identical to a working window.
+    #[test]
+    fn the_loaded_vault_returns_promptly() {
+        let outcome = measured("vault", Scenario::new());
+        assert_the_body_was_entered("vault", &outcome);
+        outcome.expect_painted(
+            LOGIN_NAME,
+            "the loaded window painted no item row, so the item list never drew",
+        );
+        outcome.expect_painted(
+            LOGIN_USERNAME,
+            "the loaded window painted no username, so the DETAIL PANE never drew -- the \
+             list alone is half this screen, and a frame that waits in the pane beside it \
+             is the same frozen window",
+        );
+    }
+
+    /// **The Sends screen returns promptly.**
+    ///
+    /// Reached the only way it can be: by pressing the sidebar's Sends row.
+    /// `sends_selected` starts `false` and `draw_sidebar` is the sole writer,
+    /// so there is no back door and this scenario drives the same sequence of
+    /// frames a user's click produces.
+    ///
+    /// Two positive controls:
+    ///
+    ///  * the Sends fetch was spawned. Only `send_fetch.wants_fetch(
+    ///    show_sends)` does that, and `show_sends` is `matches!(body,
+    ///    VaultBodyState::Sends)` -- so a spawn is the body state itself,
+    ///    observed rather than assumed.
+    ///  * the fixture item's name is NOT on screen. The Sends screen REPLACES
+    ///    the item list and the detail pane; a window showing both would mean
+    ///    the click selected nothing and this test measured the Vault arm
+    ///    over again.
+    #[test]
+    fn the_sends_screen_returns_promptly() {
+        let outcome = measured("sends", Scenario { press_sends: true, ..Scenario::new() });
+        assert_the_body_was_entered("sends", &outcome);
+        assert!(
+            outcome.send_list_spawns >= 1,
+            "the Sends row was pressed and no Sends fetch was started, so the window is not \
+             on `VaultBodyState::Sends` and this test is measuring some other screen. What \
+             was painted: {:?}",
+            outcome.painted
+        );
+        outcome.expect_painted(
+            SEND_NAME,
+            "the Sends screen is up and the fetch answered, but the Send it answered with is              not on screen -- `draw_send_pane`'s `Ok` arm, which is the rows a user reads,              was not executed",
         );
         assert!(
-            SYNC_SPAWNS.load(Ordering::SeqCst) >= 1,
-            "the harness ran {FRAMES} frames without reaching the auto-sync, which sits inside \
-             the closure past the `styled` guard, `draw_resize_handles` and the repaint \
-             schedule. Whatever these frames measured, it was not the closure's body -- this \
-             test would be green against a closure that waited for a minute further down"
+            !outcome.painted(LOGIN_NAME),
+            "the Sends screen is up and the vault item {LOGIN_NAME:?} is still painted, so \
+             the item list was not replaced -- the click did not take. What was painted: \
+             {:?}",
+            outcome.painted
         );
-        assert!(
-            took < BUDGET,
-            "control: the run reported {took:?}, which is not inside the budget it was \
-             admitted under"
+    }
+
+    /// **The "your vault could not be loaded" page returns promptly.**
+    ///
+    /// The third early return, added after the loading arm and the one that
+    /// once shipped without a repaint schedule of its own. A frame that waits
+    /// here is a window that failed to load AND froze.
+    ///
+    /// Positive control: the page's heading and **the loader's own reason**,
+    /// which this test chose ([`HARNESS_FAILURE`]). Requiring both is what
+    /// separates "the `Unavailable` arm ran" from "some centred label
+    /// happened to be on screen".
+    #[test]
+    fn the_unavailable_body_returns_promptly() {
+        let outcome = measured("unavailable", Scenario { load: load_that_fails, ..Scenario::new() });
+        assert_the_body_was_entered("unavailable", &outcome);
+        outcome.expect_painted(
+            "could not be loaded",
+            "the failed load did not reach the `VaultBodyState::Unavailable` arm",
+        );
+        outcome.expect_painted(
+            HARNESS_FAILURE,
+            "the error page is up but it is not showing the reason this test handed the \
+             loader, so it is not this load's failure being reported",
         );
     }
 
     /// **The bound is real**, and this is the test that says so.
     ///
     /// Without it, `within` could return `Ok` unconditionally -- or the
-    /// budget could be raised past any wall clock -- and the test above would
-    /// stay green while holding nothing. So: a body that waits well past its
-    /// budget must come back `Err`, and it must come back at all, which is
-    /// the other half (a bound that hangs is not a bound).
+    /// budget could be raised past any wall clock -- and every test above
+    /// would stay green while holding nothing. So: a body that waits well
+    /// past its budget must come back `Err`, and it must come back at all,
+    /// which is the other half (a bound that hangs is not a bound).
     #[test]
     fn a_body_that_waits_past_its_budget_is_reported_rather_than_waited_for() {
         let asked_at = Instant::now();
@@ -4481,4 +5060,50 @@ mod frame_promptness {
         );
     }
 
+    /// **The scratch directory does not survive the run.**
+    ///
+    /// The reported hygiene bug was that `FillStats::new` and the icons path
+    /// create `%TEMP%\deskwarden-frame-harness-<pid>` and nothing removes it,
+    /// leaving one directory per test process. **Measured, and it does not
+    /// reproduce**: `FillStats::new` stores a `PathBuf` and creates nothing,
+    /// and the icons directory is created by `favicon.rs` only when a favicon
+    /// is actually written -- which needs a `server_url`, and this harness
+    /// hands `None`. No such directory exists in `%TEMP%` on this machine
+    /// after any number of suite runs.
+    ///
+    /// [`Scratch`] is kept anyway, and so is this test, because "nothing
+    /// under that path is written today" is a property of the arms currently
+    /// driven, not of the window: a scenario added later that reaches the
+    /// favicon cache or a `record_fill` would start leaving one behind, and
+    /// the guard means nobody has to notice.
+    ///
+    /// **Both halves are asserted**, because a `Drop` that deleted a
+    /// directory nothing ever created would pass the second assertion alone
+    /// -- and since the run genuinely creates nothing, the control makes the
+    /// directory itself rather than pretending the window did.
+    #[test]
+    fn the_harness_leaves_no_scratch_directory_behind() {
+        let path = {
+            let scratch = Scratch::new("hygiene");
+            let path = scratch.0.clone();
+            let outcome = within(BUDGET, {
+                let path = path.clone();
+                move || drive(Scenario::new(), &path)
+            })
+            .unwrap_or_else(|()| panic!("the hygiene scenario did not come back"));
+            assert!(outcome.load_spawns >= 1, "control: the hygiene scenario built no window");
+            // Control: there IS something to delete when the guard drops.
+            std::fs::create_dir_all(path.join("icons"))
+                .expect("could not create the control directory");
+            std::fs::write(path.join("icons").join("probe"), b"probe")
+                .expect("could not create the control file");
+            assert!(path.exists(), "control: the control directory was not created");
+            path
+        };
+        assert!(
+            !path.exists(),
+            "the harness left {path:?} behind, contents and all. One abandoned directory per \
+             test process is what this drop guard exists to stop"
+        );
+    }
 }
