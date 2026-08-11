@@ -7,7 +7,7 @@
 use crate::bw_path::bw_command;
 use crate::vault_bridge::{VaultBridge, VaultItem};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 /// Port `bw serve` is started on, and that [`BW_SERVE_URL`] points at.
@@ -130,7 +130,7 @@ pub fn stop_bw_serve(child: &mut Child) {
 /// `bw_path::bw_command`): this process is about to hand the child a live
 /// session token, so "we never checked which binary this is" has to be a
 /// refusal, not a resolve-and-hope.
-pub fn bw_serve_command(session_token: &str) -> Result<Command, String> {
+pub fn bw_serve_command(session_token: &str) -> Result<crate::bw_path::BareCommand, String> {
     let mut cmd = bw_command()?;
     cmd.args(["serve", "--port", &BW_SERVE_PORT.to_string()])
         .env("BW_SESSION", session_token)
@@ -139,16 +139,15 @@ pub fn bw_serve_command(session_token: &str) -> Result<Command, String> {
     Ok(cmd)
 }
 
-/// Spawns `bw serve` directly, with no job-object protection.
-///
-/// Prefer `job_object::spawn_in_job(job, bw_serve_command(token)?)`, which
-/// closes the window between spawn and job assignment. This exists for callers
-/// that have no job object at all.
-pub fn spawn_bw_serve(session_token: &str) -> Result<Child, String> {
-    bw_serve_command(session_token)?
-        .spawn()
-        .map_err(|e| format!("failed to spawn `bw serve`: {e}"))
-}
+// `spawn_bw_serve` used to live here: a `pub fn` that spawned `bw serve`
+// directly, with no job-object protection, "for callers that have no job object
+// at all". Nothing in this crate called it, and it was a finished door out of
+// the kill-on-close job that `vault_export` or `send` could have walked through
+// while naming no command type and writing no `.spawn()` of their own -- every
+// rule in `job_object`'s guards satisfied, a `bw` holding a live session token
+// running outside the job. The only caller that ever wanted one, `main`, holds
+// a job and goes through `job_object::spawn_in_job`. Deleted rather than
+// documented.
 
 /// Polls `vault.list_items()` until it succeeds or the schedule is exhausted.
 ///
@@ -198,7 +197,12 @@ pub fn wait_for_vault_ready(
 /// Failure is non-fatal (we can still work from the cached vault), so this
 /// returns a `Result` for the caller to log rather than propagating.
 pub fn run_bw_sync(session_token: &str) -> Result<(), String> {
+    // Jobless, as it has always been: `bw sync` is a short-lived child that is
+    // waited on right here, and `bw_serve.rs` is one of the files
+    // `job_object`'s tree walk already excuses. Taking the command out of the
+    // wrapper is the visible, greppable act of doing so.
     let output = bw_command()?
+        .into_jobless_command()
         .arg("sync")
         .env("BW_SESSION", session_token)
         .output()

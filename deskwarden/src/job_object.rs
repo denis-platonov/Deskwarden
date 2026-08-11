@@ -614,17 +614,53 @@ mod tests {
 
     /// Ways to start a child process that do NOT pass through
     /// [`spawn_in_job`], and so are invisible to the probe above.
+    ///
+    /// **Scanned twice, and the second pass is the one that has to hold.** The
+    /// line pass exists only to name a line number, which is what makes a
+    /// failure actionable. It reads UNSTRIPPED source, and the eighth hop was
+    /// written straight through it:
+    ///
+    ///     let _ = real.spawn ();
+    ///
+    /// One space. `.spawn ()` contains none of the three literals, so the line
+    /// pass said nothing -- exactly the mistake the round-six note in
+    /// [`code_only`] warns about, left standing on this one matcher while the
+    /// other rules moved onto the stripped view.
+    ///
+    /// So the second pass runs the same needles over [`code_only`], where
+    /// comments, string literals and **all whitespace** are gone: `.spawn ()`,
+    /// `.spawn/*x*/()`, `. spawn ( )` and a receiver split across two lines are
+    /// one string there. Counted rather than merely searched, so an occurrence
+    /// the line pass already reported is not reported twice -- and if the two
+    /// disagree the stripped count wins, because it is the one no spelling can
+    /// hide from.
     fn direct_child_starts(label: &str, text: &str) -> Vec<String> {
         let needles = [
             concat!(".spa", "wn()"),
             concat!(".out", "put()"),
             concat!(".sta", "tus()"),
         ];
-        text.lines()
+        let mut found: Vec<String> = text
+            .lines()
             .enumerate()
             .filter(|(_, line)| needles.iter().any(|n| line.contains(n)))
             .map(|(i, line)| format!("{label}:{}: {}", i + 1, line.trim()))
-            .collect()
+            .collect();
+
+        let code = code_only(text);
+        for needle in needles {
+            let stripped = code.matches(needle).count();
+            let named = found.iter().filter(|f| f.contains(needle)).count();
+            // Fails safe in both directions: a stripped count that exceeds what
+            // the line pass could name adds the difference as line-less
+            // offenders, and a line pass that somehow saw more adds nothing.
+            for _ in named..stripped {
+                found.push(format!(
+                    "{label}: (in the comment-, string- and whitespace-free view) {needle}"
+                ));
+            }
+        }
+        found
     }
 
     #[test]
@@ -749,10 +785,40 @@ mod tests {
                 .len(),
             1
         );
+        // ...including THE EIGHTH HOP's spelling, which is the same three
+        // literals with one space in the middle and which the line pass alone
+        // could not see.
+        assert_eq!(
+            direct_child_starts(
+                "planted.rs",
+                &format!("let _ = real{};", concat!(".spa", "wn ()"))
+            )
+            .len(),
+            1,
+            "`.spawn ()` is still invisible here, so this guard would lose the eighth hop again"
+        );
+        // ...and the same thing split across lines, which no line-by-line
+        // matcher can ever see however many spellings it is taught.
+        assert_eq!(
+            direct_child_starts(
+                "planted.rs",
+                &format!("let _ = real\r\n    {}\r\n    );", concat!(".spa", "wn ("))
+            )
+            .len(),
+            1,
+            "a receiver and its `spawn` on two lines slip past"
+        );
         // ...and does not flag the choke-point call itself.
         assert!(direct_child_starts(
             "planted.rs",
             "let child = crate::job_object::spawn_in_job(self.job(), command)?;"
+        )
+        .is_empty());
+        // ...nor prose about spawning, which the stripped pass must drop or
+        // every doc comment in these two modules becomes an offender.
+        assert!(direct_child_starts(
+            "planted.rs",
+            "/// The runner used to call .spawn ( ) itself; it no longer can.\r\nlet a = 1;"
         )
         .is_empty());
     }
@@ -955,6 +1021,169 @@ mod tests {
             // `job_reaching_the_spawn` -- which is a rule about phrases, and
             // rules about phrases are what the last six rounds defeated.
 
+            // RULE 5, AND THE ONE THAT CLOSES THE EIGHTH HOP. Rule 1 bans
+            // *naming* a bare command type; it cannot ban receiving one by
+            // inference, which is exactly what the eighth hop did:
+            //
+            //     if let Ok(mut real) = crate::bw_path::bw_command_in(None) {
+            //         real.args(export_args(plan));
+            //         let _ = real.spawn ();
+            //     }
+            //
+            // The identifier `Command` never appeared. `bw_command_in` was
+            // `pub` and handed back a bare `std::process::Command`, so a second
+            // real `bw.exe` -- signature-verified, this plan's argv, an
+            // unlocked vault -- started outside the kill-on-close job with
+            // every rule above still satisfied.
+            //
+            // `bw_path::bw_command_in`, `bw_path::bw_command` and
+            // `bw_serve::bw_serve_command` now hand back a
+            // `bw_path::BareCommand` instead, and after that change NO public
+            // function in this crate returns a bare command. The single door
+            // out of that wrapper is the inherent method below.
+            //
+            // Why this is a fact and not another spelling race: **an inherent
+            // method cannot be aliased, re-exported or renamed in Rust.** There
+            // is no `use path::method as other`, there is no trait to reach it
+            // through (the field is private, so no foreign impl can extract
+            // it), and there is no operator sugar for it. Calling it therefore
+            // means writing this exact identifier, in code, in this file. An
+            // identifier has one spelling and `code_only` sees through
+            // whitespace, so `BareCommand :: into_jobless_command ( c )` and
+            // `c.into_jobless_command()` are the same string here.
+            assert_eq!(
+                code.matches("into_jobless_command").count(),
+                0,
+                "{file} takes a command out of `BareCommand`, which is the one way to hold a \
+                 spawnable `std::process::Command` in this crate -- so it can start a `bw` \
+                 holding an unlocked vault outside the kill-on-close job"
+            );
+
+            // RULE 6: and it may not go under `std` for a child either.
+            // Everything above is about the safe API; `CreateProcessW` and
+            // friends are reachable from the `windows` crate with no command
+            // type named anywhere, and cannot be called without this keyword.
+            // Free to assert -- both files contain zero `unsafe` today -- and
+            // if one ever legitimately needs it, that is a visible edit here.
+            assert_eq!(
+                code.matches("unsafe").count(),
+                0,
+                "{file} contains `unsafe`, so it can reach a raw process-creation API directly \
+                 and no rule above would see the child"
+            );
+
+            // RULE 7: WHOSE CODE THESE TWO MODULES MAY REACH AT ALL.
+            //
+            // Every rule above is about what these files may *write*. This one
+            // is about what they may *call*, and it is here because a measured
+            // mutant walked straight through all of them:
+            //
+            //   login_ui.rs (an ALLOWED file):
+            //       pub fn run_anything_jobless(args: &[String]) { .. spawn .. }
+            //   vault_export.rs:
+            //       crate::login_ui::run_anything_jobless(&export_args(plan));
+            //
+            // No command type named, no banned identifier, no `.spawn()` in
+            // this file in any spelling -- and a jobless `bw` running with this
+            // plan's arguments. The probe cannot see it (it never reaches
+            // `spawn_in_job`) and the outcome assertion cannot see it (the
+            // honest child still arrives, still refuses, still answers). It is
+            // the residual the seventh round wrote down and left open.
+            //
+            // Closing it needs a rule of a different kind: calling code in
+            // another module means NAMING that module. So the set of modules
+            // these two may name is closed, and it is tiny -- the choke point
+            // and the one place that builds the verified command. A helper
+            // planted anywhere else is unreachable from here whatever it is
+            // called, because the path to it cannot be written.
+            //
+            // `super::` is not an escape: both files are crate-root modules,
+            // so `super::` inside their test modules names the file's own
+            // module, and `super::super::` -- which would reach the crate root
+            // and from there anything at all -- is banned outright below.
+            // Neither file contains one today.
+            // ITEMS, not modules. A module-level allow-list was measured and
+            // was not enough: `job_object.rs` is necessarily both reachable
+            // (it is the choke point) and on the tree walk's ALLOWED list (it
+            // is the one file that legitimately spawns), so a `pub fn
+            // spawn_loose(args)` added HERE and called from `vault_export`
+            // satisfied a module-level rule completely -- 2071/217/0 failed/0
+            // warnings, with a jobless `bw` running this plan's arguments.
+            // Naming an item is the same act as naming a module -- you cannot
+            // call what you cannot write -- so the list is simply drawn one
+            // level finer, and a helper that is not on it is unreachable
+            // wherever it is planted, including in this very file.
+            const REACHABLE: &[&str] = &[
+                // The choke point, and the parts of it these modules build a
+                // child out of.
+                "crate::job_object::spawn_in_job",
+                "crate::job_object::JobCommand",
+                "crate::job_object::KillOnCloseJob",
+                "crate::job_object::KillOnCloseJob::new",
+                // The `cfg(test)` recorder the seam tests arm.
+                "crate::job_object::spawn_probe::REFUSED",
+                "crate::job_object::spawn_probe::SpawnProbe::arm",
+                // The verified `bw.exe`. `bw_command_in` is on the list because
+                // `send.rs` asserts it refuses without a verified path -- and
+                // it is harmless here, because what it hands back is a
+                // `BareCommand` whose only door is closed by RULE 5.
+                "crate::bw_path::bw_job_command",
+                "crate::bw_path::bw_job_command_in",
+                "crate::bw_path::bw_command_in",
+                "crate::bw_path::verified_bw_exe",
+                "crate::bw_path::remember_verified_bw_exe",
+                "crate::bw_path::CREATE_NO_WINDOW",
+                "crate::bw_path::BW_DATA_DIR_ENV",
+            ];
+            // `send.rs`'s test module borrows `login_ui`'s allocator probe for
+            // the secret-lifetime assertions. Left as a prefix rather than
+            // itemised because it is a `#[cfg(test)]` module: production code
+            // that called into it would not compile in the non-test build at
+            // all, which is a stronger guarantee than this list gives.
+            const REACHABLE_TEST_ONLY: &[&str] = &["crate::login_ui::password_lifetime_tests::"];
+
+            let mut from = 0;
+            while let Some(at) = code[from..].find("crate::") {
+                let start = from + at;
+                from = start + "crate::".len();
+                let head: String = code[start..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                let rest = &code[start + head.len()..];
+                // `use crate::m::{A, B};` -- one occurrence, several items.
+                let named: Vec<String> = if head.ends_with("::") && rest.starts_with('{') {
+                    rest[1..]
+                        .chars()
+                        .take_while(|c| *c != '}')
+                        .collect::<String>()
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|item| format!("{head}{item}"))
+                        .collect()
+                } else {
+                    vec![head]
+                };
+                for path in named {
+                    assert!(
+                        REACHABLE.contains(&path.as_str())
+                            || REACHABLE_TEST_ONLY.iter().any(|ok| path.starts_with(ok)),
+                        "{file} names `{path}`, which is not on the list of items these two \
+                         modules may reach. A helper anywhere in this crate -- including in \
+                         `job_object.rs` itself -- could start a `bw` outside the kill-on-close \
+                         job on their behalf, and neither the probe nor the tree walk would see \
+                         the child. If this item is genuinely needed, adding it here is the \
+                         visible decision that it cannot spawn"
+                    );
+                }
+            }
+            assert_eq!(
+                code.matches("super::super").count(),
+                0,
+                "{file} reaches out through `super::super`, which lands at the crate root and \
+                 from there at every module RULE 7 just refused"
+            );
+
             // RULE 4: the only things it may reach out of `std::process` for
             // are stream wiring and this process's own pid -- neither of which
             // can describe or start a child.
@@ -966,6 +1195,42 @@ mod tests {
             );
         }
 
+        // RULE 5 IS A "COUNT IS ZERO" RULE, so it is worth exactly nothing
+        // unless the identifier it bans really is the only door out of a
+        // `BareCommand` -- a rename in `bw_path` would leave it green while
+        // banning a word that no longer means anything. Pinned at the source,
+        // in the whitespace-free view, so `pub fn into_jobless_command ( self )
+        // -> Command` is the same string.
+        let bw_path_code = code_only(&std::fs::read_to_string(src.join("bw_path.rs")).unwrap());
+        assert!(
+            bw_path_code.contains(concat!("pubfninto_jobless_", "command(self)->Command{")),
+            "`BareCommand::into_jobless_command` is gone or has changed shape, so RULE 5 now \
+             bans an identifier that is not the way out of a `BareCommand` and asserts nothing"
+        );
+        // And the producers really do hand back the wrapper -- if any of them
+        // went back to a bare `Command`, RULE 5 would still be green while a
+        // decoy could be built by inference exactly as the eighth hop did.
+        for required in [
+            concat!("pubfnbw_command_in(dir:Option<&Path>)->Result<Bare", "Command,String>"),
+            concat!("pubfnbw_command()->Result<Bare", "Command,String>"),
+            concat!("structBare", "Command{command:Command,}"),
+        ] {
+            assert!(
+                bw_path_code.contains(required),
+                "`{required}` is gone: a bare `std::process::Command` can be obtained from \
+                 `bw_path` again without writing the one banned identifier"
+            );
+        }
+        let bw_serve_code = code_only(&std::fs::read_to_string(src.join("bw_serve.rs")).unwrap());
+        assert!(
+            bw_serve_code.contains(concat!(
+                "pubfnbw_serve_command(session_token:&str)->Result<crate::bw_path::Bare",
+                "Command,String>"
+            )),
+            "`bw_serve_command` hands back a bare command again, which these two modules can \
+             call, spawn and never name"
+        );
+
         // Positive controls, through the very same matcher: each rule can see
         // the thing it exists to catch.
         let planted = |s: &str| code_only(s);
@@ -974,6 +1239,27 @@ mod tests {
         assert_eq!(p.matches("JobCommand").count(), 0);
         assert_eq!(planted("std::process::Command::new(\"x\")").matches("std::process::Stdio").count(), 0);
         assert_eq!(planted("JobCommand :: wrap ( c )").matches("JobCommand::wrap").count(), 1);
+        // RULE 5's controls: the door is seen in both spellings it has, and
+        // naming the wrapper type itself is caught by rule 1 for free, since
+        // `BareCommand` contains `Command` and is not `JobCommand`.
+        assert_eq!(
+            planted("let c = real . into_jobless_command ( ) ;")
+                .matches("into_jobless_command")
+                .count(),
+            1
+        );
+        assert_eq!(
+            planted("BareCommand::into_jobless_command(real)")
+                .matches("into_jobless_command")
+                .count(),
+            1
+        );
+        let bare = planted("let r: BareCommand = bw_command_in(None)?;");
+        assert_eq!(bare.matches("Command").count(), 1);
+        assert_eq!(bare.matches("JobCommand").count(), 0);
+        // RULE 6's control.
+        assert_eq!(planted("unsafe { CreateProcessW(..) }").matches("unsafe").count(), 1);
+        assert_eq!(planted("// unsafe\nlet a = 1;").matches("unsafe").count(), 0);
         // ...and passes the honest spelling, which names only `JobCommand`.
         let honest = planted("let c = job_object::spawn_in_job(self.job(), command)?;");
         assert_eq!(honest.matches("Command").count(), 0);
@@ -981,8 +1267,39 @@ mod tests {
 
     /// The `cfg` predicates of every `not(..)` in one file's code.
     fn negated_cfg_predicates(text: &str) -> Vec<String> {
+        balanced_after(text, concat!("not", "("))
+    }
+
+    /// The predicate of every `cfg!(..)` in one file's code.
+    ///
+    /// A separate matcher because the `not(` one cannot see this shape at all,
+    /// and this shape is the same defect:
+    ///
+    ///     let job = if cfg!(test) { job } else { std::sync::Arc::new(None) };
+    ///
+    /// measured at 2071 lib / 217 bin / 0 failed / 0 warnings. The shipped
+    /// binary got a jobless runner and the tested library did not -- byte for
+    /// byte what the `not(test)` ban exists to prevent -- expressed without the
+    /// token `not(` appearing anywhere.
+    ///
+    /// Banned outright -- **every** `cfg!`, whatever its predicate, not merely
+    /// the ones naming `test`. Unlike `#[cfg(test)]` (which only *adds* test
+    /// code) a `cfg!` in production code is a runtime branch on "which build am
+    /// I?", and there is no legitimate use for that in a crate whose entire
+    /// guarantee is that the tested build and the shipped one are the same
+    /// program. A predicate-specific ban would have been the next spelling
+    /// race: `cfg!(debug_assertions)` divides exactly the same two builds --
+    /// `cargo test` is a debug build and the shipped binary is not -- and names
+    /// `test` nowhere. Free to assert: the crate contains zero `cfg!` of any
+    /// kind.
+    fn cfg_bang_predicates(text: &str) -> Vec<String> {
+        balanced_after(text, concat!("cfg", "!("))
+    }
+
+    /// Every parenthesis-balanced span opening at `needle`, in the code-only
+    /// view. Shared by the two matchers above so they cannot drift apart.
+    fn balanced_after(text: &str, needle: &str) -> Vec<String> {
         let code = code_only(text);
-        let needle = concat!("not", "(");
         let mut found = Vec::new();
         let mut from = 0;
         while let Some(at) = code[from..].find(needle) {
@@ -1033,16 +1350,28 @@ mod tests {
         rust_sources(&src, &mut files);
         assert!(files.len() > 5, "the source walk found almost nothing: {files:?}");
 
+        let names_test = |predicate: &str| {
+            predicate
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == "test")
+        };
+
         let mut offenders = Vec::new();
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
             for predicate in negated_cfg_predicates(&text) {
-                let names_test = predicate
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .any(|token| token == "test");
-                if names_test {
+                // `debug_assertions` alongside `test`: `cargo test` is a debug
+                // build and the shipped binary is not, so `not(debug_assertions)`
+                // removes code from the tested program and keeps it in the
+                // shipped one -- the same defect, naming `test` nowhere.
+                if names_test(&predicate) || predicate.contains("debug_assertions") {
                     offenders.push(format!("{}: not({predicate})", file.display()));
                 }
+            }
+            // The second shape, and the one the `not(` scan is blind to.
+            // Every `cfg!`, whatever it asks about.
+            for predicate in cfg_bang_predicates(&text) {
+                offenders.push(format!("{}: cfg!({predicate})", file.display()));
             }
         }
         assert!(
@@ -1050,6 +1379,31 @@ mod tests {
             "this crate compiles differently when it is under test, so the suite is green about \
              a program that is not the one shipped to users:\n{}",
             offenders.join("\n")
+        );
+
+        // THE THIRD SHAPE, and the only one no walk of `src` can see: a Cargo
+        // FEATURE. `#[cfg(feature = "prod")]` is invisible to both matchers
+        // above, and with a default-on feature that the test profile turns off
+        // it divides the two builds exactly as `not(test)` does. It takes a
+        // `Cargo.toml` edit to exploit -- so `Cargo.toml` is where it is
+        // refused. This crate declares no features at all today, so the
+        // cheapest honest rule is that it declares none: adding one becomes a
+        // visible edit here, in the test whose whole subject is build
+        // divergence.
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .unwrap();
+        assert!(
+            manifest.contains("[package]"),
+            "control: the manifest was not read, so the assertion below is vacuous"
+        );
+        assert!(
+            !manifest.contains(concat!("[fea", "tures]")),
+            "this crate now declares Cargo features. A feature is a third way to compile the \
+             shipped binary differently from the tested library, and neither matcher above can \
+             see one. If a feature is genuinely needed, replace this assertion with a check that \
+             none of them gates production code -- do not simply delete it"
         );
 
         // Controls: the matcher sees every shape of the thing it bans...
@@ -1073,6 +1427,34 @@ mod tests {
         assert!(negated_cfg_predicates("fn a_thing_is_so_and_another_is_not() { let test = 1; }")
             .iter()
             .all(|p| p.is_empty()));
+
+        // The `cfg!` matcher, in both directions. The first line is the
+        // measured survivor this ban was added for.
+        for planted in [
+            concat!("let job = if ", "cfg", "!(test) { job } else { Arc::new(None) };"),
+            concat!("if ", "cfg", "! ( test ) { return; }"),
+            concat!("let x = ", "cfg", "!(all(windows, test));"),
+            concat!("let x = ", "cfg", "!(any(test, feature = \"x\"));"),
+            // The predicate-specific version of this ban would have lost to
+            // this line, which divides exactly the same two builds.
+            concat!("let job = if ", "cfg", "!(debug_assertions) { job } else { Arc::new(None) };"),
+        ] {
+            assert!(
+                !cfg_bang_predicates(planted).is_empty(),
+                "the matcher cannot see `{planted}`, so its silence above means nothing"
+            );
+        }
+        // ...and `#[cfg(test)]`, which only ever ADDS test code, is not a
+        // `cfg!` and is untouched.
+        assert!(cfg_bang_predicates("#[cfg(test)]\nmod tests {}").is_empty());
+        // The attribute form of the debug-build split, through the `not(`
+        // matcher this time.
+        assert!(negated_cfg_predicates(concat!("#[cfg(", "not", "(debug_assertions))]\nfn f() {}"))
+            .iter()
+            .any(|p| p.contains("debug_assertions")));
+        // Prose and strings are not code: the shared `code_only` view is what
+        // lets this whole file talk about `cfg!(test)` in comments at all.
+        assert!(cfg_bang_predicates(concat!("// ", "cfg", "!(test) is banned\nlet a = 1;")).is_empty());
     }
 
     #[test]

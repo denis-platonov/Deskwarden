@@ -105,8 +105,12 @@ fn bw_status_stdout(session_token: Option<&str>) -> Option<String> {
 /// `bw_command_in`'s meaning -- no override, so the child inherits whatever
 /// `BITWARDENCLI_APPDATA_DIR` the environment already had.
 fn bw_status_stdout_in(data_dir: Option<&Path>, session_token: Option<&str>) -> Option<String> {
+    // `login_ui.rs` is one of the files `job_object`'s tree walk excuses: these
+    // are short-lived `bw` children waited on inline, and none of them outlives
+    // the call. Taking the command out of `BareCommand` is the visible act of
+    // leaving the kill-on-close job's reach.
     let mut cmd = match crate::bw_path::bw_command_in(data_dir) {
-        Ok(cmd) => cmd,
+        Ok(cmd) => cmd.into_jobless_command(),
         Err(e) => {
             log::error!("cannot run `bw status`: {e}");
             return None;
@@ -318,7 +322,7 @@ pub fn bw_logout_in(data_dir: Option<&Path>) -> Result<(), String> {
 /// dropped its argument would leave the same "already logged out" success
 /// behind as one that used it, having signed the wrong account out.
 fn logout_command_in(data_dir: Option<&Path>) -> Result<std::process::Command, String> {
-    let mut cmd = crate::bw_path::bw_command_in(data_dir)?;
+    let mut cmd = crate::bw_path::bw_command_in(data_dir)?.into_jobless_command();
     cmd.arg("logout");
     Ok(cmd)
 }
@@ -340,6 +344,7 @@ fn logout_command_in(data_dir: Option<&Path>) -> Result<std::process::Command, S
 /// panic with a Rust backtrace.
 pub fn configure_server_in(url: &str, data_dir: Option<&Path>) -> Result<(), String> {
     let output = crate::bw_path::bw_command_in(data_dir)?
+        .into_jobless_command()
         .args(["config", "server", url])
         .output()
         .map_err(|e| {
@@ -385,7 +390,7 @@ fn run_bw_with_password(
     password: &str,
     data_dir: Option<&Path>,
 ) -> Result<String, String> {
-    let mut cmd = crate::bw_path::bw_command_in(data_dir)?;
+    let mut cmd = crate::bw_path::bw_command_in(data_dir)?.into_jobless_command();
     cmd.args(args);
     cmd.args(["--passwordenv", "DESKWARDEN_BW_PASSWORD"]);
     cmd.env("DESKWARDEN_BW_PASSWORD", password);

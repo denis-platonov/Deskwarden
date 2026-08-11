@@ -108,6 +108,119 @@ pub fn active_data_dir() -> Option<PathBuf> {
         .clone()
 }
 
+/// A verified `bw.exe` command that carries **no** kill-on-close job object.
+///
+/// # Why this type exists (the eighth hop)
+///
+/// [`crate::job_object::JobCommand`] made "the command that spawns into the
+/// job" unforgeable inside [`crate::vault_export`] and [`crate::send`]: those
+/// two modules may not name a bare `std::process::Command` at all (see
+/// `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`),
+/// so they cannot describe a second child. The eighth hop went around that
+/// without contradicting a single word of it:
+///
+/// ```text
+/// if let Ok(mut real) = crate::bw_path::bw_command_in(None) {
+///     real.args(export_args(plan));
+///     let _ = real.spawn ();          // one space; the line matcher misses it
+/// }
+/// ```
+///
+/// Nothing was extracted from a `JobCommand`, so its privacy was irrelevant.
+/// The identifier `Command` never appeared, because `bw_command_in` used to
+/// hand back a bare `Command` **by inference** -- so the rule that counts the
+/// identifier saw nothing, and a second real `bw.exe` holding an unlocked
+/// vault started outside the job.
+///
+/// The type is the fix, and the matcher is only the backstop. A bare `Command`
+/// now cannot arrive by inference from anywhere in this crate: every public
+/// producer hands back this wrapper, whose field is private to this module and
+/// which offers no `spawn`, `output` or `status`. The single door out is
+/// [`BareCommand::into_jobless_command`], and an **inherent method cannot be
+/// aliased, re-exported or renamed** -- there is no `use ... as` for one, and
+/// no trait to reach it through -- so calling it means writing that exact
+/// identifier, in code, in the calling file. That is a fact about Rust, not a
+/// spelling the next mutant can vary, which is precisely what the previous
+/// seven rounds kept losing.
+///
+/// Deliberately bare of derives and trait impls, for the same reason
+/// `JobCommand` is: no `Deref`, `DerefMut`, `AsRef`, `AsMut`, `Borrow`, `From`,
+/// `Into` or `IntoIterator`. Any one of them would hand the inner command out
+/// without the identifier being written, and re-open this hop.
+pub struct BareCommand {
+    /// Private to this module. **This is the whole design**; see the type's
+    /// note. Adding a second accessor that hands this out re-opens the eighth
+    /// hop.
+    command: Command,
+}
+
+impl BareCommand {
+    /// The one way to a spawnable `std::process::Command`, and therefore the
+    /// one identifier the two job-bearing modules are forbidden to write --
+    /// see `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`,
+    /// RULE 5.
+    ///
+    /// Named for what it hands over rather than for a neutral `into_inner`:
+    /// the caller is taking a `bw` child out of the kill-on-close job's reach,
+    /// and every one of the four files allowed to do it has its own reason
+    /// recorded at the call site.
+    pub fn into_jobless_command(self) -> Command {
+        self.command
+    }
+
+    /// Readers, so a test can assert what would be run without running it --
+    /// and so `send.rs` can keep asserting that `bw_command_in` refuses
+    /// without a verified path, which it must do without naming a command
+    /// type or the door above.
+    pub fn get_program(&self) -> &OsStr {
+        self.command.get_program()
+    }
+
+    pub fn get_args(&self) -> std::process::CommandArgs<'_> {
+        self.command.get_args()
+    }
+
+    pub fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.command.get_envs()
+    }
+
+    /// Forwarders, so a caller can finish describing a child without ever
+    /// holding the bare command. Each returns `&mut Self`, never `&mut
+    /// Command`.
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
+        self.command.arg(arg);
+        self
+    }
+
+    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.command.env(key, val);
+        self
+    }
+
+    pub fn stdout<T: Into<std::process::Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stdout(cfg);
+        self
+    }
+
+    pub fn stderr<T: Into<std::process::Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stderr(cfg);
+        self
+    }
+}
+
 /// Builds a `Command` for the single verified `bw.exe`, pointed at a chosen
 /// profile directory.
 ///
@@ -119,7 +232,7 @@ pub fn active_data_dir() -> Option<PathBuf> {
 /// [`active_data_dir`] so `add_account` can sign in to a *new* account's
 /// directory without ever disturbing the global that background threads are
 /// reading.
-pub fn bw_command_in(dir: Option<&Path>) -> Result<Command, String> {
+pub fn bw_command_in(dir: Option<&Path>) -> Result<BareCommand, String> {
     match verified_bw_exe() {
         Some(path) => {
             let mut cmd = Command::new(path);
@@ -127,7 +240,7 @@ pub fn bw_command_in(dir: Option<&Path>) -> Result<Command, String> {
             if let Some(dir) = dir {
                 cmd.env(BW_DATA_DIR_ENV, dir);
             }
-            Ok(cmd)
+            Ok(BareCommand { command: cmd })
         }
         None => Err(
             "no verified Bitwarden CLI: the startup check that resolves bw.exe and confirms it \
@@ -148,7 +261,7 @@ pub fn bw_command_in(dir: Option<&Path>) -> Result<Command, String> {
 /// `bw status`, `bw logout`, `bw config server` and the one call that hands
 /// over the master password all follow the active account with no signature
 /// widened at any of them.
-pub fn bw_command() -> Result<Command, String> {
+pub fn bw_command() -> Result<BareCommand, String> {
     bw_command_in(active_data_dir().as_deref())
 }
 
@@ -169,7 +282,9 @@ pub fn bw_command() -> Result<Command, String> {
 /// second resolution of `bw.exe`: the signature-verified path is still
 /// answered in exactly one place.
 pub fn bw_job_command_in(dir: Option<&Path>) -> Result<crate::job_object::JobCommand, String> {
-    bw_command_in(dir).map(crate::job_object::JobCommand::wrap)
+    bw_command_in(dir)
+        .map(BareCommand::into_jobless_command)
+        .map(crate::job_object::JobCommand::wrap)
 }
 
 /// [`bw_job_command_in`] pointed at the active account's profile directory.
@@ -464,7 +579,7 @@ mod tests {
     /// A `Vec`, not an `Option`, so "set twice" is distinguishable from "set
     /// once" — `Command::env` overwrites, but a future `env_clear`/`envs`
     /// rewrite could easily leave two.
-    fn appdata_env_entries(cmd: &Command) -> Vec<Option<PathBuf>> {
+    fn appdata_env_entries(cmd: &BareCommand) -> Vec<Option<PathBuf>> {
         cmd.get_envs()
             .filter(|(key, _)| *key == OsStr::new(BW_DATA_DIR_ENV))
             .map(|(_, value)| value.map(PathBuf::from))
