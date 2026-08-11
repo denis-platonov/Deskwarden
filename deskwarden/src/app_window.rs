@@ -5153,6 +5153,109 @@ mod lock_host_tests {
         }
     }
 
+    /// **THE SECOND LOCK OF ONE SESSION, as a source guard over the startup
+    /// host** -- the arm that must NOT be taken into the working stage.
+    ///
+    /// A second lock finds the `FnOnce` teardown spent, so no worker starts.
+    /// Sent down the ordinary arm it clears the token, switches the drain to
+    /// a channel that is `Disconnected` from its first poll, and closes the
+    /// window with no token -- which is `main`'s "closed without a session"
+    /// branch and a bare `std::process::exit(1)` with no dialog. The user
+    /// presses Lock, signs back in, presses Lock, and the app vanishes.
+    ///
+    /// **The `if ` and the `{` are part of every needle**, for the reason the
+    /// guard above records: `if false && lock.the_teardown_was_already_spent()`
+    /// leaves the call in the text and short-circuits it away, and it was
+    /// MEASURED green across the whole suite before this test existed. A
+    /// guard that merely finds the mention is a guard about a call the code
+    /// contains rather than one it reaches.
+    #[test]
+    fn the_startup_hosts_second_lock_never_enters_the_working_stage() {
+        let startup = startup_host();
+        const ASK: &str = concat!("if lock.the_teardown_was_already_", "spent() {");
+        assert_eq!(
+            startup.matches(ASK).count(),
+            1,
+            "the startup host does not ask, exactly once and as the condition itself, \
+             whether the lock it just caught found its teardown already spent. Without \
+             that question a second lock takes the ordinary arm, waits out a channel \
+             nothing is sending on, and ends in `main`'s no-dialog `exit(1)`: {startup}"
+        );
+        // Positive control on the needle: it really does fail to match the
+        // short-circuited spelling, so the assertion above is about
+        // reachability and not about mention.
+        assert!(
+            !concat!("if false && lock.the_teardown_was_already_", "spent() {").contains(ASK),
+            "control: the needle matches a short-circuited call, so it could never tell \
+             a live question from a dead one"
+        );
+
+        let at = startup.find(ASK).expect("counted just above");
+        let rest = &startup[at..];
+        let end = rest
+            .find(concat!("} else", " {"))
+            .expect("the spent-teardown branch has no other arm, so nothing locks normally");
+        let spent = &rest[..end];
+        for (needle, why) in [
+            (
+                concat!("*spent_for_closure.borrow_mut() = ", "true;"),
+                "nothing records that this lock tore nothing down, so `main` cannot tell \
+                 it from a closed sign-in card and takes the silent `exit(1)` again",
+            ),
+            (
+                concat!("close_this_", "window(ui.ctx(), &mut closing);"),
+                "the branch records the second lock and then leaves the window open on a \
+                 vault stage whose frame it has already torn down -- a blank window the \
+                 user cannot lock and cannot leave",
+            ),
+        ] {
+            assert!(spent.contains(needle), "{why}: {spent}");
+        }
+        for (banned, why) in [
+            (
+                concat!("working_on = WorkingOn::", "TheLocksTeardown;"),
+                "the second lock switches the drain to the teardown channel after all, \
+                 so the stage waits out a channel nothing will ever send on",
+            ),
+            (
+                concat!("advance(stage, Event::", "Locked)"),
+                "the second lock takes the transition into the working stage, which is \
+                 the whole of the defect",
+            ),
+            (
+                concat!("*tore_down_for_closure.borrow_mut() = ", "true;"),
+                "the second lock claims it tore the session down when it tore nothing \
+                 down, so `main` skips the match-engine rebuild it is owed",
+            ),
+        ] {
+            assert!(!spent.contains(banned), "{why}: {spent}");
+        }
+        // And the ordinary arm really is the OTHER one, so the three bans
+        // above cannot be passing because the whole lock arm went away.
+        let ordinary = &rest[end..];
+        assert!(
+            ordinary.contains(concat!("working_on = WorkingOn::", "TheLocksTeardown;")),
+            "control: the else arm no longer enters the working stage either, so a lock \
+             that DOES tear down never reaches its own spinner: {ordinary}"
+        );
+
+        // **And the flag has to leave the window.** Recorded in a cell no
+        // reader ever sees is the same as not recorded at all.
+        assert!(
+            startup.contains(concat!(
+                "let locked_without_a_teardown = *locked_without_a_teardown.",
+                "borrow();"
+            )),
+            "the second-lock flag is never read back out of its cell, so whatever the \
+             arm wrote dies with the window and `main` sees only a missing token: \
+             {startup}"
+        );
+        assert!(
+            startup.contains(concat!("locked_without_a_teardown,", "")),
+            "the flag is read and then not carried in `StartupOutcome`: {startup}"
+        );
+    }
+
     /// **THE REPORTED BUG, as a source guard over the startup host.**
     ///
     /// The user's sentence is "still showing separate screen after login":
