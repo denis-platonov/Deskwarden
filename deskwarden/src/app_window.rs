@@ -830,28 +830,47 @@ where
                 // `bw serve` still holding a live session, which is the v0.5.0
                 // defect in a new place and invisible to every test that
                 // cannot run a frame.
-                let progress = if let (Some(teardown), Some(step_tx), Some(token_rx)) =
-                    (self.teardown.take(), self.step_tx.take(), self.token_rx.take())
-                {
-                    std::thread::spawn(move || {
-                        let step_tx = step_tx;
-                        teardown(&step_tx, token_rx);
-                    });
-                    self.stage.reached(LockReach::WorkerStarted);
-                    LockProgress::TeardownStarted
-                } else {
-                    LockProgress::TeardownAlreadySpent
-                };
-                // **Recorded, not derived.** The host above has to send a
-                // spent-teardown lock somewhere other than the working
-                // stage, and by the time it asks, `self.teardown` is `None`
-                // on both paths.
-                self.caught = Some(progress);
+                let progress = self.claim_the_teardown();
                 let was = *self.relocked.borrow();
                 *self.relocked.borrow_mut() = session_torn_down(was, progress);
                 true
             }
         }
+    }
+
+    /// **Claiming the teardown, and RECORDING which of the two happened.**
+    ///
+    /// Lifted out of [`Self::catch_the_lock`] without a behaviour change,
+    /// for one reason: `catch_the_lock` cannot be called from a test (it
+    /// needs a live frame reporting a close), and the property this method
+    /// carries is the one the second-lock finding is about. Called twice,
+    /// it must answer differently -- and until it could be called at all,
+    /// nothing in this crate said so.
+    ///
+    /// **The recording is the load-bearing line.** The host has to send a
+    /// spent-teardown lock somewhere other than the working stage, and it
+    /// cannot derive that from `self.teardown`: the FIRST lock takes the
+    /// `FnOnce` too, so from the frame after it the field reads exactly the
+    /// same. Latching the first answer instead of writing each one --
+    /// `self.caught.or(Some(progress))` -- restores the silent exit whole,
+    /// and it was measured green across the entire suite before
+    /// `a_second_claim_reports_the_teardown_spent_and_so_does_a_third`
+    /// existed.
+    fn claim_the_teardown(&mut self) -> LockProgress {
+        let progress = if let (Some(teardown), Some(step_tx), Some(token_rx)) =
+            (self.teardown.take(), self.step_tx.take(), self.token_rx.take())
+        {
+            std::thread::spawn(move || {
+                let step_tx = step_tx;
+                teardown(&step_tx, token_rx);
+            });
+            self.stage.reached(LockReach::WorkerStarted);
+            LockProgress::TeardownStarted
+        } else {
+            LockProgress::TeardownAlreadySpent
+        };
+        self.caught = Some(progress);
+        progress
     }
 
     /// **Did the lock just caught find its `FnOnce` teardown already
@@ -3764,6 +3783,62 @@ mod lock_transition_tests {
             "a worker that finished its teardown and then died had it retracted, so the \
              session is torn down twice"
         );
+    }
+
+    /// **THE SECOND LOCK OF ONE SESSION, driven rather than argued.**
+    ///
+    /// The first claim starts a worker and answers `TeardownStarted`. Every
+    /// claim after it must answer `TeardownAlreadySpent` -- the closures are
+    /// `FnOnce` and there is exactly one of each per window.
+    ///
+    /// **This is the assertion that did not exist**, and the reason it did
+    /// not is that the thing to assert about was an ABSENCE: no second
+    /// teardown, nothing to write a test against. What it cost was measured
+    /// rather than argued -- the second lock cleared the token, entered a
+    /// working stage draining a channel nothing sends on, closed the window
+    /// with no token, and `main` called `std::process::exit(1)` with no
+    /// dialog. Press Lock, sign back in, press Lock, and the app vanishes.
+    ///
+    /// The THIRD claim is asserted too. It is unreachable in a real window
+    /// -- the host ends the window on the second -- but the recording it
+    /// depends on is per-claim rather than latched, and a latch is exactly
+    /// the shape that reads correct and answers the first lock forever.
+    #[test]
+    fn a_second_claim_reports_the_teardown_spent_and_so_does_a_third() {
+        let relocked = Rc::new(RefCell::new(false));
+        let mut lock = a_lock_under_test(&relocked);
+        assert!(
+            !lock.the_teardown_was_already_spent(),
+            "control: a lock that has caught nothing yet already reports its teardown \
+             spent, so every FIRST lock would be sent down the second-lock arm"
+        );
+
+        assert_eq!(
+            lock.claim_the_teardown(),
+            LockProgress::TeardownStarted,
+            "the FIRST lock of a window did not claim its teardown, so nothing is torn \
+             down at all"
+        );
+        assert!(
+            !lock.the_teardown_was_already_spent(),
+            "the first lock reports itself as a second one, so a lock that DID start a \
+             worker is sent to the exit instead of to its own spinner"
+        );
+
+        for nth in ["second", "third"] {
+            assert_eq!(
+                lock.claim_the_teardown(),
+                LockProgress::TeardownAlreadySpent,
+                "the {nth} lock of one window claims a teardown that is already spent, so \
+                 the host is told a worker started when none did"
+            );
+            assert!(
+                lock.the_teardown_was_already_spent(),
+                "the {nth} lock does not report its teardown spent, so the host sends it \
+                 into a working stage whose channel is `Disconnected` from the first \
+                 poll -- the window closes with no token and `main` exits 1 in silence"
+            );
+        }
     }
 
     /// **And the other direction, which is the one the vault actually hangs
