@@ -88,18 +88,42 @@ $UserAgent = 'deskwarden-installer'
 # match, so the list widens what is accepted only by these named
 # organizations, not by anything that happens to contain the string.
 #
-# TODO (verify before shipping): confirm this list against a real
-# Bitwarden-signed bw.exe -- download a current bw-windows-*.zip release,
-# extract bw.exe, and run
+# VERIFIED (entry 1 only), 2026-08-10. Confirmed against a real,
+# currently-valid Bitwarden-signed bw.exe -- the CLI this bootstrap itself
+# downloads -- with
 #   (Get-AuthenticodeSignature bw.exe).SignerCertificate.SubjectName.Format($true)
-# then make sure its O= value appears verbatim below (and drop the entries
-# that don't apply). This is the same verify-against-reality step the CLI
-# download URL and asset-naming pattern got on 2026-07-28 (see the .DESCRIPTION
-# block above); it could not be repeated for the certificate here because no
-# bw.exe was available on the machine this was written on and downloading one
-# was out of scope. Failure mode if the list is wrong is fail-closed and
-# recoverable: bootstrap exits 2, and the installer tells the user to install
-# the CLI themselves.
+# and, independently, through the Rust port in src/signature.rs so that what
+# was checked is what the app actually reads. Both agreed:
+#
+#   Status     : Valid
+#   O=         : Bitwarden Inc.       (CN= is identical on this certificate)
+#   Thumbprint : 80375A0C9630A51ECB7EC79B37A8174C8DACCCED
+#   Issuer     : CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1,
+#                O="DigiCert, Inc.", C=US
+#   NotAfter   : 2027-07-30T16:59:59Z
+#
+# So 'Bitwarden Inc.' below is real and is spelled exactly as the certificate
+# spells it. THE OTHER FOUR ENTRIES ARE STILL UNVERIFIED -- plausible
+# spellings nobody here has seen on a Bitwarden certificate. They are kept
+# rather than dropped: '8bit Solutions LLC' is Bitwarden's documented former
+# legal name, the punctuation variants cover DN drift between issuances, and
+# each is an exact whole-component match on a name a public CA had to
+# validate before issuing -- so they widen what is accepted only slightly,
+# while dropping them would fail a legitimate older or differently-punctuated
+# Bitwarden build closed for no gain. 'Bitwarden' alone is the weakest and
+# the first that should go if this is ever tightened.
+#
+# Note the expiry: the verification above is one certificate, on one machine,
+# that stops existing in 2027, and the O= spelling on its successor is not
+# knowable today. Re-run the command above when that happens.
+#
+# Failure mode if the list is wrong remains fail-closed and recoverable:
+# bootstrap exits 2, and the installer tells the user to install the CLI
+# themselves. (The app-startup check in src/main.rs is deliberately graded
+# more softly -- it asks rather than exits -- because by then there is no
+# installer left to give the user that instruction. See the note on
+# TRUSTED_BW_SIGNER_ORGANIZATIONS and classify_bw_signature there, which
+# carries the same finding and must stay in step with this one.)
 #
 # Deliberately not a thumbprint pin (unlike updater.rs's pin on deskwarden's
 # own signer): that pin is appropriate for a binary verifying its own future

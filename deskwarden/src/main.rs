@@ -108,12 +108,49 @@ const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISS
 /// handed the user's master password (`login_ui::run_bw_with_password`) or
 /// session token.
 ///
-/// TODO (verify before shipping): this list has not yet been confirmed
-/// against a real Bitwarden-signed `bw.exe` -- see the identical TODO on
-/// `$BitwardenSignerOrganizations` in `installer/bootstrap-bw.ps1` for the
-/// verification step.
+/// **Entry 1, `"Bitwarden Inc."`, is verified.** Checked 2026-08-10 against
+/// a real, currently-valid Bitwarden-signed `bw.exe` -- the CLI this
+/// project's own installer downloads. Measured twice: once with
+/// `Get-AuthenticodeSignature`, and once through
+/// `signature::verify_authenticode` itself, so what is recorded here is what
+/// production reads rather than what a cmdlet formats.
 ///
-/// Because the list is *known to be unverified*, a mismatch is deliberately
+/// ```text
+/// valid      : true
+/// O=         : Bitwarden Inc.       (CN= happens to be identical -- see below)
+/// thumbprint : 80375A0C9630A51ECB7EC79B37A8174C8DACCCED
+/// issuer     : CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1,
+///              O="DigiCert, Inc.", C=US
+/// notAfter   : 2027-07-30T16:59:59Z
+/// ```
+///
+/// That certificate's subject DN is pinned verbatim as
+/// `REAL_BITWARDEN_CLI_SUBJECT_DN` (in the test module), and the tests below
+/// run the *production* comparison -- `signature::is_trusted_organization`
+/// against this very constant -- over it, so a well-meant retyping of the
+/// string here fails the suite. Note the expiry: one certificate, on one
+/// machine, that stops existing in 2027 -- and the organization spelling on
+/// its replacement is not knowable today.
+///
+/// **The other four entries remain unverified** -- plausible spellings nobody
+/// here has seen on a real Bitwarden certificate. They are kept rather than
+/// trimmed: `8bit Solutions LLC` is Bitwarden's documented former legal name,
+/// the punctuation variants cover the way DN spelling drifts between
+/// issuances, and each is an *exact whole-`O=`-component* match on a name a
+/// public CA had to validate before issuing -- so the breadth they add is
+/// narrow, while dropping them would turn a legitimate older or
+/// differently-punctuated Bitwarden certificate into a scary dialog, and a
+/// dialog users learn to click through is worse than the entry. `"Bitwarden"`
+/// alone is the weakest of the four and the first that should go if this list
+/// is ever tightened.
+///
+/// The matching note on `$BitwardenSignerOrganizations` in
+/// `installer/bootstrap-bw.ps1` records the same finding and must stay in
+/// step with this one.
+///
+/// Because four of the five entries are *still unverified* -- and the fifth
+/// is verified only against a single certificate that expires in 2027 -- a
+/// mismatch is deliberately
 /// **not** treated the same way `EXPECTED_SIGNER_THUMBPRINT` treats a bad
 /// update signature. See `check_bw_signature` below for the graded response
 /// and the reasoning behind it: an unsigned or tamper-detected binary is
@@ -2474,8 +2511,33 @@ fn fatal_startup_error(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Checks that the resolved `bw.exe` is Bitwarden's, and decides what to do
-/// when it can't be shown to be.
+/// The graded outcome of the startup `bw.exe` signature check, named and
+/// separated from [`check_bw_signature`]'s dialogs so the grading itself can
+/// be driven by a test.
+///
+/// *Which* of these four a verification result lands on is the behaviour that
+/// matters -- `Refuse` kills the app before the master password is typed, the
+/// two `Ask` arms put it to the user, `Trusted` is silent. While that routing
+/// lived inline with three message boxes and a `process::exit`, no test could
+/// reach it: [`TRUSTED_BW_SIGNER_ORGANIZATIONS`] could have been pinned
+/// perfectly while nothing checked that the list was consulted at all, that it
+/// was consulted against `O=` rather than some other component, or that an
+/// invalid signature still reached the hard refusal rather than a dialog.
+#[derive(Debug, PartialEq, Eq)]
+enum BwSignatureVerdict {
+    /// Validly signed *and* the signer's `O=` is one of
+    /// [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]. Startup continues, silently.
+    Trusted,
+    /// The OS gave a verdict and it was "not trusted": unsigned, tampered
+    /// with, expired, or not chaining to a trusted root. Refused outright.
+    Refuse,
+    /// Validly signed, but by an organization the list does not name. Asked.
+    AskUnrecognizedOrg,
+    /// The check could not be run at all. Asked.
+    AskUnverifiable,
+}
+
+/// Grades one `verify_authenticode` result.
 ///
 /// The response is graded rather than uniform, because the two failures are
 /// not equally conclusive:
@@ -2486,39 +2548,69 @@ fn fatal_startup_error(message: &str) -> ! {
 ///   Refused outright -- with an explanation the user can actually see.
 /// * **The signature is valid but the signer's `O=` isn't in
 ///   [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]**, or the check couldn't be run at
-///   all. Here the evidence points at *our* list as much as at the binary:
-///   that list carries a standing "not yet confirmed against a real
-///   Bitwarden-signed bw.exe" TODO, and `installer/bootstrap-bw.ps1` will
-///   happily leave a Scoop- or Chocolatey-installed `bw` in place, whose
-///   signer is legitimately somebody else. Hard-exiting on our own unverified
-///   data would brick those installs with no recovery path -- the updater
-///   can't help, this runs before it. So the user is told precisely what was
-///   found and asked, with "no, quit" as the default button.
+///   all. Here the evidence points at *our* list as much as at the binary,
+///   and `installer/bootstrap-bw.ps1` will happily leave a Scoop- or
+///   Chocolatey-installed `bw` in place, whose signer is legitimately somebody
+///   else. Hard-exiting on our own data would brick those installs with no
+///   recovery path -- the updater can't help, this runs before it. So the user
+///   is told precisely what was found and asked, with "no, quit" as the
+///   default button.
 ///
-/// The judgment call, stated plainly: a *known-unverified* allowlist should
-/// not be able to silently kill the app, but it also shouldn't be quietly
-/// ignored, because the next thing to happen is the master password being
-/// typed. Asking is the only option that is honest about both.
-fn check_bw_signature(bw_exe: &std::path::Path) {
-    let (headline, detail) = match deskwarden::signature::verify_authenticode(bw_exe) {
+/// **The grading survives entry 1 of the list becoming verified** (2026-08-10,
+/// see [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]), and that was a decision, not an
+/// omission. The original justification was "the list is known to be
+/// unverified"; that is now weaker for one entry and unchanged for the other
+/// four. It is still not grounds for refusing a *validly signed* binary
+/// outright: the evidence is one sample, from one machine, against one
+/// certificate that expires 2027-07-30, and the spelling on its successor is
+/// unknown -- so the day that certificate rotates is exactly the day a
+/// hard-exit here would lock every user out of a tray app that has no console
+/// to explain itself. The Scoop/Chocolatey case is untouched by the
+/// measurement and was always an independent reason to ask. Meanwhile the arm
+/// that actually catches tampering -- `Refuse` on an invalid signature -- was
+/// never graded and is not softened here.
+///
+/// The `Trusted` arm is first and is the only one that consults
+/// [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]; everything below it has already failed
+/// that comparison.
+fn classify_bw_signature(
+    result: &Result<deskwarden::signature::SignatureInfo, String>,
+) -> BwSignatureVerdict {
+    match result {
         Ok(info)
             if deskwarden::signature::is_trusted_organization(
-                &info,
+                info,
                 TRUSTED_BW_SIGNER_ORGANIZATIONS,
             ) =>
         {
+            BwSignatureVerdict::Trusted
+        }
+        Ok(info) if !info.valid => BwSignatureVerdict::Refuse,
+        Ok(_) => BwSignatureVerdict::AskUnrecognizedOrg,
+        Err(_) => BwSignatureVerdict::AskUnverifiable,
+    }
+}
+
+/// Checks that the resolved `bw.exe` is Bitwarden's, and does what
+/// [`classify_bw_signature`]'s verdict says about it -- return silently, refuse
+/// to start, or ask. The reasoning behind the grading lives on that function.
+fn check_bw_signature(bw_exe: &std::path::Path) {
+    let result = deskwarden::signature::verify_authenticode(bw_exe);
+    let subject_dn = result.as_ref().ok().and_then(|i| i.subject_dn.clone());
+    let (headline, detail) = match classify_bw_signature(&result) {
+        BwSignatureVerdict::Trusted => {
             log::info!(
                 "bw CLI at {} verified as Bitwarden-signed",
                 bw_exe.display()
             );
             return;
         }
-        Ok(info) if !info.valid => {
+        BwSignatureVerdict::Refuse => {
             log::error!(
                 "refusing to start: {} does not carry a valid Authenticode signature \
                  (subject: {:?})",
                 bw_exe.display(),
-                info.subject_dn
+                subject_dn
             );
             fatal_startup_error(&format!(
                 "The Bitwarden CLI that Deskwarden found is not validly signed, so Deskwarden \
@@ -2529,19 +2621,24 @@ fn check_bw_signature(bw_exe: &std::path::Path) {
                 bw_exe.display()
             ));
         }
-        Ok(info) => {
+        BwSignatureVerdict::AskUnrecognizedOrg => {
             log::warn!(
-                "{} is validly signed, but by an organization not in the (still unverified) \
-                 trusted list; subject: {:?}",
+                "{} is validly signed, but by an organization not in the (only partly \
+                 verified) trusted list; subject: {:?}",
                 bw_exe.display(),
-                info.subject_dn
+                subject_dn
             );
             (
                 "signed by an organization Deskwarden does not recognize",
-                describe_signer(info.subject_dn.as_deref()),
+                describe_signer(subject_dn.as_deref()),
             )
         }
-        Err(e) => {
+        BwSignatureVerdict::AskUnverifiable => {
+            let e = result
+                .as_ref()
+                .err()
+                .map(String::as_str)
+                .unwrap_or("(no detail was reported)");
             log::warn!(
                 "could not verify the signature of {}: {e}",
                 bw_exe.display()
@@ -7090,6 +7187,194 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The subject DN of the certificate on a real Bitwarden CLI, exactly as
+    /// `signature::verify_authenticode` hands it back: `CertNameToStrW` with
+    /// `CERT_X500_NAME_STR | CERT_NAME_STR_CRLF_FLAG`, so one RDN per line,
+    /// CRLF-separated, least significant first. (That is *not* the order
+    /// `Get-AuthenticodeSignature`'s `.Subject` prints, which is why this was
+    /// taken through the crate's own code path rather than off a cmdlet.)
+    ///
+    /// Transcribed 2026-08-10 from `bw.exe`, 126,338,512 bytes, SHA-256
+    /// `56DF885D2620A8F7A572FF83DD6C3C195A7A5AFEDAD523EC746B49A2989C997C`,
+    /// signer thumbprint `80375A0C9630A51ECB7EC79B37A8174C8DACCCED`, issued by
+    /// `CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1`, verdict
+    /// `Valid`, certificate good until 2027-07-30T16:59:59Z.
+    ///
+    /// **A literal, deliberately.** No test here may read the installed CLI --
+    /// or anything else outside this repository -- so the certificate is
+    /// captured as data. The cost is that this fixture cannot notice Bitwarden
+    /// re-issuing under a different name; that is exactly what the "verified
+    /// against one certificate that expires in 2027" caveat on
+    /// [`TRUSTED_BW_SIGNER_ORGANIZATIONS`] is about.
+    const REAL_BITWARDEN_CLI_SUBJECT_DN: &str = concat!(
+        "OID.1.3.6.1.4.1.311.60.2.1.3=US\r\n",
+        "OID.1.3.6.1.4.1.311.60.2.1.2=Delaware\r\n",
+        "OID.2.5.4.15=Private Organization\r\n",
+        "SERIALNUMBER=7654941\r\n",
+        "C=US\r\n",
+        "S=California\r\n",
+        "L=Santa Barbara\r\n",
+        "O=Bitwarden Inc.\r\n",
+        "CN=Bitwarden Inc."
+    );
+
+    /// A validly-signed result carrying `subject_dn`, which is the only field
+    /// the organization check reads. The thumbprint is the real one purely so
+    /// nothing here can accidentally depend on it: the `bw.exe` check is by
+    /// organization, never by thumbprint (see `EXPECTED_SIGNER_THUMBPRINT`,
+    /// which is a different pin, on deskwarden's own updates).
+    fn signed_by(subject_dn: &str) -> deskwarden::signature::SignatureInfo {
+        deskwarden::signature::SignatureInfo {
+            valid: true,
+            thumbprint: Some("80375A0C9630A51ECB7EC79B37A8174C8DACCCED".to_string()),
+            subject_dn: Some(subject_dn.to_string()),
+        }
+    }
+
+    /// The measurement that closed the "not yet confirmed against a real
+    /// Bitwarden-signed bw.exe" TODO, re-run as an assertion.
+    ///
+    /// Pinned through `classify_bw_signature` rather than by inspecting
+    /// [`TRUSTED_BW_SIGNER_ORGANIZATIONS`] directly, and that is the whole
+    /// point: a test that reads the list only proves the list, and the list
+    /// can be flawless while the code compares the wrong DN component or never
+    /// reaches the comparison. This runs the real startup grading over the real
+    /// certificate's real DN.
+    #[test]
+    fn the_real_bitwarden_cli_certificate_is_trusted_by_the_production_list() {
+        assert_eq!(
+            classify_bw_signature(&Ok(signed_by(REAL_BITWARDEN_CLI_SUBJECT_DN))),
+            BwSignatureVerdict::Trusted,
+            "startup no longer recognizes the certificate on a real, currently-valid \
+             Bitwarden-signed bw.exe, so every user would be met with the \
+             unrecognized-CLI dialog before typing their master password"
+        );
+    }
+
+    /// Control on the test above: it is sensitive to the list it claims to
+    /// exercise. With nothing trusted, the very same certificate is not.
+    #[test]
+    fn the_real_certificate_is_not_trusted_by_an_empty_list() {
+        assert!(
+            !deskwarden::signature::is_trusted_organization(
+                &signed_by(REAL_BITWARDEN_CLI_SUBJECT_DN),
+                &[]
+            ),
+            "control: the organization check said yes with nothing trusted at all, so \
+             it is not reading the trusted list and the test above proves nothing"
+        );
+    }
+
+    /// The verified entry is pinned *byte for byte*, not case-insensitively and
+    /// not by `contains`, because the production comparison is an exact
+    /// whole-component match and a tidy-up that drops the trailing period, adds
+    /// a comma, or straightens the capitalisation would silently stop matching a
+    /// real certificate.
+    #[test]
+    fn the_verified_organization_is_spelled_exactly_as_the_certificate_spells_it() {
+        let orgs = deskwarden::signature::dn_component(REAL_BITWARDEN_CLI_SUBJECT_DN, "O");
+        assert_eq!(
+            orgs,
+            vec!["Bitwarden Inc."],
+            "the fixture's O= component is not what was measured off the real \
+             certificate, so everything pinned against it is pinned against a \
+             fiction"
+        );
+        assert!(
+            TRUSTED_BW_SIGNER_ORGANIZATIONS
+                .iter()
+                .any(|trusted| *trusted == orgs[0]),
+            "the verified organization {:?} is no longer present verbatim in \
+             TRUSTED_BW_SIGNER_ORGANIZATIONS ({:?}) -- the one entry in that list \
+             anybody has actually seen on a Bitwarden certificate has been \
+             reworded",
+            orgs[0],
+            TRUSTED_BW_SIGNER_ORGANIZATIONS
+        );
+    }
+
+    /// **The real certificate cannot tell `O=` from `CN=`** -- it spells both
+    /// `Bitwarden Inc.`, so switching the production comparison to `CN=` would
+    /// leave every fixture-against-reality test above green. Decoys where the
+    /// two components disagree are the only thing that can see it.
+    #[test]
+    fn the_trusted_organization_check_reads_the_o_component_and_not_the_cn() {
+        assert_eq!(
+            deskwarden::signature::dn_component(REAL_BITWARDEN_CLI_SUBJECT_DN, "CN"),
+            vec!["Bitwarden Inc."],
+            "premise: the real certificate is only blind to an O=/CN= swap because \
+             its CN happens to match its O; if that stops being true, say so here \
+             rather than leaving the claim in a comment"
+        );
+
+        let cn_says_bitwarden = "O=Totally Unrelated Ltd\r\nCN=Bitwarden Inc.";
+        assert_eq!(
+            classify_bw_signature(&Ok(signed_by(cn_says_bitwarden))),
+            BwSignatureVerdict::AskUnrecognizedOrg,
+            "a certificate issued to `Totally Unrelated Ltd` was accepted because its \
+             common name says Bitwarden: the check is reading the wrong DN \
+             component, and anyone who can get a certificate with a CN of their \
+             choosing is handed the master password"
+        );
+
+        let o_says_bitwarden = "O=Bitwarden Inc.\r\nCN=Totally Unrelated Ltd";
+        assert_eq!(
+            classify_bw_signature(&Ok(signed_by(o_says_bitwarden))),
+            BwSignatureVerdict::Trusted,
+            "the organization is Bitwarden Inc. and startup refused to recognize it, \
+             so the check is not reading O= either"
+        );
+    }
+
+    /// The graded response, arm by arm: only *validly signed but unrecognized*
+    /// and *unverifiable* may ask. An invalid signature is the fact this check
+    /// exists to act on and stays a hard refusal -- softening it into a dialog
+    /// is a one-token edit that no list-shaped test would notice.
+    #[test]
+    fn an_invalid_signature_is_refused_outright_even_when_it_names_bitwarden() {
+        let mut tampered = signed_by(REAL_BITWARDEN_CLI_SUBJECT_DN);
+        tampered.valid = false;
+        assert_eq!(
+            classify_bw_signature(&Ok(tampered)),
+            BwSignatureVerdict::Refuse,
+            "a bw.exe whose Authenticode signature does not verify -- tampered with, \
+             or with a Bitwarden-looking subject grafted on -- is now merely asked \
+             about instead of refused, and the default-No dialog is one Enter key \
+             away from the master password"
+        );
+    }
+
+    /// The other half of the grading: a check that could not run is *not*
+    /// escalated to a refusal. See `classify_bw_signature` for why -- this runs
+    /// before the updater, so a hard exit here has no recovery path.
+    #[test]
+    fn a_signature_that_could_not_be_read_is_asked_about_rather_than_refused() {
+        assert_eq!(
+            classify_bw_signature(&Err("the file carries no readable signature".to_string())),
+            BwSignatureVerdict::AskUnverifiable,
+            "a signature check that failed to run now kills the app on startup with \
+             no way back"
+        );
+    }
+
+    /// The dialog the graded response puts up has to name the organization the
+    /// *check* rejected. If it read `CN` while the check read `O`, the warning
+    /// would reassuringly say "signed by: Bitwarden Inc." about the exact
+    /// certificate it is warning the user away from.
+    #[test]
+    fn the_unrecognized_signer_dialog_names_the_organization_the_check_read() {
+        assert_eq!(
+            describe_signer(Some(REAL_BITWARDEN_CLI_SUBJECT_DN)),
+            "It is signed by: Bitwarden Inc."
+        );
+        assert_eq!(
+            describe_signer(Some("O=Totally Unrelated Ltd\r\nCN=Bitwarden Inc.")),
+            "It is signed by: Totally Unrelated Ltd",
+            "the dialog would tell the user the binary is signed by Bitwarden while \
+             the check rejected it for being signed by somebody else"
+        );
+    }
 
     /// The foreground window these tests ask the match engine about.
     ///
