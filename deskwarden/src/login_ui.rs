@@ -7564,6 +7564,34 @@ pub(crate) mod password_lifetime_tests {
         // unpruned enumeration, under two seconds, because it reads no file's
         // bytes -- the two-minute figure elsewhere in this module is the cost
         // of READING 6,178 files, not of listing directories.
+        // **And "pruned by the list written HERE" was itself the next
+        // circularity, measured.** The list below prunes the walk; before
+        // this round it was ALSO the subtrahend in the set equality's filter
+        // and in the `git ls-files` oracle's filter, so one edit to it moved
+        // all three together. Measured at `fb4bf7d` with a real probe planted
+        // in the TRACKED `deskwarden/examples/`: retargeting this list at
+        // `deskwarden/examples` and growing [`BUILD_OUTPUT_DIRS`] to match --
+        // two coordinated edits, both in this file -- was GREEN in both
+        // configurations, probe and all, with only `job_object`'s own
+        // unrelated listing firing. The oracle did not save it, because the
+        // oracle subtracted by this same list.
+        //
+        // So the four layers no longer share an input:
+        //
+        // * the prune below is this list, and it is DECLARED circular: the
+        //   assertion under it pins the list to the const's own expansion, so
+        //   the two restatements cannot drift apart in silence;
+        // * the const's expansion must be NAMED BY `.gitignore` -- the only
+        //   input this test reads from outside this file, present in both
+        //   configurations because it is tracked. A term naming a directory
+        //   `.gitignore` does not exclude fails here whatever this test's
+        //   local lists say;
+        // * the set equality subtracts the const's expansion and the recorded
+        //   refusals, never this list;
+        // * the `git ls-files` oracle subtracts NOTHING, and a fourth check
+        //   -- the directories of the files the SCAN's own listing returned,
+        //   which is a different enumerator entirely and runs in both
+        //   configurations -- must all have been reached.
         let literals = [root.join("target"), root.join("deskwarden").join("target")];
         // `root` is carried and unused by the prune ON PURPOSE: the mutation
         // this control exists to survive is `build_output_dir(root, &path)`
@@ -7604,7 +7632,17 @@ pub(crate) mod password_lifetime_tests {
                 directories(root, &path, literals, out, refused);
             }
         }
-        // No predicate, no prune, nothing to widen. The second opinion.
+        // **The second opinion, and what it is and is not.** It consults no
+        // predicate of ours and prunes nothing by name of ours -- but it is
+        // NOT filter-free, and the comment here used to say it was. It
+        // carries a `.git` name filter byte-identical to the pruned walk's,
+        // and a silent `let Ok(entries) = .. else { return }`. Widening this
+        // filter ALONE is caught, because `reached` then strictly contains
+        // `expected`; widening BOTH in lockstep is not caught by the equality
+        // at all, and was not caught by the floor either for any directory
+        // the floor does not name. That is what the fourth check below --
+        // over the directories of the files the scan's own listing returned
+        // -- is for, and it holds in both configurations.
         fn every_directory(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -7621,6 +7659,86 @@ pub(crate) mod password_lifetime_tests {
         let mut reached: Vec<std::path::PathBuf> = Vec::new();
         let mut refused_dirs: Vec<std::path::PathBuf> = Vec::new();
         directories(&root, &root, &literals, &mut reached, &mut refused_dirs);
+
+        // **The const's own expansion, and the declared circularity.** The
+        // prune above is a restatement of this; saying so out loud is the
+        // point. The two cannot drift, so an edit to one of them alone is a
+        // failure here rather than a silent widening of the other three
+        // layers below.
+        let const_dirs: Vec<std::path::PathBuf> = BUILD_OUTPUT_DIRS
+            .iter()
+            .map(|rel| rel.iter().fold(root.clone(), |acc, c| acc.join(c)))
+            .collect();
+        assert_eq!(
+            literals.as_slice(),
+            const_dirs.as_slice(),
+            "the list this test prunes by is no longer the expansion of `BUILD_OUTPUT_DIRS`. \
+             These two are the SAME statement written twice, and this test used to let them \
+             drift: the prune list, the set equality's subtrahend and the `git ls-files` \
+             oracle's subtrahend were all this one list, so retargeting it and the const \
+             together shipped a probe-bearing tracked directory out of the scan, green in \
+             both configurations"
+        );
+
+        // **The one input this test reads from OUTSIDE this file.** Every
+        // directory `BUILD_OUTPUT_DIRS` excludes must be a directory
+        // `.gitignore` excludes. `.gitignore` is tracked, so it is present in
+        // a `git archive` export as well as in a checkout, and no edit inside
+        // `login_ui.rs` can move it. This is what makes the widening
+        // measured above -- a third entry naming `deskwarden/examples`, with
+        // every local list grown to agree -- a failure rather than a green
+        // suite: `.gitignore` names no `examples/`.
+        let ignore_text = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
+        let mut ignored_names: Vec<&str> = Vec::new();
+        let mut ignored_paths: Vec<std::path::PathBuf> = Vec::new();
+        for line in ignore_text.lines() {
+            let line = line.trim();
+            // Directory patterns only -- a trailing `/` is what makes a
+            // `.gitignore` line say "directory". Negations are not consulted,
+            // and a line that needs one is not a line a build output
+            // directory is named by.
+            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                continue;
+            }
+            let Some(pat) = line.strip_suffix('/') else {
+                continue;
+            };
+            if let Some(anchored) = pat.strip_prefix('/') {
+                ignored_paths.push(anchored.split('/').fold(root.clone(), |acc, c| acc.join(c)));
+            } else if !pat.contains('/') {
+                ignored_names.push(pat);
+            }
+        }
+        assert!(
+            !ignored_names.is_empty() && !ignored_paths.is_empty(),
+            "control: `{}` parsed into {} unanchored name(s) and {} anchored path(s), so the \
+             outside input the check below rests on is not there and that check passes by \
+             having nothing to say",
+            root.join(".gitignore").display(),
+            ignored_names.len(),
+            ignored_paths.len()
+        );
+        let unignored: Vec<&std::path::PathBuf> = const_dirs
+            .iter()
+            .filter(|d| {
+                !ignored_paths.iter().any(|p| p == *d)
+                    && !d
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| ignored_names.iter().any(|i| *i == n))
+            })
+            .collect();
+        assert!(
+            unignored.is_empty(),
+            "`BUILD_OUTPUT_DIRS` excludes {} director(ies) that `.gitignore` does not exclude, \
+             the first of them {:?}. A directory this repository TRACKS files in is not build \
+             output, and deleting it from the probe scan deletes tracked source text from the \
+             one test that reads this tree back. `.gitignore` is the only input this test has \
+             that does not live in this file, so this is the one line here that a coordinated \
+             edit to the const and to every local list in this test cannot satisfy",
+            unignored.len(),
+            unignored.first()
+        );
         let excluded: Vec<&std::path::PathBuf> =
             reached.iter().filter(|d| build_output_dir(&root, d)).collect();
         assert!(
@@ -7692,7 +7810,7 @@ pub(crate) mod password_lifetime_tests {
         let expected: std::collections::BTreeSet<&std::path::PathBuf> = all
             .iter()
             .filter(|d| {
-                !literals.iter().any(|l| d.starts_with(l))
+                !const_dirs.iter().any(|l| d.starts_with(l))
                     && !refused_dirs.iter().any(|r| d.starts_with(r))
             })
             .collect();
@@ -7733,7 +7851,38 @@ pub(crate) mod password_lifetime_tests {
             .arg(&root)
             .args(["ls-files", "-z"])
             .output();
-        if let Some(listed) = raw.ok().filter(|o| o.status.success()) {
+        let listed = match &raw {
+            Ok(out) if out.status.success() => Some(out),
+            // **The degradation is loud now.** This used to be
+            // `raw.ok().filter(|o| o.status.success())`, so a `git` that
+            // could not be run, or that ran and failed, dropped the whole
+            // oracle in silence and left the fallback's layers standing in
+            // for a check the comment above says is the only outside one.
+            // A tree with no repository to ask is the stated case and stays
+            // silent; a tree that HAS a `.git` and still cannot be asked is
+            // a broken instrument and says so.
+            Ok(out) => {
+                assert!(
+                    !root.join(".git").exists(),
+                    "control: `git ls-files` ran in a tree that HAS a `.git` and reported {} \
+                     ({:?}), so the outside oracle below did not run and this test silently \
+                     degraded to the two enumerations written in this file",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                None
+            }
+            Err(e) => {
+                assert!(
+                    !root.join(".git").exists(),
+                    "control: `git` could not be started ({e}) in a tree that HAS a `.git`, so \
+                     the outside oracle below did not run and this test silently degraded to \
+                     the two enumerations written in this file"
+                );
+                None
+            }
+        };
+        if let Some(listed) = listed {
             let mut tracked_dirs: std::collections::BTreeSet<std::path::PathBuf> =
                 std::collections::BTreeSet::new();
             for rel in listed.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
@@ -7746,11 +7895,33 @@ pub(crate) mod password_lifetime_tests {
                     at = parent;
                 }
             }
-            let missing: Vec<&std::path::PathBuf> = tracked_dirs
+            // **No subtraction.** The filter that used to sit here was
+            // `!literals.iter().any(..)`, which handed the oracle the same
+            // input the prune and the set equality already had -- one edit
+            // moved all three, and that is the finding this round closes.
+            // Nothing is subtracted from the tracked listing now: every
+            // directory holding a tracked file must have been reached, full
+            // stop. That is sound only because git tracks no file under a
+            // build output directory, and that is asserted rather than
+            // assumed, immediately below and by name. If someone ever
+            // `git add -f`s into `target/`, this reds loudly with its own
+            // message instead of quietly widening the oracle.
+            let tracked_in_build: Vec<&std::path::PathBuf> = tracked_dirs
                 .iter()
-                .filter(|d| !literals.iter().any(|l| d.starts_with(l)))
-                .filter(|d| !reached.contains(*d))
+                .filter(|d| const_dirs.iter().any(|l| d.starts_with(l)))
                 .collect();
+            let missing: Vec<&std::path::PathBuf> =
+                tracked_dirs.iter().filter(|d| !reached.contains(*d)).collect();
+            assert!(
+                tracked_in_build.is_empty(),
+                "control: git TRACKS a file under a directory `BUILD_OUTPUT_DIRS` excludes, \
+                 the directory being {:?}. The oracle below subtracts nothing from the tracked \
+                 listing, which is what stops one edit from moving the prune, the set equality \
+                 and the oracle together -- and that is sound exactly while this holds. A \
+                 force-added file under a build output directory is tracked source text the \
+                 probe scan never reads: remove it, or stop calling that directory build output",
+                tracked_in_build.first()
+            );
             assert!(
                 tracked_dirs.len() > 10,
                 "control: `git ls-files` named {} director(ies) of tracked files, so the check \
@@ -7776,6 +7947,50 @@ pub(crate) mod password_lifetime_tests {
              otherwise shrink both sides of that equality together and go unnoticed -- the \
              second-order form of the circular prune. Refused: {:?}",
             refused_dirs
+        );
+
+        // **The fourth layer, and the only one that works in the fallback
+        // too: a THIRD enumerator, already computed above for another
+        // purpose.** `files` is what the probe scan itself will read --
+        // produced by [`tracked_files`] on the git path and by [`walk`] in
+        // the fallback, neither of which is either of the two walks in this
+        // test. Every directory holding one of those files must have been
+        // reached by the pruned walk.
+        //
+        // This is what catches the lockstep widening of the `.git` NAME
+        // FILTER, which the set equality cannot see by construction -- widen
+        // it in both walks and the same subtree leaves both sides together --
+        // and which the floor only saw for the five names it happens to
+        // list. Measured before this check existed: widening both filters at
+        // `deskwarden/examples`, a tracked directory the floor does not name,
+        // SURVIVED in both configurations; at `.github`, which the floor does
+        // name, it was killed. That is a pin that depends on which name a
+        // reviewer picks, which is the species this whole control exists to
+        // stop shipping.
+        let scanned_dirs: std::collections::BTreeSet<&std::path::Path> = files
+            .iter()
+            .filter_map(|f| f.parent())
+            .filter(|p| *p != root.as_path())
+            .collect();
+        let unwalked: Vec<&&std::path::Path> =
+            scanned_dirs.iter().filter(|d| !reached.iter().any(|r| r == **d)).collect();
+        assert!(
+            scanned_dirs.len() > 5,
+            "control: the scan's own listing named {} director(ies), so the check below is a \
+             check over nothing",
+            scanned_dirs.len()
+        );
+        assert!(
+            unwalked.is_empty(),
+            "{} director(ies) hold a file the probe scan is about to READ and were never \
+             reached by the directory enumeration above, the first of them {:?}. The two walks \
+             in this test are both written here and can be taught the same blindness in \
+             lockstep -- a widened `.git` name filter in both of them removes the same subtree \
+             from both sides of the set equality and is invisible there. `files` comes from a \
+             different enumerator, in both configurations, and this is where that lockstep \
+             stops being free",
+            unwalked.len(),
+            unwalked.first()
         );
 
         // **Three needles over the same bytes, and no encoding DECISION.**
