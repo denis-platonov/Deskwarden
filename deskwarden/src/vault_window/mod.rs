@@ -2540,7 +2540,15 @@ pub fn build_frame(
         // `send_ui::pane_state`, which is where that decision is tested.
         let send_pane = show_sends
             .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock));
-        let mut send_action = send_ui::SendUiAction::None;
+        // **What the pane reports travels in a linear value.** See
+        // `send_ui::SendUiVerdict`: `into_action` is the only way out of
+        // one and it consumes the verdict, so an action substituted
+        // anywhere between the pane and the applier must DROP the real
+        // verdict -- and a verdict dropped still holding its action is
+        // counted. That is a statement about the ACTION rather than about
+        // the call, so unlike a spelling, an argument or a brace-depth pin
+        // it does not have to guess which state a shadow will be gated on.
+        let mut send_action: Option<send_ui::SendUiVerdict> = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
             .show(ui, |ui| {
@@ -2548,12 +2556,12 @@ pub fn build_frame(
                 // item list, so it takes this panel whole and the read/edit
                 // pane below is not drawn at all.
                 if let Some(state) = &send_pane {
-                    send_action = send_ui::draw_send_pane(
+                    send_action = Some(send_ui::draw_send_pane(
                         ui,
                         state,
                         notice_message.as_deref(),
                         send_delete.view(),
-                    );
+                    ));
                     return;
                 }
                 // Resolved from the list the selection was made in, for the
@@ -3313,8 +3321,24 @@ pub fn build_frame(
         // running. That was measured on this file's export wiring. So the
         // decision is a function the tests really call, and what is left here
         // is one unconditional statement whose brace depth is itself pinned.
+        // **THE COUNT IS ZERO, ALWAYS.** The counter is monotonic and
+        // thread-local, so a verdict abandoned anywhere in this frame --
+        // including at the end of a scope, after this line -- is still
+        // non-zero when the next frame reaches here, and every test that
+        // draws this window draws more than one frame. A `debug_assert`
+        // because in a shipping build the right answer is a dead pane
+        // rather than a dead process; the tests all run in debug.
+        debug_assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "a Sends verdict was dropped instead of applied, so what the pane reported \
+             never reached `apply_send_action` and the whole Sends screen -- Copy link, \
+             Refresh, Delete, Cancel and the confirmation -- is inert. See \
+             `send_ui::SendUiVerdict`"
+        );
         apply_send_action(
-            send_action,
+            send_action.map(send_ui::SendUiVerdict::into_action)
+                .unwrap_or(send_ui::SendUiAction::None),
             &mut send_delete,
             &mut send_fetch,
             ui.ctx(),
@@ -17183,14 +17207,61 @@ mod export_wiring {
     /// `spawn_export`, whatever it is named and wherever it is written, so it
     /// fails here -- and so does any forwarder, any rename and any no-op.
     ///
+    /// **The sixth field, `settings_path`, is pinned too -- by VALUE, since
+    /// it is not a function.** It is the value that decides whether a frame
+    /// reads and writes the user's real `%APPDATA%\\Deskwarden`, and it had no
+    /// assertion of any kind anywhere: `production()` could have handed the
+    /// window `None`, or a path in the temp directory, and the whole suite
+    /// would have stayed green while every preference the user set was
+    /// silently discarded between runs. It is not exploitable the way a spawn
+    /// is -- nothing is executed -- but it is the field whose corruption would
+    /// be least visible from the tests and most visible to the user.
+    ///
     /// **What this does NOT cover, plainly.** It says the pointer is the right
-    /// FUNCTION; it says nothing about what that function does. A hollowed-out
-    /// `spawn_export` passes this and is caught by `export_thread`'s own
-    /// tests. It also says nothing about whether the frame ever reads the
-    /// field -- that is the click tests, above and in `send_delete_wiring`.
+    /// FUNCTION; it says nothing about what that function does.
+    ///
+    /// A hollowed-out `spawn_export` passes this, and the claim that it is
+    /// "caught by `export_thread`'s own tests" was WRONG IN KIND and is
+    /// corrected here, because a doc that names the wrong catcher is how a gap
+    /// survives a review. **No behavioural test fires on a hollow
+    /// `spawn_export`.** Both hollow shapes -- the body replaced by `let _ =
+    /// (ctx_for_export, tx, session);`, and the `spawn_export_with(..)` shape
+    /// kept with the work replaced by `ExportReport::Interrupted` -- were
+    /// measured, and both die to
+    /// [`spawn_export_only_hands_the_real_work_to_the_tested_spawner`] and to
+    /// nothing else. That test is a TEXT MATCH over the function's body, so
+    /// anything that satisfies the text while not doing the work would ship.
+    ///
+    /// What genuinely holds the work is one layer down, and behaviourally:
+    /// `a_panicking_worker_reports_an_ambiguous_failure_instead_of_wedging_the_window` runs
+    /// `spawn_export_with` off-thread and reads the report off the channel,
+    /// and `the_report_carries_the_outcome_the_runner_produced`
+    /// runs `pick_and_export_with`. The residual is exactly one call:
+    /// `real_destination`, the modal file picker, which is the one thing in
+    /// this path no test may execute. Everything above it is held by text and
+    /// everything below it by behaviour, and that split is stated here rather
+    /// than papered over.
+    ///
+    /// This also says nothing about whether the frame ever READS a field --
+    /// that is the click tests, above and in `send_delete_wiring`.
     /// The three together are what hold the seam: the source pin says the
     /// constructor is the only one, this says its values are real, and the
     /// clicks say the window uses them.
+    ///
+    /// **Residual on `fn_addr_eq`, recorded rather than fixed.** A reviewer
+    /// built a probe crate with this crate's exact release profile (`lto =
+    /// true`, `codegen-units = 1`) and measured that under `--release` MSVC's
+    /// identical-COMDAT-folding makes two DIFFERENT functions with identical
+    /// bodies compare EQUAL, and a pure forwarder compare EQUAL to its callee;
+    /// under debug both compare `false`. The real crate holds -- `cargo test
+    /// --release --lib production_hands_the_window_the_real_functions` with a
+    /// forwarder mutant applied FAILED correctly -- and the decoy control
+    /// below cannot itself be folded, because `unreachable!` makes its body
+    /// textually distinct from every target. But an IDENTICAL-BODY twin of a
+    /// spawn function would fold in release and pass here, and the decoy would
+    /// not reveal it, so the vacuity would be invisible in this test's own
+    /// output. Unreachable today: CI runs only `cargo build --release`
+    /// (`.github/workflows/release.yml`), never `cargo test --release`.
     #[test]
     fn production_hands_the_window_the_real_functions() {
         let env = VaultFrameEnv::production();
@@ -17217,6 +17288,38 @@ mod export_wiring {
             ("export", std::ptr::fn_addr_eq(env.export, real_export)),
             ("send_delete", std::ptr::fn_addr_eq(env.send_delete, real_delete)),
         ];
+        // THE SIXTH FIELD, by value. `default_path` is where the real
+        // `%APPDATA%\\Deskwarden` is decided, and a window handed anything
+        // else keeps the user's preferences somewhere they will never be
+        // read again.
+        assert_eq!(
+            env.settings_path,
+            crate::settings::default_path(),
+            "`VaultFrameEnv::production` hands the window a settings path that is not \
+             `settings::default_path()`. Nothing here is executed, so no click test and \
+             no address comparison can see this -- a `None` or a scratch path leaves the \
+             whole suite green while every preference the user sets is discarded between \
+             runs"
+        );
+        // CONTROL: the comparison discriminates, and the value is a real
+        // path rather than the `None` that would make the assertion above
+        // pass by both sides being empty.
+        let real_path = env.settings_path.clone().expect(
+            "control: production hands the window no settings path at all, so the \
+             equality above is `None == None` and holds nothing",
+        );
+        assert!(
+            real_path.ends_with(crate::settings::SETTINGS_FILE_NAME),
+            "production's settings path {real_path:?} does not end in the settings file \
+             name, so whatever it points at is not this app's settings file"
+        );
+        assert_ne!(
+            env.settings_path,
+            Some(std::env::temp_dir().join(crate::settings::SETTINGS_FILE_NAME)),
+            "control: production's settings path compares EQUAL to a path it plainly is \
+             not, so the equality above is vacuous"
+        );
+
         for (field, same) in checked {
             assert!(
                 same,
@@ -18347,18 +18450,87 @@ mod send_delete_wiring {
         ));
     }
 
-    /// A vault load that answers at once with an empty but LOADED vault --
-    /// loaded, because the `Loading` arm returns before the sidebar's Sends
+    /// The folder [`frame_items`] files its items under, so that
+    /// `folders` is not empty either.
+    const FRAME_FOLDER_ID: &str = "frame-harness-folder-id";
+
+    /// The item this harness's vault holds, whose row the last step selects.
+    const FRAME_ITEM_ID: &str = "frame-harness-item-id";
+    const FRAME_ITEM_NAME: &str = "Frame Harness Item";
+
+    /// **A LOADED AND NON-EMPTY VAULT.**
+    ///
+    /// Loaded, because the `Loading` arm returns before the sidebar's Sends
     /// row is drawn, so a window left on the spinner could never reach the
     /// screen this test is about.
+    ///
+    /// **Non-empty, because an empty one shipped a defect.** This answered
+    /// with `items: Vec::new()` and `folders: Vec::new()`, and `items` is in
+    /// scope at the `apply_send_action` call. `let send_action = if
+    /// items.is_empty() { send_action } else { None };` was therefore
+    /// measured GREEN through the click test below -- every control on the
+    /// Sends screen dead for every account with so much as one item, which is
+    /// every real account, while the fixture's account was the one shape that
+    /// could not see it. The paired inversion was KILLED here, which is what
+    /// proved the statement was reached and the survivor a live defect.
+    ///
+    /// So this vault has an item, in a folder, and the click test drives a
+    /// selection through it. That closes the states this fixture can be
+    /// gated on; what closes the ones it still CANNOT is
+    /// [`send_ui::SendUiVerdict`], which does not enumerate states at all.
+    fn frame_items() -> Vec<crate::vault_bridge::VaultItem> {
+        vec![crate::vault_bridge::VaultItem {
+            id: FRAME_ITEM_ID.to_string(),
+            name: FRAME_ITEM_NAME.to_string(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: Some(FRAME_FOLDER_ID.to_string()),
+            favorite: false,
+            other: serde_json::Map::new(),
+        }]
+    }
+
+    /// Whether [`frame_load`] answers with an EMPTY vault instead.
+    ///
+    /// Both shapes have to be reachable, and measuring is why. With the
+    /// harness on an empty vault, `if items.is_empty() { send_action } else
+    /// { None }` was green; with it on a populated one, the mirror -- `if
+    /// items.is_empty() { None } else { send_action }` -- became green
+    /// instead, because no test in the crate drew the Sends pane over an
+    /// empty vault at all. That mirror is a real defect with a real
+    /// audience: a brand-new account has no items, and it would have had no
+    /// working Sends screen either. Swapping which of two states a fixture
+    /// builds only moves the blind spot, so this harness builds both.
+    static FRAME_VAULT_IS_EMPTY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     fn frame_load(
         _cache: Arc<VaultCache>,
         tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
         request: VaultLoadRequest,
     ) {
+        if FRAME_VAULT_IS_EMPTY.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = tx.send((
+                request.generation,
+                Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+            ));
+            return;
+        }
         let _ = tx.send((
             request.generation,
-            Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+            Ok(VaultSnapshot {
+                items: frame_items(),
+                folders: vec![crate::vault_bridge::Folder {
+                    id: FRAME_FOLDER_ID.to_string(),
+                    name: "Frame Harness Folder".to_string(),
+                    other: serde_json::Map::new(),
+                }],
+            }),
         ));
     }
 
@@ -18424,6 +18596,7 @@ mod send_delete_wiring {
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let scratch = std::env::temp_dir().join(format!(
             "deskwarden-send-delete-frame-{}-{:?}",
@@ -18743,8 +18916,12 @@ mod send_delete_wiring {
                 is_file: false,
             }]),
         ));
+        // Five frames painted and five asserted: the assert used to run
+        // before the repaint at the end of the body, so the last frame the
+        // loop painted was never looked at.
         let mut settled = ctx.run_ui(input(), |ui| frame_fn(ui));
         for _ in 0..4 {
+            settled = ctx.run_ui(input(), |ui| frame_fn(ui));
             assert!(
                 find(&settled, FRAME_STALE_NAME).is_none(),
                 "Refresh was pressed while a Sends fetch was in flight and the answer the \
@@ -18753,7 +18930,6 @@ mod send_delete_wiring {
                  was accepted as current. What was painted: {:?}",
                 texts(&settled)
             );
-            settled = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
         assert!(
             find(&settled, FRAME_SEND_NAME).is_some(),
@@ -18763,6 +18939,206 @@ mod send_delete_wiring {
             texts(&settled)
         );
 
+        // 7. **A SELECTED ITEM DOES NOT KILL THE SCREEN.**
+        //
+        // The state that made this harness's first draft miss a live
+        // defect was not a Sends state at all: `items` and `selected_id`
+        // are both in scope where the Sends action is applied, and this
+        // window's vault was empty and its selection never made. So: go
+        // back to the vault, press the real item row, return to Sends, and
+        // press Delete with an item selected behind the screen.
+        let vault_at = locate(&settled, "All items");
+        let on_vault = click(&ctx, &mut frame_fn, vault_at);
+        let item_at = locate(&on_vault, FRAME_ITEM_NAME);
+        let selected = click(&ctx, &mut frame_fn, item_at);
+        let sends_at = locate(&selected, sidebar::SENDS_ROW_LABEL);
+        let back_on_sends = click(&ctx, &mut frame_fn, sends_at);
+        let delete_at = locate(&back_on_sends, send_ui::DELETE_LABEL);
+        let armed_with_selection = click(&ctx, &mut frame_fn, delete_at);
+        assert!(
+            find(&armed_with_selection, send_ui::CONFIRM_LABEL).is_some(),
+            "with a real item selected in a real, non-empty vault, pressing Delete on a \
+             Send row put up no {:?} confirmation. What the vault holds and what is \
+             selected in it are not reasons to refuse a revoke -- and a shadow gated on \
+             either is exactly the one this harness shipped, because it loaded no items \
+             and made no selection. What was painted: {:?}",
+            send_ui::CONFIRM_LABEL,
+            texts(&armed_with_selection)
+        );
+
+        // 8. **AND NOTHING THE PANE REPORTED WAS THROWN AWAY.**
+        //
+        // The steps above each name a state. This one names none: every
+        // frame painted since this window was built minted a
+        // `send_ui::SendUiVerdict` if it drew the Sends pane, and a verdict
+        // that is dropped instead of applied is counted. Zero is the only
+        // correct answer whatever the window was showing, so this catches a
+        // shadow gated on a state this fixture cannot construct -- which is
+        // the class of defect every step above is, by construction, blind
+        // to. `run`'s own `debug_assert` says the same thing on every
+        // frame; this says it once more where it can be read.
+        assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "a Sends verdict was dropped rather than applied while this test drove the \
+             window, so what the pane reported never reached `apply_send_action` on some \
+             frame -- see `send_ui::SendUiVerdict`"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// **A brand-new account -- no items, no folders -- still has a working
+    /// Sends screen.**
+    ///
+    /// The mirror of the defect that made the test above load a populated
+    /// vault, and it is here because swapping a fixture's one state for
+    /// another only moves the blind spot. Measured, on the populated fixture
+    /// alone: `let send_action = if items.is_empty() { None } else {
+    /// send_action };` was GREEN across the whole suite, because no test in
+    /// the crate drew the Sends pane over an empty vault. Under it every
+    /// control on the Sends screen is dead for exactly the accounts that have
+    /// nothing in the vault yet -- which is every account on its first day,
+    /// and Sends is one of the few things such an account can actually use.
+    ///
+    /// Deliberately short: the states a Sends screen can be in are the test
+    /// above's business. All this adds is the VAULT behind it.
+    ///
+    /// **No `bw`, no dialog, no network** -- the same substituted env.
+    #[test]
+    fn an_empty_vault_still_has_a_working_sends_screen() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_VAULT_IS_EMPTY.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-empty-vault-frame-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::with_send_delete(
+                super::frame_env_seam::stubbed(
+                    frame_sync,
+                    frame_load,
+                    frame_send_list,
+                    Some(scratch.join("settings.json")),
+                ),
+                frame_revoke,
+            ),
+        );
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let output = ctx.run_ui(input(), |ui| frame_fn(ui));
+
+        let labels = |output: &egui::FullOutput| {
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                frame_labelled_rects(&clipped.shape, &mut out);
+            }
+            out
+        };
+        let texts = |output: &egui::FullOutput| {
+            labels(output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+        };
+        let find = |output: &egui::FullOutput, needle: &str| -> Option<egui::Rect> {
+            labels(output).into_iter().find(|(t, _)| t == needle).map(|(_, r)| r)
+        };
+        let locate = |output: &egui::FullOutput, needle: &str| -> egui::Pos2 {
+            find(output, needle).map(|r| r.center()).unwrap_or_else(|| {
+                panic!(
+                    "the window painted no {needle:?} to press. What was painted: {:?}",
+                    texts(output)
+                )
+            })
+        };
+        let click = |ctx: &egui::Context,
+                     frame_fn: &mut dyn FnMut(&mut egui::Ui),
+                     pos: egui::Pos2|
+         -> egui::FullOutput {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), button(true)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput { events: vec![button(false)], ..input() },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            ctx.run_ui(input(), |ui| frame_fn(ui))
+        };
+
+        // The Sends screen, over a vault with nothing in it.
+        let sends_at = locate(&output, sidebar::SENDS_ROW_LABEL);
+        let on_sends = click(&ctx, &mut frame_fn, sends_at);
+        assert!(
+            find(&on_sends, FRAME_SEND_NAME).is_some(),
+            "control: the Sends row was pressed on an empty vault and {FRAME_SEND_NAME:?} \
+             is not on screen, so this window never reached the Sends screen and nothing \
+             below is about a Send row. What was painted: {:?}",
+            texts(&on_sends)
+        );
+
+        // And the row works.
+        let delete_at = locate(&on_sends, send_ui::DELETE_LABEL);
+        let armed = click(&ctx, &mut frame_fn, delete_at);
+        assert!(
+            find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            "on an account whose vault is empty, pressing Delete on a Send row put up no \
+             {:?} confirmation. An empty vault is not a reason to refuse a revoke, and it \
+             is the state every account is in on its first day. What was painted: {:?}",
+            send_ui::CONFIRM_LABEL,
+            texts(&armed)
+        );
+        assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "a Sends verdict was dropped rather than applied over an empty vault -- see \
+             `send_ui::SendUiVerdict`"
+        );
+
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -19943,9 +20319,15 @@ mod send_delete_wiring {
 
         // The second lock: the call's arguments, as a whole-call equality.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `SendUiVerdict::into_action` is written INSIDE the argument
+        // list on purpose. A plain `SendUiAction` binding at frame scope
+        // would be somewhere a shadow could sit AFTER the verdict was
+        // already consumed, where substituting an action no longer costs
+        // it a counted drop. See `send_ui::SendUiVerdict`.
         let expected = squashed(concat!(
-            "apply_send_", "action( send_action, &mut send_delete, &mut send_fetch, ui.ctx(), \
-             &send_delete_tx, &session_token, spawn_send_delete, );"
+            "apply_send_", "action( send_action.map(send_ui::SendUiVerdict::into_action) \
+             .unwrap_or(send_ui::SendUiAction::None), &mut send_delete, &mut send_fetch, \
+             ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, );"
         ));
         assert_eq!(
             squashed(&code_braces_only(production())).matches(&expected).count(),

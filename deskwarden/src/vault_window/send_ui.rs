@@ -472,6 +472,90 @@ pub enum SendUiAction {
     CancelDelete,
 }
 
+/// **A [`SendUiAction`] that this pane produced, which cannot be thrown away
+/// in silence.**
+///
+/// Every earlier pin over the seam between [`draw_send_pane`] and
+/// `vault_window::apply_send_action` was a statement about the CALL -- its
+/// spelling, its arguments, its brace depth -- and each was defeated by a
+/// shadow written one layer outside what it pinned:
+///
+/// ```ignore
+/// let send_action = { drop(send_action); send_ui::SendUiAction::None };
+/// let send_action = if send_delete.report.is_some() { None } else { send_action };
+/// let send_action = if items.is_empty() { send_action } else { None };
+/// ```
+///
+/// The frame click tests answer those by pressing the real controls, but they
+/// can only answer a shadow gated on a state the FIXTURE CONSTRUCTS. The
+/// third one above was measured green through a click test whose doc claimed
+/// it "covers every state a shadow can plausibly be gated on": the harness
+/// loads a vault, `items` is in scope at the call, and the harness's vault
+/// was empty -- so every real user, who has at least one item, got a wholly
+/// dead Sends pane. Enumerating states loses that race by construction,
+/// because the mutant picks its gate AFTER reading the fixture.
+///
+/// So this type stops enumerating. It is a linear value: the action lives
+/// inside it, [`into_action`](Self::into_action) is the ONLY way out, and
+/// that method consumes `self`. A verdict that reaches its `Drop` still
+/// holding an action was **abandoned** -- and abandonment is exactly what
+/// every shadow above must do, whatever it is gated on, because to substitute
+/// a different action for this one the real one has to be dropped. The drop
+/// is counted in [`abandoned_in_this_thread`], `vault_window::run` asserts on
+/// the count across its own panel, and neither depends on which states a
+/// fixture happens to build.
+///
+/// **Residual, recorded plainly.** `std::mem::forget` -- or leaking the
+/// verdict into something that outlives the frame -- suppresses the `Drop`
+/// and so suppresses the count. That is not a gate a shadow can hide behind;
+/// it is a whole extra statement naming a leak primitive in a paint loop. But
+/// it is the one shape this mechanism does not see, which is why the frame
+/// click tests are kept alongside it rather than replaced by it.
+#[derive(Debug)]
+#[must_use = "a Sends verdict must be applied with `into_action`, not dropped"]
+pub struct SendUiVerdict(Option<SendUiAction>);
+
+thread_local! {
+    /// How many verdicts this thread has dropped while they still held an
+    /// action. Thread-local rather than global, so two tests running in
+    /// parallel cannot read each other's counts.
+    static ABANDONED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`SendUiVerdict`]s this thread has dropped without applying.
+///
+/// Zero is the only correct value anywhere a frame has finished with its
+/// pane. See [`SendUiVerdict`].
+pub fn abandoned_in_this_thread() -> usize {
+    ABANDONED.with(|c| c.get())
+}
+
+impl SendUiVerdict {
+    /// Mints a verdict. Private on purpose: only this module decides what the
+    /// Sends pane reported.
+    fn seal(action: SendUiAction) -> Self {
+        Self(Some(action))
+    }
+
+    /// The action, consuming the verdict. The only way out.
+    pub fn into_action(mut self) -> SendUiAction {
+        self.0
+            .take()
+            .expect("a verdict holds its action until exactly one `into_action`")
+    }
+}
+
+impl Drop for SendUiVerdict {
+    fn drop(&mut self) {
+        // Deliberately no panic: a `Drop` that panics during an unwind aborts
+        // the process, and this runs in a paint loop. Counting is enough --
+        // the frame and the tests read the count.
+        if self.0.is_some() {
+            ABANDONED.with(|c| c.set(c.get().saturating_add(1)));
+        }
+    }
+}
+
 /// What the window knows about a delete, as the pane needs it in order to
 /// draw one.
 ///
@@ -532,7 +616,7 @@ pub fn draw_send_pane(
     state: &SendPaneState,
     notice: Option<&str>,
     delete: SendDeleteView<'_>,
-) -> SendUiAction {
+) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
     ui.horizontal(|ui| {
@@ -664,7 +748,7 @@ pub fn draw_send_pane(
         }
     }
 
-    action
+    SendUiVerdict::seal(action)
 }
 
 /// One row. Returns the action **this row** reported, if any.
@@ -1591,6 +1675,111 @@ mod fetch_thread_tests {
     }
 }
 
+/// **The abandonment counter really counts** -- so that every assertion
+/// written against it, in this file and in `vault_window::run`, is saying
+/// something.
+///
+/// A `debug_assert_eq!(abandoned_in_this_thread(), 0, ..)` that could never be
+/// anything but zero is not a hold, it is decoration, and this is the only
+/// place that difference can be measured directly. Each test runs on a thread
+/// of its own, because the counter is thread-local by design and monotonic:
+/// reading it on the test runner's thread would be reading whatever every
+/// other test on that thread had already done.
+#[cfg(test)]
+mod verdict_linearity {
+    use super::*;
+
+    /// Runs `body` and answers with how far the count moved across it.
+    ///
+    /// A DELTA rather than the raw count, and no thread of its own:
+    /// `std::thread::spawn` is censused crate-wide by
+    /// `job_object::the_thread_spawn_census_is_exact`, and a test helper is not
+    /// a reason to widen that census. It does not need one -- libtest already
+    /// runs every test on a thread of its own, so the control below really is
+    /// measuring a fresh thread-local.
+    fn abandoned_by(body: impl FnOnce()) -> usize {
+        let before = abandoned_in_this_thread();
+        assert_eq!(
+            before, 0,
+            "control: this test's own thread starts with a non-zero abandonment count, \
+             so the counter is not thread-local and every measurement below is somebody \
+             else's"
+        );
+        body();
+        abandoned_in_this_thread() - before
+    }
+
+    /// **THE LIVENESS CONTROL for every assertion on this counter.** A verdict
+    /// dropped while it still holds an action is counted -- which is what a
+    /// shadowed Sends action must do, whatever state it is gated on.
+    #[test]
+    fn a_verdict_dropped_instead_of_applied_is_counted() {
+        assert_eq!(
+            abandoned_by(|| {
+                let verdict = SendUiVerdict::seal(SendUiAction::Refresh);
+                drop(verdict);
+            }),
+            1,
+            "a `SendUiVerdict` was dropped still holding its action and nothing counted it, \
+             so `abandoned_in_this_thread` reports zero no matter what happens and every \
+             assertion on it -- including `vault_window::run`'s own `debug_assert` -- holds \
+             nothing at all"
+        );
+    }
+
+    /// And a verdict that was applied is NOT counted, so the assertion is not
+    /// one that fails on a correct frame.
+    #[test]
+    fn a_verdict_that_was_applied_is_not_counted() {
+        assert_eq!(
+            abandoned_by(|| {
+                let verdict = SendUiVerdict::seal(SendUiAction::Refresh);
+                assert_eq!(verdict.into_action(), SendUiAction::Refresh);
+            }),
+            0,
+            "applying a verdict counted it as abandoned, so the count is a count of verdicts \
+             and not of LOST ones -- every assertion on it would fail on a correct frame"
+        );
+    }
+
+    /// The count is per abandonment rather than a flag, so two losses read as
+    /// two -- a frame that drops one verdict and a run that drops several are
+    /// distinguishable in a failure message.
+    #[test]
+    fn each_abandoned_verdict_is_counted_separately() {
+        assert_eq!(
+            abandoned_by(|| {
+                drop(SendUiVerdict::seal(SendUiAction::Refresh));
+                drop(SendUiVerdict::seal(SendUiAction::CancelDelete));
+            }),
+            2,
+            "two abandoned verdicts read as something other than two"
+        );
+    }
+
+    /// **And the pane's own product is a verdict that must be consumed**, so
+    /// the mechanism is on the real path and not only on hand-built values.
+    /// This is what makes `let _ = draw_send_pane(..)` a counted loss rather
+    /// than a silent one anywhere in the crate.
+    #[test]
+    fn the_pane_hands_back_a_verdict_that_counts_when_it_is_dropped() {
+        assert_eq!(
+            abandoned_by(|| {
+                let ctx = egui::Context::default();
+                let state = SendPaneState::Loading;
+                let _ = ctx.run_ui(Default::default(), |ui| {
+                    // Deliberately dropped rather than applied: this is the
+                    // shape every measured shadow reduces to.
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default());
+                });
+            }),
+            1,
+            "the Sends pane's own answer can be thrown away without anything counting it, so \
+             the linearity `SendUiVerdict` exists for does not reach the real pane"
+        );
+    }
+}
+
 #[cfg(test)]
 mod paint_tests {
     //! What this pane **actually paints**, driven through real frames at the
@@ -1685,7 +1874,7 @@ mod paint_tests {
 
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete);
+            action = draw_send_pane(ui, state, notice, delete).into_action();
         });
 
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
@@ -1857,7 +2046,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete);
+            let _ = draw_send_pane(ui, state, None, delete).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -1891,7 +2080,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete);
+            let _ = draw_send_pane(ui, state, None, delete).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -1903,7 +2092,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete);
+            action = draw_send_pane(ui, state, None, delete).into_action();
         });
         action
     }
@@ -2031,7 +2220,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -2051,7 +2240,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2064,7 +2253,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -2093,7 +2282,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete);
+            let _ = draw_send_pane(ui, state, None, delete).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -2108,7 +2297,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete);
+            let _ = draw_send_pane(ui, state, None, delete).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2121,7 +2310,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete);
+            action = draw_send_pane(ui, state, None, delete).into_action();
         });
         action
     }
