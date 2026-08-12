@@ -793,6 +793,19 @@ pub fn build_frame(
     // no way to wait on it. See `mod send_channel`.
     let (send_tx, send_rx): (SendListSender, send_channel::SendListReceiver) =
         send_channel::send_list_channel();
+    // The vault export reporting back. One report per click; the export
+    // itself -- the save dialog AND the `bw` child -- happens entirely on the
+    // worker thread `export_thread::spawn_export` starts, so nothing here
+    // ever waits.
+    let (export_tx, export_rx): (ExportSender, Receiver<ExportReport>) = mpsc::channel();
+    // Whether an export is running. Latched by the menu row and cleared by
+    // the drain, so a second click while one is in flight starts no second
+    // `bw` -- two exports racing on one destination is two processes writing
+    // one `.dw-partial`.
+    let mut export_in_flight = false;
+    // The last report, until the user dismisses it. `None` is "nothing to
+    // say", which is also what a cancelled dialog leaves behind.
+    let mut export_report: Option<ExportReport> = None;
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -1322,6 +1335,16 @@ pub fn build_frame(
             }
         }
 
+        // The export reporting back. `try_recv`, like every other drain here,
+        // and `export_in_flight` is cleared FIRST for the reason the Sends
+        // drain gives: the thread that set the flag has finished, whatever
+        // became of its answer.
+        if let Ok(report) = export_rx.try_recv() {
+            export_in_flight = false;
+            log::info!("vault export finished: {report:?}");
+            export_report = Some(report);
+        }
+
         // Non-blocking, like the favicon drain above: the sync thread
         // (spawned from the Sync button below) reports its outcome here, and
         // this loop never waits on it.
@@ -1607,6 +1630,33 @@ pub fn build_frame(
                     Some(AccountAction::Remove) => {
                         *remove_account_for_closure.borrow_mut() = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    // **The one row that stays**, and the one that starts work
+                    // rather than recording a request -- see
+                    // `AccountAction::Export`. Nothing on this line blocks:
+                    // `spawn_export` is a `std::thread::spawn` and returns
+                    // immediately, and both of the waits (the shell's modal
+                    // save dialog and the `bw export` child) happen on the
+                    // thread it starts.
+                    Some(AccountAction::Export) => {
+                        if !export_in_flight {
+                            export_in_flight = true;
+                            // The previous report goes with the new click: a
+                            // banner from the last export sitting over this
+                            // one's would be answering a question the user has
+                            // already moved past.
+                            export_report = None;
+                            export_thread::spawn_export(
+                                ui.ctx().clone(),
+                                export_tx.clone(),
+                                // The window's own session, cloned per export
+                                // into a `Zeroizing` the exporting thread
+                                // drops -- so the token never outlives the one
+                                // `bw export` it authenticates. It reaches the
+                                // child in `BW_SESSION` and never in argv.
+                                session_token.clone(),
+                            );
+                        }
                     }
                     None => {}
                 }
@@ -3315,6 +3365,31 @@ pub fn build_frame(
             }
         }
 
+        // The export's answer, drawn here for `folder_edit`'s reason: last, so
+        // the card is over the three panels.
+        //
+        // `export_message` decides both the words and the colour, and a report
+        // it has nothing to say about (a cancelled dialog) is dropped rather
+        // than painted -- the user closed a dialog they opened, which is not
+        // an event this app narrates back at them.
+        //
+        // While one is running the card says so instead, with no dismiss
+        // button: the export is a child process that will report either way,
+        // and a banner the user can close would leave a `bw` running with
+        // nothing on screen accounting for it.
+        if export_in_flight {
+            draw_export_in_flight(ui.ctx());
+        } else if let Some(report) = &export_report {
+            match export_message(report) {
+                Some((tone, text)) => {
+                    if draw_export_report(ui.ctx(), tone, &text) {
+                        export_report = None;
+                    }
+                }
+                None => export_report = None,
+            }
+        }
+
         // **The only place in this program that starts an app match.** Drawn
         // here for `folder_edit`'s reason -- last, so the dialog is over the
         // three panels -- and drained with `take`, so a launch happens once
@@ -4720,6 +4795,367 @@ mod send_channel {
     }
 }
 
+/// What one "Export vault..." click ended as, carried back from the worker
+/// thread the whole thing runs on.
+///
+/// A value and not four flags, for [`AccountAction`]'s reason: exactly one of
+/// these happens per click. It is deliberately NOT
+/// [`crate::vault_export::ExportOutcome`] widened -- a cancelled dialog and a
+/// refused destination both happen *before* any export runs, so folding them
+/// into that enum would put two non-outcomes into the type whose whole job is
+/// to say what the CLI did.
+#[derive(Debug)]
+enum ExportReport {
+    /// The user dismissed the save dialog, or it could not be created. Both
+    /// are the same answer, for the reason `file_picker` gives.
+    Cancelled,
+    /// The destination was refused before anything ran. See
+    /// [`crate::vault_export::plan_export`].
+    Refused(crate::vault_export::ExportRefusal),
+    /// An export really ran, and this is what it did.
+    Done {
+        outcome: crate::vault_export::ExportOutcome,
+        /// [`crate::vault_export::ExportPlan::final_path`] -- the name the
+        /// user picked, which is the only path worth naming to them. Kept
+        /// even on failure so the message can say *which* export failed when
+        /// the dialog has long closed.
+        destination: std::path::PathBuf,
+    },
+}
+
+/// How loudly an export report is painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportTone {
+    /// The archive is on disk under the name the user chose.
+    Good,
+    /// It is not, and this says why.
+    Bad,
+}
+
+/// **The whole of the outcome-to-user mapping**, as a pure function of the
+/// report -- so that "what does `Unconfirmed` say?" is a question a test can
+/// ask without a window, a dialog or a `bw`.
+///
+/// `None` is "say nothing", and [`ExportReport::Cancelled`] is the only thing
+/// that reaches it: the user closed a dialog they opened, which is not an
+/// error and not an event, and a banner reporting it would be this app
+/// narrating the user's own click back at them.
+///
+/// **Every other report has its own words, and that is load-bearing rather
+/// than decorative.** The variant this exists for is
+/// [`crate::vault_export::ExportOutcome::Unconfirmed`]: the CLI exited zero
+/// and this crate could not establish that an encrypted archive was written,
+/// so `run_export` deleted the staging file and there is nothing on disk. A
+/// mapping that rendered it like [`Written`](crate::vault_export::ExportOutcome::Written)
+/// -- or that rendered every outcome with one "The export finished" line --
+/// would tell a user they have a backup they do not have, which is the one
+/// lie this feature must not tell, and is why
+/// `export_wiring::every_outcome_says_something_different` compares all of
+/// them pairwise rather than checking each in isolation.
+fn export_message(report: &ExportReport) -> Option<(ExportTone, String)> {
+    use crate::vault_export::{ExportOutcome, ExportRefusal};
+    let bad = |text: String| Some((ExportTone::Bad, text));
+    match report {
+        ExportReport::Cancelled => None,
+        ExportReport::Refused(ExportRefusal::NoDirectory) => bad(
+            "That destination names no folder to write into. Choose a folder and a file name."
+                .to_string(),
+        ),
+        ExportReport::Refused(ExportRefusal::IntoConfigDir) => bad(
+            "Deskwarden's own settings folder is not a safe place for a vault export -- an \
+             uninstall would delete it. Choose somewhere else."
+                .to_string(),
+        ),
+        ExportReport::Refused(ExportRefusal::EmptyFileName) => bad(
+            "That is a folder, not a file. Choose a file name for the export.".to_string(),
+        ),
+        ExportReport::Done { outcome, destination } => match outcome {
+            ExportOutcome::Written => Some((
+                ExportTone::Good,
+                format!("Encrypted vault export saved to {}.", destination.display()),
+            )),
+            ExportOutcome::SessionInvalid => bad(
+                "Your vault session has expired, so nothing was exported. Lock the vault, \
+                 unlock it again, and retry the export."
+                    .to_string(),
+            ),
+            ExportOutcome::Failed(why) => bad(format!(
+                "The export failed and nothing was saved to {}. {why}",
+                destination.display()
+            )),
+            ExportOutcome::Unconfirmed => bad(format!(
+                "Bitwarden's tool reported success, but Deskwarden could not confirm that an \
+                 encrypted export was written, so nothing was saved to {}. Treat this as a \
+                 failed backup and try again.",
+                destination.display()
+            )),
+        },
+    }
+}
+
+/// The vault window's export banner: a small centred card, drawn over the
+/// panels the way [`draw_folder_edit_modal`] is, for the one report the frame
+/// is holding.
+///
+/// Answers `true` when the user dismissed it. Nothing else is decided here --
+/// the words and the colour are [`export_message`]'s, so this function has
+/// nothing in it a test would want to reach.
+fn draw_export_report(ctx: &egui::Context, tone: ExportTone, text: &str) -> bool {
+    let mut dismissed = false;
+    egui::Area::new(egui::Id::new("vault-export-report"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    match tone {
+                        ExportTone::Good => theme::BORDER,
+                        ExportTone::Bad => theme::ERROR,
+                    },
+                ))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(theme::bold("Vault export", 15.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).size(12.0).color(
+                            match tone {
+                                ExportTone::Good => theme::INK,
+                                ExportTone::Bad => theme::ERROR,
+                            },
+                        ))
+                        .wrap(),
+                    );
+                    ui.add_space(16.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_button(ui, "OK", None).clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+        });
+    dismissed
+}
+
+/// What the export card says while the child is still running.
+///
+/// The wait has two halves and this covers the second: while the save dialog
+/// is up the user is looking at the dialog, and once they answer it a `bw
+/// export` runs for as long as the vault takes. A window that looked idle
+/// through that would invite a second click, and the second click is the one
+/// that would race two children onto one destination.
+const EXPORTING: &str = "Exporting the vault...";
+
+/// The in-flight half of [`draw_export_report`]: the same card, with no
+/// dismiss button on it.
+fn draw_export_in_flight(ctx: &egui::Context) {
+    egui::Area::new(egui::Id::new("vault-export-progress"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(theme::bold("Vault export", 15.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(EXPORTING)
+                                .size(12.0)
+                                .color(theme::TEXT_SECONDARY),
+                        )
+                        .wrap(),
+                    );
+                });
+        });
+}
+
+/// The export channel's sending half. Named because two signatures carry it.
+type ExportSender = mpsc::Sender<ExportReport>;
+
+/// The vault export's off-thread half, and its job.
+mod export_thread {
+    //! **Everything about an export that blocks lives in here, and the frame
+    //! closure's only entry point is [`spawn_export`].** There are two
+    //! blocking things and the frame may wait on neither: the shell's save
+    //! dialog runs its own modal message loop until the user answers it, and
+    //! the export itself is a `bw` child this side waits on. Either one on
+    //! the eframe thread is a frozen window -- titlebar included -- for as
+    //! long as it takes, which is the exact freeze `mod send_fetch_thread`
+    //! exists to prevent for the Sends fetch and which
+    //! `send_ui::frame_promptness` times.
+    //!
+    //! So the dialog is opened on the worker thread too, rather than on the
+    //! frame with only the export moved off. `file_picker::with_com`
+    //! initialises the apartment on whatever thread it is called from and
+    //! balances it on the way out, and the dialog is parented to no window,
+    //! so this costs nothing and removes the larger of the two waits.
+    //!
+    //! **The session travels as a `Zeroizing<String>` that this thread
+    //! drops**, exactly as the Sends fetch's does, and it reaches the child
+    //! in `BW_SESSION` and never in argv --
+    //! [`crate::vault_export::export_command`] is the one place that decides
+    //! it, and `vault_export`'s own tests hold it there.
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use eframe::egui;
+
+    use super::{ExportReport, ExportSender};
+    use crate::job_object::KillOnCloseJob;
+    use crate::vault_export::{self, ExportRequest};
+
+    /// The job every `bw export` child this window starts is placed in.
+    ///
+    /// **A process-lifetime `OnceLock`, mirroring
+    /// [`super::send_fetch_thread::sends_job`] rather than reusing it**, and
+    /// the difference is a type rather than a preference:
+    /// [`vault_export::CliExportRunner`] takes
+    /// `Arc<Option<KillOnCloseJob>>` -- the shape `main.rs` holds -- while
+    /// `sends_job` answers `Option<&'static KillOnCloseJob>`, which
+    /// `send.rs`'s runner takes. Reusing that function would mean either
+    /// widening one of the two runners' signatures or minting an `Arc` around
+    /// a borrow, and neither buys anything: the property that matters is that
+    /// the child dies with this process, and two jobs hold it exactly as well
+    /// as one does.
+    ///
+    /// Everything else is `sends_job`'s reasoning verbatim, and it applies
+    /// here with more force, not less. This child holds the *whole vault*: it
+    /// carries the unlocking session in an environment block any same-user
+    /// process can read, and it is writing an archive of every credential the
+    /// user has. An orphaned `bw export` outliving the app is a live vault key
+    /// plus a half-written vault sitting in a folder. `KillOnCloseJob` closes
+    /// that: when this process dies -- by panic, by `process::exit`, by a
+    /// Task Manager kill that runs no destructor -- the kernel closes the
+    /// handle and every member child dies with it.
+    ///
+    /// It is **not** `main.rs`'s job, for `sends_job`'s first two reasons:
+    /// threading a handle down to the frame closure is the widening
+    /// `production_is_the_only_env_a_shipping_build_has` refuses, and
+    /// `main.rs` drops and rebuilds its job around backend restarts, which
+    /// would kill an export in flight across one for a reason unconnected to
+    /// it.
+    ///
+    /// **`Arc::clone` of one cell, so every call answers the SAME job.** That
+    /// is what lets `export_wiring::the_export_child_is_spawned_into_the_job_this_window_holds`
+    /// compare the job that arrived at the spawn with this function's answer
+    /// by pointer identity.
+    ///
+    /// `None` when the kernel call fails, exactly as `sends_job` degrades:
+    /// `spawn_in_job` accepts it and the export still runs. Nothing in this
+    /// module ever *passes* `None` deliberately.
+    pub(super) fn export_job() -> Arc<Option<KillOnCloseJob>> {
+        static JOB: std::sync::OnceLock<Arc<Option<KillOnCloseJob>>> = std::sync::OnceLock::new();
+        Arc::clone(JOB.get_or_init(|| Arc::new(KillOnCloseJob::new().ok())))
+    }
+
+    /// Where `%APPDATA%\Deskwarden` is, for
+    /// [`vault_export::plan_export`]'s `IntoConfigDir` refusal.
+    ///
+    /// Derived from [`crate::settings::default_path`] rather than re-resolved,
+    /// so this cannot name a different directory from the one the app really
+    /// writes its settings into. An unresolvable config directory answers an
+    /// empty path, which `plan_export`'s `is_within` treats as matching
+    /// nothing -- the refusal simply does not fire, which is the same
+    /// behaviour as this app on a platform with nowhere to put settings.
+    fn config_dir() -> PathBuf {
+        crate::settings::default_path()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_default()
+    }
+
+    /// The real save dialog, as a value so [`pick_and_export`] can be driven
+    /// with a different one.
+    ///
+    /// A `fn` and not a closure so that the substitute a test passes and the
+    /// thing production passes are the same kind of thing.
+    pub(super) fn real_destination() -> Option<PathBuf> {
+        crate::file_picker::pick_export_destination(&crate::file_picker::suggested_export_name(
+            &crate::file_picker::SystemExportClock,
+        ))
+    }
+
+    /// **One whole export, blocking, from the dialog to the verdict** -- and
+    /// the wiring's own entry point, in the sense that everything above it is
+    /// a thread and everything below it is `vault_export`.
+    ///
+    /// `pick` is injected for one reason: a test may not open a real dialog.
+    /// Nothing else here is: the plan, the runner, the job and the spawn are
+    /// all the production ones, which is what makes
+    /// `export_wiring::the_export_child_is_spawned_into_the_job_this_window_holds`
+    /// a statement about what ships. That test calls THIS function with
+    /// `job_object`'s spawn probe armed -- the probe is thread-local, so it
+    /// must be a call the test makes on its own thread, which is why the
+    /// blocking half is a plain function and not something only reachable
+    /// through `std::thread::spawn`.
+    ///
+    /// **`run_export` is not bypassed and must not be.** It sweeps stale
+    /// partials, discards this run's own staging file before the runner
+    /// starts, and promotes the staged file onto the user's chosen path on
+    /// `Written` and on nothing else -- see its own doc for what a version
+    /// that pointed the CLI straight at the destination destroys.
+    pub(super) fn pick_and_export<P>(pick: P, session: &str) -> ExportReport
+    where
+        P: FnOnce() -> Option<PathBuf>,
+    {
+        let Some(destination) = pick() else {
+            return ExportReport::Cancelled;
+        };
+        let plan = match vault_export::plan_export(&ExportRequest { destination }, &config_dir()) {
+            Ok(plan) => plan,
+            Err(refusal) => return ExportReport::Refused(refusal),
+        };
+        let destination = plan.final_path().to_path_buf();
+        let outcome = vault_export::run_export(
+            &plan,
+            session,
+            &vault_export::real_runner(export_job()),
+        );
+        ExportReport::Done { outcome, destination }
+    }
+
+    /// Exports the vault on a background thread. The frame closure's one
+    /// entry point, and *nothing but* the delegation.
+    pub(super) fn spawn_export(
+        ctx_for_export: egui::Context,
+        tx: ExportSender,
+        session: zeroize::Zeroizing<String>,
+    ) {
+        spawn_export_with(ctx_for_export, tx, move || {
+            pick_and_export(real_destination, &session)
+        });
+    }
+
+    /// The off-thread half, **generic over the work so that it can be
+    /// tested** -- `spawn_send_list_with`'s shape, and for its reason: a
+    /// pin over a function's text is satisfied by hoisting the blocking call
+    /// above the spawn, and here the work is a value this function cannot see
+    /// inside of, so there is nothing to hoist.
+    ///
+    /// `request_repaint` is what makes the answer visible: the drain is a
+    /// `try_recv` in the frame closure, so without a frame to run in, a
+    /// finished export sits in the channel until some unrelated input
+    /// provokes one.
+    pub(super) fn spawn_export_with<F>(ctx_for_export: egui::Context, tx: ExportSender, work: F)
+    where
+        F: FnOnce() -> ExportReport + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+            ctx_for_export.request_repaint();
+        });
+    }
+}
+
 /// Why an on-demand list could not be fetched.
 ///
 /// `Unauthorized` keeps its own variant all the way to the UI thread rather
@@ -5452,6 +5888,21 @@ const LOCK_SHORTCUT: &str = "CTRL+L";
 const ADD_ACCOUNT: &str = "Add account...";
 const REMOVE_ACCOUNT: &str = "Remove this account...";
 
+/// The menu's export row.
+///
+/// Spelled with `...` and not `…`, matching the two rows above it. The
+/// ellipsis is the shell's own convention for "this opens a dialog", which is
+/// true here: the click opens a save dialog and decides nothing on its own.
+///
+/// **One format and no submenu.** `bw export` offers four; this app offers
+/// `encrypted_json` alone, and that is a decision recorded in
+/// [`crate::vault_export`]'s module docs rather than a feature not yet built
+/// -- a plaintext vault file written to a stock Windows Desktop is copied by
+/// OneDrive, snapshotted by Volume Shadow Copy and read into the search index
+/// before the user has finished reading any confirmation, and none of that is
+/// reversible. A format dropdown here would be the way to reach exactly that.
+const EXPORT_VAULT: &str = "Export vault...";
+
 /// How wide the account menu is allowed to get.
 ///
 /// A blocked state paints [`AccountsState::blocked_reason`] in here, and those
@@ -5484,6 +5935,18 @@ enum AccountAction {
     Add,
     /// Delete this account's local profile and drop it from the list.
     Remove,
+    /// Write an encrypted archive of this vault to a file the user picks.
+    ///
+    /// **The one row that does NOT close the window**, and that is the whole
+    /// difference between it and the three above. Those three ask `main` for
+    /// something this window cannot do while it owns the event loop, so they
+    /// record a request and get out of the way. An export needs nothing from
+    /// `main`: it is a save dialog and a `bw` child, both of which happen on a
+    /// worker thread this window starts, and its answer is painted by this
+    /// same window some seconds later. Closing here would take the window
+    /// down mid-export and leave the user with no idea whether they have a
+    /// backup.
+    Export,
 }
 
 /// What the titlebar's account menu shows, decided apart from the drawing.
@@ -5729,6 +6192,14 @@ fn account_menu(
             .clicked()
         {
             action = Some(AccountAction::Lock);
+            ui.close();
+        }
+        // Offered unconditionally, unlike the two rows below it: an export is
+        // a read of the vault this window is already showing, so there is no
+        // state in which it can only fail -- which is the test the `can_add`
+        // and `can_remove` rows have to pass.
+        if ui.button(EXPORT_VAULT).clicked() {
+            action = Some(AccountAction::Export);
             ui.close();
         }
         if plan.can_add && ui.button(ADD_ACCOUNT).clicked() {
@@ -12508,6 +12979,35 @@ mod account_switcher_tests {
         }
     }
 
+    /// **The export row is offered, and its click reports an export.**
+    ///
+    /// Behavioural: the real `account_menu` is drawn, the menu is opened and
+    /// the row is clicked at its painted position. A row that decides nothing
+    /// is the "code complete, correct and unreachable" shape this feature set
+    /// keeps producing.
+    ///
+    /// Against `lone_state` -- one account, nothing to switch to, no remove
+    /// row -- because an export has nothing to do with how many accounts
+    /// there are, and this is the state that would expose a row wired to
+    /// `can_add` or `can_remove` by accident.
+    #[test]
+    fn the_export_row_reports_an_export() {
+        for state in [lone_state(), available_state(), blocked_state()] {
+            assert_eq!(
+                pick(Some(&state), EXPORT_VAULT),
+                Some(AccountAction::Export),
+                "clicking {EXPORT_VAULT:?} asked for something else"
+            );
+        }
+        // Control: a menu with no account list has no rows at all, so the
+        // assertion above is about a row that really is drawn.
+        let mut switcher = Switcher::new();
+        assert!(
+            !switcher.idle(None).painted(EXPORT_VAULT),
+            "control: an app with no account list paints an export row"
+        );
+    }
+
     /// **The pick has to REACH the caller.** A switcher that paints its rows
     /// correctly and answers `None` is the "decision correct, renderer inert"
     /// shape this codebase keeps producing -- five mutations to this feature's
@@ -15310,7 +15810,7 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 52,
+            modules, 53,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -15325,6 +15825,634 @@ mod preferences_modal_wiring_tests {
                 1,
                 "control: the string-literal exception {known:?} is not in this file exactly \
                  once, so it is stale and is widening this check for nothing"
+            );
+        }
+    }
+}
+
+/// **The export wiring, and the job guarantee re-proven at ITS entry point.**
+///
+/// `vault_export`'s own
+/// `the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`
+/// hands `real_runner` a job *itself*, so it covers everything from
+/// `real_runner` inwards and nothing above it -- and its own doc says so, and
+/// says that when this step landed the property had to be re-pointed at
+/// whatever the UI actually calls. This module is that re-pointing.
+///
+/// The chain from the click to the spawn has four links and each is held
+/// here, because no single test can span them: the frame closure starts a
+/// THREAD, and `job_object::spawn_probe` is thread-local by design (a global
+/// would let one test refuse another's spawn).
+///
+///  1. The menu row really decides [`AccountAction::Export`] --
+///     `account_switcher_tests::the_export_row_reports_an_export`, a click on
+///     the real drawn row.
+///  2. The frame's arm for that action starts the export and does nothing
+///     else -- [`the_export_arm_starts_the_export_off_thread_and_keeps_the_window`].
+///  3. [`export_thread::spawn_export`] is the delegation and nothing but,
+///     pinned as a whole-body equality, and
+///     [`export_thread::spawn_export_with`] really runs its work off the
+///     caller's thread -- [`the_export_runs_on_a_thread_that_is_not_the_frames`].
+///  4. **And the work it delegates, driven for real, spawns the export child
+///     into the very job this window holds** --
+///     [`the_export_child_is_spawned_into_the_job_this_window_holds`], which
+///     arms the probe and asserts the recorded job by pointer identity.
+///
+/// Nothing here starts a process, touches the network, reads the real vault,
+/// writes to `%APPDATA%\Deskwarden` or opens a dialog: the picker is the one
+/// thing injected, the probe refuses before `CreateProcess`, and every path
+/// is under a temporary directory.
+#[cfg(test)]
+mod export_wiring {
+    use super::*;
+    use crate::job_object::KillOnCloseJob;
+    use crate::vault_export::{
+        export_args, plan_export, ExportOutcome, ExportRefusal, ExportRequest,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// A scratch directory, removed on drop. Same idiom as `vault_export`'s
+    /// own tests -- this crate has no `tempfile` dev-dependency.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "deskwarden-export-wiring-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory under the system temp dir");
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Everything before the first `#[cfg(test)]`, split with `concat!` so
+    /// this needle is not itself the first occurrence.
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(concat!("#[cfg", "(test)]"))
+            .expect("no test module in this file");
+        &source[..end]
+    }
+
+    /// The address of the job [`export_thread::export_job`] hands out, or
+    /// `None` if this machine would not give the process one.
+    fn window_job_address() -> Option<usize> {
+        export_thread::export_job()
+            .as_ref()
+            .as_ref()
+            .map(|job| std::ptr::from_ref(job) as usize)
+    }
+
+    /// Drives the wiring's blocking entry point for real, with the save
+    /// dialog -- the one thing a test may not open -- replaced by a fixed
+    /// answer, and reports every spawn it attempted.
+    ///
+    /// **Only the picker is a substitute.** The plan, the config-directory
+    /// refusal, `run_export`'s sweep/stage/promote order, `real_runner`, the
+    /// `CliExportRunner` and `job_object::spawn_in_job` are all the ones that
+    /// ship, which is what makes the recorded value a fact about production.
+    fn spawns_of_one_export(destination: PathBuf) -> (ExportReport, Vec<crate::job_object::spawn_probe::Attempt>) {
+        // `export_command` refuses outright unless startup recorded a
+        // signature-verified CLI. First-wins and idempotent, so this is safe
+        // however the test order falls out, and the path is a fiction nothing
+        // ever executes.
+        crate::bw_path::remember_verified_bw_exe(PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = export_thread::pick_and_export(move || Some(destination), "session-token");
+        let attempts = probe.attempts();
+        drop(probe);
+        (report, attempts)
+    }
+
+    /// **THE CRITICAL ASSERTION, at the wiring's own entry point.**
+    ///
+    /// The export child is a process holding an unlocked vault and writing an
+    /// archive of every credential the user has. Kill-on-close membership is
+    /// what guarantees it dies with this process however this process dies --
+    /// a panic, a `process::exit` that runs no destructor, a Task Manager
+    /// kill. Fifteen rounds established that property below `real_runner`;
+    /// this wiring is the code above it, where it can go missing unseen, so
+    /// it is asserted again here against what actually arrived at the spawn.
+    ///
+    /// Nothing here reads a line of source, for the reason `vault_export`'s
+    /// own version gives at length: a text pin near `spawn_in_job(..)` cannot
+    /// see which value flows into it, and five separate mutants proved that
+    /// the hard way.
+    #[test]
+    fn the_export_child_is_spawned_into_the_job_this_window_holds() {
+        let held = window_job_address().expect(
+            "this process could not create a job object at all, so every assertion below \
+             collapses onto the `None` control and asserts nothing",
+        );
+
+        let temp = TempDir::new("job");
+        let destination = temp.path().join("vault.json");
+        let (report, attempts) = spawns_of_one_export(destination.clone());
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the wiring did not reach `spawn_in_job` exactly once, so anything asserted about \
+             what it carried is about nothing: {attempts:?}"
+        );
+
+        // THE JOB, BY POINTER IDENTITY.
+        assert_eq!(
+            attempts[0].job,
+            Some(held),
+            "the export child was spawned with a job that is not the one this window holds, so \
+             it would not die with this process after a panic, a `process::exit` or a Task \
+             Manager kill -- leaving a `bw export` running with the vault-unlocking session in \
+             its environment"
+        );
+
+        // Control: "some job at all" is not what was asserted. A second,
+        // different job is a different address, so an assertion satisfied by
+        // any job would be satisfied by this one too.
+        let other = KillOnCloseJob::new().expect("a job object is a handle, not a process");
+        assert_ne!(
+            attempts[0].job,
+            Some(std::ptr::from_ref(&other) as usize),
+            "control: the recorded job is indistinguishable from an unrelated one"
+        );
+
+        // Control: `None` is EXPRESSIBLE and DISTINGUISHABLE end to end --
+        // which is the whole difference a dropped job erases. Driven through
+        // the same `run_export`/`real_runner`/`spawn_in_job` chain, jobless.
+        let jobless_temp = TempDir::new("jobless");
+        let jobless_plan = plan_export(
+            &ExportRequest {
+                destination: jobless_temp.path().join("vault.json"),
+            },
+            Path::new(r"Z:\nowhere"),
+        )
+        .expect("a file under a scratch directory is a plannable destination");
+        let jobless_probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let _ = crate::vault_export::run_export(
+            &jobless_plan,
+            "session-token",
+            &crate::vault_export::real_runner(Arc::new(None)),
+        );
+        let jobless = jobless_probe.attempts();
+        drop(jobless_probe);
+        assert_eq!(
+            jobless.iter().map(|a| a.job).collect::<Vec<_>>(),
+            vec![None],
+            "control: a jobless runner did not reach the spawn jobless, so the probe cannot \
+             tell a child inside a job from one outside it"
+        );
+        assert_ne!(
+            attempts[0].job, None,
+            "control: the wiring's own spawn is indistinguishable from the jobless one"
+        );
+
+        // THE RECORDED SPAWN IS THE EXPORT, and not merely *a* spawn that
+        // happened -- the finding a one-line decoy satisfied once already.
+        let program = attempts[0].program.to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the export: {program}"
+        );
+        let expected = plan_export(
+            &ExportRequest {
+                destination: destination.clone(),
+            },
+            Path::new(r"Z:\nowhere"),
+        )
+        .expect("the same destination plans the same way");
+        assert_eq!(
+            attempts[0]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            export_args(&expected),
+            "the recorded spawn does not carry this export's arguments, so it is not the export"
+        );
+
+        // THE SESSION IS IN THE ENVIRONMENT AND NOT IN ARGV. On Windows any
+        // same-user process can read another's command line; it cannot read
+        // another's environment block without a handle. This is why
+        // `bw export`'s argv-only `--password` is not offered either.
+        assert!(
+            attempts[0].envs.iter().any(|(k, v)| k == "BW_SESSION"
+                && v.as_ref().map(|v| v == "session-token").unwrap_or(false)),
+            "the export child was not given the session in its environment: {:?}",
+            attempts[0].envs
+        );
+        assert!(
+            !attempts[0]
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().contains("session-token")),
+            "the vault session is on the export child's argv, where every process on this \
+             desktop can read it: {:?}",
+            attempts[0].args
+        );
+
+        // AND THE WIRING'S ANSWER CAME FROM THAT SPAWN. The probe refuses, so
+        // a report of anything but that refusal means a child was started by a
+        // route the probe never saw -- which is exactly what a decoy is.
+        match &report {
+            ExportReport::Done {
+                outcome: ExportOutcome::Failed(why),
+                destination: reported,
+            } => {
+                assert!(
+                    why.contains(crate::job_object::spawn_probe::REFUSED),
+                    "the export failed for some other reason, so its result did not come from \
+                     the call the probe recorded: {why}"
+                );
+                assert_eq!(
+                    reported, &destination,
+                    "the report names a destination the user did not pick"
+                );
+            }
+            other => panic!(
+                "the probe refused the only spawn this export may make, yet the wiring reported \
+                 {other:?}, so a child was started by a route the probe cannot see"
+            ),
+        }
+    }
+
+    /// The destination the user picked really is the one that gets planned,
+    /// and a cancelled dialog runs nothing at all.
+    #[test]
+    fn a_cancelled_dialog_starts_no_child_and_a_refused_destination_starts_no_child() {
+        crate::bw_path::remember_verified_bw_exe(PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let cancelled = export_thread::pick_and_export(|| None, "session-token");
+        let refused = export_thread::pick_and_export(
+            || Some(PathBuf::from(r"C:\Backups\")),
+            "session-token",
+        );
+        let attempts = probe.attempts();
+        drop(probe);
+
+        assert!(
+            matches!(cancelled, ExportReport::Cancelled),
+            "a dismissed save dialog reported {cancelled:?}"
+        );
+        assert!(
+            matches!(refused, ExportReport::Refused(ExportRefusal::EmptyFileName)),
+            "a destination with no file name reported {refused:?}"
+        );
+        assert!(
+            attempts.is_empty(),
+            "a cancelled or refused export started a child anyway: {attempts:?}"
+        );
+    }
+
+    /// **The blocking work happens on a thread that is not the caller's.**
+    ///
+    /// The frame closure must never wait: `send_ui::frame_promptness` exists
+    /// because a blocking call there freezes the window, titlebar included,
+    /// and this one has two waits in it -- the shell's modal save dialog,
+    /// which runs its own message loop until the user answers, and a
+    /// `bw export` child.
+    ///
+    /// Held two ways, and neither of them can hang the suite: the work blocks
+    /// on a gate the caller only opens AFTER `spawn_export_with` has
+    /// returned, and it gives up on that gate after a bounded wait. So a
+    /// version that ran the work inline returns late rather than never, and
+    /// is then caught twice over -- by the clock (it cannot return before the
+    /// gate is opened, and the gate is opened after it returns) and by thread
+    /// identity, which is the property itself.
+    #[test]
+    fn the_export_runs_on_a_thread_that_is_not_the_frames() {
+        /// How long the work waits for a gate the caller opens after the
+        /// spawn returns. Generous, so a loaded machine does not make this
+        /// flaky, and far above [`RETURNS_WITHIN`].
+        const GATE_WAIT: Duration = Duration::from_secs(5);
+        /// What "did not block" means for the spawn itself. Two orders of
+        /// magnitude below `GATE_WAIT`, so an inline run cannot fit under it.
+        const RETURNS_WITHIN: Duration = Duration::from_millis(2_000);
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let caller = std::thread::current().id();
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&ran_on);
+
+        let started = Instant::now();
+        export_thread::spawn_export_with(ctx, tx, move || {
+            let _ = gate_rx.recv_timeout(GATE_WAIT);
+            *recorded.lock().expect("not poisoned") = Some(std::thread::current().id());
+            ExportReport::Cancelled
+        });
+        let returned = started.elapsed();
+        // Opened only now -- so the work above cannot have completed before
+        // this line unless it ran on some other thread.
+        let _ = gate_tx.send(());
+
+        assert!(
+            returned < RETURNS_WITHIN,
+            "starting an export blocked the caller for {returned:?}; a real one blocks for as              long as the save dialog is up and the `bw` child runs, and the caller is the              eframe frame closure"
+        );
+        let report = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the exporting thread reported back");
+        assert!(matches!(report, ExportReport::Cancelled));
+        assert_ne!(
+            ran_on.lock().expect("not poisoned").expect("the work ran"),
+            caller,
+            "the export ran on the caller's own thread, so a real one would freeze the window              -- titlebar included -- for as long as the save dialog is up and the `bw export`              child runs"
+        );
+    }
+
+    /// **`spawn_export` is the delegation and nothing else** -- a whole-body
+    /// equality, the shape `spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`
+    /// uses and for its reason: a needle-based pin over this function is
+    /// satisfied by a hoisted blocking call above the spawn, and an equality
+    /// is not. It is what carries [`the_export_runs_on_a_thread_that_is_not_the_frames`]'s
+    /// property, and [`the_export_child_is_spawned_into_the_job_this_window_holds`]'s,
+    /// onto the one function the frame closure names.
+    #[test]
+    fn spawn_export_only_hands_the_real_work_to_the_tested_spawner() {
+        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = concat!(
+            "pub(super) fn spawn_", "export( ctx_for_export: egui::Context, tx: ExportSender, \
+             session: zeroize::Zeroizing<String>, ) { spawn_export_with(ctx_for_export, tx, \
+             move || { pick_and_export(real_destination, &session) }); }"
+        );
+        assert_eq!(
+            squashed(production()).matches(body).count(),
+            1,
+            "`spawn_export` is no longer exactly the delegation to `spawn_export_with` with \
+             the real picker -- anything added to it is a line that runs on the frame's own \
+             thread, before the spawn"
+        );
+        // And the real picker is named exactly once in production: there.
+        // A second mention is a second way to open a modal dialog, and the
+        // frame closure is where it would be written.
+        let picker = concat!("real_", "destination");
+        assert_eq!(
+            production().matches(picker).count(),
+            2,
+            "{picker:?} appears {} times in production, not twice (its definition and the one \
+             call inside `spawn_export`) -- a modal shell dialog opened anywhere else is a \
+             frozen window",
+            production().matches(picker).count()
+        );
+    }
+
+    /// **The Export arm starts the export, off-thread, and does NOT close the
+    /// window** -- as a whole-body EQUALITY, not a set of needles.
+    ///
+    /// **The equality is the fix for a survivor this test measured on its own
+    /// first draft.** That draft asserted the arm `contains` the call to
+    /// `export_thread::spawn_export(` and does not contain
+    /// `ViewportCommand::Close` or any of the session flags. Measured:
+    /// changing the arm's one condition to
+    ///
+    /// ```ignore
+    /// if false && !export_in_flight {
+    /// ```
+    ///
+    /// gave 2125 lib / 217 bin / 0 failed / 0 warnings. Every needle was
+    /// word-perfect -- the call is still written, three lines below a
+    /// condition that is never true -- and the menu's export row did
+    /// absolutely nothing. That is verbatim the "decision correct, renderer
+    /// inert" shape this whole feature set keeps producing, and a
+    /// `contains` cannot see it, because what went wrong is not a missing
+    /// line but a line that no longer runs.
+    ///
+    /// An equality can: there is no gate, no early return and no shadowing
+    /// binding that survives an exact match of the whole block. It is
+    /// compared with comments removed and whitespace squashed, so it is a pin
+    /// on the code and not on the prose or the formatter.
+    ///
+    /// The three `!contains` checks are kept below it. They are redundant
+    /// against the equality and they are what SAYS, in the failure message,
+    /// which of the several things this arm must not do it started doing.
+    #[test]
+    fn the_export_arm_starts_the_export_off_thread_and_keeps_the_window() {
+        let body = code_only(export_arm_body());
+        // The expected text goes through `code_only` too, so that the
+        // continuation lines this literal is wrapped over cannot make the
+        // comparison fail for a reason that is about the formatter.
+        assert_eq!(
+            body,
+            code_only(concat!(
+                "if !export_in_flight { export_in_flight = true; export_report = None;                  export_thread::spawn_", "export( ui.ctx().clone(), export_tx.clone(),                  session_token.clone(), ); }"
+            )),
+            "the Export arm is no longer exactly \"start one export off-thread, and only if              one is not already running\". Anything else here is either a second `bw export`              racing the first onto one destination, a condition that stops the row doing              anything at all, or work done on the eframe thread"
+        );
+
+        // What the equality already forbids, said in words, so a failure
+        // names the hazard rather than a diff.
+        assert!(
+            !body.contains(concat!("ViewportCommand::", "Close")),
+            "the Export row closes the window, so the export it just started reports back into              a window that is gone and the user never learns whether they have a backup"
+        );
+        for flag in [
+            concat!("switch_to_for_", "closure"),
+            concat!("locked_for_", "closure"),
+            concat!("add_account_for_", "closure"),
+            concat!("remove_account_for_", "closure"),
+            concat!("needs_reauth_for_", "closure"),
+        ] {
+            assert!(
+                !body.contains(flag),
+                "the Export row also writes {flag:?}, so an export ends this vault session"
+            );
+        }
+        // The session reaches the export, and as the window's own
+        // `Zeroizing` clone rather than a fresh `String`.
+        assert!(
+            body.contains(concat!("session_", "token.clone()")),
+            "the export is started without the window's own session, so a real `bw export`              answers `locked`"
+        );
+    }
+
+    /// `text` with `//` comments removed and all whitespace squashed to single
+    /// spaces -- so the equality above is a pin on the code and not on the
+    /// prose beside it or on the formatter's line breaks.
+    ///
+    /// Line comments only, which is all the sliced arm has; a `/* */` would
+    /// survive this and show up in the equality as a difference, which fails
+    /// loudly rather than silently.
+    fn code_only(text: &str) -> String {
+        text.lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The body of the frame's `Some(AccountAction::Export) => { .. }` arm.
+    fn export_arm_body() -> &'static str {
+        let production = production();
+        let head = format!("{}Export) => {{", concat!("Some(AccountAction", "::"));
+        let at = production.find(&head).unwrap_or_else(|| {
+            panic!("the strip's `match` has no {head:?} arm -- the Export row decides something nothing acts on")
+        });
+        let after = &production[at + head.len()..];
+        let mut depth = 1usize;
+        for (offset, ch) in after.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let body = &after[..offset];
+                        assert!(
+                            !body.trim().is_empty(),
+                            "the Export arm's block is empty, so every assertion over it would \
+                             pass against nothing"
+                        );
+                        assert!(
+                            body.len() < production.len() / 4,
+                            "control: the slice isolated one arm"
+                        );
+                        return body;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the Export arm's block is never closed");
+    }
+
+    // -----------------------------------------------------------------
+    // The outcome mapping
+    // -----------------------------------------------------------------
+
+    fn done(outcome: ExportOutcome) -> ExportReport {
+        ExportReport::Done {
+            outcome,
+            destination: PathBuf::from(r"C:\Backups\vault.json"),
+        }
+    }
+
+    /// **Every report says something different, and only one of them says
+    /// the export succeeded.**
+    ///
+    /// Compared PAIRWISE rather than checked one at a time, because the
+    /// mutant this exists for is a mapping that renders every outcome the
+    /// same -- which passes any per-variant "it says something" check.
+    #[test]
+    fn every_outcome_says_something_different() {
+        let reports = [
+            done(ExportOutcome::Written),
+            done(ExportOutcome::SessionInvalid),
+            done(ExportOutcome::Failed("the CLI said no".to_string())),
+            done(ExportOutcome::Unconfirmed),
+            ExportReport::Refused(ExportRefusal::NoDirectory),
+            ExportReport::Refused(ExportRefusal::IntoConfigDir),
+            ExportReport::Refused(ExportRefusal::EmptyFileName),
+        ];
+        let messages: Vec<(ExportTone, String)> = reports
+            .iter()
+            .map(|r| {
+                export_message(r).unwrap_or_else(|| panic!("{r:?} renders nothing at all"))
+            })
+            .collect();
+        for (i, (_, a)) in messages.iter().enumerate() {
+            for (j, (_, b)) in messages.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "{:?} and {:?} render the same words, so the user cannot tell them apart",
+                    reports[i], reports[j]
+                );
+            }
+        }
+
+        // Exactly one of them is good news, and it is the one where an
+        // archive is on disk under the name the user picked.
+        let good: Vec<&(ExportTone, String)> = messages
+            .iter()
+            .filter(|(tone, _)| *tone == ExportTone::Good)
+            .collect();
+        assert_eq!(
+            good.len(),
+            1,
+            "more or fewer than one report reads as a success: {messages:?}"
+        );
+        assert_eq!(
+            &export_message(&done(ExportOutcome::Written)).expect("Written renders"),
+            good[0],
+            "the one success is not `Written`"
+        );
+    }
+
+    /// **`Unconfirmed` is not `Written`.** The whole point of that variant is
+    /// that the CLI exited zero and this crate could not establish that an
+    /// encrypted archive was written -- `run_export` then deleted the staging
+    /// file, so there is nothing on disk. Rendering it as success tells the
+    /// user they have a backup they do not have, which is the one lie this
+    /// feature must not tell.
+    #[test]
+    fn an_unconfirmed_export_is_never_reported_as_a_success() {
+        let (tone, text) = export_message(&done(ExportOutcome::Unconfirmed))
+            .expect("`Unconfirmed` renders something");
+        assert_eq!(
+            tone,
+            ExportTone::Bad,
+            "an export this crate could not confirm reads as good news: {text:?}"
+        );
+        let lowered = text.to_lowercase();
+        assert!(
+            lowered.contains("could not confirm"),
+            "the words do not say what actually happened: {text:?}"
+        );
+        assert!(
+            lowered.contains("nothing was saved"),
+            "the user is not told there is no file: {text:?}"
+        );
+        // Positive control: this assertion is not passed by every report.
+        let (good_tone, _) =
+            export_message(&done(ExportOutcome::Written)).expect("`Written` renders something");
+        assert_eq!(
+            good_tone,
+            ExportTone::Good,
+            "control: every report is `Bad`, so the assertion above is vacuous"
+        );
+    }
+
+    /// A cancelled dialog is the one report that paints nothing. The user
+    /// closed a dialog they opened; that is not an event.
+    #[test]
+    fn a_cancelled_dialog_paints_nothing() {
+        assert!(export_message(&ExportReport::Cancelled).is_none());
+    }
+
+    /// **Only `encrypted_json` is offered**, and there is no way to ask for
+    /// anything else. See `vault_export`'s module docs for why a plaintext
+    /// vault file on Windows is effectively unrecoverable.
+    #[test]
+    fn the_menu_offers_one_format_and_no_choice_of_format() {
+        assert_eq!(crate::vault_export::EXPORT_FORMAT, "encrypted_json");
+        for banned in ["csv", "\"json\"", "zip", "--password", "--organizationid"] {
+            assert!(
+                !production().contains(banned),
+                "this file mentions {banned:?} -- a second export format, or a password on \
+                 argv, is reachable from the menu"
             );
         }
     }

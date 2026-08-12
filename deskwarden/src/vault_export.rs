@@ -562,29 +562,30 @@ impl CliExportRunner {
 
 /// The production [`ExportRunner`].
 ///
-/// **Nothing calls this yet.** Export step 5, the UI wiring, is unwritten: a
-/// search of `deskwarden/src` outside this file finds no reference to
-/// `real_runner`, `ExportRunner`, `CliExportRunner` or [`run_export`]. An
-/// earlier version of this comment described "the one function the UI calls"
-/// and "the one call site that wires it up"; there is no such call site, and
-/// the guarantee below is therefore currently unreachable in production
-/// rather than merely untested there.
+/// **Step 5 has landed and this now has exactly one production call site**:
+/// `vault_window::export_thread::pick_and_export`, which is what the vault
+/// window's "Export vault..." row runs on its worker thread. It is handed
+/// `vault_window::export_thread::export_job()` -- that window's own
+/// process-lifetime kill-on-close job, mirroring `send_fetch_thread`'s
+/// `sends_job` -- and never `Arc::new(None)`.
 ///
-/// It is the intended entry point, which is why
 /// [`the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`]
 /// drives [`run_export`] through THIS function and asserts, by pointer
 /// identity at [`crate::job_object::spawn_in_job`], that the job which
-/// reached the spawn is this argument.
+/// reached the spawn is this argument. That covers every hop from here
+/// inwards and, by construction, **none above it**: it hands `real_runner` a
+/// job itself, so a wiring that dropped the window's job on the way down
+/// would leave it green.
 ///
-/// **When step 5 lands, that test must be re-pointed at whatever the UI
-/// actually calls.** It is end-to-end from `real_runner` inwards, so every hop
-/// below this line is already covered whatever it is rewritten into -- but
-/// nothing covers the hops ABOVE it. If the wiring builds its own
-/// `CliExportRunner`, threads the `Arc<Option<KillOnCloseJob>>` through a
-/// window struct, or calls a new `export_now(..)` wrapper, then the job can go
-/// missing in that new code and this test will not notice: it hands
-/// `real_runner` a job itself. Re-proving means calling the wiring's own
-/// entry point with the arm's job and asserting the same recorded value.
+/// **The hops above are held by
+/// `vault_window::export_wiring::the_export_child_is_spawned_into_the_job_this_window_holds`**,
+/// which arms the same probe, calls `pick_and_export` -- the wiring's own
+/// blocking entry point, with only the shell save dialog substituted -- and
+/// asserts that the job recorded at the spawn is the one
+/// `export_thread::export_job()` hands out, by pointer identity, with a
+/// second job and a jobless run as its two controls. Both ends of the chain
+/// are therefore observed at the spawn rather than in the source text, which
+/// is what fifteen rounds established was the only thing that holds.
 pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
     CliExportRunner::new(job).into_runner()
 }
