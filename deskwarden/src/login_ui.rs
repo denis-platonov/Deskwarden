@@ -8810,6 +8810,52 @@ mod status_deadline_tests {
         !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     }
 
+    /// What this file's below-the-cut region is walked under.
+    ///
+    /// The walk itself is [`crate::below_cut::walk`] and is NOT written here.
+    /// It used to be, inline in the guard below, in one of fifteen
+    /// near-identical copies -- which is how the escaped-quote off-by-one in
+    /// the brace matcher reached three files at once, and how the byte-offset
+    /// close check that the shared walk carries failed to reach this file at
+    /// all. This copy had the line walk and no close check, so a payload that
+    /// closes the last test module with an INDENTED brace, plants a `pub fn`
+    /// at file scope after it and rebalances with a column-0 `}` walked
+    /// straight through: measured SURVIVING the whole suite at 2223 lib / 217
+    /// bin / 0 failed / 0 warnings in both profiles, with the planted `pub fn`
+    /// shipping in the lib's DEBUG LLVM IR. What the copies really disagreed
+    /// about is this struct's worth of text, so that is what stayed local.
+    ///
+    /// `is_module_opener` is this file's OWN [`below_cut_is_module_opener`]
+    /// and not [`crate::below_cut::is_module_opener`], deliberately: the
+    /// `modules == column_zero_module_openers(..)` control below compares the
+    /// walk's count against the other instance, so a one-edit widening of
+    /// either predicate desynchronizes the two and reds the suite. Pointing
+    /// the walk at the shared predicate would have made both sides move
+    /// together and thrown that property away.
+    const BELOW_CUT_RULES: crate::below_cut::WalkRules = crate::below_cut::WalkRules {
+        // The region handed to the walk begins AT the marker, so the walk
+        // starts unarmed and the first module's own gate is the one that
+        // arms it -- nothing outside the region is taken on trust.
+        gate: BELOW_CUT_GATE,
+        gated_at_start: false,
+        // This file's walk compared the TRIMMED line against the gate, so
+        // that is what is preserved here rather than quietly strengthened.
+        gate_at_column_zero: false,
+        is_module_opener: below_cut_is_module_opener,
+        string_lines: BELOW_CUT_STRING_LINES,
+        top_level_item_note: "Every source guard in this file slices at the first test gate and reads only what is above it, so an item down here is read by none of them: it can duplicate a call site pinned at exactly one, or reintroduce a construct banned by name, and the suite stays green.",
+        ungated_module_note: "A `pub(crate) mod ext { .. }` written down here is the same escape, one `mod` deep.",
+    };
+
+    /// `(visited, modules, closes, depth)` for the region below this file's
+    /// cut, by the one shared walk.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = source
+            .find(BELOW_CUT_MARKER)
+            .expect("the cut marker is checked by the caller");
+        crate::below_cut::walk(&source[cut..], &BELOW_CUT_RULES)
+    }
+
     /// **Below the cut there is nothing but test-only modules, and the cut is
     /// where every guard in this file believes it is.**
     ///
@@ -8889,59 +8935,35 @@ mod status_deadline_tests {
              the cut moved down"
         );
 
-        // 3. The walk. `lines()` strips the `\r` of this file's CRLF endings,
-        //    so every comparison below is against the line's real text.
-        let mut depth = 0usize;
-        let mut gated = false;
-        let mut modules = 0usize;
-        let mut closes = 0usize;
-        let mut visited = 0usize;
-        for line in source[cut..].lines() {
-            visited += 1;
-            if depth == 0 {
-                // Between modules NOTHING is allowed but blanks, comments,
-                // the gate and a module opener -- at any indentation, because
-                // an indented `fn` at file scope is still a top-level item.
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("//") {
-                    continue;
-                }
-                if trimmed == BELOW_CUT_GATE {
-                    gated = true;
-                    continue;
-                }
-                assert!(
-                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
-                    "top-level source below the cut: {line:?}. Every source guard in this file \
-                     slices at {BELOW_CUT_MARKER:?} and reads only what is above it, so an item \
-                     down here is read by none of them: it can duplicate a call site pinned at \
-                     exactly one, or reintroduce a construct banned by name, and the suite stays \
-                     green. Move it above the test modules."
-                );
-                assert!(
-                    gated,
-                    "the module {line:?} below the cut is not {BELOW_CUT_GATE:?}-gated, so it \
-                     ships -- and it ships in the half of the file no source guard here reads"
-                );
-                gated = false;
-                depth = 1;
-                modules += 1;
-            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
-                // Inside a test module every item is indented, so the only
-                // column-0 line is the module's own closing brace.
-                if line == "}" {
-                    depth = 0;
-                    closes += 1;
-                    continue;
-                }
-                assert!(
-                    BELOW_CUT_STRING_LINES.contains(&line),
-                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
-                     top-level item escaped the brace count, or this is the contents of a \
-                     string literal and belongs in BELOW_CUT_STRING_LINES"
-                );
-            }
-        }
+        // 3. The walk, run over an LF copy of this file and a CRLF copy of
+        //    the same text, which must agree. Built BOTH ways rather than
+        //    compared against the bytes on disk on purpose: this repository
+        //    stores LF blobs and only `core.autocrlf=true` makes the working
+        //    tree CRLF, so a control that asserted "this file is CRLF" would
+        //    itself be a check that passes on one machine and fails on Linux
+        //    CI.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        let as_lf = walk_below_the_cut(&lf);
+        let as_crlf = walk_below_the_cut(&crlf);
+        assert_eq!(
+            as_lf, as_crlf,
+            "the walk gives a different answer on an LF copy of this file than on a CRLF \
+             one, so something in it is sensitive to line endings"
+        );
+        // And the file as it really is on disk, whichever of the two that is.
+        let as_on_disk = walk_below_the_cut(source);
+        assert!(
+            as_on_disk == as_lf || as_on_disk == as_crlf,
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+        let (visited, modules, closes, depth) = as_on_disk;
 
         // 4. The walk is not vacuous, and it finished.
         assert!(
@@ -8963,6 +8985,102 @@ mod status_deadline_tests {
         assert_eq!(
             closes, modules,
             "control: every module the walk opened must also have been closed at column 0"
+        );
+
+        // The opener count, cross-checked against a SECOND instance of the
+        // opener predicate. `column_zero_module_openers` uses
+        // `below_cut::is_module_opener`; the walk used this file's own
+        // `below_cut_is_module_opener`. Widening either one alone
+        // desynchronizes them and fails here, which is the property that
+        // sharing a single predicate would have cost.
+        assert_eq!(
+            modules,
+            crate::below_cut::column_zero_module_openers(&source[cut..]),
+            "the walk opened {modules} modules but there are {} column-0 gated module openers \
+             below the cut -- the walk's opener predicate and \
+             `below_cut::is_module_opener` no longer agree",
+            crate::below_cut::column_zero_module_openers(&source[cut..])
+        );
+
+        // Controls on the walk itself. Without these it could be a no-op that
+        // visits lines and asserts nothing.
+        let appended = format!("{source}\npub fn sneaked() {{}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&appended)).is_err(),
+            "control: the walk accepted a `pub fn` appended below the test modules, which is \
+             the exact mutation it exists to catch"
+        );
+        // An INDENTED top-level item, which a column-0-only filter would miss.
+        // The payload is an indented, GATED module opener and not a `struct`:
+        // a struct is refused whether or not indentation is checked, because
+        // it is not a module opener either way, so it would leave the
+        // indentation rule unmeasured. This shape the opener predicate
+        // accepts, so only the indentation rule can refuse it -- and the
+        // trailing column-0 `}` makes the payload one the walk would
+        // otherwise ACCEPT, so deleting the rule reds this control.
+        let indented =
+            format!("{source}\n{BELOW_CUT_MARKER}\n    mod sneaked_indented {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&indented)).is_err(),
+            "control: the walk accepted an INDENTED, gated module opener appended below the \
+             test modules, which a column-0-only filter would miss"
+        );
+        // A column-0 line INSIDE the last test module that this file does not
+        // name in its string-literal allowance. The line is planted by
+        // dropping the file's final column-0 `}` and writing it back after
+        // the payload, so the braces still balance and the module's real
+        // close is still the last line -- the ONLY thing that refuses it is
+        // the allowance being an exact list rather than a permission.
+        let without_final_brace = source
+            .replace("\r\n", "\n")
+            .strip_suffix("}\n")
+            .expect("this file ends with a column-0 closing brace")
+            .to_owned();
+        let unlisted = format!("{without_final_brace}zz_not_source\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&unlisted)).is_err(),
+            "control: the walk accepted a column-0 line inside a test module that this file's \
+             string-literal allowance does not name, so the allowance is a permission and not \
+             a list"
+        );
+        // Liveness control at the IDENTICAL site: the same planting, with a
+        // line this file's allowance DOES name, is accepted. So the refusal
+        // above is about the allowance and not about the planting having
+        // broken the region.
+        let listed = format!("{without_final_brace}{}\n}}\n", BELOW_CUT_STRING_LINES[0]);
+        let cut_of_listed = listed
+            .find(BELOW_CUT_MARKER)
+            .expect("the marker survives the planting");
+        assert!(
+            crate::below_cut::try_walk(&listed[cut_of_listed..], &BELOW_CUT_RULES).is_ok(),
+            "control: the walk refuses the planted region even when the planted line IS named \
+             in the allowance, so the refusal above is not measuring the allowance"
+        );
+        let ungated = format!("{source}\nmod shipped {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&ungated)).is_err(),
+            "control: the walk accepted an UNGATED module below the cut, which ships"
+        );
+
+        // And the one the line walk could not catch, which is why this file
+        // stopped carrying its own: this file's own text with its last module
+        // closed by an INDENTED brace, a `pub fn` at file scope after it, and
+        // a column-0 `}` further down to rebalance the count. Perfectly
+        // balanced source, no lexer trick -- every payload line is indented,
+        // so the `depth == 1` branch skips it and the walk ends with
+        // `closes == modules` and `depth == 0`. Measured SURVIVING the whole
+        // suite here at 2223 lib / 217 bin / 0 failed / 0 warnings, and
+        // shipping three times over in the lib's DEBUG LLVM IR. Only the
+        // byte-offset close check the shared walk carries kills it.
+        let balanced = format!(
+            "{without_final_brace}    }}\n    pub fn sneaked(x: u64) -> u64 {{ x }}\n    \
+             #[allow(dead_code)]\n    mod filler {{\n}}\n"
+        );
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&balanced)).is_err(),
+            "control: the walk accepted this file's last test module closed by an INDENTED \
+             brace with a `pub fn` at file scope after it. That is the payload the byte-offset \
+             close check exists for, and it is once again invisible"
         );
         for known in BELOW_CUT_STRING_LINES {
             assert_eq!(
