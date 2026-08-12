@@ -7718,6 +7718,106 @@ pub(crate) mod password_lifetime_tests {
             ignored_names.len(),
             ignored_paths.len()
         );
+        // **The NEGATIVE control on that reader, and why it is not a list.**
+        // The assertion above is a positive control only: it says the parser
+        // produced SOMETHING. Nothing above constrains it in the
+        // over-accept direction, and the whole weight of the layer below
+        // rests on the parser being a faithful reader of a file no edit here
+        // can move. Measured at `de79a19`: retargeting `BUILD_OUTPUT_DIRS[1]`
+        // and `literals` at `deskwarden/examples` and pushing ONE extra name
+        // into `ignored_names` -- three edits, all inside this file -- took a
+        // tracked `deskwarden/examples` holding a real probe out of the scan
+        // and the test PASSED in the fallback configuration, probe unseen.
+        // The anchor was outside this file; its reader was not.
+        //
+        // So every entry the parser produced is required to be a line of the
+        // text it claims to have read. The input is DERIVED -- it is
+        // `ignore_text`, the same bytes the loop above consumed -- rather
+        // than an enumeration of names a reviewer thought of, which is the
+        // failure this file keeps repeating: every such list eventually
+        // loses a spelling race, and `["src", "examples", "docs",
+        // "installer"]` would lose it to the fifth directory this repository
+        // grows. There is no name here to lose it with. A parsed entry is
+        // rendered back into the `.gitignore` pattern that alone could have
+        // produced it and that exact line must be present, so an entry the
+        // text does not say is a failure whatever it is spelled.
+        //
+        // This is a check on the READER, not a second parser: it decides
+        // nothing about what a pattern means, matches no directory and
+        // consults no path of this tree. The under-accept direction is
+        // deliberately left alone -- the parser is conservative there (it
+        // requires the trailing `/`, skips `!`, `#`, blanks and unanchored
+        // interior-`/` patterns), all four patterns this repository needs
+        // parse, and a reader that accepts too LITTLE can only make the
+        // layer below fail loudly.
+        let unsubstantiated: Vec<String> = ignored_names
+            .iter()
+            .map(|n| format!("{n}/"))
+            .chain(ignored_paths.iter().map(|p| {
+                let rel = p.strip_prefix(&root).unwrap_or(p.as_path());
+                let mut pat = String::new();
+                for c in rel.components() {
+                    pat.push('/');
+                    pat.push_str(&c.as_os_str().to_string_lossy());
+                }
+                pat.push('/');
+                pat
+            }))
+            .filter(|pat| !ignore_text.lines().any(|l| l.trim() == *pat))
+            .collect();
+        assert!(
+            unsubstantiated.is_empty(),
+            "the `.gitignore` reader in this test produced {} entr(y/ies) that `{}` does not \
+             contain, the first of them {:?}. That file is the ONE input this test has that no \
+             edit inside `login_ui.rs` can move, and the layer below is only as good as this \
+             reader: teaching the reader one extra name is a single edit that makes the anchor \
+             agree to anything, and that edit -- with `BUILD_OUTPUT_DIRS` and `literals` \
+             retargeted at `deskwarden/examples` -- was measured shipping a tracked, \
+             probe-bearing directory out of the scan, green, in the fallback configuration. \
+             Every entry here must be a line of that file, rendered back exactly",
+            unsubstantiated.len(),
+            root.join(".gitignore").display(),
+            unsubstantiated.first()
+        );
+        // **And the same reader is asked about a directory it must never be
+        // able to name: the one this very file lives in.** Also derived --
+        // the path comes from the scan's own listing, which is asserted to
+        // contain `login_ui.rs` above -- so there is no second literal here
+        // either. This closes the residual the name branch leaves open: it
+        // matches by `file_name` at ANY depth, so it is not enough that
+        // `.gitignore` really says `target/`; what matters is that no
+        // directory holding this crate's source answers to a parsed entry.
+        // If a directory literally named `target`, `.vscode` or `.idea` ever
+        // appears above a source file of this crate, this fires -- and it
+        // fires for the directory that would carry the probe, which is the
+        // only one the scan cannot afford to lose. It does NOT speak for
+        // every other tracked directory of the tree; that is what the
+        // `git ls-files` oracle and the `scanned_dirs` layer below are for.
+        let own = files
+            .iter()
+            .find(|p| p.ends_with("login_ui.rs"))
+            .expect("the scan's listing holds this file; asserted above");
+        let ignored_ancestors: Vec<&std::path::Path> = own
+            .ancestors()
+            .skip(1)
+            .take_while(|a| *a != root.as_path() && a.starts_with(&root))
+            .filter(|a| {
+                ignored_paths.iter().any(|p| p == *a)
+                    || a.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| ignored_names.iter().any(|i| *i == n))
+            })
+            .collect();
+        assert!(
+            ignored_ancestors.is_empty(),
+            "the `.gitignore` reader in this test calls {} director(ies) above `{}` ignored, \
+             the first of them {:?}. A directory holding this crate's own source is not build \
+             output, and a reader that says it is hands the layer below permission to delete \
+             the probe scan's own subtree",
+            ignored_ancestors.len(),
+            own.display(),
+            ignored_ancestors.first()
+        );
         let unignored: Vec<&std::path::PathBuf> = const_dirs
             .iter()
             .filter(|d| {
