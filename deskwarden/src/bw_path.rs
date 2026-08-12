@@ -818,13 +818,37 @@ mod tests {
     /// A program name reached through a LOCAL BINDING — `let exe = ..;
     /// Command::new(exe)` — still walks past this, because the name is not in
     /// the argument list at all and no amount of window-widening gets it back
-    /// without swallowing the rest of the file. That shape is held elsewhere,
-    /// and it is worth writing down which elsewhere: it is
-    /// `job_object::tests::the_two_job_bearing_modules_can_start_a_child_only_through_this_one`
-    /// (no file outside `ALLOWED` may start a child, in either call syntax) and
-    /// RULE 1 in `the_two_job_bearing_modules_cannot_name_a_bare_command` (no
-    /// file in the runners' `mod` closure may NAME a bare command type). This
-    /// guard is about the ACCOUNT DIRECTORY, and it is the third of three.
+    /// without swallowing the rest of the file. So does an ALIASED type:
+    /// `use std::process::Command as thread; thread::new(exe)` spells no
+    /// `Command::new(` anywhere, and that exact mutant was measured SURVIVING
+    /// this guard.
+    ///
+    /// **The backstop, stated precisely — and this sentence has been wrong
+    /// before.** The previous version of this note named two compensating
+    /// controls, "the child-start walk and RULE 1". RULE 1 lives in
+    /// `the_two_job_bearing_modules_cannot_name_a_bare_command` and it is
+    /// fenced to the RUNNERS' `mod` CLOSURE; `accounts.rs` is not in that
+    /// closure, so RULE 1 never reached the file the measured mutant was
+    /// written in. Half of a named backstop that does not hold is worse than
+    /// no backstop named at all, because it is what stops the next person
+    /// looking.
+    ///
+    /// What actually holds, crate-wide and with no fence, is exactly one
+    /// thing:
+    /// `job_object::tests::the_two_job_bearing_modules_can_start_a_child_only_through_this_one`.
+    /// No file outside its `ALLOWED` list may START a child — in either of
+    /// Rust's method syntaxes, whether the method is called or merely NAMED as
+    /// a path value, and with the `std::thread` exemption RESOLVED rather than
+    /// taken on the spelling of the prefix, so the `as thread` alias above is
+    /// reported there even though it is invisible here. A `Command` this guard
+    /// cannot see still cannot be STARTED outside the choke point.
+    ///
+    /// RULE 1 is a real rule and it does hold — over the runners' `mod`
+    /// closure. It is simply not this guard's backstop outside that closure.
+    ///
+    /// This guard is about the ACCOUNT DIRECTORY: it is the reason a switched
+    /// account does not keep answering from the previous one, and it is the
+    /// third of three.
     fn direct_bw_spawns(label: &str, text: &str) -> Vec<String> {
         let needle = concat!("Command", "::new(");
         let code = spliced(text);

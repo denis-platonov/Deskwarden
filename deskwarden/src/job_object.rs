@@ -813,17 +813,100 @@ mod tests {
     /// child: `spawn`, `output` and `status`. [`CHILD_STARTERS`] is that list,
     /// and each name is matched in both syntaxes.
     ///
-    /// The associated-function needle is `::NAME(` and not `Command::NAME(`,
+    /// The associated-function needle is `::NAME` and not `Command::NAME`,
     /// because the type can be spelled in ways a literal cannot chase: a `use`
     /// alias (`type C = Command; C::spawn(&mut c)`), a qualified form
     /// (`<std::process::Command>::spawn(&mut c)`), or a plain `process::`
-    /// prefix. `::NAME(` is what all of them have in common.
+    /// prefix. `::NAME` is what all of them have in common.
     ///
-    /// The one std method reached that way in this crate that does NOT start a
-    /// process is `std::thread::spawn`, which is written in a couple of dozen
-    /// places -- so it is subtracted by name rather than the whole needle being
-    /// abandoned. A thread is not a child process; naming that one exception is
-    /// the price of a needle that no spelling of the type can hide from.
+    /// # The paren is not part of a call
+    ///
+    /// The needles used to be `.NAME()` and `::NAME(` -- both of which require
+    /// a `(` immediately after the method name. Rust's PATH-AS-VALUE form has
+    /// no paren there at all, and that is a call:
+    ///
+    ///     let f = std::process::Command::spawn;   // no `(` after `spawn`
+    ///     let _child = f(&mut c)?;
+    ///
+    /// Measured in `src/accounts.rs` -- a non-`ALLOWED` file, outside the
+    /// runners' `mod` closure -- that SURVIVED the whole suite at
+    /// 2115 / 217 / 2 ignored / 0 failed / 0 warnings. The byte-identical
+    /// control with `let _child = c.spawn()?;` instead was KILLED here at
+    /// 2114 / 1, so the walk really did read the file: the difference was a
+    /// pure SPELLING change with no semantic content whatsoever.
+    /// `.map(Command::spawn)`, `.and_then(Command::output)`, a struct field of
+    /// type `fn(&mut Command) -> ..` and an `impl FnOnce` are the same escape.
+    ///
+    /// So the paren is gone from the PATH needle, which is now the bare token
+    /// `::NAME` -- whatever follows it, as long as what follows does not
+    /// CONTINUE the identifier. That last clause is what keeps
+    /// `job_object::spawn_in_job(..)` out; it is a property of Rust's lexer
+    /// rather than a list of exceptions. [`path_form_starts`] is that scan.
+    ///
+    /// The RECEIVER needle keeps its `()`, and that is not an oversight. All
+    /// three of these methods take `&mut self` AND NOTHING ELSE, so the
+    /// receiver form of a real child start is always written with an EMPTY
+    /// argument list; and a method cannot be referenced through a receiver in
+    /// Rust at all, so there is no path-as-value spelling to lose here.
+    /// Dropping the parens from this side would not close a hole -- it would
+    /// open a false-positive one. Measured: it turns
+    /// `output.status.success()`, `breaches.status(ctx, password)` and
+    /// `scope.spawn(move || ..)` into offenders, twenty-two of them across six
+    /// files, none of which is a `Command`. The parens ARE the type
+    /// distinction here, unlike on the path side where they were only a
+    /// syntax accident.
+    ///
+    /// # `thread` is resolved, not assumed
+    ///
+    /// The one std method reached by the path syntax in this crate that does
+    /// NOT start a process is `std::thread::spawn`, written in a couple of
+    /// dozen places. It used to be excused by SUBTRACTING the count of the
+    /// literal `thread::NAME(` from the total -- and nothing in that
+    /// subtraction required `thread` to be `std::thread`:
+    ///
+    ///     use std::process::Command as thread;   // no lint fires on a rename
+    ///     let mut c = thread::new(exe);
+    ///     let _child = thread::spawn(&mut c)?;
+    ///
+    /// Measured: SURVIVED at 2115 / 217 / 2 / 0 failed / 0 warnings. The `+1`
+    /// from the path form was cancelled by the `-1` from the exception, and as
+    /// a bonus `thread::new(` spells no `Command::new(`, so `bw_path`'s
+    /// `direct_bw_spawns` was silent too. ONE ALIAS DEFEATED TWO GUARDS.
+    ///
+    /// [`is_std_thread`] replaces the subtraction, and it does so by DELETING
+    /// the guesswork rather than widening it. An exemption is granted only for
+    /// the path written out in full as `std::thread::NAME`. There is no
+    /// bare-`thread::` exemption at all.
+    ///
+    /// That is affordable because it costs this crate nothing: every one of
+    /// the couple of dozen genuine sites is already spelled
+    /// `std::thread::spawn` in full, and
+    /// [`no_bare_thread_prefix_is_relied_on_for_an_exemption`] pins that, so
+    /// the day someone writes `use std::thread;` and a bare `thread::spawn`
+    /// they get a failing test naming this rule rather than a silent hole.
+    ///
+    /// An intermediate version tried to RESOLVE a bare `thread::` -- excusing
+    /// it in files that import `std::thread` and contain no `as thread`
+    /// rename. That was measured and it laundered:
+    ///
+    ///     use std::thread::sleep as _keep_alive;   // makes the import test pass
+    ///     type thread = std::process::Command;     // not an `as thread` rename
+    ///     let _child = thread::spawn(&mut c)?;
+    ///
+    /// SURVIVED at 2115 / 217 / 2 / 0 failed. Resolving Rust name binding with
+    /// substring tests is the same mistake as the subtraction it replaced, one
+    /// level up. A path spelled in full needs no resolution.
+    ///
+    /// # Raw identifiers are normalised first
+    ///
+    /// `r#spawn` is the same method as `spawn`, and `c.r#spawn()` compiles.
+    /// Measured against the token rule above BEFORE this normalisation:
+    /// SURVIVED at 2115 / 217 / 2 / 0 failed / 0 warnings, because the
+    /// stripped text reads `.r#spawn()` and neither `.spawn()` nor a `::`
+    /// prefix is there. [`without_raw_idents`] already existed for the
+    /// `#[path]` rule for exactly this reason -- it is applied here now too,
+    /// which makes it a normalisation every rule in this module shares rather
+    /// than a fix bolted onto one of them.
     fn direct_child_starts(label: &str, text: &str) -> Vec<String> {
         // The line pass reads unstripped source and exists only to name a line
         // number, so it keeps the receiver spelling it can actually find.
@@ -839,15 +922,14 @@ mod tests {
             .map(|(i, line)| format!("{label}:{}: {}", i + 1, line.trim()))
             .collect();
 
-        let code = code_only(text);
+        let code = without_raw_idents(&code_only(text));
         for method in CHILD_STARTERS {
             let receiver = format!(".{method}()");
-            let associated = format!("::{method}(");
-            // `std::thread::spawn(..)` is the one non-process method reached in
-            // this crate by the associated syntax.
-            let thread_form = format!("thread::{method}(");
-            let stripped = code.matches(&receiver).count() + code.matches(&associated).count()
-                - code.matches(&thread_form).count();
+            let stripped = code.matches(&receiver).count()
+                + path_form_starts(&code, method)
+                    .into_iter()
+                    .filter(|at| !is_std_thread(&code, *at))
+                    .count();
             let named = found.iter().filter(|f| f.contains(&receiver)).count();
             // Fails safe in both directions: a stripped count that exceeds what
             // the line pass could name adds the difference as line-less
@@ -865,7 +947,130 @@ mod tests {
     /// The methods of `std::process::Command` that start a child process.
     /// Exhaustive by the std API, which is what makes this a closed list rather
     /// than a denylist of spellings -- see [`direct_child_starts`].
+    ///
+    /// `spawn`, `output` and `status` are the only stable process-starting
+    /// methods on `Command`; the Windows `CommandExt` starts nothing, and
+    /// `exec`/`pre_exec` are Unix-only. The escape measured against this rule
+    /// has never been a missing NAME -- it has been the SHAPE of the needle
+    /// around the name, which is why the needles are now token-shaped.
     const CHILD_STARTERS: &[&str] = &["spawn", "output", "status"];
+
+    /// Byte offsets in a [`code_only`] view where `method` appears as a
+    /// complete identifier token immediately preceded by `::` -- the
+    /// associated-function syntax, in which the method may be CALLED or merely
+    /// NAMED.
+    ///
+    /// Deliberately says NOTHING about what follows the name.
+    /// `Command::spawn(&mut c)`, `let f = Command::spawn;`,
+    /// `.map(Command::spawn)`, `.and_then(Command::output)` and a struct field
+    /// initialised with `Command::status` are all hits, because a path is a
+    /// VALUE in Rust and calling it later is a detail no scanner of this file
+    /// can follow. What follows the name matters only insofar as it must not
+    /// CONTINUE the identifier: `spawn_in_job`, `status_code` and `outputs`
+    /// are different names, not different spellings of these ones.
+    fn path_form_starts(code: &str, method: &str) -> Vec<usize> {
+        let b = code.as_bytes();
+        let continues_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find(method) {
+            let start = from + at;
+            from = start + method.len();
+            if b.get(from).is_some_and(|c| continues_ident(*c)) {
+                continue;
+            }
+            if start > 1 && b[start - 1] == b':' && b[start - 2] == b':' {
+                out.push(start);
+            }
+        }
+        out
+    }
+
+    /// Whether the hit at `at` names `std::thread`'s function rather than a
+    /// `Command` method -- the ONE non-process use of these names in this
+    /// crate, and the reason [`direct_child_starts`] does not simply fail on
+    /// every `::spawn` it sees.
+    ///
+    /// The prefix is required to be WRITTEN OUT, and nothing is inferred. The
+    /// exemption is granted for `std::thread::NAME` and for nothing else --
+    /// not for a bare `thread::NAME`, however plausible the file makes it look.
+    ///
+    /// `thread` is an ordinary identifier. `use .. as thread;` rebinds it,
+    /// `type thread = ..;` rebinds it, a local `mod thread` rebinds it, and
+    /// each of those was either measured escaping or is a trivial variant of
+    /// one that was. Deciding Rust name binding from substrings is not a thing
+    /// this file can do correctly, so it no longer tries: it reads a path it
+    /// can verify on sight, and treats every other spelling as a child start.
+    ///
+    /// `std` itself could in principle be shadowed by a local `mod std`.
+    /// DISCLOSED, not fixed -- that shape has to be written at the crate root,
+    /// makes every other `std::` path in the file ambiguous, and is held by
+    /// nothing here. It is a much louder edit than the `as thread` rename this
+    /// replaced, which fired no lint at all.
+    ///
+    /// A `.thread` RECEIVER call is never excused: `std::thread::spawn` is a
+    /// free function, only ever reached by the path syntax, and the receiver
+    /// needle requires an empty argument list anyway.
+    fn is_std_thread(code: &str, at: usize) -> bool {
+        let Some(path) = code[..at].strip_suffix("::") else {
+            return false;
+        };
+        let Some(before) = path.strip_suffix(concat!("std::", "thread")) else {
+            return false;
+        };
+        // `..my_std::thread::spawn` is not `std::thread::spawn`.
+        !before.as_bytes().last().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    }
+
+    #[test]
+    fn no_bare_thread_prefix_is_relied_on_for_an_exemption() {
+        // [`is_std_thread`] excuses ONLY a fully written `std::thread::NAME`,
+        // which costs this crate nothing TODAY -- every genuine site spells it
+        // out. This is the assertion that keeps that true, so that the day
+        // someone writes `use std::thread;` and a bare `thread::spawn(..)`
+        // they get told to spell it out rather than discovering that the
+        // child-start guard has quietly started reporting it.
+        //
+        // Without this pin the exemption would rot into a hole the other way:
+        // the next person hits the failure, reads `thread::spawn` in the
+        // offender list, concludes the guard is broken, and re-adds the
+        // subtraction that three separate mutants have now walked through.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        let mut bare = Vec::new();
+        for file in &files {
+            let code = without_raw_idents(&code_only(&std::fs::read_to_string(file).unwrap()));
+            for method in CHILD_STARTERS {
+                for at in path_form_starts(&code, method) {
+                    let head = &code[..at];
+                    let Some(path) = head.strip_suffix("::") else { continue };
+                    if path.ends_with("thread") && !is_std_thread(&code, at) {
+                        bare.push(format!(
+                            "{}: a `thread::{method}` that is not `std::thread::{method}`",
+                            file.display()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "spell these `std::thread::..` out in full; the child-start guard excuses only the \
+             fully written path, because `thread` is an identifier anything can rebind:\n{}",
+            bare.join("\n")
+        );
+        // Controls: the exemption exists, and it is narrow.
+        let hit = |s: &str| {
+            let code = without_raw_idents(&code_only(s));
+            let at = path_form_starts(&code, "spawn")[0];
+            is_std_thread(&code, at)
+        };
+        assert!(hit(&format!("std::thread::{}(move || w());", concat!("spa", "wn"))));
+        assert!(!hit(&format!("thread::{}(&mut c)?;", concat!("spa", "wn"))));
+        assert!(!hit(&format!("my_std::thread::{}(&mut c)?;", concat!("spa", "wn"))));
+        assert!(!hit(&format!("Command::{}(&mut c)?;", concat!("spa", "wn"))));
+    }
 
     #[test]
     fn the_two_job_bearing_modules_can_start_a_child_only_through_this_one() {
@@ -1611,6 +1816,45 @@ mod tests {
             "control: `include_str!` embeds DATA and is used by every source pin in this crate"
         );
         assert_eq!(seen("let b = include_bytes!(\"icon.ico\");"), 0, "control: `include_bytes!`");
+        // ...and THE SHAPE THIS RULE FALSE-FIRED ON, which is why it is now
+        // anchored to bracket depth from a `#[` rather than to the single
+        // character before the key. Each of these made the suite FAIL at
+        // 2114 / 1 on the parent commit, reporting a `#[path]` attribute in
+        // `src/accounts.rs` that was never there. `path` is a very common
+        // identifier in a Windows app full of paths, and a guard that lies to
+        // the next maintainer gets weakened by the next maintainer.
+        for ordinary in [
+            "let mut path = a; if alt { path = b; }",
+            "*path = x;",
+            "if c { path = a } else { path = b }",
+            "for p in ps { path = p; }",
+            "let (path, _) = t; path = u;",
+        ] {
+            assert_eq!(
+                seen(ordinary),
+                0,
+                "control: ordinary Rust flagged as an attribute: {ordinary}"
+            );
+        }
+        // ...and the anchor holds in the other direction too: an attribute is
+        // still found however deeply it nests, and an inner attribute counts.
+        assert_eq!(
+            seen(r#"#![cfg_attr(all(windows, test), path = "aid.rs")]"#),
+            1,
+            "control: an inner attribute"
+        );
+        assert_eq!(
+            seen(r#"#[cfg_attr(a, cfg_attr(b, path = "aid.rs"))] mod aid;"#),
+            1,
+            "control: two levels of nesting"
+        );
+        // ...and a `path = ..` written AFTER an attribute has closed is not
+        // inside it, which is the whole point of counting brackets.
+        assert_eq!(
+            seen(r#"#[derive(Clone)] fn f() { path = b; }"#),
+            0,
+            "control: after the attribute closed"
+        );
 
         // Files allowed to start a child outside the job, each because it
         // really does today and for a reason that is not this module's to
@@ -1659,11 +1903,20 @@ mod tests {
         for allowed in ALLOWED {
             let text = std::fs::read_to_string(src.join(allowed)).unwrap();
             let code = code_only(&text);
-            let starts: usize =
-                [concat!(".spa", "wn()"), concat!(".out", "put()"), concat!(".sta", "tus()")]
-                    .iter()
-                    .map(|n| code.matches(n).count())
-                    .sum();
+            // Counted through the SAME matcher the rule uses, so a file whose
+            // only child start is written in the path form still counts as
+            // starting one. A second, differently-spelled count here is how an
+            // exemption stays alive over code the rule can no longer see.
+            let starts: usize = CHILD_STARTERS
+                .iter()
+                .map(|m| {
+                    code.matches(&format!(".{m}()")).count()
+                        + path_form_starts(&code, m)
+                            .into_iter()
+                            .filter(|at| !is_std_thread(&code, *at))
+                            .count()
+                })
+                .sum();
             assert!(
                 starts > 0,
                 "{allowed} is excused from this guard but no longer starts a child; remove it \
@@ -1681,10 +1934,74 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "a child process is started outside `spawn_in_job`, so it joins no job object and \
-             the spawn probe never sees it -- a `bw` holding an unlocked vault could outlive a \
-             panic, a `process::exit` or a Task Manager kill:\n{}",
+            "a `std::process::Command` starts a child outside `spawn_in_job`, so it joins no job \
+             object and the spawn probe never sees it -- a `bw` holding an unlocked vault could \
+             outlive a panic, a `process::exit` or a Task Manager kill.\n\nWHAT THIS ASSERTION \
+             DOES AND DOES NOT PROVE: it reads the three `Command` methods that start a child, in \
+             both of Rust's method syntaxes, over every `.rs` file in the tree. It says nothing \
+             about the raw Win32 door -- `CreateProcessW` and friends through the already-enabled \
+             `Win32_System_Threading` feature start a child with no `Command` anywhere. That is \
+             held by the SEPARATE scan below, and RULE 9 holds it for this file; before this \
+             round the message here claimed flatly that `no child process is started outside \
+             spawn_in_job`, which was an overclaim, and an overclaim is exactly how the \
+             disclosure in `bw_path::direct_bw_spawns` came to name a backstop that did not \
+             exist. Offenders:\n{}",
             offenders.join("\n")
+        );
+
+        // THE RAW WIN32 DOOR, which the `Command` scan above cannot see at
+        // all. `Win32_System_Threading` is already an enabled feature of the
+        // `windows` dependency, so `CreateProcessW(..)` compiles in any file
+        // in this crate and starts a child that joins no job object -- with no
+        // `Command`, no `spawn`, and nothing for the scan above to match.
+        //
+        // RULE 9 elsewhere in this module holds `job_object.rs` against this.
+        // Nothing held the other forty-odd files, and the message above used
+        // to claim otherwise. This is that claim, made true.
+        //
+        // Held as a token scan over the stripped view, so the `windows` crate's
+        // own re-export path (`Win32::System::Threading::CreateProcessW`) and a
+        // bare `CreateProcessW` after a `use` are the same hit.
+        //
+        // `ALLOWED` governs this scan too, and for the same reason -- those
+        // files already start children today. Measured: `vault_window/mod.rs`
+        // really does call `ShellExecuteW`, to open a vault URL in the user's
+        // browser without going through `cmd.exe /C start` and its
+        // metacharacter injection. It is on `ALLOWED` already, so the
+        // exemption is one visible list rather than two.
+        const WIN32_STARTERS: &[&str] =
+            &["CreateProcess", "ShellExecute", "WinExec", "CreateProcessAsUser"];
+        let mut win32 = Vec::new();
+        for file in &files {
+            let rel = relative(file);
+            if ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let code = code_only(&std::fs::read_to_string(file).unwrap());
+            for needle in WIN32_STARTERS {
+                let n = code.matches(needle).count();
+                if n > 0 {
+                    win32.push(format!("{rel}: {needle} x{n}"));
+                }
+            }
+        }
+        assert!(
+            win32.is_empty(),
+            "a child process is started through the raw Win32 API, outside `spawn_in_job` and \
+             outside the `Command` scan above -- it joins no job object:\n{}\n\nUnlike \
+             `CHILD_STARTERS`, this list is NOT closed by an std API: it is the Win32 process \
+             creation surface, and a name not on it walks past. That is disclosed rather than \
+             fixed, because the alternative is scanning for every `unsafe` block in the crate. \
+             The `Command` path is the one with a closed enumeration behind it.",
+            win32.join("\n")
+        );
+        // Control, so the silence above is worth something.
+        assert_eq!(
+            code_only(&format!("unsafe {{ {}W(..) }}", concat!("Create", "Process")))
+                .matches(WIN32_STARTERS[0])
+                .count(),
+            1,
+            "the Win32 scan cannot see the call it exists to catch"
         );
 
         // The two files this guarantee is actually about are named, so that
@@ -1747,6 +2064,112 @@ mod tests {
             1,
             "a receiver and its `spawn` on two lines slip past"
         );
+        // ...including THE NINETEENTH HOP: a call spelled as a PATH VALUE,
+        // which has no paren after the method name at all and which SURVIVED
+        // the whole suite in `src/accounts.rs` at 2115 / 217 / 2 / 0 failed.
+        for value_form in [
+            format!("letf=std::process::Command::{};letc=f(&mut c)?;", concat!("spa", "wn")),
+            format!("lets=v.iter().map(Command::{}).count();", concat!("spa", "wn")),
+            format!("r.and_then(std::process::Command::{})", concat!("out", "put")),
+            format!("structS{{f:fn(&mut Command)->R}}letx=S{{f:C::{}}};", concat!("sta", "tus")),
+        ] {
+            assert_eq!(
+                direct_child_starts("planted.rs", &value_form).len(),
+                1,
+                "a child start NAMED rather than called walks past again: {value_form}"
+            );
+        }
+        // ...and the ALIAS that laundered the old `thread::` subtraction. The
+        // `+1` from the path form used to be cancelled by a `-1` from a
+        // `thread::spawn(` that was not std's thread at all. SURVIVED at
+        // 2115 / 217 / 2 / 0 failed / 0 warnings, and silenced `bw_path`'s
+        // `direct_bw_spawns` in the same stroke, since `thread::new(` spells
+        // no `Command::new(`.
+        assert_eq!(
+            direct_child_starts(
+                "planted.rs",
+                &format!(
+                    "use std::process::Command as thread;\r\nlet _c = thread::{}(&mut c)?;",
+                    concat!("spa", "wn")
+                )
+            )
+            .len(),
+            1,
+            "`use .. as thread` still cancels its own detection -- the exception is being taken \
+             at face value again instead of resolved"
+        );
+        // ...while the couple of dozen REAL `std::thread::spawn` sites stay
+        // silent, in both the spelled-out and the imported form, or this rule
+        // is unusable and the next person deletes it.
+        assert!(
+            direct_child_starts(
+                "planted.rs",
+                &format!("let h = std::thread::{}(move || work());", concat!("spa", "wn"))
+            )
+            .is_empty(),
+            "control: `std::thread::spawn` is not a child process"
+        );
+        // ...while a BARE `thread::spawn` is NOT excused, however convincingly
+        // the file is dressed up. This is the TWENTIETH HOP against the
+        // resolution attempt that briefly replaced the old subtraction:
+        // `use std::thread::sleep as _k;` satisfied an "imports std::thread"
+        // test, `type thread = Command;` is not an `as thread` rename, and the
+        // pair SURVIVED at 2115 / 217 / 2 / 0 failed.
+        for laundered in [
+            format!("use std::thread;\r\nlet h = thread::{}(&mut c)?;", concat!("spa", "wn")),
+            format!(
+                "use std::thread::sleep as _k;\r\ntype thread = std::process::Command;\r\n\
+                 let h = thread::{}(&mut c)?;",
+                concat!("spa", "wn")
+            ),
+            format!("mod thread {{ }}\r\nlet h = thread::{}(&mut c)?;", concat!("spa", "wn")),
+        ] {
+            assert_eq!(
+                direct_child_starts("planted.rs", &laundered).len(),
+                1,
+                "a bare `thread::` prefix is being excused on the strength of its spelling again \
+                 -- `thread` is an identifier anything can rebind: {laundered}"
+            );
+        }
+        // ...and a LONGER identifier ending in `std::thread` is not std's.
+        assert_eq!(
+            direct_child_starts(
+                "planted.rs",
+                &format!("let h = my_std::thread::{}(&mut c)?;", concat!("spa", "wn"))
+            )
+            .len(),
+            1,
+            "`my_std::thread::spawn` is being read as `std::thread::spawn`"
+        );
+        // ...and RAW IDENTIFIER spellings, which are the same method to rustc
+        // and which SURVIVED the token rule at 2115 / 217 / 2 / 0 failed / 0
+        // warnings before [`without_raw_idents`] was applied here.
+        for raw in [
+            format!("let _c = c.r#{}()?;", concat!("spa", "wn")),
+            format!("let f = std::process::Command::r#{};", concat!("spa", "wn")),
+            format!("let o = c.r#{}();", concat!("out", "put")),
+        ] {
+            assert_eq!(
+                direct_child_starts("planted.rs", &raw).len(),
+                1,
+                "a raw-identifier spelling of a child start walks past: {raw}"
+            );
+        }
+        // ...and the receiver form keeps its parens ON PURPOSE: all three
+        // methods take `&mut self` and nothing else, so a `.NAME(..)` WITH
+        // arguments is a different method on a different type. Dropping the
+        // parens here was measured to produce twenty-two offenders across six
+        // files, none of them a `Command`.
+        for not_a_command in [
+            format!("if out.{}.success() {{ ok() }}", concat!("sta", "tus")),
+            format!("let s = breaches.{}(ctx, password);", concat!("sta", "tus")),
+            format!("let r = scope.{}(move || drain(pipe));", concat!("spa", "wn")),
+        ] {
+            assert!(
+                direct_child_starts("planted.rs", &not_a_command).is_empty(),
+                "the receiver form is flagging something that is not a `Command`: {not_a_command}"
+            );
+        }
         // ...and does not flag the choke-point call itself.
         assert!(direct_child_starts(
             "planted.rs",
@@ -1916,33 +2339,81 @@ mod tests {
     }
     /// Occurrences of an attribute argument `path = ..` in a stripped view.
     ///
-    /// The test that reads this explains why it is a token check rather than a
-    /// list of the delimiters an attribute can sit behind. In short: the
-    /// character before the key must not be part of an identifier (which is
-    /// every attribute position, at any nesting depth, and excludes
-    /// `let path =` and `self.path =`), and the character after the `=` must
-    /// not be `>` (which excludes a `path => ..` match arm).
+    /// # Anchored to the attribute, not to one preceding character
+    ///
+    /// The previous version asked only whether the character before `path=`
+    /// was part of an identifier, on the theory that this excluded
+    /// `let path =` and `self.path =` while admitting every attribute
+    /// position. It does exclude those two -- and it FALSE-FIRES on the third
+    /// shape, which is the commonest one in a path-heavy Windows app:
+    ///
+    ///     let mut path = a;
+    ///     if alt { path = b; }        // stripped: `{path=b;}`
+    ///
+    /// A plain REASSIGNMENT has `;`, `{`, `}` or `)` before it, not a letter,
+    /// so it was counted -- measured on the parent commit as a FAILING suite
+    /// at 2114 / 1, reporting that `src/accounts.rs` carried a `#[path]`
+    /// attribute or a bare `include!`. It carried neither. `*path = x;` and
+    /// `if c { path = a } else { path = b }` are the same shape.
+    ///
+    /// A guard that lies to the next maintainer is worse than one that is
+    /// merely narrow: the only way to make that suite green is to weaken or
+    /// delete the rule, and two pins in this session were degraded exactly
+    /// that way.
+    ///
+    /// So the key is no longer identified by its neighbour. An attribute
+    /// argument is by definition INSIDE the brackets of a `#[..]` or `#![..]`,
+    /// and that is a structural fact no local spelling can imitate: this walks
+    /// the stripped text, opens an attribute at `#[`/`#![`, tracks BRACKET
+    /// DEPTH through any nesting, and only counts `path=` while that depth is
+    /// non-zero. `cfg_attr(windows,path="..")` is still a hit -- nesting is
+    /// depth, not a special case -- and no amount of `path = ` in ordinary
+    /// code can reach a non-zero attribute depth.
+    ///
+    /// The two local tests kept from the previous version still apply INSIDE
+    /// the brackets: the character before the key must not continue an
+    /// identifier, and the character after the `=` must not be `>` or `=` (a
+    /// `path => ..` arm or a `path == ..` compare, both of which this crate
+    /// writes inside macro arguments -- and a macro invocation is not an
+    /// attribute, but `#[cfg(..)]` predicates are full of `=` too).
     fn path_attr_hits(code: &str) -> usize {
         let b = code.as_bytes();
         let mut hits = 0;
-        let mut from = 0;
-        while let Some(at) = code[from..].find("path=") {
-            let start = from + at;
-            from = start + "path=".len();
-            let inside_identifier = start > 0
-                && (b[start - 1].is_ascii_alphanumeric()
-                    || b[start - 1] == b'_'
-                    || b[start - 1] == b'.');
-            // `path => ..` is a match arm and `path == ..` a comparison; an
-            // attribute argument is a single `=`. Both shapes are written in
-            // this crate behind a `|` or a `(`, which is exactly the position
-            // an attribute key sits in, so neither can be told apart by what
-            // precedes it.
-            let not_an_assignment =
-                matches!(b.get(from), Some(b'>') | Some(b'='));
-            if !inside_identifier && !not_an_assignment {
-                hits += 1;
+        // Bracket depth counted from the `#[` (or `#![`) that opened the
+        // attribute; 0 means "not inside an attribute at all".
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < b.len() {
+            if depth == 0 {
+                let opens = b[i] == b'#'
+                    && (b.get(i + 1) == Some(&b'[')
+                        || (b.get(i + 1) == Some(&b'!') && b.get(i + 2) == Some(&b'[')));
+                if opens {
+                    depth = 1;
+                    i += if b[i + 1] == b'!' { 3 } else { 2 };
+                    continue;
+                }
+                i += 1;
+                continue;
             }
+            match b[i] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 && code[i..].starts_with("path=") {
+                let prev = b[i - 1];
+                let inside_identifier =
+                    prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.';
+                // `path => ..` is a match arm and `path == ..` a comparison; an
+                // attribute argument is a single `=`.
+                let not_an_assignment =
+                    matches!(b.get(i + "path=".len()), Some(b'>') | Some(b'='));
+                if !inside_identifier && !not_an_assignment {
+                    hits += 1;
+                }
+            }
+            i += 1;
         }
         hits
     }
