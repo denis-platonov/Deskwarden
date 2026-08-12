@@ -837,34 +837,191 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::signature::SignatureInfo;
-    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard};
 
-    thread_local! {
+    /// What the substitute seam saw, for the whole PROCESS.
+    ///
+    /// # This used to be `thread_local!`, and that was the defect
+    ///
+    /// The previous shape of this harness kept `VERIFY_ANSWER`, `VERIFIED`
+    /// and `LAUNCHED` in `thread_local!` storage and its doc called that a
+    /// feature: "per-test state with no ordering assumption". It was a hole,
+    /// and a measured one. Inserted into [`apply_update_with`] immediately
+    /// BEFORE the `verify` call:
+    ///
+    /// ```ignore
+    /// let zz_p = installer_path.clone();
+    /// let zz_l = env.launch;
+    /// let _ = std::thread::Builder::new().spawn(move || zz_l(&zz_p));
+    /// ```
+    ///
+    /// -- which in production starts the real installer, unverified and
+    /// ungated, on a background thread -- SURVIVED the entire suite at 2182
+    /// lib / 217 bin / 0 failed and ZERO warnings. The launch happened on a
+    /// thread that was not the test's, so every one of the six routing tests
+    /// read an empty thread-local recorder and passed. The liveness control
+    /// at the identical site, the same three lines with `let _ = zz_l(&zz_p);`
+    /// in place of the `Builder` wrapper, was KILLED by all six at 2176/6.
+    /// The ONLY difference between the survivor and the kill was which thread
+    /// the call was on.
+    ///
+    /// So the recorder is global. **A launch on any thread in this process,
+    /// however that thread was created, is written here.** The seam is a bare
+    /// `fn` pointer by design (see [`UpdaterEnv`]) and cannot capture, so a
+    /// `static` is the only place it can write; the per-test isolation the
+    /// thread-locals used to give is now supplied by [`ROUTE_LOCK`] instead,
+    /// which is a stronger property because it also serialises the
+    /// harness-owned threads a mutant might create.
+    struct Recorder {
+        /// Which routing window is open. Bumped by [`Session::open`] and
+        /// stamped onto every entry below AT THE MOMENT OF RECORDING, so a
+        /// launch that arrives late is tagged with the window it landed in
+        /// rather than the one that caused it -- which is what makes it red
+        /// that window's assertions instead of vanishing.
+        generation: u64,
         /// What the substitute `verify` answers on its next call.
-        static VERIFY_ANSWER: RefCell<Option<Result<SignatureInfo, String>>> =
-            const { RefCell::new(None) };
+        answer: Option<Result<SignatureInfo, String>>,
         /// Every path the substitute `verify` was asked about.
-        static VERIFIED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        verified: Vec<(u64, PathBuf)>,
         /// Every path that reached the launch seam. **If this is ever
         /// non-empty when it should be empty, an unverified installer would
         /// have been started for real.**
-        static LAUNCHED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        launched: Vec<(u64, PathBuf)>,
     }
 
-    /// Thread-local rather than a `Mutex`: the seam is a bare `fn` pointer by
-    /// design (see [`UpdaterEnv`]), so it cannot capture, and `cargo test`
-    /// gives each test its own thread -- so these are per-test state with no
-    /// ordering assumption between tests.
+    static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
+        generation: 0,
+        answer: None,
+        verified: Vec::new(),
+        launched: Vec::new(),
+    });
+
+    /// Held for the whole of one routing window, so exactly one window is
+    /// open at a time and the global recorder above is unambiguous.
+    static ROUTE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Poisoning is recovered from deliberately: a routing test that fails
+    /// panics while a `Session` is alive, and a poisoned recorder would then
+    /// turn one real failure into five misleading ones.
+    fn recorder() -> MutexGuard<'static, Recorder> {
+        RECORDER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The one write that says "a process would have started here".
+    fn record_launch(path: &Path) {
+        let mut r = recorder();
+        let generation = r.generation;
+        r.launched.push((generation, path.to_path_buf()));
+    }
+
     fn substitute_verify(path: &Path) -> Result<SignatureInfo, String> {
-        VERIFIED.with(|v| v.borrow_mut().push(path.to_path_buf()));
-        VERIFY_ANSWER.with(|a| {
-            a.borrow_mut().take().expect("the test did not program a verify answer")
-        })
+        {
+            let mut r = recorder();
+            let generation = r.generation;
+            r.verified.push((generation, path.to_path_buf()));
+        }
+        recorder()
+            .answer
+            .take()
+            .expect("the test did not program a verify answer")
     }
 
     fn substitute_launch(path: &Path) -> Result<(), String> {
-        LAUNCHED.with(|l| l.borrow_mut().push(path.to_path_buf()));
+        record_launch(path);
         Ok(())
+    }
+
+    /// Panics if anything reached the seam AFTER the window that caused it
+    /// had closed.
+    ///
+    /// Free rather than written inline in [`Session::open`] so that it can
+    /// have a liveness control of its own. Nothing in this suite legitimately
+    /// leaves a late launch behind, so an assertion written inline here is
+    /// INERT -- and measurably so: neutralising it to `true || ..` survived
+    /// the whole suite at 2188 / 217 / 0 failed / 0 warnings. A backstop with
+    /// no control is a backstop nobody knows the shape of, so it is a
+    /// function with a `#[should_panic]` test on it instead.
+    fn assert_no_late_launch(launched: &[(u64, PathBuf)]) {
+        assert!(
+            launched.is_empty(),
+            "a launch reached the seam AFTER the routing window that caused it had \
+             closed: {launched:?}. In production that is a process start no assertion \
+             was looking at"
+        );
+    }
+
+    /// One routing window.
+    ///
+    /// Opening one takes [`ROUTE_LOCK`], asserts the recorder is EMPTY --
+    /// anything in it arrived after the previous window closed, which is
+    /// itself a launch nobody witnessed in time -- then bumps the generation
+    /// and installs the programmed `verify` answer. Dropping one clears the
+    /// recorder and releases the lock.
+    struct Session {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Session {
+        fn open(answer: Option<Result<SignatureInfo, String>>) -> Self {
+            let serial = ROUTE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let mut r = recorder();
+            assert_no_late_launch(&r.launched);
+            r.generation += 1;
+            r.answer = answer;
+            r.verified.clear();
+            r.launched.clear();
+            drop(r);
+            Session { _serial: serial }
+        }
+
+        fn launched(&self) -> Vec<PathBuf> {
+            recorder().launched.iter().map(|(_, p)| p.clone()).collect()
+        }
+
+        fn verified(&self) -> Vec<PathBuf> {
+            recorder().verified.iter().map(|(_, p)| p.clone()).collect()
+        }
+
+        /// Wait for the recorder to stop changing before it is read.
+        ///
+        /// A launch on a thread the code under test created lands after
+        /// `apply_update_with` has already returned, so reading the recorder
+        /// the instant the call finishes would still miss it. This waits for
+        /// 120ms of no change, up to 600ms in total.
+        ///
+        /// **What this does not see, said plainly:** a launch deliberately
+        /// delayed past 600ms, or one that lands between this window closing
+        /// and the next one opening. The first is caught by the next window's
+        /// emptiness assertion in [`Session::open`] if any window follows it,
+        /// and neither is reachable at all from this module's production code,
+        /// which [`the_only_process_start_in_this_module_is_the_launch_seam`]
+        /// forbids from naming a thread.
+        fn settle(&self) {
+            let mut last = self.launched().len();
+            let mut stable = 0u32;
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let now = self.launched().len();
+                if now == last {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    last = now;
+                }
+                if stable >= 12 {
+                    return;
+                }
+            }
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let mut r = recorder();
+            r.answer = None;
+            r.verified.clear();
+            r.launched.clear();
+        }
     }
 
     impl UpdaterEnv {
@@ -886,13 +1043,18 @@ mod tests {
         }
     }
 
+    /// Everything one routing window observed.
+    struct Routed {
+        result: Result<(), String>,
+        launched: Vec<PathBuf>,
+        verified: Vec<PathBuf>,
+    }
+
     /// Runs `apply_update_with` against the recording seam, with `verify`
-    /// programmed to answer `answer`. Returns the launcher's result together
-    /// with the paths that reached `launch`.
-    fn route(answer: Result<SignatureInfo, String>) -> (Result<(), String>, Vec<PathBuf>) {
-        VERIFY_ANSWER.with(|a| *a.borrow_mut() = Some(answer));
-        VERIFIED.with(|v| v.borrow_mut().clear());
-        LAUNCHED.with(|l| l.borrow_mut().clear());
+    /// programmed to answer `answer`, and reports every path that reached
+    /// either half of the seam ON ANY THREAD.
+    fn route_recording(answer: Result<SignatureInfo, String>) -> Routed {
+        let session = Session::open(Some(answer));
 
         // A directory that does not exist and is never created: nothing on
         // this path may touch the disk, because nothing on this path reads the
@@ -904,7 +1066,14 @@ mod tests {
         };
         let env = UpdaterEnv::substitute(substitute_verify, substitute_launch);
         let result = apply_update_with(&dir, &release, &env);
-        (result, LAUNCHED.with(|l| l.borrow().clone()))
+        session.settle();
+        Routed { result, launched: session.launched(), verified: session.verified() }
+    }
+
+    /// [`route_recording`] for the cases that only care about `launch`.
+    fn route(answer: Result<SignatureInfo, String>) -> (Result<(), String>, Vec<PathBuf>) {
+        let routed = route_recording(answer);
+        (routed.result, routed.launched)
     }
 
     /// A `SignatureInfo` as `verify_authenticode` would return one.
@@ -1008,7 +1177,8 @@ mod tests {
     /// checked is the file that runs.
     #[test]
     fn the_trusted_installer_is_launched_and_it_is_the_file_that_was_verified() {
-        let (result, launched) = route(Ok(signature(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
+        let Routed { result, launched, verified } =
+            route_recording(Ok(signature(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
 
         assert!(result.is_ok(), "the trusted installer was refused: {result:?}");
         assert_eq!(
@@ -1016,7 +1186,6 @@ mod tests {
             vec![routed_path()],
             "the launch seam did not receive exactly the one path the module constructed"
         );
-        let verified = VERIFIED.with(|v| v.borrow().clone());
         assert_eq!(
             verified, launched,
             "the file that was VERIFIED is not the file that was LAUNCHED; the gap between \
@@ -1036,6 +1205,67 @@ mod tests {
 
         assert!(result.is_ok(), "a lower-cased thumbprint was refused: {result:?}");
         assert_eq!(launched, vec![routed_path()]);
+    }
+
+    /// **A launch on a thread this test did not create is still witnessed.**
+    ///
+    /// Without this, every `launched.is_empty()` above is a claim about ONE
+    /// thread rather than about the process, which is exactly the hole the
+    /// `std::thread::Builder::new().spawn(move || zz_l(&zz_p))` mutant walked
+    /// through at a full 2182 / 0 failed / 0 warnings. This is the control
+    /// that says the new recorder does not have that shape: the thread here
+    /// is created by the harness rather than by production code, but the
+    /// recorder cannot tell the difference and that is the point.
+    #[test]
+    fn a_launch_on_a_thread_the_test_does_not_own_is_witnessed() {
+        let session = Session::open(None);
+        let path = routed_path();
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let _ = substitute_launch(&path);
+            })
+            .expect("could not start the witness thread");
+        handle.join().expect("the witness thread panicked");
+        session.settle();
+
+        assert_eq!(
+            session.launched(),
+            vec![routed_path()],
+            "the recorder did not witness a launch made on another thread, so every \
+             `launched.is_empty()` assertion in this module is a claim about one thread \
+             rather than about this process"
+        );
+    }
+
+    /// The same, DETACHED and never joined, and landing after the call that
+    /// started it has already returned -- the exact shape of the survivor.
+    /// [`Session::settle`] is what closes the gap; this test is what says
+    /// settle's budget is actually long enough to close it.
+    #[test]
+    fn a_launch_on_a_detached_thread_is_witnessed_by_the_settle_window() {
+        let session = Session::open(None);
+        let path = routed_path();
+        let _ = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = substitute_launch(&path);
+        });
+        session.settle();
+
+        assert_eq!(
+            session.launched(),
+            vec![routed_path()],
+            "a launch on a detached thread was not witnessed inside the settle window"
+        );
+    }
+
+    /// The liveness control for [`assert_no_late_launch`], which no other
+    /// test in this file can reach: a well-behaved suite never leaves a late
+    /// launch in the recorder, so the only way to know the check would fire
+    /// is to hand it one.
+    #[test]
+    #[should_panic(expected = "AFTER the routing window")]
+    fn a_late_launch_left_in_the_recorder_is_a_failure() {
+        assert_no_late_launch(&[(7, PathBuf::from(r"Z:\late-installer.exe"))]);
     }
 
     // ---------------------------------------------------------------------
@@ -1062,6 +1292,14 @@ mod tests {
     /// What this does NOT cover, plainly: it says the pointer is the right
     /// FUNCTION, never what that function does. A hollowed-out
     /// `verify_authenticode` passes this and is `signature.rs`'s problem.
+    ///
+    /// And one profile caveat, measured rather than assumed: `fn_addr_eq`
+    /// does not survive identical-code folding, so under this crate's release
+    /// profile (`lto = true, codegen-units = 1`) a byte-identical twin of
+    /// [`launch_installer`] compares EQUAL to it and would pass this pin. A
+    /// probe crate with that profile measured exactly that; in debug, which is
+    /// what `cargo test` builds and what every number in this file's ledger
+    /// was measured under, the two are distinguished.
     #[test]
     fn production_holds_the_real_verify_and_the_real_launch() {
         let env = UpdaterEnv::production();
@@ -1109,27 +1347,328 @@ mod tests {
         unreachable!("never called -- this exists to have an address")
     }
 
-    /// The production slice of this file: everything above `mod tests`. Both
-    /// source guards below read it, so neither can be blinded by anything
-    /// written inside the test module.
+    // ---------------------------------------------------------------------
+    // THE SOURCE GUARDS, AND WHAT ANCHORS THEM
+    //
+    // Both guards below read the file's PRODUCTION SLICE. Two separate
+    // things have to hold for that to mean anything: the slice has to end
+    // where production code ends, and what is read out of it has to be code
+    // rather than text that merely looks like code. Each was a measured
+    // survivor; see `production_slice` and `code_chars` for the numbers.
+    // ---------------------------------------------------------------------
+
+    /// The marker that ends the production half of this file.
     ///
-    /// Cut at the test MODULE rather than at the first `cfg` gate in the text,
-    /// which is the cut `vault_window`'s guards use and which has a trap this
-    /// file walked into on the first run: a doc comment that merely MENTIONS
-    /// the gate, in a code span, truncates the slice to nothing and reds both
-    /// guards. Cutting at the module header is also the conservative
-    /// direction -- a test-gated item written above `mod tests` stays INSIDE
-    /// the slice and is judged as production code, so the guards over-report
-    /// rather than under-report.
+    /// Deliberately the gate and the module opener TOGETHER, and deliberately
+    /// required to be UNIQUE -- see [`production_slice`].
+    const TEST_MODULE_MARKER: &str = "\r\n#[cfg(test)]\r\nmod tests {\r\n";
+
+    /// Just the module opener, counted separately so that a forgery of only
+    /// half the marker is caught too.
+    const TEST_MODULE_OPENER: &str = "\r\nmod tests {\r\n";
+
+    /// The production slice of this file: everything above the test module.
+    /// Both source guards below read it, so neither can be blinded by
+    /// anything written inside the test module.
+    ///
+    /// # The cut is anchored by UNIQUENESS, because it was forgeable
+    ///
+    /// Two earlier cuts both failed, in opposite directions.
+    ///
+    /// Cutting at the first `cfg` gate in the text failed LOUDLY: a doc
+    /// comment that merely mentions the gate in a code span truncates the
+    /// slice to nothing and reds both guards. Annoying, but it fails.
+    ///
+    /// Cutting at the first module opener failed SILENTLY, which is worse,
+    /// and it was measured. Inserted immediately above the test module:
+    ///
+    /// ```ignore
+    /// const ZZ_LAYOUT: &str = r"
+    /// mod tests {
+    /// ";
+    ///
+    /// fn zz_second_launch(p: &Path) {
+    ///     let _ = ZZ_LAYOUT;
+    ///     let _ = Command::new(p).spawn();
+    /// }
+    /// ```
+    ///
+    /// plus a call to it as the second line of [`apply_update_with`], SURVIVED
+    /// at 2182 lib / 217 bin / 0 failed / 0 warnings. The raw string's second
+    /// line became the FIRST occurrence of the marker, so the cut moved up
+    /// above the forged helper, both guards read a slice in which nothing had
+    /// changed, and a plain `Command::new(p).spawn()` ran before verification.
+    /// The liveness control at the identical site -- the same helper and the
+    /// same call with only the four-line raw string removed -- was KILLED at
+    /// 2181/1. The raw string was the whole difference.
+    ///
+    /// The lesson is that a cut chosen by "first occurrence" can be MOVED by
+    /// production text, and production text is what the guard is supposed to
+    /// be judging. So the cut is not chosen by position any more: the marker
+    /// must occur EXACTLY ONCE in the file, and so must the bare module opener
+    /// on its own. A forgery does not move the cut, it adds a second
+    /// occurrence -- and a second occurrence is the failure. Forging the gate
+    /// and the opener together does not help, because that is two occurrences
+    /// of both.
+    ///
+    /// The cost is the same loudness the first cut had, and it is the right
+    /// trade: this file may no longer write the exact byte sequence
+    /// `<CRLF>mod tests {<CRLF>` anywhere except at its one real test module,
+    /// not in a doc comment, not in a raw string, not in a test fixture. That
+    /// is a rule a reader can check by eye, and breaking it reds two tests
+    /// with a message that says so.
     fn production_slice() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/updater.rs");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+
+        let markers = text.matches(TEST_MODULE_MARKER).count();
+        assert_eq!(
+            markers, 1,
+            "updater.rs contains {markers} occurrences of the test-module marker, not 1. \
+             The production slice both source guards read is cut at this marker, so a \
+             SECOND one -- in a raw string, a doc comment or a fixture -- would let \
+             production code choose where the guards stop reading. That was measured \
+             surviving at a full 2182 / 0 failed / 0 warnings, so it is a failure here \
+             rather than a matter of taste"
+        );
+        let openers = text.matches(TEST_MODULE_OPENER).count();
+        assert_eq!(
+            openers, 1,
+            "updater.rs contains {openers} occurrences of the bare test-module opener, \
+             not 1; half a forged marker moves the cut just as well as a whole one"
+        );
+
         let cut = text
-            .find("\r\nmod tests {")
-            .expect("updater.rs no longer declares `mod tests`, so this slice would be the whole file");
+            .find(TEST_MODULE_MARKER)
+            .expect("updater.rs no longer declares a `#[cfg(test)] mod tests`");
         text[..cut].to_string()
     }
+
+    /// One character of this file that the COMPILER would see.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct CodeChar {
+        ch: char,
+        in_literal: bool,
+    }
+
+    /// `text` with every comment removed and every run of whitespace removed,
+    /// as a sequence of characters each tagged with whether it came from
+    /// inside a string or character literal.
+    ///
+    /// # Why the guards below read this rather than the raw text
+    ///
+    /// A guard that counts a needle in raw source counts it in prose and in
+    /// string data too, which cuts both ways: a doc comment that mentions the
+    /// needle reds the guard for nothing, and -- the direction that matters --
+    /// a needle a guard is counting UP TO A LIMIT can be spent harmlessly
+    /// inside a literal. Stripping comments and tagging literals is what makes
+    /// a count a statement about code.
+    ///
+    /// It also makes whitespace irrelevant, which is what closes the UFCS and
+    /// spacing families in one move: `Command :: new`, `Command\n    ::new` and
+    /// `Command::new` all render identically here.
+    ///
+    /// Handles line comments, nested block comments, normal strings with
+    /// escapes, raw strings with any number of hashes, byte and C string
+    /// prefixes, and character literals -- distinguished from lifetimes by
+    /// looking for the closing quote.
+    fn code_chars(text: &str) -> Vec<CodeChar> {
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let at = |k: usize| -> char {
+            if k < n {
+                chars[k]
+            } else {
+                '\0'
+            }
+        };
+        let mut out: Vec<CodeChar> = Vec::new();
+        let push = |ch: char, in_literal: bool, out: &mut Vec<CodeChar>| {
+            if !ch.is_whitespace() {
+                out.push(CodeChar { ch, in_literal });
+            }
+        };
+        let mut i = 0usize;
+        while i < n {
+            let c = chars[i];
+
+            if c == '/' && at(i + 1) == '/' {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && at(i + 1) == '*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < n && depth > 0 {
+                    if chars[i] == '/' && at(i + 1) == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && at(i + 1) == '/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // A raw string, possibly behind a `b` or `c` prefix. Only if the
+            // `r` does not continue an identifier, so `for` and `str` are not
+            // mistaken for one.
+            let raw_r = if c == 'r' {
+                Some(i)
+            } else if (c == 'b' || c == 'c') && at(i + 1) == 'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(r) = raw_r {
+                let fresh = out
+                    .last()
+                    .map_or(true, |p| !(p.ch.is_alphanumeric() || p.ch == '_'));
+                let mut h = r + 1;
+                while at(h) == '#' {
+                    h += 1;
+                }
+                let hashes = h - r - 1;
+                if fresh && at(h) == '"' {
+                    for k in i..=h {
+                        push(chars[k], true, &mut out);
+                    }
+                    i = h + 1;
+                    while i < n {
+                        if chars[i] == '"' {
+                            let mut k = i + 1;
+                            let mut got = 0usize;
+                            while got < hashes && at(k) == '#' {
+                                k += 1;
+                                got += 1;
+                            }
+                            if got == hashes {
+                                for m in i..k {
+                                    push(chars[m], true, &mut out);
+                                }
+                                i = k;
+                                break;
+                            }
+                        }
+                        push(chars[i], true, &mut out);
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            if c == '"' {
+                push(c, true, &mut out);
+                i += 1;
+                while i < n {
+                    let d = chars[i];
+                    if d == '\\' {
+                        push(d, true, &mut out);
+                        if i + 1 < n {
+                            push(chars[i + 1], true, &mut out);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    push(d, true, &mut out);
+                    i += 1;
+                    if d == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // A character literal, as opposed to a lifetime: `'\n'` or `'x'`.
+            if c == '\'' && (at(i + 1) == '\\' || at(i + 2) == '\'') {
+                push(c, true, &mut out);
+                i += 1;
+                while i < n {
+                    let d = chars[i];
+                    if d == '\\' {
+                        push(d, true, &mut out);
+                        if i + 1 < n {
+                            push(chars[i + 1], true, &mut out);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    push(d, true, &mut out);
+                    i += 1;
+                    if d == '\'' {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            push(c, false, &mut out);
+            i += 1;
+        }
+        out
+    }
+
+    /// The code with every literal's contents ERASED: what is left is only
+    /// what the programmer wrote as syntax. Counting identifiers here cannot
+    /// be inflated or satisfied by string data.
+    fn code_without_literals(cc: &[CodeChar]) -> String {
+        cc.iter().filter(|c| !c.in_literal).map(|c| c.ch).collect()
+    }
+
+    /// The code with literals KEPT: used only for the one exact-equality pin
+    /// below, where the literals are half the thing being pinned and equality
+    /// cannot be forged by adding text elsewhere.
+    fn code_with_literals(cc: &[CodeChar]) -> String {
+        cc.iter().map(|c| c.ch).collect()
+    }
+
+    /// The whole of `fn <header> { .. }`, located by BRACE DEPTH over code
+    /// characters, so a brace inside a comment or a string cannot move its
+    /// end. Rendered with literals kept and whitespace removed.
+    fn code_fn(cc: &[CodeChar], header: &str) -> Option<String> {
+        let flat = code_with_literals(cc);
+        // `flat` is one char per entry of `cc`, so a char index into one is a
+        // char index into the other.
+        let flat_chars: Vec<char> = flat.chars().collect();
+        let needle: Vec<char> = header.chars().collect();
+        let start = (0..flat_chars.len().saturating_sub(needle.len()) + 1)
+            .find(|&s| flat_chars[s..s + needle.len()] == needle[..])?;
+        let mut depth = 0usize;
+        let mut seen_open = false;
+        for k in start..cc.len() {
+            if cc[k].in_literal {
+                continue;
+            }
+            if cc[k].ch == '{' {
+                depth += 1;
+                seen_open = true;
+            } else if cc[k].ch == '}' {
+                depth -= 1;
+                if seen_open && depth == 0 {
+                    return Some(flat_chars[start..=k].iter().collect());
+                }
+            }
+        }
+        None
+    }
+
+    /// The header of the one function in this module allowed to start a
+    /// process, and its whole body, pinned exactly.
+    const LAUNCH_SEAM_HEADER: &str = "fnlaunch_installer(installer_path:&Path)->Result<(),String>";
+    const LAUNCH_SEAM: &str = concat!(
+        "fnlaunch_installer(installer_path:&Path)->Result<(),String>{",
+        "Command::new(installer_path)",
+        ".args([\"/VERYSILENT\",\"/SUPPRESSMSGBOXES\"])",
+        ".spawn()",
+        ".map_err(|e|format!(\"failedtolaunchinstaller:{e}\"))?;",
+        "Ok(())}",
+    );
 
     /// **[`UpdaterEnv::production`] is the only constructor a shipping build
     /// compiles.**
@@ -1139,14 +1678,16 @@ mod tests {
     /// SECOND constructor that some call site can reach instead -- a
     /// `pub fn permissive() -> Self` is one line, and the address test never
     /// looks at it. Every constructor of this type has to spell `-> Self` or
-    /// `-> UpdaterEnv`; the production slice contains exactly one.
+    /// `-> UpdaterEnv`; the production slice contains exactly one, counted over
+    /// CODE rather than over text, so a doc comment or a string cannot add to
+    /// or excuse the count.
     ///
-    /// The test-only substitute is written in `mod tests`, below the cut, and
-    /// is therefore not compiled into a shipping build at all.
+    /// The test-only substitute is written in the test module, below the cut,
+    /// and is therefore not compiled into a shipping build at all.
     #[test]
     fn production_is_the_only_updater_env_a_shipping_build_has() {
-        let slice = production_slice();
-        let constructors = slice.matches("-> Self").count() + slice.matches("-> UpdaterEnv").count();
+        let code = code_without_literals(&code_chars(&production_slice()));
+        let constructors = code.matches("->Self").count() + code.matches("->UpdaterEnv").count();
         assert_eq!(
             constructors, 1,
             "the production half of updater.rs declares {constructors} functions returning an \
@@ -1154,72 +1695,197 @@ mod tests {
              build; a second one is a launcher whose signature check is whatever its caller \
              picked"
         );
-        // And the one that exists is `production`.
         assert!(
-            slice.contains("pub fn production() -> Self"),
+            code.contains("pubfnproduction()->Self"),
             "updater.rs's production slice no longer declares `production() -> Self`"
         );
     }
 
-    /// **The module starts a process in exactly one place, and that place is
-    /// [`launch_installer`] -- which is only reachable through the gate.**
+    /// **The module starts a process in exactly one place, that place is
+    /// [`launch_installer`], and its body is exactly these bytes.**
     ///
-    /// This is the backstop for the mutant that satisfies every routing
-    /// assertion above and still launches an unverified file: call the seam
-    /// exactly as expected, and ALSO write a second, ungated
-    /// `Command::new(..).spawn()` somewhere else in the module. The routing
-    /// tests substitute `launch`, so the extra spawn is invisible to them --
-    /// they would record the one expected path and pass while a real build
-    /// started a second process.
+    /// # This guard used to be a denylist, and the denylist kept losing
     ///
-    /// Held over the production slice, so a `Command::new` written in `mod
-    /// tests` cannot excuse one written in production code. `apply_update_with`
-    /// and `apply_update` are checked by name for containing neither needle,
-    /// so the ungated spawn cannot be hidden in the funnel itself.
+    /// It counted the strings `Command::new` and `.spawn()` in the production
+    /// slice and required one of each. Every measured escape from it was a
+    /// different SPELLING of the same act:
+    ///
+    ///  * `<Command>::new(&p).args([..]).status()` -- UFCS breaks the
+    ///    `Command::new` substring and `.status()` is not `.spawn()`. SURVIVED
+    ///    at 2182 / 0 failed / 0 warnings.
+    ///  * `.output()` in place of `.status()`, identically.
+    ///  * `type C = std::process::Command; C::new(p)`.
+    ///  * `let f = Command::new;` -- the constructor as a value, never called
+    ///    by that name.
+    ///  * `std::thread::Builder::new().spawn(..)` -- which is not a process
+    ///    start at all, but got a launch onto a thread no assertion watched.
+    ///
+    /// Widening the list is what lost four times. So the list is gone. What
+    /// replaces it is three closed statements about the production slice, read
+    /// as CODE (see [`code_chars`]) rather than as text:
+    ///
+    /// 1. **The seam's body is pinned exactly.** Not "contains a spawn" --
+    ///    equals [`LAUNCH_SEAM`], arguments included. This is also the only
+    ///    thing holding the installer's silent-install flags: deleting the
+    ///    whole `.args([..])` line was measured SURVIVING the previous shape of
+    ///    this suite at a full 2182 / 217 / 0 failed / 0 warnings, which would
+    ///    have shipped an updater that pops an interactive installer UI, and
+    ///    which says the seam's ARGUMENTS were never pinned by anything.
+    /// 2. **`Command` is named exactly twice in the whole production slice**:
+    ///    once by the `use` that imports it and once inside the pinned body.
+    ///    This is not a list of spellings -- it is the observation that every
+    ///    way to start a child through `std::process` has to NAME the type
+    ///    somewhere, whatever punctuation surrounds the name and whichever of
+    ///    `spawn`, `status` or `output` finishes the job. UFCS names it. An
+    ///    alias names it. A `use .. as` names it. Taking the constructor as a
+    ///    value names it.
+    /// 3. **The production slice contains no `unsafe` and no `thread`.** The
+    ///    only way left to start a process without naming `Command` is to call
+    ///    Win32 directly, which needs `unsafe`; and the only way to get a call
+    ///    onto a thread no routing assertion is watching is to name a thread.
+    ///    Both are zero here and neither is anything this module has ever had a
+    ///    use for, so both are cheap.
+    ///
+    /// # What this does NOT cover
+    ///
+    /// It reads THIS FILE only. `updater.rs` is on `job_object.rs`'s child-
+    /// start `ALLOWED` list, so a spawn moved into another module and called
+    /// from here is that guard's business, not this one's -- and a `pub`
+    /// forwarder in a non-`ALLOWED` file has its own history there.
     #[test]
     fn the_only_process_start_in_this_module_is_the_launch_seam() {
         let slice = production_slice();
+        let cc = code_chars(&slice);
+        let code = code_without_literals(&cc);
 
+        // 1. The seam, byte for byte.
+        let body = code_fn(&cc, LAUNCH_SEAM_HEADER)
+            .expect("updater.rs no longer declares `launch_installer` with its pinned header");
         assert_eq!(
-            slice.matches("Command::new").count(),
-            1,
-            "updater.rs's production code starts a process in more than one place. The routing \
-             tests substitute the launch seam, so any spawn written outside it is invisible to \
-             them -- and would still run for a real user"
-        );
-        assert_eq!(
-            slice.matches(".spawn()").count(),
-            1,
-            "updater.rs's production code contains more than one `.spawn()`"
+            body, LAUNCH_SEAM,
+            "the one process start in updater.rs is no longer exactly the pinned seam. Its \
+             body, its arguments and its error mapping are all part of the pin: dropping \
+             `/VERYSILENT` and `/SUPPRESSMSGBOXES` is an interactive installer on a user's \
+             screen, and adding anything is a second thing happening at the one point in \
+             this crate that turns a file into a running process"
         );
 
-        // The one that exists is inside `launch_installer`.
-        let start = slice
-            .find("fn launch_installer(")
-            .expect("updater.rs no longer declares `launch_installer`");
-        let end = start
-            + slice[start..]
-                .find("\r\n}")
-                .expect("`launch_installer` has no closing brace at column 0");
-        let body = &slice[start..end];
+        // 2. The type is named twice: the import, and the seam.
+        let named = code.matches("Command").count();
+        assert_eq!(
+            named, 2,
+            "updater.rs's production code names `Command` {named} times, not 2 (the `use` \
+             and the launch seam). Every way to start a child through `std::process` names \
+             the type somewhere -- `<Command>::new`, `type C = Command`, `use .. as C`, \
+             `let f = Command::new`, `.status()`, `.output()` -- so this count is the \
+             statement, not a list of the spellings"
+        );
         assert!(
-            body.contains("Command::new") && body.contains(".spawn()"),
-            "updater.rs's one process start is no longer inside `launch_installer`, so it is no \
-             longer the value the seam substitutes -- the routing tests would observe a launch \
-             that is not the launch"
+            code.contains("usestd::process::Command;"),
+            "updater.rs no longer imports `Command` by its own name, so the count above is \
+             counting something else"
+        );
+        assert_eq!(
+            body.matches("Command").count(),
+            1,
+            "the pinned seam does not name `Command`, so the two names counted above are \
+             both somewhere else"
         );
 
-        // And neither the gated body nor the public wrapper spawns anything of
-        // its own, above or beside the seam call.
-        for name in ["fn apply_update_with(", "pub fn apply_update("] {
-            let start = slice.find(name).unwrap_or_else(|| panic!("updater.rs no longer declares `{name}`"));
-            let end = start + slice[start..].find("\r\n}").expect("no closing brace at column 0");
-            let body = &slice[start..end];
-            assert!(
-                !body.contains("Command::new") && !body.contains(".spawn()"),
-                "`{name}` starts a process directly rather than through the launch seam, so a \
-                 test that substitutes the seam cannot see it"
-            );
-        }
+        // 3. No Win32 process creation, and no threads.
+        let unsafes = code.matches("unsafe").count();
+        assert_eq!(
+            unsafes, 0,
+            "updater.rs's production code contains {unsafes} `unsafe` blocks. It has never \
+             needed one, and `unsafe` is what a direct `CreateProcessW` would need -- the \
+             one way left to start a process without naming `Command`"
+        );
+        let threads = code.matches("thread").count();
+        assert_eq!(
+            threads, 0,
+            "updater.rs's production code names `thread` {threads} times. It must name it \
+             none: a call moved onto a thread is a call the routing tests observe only by \
+             the grace of a timing window, and \
+             `std::thread::Builder::new().spawn(move || zz_l(&zz_p))` inserted above the \
+             verify call was measured SURVIVING the whole suite at 2182 / 0 failed / 0 \
+             warnings for exactly that reason"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // AND THE SCANNER THE TWO GUARDS ABOVE STAND ON
+    //
+    // `code_chars` is now load-bearing for three counts and one equality. A
+    // scanner that quietly returned an empty string would make all four
+    // vacuous, so it is pinned here directly.
+    // ---------------------------------------------------------------------
+
+    fn erased(text: &str) -> String {
+        code_without_literals(&code_chars(text))
+    }
+
+    fn kept(text: &str) -> String {
+        code_with_literals(&code_chars(text))
+    }
+
+    #[test]
+    fn the_scanner_drops_comments_and_whitespace() {
+        assert_eq!(erased("let a = 1; // Command::new"), "leta=1;");
+        assert_eq!(erased("/// Command::new\r\nlet a = 1;"), "leta=1;");
+        assert_eq!(erased("/* Command::new */ let a = 1;"), "leta=1;");
+        assert_eq!(erased("/* a /* b */ Command::new */ let a = 1;"), "leta=1;");
+        assert_eq!(erased("Command :: new ( p )"), "Command::new(p)");
+        assert_eq!(erased("Command\r\n    ::new(p)"), "Command::new(p)");
+        assert_eq!(erased("<Command>::new(p)"), "<Command>::new(p)");
+    }
+
+    #[test]
+    fn the_scanner_erases_literals_but_keeps_their_shape() {
+        assert_eq!(erased("let s = \"Command::new\";"), "lets=;");
+        assert_eq!(kept("let s = \"Command::new\";"), "lets=\"Command::new\";");
+        assert_eq!(erased("let s = r\"Command::new\";"), "lets=;");
+        assert_eq!(erased("let s = r#\"a \" Command::new\"#;"), "lets=;");
+        assert_eq!(erased("let s = \"a \\\" Command::new\";"), "lets=;");
+        assert_eq!(erased("let c = '\\'';let d = 1;"), "letc=;letd=1;");
+        // A lifetime is not a character literal.
+        assert_eq!(erased("fn f<'a>(x: &'a str) {}"), "fnf<'a>(x:&'astr){}");
+        // `for` and `str` do not open a raw string.
+        assert_eq!(erased("for x in y {}"), "forxiny{}");
+    }
+
+    #[test]
+    fn the_scanner_finds_a_function_by_brace_depth_not_by_text() {
+        let src = concat!(
+            "fn f(a: u8) -> u8 {\r\n",
+            "    // }\r\n",
+            "    let s = \"}\";\r\n",
+            "    if a > 0 { return 1; }\r\n",
+            "    s.len() as u8\r\n",
+            "}\r\n",
+            "fn g() {}\r\n",
+        );
+        let cc = code_chars(src);
+        assert_eq!(
+            code_fn(&cc, "fnf(a:u8)->u8").unwrap(),
+            "fnf(a:u8)->u8{lets=\"}\";ifa>0{return1;}s.len()asu8}"
+        );
+        assert_eq!(code_fn(&cc, "fnnosuchfn()"), None);
+    }
+
+    /// The scanner is not silently returning nothing: the real file's
+    /// production slice renders to something substantial, and the needles the
+    /// guards count are actually present in it.
+    #[test]
+    fn the_scanner_reads_this_file_as_code_rather_than_as_nothing() {
+        let code = erased(&production_slice());
+        assert!(
+            code.len() > 1000,
+            "updater.rs's production slice renders to {} characters of code; the scanner is \
+             returning nothing and every count held over it is vacuous",
+            code.len()
+        );
+        assert!(code.contains("fnlaunch_installer("));
+        assert!(code.contains("fnapply_update_with("));
+        assert!(code.contains("pubfnapply_update("));
     }
 }
