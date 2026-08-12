@@ -1794,6 +1794,28 @@ pub fn build_frame(
         // are two things that can disagree, and the one that decides which
         // panels are drawn must be the one the body state actually returned.
         let show_sends = matches!(body, VaultBodyState::Sends);
+        // **THE SEARCH BOX IS NOT DRAWN ON THE SENDS SCREEN, SO IT IS
+        // EMPTIED ON THE WAY IN.**
+        //
+        // The field lives below in `if !show_sends`, so text left in it
+        // survives the sidebar switch while nothing on screen shows it. That
+        // is invisible state, and invisible state is what a gate hides in:
+        // `let send_pane = if search.is_empty() { send_pane } else { None };`
+        // was measured GREEN across the whole suite, because no test in the
+        // crate had ever typed into the box before opening Sends -- the same
+        // race `items` won two rounds earlier, with a different state.
+        //
+        // Two answers, and both are here on purpose. The suite now DRIVES
+        // it: `clicking_delete_on_a_send_row_really_revokes_it` types into
+        // the real box through the real Ctrl+K before it presses Sends. And
+        // this line REMOVES it: on the Sends screen `search` is empty by
+        // construction, so a gate on it is no longer a defect to catch. The
+        // driving alone would only have closed the states this fixture
+        // happens to build, which is exactly the loop this window has been
+        // going round.
+        if show_sends {
+            search.clear();
+        }
         match body {
             VaultBodyState::Loading => {
                 egui::CentralPanel::default()
@@ -2531,38 +2553,72 @@ pub fn build_frame(
             }
         }
 
-        // The Sends screen's whole model for this frame, computed BEFORE the
-        // panel rather than inside it: the closure would otherwise hold
-        // `send_fetch` borrowed for its whole length, and the action it
-        // reports (Refresh, or a dismissal) has to write to that same value.
-        // It is also the point at which "no answer", "an empty account" and
-        // "a failed fetch" become three different things -- see
-        // `send_ui::pane_state`, which is where that decision is tested.
-        let send_pane = show_sends
-            .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock));
-        // **What the pane reports travels in a linear value.** See
-        // `send_ui::SendUiVerdict`: `into_action` is the only way out of
-        // one and it consumes the verdict, so an action substituted
-        // anywhere between the pane and the applier must DROP the real
-        // verdict -- and a verdict dropped still holding its action is
-        // counted. That is a statement about the ACTION rather than about
-        // the call, so unlike a spelling, an argument or a brace-depth pin
-        // it does not have to guess which state a shadow will be gated on.
-        let mut send_action: Option<send_ui::SendUiVerdict> = None;
-        egui::CentralPanel::default()
+        // **THERE IS NO BINDING BETWEEN THE PANE AND THE APPLIER.**
+        //
+        // The panel closure returns the Sends verdict and that value is
+        // written directly into `apply_send_action` as its first argument.
+        // No `let` stands between the two, so there is no name for a
+        // shadowing `let send_action = ...;` to rebind -- and therefore no
+        // frame-local state (`items`, `search`, `selected_id`, the filter,
+        // the delete report, ...) that such a gate could be written
+        // against. THAT is what closes this class. Four earlier holds --
+        // whole-call text equality, brace depth, the abandonment counter
+        // and the frame click tests -- each pinned something real and each
+        // left the binding standing, and a sixth state (`search`) was found
+        // against it after five had been enumerated. Enumerating states
+        // loses that race by construction; deleting the site does not.
+        //
+        // What the linear type still contributes is disclosed exactly, in
+        // `send_ui::SendUiVerdict`: its field and `seal` are PRIVATE to
+        // `send_ui`, so this module cannot mint a verdict carrying a
+        // different action -- privacy, not the drop counter, is what stops
+        // a substituted verdict being written here or inside the closure.
+        // The counter catches the remaining shape, a real verdict dropped
+        // for `send_ui::no_sends_screen_this_frame()`, and it catches it
+        // IN DEBUG BUILDS ONLY -- see the assertion just below.
+        debug_assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "a Sends verdict was dropped instead of applied, so what the pane reported \
+             never reached `apply_send_action` and the whole Sends screen -- Copy link, \
+             Refresh, Delete, Cancel and the confirmation -- is inert. See \
+             `send_ui::SendUiVerdict`"
+        );
+        apply_send_action(
+            egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
             .show(ui, |ui| {
                 // The Sends screen replaces the detail pane as well as the
                 // item list, so it takes this panel whole and the read/edit
                 // pane below is not drawn at all.
-                if let Some(state) = &send_pane {
-                    send_action = Some(send_ui::draw_send_pane(
+                // The Sends screen's whole model for this frame, written
+                // HERE rather than bound above the panel. A `let` above the
+                // panel is a name, and a name upstream of the pane is a
+                // second place to gate what the pane is asked for -- which
+                // is where the `search` shadow went once the verdict's own
+                // binding was deleted. Written inline it has no name, and
+                // the expression itself is pinned by
+                // `the_applier_takes_the_panel_with_no_binding_between`.
+                //
+                // It is also the point at which "no answer", "an empty
+                // account" and "a failed fetch" become three different
+                // things -- see `send_ui::pane_state`, where that decision
+                // is tested.
+                if let Some(state) = &show_sends
+                    .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock))
+                {
+                    // The pane draws and reports in one expression, and
+                    // that expression IS the closure's value. A gate on
+                    // `send_pane` above does not silence the controls, it
+                    // blanks the whole screen, which the frame click tests
+                    // fail on; a gate written here has to drop the verdict
+                    // it just took, which the counter sees.
+                    return send_ui::draw_send_pane(
                         ui,
                         state,
                         notice_message.as_deref(),
                         send_delete.view(),
-                    ));
-                    return;
+                    );
                 }
                 // Resolved from the list the selection was made in, for the
                 // reason the row menu is: a row clicked under Trash or
@@ -3307,38 +3363,14 @@ pub fn build_frame(
                         }
                     }
                 }
-            });
-
-        // What the Sends screen reported. Applied out here rather than in the
-        // closure because the arms write to `send_fetch`, which the closure
-        // reads through `send_pane`.
-        //
-        // **Every arm is inside `apply_send_action`, and there is no `match`
-        // on this line, deliberately.** A source-text equality over a
-        // `match`'s arm bodies pins their CONTENTS and not their
-        // REACHABILITY: a guard arm inserted above one leaves it
-        // byte-identical, draws no unreachable-pattern warning, and stops it
-        // running. That was measured on this file's export wiring. So the
-        // decision is a function the tests really call, and what is left here
-        // is one unconditional statement whose brace depth is itself pinned.
-        // **THE COUNT IS ZERO, ALWAYS.** The counter is monotonic and
-        // thread-local, so a verdict abandoned anywhere in this frame --
-        // including at the end of a scope, after this line -- is still
-        // non-zero when the next frame reaches here, and every test that
-        // draws this window draws more than one frame. A `debug_assert`
-        // because in a shipping build the right answer is a dead pane
-        // rather than a dead process; the tests all run in debug.
-        debug_assert_eq!(
-            send_ui::abandoned_in_this_thread(),
-            0,
-            "a Sends verdict was dropped instead of applied, so what the pane reported \
-             never reached `apply_send_action` and the whole Sends screen -- Copy link, \
-             Refresh, Delete, Cancel and the confirmation -- is inert. See \
-             `send_ui::SendUiVerdict`"
-        );
-        apply_send_action(
-            send_action.map(send_ui::SendUiVerdict::into_action)
-                .unwrap_or(send_ui::SendUiAction::None),
+                // The Sends screen was not showing this frame. Minting
+                // this is the ONE thing `mod.rs` may do without asking
+                // `send_ui` to draw, and it carries `SendUiAction::None`
+                // by construction -- it cannot carry anything else.
+                send_ui::no_sends_screen_this_frame()
+            })
+            .inner
+            .into_action(),
             &mut send_delete,
             &mut send_fetch,
             ui.ctx(),
@@ -18475,9 +18507,17 @@ mod send_delete_wiring {
     /// proved the statement was reached and the survivor a live defect.
     ///
     /// So this vault has an item, in a folder, and the click test drives a
-    /// selection through it. That closes the states this fixture can be
-    /// gated on; what closes the ones it still CANNOT is
-    /// [`send_ui::SendUiVerdict`], which does not enumerate states at all.
+    /// selection through it -- and, since the round that found the `search`
+    /// shadow, types into the search box on the way to Sends.
+    ///
+    /// **That still only closes the states THIS FIXTURE BUILDS, and the
+    /// previous round's claim that [`send_ui::SendUiVerdict`] "does not
+    /// enumerate states at all" was false.** A dropped verdict is only
+    /// COUNTED when a test runs the discarding branch, so the linear type
+    /// weakened the fixture requirement rather than removing it, and a
+    /// sixth state beat it. What closes the states no fixture builds is
+    /// that there is no longer anywhere to write the gate: see
+    /// [`the_applier_takes_the_panel_with_no_binding_between`].
     fn frame_items() -> Vec<crate::vault_bridge::VaultItem> {
         vec![crate::vault_bridge::VaultItem {
             id: FRAME_ITEM_ID.to_string(),
@@ -18497,6 +18537,14 @@ mod send_delete_wiring {
 
     /// Whether [`frame_load`] answers with an EMPTY vault instead.
     ///
+    /// **Reset with a guard, not with a trailing store.** It used to be put
+    /// back to `false` on the last line of the test that sets it, so a
+    /// panic anywhere above left it `true` for the rest of the process --
+    /// cleaned up only by the other frame test's opening `store(false)`,
+    /// and only because `FRAME_LOCK` serialises the two. That is a fixture
+    /// whose state depends on which test panicked, which is the last thing
+    /// a fixture should be.
+    ///
     /// Both shapes have to be reachable, and measuring is why. With the
     /// harness on an empty vault, `if items.is_empty() { send_action } else
     /// { None }` was green; with it on a populated one, the mirror -- `if
@@ -18508,6 +18556,23 @@ mod send_delete_wiring {
     /// builds only moves the blind spot, so this harness builds both.
     static FRAME_VAULT_IS_EMPTY: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    /// Sets [`FRAME_VAULT_IS_EMPTY`] for as long as it lives, and puts it
+    /// back on the way out **including on an unwind**. See that static.
+    struct EmptyVaultFixture;
+
+    impl EmptyVaultFixture {
+        fn armed() -> Self {
+            FRAME_VAULT_IS_EMPTY.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for EmptyVaultFixture {
+        fn drop(&mut self) {
+            FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     fn frame_load(
         _cache: Arc<VaultCache>,
@@ -18556,10 +18621,14 @@ mod send_delete_wiring {
     /// this module is secondary to it.** The call to [`apply_send_action`] was
     /// held by BRACE DEPTH against a sibling statement, which is a statement
     /// about WHERE THE CALL IS WRITTEN and not about what its argument holds
-    /// when control arrives. Two shadows were measured green through it, both
-    /// leaving the call, its arguments and its depth byte-identical, both
-    /// warning-free, and both making the entire Sends pane -- Copy link,
-    /// Refresh, Delete, Cancel, the confirmation -- do nothing at all:
+    /// when control arrives. FOUR shadows were measured green over the
+    /// rounds, each leaving the call, its arguments and its depth
+    /// byte-identical, each warning-free, and each making the entire Sends
+    /// pane -- Copy link, Refresh, Delete, Cancel, the confirmation -- do
+    /// nothing at all. The last of them, gated on `search`, is why this test
+    /// now types into the search box before it presses Sends, and why there
+    /// is no longer a `send_action` binding for any of them to be written
+    /// against:
     ///
     /// ```ignore
     /// let send_action = { drop(send_action); send_ui::SendUiAction::None };
@@ -18720,6 +18789,62 @@ mod send_delete_wiring {
             "the window started a revoke without anybody clicking anything"
         );
 
+        // 0. **TYPE INTO THE SEARCH BOX, BEFORE GOING ANYWHERE NEAR SENDS.**
+        //
+        // `search` is a frame local that is live where the Sends pane is
+        // asked for, and NOTHING in this crate had ever made it non-empty
+        // before reaching that screen. `let send_pane = if search.is_empty()
+        // { send_pane } else { None };` was therefore measured GREEN across
+        // the whole suite, with the paired inversion KILLED here -- a wholly
+        // dead Sends pane, every control inert, for any user who had typed a
+        // single letter into the box. That is the same race `items` won two
+        // rounds earlier with a different state, and enumerating states is
+        // what keeps losing it.
+        //
+        // So the box is reached the way a user reaches it -- the real
+        // Ctrl+K, then real key events -- and `run` now EMPTIES `search` on
+        // the way into Sends, so the state cannot differ there at all. Both,
+        // deliberately: driving alone would only close the states this
+        // fixture happens to build.
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                // `i.modifiers` is read off the RawInput, not off the key
+                // event, so the shortcut does not fire without this.
+                modifiers: egui::Modifiers::CTRL,
+                ..input()
+            },
+            |ui| frame_fn(ui),
+        );
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Text("zq".to_string())],
+                ..input()
+            },
+            |ui| frame_fn(ui),
+        );
+        let typed = ctx.run_ui(input(), |ui| frame_fn(ui));
+
+        // CONTROL: the letters really landed. The box paints what it
+        // holds, and the list says it filtered on it. Without this,
+        // everything below would still pass over an EMPTY search box and
+        // this step would be building no state at all -- which is precisely
+        // the failure mode that produced the shadow in the first place.
+        assert!(
+            find(&typed, "zq").is_some(),
+            "control: the search box does not paint \"zq\" after Ctrl+K and two letters, \
+             so nothing was typed and `search` is still empty. This step exists to make it \
+             NON-empty; if it does not, the `search`-gated shadow it answers is green \
+             again and nothing here would say so. What was painted: {:?}",
+            texts(&typed)
+        );
+
         // 1. The Sends screen, reached the only way there is.
         let sends_at = locate(&output, sidebar::SENDS_ROW_LABEL);
         output = click(&ctx, &mut frame_fn, sends_at);
@@ -18732,6 +18857,38 @@ mod send_delete_wiring {
             "the Sends row was pressed and {FRAME_SEND_NAME:?} is not on screen, so this \
              window is not on the Sends screen and nothing below is about a Send row at \
              all. What was painted: {:?}",
+            texts(&output)
+        );
+
+        // 1b. **AND THE BOX WAS EMPTIED ON THE WAY IN.**
+        //
+        // The search field is not drawn on the Sends screen, so the vault
+        // is the only place it can be read: go back and look. Without this,
+        // deleting the `if show_sends { search.clear(); }` in `run` was
+        // measured GREEN across the whole suite -- the invariant that makes
+        // a `search`-gated shadow inert rather than a defect would have been
+        // free to delete, and the sixth state would have come straight back.
+        let all_items_at = locate(&output, "All items");
+        let back = click(&ctx, &mut frame_fn, all_items_at);
+        assert!(
+            find(&back, "zq").is_none(),
+            "the search box still holds \"zq\" after a visit to the Sends screen. The box \
+             is not drawn there, so that is text the user cannot see filtering the list \
+             they come back to -- and it is live frame state at the point the Sends pane \
+             is asked for, which is exactly where the sixth measured shadow was gated. \
+             What was painted: {:?}",
+            texts(&back)
+        );
+
+        // Back to Sends to carry on, with a control that the round trip
+        // really did land on the Sends screen again.
+        let sends_again = locate(&back, sidebar::SENDS_ROW_LABEL);
+        output = click(&ctx, &mut frame_fn, sends_again);
+        assert!(
+            find(&output, FRAME_SEND_NAME).is_some(),
+            "control: the window is not back on the Sends screen after the round trip \
+             through the vault, so nothing below is about a Send row. What was \
+             painted: {:?}",
             texts(&output)
         );
 
@@ -19013,7 +19170,7 @@ mod send_delete_wiring {
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         *FRAME_LIST_TX.lock().expect("not poisoned") = None;
-        FRAME_VAULT_IS_EMPTY.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _empty_vault = EmptyVaultFixture::armed();
 
         let scratch = std::env::temp_dir().join(format!(
             "deskwarden-empty-vault-frame-{}-{:?}",
@@ -19138,7 +19295,6 @@ mod send_delete_wiring {
              `send_ui::SendUiVerdict`"
         );
 
-        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -20225,15 +20381,21 @@ mod send_delete_wiring {
     ///
     /// **NEITHER ASSERTION IN HERE PINS LIVENESS, and this whole test is
     /// secondary to [`clicking_delete_on_a_send_row_really_revokes_it`].**
-    /// Depth says where the call is WRITTEN; it says nothing about what
-    /// `send_action` holds when control reaches it. A shadowing `let
-    /// send_action = ...;` on the line above leaves the call text, its
-    /// arguments and its depth byte-identical, draws no warning, and makes
-    /// every control on the Sends screen inert. Two such were measured green
-    /// against this test. What this holds is placement -- that no `if`,
-    /// `match`, `for` or block was wrapped AROUND the call -- and that is
-    /// worth keeping, because it is a different mutation from the one the
-    /// click catches.
+    /// Depth says where the call is WRITTEN, not what reaches it.
+    ///
+    /// It used to say much less than that. While a `let send_action`
+    /// existed at frame scope, a shadowing `let send_action = ...;` on the
+    /// line above left the call text, its arguments and its depth
+    /// byte-identical, drew no warning, and made every control on the Sends
+    /// screen inert. FOUR were measured green against the whole suite that
+    /// way -- gated on `items`, on the delete report, on a bare
+    /// `drop(send_action)`, and finally on `search`, the vault window's
+    /// own search box, found after five states had been enumerated and
+    /// declared exhaustive. The binding is gone: the applier's first
+    /// argument is the panel expression itself, which is what
+    /// [`the_applier_takes_the_panel_with_no_binding_between`] asserts and
+    /// what this test's head anchor below re-states. There is no name to
+    /// rebind, so there is no state left to gate on.
     #[test]
     fn the_frame_applies_the_sends_action_unconditionally() {
         let code = code_braces_only(production());
@@ -20317,25 +20479,39 @@ mod send_delete_wiring {
              top level, so the depth measurement is not measuring nesting"
         );
 
-        // The second lock: the call's arguments, as a whole-call equality.
+        // The second lock: the call's arguments. This can no longer be one
+        // whole-call equality, because the call's first argument is now the
+        // entire central panel -- which is the point. So it is two anchors:
+        // the HEAD, which says the applier takes the panel expression
+        // directly and therefore that nothing can be bound between them,
+        // and the TAIL, which pins the rest of the arguments as before.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
-        // `SendUiVerdict::into_action` is written INSIDE the argument
-        // list on purpose. A plain `SendUiAction` binding at frame scope
-        // would be somewhere a shadow could sit AFTER the verdict was
-        // already consumed, where substituting an action no longer costs
-        // it a counted drop. See `send_ui::SendUiVerdict`.
-        let expected = squashed(concat!(
-            "apply_send_", "action( send_action.map(send_ui::SendUiVerdict::into_action) \
-             .unwrap_or(send_ui::SendUiAction::None), &mut send_delete, &mut send_fetch, \
+        let flat = squashed(&code_braces_only(production()));
+        let head = squashed(concat!(
+            "apply_send_", "action( egui::CentralPanel::default()"
+        ));
+        assert_eq!(
+            flat.matches(&head).count(),
+            1,
+            "the frame no longer hands the central panel straight to \
+             `apply_send_action`. Whatever now stands between the two is a place a \
+             `let` can be written, and a `let` is a name a later `let` can shadow with an \
+             inert action while every other hold in this file stays byte-identical. That \
+             was the defect this design was rewritten to delete -- see \
+             `send_ui::SendUiVerdict`"
+        );
+        let tail = squashed(concat!(
+            "}) .inner .into_", "action(), &mut send_delete, &mut send_fetch, \
              ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, );"
         ));
         assert_eq!(
-            squashed(&code_braces_only(production())).matches(&expected).count(),
+            flat.matches(&tail).count(),
             1,
-            "the frame no longer applies the Sends action with the window's own delete state, \
-             its own fetch, its own session and the spawner the env seam handed it. Note what \
-             this does NOT hold: it is a pin on the call's CONTENTS. Placement is the depth \
-             assertion above, and LIVENESS is held by neither -- that is \
+            "the frame no longer applies the Sends action with the window's own delete \
+             state, its own fetch, its own session and the spawner the env seam handed it \
+             -- taken from the panel's own return value. Note what this does NOT hold: it \
+             is a pin on the call's CONTENTS. Placement is the depth assertion above, and \
+             LIVENESS is held by neither -- that is \
              `clicking_delete_on_a_send_row_really_revokes_it`"
         );
 
@@ -20348,6 +20524,136 @@ mod send_delete_wiring {
              guard arm inserted above it can silently disable, which is the defeat this \
              design exists to answer"
         );
+    }
+
+    /// **THE SITE WHERE A SHADOW COULD BE WRITTEN IS GONE, AND THIS IS THE
+    /// ASSERTION THAT KEEPS IT GONE.**
+    ///
+    /// Every earlier hold on this call -- the whole-call text equality, the
+    /// brace depth, the abandonment counter, the frame click tests -- left
+    /// a `let send_action` standing at frame scope, and each of the four
+    /// measured shadows was a second `let` of that name. The fourth was
+    /// gated on `search`, found after the previous round had enumerated
+    /// five states and written down that the mechanism "does not have to
+    /// guess which state a shadow will be gated on". It did have to. A
+    /// gate is only COUNTED when a test executes the discarding branch, so
+    /// the fixture still had to build the state -- weaker than a spelling
+    /// pin, but still a state requirement, and the sixth state won.
+    ///
+    /// So this asserts the shape rather than the states:
+    ///
+    /// * `mod.rs` never NAMES [`send_ui::SendUiVerdict`] in production. It
+    ///   cannot annotate a binding of one, and since the field and
+    ///   [`send_ui::SendUiVerdict::seal`] are private to `send_ui` it could
+    ///   not construct one to bind anyway.
+    /// * `into_action` is written exactly once, in the applier's argument
+    ///   list, immediately after the panel it consumes. A `let` of the
+    ///   resulting `SendUiAction` -- which would be a shadowable name that
+    ///   no longer costs a counted drop -- would be a second one, or would
+    ///   break the head anchor in
+    ///   [`the_frame_applies_the_sends_action_unconditionally`].
+    /// * the pane is drawn exactly once, and the one verdict `mod.rs` may
+    ///   mint without drawing it is written exactly once.
+    ///
+    /// **What this does NOT hold, stated plainly.** It is a source-text
+    /// test and pins spelling, not reachability. A gate written INSIDE the
+    /// panel closure is still expressible; what has changed is that it can
+    /// no longer be silent. To substitute an action it must drop the real
+    /// verdict (counted, and `debug_assert`ed in `run` -- DEBUG ONLY), and
+    /// to avoid the drop it must not ask for the pane at all, which blanks
+    /// the Sends screen and fails the frame click tests. Those two are the
+    /// residual, and they are measured, not assumed.
+    #[test]
+    fn the_applier_takes_the_panel_with_no_binding_between() {
+        let code = code_braces_only(production());
+
+        // Control: the stripper really removed the doc comments, which
+        // mention every one of these names. Without this, a count of zero
+        // below would be evidence of nothing.
+        assert!(
+            production().contains(concat!("SendUi", "Verdict")),
+            "control: the production slice does not mention the verdict type even in prose, \
+             so the slice is not the frame"
+        );
+        assert!(
+            !code.contains("travels in a linear value"),
+            "control: `code_braces_only` left comment text in, so a count over it counts \
+             prose and holds nothing"
+        );
+
+        assert_eq!(
+            code.matches(concat!("SendUi", "Verdict")).count(),
+            0,
+            "`mod.rs` names `send_ui::SendUiVerdict` in production code again. The only \
+             reason to write that type here is to bind a verdict -- and a binding is a \
+             name, a name is shadowable, and a shadowed verdict is a Sends screen whose \
+             Copy link, Refresh, Delete and Cancel are all silently inert. Four such \
+             shadows were measured green while that binding existed"
+        );
+        assert_eq!(
+            code.matches(concat!("into_", "action()")).count(),
+            1,
+            "`into_action()` is written {} times in the frame, not once. It is written \
+             inside the applier's argument list on purpose: anywhere else it produces a \
+             plain `SendUiAction` that can be bound, and a binding taken AFTER the verdict \
+             is consumed is a shadow that costs no counted drop -- exactly the mutant that \
+             killed only the text equality and no behavioural test",
+            code.matches(concat!("into_", "action()")).count()
+        );
+        // The pane model is written INLINE, in the one place it is used.
+        // A `let` above the panel would be a name upstream of the pane, and
+        // gating what the pane is ASKED FOR is the same defect as gating
+        // what it reported -- that is where the `search` shadow moved to
+        // once the verdict's own binding was gone.
+        let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let model = squashed(concat!(
+            "if let Some(state) = &show_sends .then(|| send_ui::pane_", "state(\
+             send_fetch.result.as_ref(), &crate::send::SystemClock)) {"
+        ));
+        assert_eq!(
+            squashed(&code).matches(&model).count(),
+            1,
+            "the Sends pane is no longer asked for with this window's own `show_sends` and \
+             this window's own fetch result, written inline at the one place it is used. \
+             Anything between -- a binding, a filter, a second `if` -- is a place to gate \
+             what the pane is asked for, and a pane that is never asked for is a Sends \
+             screen that draws nothing at all"
+        );
+        assert_eq!(
+            code.matches(concat!("send_ui::pane_", "state(")).count(),
+            1,
+            "the frame derives the Sends pane model {} times, not once. Two derivations of \
+             one screen's state are two things that can disagree",
+            code.matches(concat!("send_ui::pane_", "state(")).count()
+        );
+
+        assert_eq!(
+            code.matches(concat!("draw_send_", "pane(")).count(),
+            1,
+            "the frame draws the Sends pane {} times, not once",
+            code.matches(concat!("draw_send_", "pane(")).count()
+        );
+        assert_eq!(
+            code.matches(concat!("no_sends_screen_this_", "frame()")).count(),
+            1,
+            "the one verdict this module may mint without drawing the pane is written {} \
+             times, not once. Each extra one is a place the real verdict can be dropped \
+             for an inert one",
+            code.matches(concat!("no_sends_screen_this_", "frame()")).count()
+        );
+
+        // And no `let` binds anything on the way. The two spellings a
+        // shadow of the old shape used are named directly, because they
+        // are what four measured mutants actually wrote.
+        for banned in [concat!("let send_", "action"), concat!("let mut send_", "action")] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` is back in the frame. That binding is the entire reason this \
+                 class of defect kept reappearing: it is a name between the pane and the \
+                 applier, and every hold in this file stays byte-identical when a second \
+                 `let` of it substitutes an inert action"
+            );
+        }
     }
 
     // ==================================================================

@@ -495,15 +495,56 @@ pub enum SendUiAction {
 /// dead Sends pane. Enumerating states loses that race by construction,
 /// because the mutant picks its gate AFTER reading the fixture.
 ///
-/// So this type stops enumerating. It is a linear value: the action lives
-/// inside it, [`into_action`](Self::into_action) is the ONLY way out, and
-/// that method consumes `self`. A verdict that reaches its `Drop` still
-/// holding an action was **abandoned** -- and abandonment is exactly what
-/// every shadow above must do, whatever it is gated on, because to substitute
-/// a different action for this one the real one has to be dropped. The drop
-/// is counted in [`abandoned_in_this_thread`], `vault_window::run` asserts on
-/// the count across its own panel, and neither depends on which states a
-/// fixture happens to build.
+/// It is a linear value: the action lives inside it,
+/// [`into_action`](Self::into_action) is the ONLY way out, and that method
+/// consumes `self`. A verdict that reaches its `Drop` still holding an
+/// action was **abandoned**, and the drop is counted in
+/// [`abandoned_in_this_thread`].
+///
+/// **THE CLAIM THIS DOC USED TO MAKE HERE WAS FALSE, AND WAS MEASURED
+/// FALSE.** It said the count "does not depend on which states a fixture
+/// happens to build". A drop is only COUNTED when a test executes the
+/// discarding branch, so a gated shadow still needs the fixture to build
+/// its state -- the requirement was weakened from "build the state AND
+/// assert on the action" to "build the state", not removed. The evidence
+/// was already in the numbers that shipped the claim: the `items` shadow
+/// died in 4 tests, all in the populated fixture, and its mirror died in
+/// exactly 1, in the empty one. A state-independent hold would have killed
+/// both in every frame test that draws this pane. A sixth state was then
+/// found green against the whole suite -- `search`, the vault window's own
+/// search box, live at the pane and never made non-empty by any test before
+/// reaching the Sends screen.
+///
+/// **So the SITE was deleted, which is what actually closed the class.**
+/// `vault_window::run` has no binding between the pane and
+/// `apply_send_action`: the panel closure returns the verdict and that
+/// expression is written directly as the applier's first argument, and the
+/// pane's model is written inline at its one use rather than bound above
+/// the panel. There is no name to shadow, so there is no frame state left
+/// to gate on. See
+/// `send_delete_wiring::the_applier_takes_the_panel_with_no_binding_between`.
+///
+/// **PRIVACY IS THE LOAD-BEARING PART OF THIS TYPE, NOT THE DROP COUNTER.**
+/// The tuple field and [`seal`](Self::seal) are private to this module, so
+/// `vault_window` cannot mint a verdict carrying a different action; the
+/// most it can express is dropping a real one for
+/// [`no_sends_screen_this_frame`]. The counter was measured contributing
+/// nothing on its own: a shadow that consumed the verdict linearly
+/// (`into_action()` then `.filter(..)` in the argument list) left the count
+/// at zero, fired no `debug_assert`, and was noticed by NO behavioural test
+/// -- only by a source-text equality over the call. It is kept because it
+/// does catch the drop-and-mint shape, which was measured, and it is
+/// written down here with the reach it actually has.
+///
+/// **IT IS A `debug_assert`, SO IT HOLDS NOTHING IN A RELEASE BUILD.** The
+/// only guard in `vault_window::run` is `debug_assert_eq!(
+/// abandoned_in_this_thread(), 0, ..)`; the two hard `assert_eq!`s are
+/// `#[cfg(test)]`. Under `--release`, which is what CI ships, an abandoned
+/// verdict is not detected at all. That is deliberate -- in a paint loop
+/// the right answer is a dead pane rather than a dead process -- but it
+/// means the count is a TEST-TIME hold. What holds this seam in a shipping
+/// build is the shape of the code (no binding, private constructor) and the
+/// source pins that keep that shape.
 ///
 /// **Residual, recorded plainly.** `std::mem::forget` -- or leaking the
 /// verdict into something that outlives the frame -- suppresses the `Drop`
@@ -528,6 +569,20 @@ thread_local! {
 /// pane. See [`SendUiVerdict`].
 pub fn abandoned_in_this_thread() -> usize {
     ABANDONED.with(|c| c.get())
+}
+
+/// A verdict for a frame on which **the Sends screen was not drawn**.
+///
+/// This is the only verdict `vault_window` can obtain without calling
+/// [`draw_send_pane`], and it carries [`SendUiAction::None`] by
+/// construction -- there is no parameter, so it cannot be made to carry
+/// anything else. [`SendUiVerdict::seal`] and the field stay private, so
+/// substituting an action for the one the pane reported is not expressible
+/// outside this module; the most a caller can do is DROP the real verdict
+/// in favour of this one, which is what [`abandoned_in_this_thread`]
+/// counts. See [`SendUiVerdict`].
+pub fn no_sends_screen_this_frame() -> SendUiVerdict {
+    SendUiVerdict::seal(SendUiAction::None)
 }
 
 impl SendUiVerdict {
