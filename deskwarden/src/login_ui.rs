@@ -5991,6 +5991,359 @@ pub(crate) mod password_lifetime_tests {
         );
     }
 
+    /// Whether `dir` holds bytes that are not this tree's content,
+    /// decided by **shape rather than by name**. Used by both paths.
+    ///
+    /// Three shapes, each a producer of bytes that were never ours:
+    ///
+    /// * `dir/.git` exists, **of either kind**. A `.git` FILE is a sibling
+    ///   worktree. A `.git` DIRECTORY is a nested full clone -- and the
+    ///   old test caught only the first: it skipped the nested clone's
+    ///   `.git` by name and then walked every working file underneath it,
+    ///   which is precisely the another-checkout false positive the `git
+    ///   ls-files` bound was introduced to remove, left open in fallback
+    ///   mode.
+    /// * `dir` is itself a git directory (`HEAD` + `objects/` + `refs/`).
+    ///   That is a bare repository, or a `.git` directory reached under
+    ///   any name. This is load-bearing on the GIT path too, not only in
+    ///   the fallback: measured, `git ls-files --others` collapses a
+    ///   nested *clone* to one directory entry, but enumerates a nested
+    ///   *bare* repository file by file, hooks and all.
+    /// * `dir/CACHEDIR.TAG` is a file. Cargo writes that tag into its
+    ///   target directory, so this skips a Rust build output under **any
+    ///   name** -- including a `CARGO_TARGET_DIR` pointed at an in-repo
+    ///   directory not called `target`, which is the hazard the git bound
+    ///   was introduced for and which the fallback did not close. It also
+    ///   replaces the literal `"target"` skip: a directory called `target`
+    ///   that is not a build output has no claim to be skipped, and a
+    ///   build output called anything else has every claim.
+    ///
+    /// The old `"target" | ".git" | ".superpowers"` name list is gone with
+    /// it, `.superpowers` included. That directory is gitignored, so it is
+    /// in neither the tracked list nor the untracked-not-ignored list; the
+    /// only mode that can still reach it is the fallback over a hand-copied
+    /// development tree, and in that mode a probe-bearing file anywhere in
+    /// the copy is a genuine finding **about that copy**, not noise.
+    fn is_not_this_trees_content(dir: &std::path::Path) -> bool {
+        dir.join(".git").exists()
+            || (dir.join("HEAD").is_file()
+                && dir.join("objects").is_dir()
+                && dir.join("refs").is_dir())
+            || dir.join("CACHEDIR.TAG").is_file()
+    }
+
+    /// The fallback, used only when `git` cannot be run. Skips whatever
+    /// [`is_not_this_trees_content`] names, and unreadable directories
+    /// rather than panicking on them.
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if is_not_this_trees_content(&path) {
+                    continue;
+                }
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The files this repository OWNS, as absolute paths, or `None` if
+    /// `git` could not be run or reported failure.
+    ///
+    /// **Tracked is not the same as owned.** `git ls-files` is index-based
+    /// -- a staged-but-uncommitted file IS listed, verified -- but a file
+    /// written and not yet `git add`ed is not, and write-then-compile-
+    /// before-`add` is the loop this repository is being developed in. So
+    /// the list is the union of the tracked files with the untracked ones
+    /// that are present and not gitignored.
+    fn tracked_files(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+        fn list(root: &std::path::Path, extra: &[&str]) -> Option<Vec<Vec<u8>>> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-files", "-z"])
+                .args(extra)
+                .output()
+                .ok()?;
+            out.status.success().then(|| {
+                out.stdout
+                    .split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            })
+        }
+
+        let tracked = list(root, &[])?;
+        let untracked = list(root, &["--others", "--exclude-standard"]).unwrap_or_default();
+
+        let mut undecodable: Vec<String> = Vec::new();
+        let mut listed: Vec<std::path::PathBuf> = Vec::new();
+        let entries = tracked
+            .iter()
+            .map(|raw| (raw, true))
+            .chain(untracked.iter().map(|raw| (raw, false)));
+        for (raw, is_tracked) in entries {
+            // A non-UTF-8 tracked name used to go through
+            // `from_utf8_lossy`, fail `is_file()` on the mangled path, and
+            // be dropped in silence -- a guard that skips without saying
+            // so. It is reported instead; see the assertion below.
+            let Ok(rel) = std::str::from_utf8(raw) else {
+                undecodable.push(String::from_utf8_lossy(raw).into_owned());
+                continue;
+            };
+            let path = root.join(rel);
+            // A tracked path can be absent from the working tree (deleted
+            // but not yet staged), and an untracked nested CLONE is listed
+            // as its directory rather than its files. Neither is a file to
+            // scan, and neither is this test's business to complain about.
+            if !path.is_file() {
+                continue;
+            }
+            // Tracked content is this repository's by definition, and git
+            // has already decided that. An untracked path has had only
+            // `.gitignore` applied to it, which does not know about a
+            // nested bare repository or about a build output sitting under
+            // a name the ignore file does not name -- so it gets the same
+            // shape test the fallback walk uses.
+            if !is_tracked
+                && path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|a| *a != root)
+                    .any(is_not_this_trees_content)
+            {
+                continue;
+            }
+            listed.push(path);
+        }
+        assert!(
+            undecodable.is_empty(),
+            "control: {} listed path(s) are not UTF-8, so they were never opened and the \
+             probe could be sitting in one of them unread. This is a silent skip in a \
+             guard, reported rather than swallowed. First: {:?}",
+            undecodable.len(),
+            undecodable.first()
+        );
+        // An empty listing means this is not a checkout of anything, which
+        // is the fallback's case and not a pass.
+        (!listed.is_empty()).then_some(listed)
+    }
+
+    /// **The pin on [`is_not_this_trees_content`], which nothing else can
+    /// reach.**
+    ///
+    /// The shapes that predicate refuses only ever occur in someone's working
+    /// directory: a nested clone, a sibling worktree, a bare repository, an
+    /// in-repo `CARGO_TARGET_DIR`. None of them exists in a clean checkout, so
+    /// on a green tree every one of those three clauses can be deleted with the
+    /// whole suite still passing -- which is how the nested-full-clone gap
+    /// survived the round that introduced the worktree skip. The gap was found
+    /// by hand, in an export, and would have been found by hand again next
+    /// time.
+    ///
+    /// So the shapes are BUILT here, in a temporary directory, and the
+    /// predicate is asked about each one. `walk` is then run over the same
+    /// directory with the probe planted inside every refused shape and in one
+    /// ordinary file, so the refusal is measured as "these bytes were not
+    /// scanned" rather than only as a boolean.
+    #[test]
+    fn the_walk_refuses_a_nested_clone_a_worktree_a_bare_repo_and_a_build_output() {
+        // This test writes the assembled probe to disk and reads it back, and
+        // it never arms. Same reason as the scan above.
+        hold_the_probe_lock();
+
+        /// Removes the directory on the way out, however this test leaves.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "deskwarden-shape-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _scratch = Scratch(root.clone());
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the scratch directory is creatable");
+
+        /// `dir/rel`, with the probe in it and every parent created.
+        fn plant(root: &std::path::Path, rel: &str) -> std::path::PathBuf {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("the plant has a parent"))
+                .expect("the parent is creatable");
+            std::fs::write(&path, PROBE.as_bytes()).expect("the plant is writable");
+            path
+        }
+
+        // A nested full clone: `.git` is a DIRECTORY. This is the shape the
+        // previous `path.join(".git").is_file()` test missed -- it skipped the
+        // `.git` by name and walked the working files beside it.
+        std::fs::create_dir_all(root.join("nested_clone/.git")).expect("creatable");
+        plant(&root, "nested_clone/src/lib.rs");
+        // A sibling worktree: `.git` is a FILE.
+        std::fs::create_dir_all(root.join("nested_worktree")).expect("creatable");
+        std::fs::write(root.join("nested_worktree/.git"), b"gitdir: ../elsewhere")
+            .expect("writable");
+        plant(&root, "nested_worktree/src/lib.rs");
+        // A bare repository: no `.git` at all -- it IS the git directory.
+        // `git ls-files --others` enumerates one of these file by file.
+        std::fs::create_dir_all(root.join("nested_bare/objects")).expect("creatable");
+        std::fs::create_dir_all(root.join("nested_bare/refs")).expect("creatable");
+        std::fs::write(root.join("nested_bare/HEAD"), b"ref: refs/heads/main").expect("writable");
+        plant(&root, "nested_bare/description");
+        // A Cargo build output under a name that is not `target`.
+        std::fs::create_dir_all(root.join("buildout")).expect("creatable");
+        std::fs::write(root.join("buildout/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172")
+            .expect("writable");
+        plant(&root, "buildout/deskwarden.rlib");
+        // And one ordinary file, which is the control: a walk that refuses
+        // everything satisfies the four assertions above and measures nothing.
+        let ordinary = plant(&root, "docs/notes.md");
+        std::fs::create_dir_all(root.join("docs/nested")).expect("creatable");
+        let ordinary_deep = plant(&root, "docs/nested/more.md");
+
+        for refused in ["nested_clone", "nested_worktree", "nested_bare", "buildout"] {
+            assert!(
+                is_not_this_trees_content(&root.join(refused)),
+                "`{refused}` is bytes that are not this tree's content and the predicate                  accepted it. Whatever is inside it -- another checkout's `login_ui.rs` at a                  commit predating the `concat!` split, or this crate's own rlib -- is then                  read back and reported as a violation of THIS tree"
+            );
+        }
+        for kept in ["docs", "docs/nested"] {
+            assert!(
+                !is_not_this_trees_content(&root.join(kept)),
+                "control: `{kept}` is an ordinary directory and the predicate refused it, so                  the four assertions above are satisfied by a predicate that refuses                  everything and the fallback walk measures nothing"
+            );
+        }
+
+        let mut found = Vec::new();
+        walk(&root, &mut found);
+        assert_eq!(
+            found.iter().collect::<std::collections::BTreeSet<_>>(),
+            [&ordinary, &ordinary_deep].into_iter().collect::<std::collections::BTreeSet<_>>(),
+            "the fallback walk reached exactly the two ordinary files and nothing else. Every              file it did not reach here holds the assembled probe, so anything extra in this              set is a false positive the scan would have reported against this tree"
+        );
+    }
+
+    /// **The pin on [`tracked_files`]'s answer to "what does this repository
+    /// own", built against a real throwaway repository rather than against
+    /// this one.**
+    ///
+    /// Everything this function decides is invisible on a clean checkout: the
+    /// untracked union has nothing untracked to add, the gitignore filter has
+    /// nothing ignored to drop, and the ancestor shape filter has no nested
+    /// repository to refuse. Delete any of the three and the suite stays
+    /// green -- which is exactly the failure mode the round before this one
+    /// shipped, where four of six reported kills turned out to be inert in
+    /// the configuration every number was measured in.
+    ///
+    /// So a repository with all five shapes in it is CONSTRUCTED, and the
+    /// listing is compared as a set. Five claims, and the ordinary tracked
+    /// file is the control on all of them:
+    ///
+    /// * a committed file is listed;
+    /// * a **staged but uncommitted** file is listed (`git ls-files` is
+    ///   index-based, so this is a property of the index, not of `HEAD`);
+    /// * an **untracked, not-ignored** file is listed -- this is the
+    ///   write-then-compile-before-`git add` loop, and it was out of scope
+    ///   until now;
+    /// * a **gitignored** file is NOT listed;
+    /// * an untracked path under a nested bare repository is NOT listed, even
+    ///   though `git ls-files --others` enumerates that repository file by
+    ///   file, and neither is an untracked build output under a name
+    ///   `.gitignore` does not mention.
+    ///
+    /// If `git` cannot be run this test has nothing to say and returns; the
+    /// scan above covers that case through its fallback.
+    #[test]
+    fn tracked_files_lists_what_this_repository_owns_and_nothing_else() {
+        /// Removes the directory on the way out, however this test leaves.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn git(root: &std::path::Path, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "deskwarden-owns-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _scratch = Scratch(root.clone());
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the scratch directory is creatable");
+
+        if !git(&root, &["init", "-q", "."]) {
+            // No usable `git`. That is the fallback's world, and the scan
+            // above is what covers it.
+            return;
+        }
+
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("creatable");
+            std::fs::write(&path, body).expect("writable");
+            path
+        };
+
+        std::fs::write(root.join(".gitignore"), "ignored_scratch/").expect("writable");
+        let committed = write("src/committed.rs", "// committed");
+        let committed_two = write("docs/committed.md", "// committed, and not a `.rs`");
+        assert!(
+            git(&root, &["add", ".gitignore", "src/committed.rs", "docs/committed.md"]),
+            "the add ran"
+        );
+        assert!(
+            git(&root, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"]),
+            "the commit ran"
+        );
+        let gitignore = root.join(".gitignore");
+        let staged = write("src/staged.rs", "// staged, never committed");
+        assert!(git(&root, &["add", "src/staged.rs"]), "the second add ran");
+        // The one this round exists for.
+        let untracked = write("src/scratch_untracked.txt", "// written, not yet added");
+        let untracked_two = write("docs/scratch_untracked.md", "// likewise, outside `src/`");
+        // Ignored, and therefore not ours to police.
+        write("ignored_scratch/note.txt", "// ignored");
+        // A nested BARE repository. `--others` enumerates it file by file.
+        std::fs::create_dir_all(root.join("nested_bare/objects")).expect("creatable");
+        std::fs::create_dir_all(root.join("nested_bare/refs")).expect("creatable");
+        write("nested_bare/HEAD", "ref: refs/heads/main");
+        write("nested_bare/objects/loose", "// not our bytes");
+        // A build output under a name `.gitignore` does not name.
+        write("buildout/CACHEDIR.TAG", "Signature: 8a477f597d28d172");
+        write("buildout/deskwarden.rlib", "// not our bytes either");
+
+        let listed: std::collections::BTreeSet<std::path::PathBuf> =
+            tracked_files(&root).expect("the listing is not empty").into_iter().collect();
+        let expected: std::collections::BTreeSet<std::path::PathBuf> =
+            [gitignore, committed, committed_two, staged, untracked, untracked_two]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            listed, expected,
+            "`tracked_files` did not name exactly the files this repository owns. An entry              missing from the left is a file the probe scan no longer polices -- an untracked              source under `src/` is the one this round added. An extra entry is another              repository's or a build output's bytes being reported as this tree's, which is              the false positive the git bound was introduced to remove"
+        );
+    }
+
     /// **The pin on the fix above, stated where it can be checked directly.**
     ///
     /// The whole reason a source-linting test could produce a probe hit is that
@@ -6021,8 +6374,9 @@ pub(crate) mod password_lifetime_tests {
     /// `.superpowers/` -- while explicitly refusing a blanket dot-directory
     /// skip on the grounds that it "would have taken `.github/` and `.claude/`
     /// with them, which are neither". `.claude/` is exactly the problem. On
-    /// this user's checkout `.claude/worktrees/` holds four sibling git
-    /// worktrees belonging to other agents, two of them parked on commits that
+    /// this user's checkout `.claude/worktrees/` holds two live sibling git
+    /// worktrees belonging to other agents (beside two empty directories left
+    /// by finished ones), parked on commits that
     /// predate the `concat!` split -- so the walk read another checkout's
     /// `login_ui.rs`, found the probe in it as a single literal, and failed
     /// this test 6 runs out of 6. Nothing was wrong with THIS tree.
@@ -6041,19 +6395,51 @@ pub(crate) mod password_lifetime_tests {
     /// * An agent that points `CARGO_TARGET_DIR` at an in-repo directory NOT
     ///   literally named `target` planted this crate's own rlib -- which of
     ///   course carries the assembled probe, because that is what compiling a
-    ///   `concat!` produces -- inside the walk.
+    ///   `concat!` produces -- inside the walk. (On the git path only; see the
+    ///   fallback section below, which is where that hazard actually lived.)
     /// * In a worktree `.git` is a **file**, not a directory, so the `is_dir`
     ///   skip did not fire on it and it was read rather than skipped.
     ///
-    /// If `git` cannot be run at all (an unpacked source tarball, a build
-    /// sandbox with no `git`), the test falls back to the directory walk with
-    /// nested worktrees skipped explicitly -- a directory holding a `.git`
-    /// **file** rather than a `.git` directory is a worktree. The tradeoff is
-    /// stated rather than hidden: in that mode an in-repo `CARGO_TARGET_DIR`
-    /// under another name is still in scope, and a gitignored file that has
-    /// nothing to do with this repository is still scanned. The fallback is
-    /// strictly the weaker instrument; it exists so the test does not become
-    /// vacuous off a git checkout, not because it is equivalent.
+    /// **The fallback is not a corner case; it is what ships, and it is what
+    /// every isolated measurement of this repository runs.** If `git` cannot
+    /// be run, or is run and fails, the test falls back to the directory walk.
+    /// A `git archive` export has no `.git`, so `git -C <export> ls-files`
+    /// exits 128 and the fallback runs -- and this repository's standing
+    /// measurement protocol is an isolated `git archive` export for every
+    /// number. So is a release tarball, an unpacked source drop, and a
+    /// `cargo package` staging directory. The claim that the in-repo
+    /// `CARGO_TARGET_DIR`-under-another-name hazard "closes with" the git
+    /// bound was true only on a git checkout: measured at `c09140a`,
+    /// `mkdir buildout && <probe> > buildout/deskwarden.rlib` FAILED in a
+    /// plain export and passed in a `git init`-ed one. Four of that round's
+    /// reported kills mutated `tracked_files`, which a plain export never
+    /// runs, and were therefore inert in the configuration every number came
+    /// from.
+    ///
+    /// The answer is not to document the weakness but to remove it, so both
+    /// paths now decide the same question the same way, by
+    /// [`is_not_this_trees_content`]: nested clone, nested worktree, nested
+    /// bare repository, and Cargo build output under any name are out of scope
+    /// whether git listed the tree or the walk did. What remains asymmetric is
+    /// only what git alone can know -- `.gitignore`, and the fact that a
+    /// tracked file is owned by definition -- so in fallback mode a gitignored
+    /// scratch file that has nothing to do with this repository is still
+    /// scanned. That direction is the safe one: it can only report bytes that
+    /// really are sitting in the tree being measured.
+    ///
+    /// **And "owns" is wider than "tracks".** `git ls-files` is index-based:
+    /// a staged-but-uncommitted file IS listed (verified), but a file written
+    /// and not yet `git add`ed is NOT -- so a probe-bearing
+    /// `deskwarden/src/scratch_untracked.txt` survived this test, which the
+    /// old directory walk had caught. Write-then-compile-before-`git add` is
+    /// exactly the loop this repository is developed in, so the list is the
+    /// union of `git ls-files` with `git ls-files --others
+    /// --exclude-standard`. What that costs: another agent's uncommitted new
+    /// files enter this test's scope in a shared working tree, and a scratch
+    /// file someone drops in without gitignoring it is scanned. Both are the
+    /// point rather than the price -- a file sitting in the tree is a file a
+    /// test can read back -- and gitignored scratch stays out, so
+    /// `target/`, `.superpowers/` and the rest are untouched.
     ///
     /// **And this test takes [`PROBE_LOCK`] before it reads anything.** It is
     /// the largest reader of bytes in the crate and it arms nothing, so on any
@@ -6073,60 +6459,6 @@ pub(crate) mod password_lifetime_tests {
         // Before a single byte is read: this test allocates the probe whenever
         // the property it checks is violated, and it never arms. See the doc.
         hold_the_probe_lock();
-
-        /// The fallback, used only when `git` cannot be run. Skips nested
-        /// worktrees (a `.git` *file*, not directory) and unreadable
-        /// directories rather than panicking on them.
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if path.is_dir() {
-                    if matches!(name.as_str(), "target" | ".git" | ".superpowers") {
-                        continue;
-                    }
-                    // A directory holding a `.git` FILE is a sibling worktree:
-                    // another checkout of this repository, at whatever commit
-                    // that agent is parked on. Not this tree's content.
-                    if path.join(".git").is_file() {
-                        continue;
-                    }
-                    walk(&path, out);
-                } else {
-                    out.push(path);
-                }
-            }
-        }
-
-        /// The files this repository tracks, as absolute paths, or `None` if
-        /// `git` could not be run or reported failure.
-        fn tracked_files(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["ls-files", "-z"])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let listed: Vec<std::path::PathBuf> = out
-                .stdout
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| root.join(String::from_utf8_lossy(s).as_ref()))
-                // A tracked path can be absent from the working tree (deleted
-                // but not yet staged). Nothing to scan, and not this test's
-                // business to complain about.
-                .filter(|p| p.is_file())
-                .collect();
-            // An empty listing means this is not a checkout of anything, which
-            // is the fallback's case and not a pass.
-            (!listed.is_empty()).then_some(listed)
-        }
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6189,10 +6521,19 @@ pub(crate) mod password_lifetime_tests {
         // The controls above are over the LIST. These two are over what was
         // actually opened, so a tree in which every read failed -- or in which
         // only this file's read did -- is a failure and not a green run.
+        // `read > 30` alone tolerated 65 of 95 reads failing, which is not a
+        // tolerance for "an editor has one file open" -- it is a tolerance for
+        // two thirds of the tree going unscanned. The slack is stated against
+        // the real count instead: at most five listed files may fail to open.
+        // The listed files are sources and assets, not build output, so
+        // nothing in the concurrent-agent picture locks them in bulk; if this
+        // ever does fire spuriously it fires LOUDLY, which is the direction a
+        // guard should fail in.
+        let unread = files.len() - read;
         assert!(
-            read > 30,
-            "control: only {read} of the {} listed files could be read, so the check above is a \
-             check over nothing",
+            read > 30 && unread <= 5,
+            "control: only {read} of the {} listed files could be read ({unread} failed), so \
+             the check above is a check over a fraction of the tree",
             files.len()
         );
         assert!(
