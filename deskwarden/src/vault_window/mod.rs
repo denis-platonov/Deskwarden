@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 /// lock itself is the same place it otherwise tells you when it will.
 const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
 
+
 /// Which auto-lock policy a frame of the open window must honour.
 ///
 /// `opened_with` is the [`AutoLock`] `main.rs` computed from `settings.json`
@@ -18456,6 +18457,20 @@ mod send_delete_wiring {
     /// The one Send this harness's account has.
     const FRAME_SEND_ID: &str = "frame-harness-send-id";
     const FRAME_SEND_NAME: &str = "Frame Harness Send";
+    const FRAME_SEND_URL: &str = "https://send.example.invalid/frame-harness";
+
+    /// **A SECOND row, with a DIFFERENT access URL.**
+    ///
+    /// With one row on screen, "Copy link put that row's own access URL on
+    /// the clipboard" cannot tell a correct per-row lookup from a
+    /// hard-coded constant or from `rows[0].access_url`: all three answer
+    /// identically. The matrix therefore presses the SECOND row's Copy
+    /// link and expects the SECOND row's URL, which only a real per-row
+    /// lookup produces. The name is chosen to sort after the first one for
+    /// a reader; the pane keeps the CLI's order regardless.
+    const FRAME_SECOND_SEND_ID: &str = "frame-harness-send-id-2";
+    const FRAME_SECOND_SEND_NAME: &str = "Second Harness Send";
+    const FRAME_SECOND_SEND_URL: &str = "https://send.example.invalid/second-harness";
 
     fn frame_revoke(
         _ctx: egui::Context,
@@ -18509,15 +18524,24 @@ mod send_delete_wiring {
         }
         let _ = tx.send((
             generation,
-            Ok(vec![crate::send::SendSummary {
-                id: FRAME_SEND_ID.to_string(),
-                name: FRAME_SEND_NAME.to_string(),
-                access_url: "https://send.example.invalid/frame-harness".to_string(),
-                // Far enough out that no clock this can run under makes it
-                // expired, which is a row with different buttons.
-                deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
-                is_file: false,
-            }]),
+            Ok(vec![
+                crate::send::SendSummary {
+                    id: FRAME_SEND_ID.to_string(),
+                    name: FRAME_SEND_NAME.to_string(),
+                    access_url: FRAME_SEND_URL.to_string(),
+                    // Far enough out that no clock this can run under makes
+                    // it expired, which is a row with different buttons.
+                    deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                    is_file: false,
+                },
+                crate::send::SendSummary {
+                    id: FRAME_SECOND_SEND_ID.to_string(),
+                    name: FRAME_SECOND_SEND_NAME.to_string(),
+                    access_url: FRAME_SECOND_SEND_URL.to_string(),
+                    deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                    is_file: false,
+                },
+            ]),
         ));
     }
 
@@ -18528,6 +18552,17 @@ mod send_delete_wiring {
     /// The item this harness's vault holds, whose row the last step selects.
     const FRAME_ITEM_ID: &str = "frame-harness-item-id";
     const FRAME_ITEM_NAME: &str = "Frame Harness Item";
+
+    /// A SECOND item, deliberately in NO folder.
+    ///
+    /// The harness used to hold exactly one item, and that one item was in
+    /// the harness's one folder -- so pressing the folder row changed
+    /// nothing that could be seen, which is why `FolderSelected` could have
+    /// its click deleted and stay green. With this here, the folder row
+    /// really does remove a row from the list, and that removal is the
+    /// witness that variant returns.
+    const FRAME_LOOSE_ITEM_ID: &str = "frame-harness-loose-item-id";
+    const FRAME_LOOSE_ITEM_NAME: &str = "Frame Harness Loose Item";
 
     /// **A LOADED AND NON-EMPTY VAULT.**
     ///
@@ -18569,6 +18604,20 @@ mod send_delete_wiring {
             notes: None,
             item_type: Some(1),
             folder_id: Some(FRAME_FOLDER_ID.to_string()),
+            favorite: false,
+            other: serde_json::Map::new(),
+        },
+        crate::vault_bridge::VaultItem {
+            id: FRAME_LOOSE_ITEM_ID.to_string(),
+            name: FRAME_LOOSE_ITEM_NAME.to_string(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
             favorite: false,
             other: serde_json::Map::new(),
         }]
@@ -19395,11 +19444,10 @@ mod send_delete_wiring {
     /// place at all; what it must be gated ON, to be green, is a state no
     /// fixture builds. So this closes the states instead of the places.
     ///
-    /// **The honest boundary:** this does not make a green mutant impossible.
-    /// It makes a green mutant require a frame-local that is NOT in this
-    /// list -- and adding a state to a window is a visible act, whereas
-    /// moving a `let` one brace inward is not. See the test below for what a
-    /// ninth site would have to look like.
+    /// **The honest boundary, MEASURED.** This does not make a green mutant
+    /// impossible, and the size of what it leaves open was previously
+    /// understated by an order of magnitude -- one named survivor where
+    /// there are about sixteen. See the test below, which now names them.
     #[derive(Clone, Copy, Debug)]
     enum ReachableState {
         /// The window as it opens: vault loaded, nothing pressed.
@@ -19449,6 +19497,251 @@ mod send_delete_wiring {
         ];
     }
 
+    thread_local! {
+        /// Every label the Sends screen paints in [`ReachableState::Fresh`],
+        /// recorded the first time this matrix reaches step 1.
+        ///
+        /// **This is what stops [`Reached::on_the_sends_screen`] being a
+        /// free hatch.** Measured: with the `ItemSelected` click deleted and
+        /// its witness swapped for `send_ui::DELETE_LABEL` -- a label every
+        /// state paints -- the matrix went green again, which is the same
+        /// defect the witness was introduced to close, one indirection
+        /// further out. A label that `Fresh` already paints on the Sends
+        /// screen distinguishes nothing, so naming one is refused here
+        /// rather than trusted to the author of the variant.
+        static FRESH_SENDS_SCREEN: RefCell<Option<Vec<String>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// **PROOF THAT THE STATE A VARIANT NAMES IS REALLY THE ONE ON SCREEN.**
+    ///
+    /// The matrix's setup `match` returns one of these, so a variant CANNOT
+    /// be declared without producing one, and every route into this type
+    /// performs an assertion that names an observable label. That is the
+    /// structural answer to the way `FolderSelected` and `ItemSelected`
+    /// failed: both were once arms whose whole body was a click, both had
+    /// their click DELETED, and the matrix stayed green -- because a
+    /// variant with no post-setup control is a variant that drives `Fresh`
+    /// ten times under ten different names.
+    ///
+    /// `#[must_use]` and a private field are the teeth: the value has to
+    /// travel to [`Reached::check_the_sends_screen`], which is the only
+    /// thing that consumes it, and it cannot be conjured anywhere else in
+    /// the module.
+    ///
+    /// **What this does NOT close.** [`Reached::on_the_sends_screen`] is
+    /// open to any variant, and a lazy eleventh variant could pass a label
+    /// that its setup did not cause -- see the doc comment on that
+    /// constructor for the one guard against it, and the matrix's own
+    /// closing note for what remains.
+    #[derive(Debug)]
+    #[must_use = "a ReachableState variant that does not hand its witness to \
+                  `check_the_sends_screen` has no post-setup control, and a variant with no \
+                  post-setup control is `Fresh` under another name -- that is exactly how \
+                  `FolderSelected` and `ItemSelected` kept the matrix green with their \
+                  clicks deleted"]
+    enum Reached {
+        /// Already proved, on the vault side, before the Sends row was
+        /// pressed. The Sends screen still has to carry a row to press.
+        Now(ReachableState),
+        /// To be proved by a label on the Sends screen itself, once step 1
+        /// has established that the screen is up. The matrix performs this
+        /// assertion; the variant only names the label.
+        OnTheSendsScreen(ReachableState, &'static str),
+        /// Proved by the variant's own block further down, which does
+        /// something no shared helper can (starts a real revoke and reads
+        /// the spawn ledger). Restricted by [`Reached::its_own_block`] to
+        /// the one variant that has such a block, so it is not a hatch a
+        /// new variant can climb through.
+        ItsOwnBlock(ReachableState),
+    }
+
+    impl Reached {
+        /// `needle` was NOT painted before the setup ran and IS painted
+        /// after it. A difference the setup CAUSED, so it cannot be
+        /// satisfied by a label the window paints anyway.
+        fn appeared(
+            state: ReachableState,
+            before: &[String],
+            after: &egui::FullOutput,
+            needle: &str,
+        ) -> Self {
+            assert!(
+                !before.iter().any(|t| t == needle),
+                "control for {state:?}: {needle:?} was already on screen BEFORE this \
+                 variant's setup ran, so its appearance afterwards proves nothing about \
+                 the setup. Name a label this state and no other produces."
+            );
+            assert!(
+                matrix_find(after, needle).is_some(),
+                "control for {state:?}: the setup ran and {needle:?} never appeared, so \
+                 this state is not being driven at all -- every step below is running \
+                 against `Fresh` under another name. What was painted: {:?}",
+                matrix_texts(after)
+            );
+            Self::Now(state)
+        }
+
+        /// `needle` WAS painted before the setup ran and is gone after it.
+        fn vanished(
+            state: ReachableState,
+            before: &[String],
+            after: &egui::FullOutput,
+            needle: &str,
+        ) -> Self {
+            assert!(
+                before.iter().any(|t| t == needle),
+                "control for {state:?}: {needle:?} was not on screen before this variant's \
+                 setup ran either, so its absence afterwards proves nothing about the \
+                 setup."
+            );
+            assert!(
+                matrix_find(after, needle).is_none(),
+                "control for {state:?}: the setup ran and {needle:?} is still on screen, \
+                 so this state is not being driven at all -- every step below is running \
+                 against `Fresh` under another name. What was painted: {:?}",
+                matrix_texts(after)
+            );
+            Self::Now(state)
+        }
+
+        /// Strictly MORE occurrences of `needle` than before the setup.
+        /// For a label the window paints once per place it appears: an
+        /// item's name is in the list, and a SELECTED item's name is in
+        /// the list and in the detail pane.
+        fn more(
+            state: ReachableState,
+            before: &[String],
+            after: &egui::FullOutput,
+            needle: &str,
+        ) -> Self {
+            let was = before.iter().filter(|t| *t == needle).count();
+            assert!(
+                matrix_count(after, needle) > was,
+                "control for {state:?}: the setup ran and {needle:?} is still on screen                  {was} time(s), so nothing was selected and this state is not being driven                  -- every step below is running against `Fresh` under another name. What                  was painted: {:?}",
+                matrix_texts(after)
+            );
+            Self::Now(state)
+        }
+
+        /// Strictly FEWER occurrences of `needle` than before the setup.
+        /// For the badge that reads `UNKNOWN_COUNT` until its list arrives:
+        /// one fewer unknown badge is a list becoming `Some`.
+        fn fewer(
+            state: ReachableState,
+            before: &[String],
+            after: &egui::FullOutput,
+            needle: &str,
+        ) -> Self {
+            let was = before.iter().filter(|t| *t == needle).count();
+            assert!(
+                was > 0,
+                "control for {state:?}: there were no {needle:?} on screen before the setup \
+                 ran, so \"one fewer\" cannot be observed and this control is vacuous."
+            );
+            assert!(
+                matrix_count(after, needle) < was,
+                "control for {state:?}: the setup ran and there are still {was} {needle:?} \
+                 on screen, so nothing resolved and this state is not being driven. What \
+                 was painted: {:?}",
+                matrix_texts(after)
+            );
+            Self::Now(state)
+        }
+
+        /// `needle` is not painted AT ALL in this state -- for a state
+        /// whose whole content is an absence and which therefore has no
+        /// "before" to differ from (the fixture is armed before the window
+        /// is built).
+        fn never_paints(
+            state: ReachableState,
+            after: &egui::FullOutput,
+            needle: &str,
+        ) -> Self {
+            assert!(
+                matrix_find(after, needle).is_none(),
+                "control for {state:?}: {needle:?} is on screen, so this is not the state \
+                 this variant names. What was painted: {:?}",
+                matrix_texts(after)
+            );
+            Self::Now(state)
+        }
+
+        /// Proved by a label on the Sends screen, asserted by the matrix.
+        ///
+        /// The one guard: the label may not be [`FRAME_SEND_NAME`], which
+        /// every state paints, because that is the generic "there is a row
+        /// below to press" check the matrix already runs for `Now` -- a
+        /// variant that named it would be declaring itself with no
+        /// distinguishing observable at all.
+        fn on_the_sends_screen(state: ReachableState, needle: &'static str) -> Self {
+            assert_ne!(
+                needle, FRAME_SEND_NAME,
+                "control for {state:?}: {needle:?} is painted in EVERY state, so naming it \
+                 as this variant's witness is the same as having no witness. Name a label \
+                 only this state's Sends screen produces."
+            );
+            Self::OnTheSendsScreen(state, needle)
+        }
+
+        /// The baseline. Reserved to [`ReachableState::Fresh`], which is
+        /// the state every other variant is a departure FROM and so is the
+        /// one variant with nothing to distinguish itself from.
+        fn the_baseline(state: ReachableState) -> Self {
+            assert!(
+                matches!(state, ReachableState::Fresh),
+                "{state:?} claimed to be the baseline, but the baseline is `Fresh` and \
+                 there is only one of it. A new variant that is indistinguishable from \
+                 `Fresh` is not a new state."
+            );
+            Self::Now(state)
+        }
+
+        /// Reserved to [`ReachableState::RevokeInFlight`], whose control
+        /// lives in its own block below (a real revoke started, the spawn
+        /// ledger read, and the row on its `DELETING_LABEL` face). Not a
+        /// hatch: the allowlist is right here.
+        fn its_own_block(state: ReachableState) -> Self {
+            assert!(
+                matches!(state, ReachableState::RevokeInFlight),
+                "{state:?} has no block of its own, so this is a variant declaring itself \
+                 with no control whatsoever. Give it an observable, or give it a block."
+            );
+            Self::ItsOwnBlock(state)
+        }
+
+        /// **Consumes the witness.** For `Now` and `ItsOwnBlock` this is
+        /// the generic check that the Sends screen carries a row to press
+        /// at all; for `OnTheSendsScreen` it is the variant's own witness.
+        fn check_the_sends_screen(self, output: &egui::FullOutput) {
+            let (state, needle) = match self {
+                Reached::Now(state) | Reached::ItsOwnBlock(state) => (state, FRAME_SEND_NAME),
+                Reached::OnTheSendsScreen(state, needle) => (state, needle),
+            };
+            if matches!(state, ReachableState::Fresh) {
+                FRESH_SENDS_SCREEN.with(|c| *c.borrow_mut() = Some(matrix_texts(output)));
+            }
+            if let Reached::OnTheSendsScreen(_, needle) = self {
+                let baseline = FRESH_SENDS_SCREEN
+                    .with(|c| c.borrow().clone())
+                    .expect(
+                        "`ReachableState::Fresh` has not been driven yet, so there is no                          baseline to check this variant's witness against. `Fresh` is                          first in `ReachableState::ALL` for exactly this reason.",
+                    );
+                assert!(
+                    !baseline.iter().any(|t| t == needle),
+                    "control for {state:?}: {needle:?} is painted on the Sends screen in                      `Fresh` too, so it distinguishes nothing and this variant has no                      witness at all -- it is `Fresh` under another name, which is how                      `FolderSelected` and `ItemSelected` kept this test green with their                      setup deleted. Name a label only this state's Sends screen produces."
+                );
+            }
+            assert!(
+                matrix_find(output, needle).is_some(),
+                "control: in state {state:?} the Sends screen is up but {needle:?} is not \
+                 on it, so this state is not the one being driven and there is no row \
+                 below to press. What was painted: {:?}",
+                matrix_texts(output)
+            );
+        }
+    }
+
     fn matrix_input() -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -19492,6 +19785,46 @@ mod send_delete_wiring {
                     matrix_texts(output)
                 )
             })
+    }
+
+    /// The `needle` button belonging to the row labelled `row`.
+    ///
+    /// With one Send on screen "the Copy link button" is unambiguous and
+    /// also undiscriminating -- it cannot tell a per-row lookup from
+    /// `rows[0]` or from a constant. With two, every button label appears
+    /// twice and a bare [`matrix_locate`] silently means "the first one",
+    /// so the row a press lands on has to be chosen rather than inherited.
+    fn matrix_locate_in_row(
+        state: ReachableState,
+        output: &egui::FullOutput,
+        row: &str,
+        needle: &str,
+    ) -> egui::Pos2 {
+        let row_y = matrix_locate(state, output, row).y;
+        let (_, rect) = matrix_labels(output)
+            .into_iter()
+            .filter(|(t, _)| t == needle)
+            .min_by(|(_, a), (_, b)| {
+                (a.center().y - row_y)
+                    .abs()
+                    .total_cmp(&(b.center().y - row_y).abs())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "in state {state:?} the window painted no {needle:?} anywhere, so the \
+                     {row:?} row cannot be driven. What was painted: {:?}",
+                    matrix_texts(output)
+                )
+            });
+        assert!(
+            (rect.center().y - row_y).abs() < 40.0,
+            "in state {state:?} the nearest {needle:?} to the {row:?} row is {} points away, \
+             which is further than a row is tall -- that row has no {needle:?} of its own and \
+             this press would land on a different Send's button. What was painted: {:?}",
+            (rect.center().y - row_y).abs(),
+            matrix_texts(output)
+        );
+        rect.center()
     }
 
     fn matrix_frame(
@@ -19609,24 +19942,74 @@ mod send_delete_wiring {
     ///
     /// Step 1 is what a shadow gated on a list or a flag OUTSIDE the pane
     /// fails: `let show_sends = show_sends && trash_list.items.is_none();`
-    /// leaves the whole window body empty from the first visit to Trash, and
-    /// `TrashVisited` sees exactly that. Step 2 is what a shadow gated on a
+    /// leaves the SENDS SCREEN blank from the first visit to Trash, and
+    /// `TrashVisited` sees exactly that. (Blank, not the whole window body:
+    /// the mutant still paints the sidebar, `"Nothing here yet"` where the
+    /// list would be and `"Select an item."` in the detail pane. The user
+    /// keeps a window and loses the feature -- pressing Sends does nothing
+    /// visible, for the rest of the session.) Step 2 is what a shadow gated on a
     /// flag INSIDE the pane fails: `let action = if delete.in_flight.is_none()
     /// { action } else { SendUiAction::None };` swallows every press for the
     /// seconds a revoke takes, and `RevokeInFlight` presses during exactly
     /// those seconds.
     ///
-    /// **What this does NOT close.** A gate on a frame-local that is not one
-    /// of these states is still green -- a ninth site would look like `let
-    /// show_sends = show_sends && export.in_flight.is_none();`, or a gate on
-    /// `icons`, on `move_error`, on the folder-modal's cell, on
-    /// `last_activity`. That is the boundary, and it is stated rather than
-    /// papered over: the answer to a ninth site is a tenth VARIANT here, not
-    /// an eighth source pin, because a variant is a state the product has and
-    /// a pin is a place a person chose.
+    /// **WHAT THIS DOES NOT CLOSE -- THE MEASURED BOUNDARY.**
+    ///
+    /// The previous wording named one survivor, `export.in_flight`, and
+    /// wrote it as `let show_sends = show_sends && export.in_flight.is_none();`.
+    /// That does not compile: [`ExportState::in_flight`] is a `bool`, so
+    /// the disclosed ninth site was never run. The compiling form is `let
+    /// show_sends = show_sends && !export.in_flight;`, and it SURVIVES the
+    /// whole crate in both profiles, paired with `&& export.in_flight`
+    /// which is KILLED at the identical site.
+    ///
+    /// It is also not one survivor. An instrumented build printed all 21
+    /// frame-local predicates on every frame where `show_sends` was true,
+    /// across every test in the crate. **Six are ever true anywhere in the
+    /// suite** -- `sync_in_progress`, `load_generation > 0`, `auto_synced`,
+    /// `favicon_requested`, `visible_ids`, `send_delete.view().in_flight`.
+    /// **Fifteen are never once true, in any test, on any frame:**
+    /// `export.in_flight`, `move_error`, `generate_error`, `folder_edit`,
+    /// `prefs`, `item_delete_pending`, `pending_launch`,
+    /// `totp_poll_in_flight`, `totp_poll_failing`, `sync_status`,
+    /// `last_sync_at`, `vault_load_error`, `fill_count`, `mode !=
+    /// DetailMode::Read`, `initial_load_started`. With `last_activity`
+    /// that is about sixteen -- roughly a third of the ~45 locals bound
+    /// above the frame closure.
+    ///
+    /// **A gate on any of those sixteen is inert by construction, i.e.
+    /// guaranteed SURVIVED.** Not "not yet caught": a conjunct that is
+    /// never false on any frame any test runs makes a program that is
+    /// behaviourally identical to this one on every input the suite
+    /// supplies. No assertion, in this test or any other, can distinguish
+    /// two identical programs. Four were measured to be sure --
+    /// `!export.in_flight`, `move_error.is_none()`, `prefs.is_none()`,
+    /// `folder_edit.is_none()` -- each SURVIVED in both profiles with its
+    /// inversion KILLED at the identical site.
+    ///
+    /// **So this is a code-review property, not a test property.** The
+    /// thing that would make it a test property is a fixture that drives
+    /// the window through an export, a failed move, an open folder editor,
+    /// a preferences panel and so on WHILE the Sends screen is up -- which
+    /// is sixteen more variants, and sixteen more variants is a different
+    /// and much larger piece of work than this test is. What is claimed
+    /// here is exactly what was measured: the ten states below are closed
+    /// in both profiles, and a gate written on a seventeenth local that no
+    /// test ever makes true is green and will stay green.
+    ///
+    /// The answer to such a site remains a VARIANT rather than a source
+    /// pin -- a variant is a state the product has and a pin is a place a
+    /// person chose -- but the count of missing variants is sixteen, and
+    /// saying so is worth more than the one-survivor sentence that stood
+    /// here before.
     #[test]
     fn the_sends_screen_works_in_every_state_the_user_can_reach() {
         let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRESH_SENDS_SCREEN.with(|c| *c.borrow_mut() = None);
+        assert!(
+            matches!(ReachableState::ALL[0], ReachableState::Fresh),
+            "`Fresh` is no longer the first state driven, so the baseline every              `Reached::on_the_sends_screen` witness is checked against is recorded too              late -- see `FRESH_SENDS_SCREEN`."
+        );
         for state in ReachableState::ALL {
             drive_the_sends_screen_in(state);
         }
@@ -19690,19 +20073,61 @@ mod send_delete_wiring {
         let mut output = matrix_frame(&ctx, &mut frame_fn);
 
         // ---- reach the state, on the vault side ----
-        match state {
-            ReachableState::Fresh
-            | ReachableState::EmptyVault
-            | ReachableState::NoticeUp
-            | ReachableState::FetchInFlight
-            | ReachableState::RevokeInFlight => {}
+        //
+        // **EXHAUSTIVE, AND EVERY ARM HANDS BACK A [`Reached`].** There is
+        // no wildcard here on purpose: an eleventh variant cannot be added
+        // without writing an arm, and an arm cannot be written without
+        // producing a witness, and no witness can be produced without an
+        // assertion naming a label. `FolderSelected` and `ItemSelected`
+        // were once arms whose entire bodies were a click; both had their
+        // click deleted and this test stayed green, because a click with
+        // nothing checking it is not a state.
+        let reached = match state {
+            ReachableState::Fresh => Reached::the_baseline(state),
+            // The one state whose content is an absence: the fixture is
+            // armed before the window is built, so there is no "before"
+            // for it to differ from -- but an account with no items is
+            // exactly an account where the item this harness normally
+            // holds is nowhere on screen.
+            ReachableState::EmptyVault => {
+                Reached::never_paints(state, &output, FRAME_ITEM_NAME)
+            }
+            ReachableState::NoticeUp => {
+                Reached::on_the_sends_screen(state, send_ui::FAILED_HEADLINE)
+            }
+            ReachableState::FetchInFlight => {
+                Reached::on_the_sends_screen(state, send_ui::LOADING_LABEL)
+            }
+            ReachableState::RevokeInFlight => Reached::its_own_block(state),
             ReachableState::FolderSelected => {
+                let before = matrix_texts(&output);
                 let at = matrix_locate(state, &output, "Frame Harness Folder");
                 output = matrix_click(&ctx, &mut frame_fn, at);
+                // `filter` really is `SidebarFilter::Folder`, observable
+                // because the harness holds a second item that is in NO
+                // folder: scoping the list to the folder takes it off
+                // screen, and nothing else this test does takes it off
+                // screen. Locating the folder row is not enough -- that
+                // succeeds whether or not the row was ever pressed.
+                Reached::vanished(state, &before, &output, FRAME_LOOSE_ITEM_NAME)
             }
             ReachableState::ItemSelected => {
-                let at = matrix_locate(state, &output, FRAME_ITEM_NAME);
+                let before = matrix_texts(&output);
+                // **THE SECOND ITEM, NOT THE FIRST.** Measuring this
+                // control turned up something the variant had been hiding
+                // since it was written: the window SELECTS THE FIRST ITEM
+                // ON LOAD, so `selected_id` is already `Some` in `Fresh`
+                // and a click on the first row changed nothing at all.
+                // That is why the click could be deleted with the matrix
+                // still green -- the arm was not merely uncontrolled, it
+                // was driving `Fresh` outright. Pressing the row that is
+                // NOT the auto-selection is what makes this a state of its
+                // own, and the detail pane painting that item's name
+                // (making two occurrences of it, one row and one pane) is
+                // what proves the press landed.
+                let at = matrix_locate(state, &output, FRAME_LOOSE_ITEM_NAME);
                 output = matrix_click(&ctx, &mut frame_fn, at);
+                Reached::more(state, &before, &output, FRAME_LOOSE_ITEM_NAME)
             }
             ReachableState::TrashVisited | ReachableState::ArchiveVisited => {
                 let row = if matches!(state, ReachableState::TrashVisited) {
@@ -19716,30 +20141,35 @@ mod send_delete_wiring {
                 // i.e. `items` becoming `Some` -- which is the whole of what
                 // this state is, and what no fixture could build until
                 // `VaultFrameEnv::aux_load` was a seam.
-                let unknown_before = matrix_count(&output, sidebar::UNKNOWN_COUNT);
+                let before = matrix_texts(&output);
                 let at = matrix_locate(state, &output, row);
                 output = matrix_click(&ctx, &mut frame_fn, at);
-                assert!(
-                    matrix_count(&output, sidebar::UNKNOWN_COUNT) < unknown_before,
-                    "control: {row} was opened and no badge resolved, so its list never \
-                     arrived and `items` is still `None` -- {state:?} is not the state being \
-                     driven. What was painted: {:?}",
-                    matrix_texts(&output)
-                );
+                Reached::fewer(state, &before, &output, sidebar::UNKNOWN_COUNT)
             }
             ReachableState::SearchTyped => {
+                let before = matrix_texts(&output);
                 output = matrix_type(&ctx, &mut frame_fn, "zq");
-                assert!(
-                    matrix_find(&output, "zq").is_some(),
-                    "control: the search box does not paint \"zq\" after Ctrl+K and two \
-                     letters, so `search` is still empty and this state is not being built \
-                     at all. What was painted: {:?}",
-                    matrix_texts(&output)
-                );
+                Reached::appeared(state, &before, &output, "zq")
             }
-        }
+        };
 
         // ---- the Sends screen, reached the only way there is ----
+        //
+        // Step 1 below counts ONE string and reads it as two different
+        // things: the sidebar row that leads to the screen, and the pane's
+        // own heading. Nothing in the type system holds those two together,
+        // so they are held here -- reword either and this fails loudly
+        // instead of quietly degrading step 1 into "the sidebar row
+        // exists", which is true in every state including the ones where
+        // the window body is blank.
+        assert_eq!(
+            send_ui::SENDS_HEADING,
+            sidebar::SENDS_ROW_LABEL,
+            "the Sends pane's own heading and the sidebar row that leads to it are no longer \
+             the same string, so counting that string twice no longer proves the PANE \
+             painted. Count `send_ui::SENDS_HEADING` in its own right, or put the two back \
+             in step."
+        );
         let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
         output = matrix_click(&ctx, &mut frame_fn, sends_at);
 
@@ -19754,44 +20184,29 @@ mod send_delete_wiring {
             matrix_count(&output, sidebar::SENDS_ROW_LABEL) >= 2,
             "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
              its own heading -- only the sidebar row that leads to it is on screen. The \
-             window body is empty: the item list is skipped because `show_sends` is true \
-             and the pane was not asked for. What was painted: {:?}",
+             SENDS SCREEN is blank: the item list is skipped because `show_sends` is true \
+             and the pane was not asked for, so the window keeps its sidebar and its \
+             detail-pane placeholder and the user has no Sends feature at all. What was \
+             painted: {:?}",
             matrix_texts(&output)
         );
 
         // The state really is the one this iteration names, checked on
-        // screen before anything is pressed.
-        match state {
-            ReachableState::NoticeUp => assert!(
-                matrix_find(&output, send_ui::FAILED_HEADLINE).is_some(),
-                "control: the fetch was set to fail and the Sends pane is not on its error \
-                 screen, so {state:?} is not the state being driven. What was painted: {:?}",
-                matrix_texts(&output)
-            ),
-            ReachableState::FetchInFlight => {
-                assert!(
-                    matrix_find(&output, send_ui::LOADING_LABEL).is_some(),
-                    "control: the send-list stub withheld its answer and the pane is not \
-                     waiting, so no fetch is in flight. What was painted: {:?}",
-                    matrix_texts(&output)
-                );
-            }
-            _ => assert!(
-                matrix_find(&output, FRAME_SEND_NAME).is_some(),
-                "control: in state {state:?} the Sends screen is up but {FRAME_SEND_NAME:?} \
-                 is not on it, so there is no row below to press. What was painted: {:?}",
-                matrix_texts(&output)
-            ),
-        }
+        // screen before anything is pressed -- by the witness the setup
+        // above was obliged to produce, which is consumed here and nowhere
+        // else.
+        reached.check_the_sends_screen(&output);
 
         // The revoke, for the one state that is about a revoke being in
         // flight. The stub reports NOTHING, so `send_delete.in_flight` stays
         // `Some` for every frame below -- which is exactly how long a real
         // `bw send delete` holds it.
         if matches!(state, ReachableState::RevokeInFlight) {
-            let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
+            let delete_at =
+                matrix_locate_in_row(state, &output, FRAME_SEND_NAME, send_ui::DELETE_LABEL);
             let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
-            let confirm_at = matrix_locate(state, &armed, send_ui::CONFIRM_LABEL);
+            let confirm_at =
+                matrix_locate_in_row(state, &armed, FRAME_SEND_NAME, send_ui::CONFIRM_LABEL);
             output = matrix_click(&ctx, &mut frame_fn, confirm_at);
             assert_eq!(
                 FRAME_REVOKES.lock().expect("not poisoned").len(),
@@ -19908,21 +20323,30 @@ mod send_delete_wiring {
 
         // 3. **THE ROW'S OWN CONTROLS.** Copy link is drawn, Delete arms the
         //    confirmation and destroys nothing, and Cancel really disarms it.
-        let copy_at = matrix_locate(state, &output, "Copy link");
+        // **THE SECOND ROW'S Copy link, AND THE SECOND ROW'S URL.** With
+        // one row on screen this step could not tell a per-row lookup from
+        // `rows[0].access_url` or from a hard-coded constant: all three
+        // answer with the same string. The row pressed here is not the
+        // first one, so only a lookup that really reads the row under the
+        // cursor produces the expected answer.
+        let copy_at =
+            matrix_locate_in_row(state, &output, FRAME_SECOND_SEND_NAME, "Copy link");
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
             copied,
-            vec!["https://send.example.invalid/frame-harness".to_string()],
-            "in state {state:?} pressing Copy link on a real Sends row put {copied:?} on the \
-             clipboard, not exactly that row's own access URL. Copy link is the whole point \
-             of a Send -- a row that publishes a link the user cannot get hold of is a dead \
-             feature, and a press that reaches nothing looks identical on screen. What was \
-             painted: {:?}",
+            vec![FRAME_SECOND_SEND_URL.to_string()],
+            "in state {state:?} pressing Copy link on the SECOND Sends row put {copied:?} on \
+             the clipboard, not exactly that row's own access URL -- {FRAME_SECOND_SEND_URL:?} \
+             . A press that answers with the first row's link, or with one constant for every \
+             row, publishes the wrong Send: the user hands out a link to something they did \
+             not mean to share. Copy link is the whole point of a Send, and a press that \
+             reaches nothing looks identical on screen. What was painted: {:?}",
             matrix_texts(&after_copy)
         );
         let output = after_copy;
         FRAME_REVOKES.lock().expect("not poisoned").clear();
-        let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
+        let delete_at =
+            matrix_locate_in_row(state, &output, FRAME_SEND_NAME, send_ui::DELETE_LABEL);
         let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
         assert!(
             matrix_find(&armed, send_ui::CONFIRM_LABEL).is_some(),
@@ -19938,7 +20362,8 @@ mod send_delete_wiring {
              {started:?} -- so the confirmation is a decoration"
         );
 
-        let cancel_at = matrix_locate(state, &armed, send_ui::CANCEL_LABEL);
+        let cancel_at =
+            matrix_locate_in_row(state, &armed, FRAME_SEND_NAME, send_ui::CANCEL_LABEL);
         let disarmed = matrix_click(&ctx, &mut frame_fn, cancel_at);
         assert!(
             matrix_find(&disarmed, send_ui::CONFIRM_LABEL).is_none(),
@@ -19973,6 +20398,28 @@ mod send_delete_wiring {
                 matrix_find(&back, "zq").is_some(),
                 "the search box is empty after a round trip through the Sends screen, so the \
                  user's query was destroyed by visiting a sidebar row. What was painted: {:?}",
+                matrix_texts(&back)
+            );
+            // **AND IT IS STILL DOING SOMETHING.** Text left in the box
+            // that no longer scopes the list is the same defect wearing
+            // the text as a disguise: the user sees their query, and sees
+            // every item they filtered out sitting under it. "zq" matches
+            // neither of the harness's items, so a list that is really
+            // filtered draws its no-matches placeholder INSTEAD of rows.
+            //
+            // (The detail pane goes on painting the item that was already
+            // selected, which is the product's own behaviour and is why
+            // this reads the LIST's placeholder rather than the absence of
+            // a name from the whole screen.)
+            let no_matches = item_list::ListPlaceholder::NoMatches.message();
+            assert!(
+                matrix_find(&back, no_matches).is_some(),
+                "after a round trip through the Sends screen the search box still says                  \"zq\" but the list is not scoped by it -- {no_matches:?} is nowhere on                  screen. The text survived and the FILTER did not, which is the same lost                  query wearing the text as a disguise. What was painted: {:?}",
+                matrix_texts(&back)
+            );
+            assert!(
+                matrix_find(&back, FRAME_LOOSE_ITEM_NAME).is_none(),
+                "the list says {no_matches:?} and is drawing a row anyway. What was                  painted: {:?}",
                 matrix_texts(&back)
             );
         }

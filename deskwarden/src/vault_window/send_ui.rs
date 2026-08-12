@@ -666,6 +666,17 @@ const TAG_PAD_X: f32 = 6.0;
 /// one it is handed. That is the same split every other pane in this window
 /// uses, and it is why a Sends failure is a `NoticeSource` rather than a
 /// widget of its own.
+/// The heading the Sends PANE paints at the top of its own screen.
+///
+/// Named because the matrix test counts it: the pane's heading and
+/// `sidebar::SENDS_ROW_LABEL` are the same string, and "two occurrences"
+/// is how that test tells "the pane painted" from "only the sidebar row
+/// that leads to it painted". While this was a bare literal, rewording it
+/// silently turned that step into "the sidebar row exists" -- which is
+/// true in every state, including the ones where the window body is
+/// blank. The two constants are pinned equal by the matrix itself.
+pub const SENDS_HEADING: &str = "Sends";
+
 pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
@@ -676,7 +687,7 @@ pub fn draw_send_pane(
 
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new("Sends")
+            egui::RichText::new(SENDS_HEADING)
                 .size(17.0)
                 .color(theme::INK)
                 .strong(),
