@@ -230,20 +230,128 @@ pub const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT
 /// The launch-time trust decision, as a pure function of the signature so it
 /// can be tested without a signed file on disk.
 ///
-/// [`apply_update`] cannot be driven all the way to its spawn by any test that
-/// is allowed to exist here -- doing so would mean shipping a genuinely
-/// Authenticode-signed fixture and then running it -- so the decision is
-/// lifted out of the launcher and pinned on its own. What remains untestable
-/// is only whether the launcher still ASKS, and that is disclosed rather than
-/// papered over: deleting the `if !installer_is_launchable(..)` branch from
-/// [`apply_update`] was measured SURVIVING every assertion in this crate, at
-/// 2168 lib / 217 bin / 4 ignored / 0 failed. It is caught only by the
-/// dead-code warning it leaves behind, which is why the ledger this crate
-/// keeps is "0 failed AND 0 warnings" rather than "0 failed". SUBSTITUTING the
-/// thumbprint rather than deleting the call is caught outright -- see
-/// [`the_launch_time_trust_decision_is_the_expected_signer`].
+/// This pins WHAT the decision computes. It says nothing about whether the
+/// launcher consults it, and that gap was not theoretical: the previous shape
+/// of this module disclosed that deleting the `if !installer_is_launchable(..)`
+/// branch from [`apply_update`] SURVIVED the whole suite, and rested its
+/// defence on the dead-code warning the deletion leaves behind. **That backstop
+/// did not exist.** Measured on this crate at `e7327f9`, replacing the entire
+/// gating block with
+///
+/// ```ignore
+/// let _launchable = installer_is_launchable(&info);
+/// ```
+///
+/// -- which uses `info`, uses the function, and removes the gate -- survived at
+/// 2168 lib / 217 bin / 4 ignored / 0 failed and ZERO warnings. Composed with a
+/// one-line `pub fn zz_start(d: &Path, r: &ReleaseInfo)` forwarder in
+/// `accounts.rs` (see [`apply_update`]'s note on the child-start guard's
+/// `ALLOWED` list) it restored an arbitrary-directory, signature-free, jobless
+/// process launcher on the crate's public surface, still at 2168 / 0 failed /
+/// 0 warnings.
+///
+/// Substitution was killed; deletion and NEUTRALISATION were both free. The
+/// difference is the whole lesson: a pin on a pure decision cannot see whether
+/// the decision is in a GATING POSITION. That is now held separately, by
+/// [`apply_update_with`] and the routing tests over it, and this function is
+/// only one half of the pair.
 fn installer_is_launchable(info: &crate::signature::SignatureInfo) -> bool {
     is_trusted_signer(info, EXPECTED_SIGNER_THUMBPRINT)
+}
+
+/// The one place in this crate that turns the downloaded installer into a
+/// running process.
+///
+/// Split out of [`apply_update`] so that the launch is a VALUE
+/// ([`UpdaterEnv::launch`]) a test can substitute and observe, rather than a
+/// statement no test may ever execute. It takes a path because it is the
+/// bottom of the funnel, not the top: the path it is given is constructed by
+/// [`apply_update_with`] from [`installer_file_name`], and reaching this
+/// function without going through the gate above it is what
+/// [`the_only_process_start_in_this_module_is_the_launch_seam`] forbids.
+fn launch_installer(installer_path: &Path) -> Result<(), String> {
+    Command::new(installer_path)
+        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES"])
+        .spawn()
+        .map_err(|e| format!("failed to launch installer: {e}"))?;
+    Ok(())
+}
+
+/// The two outside-world operations [`apply_update`] performs, as `fn`
+/// pointers, so that the ROUTING between them can be tested.
+///
+/// # Why this exists
+///
+/// `apply_update` cannot be driven to its spawn by any test that is allowed to
+/// exist in this crate: doing so would mean shipping a genuinely
+/// Authenticode-signed installer as a fixture and then RUNNING it. So for three
+/// revisions the trust decision was lifted into the pure
+/// [`installer_is_launchable`] and pinned over hand-built [`SignatureInfo`]
+/// values, and the question "does the launcher still ask?" was disclosed as
+/// untestable. It was not untestable. It was untested, and measured survivors
+/// followed -- see [`installer_is_launchable`] for the numbers.
+///
+/// Behind this seam the launcher can be run end to end with **no real file, no
+/// real signature and no real process**: the harness supplies a
+/// [`SignatureInfo`] by hand through `verify` and records every path that
+/// arrives at `launch`. The assertions are then about ROUTING -- that `launch`
+/// is NOT reached for a wrong signer, an invalid signature, a missing
+/// thumbprint or an unreadable file, and IS reached, with exactly the
+/// constructed path, for the trusted one. That is the property deletion and
+/// neutralisation both break and substitution also breaks, so one shape of test
+/// now covers all three.
+///
+/// # `fn` pointers rather than `impl Fn`
+///
+/// Closures would be more convenient at the call site and would be the wrong
+/// choice here, for the reason `VaultFrameEnv` in `vault_window/mod.rs`
+/// records: a seam that is itself unpinned only MOVES the hole. A `fn` pointer
+/// has an address, so [`production_holds_the_real_verify_and_the_real_launch`]
+/// can assert that what [`UpdaterEnv::production`] hands over is the real
+/// `verify_authenticode` and the real [`launch_installer`] BY IDENTITY, with
+/// `std::ptr::fn_addr_eq`. A wrapper, a forwarder, a rename or a flag-gated
+/// no-op is a different address and fails there, whatever it is spelled.
+pub struct UpdaterEnv {
+    /// [`crate::signature::verify_authenticode`] in production.
+    verify: fn(&Path) -> Result<crate::signature::SignatureInfo, String>,
+    /// [`launch_installer`] in production -- the module's only process start.
+    launch: fn(&Path) -> Result<(), String>,
+}
+
+impl UpdaterEnv {
+    /// The real world. The only constructor a shipping build compiles --
+    /// pinned by [`production_is_the_only_updater_env_a_shipping_build_has`],
+    /// which reads this file's production slice. The test-only substitute is
+    /// written down in `mod tests` as an inherent impl, deliberately BELOW
+    /// every source guard in this file, so that a test-gated item up here
+    /// cannot truncate the slice those guards read.
+    pub fn production() -> Self {
+        Self { verify: verify_authenticode, launch: launch_installer }
+    }
+}
+
+/// [`apply_update`]'s whole body, with the outside world as a parameter.
+///
+/// The gate is the point: `launch` is unreachable except through the `if`
+/// below, and there is no other path to a process start in this module. See
+/// [`UpdaterEnv`] for why this shape exists and
+/// [`the_only_process_start_in_this_module_is_the_launch_seam`] for the guard
+/// that keeps a second, ungated spawn from being written beside it.
+fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -> Result<(), String> {
+    let installer_path = dest_dir.join(installer_file_name(&release.version));
+    // The path is folded into every error on this path deliberately: the one
+    // thing a caller must be able to see is WHICH file was about to be
+    // launched, and `verify_authenticode`'s own errors are about the Win32
+    // call rather than about the file.
+    let info = (env.verify)(&installer_path)
+        .map_err(|e| format!("refusing to launch {}: {e}", installer_path.display()))?;
+    if !installer_is_launchable(&info) {
+        return Err(format!(
+            "refusing to launch {}: it is not signed by the expected signer",
+            installer_path.display()
+        ));
+    }
+    (env.launch)(&installer_path)
 }
 
 /// Launches the installer this module downloaded for `release`, and nothing
@@ -277,25 +385,17 @@ fn installer_is_launchable(info: &crate::signature::SignatureInfo) -> bool {
 /// supplied. [`download_and_verify`] already checks, but it checks at download
 /// time and hands back a path; the gap between those two moments is exactly
 /// where a swap goes. This is the check that is adjacent to the launch.
+///
+/// # And the check is now known to be CONSULTED
+///
+/// The body lives in [`apply_update_with`], over an [`UpdaterEnv`], and this is
+/// a two-line wrapper over it holding production's env. That is not a
+/// refactoring for its own sake: with the decision merely lifted into a pure
+/// [`installer_is_launchable`], neutralising the gate to `let _launchable =
+/// installer_is_launchable(&info);` was measured surviving the entire suite at
+/// zero warnings. The routing tests behind the seam are what fail on it now.
 pub fn apply_update(dest_dir: &Path, release: &ReleaseInfo) -> Result<(), String> {
-    let installer_path = dest_dir.join(installer_file_name(&release.version));
-    // The path is folded into every error on this path deliberately: the one
-    // thing a caller must be able to see is WHICH file was about to be
-    // launched, and `verify_authenticode`'s own errors are about the Win32
-    // call rather than about the file.
-    let info = verify_authenticode(&installer_path)
-        .map_err(|e| format!("refusing to launch {}: {e}", installer_path.display()))?;
-    if !installer_is_launchable(&info) {
-        return Err(format!(
-            "refusing to launch {}: it is not signed by the expected signer",
-            installer_path.display()
-        ));
-    }
-    Command::new(&installer_path)
-        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES"])
-        .spawn()
-        .map_err(|e| format!("failed to launch installer: {e}"))?;
-    Ok(())
+    apply_update_with(dest_dir, release, &UpdaterEnv::production())
 }
 
 #[cfg(test)]
@@ -720,5 +820,406 @@ mod tests {
         // the two never collapse back into one shared number, which is the
         // arrangement that produced the inert setting in the first place.
         assert_ne!(API_DEADLINE, DOWNLOAD_STALL_TIMEOUT);
+    }
+
+    // ---------------------------------------------------------------------
+    // THE GATE, AS ROUTING
+    //
+    // Everything above pins what the launcher COMPUTES. This section pins
+    // that the launcher ASKS -- the property the previous shape of this
+    // module disclosed as untestable and that a measured one-line
+    // neutralisation (`let _launchable = installer_is_launchable(&info);`)
+    // walked straight through at 2168 passed / 0 failed / 0 warnings.
+    //
+    // No fixture, no network, no signed file, no process: the harness hands
+    // `apply_update_with` a `SignatureInfo` built by hand and records every
+    // path that reaches the launch seam.
+    // ---------------------------------------------------------------------
+
+    use crate::signature::SignatureInfo;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// What the substitute `verify` answers on its next call.
+        static VERIFY_ANSWER: RefCell<Option<Result<SignatureInfo, String>>> =
+            const { RefCell::new(None) };
+        /// Every path the substitute `verify` was asked about.
+        static VERIFIED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        /// Every path that reached the launch seam. **If this is ever
+        /// non-empty when it should be empty, an unverified installer would
+        /// have been started for real.**
+        static LAUNCHED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Thread-local rather than a `Mutex`: the seam is a bare `fn` pointer by
+    /// design (see [`UpdaterEnv`]), so it cannot capture, and `cargo test`
+    /// gives each test its own thread -- so these are per-test state with no
+    /// ordering assumption between tests.
+    fn substitute_verify(path: &Path) -> Result<SignatureInfo, String> {
+        VERIFIED.with(|v| v.borrow_mut().push(path.to_path_buf()));
+        VERIFY_ANSWER.with(|a| {
+            a.borrow_mut().take().expect("the test did not program a verify answer")
+        })
+    }
+
+    fn substitute_launch(path: &Path) -> Result<(), String> {
+        LAUNCHED.with(|l| l.borrow_mut().push(path.to_path_buf()));
+        Ok(())
+    }
+
+    impl UpdaterEnv {
+        /// The test-only substitute.
+        ///
+        /// An inherent impl written from `mod tests` rather than a
+        /// `#[cfg(test)]` method beside [`UpdaterEnv::production`], for the
+        /// reason `vault_window`'s seam records: every source guard in a file
+        /// cuts its production slice at the FIRST test gate in the text, so a
+        /// gated item up beside `production` would truncate the slice
+        /// [`production_is_the_only_updater_env_a_shipping_build_has`] and
+        /// [`the_only_process_start_in_this_module_is_the_launch_seam`] read,
+        /// and blind both of them to everything below it.
+        fn substitute(
+            verify: fn(&Path) -> Result<SignatureInfo, String>,
+            launch: fn(&Path) -> Result<(), String>,
+        ) -> Self {
+            Self { verify, launch }
+        }
+    }
+
+    /// Runs `apply_update_with` against the recording seam, with `verify`
+    /// programmed to answer `answer`. Returns the launcher's result together
+    /// with the paths that reached `launch`.
+    fn route(answer: Result<SignatureInfo, String>) -> (Result<(), String>, Vec<PathBuf>) {
+        VERIFY_ANSWER.with(|a| *a.borrow_mut() = Some(answer));
+        VERIFIED.with(|v| v.borrow_mut().clear());
+        LAUNCHED.with(|l| l.borrow_mut().clear());
+
+        // A directory that does not exist and is never created: nothing on
+        // this path may touch the disk, because nothing on this path reads the
+        // disk any more.
+        let dir = PathBuf::from(r"Z:\deskwarden-routing-test-never-created");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: String::new(),
+        };
+        let env = UpdaterEnv::substitute(substitute_verify, substitute_launch);
+        let result = apply_update_with(&dir, &release, &env);
+        (result, LAUNCHED.with(|l| l.borrow().clone()))
+    }
+
+    /// A `SignatureInfo` as `verify_authenticode` would return one.
+    fn signature(valid: bool, thumbprint: Option<&str>) -> SignatureInfo {
+        SignatureInfo {
+            valid,
+            thumbprint: thumbprint.map(str::to_string),
+            subject_dn: Some("CN=Deskwarden".to_string()),
+        }
+    }
+
+    /// The path `route` builds, for the assertions below to compare against.
+    fn routed_path() -> PathBuf {
+        PathBuf::from(r"Z:\deskwarden-routing-test-never-created")
+            .join(installer_file_name(&Version::parse("9.9.9").unwrap()))
+    }
+
+    /// **The gate is consulted: a valid signature by SOMEONE ELSE is never
+    /// launched.**
+    ///
+    /// This is the case that matters, because it is what a planted installer
+    /// carries -- a real, valid Authenticode signature, by a signer that is
+    /// not ours. `verify` succeeds, `installer_is_launchable` says no, and the
+    /// question is whether anything downstream cares. Deleting the `if`, or
+    /// neutralising it to a `let _`, makes `LAUNCHED` non-empty here.
+    #[test]
+    fn a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam() {
+        let (result, launched) =
+            route(Ok(signature(true, Some("AABBCCDDEEFF00112233445566778899"))));
+
+        assert!(
+            launched.is_empty(),
+            "an installer validly signed by someone other than the expected signer reached the \
+             launch seam ({launched:?}); in production that is a process start"
+        );
+        let error = result.expect_err("a wrong-signer installer must not be a success");
+        assert!(
+            error.contains("not signed by the expected signer"),
+            "the refusal does not say why: {error}"
+        );
+    }
+
+    /// An INVALID signature naming the right signer is not launched either --
+    /// a thumbprint match is not on its own a verdict.
+    #[test]
+    fn an_invalid_signature_never_reaches_the_launch_seam() {
+        let (result, launched) = route(Ok(signature(false, Some(EXPECTED_SIGNER_THUMBPRINT))));
+
+        assert!(
+            launched.is_empty(),
+            "an installer whose signature the OS rejected reached the launch seam ({launched:?})"
+        );
+        assert!(result.is_err());
+    }
+
+    /// No thumbprint at all -- an unsigned file, or one whose certificate
+    /// could not be read -- is not launched.
+    #[test]
+    fn a_missing_thumbprint_never_reaches_the_launch_seam() {
+        let (result, launched) = route(Ok(signature(true, None)));
+
+        assert!(
+            launched.is_empty(),
+            "an installer carrying no signer thumbprint reached the launch seam ({launched:?})"
+        );
+        assert!(result.is_err());
+    }
+
+    /// `verify` returning `Err` -- the answer is UNKNOWN, not "untrusted" --
+    /// is also a refusal, and the failure is propagated rather than swallowed
+    /// into a default verdict.
+    ///
+    /// This is the mutant shaped as "the result is ignored rather than
+    /// unused": a body that turns the `?` into an `unwrap_or(..)` of a
+    /// fabricated trusted `SignatureInfo` still USES `verify`, still USES
+    /// `installer_is_launchable`, and warns about nothing.
+    #[test]
+    fn an_unverifiable_installer_never_reaches_the_launch_seam() {
+        let (result, launched) = route(Err("the file could not be read as a signed object".into()));
+
+        assert!(
+            launched.is_empty(),
+            "an installer that could not be verified at all reached the launch seam ({launched:?})"
+        );
+        let error = result.expect_err("an unknown verdict is not a success");
+        assert!(
+            error.contains("the file could not be read as a signed object"),
+            "the verifier's own failure was swallowed: {error}"
+        );
+    }
+
+    /// **The counterpart, without which every assertion above is vacuous:**
+    /// the trusted case IS launched, and with exactly the path the module
+    /// constructed -- not one the caller named, and not some other file in the
+    /// same directory.
+    ///
+    /// A gate that refuses everything passes the four tests above and is a
+    /// broken updater. A launcher that launches a DIFFERENT path than the one
+    /// it verified passes them too, and is the swap the re-verification exists
+    /// to close; the path equality here is what says the file that was
+    /// checked is the file that runs.
+    #[test]
+    fn the_trusted_installer_is_launched_and_it_is_the_file_that_was_verified() {
+        let (result, launched) = route(Ok(signature(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
+
+        assert!(result.is_ok(), "the trusted installer was refused: {result:?}");
+        assert_eq!(
+            launched,
+            vec![routed_path()],
+            "the launch seam did not receive exactly the one path the module constructed"
+        );
+        let verified = VERIFIED.with(|v| v.borrow().clone());
+        assert_eq!(
+            verified, launched,
+            "the file that was VERIFIED is not the file that was LAUNCHED; the gap between \
+             those two paths is exactly where a swap goes"
+        );
+    }
+
+    /// The gate is case-insensitive on the thumbprint (they are hex), the same
+    /// way [`the_launch_time_trust_decision_is_the_expected_signer`] says --
+    /// asserted here through the ROUTING rather than over the predicate.
+    #[test]
+    fn the_trusted_thumbprint_is_matched_case_insensitively_through_the_gate() {
+        let (result, launched) = route(Ok(signature(
+            true,
+            Some(&EXPECTED_SIGNER_THUMBPRINT.to_ascii_lowercase()),
+        )));
+
+        assert!(result.is_ok(), "a lower-cased thumbprint was refused: {result:?}");
+        assert_eq!(launched, vec![routed_path()]);
+    }
+
+    // ---------------------------------------------------------------------
+    // AND THE SEAM ITSELF
+    //
+    // A seam that is not pinned only moves the hole one level out: the tests
+    // above observe what the HARNESS supplied, never what production supplies.
+    // These two are what join them.
+    // ---------------------------------------------------------------------
+
+    /// **Both fields of the production [`UpdaterEnv`] are the real functions,
+    /// compared BY ADDRESS.**
+    ///
+    /// The same hold `vault_window`'s
+    /// `production_hands_the_window_the_real_functions` puts on its five spawn
+    /// fields, and for the same measured reason: a wrapper written at module
+    /// level -- `fn verify_when_enabled(p: &Path) -> Result<SignatureInfo,
+    /// String> { if CHECKS_ENABLED { verify_authenticode(p) } else {
+    /// Ok(trusted()) } }` -- still spells the real name, still leaves
+    /// `production` defining nothing of its own, and is invisible to every
+    /// routing test above, because those substitute this very pointer. It is a
+    /// different address, so it fails here.
+    ///
+    /// What this does NOT cover, plainly: it says the pointer is the right
+    /// FUNCTION, never what that function does. A hollowed-out
+    /// `verify_authenticode` passes this and is `signature.rs`'s problem.
+    #[test]
+    fn production_holds_the_real_verify_and_the_real_launch() {
+        let env = UpdaterEnv::production();
+
+        // Typed `let`s rather than casts off the `fn` items, so each is a `fn`
+        // POINTER of exactly the field's type before any address is taken: a
+        // signature drift is a compile error here, not a silently different
+        // address.
+        let real_verify: fn(&Path) -> Result<SignatureInfo, String> = verify_authenticode;
+        let real_launch: fn(&Path) -> Result<(), String> = launch_installer;
+
+        assert!(
+            std::ptr::fn_addr_eq(env.verify, real_verify),
+            "`UpdaterEnv::production` hands the launcher something other than the real \
+             `verify_authenticode`. A wrapper, a forwarder or a flag-gated pass-through still \
+             SPELLS the name, and the routing tests cannot see it because they substitute this \
+             pointer. This is the assertion it fails"
+        );
+        assert!(
+            std::ptr::fn_addr_eq(env.launch, real_launch),
+            "`UpdaterEnv::production` hands the launcher something other than the real \
+             `launch_installer`"
+        );
+
+        // CONTROL: the comparison discriminates. A function of the right
+        // SIGNATURE that is not the right function reads as different, so the
+        // assertions above are not something every pair of `fn` pointers has.
+        let decoy: fn(&Path) -> Result<(), String> = not_the_launcher;
+        assert!(
+            !std::ptr::fn_addr_eq(env.launch, decoy),
+            "control: a different function of the same signature compares EQUAL to the \
+             production launcher, so every assertion above is vacuous"
+        );
+        // ...and the real one really does compare equal to itself, so the
+        // control is not passing because comparison always answers `false`.
+        assert!(
+            std::ptr::fn_addr_eq(real_launch, real_launch),
+            "control: `fn_addr_eq` answers `false` for one function against itself"
+        );
+    }
+
+    /// The decoy [`production_holds_the_real_verify_and_the_real_launch`]
+    /// compares against: `launch`'s signature exactly, and nothing else.
+    fn not_the_launcher(_: &Path) -> Result<(), String> {
+        unreachable!("never called -- this exists to have an address")
+    }
+
+    /// The production slice of this file: everything above `mod tests`. Both
+    /// source guards below read it, so neither can be blinded by anything
+    /// written inside the test module.
+    ///
+    /// Cut at the test MODULE rather than at the first `cfg` gate in the text,
+    /// which is the cut `vault_window`'s guards use and which has a trap this
+    /// file walked into on the first run: a doc comment that merely MENTIONS
+    /// the gate, in a code span, truncates the slice to nothing and reds both
+    /// guards. Cutting at the module header is also the conservative
+    /// direction -- a test-gated item written above `mod tests` stays INSIDE
+    /// the slice and is judged as production code, so the guards over-report
+    /// rather than under-report.
+    fn production_slice() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/updater.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let cut = text
+            .find("\r\nmod tests {")
+            .expect("updater.rs no longer declares `mod tests`, so this slice would be the whole file");
+        text[..cut].to_string()
+    }
+
+    /// **[`UpdaterEnv::production`] is the only constructor a shipping build
+    /// compiles.**
+    ///
+    /// [`production_holds_the_real_verify_and_the_real_launch`] pins the value
+    /// `production()` builds. It is worth nothing if a shipping build has a
+    /// SECOND constructor that some call site can reach instead -- a
+    /// `pub fn permissive() -> Self` is one line, and the address test never
+    /// looks at it. Every constructor of this type has to spell `-> Self` or
+    /// `-> UpdaterEnv`; the production slice contains exactly one.
+    ///
+    /// The test-only substitute is written in `mod tests`, below the cut, and
+    /// is therefore not compiled into a shipping build at all.
+    #[test]
+    fn production_is_the_only_updater_env_a_shipping_build_has() {
+        let slice = production_slice();
+        let constructors = slice.matches("-> Self").count() + slice.matches("-> UpdaterEnv").count();
+        assert_eq!(
+            constructors, 1,
+            "the production half of updater.rs declares {constructors} functions returning an \
+             `UpdaterEnv`, not 1. `production` is meant to be the only env a shipping build can \
+             build; a second one is a launcher whose signature check is whatever its caller \
+             picked"
+        );
+        // And the one that exists is `production`.
+        assert!(
+            slice.contains("pub fn production() -> Self"),
+            "updater.rs's production slice no longer declares `production() -> Self`"
+        );
+    }
+
+    /// **The module starts a process in exactly one place, and that place is
+    /// [`launch_installer`] -- which is only reachable through the gate.**
+    ///
+    /// This is the backstop for the mutant that satisfies every routing
+    /// assertion above and still launches an unverified file: call the seam
+    /// exactly as expected, and ALSO write a second, ungated
+    /// `Command::new(..).spawn()` somewhere else in the module. The routing
+    /// tests substitute `launch`, so the extra spawn is invisible to them --
+    /// they would record the one expected path and pass while a real build
+    /// started a second process.
+    ///
+    /// Held over the production slice, so a `Command::new` written in `mod
+    /// tests` cannot excuse one written in production code. `apply_update_with`
+    /// and `apply_update` are checked by name for containing neither needle,
+    /// so the ungated spawn cannot be hidden in the funnel itself.
+    #[test]
+    fn the_only_process_start_in_this_module_is_the_launch_seam() {
+        let slice = production_slice();
+
+        assert_eq!(
+            slice.matches("Command::new").count(),
+            1,
+            "updater.rs's production code starts a process in more than one place. The routing \
+             tests substitute the launch seam, so any spawn written outside it is invisible to \
+             them -- and would still run for a real user"
+        );
+        assert_eq!(
+            slice.matches(".spawn()").count(),
+            1,
+            "updater.rs's production code contains more than one `.spawn()`"
+        );
+
+        // The one that exists is inside `launch_installer`.
+        let start = slice
+            .find("fn launch_installer(")
+            .expect("updater.rs no longer declares `launch_installer`");
+        let end = start
+            + slice[start..]
+                .find("\r\n}")
+                .expect("`launch_installer` has no closing brace at column 0");
+        let body = &slice[start..end];
+        assert!(
+            body.contains("Command::new") && body.contains(".spawn()"),
+            "updater.rs's one process start is no longer inside `launch_installer`, so it is no \
+             longer the value the seam substitutes -- the routing tests would observe a launch \
+             that is not the launch"
+        );
+
+        // And neither the gated body nor the public wrapper spawns anything of
+        // its own, above or beside the seam call.
+        for name in ["fn apply_update_with(", "pub fn apply_update("] {
+            let start = slice.find(name).unwrap_or_else(|| panic!("updater.rs no longer declares `{name}`"));
+            let end = start + slice[start..].find("\r\n}").expect("no closing brace at column 0");
+            let body = &slice[start..end];
+            assert!(
+                !body.contains("Command::new") && !body.contains(".spawn()"),
+                "`{name}` starts a process directly rather than through the launch seam, so a \
+                 test that substitutes the seam cannot see it"
+            );
+        }
     }
 }
