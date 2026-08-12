@@ -884,7 +884,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 35] = [
+        const OPENS_NO_WINDOW: [&str; 36] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -892,6 +892,9 @@ mod tests {
             "app_identity",
             "app_match",
             "backend_policy",
+            // A test-only brace matcher over source text. It is
+            // `#[cfg(test)]` at its declaration and draws nothing.
+            "below_cut",
             // Hashes a password and talks to the Have I Been Pwned range
             // API. Pure logic plus one HTTP call; it draws nothing.
             "breach",

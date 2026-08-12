@@ -3606,7 +3606,17 @@ mod tests {
             // itemised because it is a `#[cfg(test)]` module: production code
             // that called into it would not compile in the non-test build at
             // all, which is a stronger guarantee than this list gives.
-            const REACHABLE_TEST_ONLY: &[&str] = &["crate::login_ui::password_lifetime_tests::"];
+            // `send.rs`'s and `vault_export.rs`'s below-the-cut walks call the
+            // ONE brace matcher in this crate, which lives in `below_cut`.
+            // Same argument as the line above and a slightly stronger one:
+            // `below_cut` is `#[cfg(test)]` at its DECLARATION in `lib.rs`,
+            // so production code naming it does not compile in a shipping
+            // build -- there is no `below_cut` for a jobless spawn to hide
+            // in, because in that build the module does not exist.
+            const REACHABLE_TEST_ONLY: &[&str] = &[
+                "crate::login_ui::password_lifetime_tests::",
+                "crate::below_cut::",
+            ];
 
             for path in crate_paths(&code) {
                 {
@@ -5350,7 +5360,18 @@ mod tests {
         let mut modules = 0usize;
         let mut closes = 0usize;
         let mut visited = 0usize;
-        for line in tail.lines() {
+        let region = tail;
+        // Byte offsets are carried alongside each line so a module opener can
+        // be brace-matched and its REAL close pinned; see
+        // [`crate::below_cut::match_brace`] for what that closes.
+        let mut expected_close: Option<usize> = None;
+        let mut at = 0usize;
+        let mut numbered: Vec<(usize, &str)> = Vec::new();
+        for raw in region.split_inclusive('\n') {
+            numbered.push((at, raw.trim_end_matches('\n').trim_end_matches('\r')));
+            at += raw.len();
+        }
+        for &(offset, line) in &numbered {
             visited += 1;
             if depth == 0 {
                 // Between modules NOTHING is allowed but blanks, comments, the
@@ -5393,10 +5414,30 @@ mod tests {
                 gated = false;
                 depth = 1;
                 modules += 1;
+                // Where this module REALLY ends, by brace count. Only that
+                // line may be accepted as its close.
+                let brace = offset
+                    + line
+                        .rfind('{')
+                        .expect("a module opener ends in an opening brace");
+                expected_close = Some(crate::below_cut::match_brace(region, brace));
             } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
                 // Inside a test module every item is indented, so the only
                 // column-0 line is the module's own closing brace.
                 if line == "}" {
+                    if Some(offset) != expected_close {
+                        return Err(format!(
+                            "the column-0 `}}` at byte {offset} below the cut is not the brace \
+                         that closes the module it appears to close ({expected_close:?}). \
+                         The module was closed EARLIER, by an indented brace the line rule \
+                         cannot see, and everything between the two was walked as if it \
+                         were still module contents -- top-level items at file scope, in \
+                         the half of this file no guard reads. Measured surviving the whole \
+                         suite at 2202 passed / 0 failed / 0 warnings and shipping three \
+                         times over in the lib's LLVM IR."
+                        ));
+                    }
+                    expected_close = None;
                     depth = 0;
                     closes += 1;
                     continue;
@@ -5546,10 +5587,16 @@ mod tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 2,
-            "the number of top-level test modules below the cut changed. It is `spawn_probe` \
-             and `tests`. That is fine to change -- but this count is the control that proves \
-             the walk really visited them, so update it deliberately rather than loosening it"
+            modules,
+            crate::below_cut::column_zero_module_openers(tail),
+            "the walk opened a different number of modules below the cut than there are \
+             column-0 module openers down there. DERIVED from the source rather than pinned \
+             to a digit: a bare literal plus a gated second module were two coordinated \
+             edits that between them widened this control without touching a word of its \
+             prose. This is a NON-VACUITY control and nothing more -- it shares the opener \
+             predicate with the walk it controls, so it proves the walk really opened what \
+             is there, not that the predicate is right. What catches a planted item is the \
+             brace-matched close, above."
         );
         assert_eq!(
             closes, modules,
@@ -6366,7 +6413,6 @@ mod tests {
         /// which the previous round proved with a renamed `CreateProcessW` --
         /// which is what the callee list is for.
         unsafe_regions: usize,
-        below_cut_modules: usize,
         below_cut_min_lines: usize,
     }
 
@@ -6491,7 +6537,6 @@ mod tests {
             imports: BW_PATH_IMPORTS,
             local_paths: BW_PATH_LOCAL_PATHS,
             unsafe_regions: 0,
-            below_cut_modules: 1,
             below_cut_min_lines: 300,
         },
         Fence {
@@ -6504,7 +6549,6 @@ mod tests {
             imports: PRODUCTION_IMPORTS,
             local_paths: PRODUCTION_LOCAL_PATHS,
             unsafe_regions: 3,
-            below_cut_modules: 2,
             below_cut_min_lines: 500,
         },
     ];
@@ -6762,10 +6806,16 @@ mod tests {
                  lines"
             );
             assert_eq!(
-                modules, fence.below_cut_modules,
-                "the number of top-level test modules below {file}'s cut changed. That is fine \
-                 to change -- but this count is the control that proves the walk really \
-                 visited them, so update it deliberately rather than loosening it"
+                modules,
+                crate::below_cut::column_zero_module_openers(&lf),
+                "the walk opened a different number of modules below the cut than there are \
+                 column-0 module openers down there. DERIVED from the source rather than pinned \
+                 to a digit: a bare literal plus a gated second module were two coordinated \
+                 edits that between them widened this control without touching a word of its \
+                 prose. This is a NON-VACUITY control and nothing more -- it shares the opener \
+                 predicate with the walk it controls, so it proves the walk really opened what \
+                 is there, not that the predicate is right. What catches a planted item is the \
+                 brace-matched close, above."
             );
             assert_eq!(
                 closes, modules,

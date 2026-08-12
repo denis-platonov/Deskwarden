@@ -1974,10 +1974,18 @@ mod tests {
              inspecting top-level lines part way down"
         );
         assert_eq!(
-            modules, 1,
-            "the number of gated test modules below the cut changed. That is fine -- \
-             but this count is the control that proves the walk really visited them, \
-             so update it deliberately rather than loosening it"
+            modules,
+            crate::below_cut::column_zero_module_openers(
+                &whole[whole.find(CUT_MARKER).expect("the walk just found it")..],
+            ),
+            "the walk opened a different number of modules below the cut than there are \
+             column-0 module openers down there. DERIVED from the source rather than pinned \
+             to a digit: a bare literal plus a gated second module were two coordinated \
+             edits that between them widened this control without touching a word of its \
+             prose. This is a NON-VACUITY control and nothing more -- it shares the opener \
+             predicate with the walk it controls, so it proves the walk really opened what \
+             is there, not that the predicate is right. What catches a planted item is the \
+             brace-matched close, above."
         );
         assert_eq!(
             closes, modules,
@@ -2124,7 +2132,7 @@ mod tests {
     }
 
     /// The byte offset, within `region`, of the `}` that matches the `{`
-    /// at `open`.
+    /// at `open`, by a real brace count over source text.
     ///
     /// # Why a brace count rather than one more line rule
     ///
@@ -2135,128 +2143,13 @@ mod tests {
     /// indentation: top-level items, at file scope, below the cut, in the
     /// half no guard here reads. Appending a column-0 `}` further down
     /// rebalanced `closes` and `depth` as well, so the non-vacuity controls
-    /// could not see it either. That shape was MEASURED surviving the whole
-    /// suite at 2199 / 0 failed / 0 warnings, in this file and in the other
-    /// two that carry this walk.
+    /// could not see it either.
     ///
-    /// Only a real brace count can say where a module ACTUALLY ends, so the
-    /// walk computes that when it opens one and refuses to accept any other
-    /// line as its close. Comments and literals are skipped, because the
-    /// region below the cut is test code full of braces inside format
-    /// strings and prose. A shape this scanner cannot read makes the
-    /// caller's assertion FAIL rather than pass blindly.
-    fn below_cut_match_brace(region: &str, open: usize) -> usize {
-        let b = region.as_bytes();
-        assert_eq!(
-            b[open], b'{',
-            "the caller pointed the brace matcher at something other than a brace"
-        );
-        let mut i = open;
-        let mut depth = 0i32;
-        while i < b.len() {
-            match b[i] {
-                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                    i += 2;
-                    let mut nest = 1usize;
-                    while i < b.len() && nest > 0 {
-                        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-                            nest += 1;
-                            i += 2;
-                        } else if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
-                            nest -= 1;
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-                b'r' | b'b' => {
-                    // A raw string -- `r".."`, `r#".."#`, `br#".."#` -- but only
-                    // when the letter STARTS a token, so `for` and `breach` are
-                    // not read as string openers.
-                    let starts =
-                        i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-                    let mut j = i;
-                    if b[j] == b'b' {
-                        j += 1;
-                    }
-                    if starts && j < b.len() && b[j] == b'r' {
-                        j += 1;
-                        let from = j;
-                        while j < b.len() && b[j] == b'#' {
-                            j += 1;
-                        }
-                        let hashes = j - from;
-                        if j < b.len() && b[j] == b'"' {
-                            i = below_cut_end_of_raw(b, j + 1, hashes);
-                            continue;
-                        }
-                    }
-                    i += 1;
-                }
-                b'"' => {
-                    i += 1;
-                    while i < b.len() && b[i] != b'"' {
-                        i += if b[i] == b'\\' { 2 } else { 1 };
-                    }
-                    i += 1;
-                }
-                b'\'' => {
-                    // `'x'` and `'\\x'` are char literals; anything else with a
-                    // leading tick is a lifetime and carries no braces.
-                    if i + 2 < b.len() && b[i + 1] == b'\\' {
-                        let mut j = i + 2;
-                        while j < b.len() && b[j] != b'\'' {
-                            j += 1;
-                        }
-                        i = j + 1;
-                    } else if i + 2 < b.len() && b[i + 2] == b'\'' {
-                        i += 3;
-                    } else {
-                        i += 1;
-                    }
-                }
-                b'{' => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return i;
-                    }
-                    i += 1;
-                }
-                _ => i += 1,
-            }
-        }
-        panic!("the block opened at byte {open} below the cut is never closed");
-    }
-
-    /// The byte offset just past the terminator of a raw string whose body
-    /// starts at `from` and which was opened with `hashes` hash marks.
-    fn below_cut_end_of_raw(b: &[u8], from: usize, hashes: usize) -> usize {
-        let mut i = from;
-        while i < b.len() {
-            if b[i] == b'"' {
-                let mut k = 0usize;
-                while k < hashes && i + 1 + k < b.len() && b[i + 1 + k] == b'#' {
-                    k += 1;
-                }
-                if k == hashes {
-                    return i + 1 + hashes;
-                }
-            }
-            i += 1;
-        }
-        panic!("unterminated raw string below the cut");
-    }
-
+    /// **The matcher itself lives in [`crate::below_cut`] and NOT here.**
+    /// It was copy-pasted into three files and had to reach six; all three
+    /// copies carried an identical off-by-one on `'\''` that let a payload
+    /// open a phantom string, swallow a module's closing brace, and survive
+    /// the whole suite while shipping. One implementation, six callers.
     /// The two-state walk from the cut to EOF over whatever text it is handed.
     /// Returns `(visited, modules, closes, depth)` so the caller can control
     /// it for non-vacuity.
@@ -2275,7 +2168,7 @@ mod tests {
         let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
         // Byte offsets are carried alongside each line so a module opener can
         // be brace-matched and its REAL close pinned; see
-        // [`below_cut_match_brace`] for what that closes.
+        // [`crate::below_cut::match_brace`] for what that closes.
         let region = &source[cut..];
         let mut expected_close: Option<usize> = None;
         let mut at = 0usize;
@@ -2321,7 +2214,7 @@ mod tests {
                     + line
                         .rfind('{')
                         .expect("a module opener ends in an opening brace");
-                expected_close = Some(below_cut_match_brace(region, brace));
+                expected_close = Some(crate::below_cut::match_brace(region, brace));
             } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
                 // Inside a test module every item is indented, so the only
                 // column-0 line is the module's own closing brace.

@@ -15,6 +15,10 @@ pub mod app_identity;
 pub mod app_match;
 pub mod app_window;
 pub mod backend_policy;
+/// The one brace matcher every below-the-cut source walk uses.
+/// Test-only at the declaration, so nothing in it can ship.
+#[cfg(test)]
+pub mod below_cut;
 pub mod breach;
 pub mod bw_path;
 pub mod bw_serve;
