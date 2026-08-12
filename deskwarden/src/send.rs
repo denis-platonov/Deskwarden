@@ -850,7 +850,15 @@ pub fn create_send<R: SendRunner>(
     parse_created_send(&raw.stdout)
 }
 
-pub fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendError> {
+/// **`pub(crate)`, not `pub`.** The commit that sealed this module described
+/// it as sealed while this entry point was still `pub`, held only by the
+/// call-site map's empty-control row -- a text rule, not a wall. It cannot go
+/// narrower than the crate: `vault_window::send_ui`'s tests drive it against
+/// substituted runners, and that is a different module. What `pub(crate)`
+/// does buy is that no consumer of the library can reach a sixty-second
+/// blocking `bw send list` at all, and that any in-crate reach for it is a
+/// call the crate-wide site map already pins to the empty list.
+pub(crate) fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendError> {
     let raw = runner.run(&list_invocation(runner.session()))?;
     if raw.exit_code != Some(0) {
         return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
@@ -1056,6 +1064,16 @@ impl<'a> CliSendRunner<'a> {
     /// what the Sends screen used to show. `create` never had this problem
     /// because its invocation is built from a plan the caller already holds a
     /// session for.
+    ///
+    /// **The `..Self::new(job, data_dir)` below is shaped by a count, and
+    /// that is worth saying out loud.** It was written that way so the pinned
+    /// `CliSendRunner::new` count could stay at zero while the field list
+    /// stayed in one place -- the count shaping the code rather than the code
+    /// shaping the count. It is left as it is because the struct-update form
+    /// is also the form that cannot drift from `new`'s field initialisation,
+    /// which is the property `the_list_runner_carries_the_job_it_was_given`
+    /// reads; but the count is no longer the reason, and if the two ever
+    /// disagree the fields win.
     fn with_session(
         job: Option<&'a crate::job_object::KillOnCloseJob>,
         data_dir: Option<&'a Path>,
@@ -1234,31 +1252,64 @@ impl SendRunner for CliSendRunner<'_> {
 ///
 /// Privacy pins the route. `pub(in ..)` was not available: it accepts only
 /// ANCESTOR modules, and `crate::vault_window::send_fetch_thread` is not an
-/// ancestor of `crate::send`, so `pub(in crate::vault_window::send_fetch_thread)`
-/// is E0742 here exactly as `pub(in crate::bw_serve)` was E0433 in an earlier
-/// round. What IS available is plain module privacy: with no `pub` at all,
+/// ancestor of `crate::send`. The conclusion stands -- no form of it
+/// compiles -- but the error codes were written down swapped. Measured on
+/// this tree: `pub(in crate::vault_window::send_fetch_thread)` is **E0433**
+/// and so is `pub(in crate::vault_window)`, because neither path resolves
+/// from here at all; `pub(in crate::bw_serve)` is **E0742**, the module
+/// resolving but not being an ancestor. What IS available is plain module
+/// privacy: with no `pub` at all,
 /// the type is visible in `crate::send` and its descendants -- which is
 /// this module's own tests, and nothing else in the crate. Every spelling
 /// `vault_window` could reach for -- `crate::send::CliSendRunner`, a `use`,
 /// a `type` alias, a re-export, `Self` inside an `impl` written over there
 /// -- is now **E0603**, at compile time, before any test runs.
 ///
+/// **The wall is a module boundary, and a module is not a file.** That
+/// distinction cost a round. `crate::send`'s privacy extends to every
+/// DESCENDANT of this module, and a descendant lives in a different file --
+/// so `src/send/inner.rs`, added with one line of `pub mod inner;` here, sees
+/// `CliSendRunner`, its private fields and the private `list_invocation`
+/// alike, and every per-file count in the guard module keyed on the literal
+/// path `"send.rs"` read none of it. A struct literal there, driven through
+/// `SendRunner::run` and `list_invocation`, survived twice at 2112 lib / 217
+/// bin / 0 failed / 0 warnings. The residual disclosed below used to say "one
+/// spelling away"; it was one FILE away, and adding that file needed no
+/// counted spelling at all. The counts now run over the transitive `mod`
+/// closure of this module -- see `send_ui::source_pins::send_module_files`,
+/// which is fail-by-default: an unresolvable child or a `#[path = ..]`
+/// attribute is a panic, not a skip.
+///
 /// **What this does not close, said plainly.** The mutant above was written
 /// INSIDE this file, where `CliSendRunner` is still nameable. A new
 /// `pub fn` added here could still build one and the frame could still call
-/// it. What refuses that today is a TEXT RULE and not a wall:
+/// it. Two things refuse that, and neither is sufficient alone. The first is
+/// an EQUALITY --
+/// `vault_window::send_ui::source_pins::the_public_surface_of_the_send_module_is_exactly_these_items`
+/// pins every `pub` declaration in this module and its descendants, at any
+/// nesting depth, so a new door fails whether it is a `pub mod`, a `pub fn`,
+/// a `pub use`, or a method bolted onto an already-`pub` type. The second is
+/// still a TEXT RULE and not a wall:
 /// `vault_window::send_ui::source_pins::every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`
-/// counts, over this file's production half alone, how often `CliSendRunner`,
-/// `CliSendRunner::with_session`, `CliSendRunner::new`, `list_sends` and
-/// `cli_send_list` are spelled, against the number the DEFINITIONS account
-/// for. Four mutants of that shape were measured against it and all four die:
-/// a helper using `CliSendRunner::new`, one building the runner by struct
-/// literal (naming neither constructor), a defaulted trait method, and one
-/// spelling only `cli_send_list`. It is still a count, so it is still one
-/// spelling away from a survivor; the shape that would end the argument is an
-/// EQUALITY over this module's whole public surface, the way
-/// `mod send_fetch_thread`'s export list is an equality. That is designed and
-/// not written.
+/// counts, over the whole module's production -- this file AND every
+/// descendant -- how often `CliSendRunner`, `CliSendRunner::with_session`,
+/// `CliSendRunner::new`, `list_sends`, `list_invocation` and `cli_send_list`
+/// are spelled, against the number the DEFINITIONS account for. `list_sends`
+/// and `list_invocation` are the two routes into a real child that name no
+/// constructor, and `list_invocation` was added because the surviving mutant
+/// used exactly it.
+///
+/// **The gap these two leave, and what covers it.** The equality pins
+/// DECLARATIONS and the counts pin SPELLINGS, so neither sees a blocking
+/// child written in the BODY of an item that is already on the pinned
+/// surface, started through the standard library directly rather than by
+/// naming anything this module owns. Measured on this commit, that shape
+/// written inside `expiry_wording` -- a function already on the list and
+/// already called from the frame -- adds no `pub` line and spells none of the
+/// six needles, and it dies anyway: `bw_path`'s and `job_object`'s crate-wide
+/// spawn guards read every file under `src`, this one included, and both fire.
+/// The three guards are load-bearing together and no one of them is
+/// sufficient.
 ///
 /// The session, the job and the profile directory are all parameters for the
 /// same reason they were parameters of the constructor: this function reads
@@ -2061,6 +2112,21 @@ mod runner_tests {
         // `!contains` pin pass while asserting nothing whatsoever.
         let code = code_under_test();
         assert!(code.contains("struct CliSendRunner<'a> {"));
+        // **The pin is on the ABSENCE of `pub`, and a substring cannot say
+        // that.** This line used to read `pub struct CliSendRunner<'a> {`,
+        // and when the type was narrowed to module privacy it was weakened
+        // to the line above -- which is a SUBSTRING of the old one, so
+        // re-adding `pub` satisfies it exactly as well. The E0603 controls in
+        // `vault_window::send_ui::source_pins` would still catch the widening,
+        // so this was defence-in-depth lost rather than an open hole; the
+        // negative is what the positive above was standing in for.
+        assert!(
+            !code.contains("pub struct CliSendRunner"),
+            "`CliSendRunner` is `pub` again. Module privacy is the wall that makes every \
+             spelling of it outside `crate::send` an E0603 -- a `use`, a `type` alias, a \
+             re-export, a `Self` in an `impl` written elsewhere -- and widening it puts the \
+             sixty-second blocking runner back within reach of the eframe frame closure"
+        );
         assert!(!code.contains("no such line appears anywhere in this module"));
         // And the split really did drop the tests: this function's own name
         // is below the cut.
@@ -2309,7 +2375,14 @@ mod runner_tests {
         //    move UP -- into a doc comment or a string that happened to spell
         //    a gate followed by a module opener -- this anchor would fall
         //    below it and every pin downstream would be reading nothing.
-        const LAST_PRODUCTION_ITEM: &str = concat!("None => Err(SendError::", "TimedOut),");
+        // Repointed to the body of `cli_send_list`, which really is the last
+        // production item in the file. The previous anchor sat above that
+        // function's doc comment, so the 4000-byte allowance below was being
+        // spent on prose rather than on code -- and prose is exactly what the
+        // allowance is not meant to measure. Written with `concat!` so the
+        // anchor's own source line is not a second occurrence of it.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("list_sen", "ds(&CliSendRunner::with_session(job, data_dir, session))");
         assert_eq!(
             lf.matches(LAST_PRODUCTION_ITEM).count(),
             1,

@@ -2862,6 +2862,205 @@ mod source_pins {
         rest[..end].to_string()
     }
 
+    /// Every `mod NAME;` item written in `region` -- the declarations that
+    /// name a SECOND FILE -- in source order, deduplicated.
+    ///
+    /// `mod x { .. }` is deliberately skipped: an inline module's body is in
+    /// this very text, so every count taken over `region` already reads it.
+    /// `mod y;` written *inside* an inline `mod x { .. }` is NOT harmless and
+    /// is NOT resolved here -- it is reported like any other child, and
+    /// [`send_module_files`] resolves children against the FILE, so the
+    /// lookup for `send/y.rs` fails loudly rather than guessing. That panic
+    /// is the guard; this function does nothing for it.
+    ///
+    /// The shape is lifted from `job_object.rs`'s `production_mod_children`,
+    /// which is the crate's existing, transitive, fail-by-default module
+    /// discovery. The one difference is that it reads a *glued* `code_only`
+    /// view while this reads [`production_region`], which keeps whitespace --
+    /// so `mod` must be followed by a space here rather than by the name.
+    fn mod_children(region: &str) -> Vec<String> {
+        let b = region.as_bytes();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out: Vec<String> = Vec::new();
+        let mut from = 0usize;
+        while let Some(at) = region[from..].find("mod") {
+            let start = from + at;
+            from = start + 3;
+            // `mod` must be a token: not the tail of `submod`, not the head
+            // of `module_of`. Being generous in either direction costs a
+            // false POSITIVE -- a name that resolves to no file, which fails
+            // loudly -- never a miss.
+            if (start > 0 && is_ident(b[start - 1])) || b.get(from).is_some_and(|c| is_ident(*c)) {
+                continue;
+            }
+            let mut i = from;
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+            let name_start = i;
+            while b.get(i).is_some_and(|c| is_ident(*c)) {
+                i += 1;
+            }
+            if i == name_start {
+                continue;
+            }
+            let name = region[name_start..i].to_string();
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+            if b.get(i) != Some(&b';') {
+                continue;
+            }
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            from = i;
+        }
+        out
+    }
+
+    /// **Every file whose module path is under `crate::send`**, the root
+    /// first, discovered by walking `mod` items transitively rather than from
+    /// a list a new file would not be on.
+    ///
+    /// **Why this exists.** `crate::send`'s privacy -- the E0603 wall that
+    /// `ec71706` put around `CliSendRunner` -- extends to all of that
+    /// module's DESCENDANTS, and a descendant lives in a DIFFERENT FILE.
+    /// Every per-file count in this module keyed on the literal path string
+    /// `"send.rs"`, so the descendant was read by none of them. Measured on
+    /// `89d5e8e`, a NEW FILE `src/send/inner.rs`:
+    ///
+    /// ```ignore
+    /// use super::{SendError, SendRunner, SendSummary};
+    /// pub fn warm(session: &str) -> Result<Vec<SendSummary>, SendError> {
+    ///     let runner = super::CliSendRunner {   // struct literal -- private
+    ///         job: None,                        // fields are visible in a
+    ///         data_dir: None,                   // descendant module
+    ///         session: Some(zeroize::Zeroizing::new(session.to_string())),
+    ///     };
+    ///     let raw = runner.run(&super::list_invocation(Some(session)))?;
+    ///     let _ = raw;
+    ///     Ok(Vec::new())
+    /// }
+    /// ```
+    ///
+    /// plus `pub mod inner;` in `send.rs` and
+    /// `let _ = crate::send::inner::warm(&session_token);` in the frame
+    /// closure, SURVIVED TWICE at 2112 lib / 217 bin / 0 failed / 0 warnings,
+    /// byte-identical both runs: an unbounded per-frame, up-to-sixty-second
+    /// blocking `bw send list` on the eframe thread. Every guard missed it
+    /// for a different reason. The per-file counts read `send.rs`, which
+    /// gained one line, `pub mod inner;`, spelling no needle. The crate-wide
+    /// call-site map counts `list_sends(`, `cli_send_list(` and the two
+    /// constructors -- a STRUCT LITERAL spells none of them, and
+    /// `runner.run(&list_invocation(..))` bypasses `list_sends` entirely,
+    /// which is the very bypass the author had documented for the
+    /// in-`send.rs` case, transplanted one file over. And type privacy does
+    /// nothing at all: a descendant sees the type, its private fields and the
+    /// private `list_invocation` alike.
+    ///
+    /// The residual the previous round disclosed was understated. It was
+    /// framed as "one spelling away"; it was one FILE away, and adding that
+    /// file needed no counted spelling.
+    ///
+    /// So the counts below are taken over this set, not over one path.
+    fn send_module_files(files: &[(String, String)]) -> Vec<String> {
+        let has = |p: &str| files.iter().any(|(f, _)| f == p);
+        let root = if has("send.rs") { "send.rs" } else { "send/mod.rs" };
+        assert!(
+            has(root),
+            "control: the crate walk found neither `send.rs` nor `send/mod.rs`, so the module \
+             whose descendants every count below reads does not exist under either name this \
+             walk can follow. Resolve that rather than letting the closure fence nothing"
+        );
+        let mut out = vec![root.to_string()];
+        let mut at = 0usize;
+        while at < out.len() {
+            let file = out[at].clone();
+            at += 1;
+            let text = files
+                .iter()
+                .find(|(p, _)| *p == file)
+                .map(|(_, t)| t.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the `crate::send` closure wants to read `src/{file}`, which the crate \
+                         walk did not find. Do not let the closure quietly stop here"
+                    )
+                });
+            let region = production_region(text);
+            // A `#[path = ".."]` attribute re-points a `mod` item at an
+            // arbitrary file -- possibly outside `src/` -- so both candidates
+            // below would be wrong while the real descendant, where
+            // `CliSendRunner`'s private fields and `list_invocation` are
+            // still in scope, sat outside every count. There is no such
+            // attribute in this module and no reason for one, so it is
+            // refused outright rather than followed. (Refused the same way,
+            // and for the same reason, as in `job_object.rs`'s closure.)
+            let glued: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+            for spelling in [concat!("#[pa", "th="), concat!(",pa", "th="), concat!("(pa", "th=")] {
+                assert!(
+                    !glued.contains(spelling),
+                    "production `src/{file}` carries a `path = ..` attribute ({spelling:?}). \
+                     That re-points a `mod` item at a file this closure would not look at, \
+                     which puts a descendant of `crate::send` -- where the private runner, its \
+                     private fields and the private `list_invocation` are all in scope -- \
+                     outside every count in this module. Put the child where its `mod` name \
+                     says it goes"
+                );
+            }
+            for child in mod_children(&region) {
+                let dir = file.trim_end_matches(".rs").trim_end_matches("/mod");
+                let flat = format!("{dir}/{child}.rs");
+                let nested = format!("{dir}/{child}/mod.rs");
+                // BOTH existing is refused rather than resolved: rustc itself
+                // errors (E0761), so the two would disagree about which file
+                // is even compiled and this closure would read one while the
+                // other sat unread.
+                let present: Vec<String> =
+                    [flat, nested].into_iter().filter(|c| has(c)).collect();
+                assert!(
+                    present.len() < 2,
+                    "production `src/{file}` declares `mod {child};` and BOTH {present:?} \
+                     exist. rustc refuses that outright (E0761), so this tree does not build \
+                     -- and if it somehow did, this closure would read one file and leave the \
+                     other entirely uncounted. Delete whichever one is not the module"
+                );
+                let found = present.into_iter().next().unwrap_or_else(|| {
+                    panic!(
+                        "production `src/{file}` declares `mod {child};` but neither \
+                         `src/{dir}/{child}.rs` nor `src/{dir}/{child}/mod.rs` exists, so this \
+                         closure cannot count the file it pulls in. If the `mod` item sits \
+                         inside an INLINE `mod` in this file, the real file is a directory \
+                         deeper than either name above: this scan finds `mod` items wherever \
+                         they are written but resolves them against the FILE, so it stops here \
+                         rather than guessing, and the fix is to stop nesting it"
+                    )
+                });
+                if !out.contains(&found) {
+                    out.push(found);
+                }
+            }
+        }
+        out
+    }
+
+    /// The production halves of [`send_module_files`], joined -- the text
+    /// every "`send.rs` spells this needle exactly N times" count reads.
+    fn send_module_production(files: &[(String, String)]) -> String {
+        send_module_files(files)
+            .iter()
+            .map(|file| {
+                files
+                    .iter()
+                    .find(|(p, _)| p == file)
+                    .map(|(_, text)| production_region(text))
+                    .unwrap_or_else(|| panic!("`src/{file}` is in the closure but not the walk"))
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
     /// The body of `mod send_fetch_thread`, from its opener to the first `}`
     /// at column zero.
     ///
@@ -3236,7 +3435,20 @@ mod source_pins {
         // the file that wrote it. The one way a rename crosses a file is a
         // re-export, so no file but `send.rs` may re-export either name.
         for (path, text) in files.iter().filter(|(path, _)| path != "send.rs") {
-            for item in [concat!("list_", "sends"), concat!("CliSendRunner", "")] {
+            // **`cli_send_list` is on this list.** It was not: when the
+            // pinned primary needle moved to `cli_send_list` the call-site
+            // rows moved with it and this loop did not, so the ONE name that
+            // carries a real `bw` child out of `crate::send` was the one name
+            // a `pub use` could rename past `local_names_of`. Not exploitable
+            // on its own -- the crate-wide mention equality above counts the
+            // token wherever it is written, `pub use` included -- but it is
+            // the same drift that produced this round's finding, so the list
+            // is kept in step with the rows above.
+            for item in [
+                concat!("cli_send_", "list"),
+                concat!("list_", "sends"),
+                concat!("CliSendRunner", ""),
+            ] {
                 for use_item in use_items(&production_region(text)) {
                     assert!(
                         !(use_item.starts_with("pub use") && use_item.contains(item)),
@@ -3870,13 +4082,21 @@ mod source_pins {
             .map(|(_, text)| production_region(text))
             .collect::<Vec<_>>()
             .join("\r\n");
-        let send_rs = sanitized(
-            &files
-                .iter()
-                .find(|(p, _)| p == "send.rs")
-                .map(|(_, text)| production_region(text))
-                .expect("asserted just above"),
+        // **`send.rs` AND EVERY DESCENDANT OF `crate::send`.** The counts
+        // below used to read the single path `"send.rs"`, and privacy does
+        // not stop at a file: a descendant module lives in another file and
+        // sees the private type, its private fields and the private
+        // `list_invocation` alike. See [`send_module_files`] for the measured
+        // survivor -- a new `src/send/inner.rs` building the runner by struct
+        // literal -- and for why the discovery is a transitive, fail-by-
+        // default closure rather than a second path string.
+        let send_module = send_module_files(&files);
+        assert!(
+            send_module.contains(&"send.rs".to_string()),
+            "control: the `crate::send` closure is {send_module:?}, which does not contain \
+             `send.rs`, so the definition counts pinned below are pinned on nothing"
         );
+        let send_rs = sanitized(&send_module_production(&files));
         let block = sanitized(&sealed_module());
 
         // Control: the slice is a slice, not the whole file. Without this the
@@ -3950,15 +4170,25 @@ mod source_pins {
             (concat!("CliSendRunner", "::with_session"), 1, false),
             (concat!("CliSendRunner", ""), 4, false),
             (concat!("CliSendRunner", "::new"), 0, false),
+            // **The bypass, counted.** `runner.run(&list_invocation(..))` is
+            // a complete blocking `bw send list` that spells neither
+            // `list_sends` nor `cli_send_list`; the author documented it for
+            // the in-`send.rs` case and the measured `send/inner.rs` survivor
+            // used exactly it, one file over. `list_invocation` is private to
+            // `crate::send`, so this row and the closure above are together
+            // the whole of what refuses a second use of it.
+            (concat!("list_", "invocation"), 2, false),
         ] {
             assert_eq!(
                 send_rs.matches(needle).count(),
                 defined_in_send_rs,
-                "`send.rs`'s production spells {needle:?} {} times, not the \
+                "the `crate::send` module ({send_module:?}) spells {needle:?} {} times, not the \
                  {defined_in_send_rs} its DEFINITIONS account for. The extra mention is a \
-                 blocking `bw send list` written in the one file this seal used to \
-                 subtract -- and a `pub fn` there is callable from the frame closure by a \
-                 line that spells none of these needles at all",
+                 blocking `bw send list` written inside the privacy boundary -- in `send.rs` \
+                 itself or in a DESCENDANT file, where the private runner, its private fields \
+                 and the private `list_invocation` are all still in scope -- and a `pub fn` \
+                 there is callable from the frame closure by a line that spells none of these \
+                 needles at all",
                 send_rs.matches(needle).count()
             );
             if !is_seal_needle {
@@ -4087,6 +4317,152 @@ mod source_pins {
             );
         }
     }
+
+    /// **`crate::send`'s public surface is exactly these items -- an
+    /// equality, over the whole module including its descendants.**
+    ///
+    /// This is the shape the previous round designed and did not write. Its
+    /// doc comment said so in as many words: the counts above are counts, so
+    /// they are "one spelling away from a survivor", and "the shape that
+    /// would end the argument is an EQUALITY over this module's whole public
+    /// surface, the way `mod send_fetch_thread`'s export list is an
+    /// equality." Then a survivor arrived that was not one spelling away but
+    /// one FILE away -- see [`send_module_files`] -- and adding that file
+    /// needed no counted spelling at all.
+    ///
+    /// The counts above now read the whole closure, which kills that mutant
+    /// on `CliSendRunner` and on `list_invocation`. This test is the half
+    /// that does not depend on guessing which token the next one will spell.
+    /// **Every `pub` in `crate::send` is listed here**, at any nesting depth
+    /// -- module items, struct fields, inherent methods, trait methods -- so
+    /// that a new door out of the module fails whether it is written at
+    /// column zero of `send.rs`, inside an `impl` on an already-`pub` type,
+    /// or in a brand-new descendant file. `pub mod inner;` is a new entry.
+    /// So is `pub fn warm`, wherever it is put. So is a `pub use`.
+    ///
+    /// The list is deliberately literal rather than summarised: what makes it
+    /// a wall instead of a count is that ADDING anything fails, and a
+    /// summary is a thing an addition can be made to fit.
+    ///
+    /// **What still gets past it, said plainly.** A door does not have to be
+    /// `pub`. `list_sends` is `pub(crate)`, `real_send_list` is
+    /// `pub(super)`, and a `pub(crate) fn` written in `send.rs` carries the
+    /// blocking fetch to every file in the crate while spelling no `pub `
+    /// this scan collects. That is not an open hole today, because such a
+    /// function cannot reach a `bw` child without spelling one of the needles
+    /// counted above -- `CliSendRunner`, `list_invocation` or `list_sends`
+    /// -- inside the closure, where all three are pinned to their definition
+    /// counts. The two halves are load-bearing together and neither is
+    /// sufficient alone.
+    #[test]
+    fn the_public_surface_of_the_send_module_is_exactly_these_items() {
+        let files = crate_sources();
+        let send_module = send_module_files(&files);
+        assert!(
+            send_module.contains(&"send.rs".to_string()),
+            "control: the `crate::send` closure is {send_module:?}, which does not contain \
+             `send.rs`"
+        );
+
+        // Every line of the module's production whose first token is `pub`,
+        // squashed so this pins the code and not the formatter. The region is
+        // `production_region`, so a `pub fn` written in a doc comment is
+        // blanked and is not a door -- and a `#[cfg(test)]` item is not one
+        // either.
+        let mut surface: Vec<String> = Vec::new();
+        for file in &send_module {
+            let text = files
+                .iter()
+                .find(|(p, _)| p == file)
+                .map(|(_, t)| production_region(t))
+                .unwrap_or_else(|| panic!("`src/{file}` is in the closure but not the walk"));
+            for line in text.lines() {
+                let line = line.trim();
+                if line == "pub" || line.starts_with("pub ") || line.starts_with("pub(") {
+                    surface.push(format!("{file}: {}", squashed(line)));
+                }
+            }
+        }
+
+        // Control: the scan really found the module's declarations. Without
+        // it an empty `surface` would match an empty expectation and this
+        // test would pass over a module that had been deleted.
+        assert!(
+            surface.len() > 30,
+            "control: the `pub` scan over {send_module:?} found only {} items, which is not \
+             this module -- the region cut or the line test is wrong, and an equality against \
+             nothing is not an equality",
+            surface.len()
+        );
+
+        let expected: Vec<String> = SEND_PUBLIC_SURFACE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            surface, expected,
+            "`crate::send`'s public surface is not the pinned one. An ADDITION here is a new \
+             door out of the module the frame closure can call -- `pub mod inner;`, a \
+             `pub fn warm`, a `pub use`, a `pub fn` bolted onto an already-`pub` type's \
+             `impl`, in `send.rs` or in any descendant file -- and behind that door sit the \
+             private runner, its private fields and the private `list_invocation`, which \
+             together are an up-to-sixty-second blocking `bw send list` on the eframe thread. \
+             A DELETION here is a route the counts elsewhere in this module are still pinned \
+             to. Either way this list is the deliberate decision, so change it deliberately"
+        );
+    }
+
+    /// Every `pub` declaration in `crate::send`'s production, file by file,
+    /// in source order. See
+    /// [`the_public_surface_of_the_send_module_is_exactly_these_items`].
+    const SEND_PUBLIC_SURFACE: &[&str] = &[
+        "send.rs: pub const DELETE_IN_DAYS_CHOICES: [u8; 3] = [1, 7, 30];",
+        "send.rs: pub const DEFAULT_DELETE_IN_DAYS: u8 = 7;",
+        "send.rs: pub struct SendPlan {",
+        "send.rs: pub name: String,",
+        "send.rs: pub text: Zeroizing<String>,",
+        "send.rs: pub hidden: bool,",
+        "send.rs: pub delete_in_days: u8,",
+        "send.rs: pub password: Option<Zeroizing<String>>,",
+        "send.rs: pub max_access_count: Option<u32>,",
+        "send.rs: pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {",
+        "send.rs: pub trait SendClock {",
+        "send.rs: pub struct FixedClock(pub i64);",
+        "send.rs: pub struct SystemClock;",
+        "send.rs: pub fn expiry_wording(days: u8, now: &dyn SendClock) -> String {",
+        "send.rs: pub struct SendInvocation {",
+        "send.rs: pub fn args(&self) -> &[String] {",
+        "send.rs: pub fn stdin_json_b64(&self) -> &str {",
+        "send.rs: pub fn session_token(&self) -> Option<&str> {",
+        "send.rs: pub fn plan_to_invocation(",
+        "send.rs: pub struct CreatedSend {",
+        "send.rs: pub id: String,",
+        "send.rs: pub name: String,",
+        "send.rs: pub access_url: String,",
+        "send.rs: pub deletion_date: String,",
+        "send.rs: pub struct SendSummary {",
+        "send.rs: pub id: String,",
+        "send.rs: pub name: String,",
+        "send.rs: pub access_url: String,",
+        "send.rs: pub deletion_date: String,",
+        "send.rs: pub is_file: bool,",
+        "send.rs: pub struct RawOutput {",
+        "send.rs: pub exit_code: Option<i32>,",
+        "send.rs: pub stdout: String,",
+        "send.rs: pub stderr: String,",
+        "send.rs: pub enum SendError {",
+        "send.rs: pub fn user_message(&self) -> &str {",
+        "send.rs: pub fn is_ambiguous(&self) -> bool {",
+        "send.rs: pub fn classify_failure(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SendError {",
+        "send.rs: pub fn parse_created_send(stdout: &str) -> Result<CreatedSend, SendError> {",
+        "send.rs: pub fn parse_send_list(stdout: &str) -> Result<Vec<SendSummary>, SendError> {",
+        "send.rs: pub trait SendRunner {",
+        "send.rs: pub fn create_send<R: SendRunner>(",
+        "send.rs: pub(crate) fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendError> {",
+        "send.rs: pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError> {",
+        "send.rs: pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);",
+        "send.rs: pub enum WaitDecision {",
+        "send.rs: pub fn wait_decision(exited: bool, elapsed: Duration, cap: Duration) -> WaitDecision {",
+        "send.rs: pub fn raw_output_from(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> RawOutput {",
+        "send.rs: pub fn cli_send_list(",
+    ];
 
     /// **Nothing waits on the Sends channel from the frame's own thread.**
     ///
