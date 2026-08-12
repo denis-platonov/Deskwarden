@@ -6102,21 +6102,35 @@ pub(crate) mod password_lifetime_tests {
     ///
     /// What that leaves is the one true positive-by-construction: a
     /// compiled artifact of this crate **necessarily** carries the assembled
-    /// probe, because that is what compiling a `concat!` produces. On the
-    /// git path it never arises -- `.gitignore` names both directories, so
-    /// they are neither tracked nor listed by `--others`. The fallback
-    /// cannot read `.gitignore`, so it names the same two paths, and thereby
-    /// AGREES with the authoritative path rather than diverging from it.
+    /// probe, because that is what compiling a `concat!` produces.
     ///
-    /// Stated plainly, because it is a weakness: this is a directory-level
-    /// exclusion in the fallback, and moving a source file into
+    /// **This predicate is applied by BOTH paths, and that is the fix this
+    /// round exists for.** The previous round applied it in the fallback
+    /// walk alone and justified the asymmetry by reasoning that
+    /// "`.gitignore` names both directories, so git never offers one here in
+    /// the first place". That is false. `.gitignore` governs `--others`; it
+    /// does not govern `git ls-files`. A force-added file under `target/` is
+    /// tracked, and the git path listed it. Measured on a `git archive`
+    /// export carrying a force-added `deskwarden/target/notes.rs`: the git
+    /// path FAILED naming the file (96 listed, 96 scanned, one hit) and the
+    /// fallback PASSED (95 listed, 95 scanned, no hit) -- opposite verdicts
+    /// on the same bytes, with the silent verdict belonging to the
+    /// configuration that ships, since `git archive` puts tracked files into
+    /// the tarball and a tarball has no `.git`. [`tracked_files`] now
+    /// applies these same two literal paths, and both configurations list 95
+    /// and scan 95 on that export.
+    ///
+    /// Stated plainly, because it is a weakness -- and it is now a symmetric
+    /// one rather than a divergence: this is a directory-level
+    /// exclusion in both paths, and moving a source file into
     /// `deskwarden/target/` hides it there. It is not a marker and cannot be
-    /// asserted by adding a file -- the previous round's `CACHEDIR.TAG` and
+    /// asserted by adding a file, and it hides the file on the git path too
+    /// so the two configurations do not disagree about it -- the previous
+    /// round's `CACHEDIR.TAG` and
     /// `.git` opt-outs both worked by writing one empty file into a
     /// directory of someone else's choosing, and neither works here. It is
     /// also not a widening of the old skip list: `.git/` and `.superpowers/`
-    /// are not on it. And the same move hides the file on the git path too,
-    /// so the two configurations do not disagree about it.
+    /// are not on it.
     ///
     /// The cost of NOT having it, measured: the forced fallback listed
     /// 29,865 files and read 6,178 of them, all of `deskwarden/target/`,
@@ -6163,8 +6177,18 @@ pub(crate) mod password_lifetime_tests {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // Our OWN `.git`, whichever shape it has. This test used to be
+            // inside the `is_dir` arm, so in a LINKED WORKTREE -- where
+            // `root/.git` is a FILE holding a `gitdir:` line -- it did not
+            // fire and the file was pushed into `out` and scanned. Harmless
+            // in content, but the skip did not do what its comment said in
+            // that layout, and the layout is one two live checkouts of this
+            // repository are in.
+            if path == root.join(".git") {
+                continue;
+            }
             if path.is_dir() {
-                if path == root.join(".git") || build_output_dir(root, &path) {
+                if build_output_dir(root, &path) {
                     continue;
                 }
                 if nested_repository_shape(&path) {
@@ -6274,9 +6298,63 @@ pub(crate) mod password_lifetime_tests {
             // nested bare repository, so it gets the same repository-shape
             // test the fallback walk uses -- and, as there, the answer is
             // to REFUSE and say so, not to drop the file in silence.
-            // Build output is not this filter's business: `.gitignore`
-            // names both `target/` directories, so git never offers one
-            // here in the first place.
+            //
+            // **Build output IS this filter's business, on tracked entries
+            // too.** The previous round asserted the opposite -- ".gitignore
+            // names both `target/` directories, so git never offers one here
+            // in the first place" -- and that was reasoned, not measured,
+            // and it is false: `.gitignore` governs `--others`, not `git
+            // ls-files`. A force-added file under `target/` is TRACKED and
+            // IS listed. Measured on a `git archive` export with
+            // `deskwarden/target/notes.rs` force-added: the git path listed
+            // 96, scanned 96 and FAILED naming it, while the fallback --
+            // which is the release-tarball configuration, and which
+            // `git archive` ships that same file into -- listed 95, scanned
+            // 95 and passed. The two paths returned OPPOSITE verdicts on
+            // identical bytes, with the silent one shipping.
+            //
+            // So the two literal paths are applied here as well, and the
+            // configurations agree again. That direction was chosen over
+            // dropping the fallback's exclusion because the fallback cannot
+            // read `.gitignore` and has no other way to know: without the
+            // exclusion the forced fallback listed 29,865 files, read 6,178,
+            // took over two minutes, and reported this crate's own `.exe` as
+            // a violation of its own source. The cost of this direction is
+            // stated plainly in [`build_output_dir`]: a source file MOVED
+            // into `target/` is hidden, now genuinely in both configurations
+            // rather than in one of them.
+            //
+            // **What this does NOT make identical, disclosed rather than
+            // implied.** `.gitignore`'s `target/` is UNANCHORED, so on the
+            // git path it takes out a directory named `target` at ANY depth,
+            // while this predicate is two literal paths. Measured on the
+            // export: a probe in `docs/target/notes.rs` is GREEN on the git
+            // path (95 listed) and RED in the fallback (96 listed, one hit).
+            // The same holds for every other gitignored name -- `.vscode/`,
+            // `.idea/`, `*.pdb`, `**/*.rs.bk`, `/.superpowers/`. That
+            // residual divergence runs the OTHER way from the one fixed
+            // above: the fallback, which is the configuration that ships, is
+            // the LOUDER of the two, so no file is silently green in the
+            // shipping configuration because of it. It is left rather than
+            // closed because closing it means reimplementing `.gitignore`,
+            // which is the sniffing this test has spent three rounds
+            // deleting. It is a latent red, not a latent miss.
+            //
+            // Also disclosed, and not fixed here: a nested clone COMMITTED
+            // as a gitlink is listed by `git ls-files` as one tracked entry
+            // that is not a file, so the `is_file` guard above drops it and
+            // its whole working tree is out of scope on the git path, while
+            // the fallback refuses it and fails. Measured. This repository
+            // has no submodules, so the pin for it would have to be built
+            // rather than observed; it belongs with the shape pin below.
+            if path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| *a != root)
+                .any(|a| build_output_dir(root, a))
+            {
+                continue;
+            }
             if !is_tracked {
                 if let Some(nested) = path
                     .ancestors()
@@ -6979,6 +7057,55 @@ pub(crate) mod password_lifetime_tests {
              name says the whole tree"
         );
 
+        // **Three needles over the same bytes, and no encoding DECISION.**
+        // The byte search catches a probe in any encoding whose bytes for
+        // ASCII are ASCII -- UTF-8, Latin-1, Windows-1252 -- and misses one
+        // in any encoding that is not, of which the reachable case on
+        // Windows is UTF-16. Measured: `docs/u16.md` written as a BOM plus
+        // the probe in UTF-16LE was GREEN in both configurations (96 listed,
+        // 96 scanned, no hit), while the byte-identical content as UTF-8 was
+        // one hit. The scan worked; the encoding hid the file.
+        //
+        // That is not hypothetical here, because it lands on the file the
+        // previous round cited as its own motivating example: the TRACKED
+        // `deskwarden/installer/bootstrap-bw.ps1`, which Windows PowerShell
+        // 5.1's `>`, `Out-File` and `Set-Content -Encoding Unicode`
+        // regenerate as UTF-16LE BY DEFAULT. The old design red-lined that
+        // file loudly for its encoding; this one scanned it and would have
+        // found nothing in it, ever -- a loud false positive traded for a
+        // silent true negative on the same file.
+        //
+        // So the same window search is run twice more, over the probe's
+        // UTF-16LE and UTF-16BE transcodings. This adds two byte patterns,
+        // not an encoding rule: nothing here inspects a file to decide what
+        // it is, so the `is_source_text`/`MUST_BE_TEXT` shape three rounds
+        // were spent removing is not on its way back. What it does NOT cover
+        // is stated rather than implied: an encoding that is neither
+        // ASCII-transparent nor UTF-16 -- UTF-32, EBCDIC, a compressed or
+        // encrypted container -- still hides the bytes, as does any splitting
+        // of the literal across a window boundary, which is what
+        // `concat!` is FOR and is the remedy this test recommends.
+        let probe_utf16le: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let probe_utf16be: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let needles: [(&str, &[u8]); 3] = [
+            ("as bytes", PROBE.as_bytes()),
+            ("encoded UTF-16LE", &probe_utf16le),
+            ("encoded UTF-16BE", &probe_utf16be),
+        ];
+        // Control: the three needles are three DIFFERENT byte strings of
+        // non-zero length. Without it, two transcodings that silently
+        // collapsed to the same bytes -- or to an empty window, which
+        // `windows(0)` would make match nothing at all -- would look like
+        // three passes while being one.
+        assert!(
+            probe_utf16le.len() == PROBE.len() * 2
+                && probe_utf16be.len() == PROBE.len() * 2
+                && probe_utf16le != probe_utf16be
+                && probe_utf16le != PROBE.as_bytes(),
+            "control: the UTF-16 transcodings of the probe are not two distinct non-empty \
+             needles, so the two extra passes below are not two extra passes"
+        );
+
         let mut scanned = 0usize;
         let mut unreadable = 0usize;
         let mut scanned_this_file = false;
@@ -7003,9 +7130,12 @@ pub(crate) mod password_lifetime_tests {
             };
             scanned += 1;
             scanned_this_file |= file.ends_with("login_ui.rs");
+            let found = needles
+                .iter()
+                .find(|(_, n)| bytes.windows(n.len()).any(|w| w == *n));
             assert!(
-                !bytes.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()),
-                "{} contains the assembled probe. Any test that reads this tree back now \
+                found.is_none(),
+                "{} contains the assembled probe ({}). Any test that reads this tree back now \
                  allocates a copy of it and frees it on its own libtest thread, and the global \
                  scan cannot tell those bytes from an armed test's own -- which is a measured, \
                  intermittent false positive on this crate's security tests. Split the literal \
@@ -7016,7 +7146,8 @@ pub(crate) mod password_lifetime_tests {
                  reports such a file loudly rather than sniffing at its bytes to guess whose \
                  they are, because every sniff tried so far was also an evasion; see \
                  `build_output_dir`",
-                file.display()
+                file.display(),
+                found.map_or("", |(label, _)| label)
             );
         }
 
