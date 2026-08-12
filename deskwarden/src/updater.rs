@@ -208,8 +208,90 @@ pub fn download_and_verify(
     Ok(dest_path)
 }
 
-pub fn apply_update(installer_path: &Path) -> Result<(), String> {
-    Command::new(installer_path)
+/// The Authenticode signer thumbprint an installer must carry before
+/// [`apply_update`] will launch it.
+///
+/// The real certificate deskwarden's release builds will be signed with does
+/// not exist yet at this point in the project, so there is no genuine value to
+/// put here. This placeholder is intentionally not a plausible-looking
+/// thumbprint: it can never match a real signature, so `is_trusted_signer`
+/// -- and therefore both [`download_and_verify`] and [`apply_update`] -- fails
+/// closed, refusing every update, until this constant is replaced with the
+/// real one.
+///
+/// It lives HERE rather than in `main.rs` on purpose. [`apply_update`] is the
+/// one function in this crate that turns a file on disk into a running
+/// process, and if the signer it checks against were a parameter then the
+/// check would be worth exactly as much as the caller wanted it to be worth:
+/// any caller could pass the thumbprint of whatever it had just planted. A
+/// compile-time constant cannot be argued with at a call site.
+pub const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
+
+/// The launch-time trust decision, as a pure function of the signature so it
+/// can be tested without a signed file on disk.
+///
+/// [`apply_update`] cannot be driven all the way to its spawn by any test that
+/// is allowed to exist here -- doing so would mean shipping a genuinely
+/// Authenticode-signed fixture and then running it -- so the decision is
+/// lifted out of the launcher and pinned on its own. What remains untestable
+/// is only whether the launcher still ASKS, and that is disclosed rather than
+/// papered over: deleting the `if !installer_is_launchable(..)` branch from
+/// [`apply_update`] was measured SURVIVING every assertion in this crate, at
+/// 2168 lib / 217 bin / 4 ignored / 0 failed. It is caught only by the
+/// dead-code warning it leaves behind, which is why the ledger this crate
+/// keeps is "0 failed AND 0 warnings" rather than "0 failed". SUBSTITUTING the
+/// thumbprint rather than deleting the call is caught outright -- see
+/// [`the_launch_time_trust_decision_is_the_expected_signer`].
+fn installer_is_launchable(info: &crate::signature::SignatureInfo) -> bool {
+    is_trusted_signer(info, EXPECTED_SIGNER_THUMBPRINT)
+}
+
+/// Launches the installer this module downloaded for `release`, and nothing
+/// else.
+///
+/// # Why this does not take a path
+///
+/// It used to: `pub fn apply_update(installer_path: &Path)`, which spawned
+/// whatever it was handed, with no job object and no further checks. That made
+/// the updater a general-purpose, arbitrary-path process launcher standing
+/// `pub` on the crate's surface -- and `updater.rs` is on the child-start
+/// guard's `ALLOWED` list, so the guard reads none of it. Measured: a one-line
+/// `pub fn zz_start(p: &Path) { crate::updater::apply_update(p) }` in
+/// `accounts.rs` SURVIVED the whole suite at 2164 lib / 217 bin / 0 failed /
+/// 0 warnings. A call to an existing `pub fn` is a QUIETER edit than the alias
+/// lines the guard does catch, not a louder one.
+///
+/// So the capability is removed rather than guarded. The updater is the thing
+/// that did the downloading; it knows where it wrote and under what name, so
+/// it reconstructs the path from [`installer_file_name`] -- the same function
+/// [`download_and_verify`] wrote it with and [`cleanup_stale_downloads`]
+/// recognises it by. A caller chooses a directory and a version; it does not
+/// choose a file.
+///
+/// # And it re-verifies
+///
+/// Naming the file is not on its own enough -- a caller can still name a
+/// directory, and a directory is a place a file can be planted. So the
+/// signature check is repeated here, immediately before the spawn, against
+/// [`EXPECTED_SIGNER_THUMBPRINT`] rather than against anything the caller
+/// supplied. [`download_and_verify`] already checks, but it checks at download
+/// time and hands back a path; the gap between those two moments is exactly
+/// where a swap goes. This is the check that is adjacent to the launch.
+pub fn apply_update(dest_dir: &Path, release: &ReleaseInfo) -> Result<(), String> {
+    let installer_path = dest_dir.join(installer_file_name(&release.version));
+    // The path is folded into every error on this path deliberately: the one
+    // thing a caller must be able to see is WHICH file was about to be
+    // launched, and `verify_authenticode`'s own errors are about the Win32
+    // call rather than about the file.
+    let info = verify_authenticode(&installer_path)
+        .map_err(|e| format!("refusing to launch {}: {e}", installer_path.display()))?;
+    if !installer_is_launchable(&info) {
+        return Err(format!(
+            "refusing to launch {}: it is not signed by the expected signer",
+            installer_path.display()
+        ));
+    }
+    Command::new(&installer_path)
         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES"])
         .spawn()
         .map_err(|e| format!("failed to launch installer: {e}"))?;
@@ -516,6 +598,103 @@ mod tests {
             partial.display()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `apply_update` starts a process, so every test of it has to be certain
+    /// it cannot start one. These two are: the placeholder thumbprint can
+    /// never match a real signature, and neither of the files below is a
+    /// signed PE in the first place, so `verify_authenticode` fails before the
+    /// spawn is reached on either path.
+    #[test]
+    fn apply_update_refuses_an_installer_it_cannot_verify() {
+        let dir = scratch_dir("apply-unverifiable");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: String::new(),
+        };
+        std::fs::write(dir.join(installer_file_name(&release.version)), b"not a signed PE").unwrap();
+
+        let result = apply_update(&dir, &release);
+
+        assert!(result.is_err(), "an installer that fails verification must not be launched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The narrowing itself, asserted rather than left to the doc comment: the
+    /// caller hands over a directory and a release, and the file that would be
+    /// launched is the one `download_and_verify` writes -- not one the caller
+    /// named.
+    ///
+    /// A directory holding a *differently* named executable therefore has
+    /// nothing in it `apply_update` will touch, and the error says which file
+    /// it looked for.
+    #[test]
+    fn apply_update_launches_only_the_file_the_download_pass_wrote() {
+        let dir = scratch_dir("apply-constructs");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: String::new(),
+        };
+        // A plausible decoy, sitting right beside where the real one would go.
+        std::fs::write(dir.join("setup.exe"), b"not a signed PE").unwrap();
+
+        let error = apply_update(&dir, &release).expect_err("nothing here is verifiable");
+
+        let wanted = dir.join(installer_file_name(&release.version));
+        assert!(
+            error.contains(&wanted.display().to_string()),
+            "apply_update reported {error}, which does not name {}; it is not constructing the \
+             path from the release",
+            wanted.display()
+        );
+        assert!(
+            !error.contains("setup.exe"),
+            "apply_update went looking at a file the caller merely left lying around: {error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The signer is a constant, not an argument, so no call site can weaken
+    /// it. If this ever becomes a parameter again, this stops compiling.
+    #[test]
+    fn the_launch_time_signer_check_is_not_something_a_caller_supplies() {
+        assert_eq!(EXPECTED_SIGNER_THUMBPRINT, "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED");
+        // And the shape is pinned by the type system rather than by prose: a
+        // function pointer of exactly this signature. If `apply_update` grows
+        // back a `&Path` for the installer, or a caller-supplied thumbprint,
+        // this line stops compiling.
+        let narrowed: fn(&Path, &ReleaseInfo) -> Result<(), String> = apply_update;
+        let _ = narrowed;
+    }
+
+    /// The decision [`apply_update`] makes immediately before it spawns, over
+    /// signatures built by hand -- the only way to reach it, since a test that
+    /// got there through a real file would need a real signed installer.
+    #[test]
+    fn the_launch_time_trust_decision_is_the_expected_signer() {
+        use crate::signature::SignatureInfo;
+        let info = |valid, thumbprint: Option<&str>| SignatureInfo {
+            valid,
+            thumbprint: thumbprint.map(str::to_string),
+            subject_dn: Some("CN=Deskwarden".to_string()),
+        };
+
+        // The one accepted case: a valid signature carrying exactly the
+        // constant, case-insensitively (thumbprints are hex).
+        assert!(installer_is_launchable(&info(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
+        assert!(installer_is_launchable(&info(
+            true,
+            Some(&EXPECTED_SIGNER_THUMBPRINT.to_ascii_lowercase())
+        )));
+
+        // A valid signature by SOMEONE ELSE is the case that matters: it is
+        // what a planted installer would carry, and it is what a check against
+        // a caller-supplied thumbprint would have accepted.
+        assert!(!installer_is_launchable(&info(true, Some("AABBCCDDEEFF00112233445566778899"))));
+        // ...and an invalid or absent signature, whoever it names.
+        assert!(!installer_is_launchable(&info(false, Some(EXPECTED_SIGNER_THUMBPRINT))));
+        assert!(!installer_is_launchable(&info(true, None)));
+        assert!(!installer_is_launchable(&info(false, None)));
     }
 
     /// Pins the two production numbers against the failure each was chosen to

@@ -92,7 +92,13 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// thumbprint: it can never match a real signature, so `is_trusted_signer`
 /// (and therefore `download_and_verify`) fails closed -- refusing every
 /// update -- until this constant is replaced with the real one.
-const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
+///
+/// Defined in `updater.rs` and merely re-read here. `apply_update` checks the
+/// signature again immediately before it launches anything, and that check has
+/// to be against a value no call site can choose -- so the constant lives next
+/// to the launch rather than next to the caller, and there is exactly one of
+/// it.
+use deskwarden::updater::EXPECTED_SIGNER_THUMBPRINT;
 
 /// Organization (`O=`) values accepted as proof that the resolved `bw.exe`
 /// (see `bw_path::resolve_bw_exe`) really is Bitwarden's own CLI.
@@ -1944,7 +1950,11 @@ fn main() {
                                 &dest_dir,
                                 &agent,
                             )
-                            .and_then(|installer_path| updater::apply_update(&installer_path));
+                            // The downloaded path is deliberately discarded:
+                            // `apply_update` reconstructs it from the release
+                            // and re-verifies it, so this call site cannot
+                            // name the file that gets launched.
+                            .and_then(|_installer_path| updater::apply_update(&dest_dir, &release));
                             let _ = tx.send(outcome);
                         });
                     }
