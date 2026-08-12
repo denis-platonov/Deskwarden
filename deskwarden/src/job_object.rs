@@ -5434,7 +5434,7 @@ mod tests {
                          were still module contents -- top-level items at file scope, in \
                          the half of this file no guard reads. Measured surviving the whole \
                          suite at 2202 passed / 0 failed / 0 warnings and shipping three \
-                         times over in the lib's LLVM IR."
+                         times over in the lib's DEBUG LLVM IR."
                         ));
                     }
                     expected_close = None;
@@ -5640,13 +5640,30 @@ mod tests {
              through it"
         );
         // An INDENTED top-level item, which a column-0-only filter would miss.
+        // The payload is an indented, GATED module opener and not an `impl`:
+        // an `impl` is refused whether or not indentation is checked, because
+        // `below_cut_is_module_opener` rejects it either way, so that shape
+        // left the indentation rule unmeasured. A module opener the predicate
+        // ACCEPTS, closed at column 0 so the walk would otherwise finish
+        // balanced, is refused by the indentation rule and by nothing else.
         assert!(
             walk_below_the_cut(&format!(
-                "\n{gate}\nmod tests {{\n}}\n\n  impl JobCommand {{\n  }}\n"
+                "\n{gate}\nmod tests {{\n}}\n\n{gate}\n  mod sneaked_indented {{\n}}\n"
             ))
             .is_err(),
             "control: the walk is fooled by indenting a top-level item, which is the defect \
              the column-0 form of this check shipped with elsewhere"
+        );
+        // Liveness control at the IDENTICAL site: the same module written at
+        // column 0 is ACCEPTED, so the refusal above is about the indentation
+        // and not about the module being unwelcome down there at all.
+        assert!(
+            walk_below_the_cut(&format!(
+                "\n{gate}\nmod tests {{\n}}\n\n{gate}\nmod sneaked_indented {{\n}}\n"
+            ))
+            .is_ok(),
+            "control: the walk refuses the same gated module written at column 0, so the \
+             refusal above is not measuring indentation"
         );
         // A whole module on ONE line is not a module opener.
         assert!(

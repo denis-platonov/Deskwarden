@@ -41,7 +41,7 @@
 //!
 //! Measured on the unfixed tree: a payload whose decoy was `['\'','"']`
 //! SURVIVED the full suite at 2202 passed / 0 failed / 0 warnings and shipped
-//! three times over in the lib's LLVM IR, in all three files that carried the
+//! three times over in the lib's DEBUG LLVM IR, in all three files that carried
 //! matcher. The byte-identical payload with the decoy written `['a','"']` was
 //! KILLED by the offset assertion. The off-by-one was the whole hole.
 //!
@@ -278,7 +278,7 @@ pub type WalkCounts = (usize, usize, usize, usize);
 /// `depth == 1` branch skips it, and the trailing column-0 `}` restores
 /// `depth == 0` with `closes == modules`. Measured with eight of those
 /// planted at once: 2211 lib / 217 bin / 0 failed / 0 warnings in both
-/// profiles, and seven `pub fn`s shipping in the lib's LLVM IR.
+/// profiles, and seven `pub fn`s shipping in the lib's DEBUG LLVM IR.
 ///
 /// So each module opener is brace-matched by [`match_brace`] and the byte
 /// offset of its REAL close is recorded. Only that line may be accepted as
@@ -355,7 +355,7 @@ pub fn try_walk(region: &str, rules: &WalkRules) -> Result<WalkCounts, String> {
                          module contents -- top-level items at file scope, in the half of \
                          this file no guard reads. Measured surviving the whole suite at 2211 \
                          lib / 217 bin / 0 failed / 0 warnings in both profiles, and shipping \
-                         in the lib's LLVM IR."
+                         in the lib's DEBUG LLVM IR."
                     ));
                 }
                 expected_close = None;
@@ -851,10 +851,30 @@ mod tests {
         );
         // Liveness control at the identical site: the column-0 form of the
         // same payload, which `main.rs`'s own guard also catches.
+        //
+        // The cut is recomputed IN the string being sliced. `cut` above is a
+        // byte offset into `source`, which `include_str!` reads with the
+        // working tree's line endings; `column_zero` is built from `lf`, which
+        // is two bytes shorter per line. Measured on a CRLF checkout: `cut` is
+        // 395685 and the marker in the LF copy is at 388330 -- 7355 bytes off,
+        // landing the slice in the middle of a test function body, so the walk
+        // returned `Err` for garbage rather than for the appended `pub fn`. On
+        // a pure-LF tree the delta is zero and it passed, so the control could
+        // never go red on either configuration for the reason it names.
         let column_zero = format!("{lf}pub fn sneaked(x: u64) -> u64 {{ x }}\n");
+        let cut_of_column_zero =
+            column_zero.find(MARKER).expect("the marker survives the append");
         assert!(
-            try_walk(&column_zero[cut..], &RULES).is_err(),
-            "control: the walk accepted a column-0 `pub fn` below `main.rs`'s cut"
+            column_zero.as_bytes()[cut_of_column_zero - 1] == b'\n',
+            "control: the recomputed cut landed mid-line, so the slice below is not a \
+             region boundary and its refusal would be about garbage"
+        );
+        let why = try_walk(&column_zero[cut_of_column_zero..], &RULES)
+            .expect_err("control: the walk accepted a column-0 `pub fn` below `main.rs`'s cut");
+        assert!(
+            why.contains("top-level source below the cut"),
+            "control: the column-0 `pub fn` was refused, but not by the top-level line rule \
+             this control names: {why}"
         );
         // And the unmutated file must still pass, or both refusals above are
         // a walk that refuses everything.

@@ -2338,7 +2338,15 @@ mod tests {
              the exact mutation it exists to catch"
         );
         // And an INDENTED one, which the column-0 filter this replaced missed.
-        let with_an_indented_item = format!("{lf}\n    struct Sneaked(u8);\n");
+        // The
+        // payload is an indented, GATED module opener and not a `struct`: a
+        // struct is refused whether or not indentation is checked, because
+        // it is not a module opener either way, so it left the indentation
+        // rule unmeasured. This shape the opener predicate accepts and the
+        // walk would otherwise ACCEPT outright, so only the indentation rule
+        // refuses it and deleting that rule reds this control.
+        let with_an_indented_item =
+            format!("{lf}\n{CUT_GATE}\n    mod sneaked_indented {{\n}}\n");
         assert!(
             std::panic::catch_unwind(|| walk_below_the_cut(&with_an_indented_item)).is_err(),
             "control: the walk accepted an INDENTED top-level item appended below the test \

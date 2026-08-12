@@ -2128,11 +2128,59 @@ mod tests {
             "control: the walk accepted a `pub fn` appended below the test modules, which is \
              the exact mutation it exists to catch"
         );
-        let indented = format!("{source}\n    struct Sneaked(u8);\n");
+        // An INDENTED top-level item, which a column-0-only filter would miss.
+        // The payload is an indented, GATED module opener and not a
+        // `struct`: a struct is refused whether or not indentation is
+        // checked, because it is not a module opener either way, so it left
+        // the indentation rule unmeasured. This shape the opener predicate
+        // accepts, so only the indentation rule can refuse it -- and the
+        // trailing column-0 `}` makes the payload one the walk would
+        // otherwise ACCEPT, so deleting the rule reds this control.
+        let indented =
+            format!("{source}\n{BELOW_CUT_GATE}\n    mod sneaked_indented {{\n}}\n");
         assert!(
             std::panic::catch_unwind(|| walk_below_the_cut(&indented)).is_err(),
-            "control: the walk accepted an INDENTED top-level item appended below the test \
-             modules, which a column-0-only filter would miss"
+            "control: the walk accepted an INDENTED, gated module opener appended below \
+             the test modules, which a column-0-only filter would miss"
+        );
+        // A column-0 line INSIDE the last test module that this file does
+        // not name in its string-literal allowance. The line is planted by
+        // dropping the file's final column-0 `}` and writing it back after
+        // the payload, so the braces still balance and the module's real
+        // close is still the last line -- the ONLY thing that refuses it is
+        // the allowance being an exact list rather than a permission.
+        // Measured: without this the `string_lines` rule was held by one
+        // test in the whole crate, so a mutation plus deleting that test
+        // were the two edits that opened it.
+        let unlisted = format!(
+            "{}zz_not_source\n}}\n",
+            source
+                .replace("\r\n", "\n")
+                .strip_suffix("}\n")
+                .expect("this file ends with a column-0 closing brace")
+        );
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&unlisted)).is_err(),
+            "control: the walk accepted a column-0 line inside a test module that this \
+             file's string-literal allowance does not name, so the allowance is a \
+             permission and not a list"
+        );
+        // Liveness control at the IDENTICAL site: the SAME planting, walked
+        // with this file's own rules except that the planted line is named in
+        // the allowance, is ACCEPTED. So the refusal above is about the
+        // allowance and not about the planting having broken the region.
+        // This file's real `BELOW_CUT_STRING_LINES` is empty, so the naming
+        // has to be done here rather than read off the constant.
+        let naming_it = crate::below_cut::WalkRules {
+            string_lines: &["zz_not_source"],
+            ..BELOW_CUT_RULES
+        };
+        let cut_of_unlisted =
+            unlisted.find(BELOW_CUT_MARKER).expect("the marker survives the planting");
+        assert!(
+            crate::below_cut::try_walk(&unlisted[cut_of_unlisted..], &naming_it).is_ok(),
+            "control: the walk refuses the planted region even when the line IS named in \
+             the allowance, so the refusal above is not measuring the allowance"
         );
         let ungated = format!("{source}\nmod shipped {{\n}}\n");
         assert!(
@@ -2147,7 +2195,7 @@ mod tests {
         // line is indented, so the `depth == 1` branch skips it and the walk
         // ends with `closes == modules` and `depth == 0`. Measured SURVIVING
         // the whole suite at 2211 lib / 217 bin / 0 failed / 0 warnings in
-        // both profiles, and shipping in the lib's LLVM IR. Only the
+        // both profiles, and shipping in the lib's DEBUG LLVM IR. Only the
         // byte-offset close check kills it.
         let balanced = format!(
             "{}    }}\n    pub fn sneaked(x: u64) -> u64 {{ x }}\n    \

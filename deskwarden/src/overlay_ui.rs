@@ -2823,7 +2823,7 @@ mod geometry_tests {
                          were still module contents -- top-level items at file scope, in \
                          the half of this file no guard reads. Measured surviving the whole \
                          suite at 2202 passed / 0 failed / 0 warnings and shipping three \
-                         times over in the lib's LLVM IR."
+                         times over in the lib's DEBUG LLVM IR."
                     );
                     expected_close = None;
                     depth = 0;
