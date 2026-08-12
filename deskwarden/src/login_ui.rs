@@ -5991,10 +5991,10 @@ pub(crate) mod password_lifetime_tests {
         );
     }
 
-    /// Whether `dir` holds bytes that are not this tree's content,
-    /// decided by **shape rather than by name**. Used by both paths.
+    /// Whether `dir` is a **repository other than this one**, decided by
+    /// shape rather than by name. Used by both paths.
     ///
-    /// Three shapes, each a producer of bytes that were never ours:
+    /// Two shapes, each a producer of bytes that were never ours:
     ///
     /// * `dir/.git` exists, **of either kind**. A `.git` FILE is a sibling
     ///   worktree. A `.git` DIRECTORY is a nested full clone -- and the
@@ -6009,43 +6009,114 @@ pub(crate) mod password_lifetime_tests {
     ///   the fallback: measured, `git ls-files --others` collapses a
     ///   nested *clone* to one directory entry, but enumerates a nested
     ///   *bare* repository file by file, hooks and all.
-    /// * `dir/CACHEDIR.TAG` is a file. Cargo writes that tag into its
-    ///   target directory, so this skips a Rust build output under **any
-    ///   name** -- including a `CARGO_TARGET_DIR` pointed at an in-repo
-    ///   directory not called `target`, which is the hazard the git bound
-    ///   was introduced for and which the fallback did not close. It also
-    ///   replaces the literal `"target"` skip: a directory called `target`
-    ///   that is not a build output has no claim to be skipped, and a
-    ///   build output called anything else has every claim.
     ///
-    /// The old `"target" | ".git" | ".superpowers"` name list is gone with
-    /// it, `.superpowers` included. That directory is gitignored, so it is
-    /// in neither the tracked list nor the untracked-not-ignored list; the
-    /// only mode that can still reach it is the fallback over a hand-copied
-    /// development tree, and in that mode a probe-bearing file anywhere in
-    /// the copy is a genuine finding **about that copy**, not noise.
-    fn is_not_this_trees_content(dir: &std::path::Path) -> bool {
+    /// **What is gone from this list is `CACHEDIR.TAG`, because it is both
+    /// unreliable as a marker of build output and forgeable as a switch.**
+    ///
+    /// Unreliable: cargo writes that tag only when it creates the target
+    /// directory *itself*. Measured on cargo 1.96.0, `mkdir X;
+    /// CARGO_TARGET_DIR=X cargo build` leaves **no** tag while
+    /// `CARGO_TARGET_DIR=Y cargo build` with `Y` absent writes one, and
+    /// `CARGO_TARGET_DIR=<pre-existing> cargo test --no-run` produced 18
+    /// probe-bearing artifacts with no tag above any of them. A
+    /// CI-cache-restored `target/`, a `cp -r`'d build directory and
+    /// anything predating cargo's tag support are the same. Copying one of
+    /// those 18 into `<export>/buildout/debug/` FAILED this scan in
+    /// **both** configurations, reporting this tree's own source as
+    /// carrying the probe and naming an `.exe`. The claim that the tag
+    /// skipped build output "under any name" was simply false.
+    ///
+    /// Forgeable, and far worse: with the probe sitting in a **tracked**
+    /// `deskwarden/src/vault_window/sidebar.rs`, an empty
+    /// `deskwarden/src/vault_window/CACHEDIR.TAG` -- one file, no content
+    /// -- turned the fallback scan from FAILED to `ok`, whole subtree
+    /// gone, no control firing. A planted `.git` did the same. It failed
+    /// to hide `src/` itself only because `login_ui.rs` lives there and
+    /// the "the walk reached this file" control caught it: an accident of
+    /// layout, not a guard. A directory-level opt-out that any one empty
+    /// file can assert is not a filter, it is a switch, and what it
+    /// switches off is the instrument.
+    ///
+    /// So build output is no longer excluded by a directory marker at all.
+    /// It is excluded by what it *is*; see [`is_source_text`]. And the two
+    /// repository shapes that remain cannot hide a file either. On the git
+    /// path they filter UNTRACKED entries only -- a tracked file is this
+    /// repository's by definition and passes through no directory filter
+    /// whatsoever -- and in the fallback they are not an exclusion but a
+    /// hard failure; see [`walk`].
+    fn nested_repository_shape(dir: &std::path::Path) -> bool {
         dir.join(".git").exists()
             || (dir.join("HEAD").is_file()
                 && dir.join("objects").is_dir()
                 && dir.join("refs").is_dir())
-            || dir.join("CACHEDIR.TAG").is_file()
     }
 
-    /// The fallback, used only when `git` cannot be run. Skips whatever
-    /// [`is_not_this_trees_content`] names, and unreadable directories
-    /// rather than panicking on them.
-    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    /// Whether these bytes are the kind of file this scan's property is
+    /// about: **source text**.
+    ///
+    /// The property is "no source file in this crate contains the probe as a
+    /// literal", and it matters because other tests read source text back and
+    /// would allocate a copy of it. A compiled artifact of this crate
+    /// **necessarily** contains the assembled probe -- that is what compiling
+    /// a `concat!` produces -- so reporting one is not a finding, it is a
+    /// structural false positive. Suppressing it was the whole job of the
+    /// `CACHEDIR.TAG` rule, which did it by guessing at the directory and got
+    /// the guess wrong in both directions. This does it by looking at the
+    /// bytes, which cannot be forged by adding a file.
+    ///
+    /// **Valid UTF-8 is the test, not "no NUL byte in the first 8 KiB".**
+    /// Both separate an `.exe`, an `.rlib`, a `.pdb` and an incremental `.o`
+    /// from source -- all 18 probe-bearing artifacts measured above are
+    /// invalid UTF-8, and a PE file is invalid by its fourth byte -- but the
+    /// NUL sniff hands back exactly the kind of one-byte opt-out this round
+    /// exists to remove: a NUL pasted into a `.rs` file compiles fine and
+    /// would have taken that file silently out of scope. Invalid UTF-8 does
+    /// not compile, so a file that fails this test is not Rust source. The
+    /// scan asserts that separately, over the extension, so a source file
+    /// going non-UTF-8 is a loud failure rather than a quiet skip.
+    ///
+    /// What this costs, stated: the five tracked binary assets in this
+    /// repository -- `deskwarden.ico` and four `.ttf` fonts -- are listed and
+    /// then not scanned. A probe pasted into one of those would go unseen.
+    /// They are build inputs no test reads back as text, and the alternative
+    /// is scanning every compiled artifact of this crate and reporting each
+    /// one, which is the failure this replaces.
+    fn is_source_text(bytes: &[u8]) -> bool {
+        std::str::from_utf8(bytes).is_ok()
+    }
+
+    /// The fallback, used only when `git` cannot be run.
+    ///
+    /// **It excludes nothing.** Every file below `dir` is listed, build
+    /// output included -- [`is_source_text`] is what keeps an artifact from
+    /// being reported, and it decides per file, on the bytes. Unreadable
+    /// directories are skipped rather than panicked on; concurrent agents
+    /// building in-tree produce those.
+    ///
+    /// A nested repository shape is recorded into `refused` and left
+    /// unwalked, and that is **not** a quiet skip: the scan asserts `refused`
+    /// is empty and fails naming it. Without git this instrument cannot tell
+    /// whose bytes are inside such a directory. Walking in reports another
+    /// checkout's `login_ui.rs` as a violation of THIS tree; skipping it lets
+    /// one planted `.git` file delete a subtree from the scan. Neither is an
+    /// answer, so the answer is to say so. That is what turns the planted
+    /// marker from a silent opt-out into a red suite.
+    fn walk(
+        dir: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+        refused: &mut Vec<std::path::PathBuf>,
+    ) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if is_not_this_trees_content(&path) {
+                if nested_repository_shape(&path) {
+                    refused.push(path);
                     continue;
                 }
-                walk(&path, out);
+                walk(&path, out, refused);
             } else {
                 out.push(path);
             }
@@ -6106,17 +6177,20 @@ pub(crate) mod password_lifetime_tests {
                 continue;
             }
             // Tracked content is this repository's by definition, and git
-            // has already decided that. An untracked path has had only
+            // has already decided that -- so a tracked path passes through
+            // NO directory filter here, and no marker planted beside it can
+            // take it out of scope. An untracked path has had only
             // `.gitignore` applied to it, which does not know about a
-            // nested bare repository or about a build output sitting under
-            // a name the ignore file does not name -- so it gets the same
-            // shape test the fallback walk uses.
+            // nested bare repository, so it gets the same repository-shape
+            // test the fallback walk uses. Build output is not this
+            // filter's business any more: an untracked artifact is listed
+            // and then dropped by `is_source_text` on its bytes.
             if !is_tracked
                 && path
                     .ancestors()
                     .skip(1)
                     .take_while(|a| *a != root)
-                    .any(is_not_this_trees_content)
+                    .any(nested_repository_shape)
             {
                 continue;
             }
@@ -6135,25 +6209,39 @@ pub(crate) mod password_lifetime_tests {
         (!listed.is_empty()).then_some(listed)
     }
 
-    /// **The pin on [`is_not_this_trees_content`], which nothing else can
-    /// reach.**
+    /// **The pin on [`nested_repository_shape`], [`is_source_text`] and the
+    /// fallback [`walk`], which nothing else can reach.**
     ///
     /// The shapes that predicate refuses only ever occur in someone's working
-    /// directory: a nested clone, a sibling worktree, a bare repository, an
-    /// in-repo `CARGO_TARGET_DIR`. None of them exists in a clean checkout, so
-    /// on a green tree every one of those three clauses can be deleted with the
-    /// whole suite still passing -- which is how the nested-full-clone gap
-    /// survived the round that introduced the worktree skip. The gap was found
-    /// by hand, in an export, and would have been found by hand again next
-    /// time.
+    /// directory: a nested clone, a sibling worktree, a bare repository. None
+    /// of them exists in a clean checkout, so on a green tree every clause can
+    /// be deleted with the whole suite still passing -- which is how the
+    /// nested-full-clone gap survived the round that introduced the worktree
+    /// skip, and how the `CACHEDIR.TAG` opt-out survived the round after it.
+    /// Both gaps were found by hand, in an export, and would have been found
+    /// by hand again next time.
     ///
-    /// So the shapes are BUILT here, in a temporary directory, and the
-    /// predicate is asked about each one. `walk` is then run over the same
-    /// directory with the probe planted inside every refused shape and in one
-    /// ordinary file, so the refusal is measured as "these bytes were not
-    /// scanned" rather than only as a boolean.
+    /// So the shapes are BUILT here, in a temporary directory, and three
+    /// separate claims are measured over them:
+    ///
+    /// * the three repository shapes are recognised, and an ordinary
+    ///   directory is not -- the control, without which a predicate that
+    ///   refuses everything satisfies the other three;
+    /// * a `CACHEDIR.TAG` **hides nothing**. This is the C2 mutation in
+    ///   miniature: a probe-bearing source file with a tag planted in its own
+    ///   directory is still walked to. On the old predicate this file was
+    ///   invisible;
+    /// * the walk reaches build output and [`is_source_text`] is what keeps
+    ///   the artifact from being reported -- so the C1 mutation (a
+    ///   probe-bearing `.exe` from a pre-existing `CARGO_TARGET_DIR`) is
+    ///   answered on the bytes, and the `.d` file beside it, which is text,
+    ///   is still scanned;
+    /// * a nested repository is REFUSED rather than skipped -- it comes back
+    ///   in `refused`, which the scan turns into a failure. A `.git` planted
+    ///   inside `src/` therefore reds the suite instead of deleting a
+    ///   subtree, in the configuration that ships.
     #[test]
-    fn the_walk_refuses_a_nested_clone_a_worktree_a_bare_repo_and_a_build_output() {
+    fn the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip() {
         // This test writes the assembled probe to disk and reads it back, and
         // it never arms. Same reason as the scan above.
         hold_the_probe_lock();
@@ -6184,9 +6272,7 @@ pub(crate) mod password_lifetime_tests {
             path
         }
 
-        // A nested full clone: `.git` is a DIRECTORY. This is the shape the
-        // previous `path.join(".git").is_file()` test missed -- it skipped the
-        // `.git` by name and walked the working files beside it.
+        // A nested full clone: `.git` is a DIRECTORY.
         std::fs::create_dir_all(root.join("nested_clone/.git")).expect("creatable");
         plant(&root, "nested_clone/src/lib.rs");
         // A sibling worktree: `.git` is a FILE.
@@ -6200,36 +6286,92 @@ pub(crate) mod password_lifetime_tests {
         std::fs::create_dir_all(root.join("nested_bare/refs")).expect("creatable");
         std::fs::write(root.join("nested_bare/HEAD"), b"ref: refs/heads/main").expect("writable");
         plant(&root, "nested_bare/description");
-        // A Cargo build output under a name that is not `target`.
+
+        // A Cargo build output under a name that is not `target`, WITH the
+        // tag -- and the tag no longer takes it out of the walk. What keeps
+        // the artifact from being reported is that it is not source text; the
+        // `.d` file beside it is text and is scanned.
         std::fs::create_dir_all(root.join("buildout")).expect("creatable");
-        std::fs::write(root.join("buildout/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172")
+        let tag = root.join("buildout/CACHEDIR.TAG");
+        std::fs::write(&tag, b"Signature: 8a477f597d28d172").expect("writable");
+        let artifact = root.join("buildout/deskwarden.exe");
+        let mut bytes = b"MZ\x90\x00\xff\xfe\xfd".to_vec();
+        bytes.extend_from_slice(PROBE.as_bytes());
+        std::fs::write(&artifact, &bytes).expect("writable");
+        let depfile = root.join("buildout/deskwarden.d");
+        std::fs::write(&depfile, b"deskwarden.exe: src/main.rs").expect("writable");
+
+        // The C2 mutation in miniature: a probe-bearing source file with a
+        // tag planted in its own directory. Under the old predicate this
+        // whole directory left the scan.
+        let hidden = plant(&root, "src/vault_window/sidebar.rs");
+        std::fs::write(root.join("src/vault_window/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172")
             .expect("writable");
-        plant(&root, "buildout/deskwarden.rlib");
+        let hidden_tag = root.join("src/vault_window/CACHEDIR.TAG");
+
         // And one ordinary file, which is the control: a walk that refuses
-        // everything satisfies the four assertions above and measures nothing.
+        // everything satisfies the assertions above and measures nothing.
         let ordinary = plant(&root, "docs/notes.md");
         std::fs::create_dir_all(root.join("docs/nested")).expect("creatable");
         let ordinary_deep = plant(&root, "docs/nested/more.md");
 
-        for refused in ["nested_clone", "nested_worktree", "nested_bare", "buildout"] {
+        for shape in ["nested_clone", "nested_worktree", "nested_bare"] {
             assert!(
-                is_not_this_trees_content(&root.join(refused)),
-                "`{refused}` is bytes that are not this tree's content and the predicate                  accepted it. Whatever is inside it -- another checkout's `login_ui.rs` at a                  commit predating the `concat!` split, or this crate's own rlib -- is then                  read back and reported as a violation of THIS tree"
+                nested_repository_shape(&root.join(shape)),
+                "`{shape}` is another repository and the predicate did not recognise it. \
+                 Whatever is inside it -- another checkout's `login_ui.rs` at a commit \
+                 predating the `concat!` split -- is then read back and reported as a \
+                 violation of THIS tree"
             );
         }
-        for kept in ["docs", "docs/nested"] {
+        for kept in ["docs", "docs/nested", "buildout", "src/vault_window"] {
             assert!(
-                !is_not_this_trees_content(&root.join(kept)),
-                "control: `{kept}` is an ordinary directory and the predicate refused it, so                  the four assertions above are satisfied by a predicate that refuses                  everything and the fallback walk measures nothing"
+                !nested_repository_shape(&root.join(kept)),
+                "control: `{kept}` is not a repository and the predicate said it was. The \
+                 assertions above are then satisfied by a predicate that refuses everything, \
+                 and the fallback walk measures nothing. `buildout` and `src/vault_window` \
+                 both carry a planted `CACHEDIR.TAG` here: the day that tag comes back as a \
+                 directory-level opt-out, one empty file deletes a subtree of `src/` from \
+                 this scan again"
             );
         }
 
+        assert!(
+            !is_source_text(&bytes),
+            "control: a PE header followed by the probe was accepted as source text. Every \
+             compiled artifact of this crate carries the assembled probe by construction, so \
+             the scan would report this crate's own `.exe` as a violation of its own source -- \
+             which it did, measured, in both configurations"
+        );
+        assert!(
+            is_source_text(PROBE.as_bytes()),
+            "control: ordinary source text was rejected as not-source, so the rule above is \
+             satisfied by a predicate that rejects everything and the scan reads nothing"
+        );
+
         let mut found = Vec::new();
-        walk(&root, &mut found);
+        let mut refused = Vec::new();
+        walk(&root, &mut found, &mut refused);
         assert_eq!(
             found.iter().collect::<std::collections::BTreeSet<_>>(),
-            [&ordinary, &ordinary_deep].into_iter().collect::<std::collections::BTreeSet<_>>(),
-            "the fallback walk reached exactly the two ordinary files and nothing else. Every              file it did not reach here holds the assembled probe, so anything extra in this              set is a false positive the scan would have reported against this tree"
+            [&ordinary, &ordinary_deep, &hidden, &hidden_tag, &tag, &artifact, &depfile]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the fallback walk did not reach exactly the files outside the nested \
+             repositories. `sidebar.rs` missing from the left is the C2 finding: a planted \
+             `CACHEDIR.TAG` deleted a probe-bearing tracked source file from the scan. A file \
+             under one of the three nested repositories appearing on the left is the \
+             another-checkout false positive"
+        );
+        assert_eq!(
+            refused.iter().collect::<std::collections::BTreeSet<_>>(),
+            [&root.join("nested_clone"), &root.join("nested_worktree"), &root.join("nested_bare")]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the walk did not hand back exactly the three nested repositories it declined to \
+             enter. The scan asserts this list is empty, so an entry missing from the left is a \
+             directory quietly dropped from the scan with nothing said about it -- which is the \
+             silent opt-out this round removes"
         );
     }
 
@@ -6258,11 +6400,14 @@ pub(crate) mod password_lifetime_tests {
     /// * a **gitignored** file is NOT listed;
     /// * an untracked path under a nested bare repository is NOT listed, even
     ///   though `git ls-files --others` enumerates that repository file by
-    ///   file, and neither is an untracked build output under a name
-    ///   `.gitignore` does not mention.
+    ///   file. An untracked build output under a name `.gitignore` does not
+    ///   mention IS listed, and that is the change this round makes: it used
+    ///   to be dropped on `CACHEDIR.TAG`, which cargo does not reliably write
+    ///   and anyone can plant. It is dropped on its bytes instead, in the
+    ///   scan, by `is_source_text`.
     ///
-    /// If `git` cannot be run this test has nothing to say and returns; the
-    /// scan above covers that case through its fallback.
+    /// If `git` cannot be run this test FAILS rather than returning green;
+    /// see the assertion below.
     #[test]
     fn tracked_files_lists_what_this_repository_owns_and_nothing_else() {
         /// Removes the directory on the way out, however this test leaves.
@@ -6291,11 +6436,18 @@ pub(crate) mod password_lifetime_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("the scratch directory is creatable");
 
-        if !git(&root, &["init", "-q", "."]) {
-            // No usable `git`. That is the fallback's world, and the scan
-            // above is what covers it.
-            return;
-        }
+        // **No silent return.** If `git` cannot be run here, every claim
+        // below -- the untracked union, the gitignore boundary, the
+        // nested-repository filter -- goes inert and this test reports `ok`
+        // having measured nothing. That is the exact failure mode it was
+        // written to fix, re-created one level up, so it is a failure.
+        assert!(
+            git(&root, &["init", "-q", "."]),
+            "`git init` failed in a fresh temporary directory. Every assertion in this test is \
+             about what `git ls-files` decides; without git it measures nothing at all, and \
+             returning green for that is the silent pass this test exists to prevent. Run the \
+             suite where git works."
+        );
 
         let write = |rel: &str, body: &str| {
             let path = root.join(rel);
@@ -6328,19 +6480,40 @@ pub(crate) mod password_lifetime_tests {
         std::fs::create_dir_all(root.join("nested_bare/refs")).expect("creatable");
         write("nested_bare/HEAD", "ref: refs/heads/main");
         write("nested_bare/objects/loose", "// not our bytes");
-        // A build output under a name `.gitignore` does not name.
-        write("buildout/CACHEDIR.TAG", "Signature: 8a477f597d28d172");
-        write("buildout/deskwarden.rlib", "// not our bytes either");
+        // A build output under a name `.gitignore` does not name. It IS
+        // listed now -- `CACHEDIR.TAG` is no longer a directory-level
+        // opt-out, because it is forgeable and cargo does not reliably
+        // write it. What keeps a real artifact from being reported is
+        // `is_source_text`, on the bytes, in the scan; these two fixtures
+        // are text, so they are listed and would be scanned.
+        let tag = write("buildout/CACHEDIR.TAG", "Signature: 8a477f597d28d172");
+        let rlib = write("buildout/deskwarden.rlib", "// text, so it is listed and scanned");
 
         let listed: std::collections::BTreeSet<std::path::PathBuf> =
             tracked_files(&root).expect("the listing is not empty").into_iter().collect();
         let expected: std::collections::BTreeSet<std::path::PathBuf> =
-            [gitignore, committed, committed_two, staged, untracked, untracked_two]
+            [gitignore, committed, committed_two, staged, untracked, untracked_two, tag, rlib]
                 .into_iter()
                 .collect();
         assert_eq!(
             listed, expected,
             "`tracked_files` did not name exactly the files this repository owns. An entry              missing from the left is a file the probe scan no longer polices -- an untracked              source under `src/` is the one this round added. An extra entry is another              repository's or a build output's bytes being reported as this tree's, which is              the false positive the git bound was introduced to remove"
+        );
+
+        // And the empty answer is `None`, not `Some(vec![])`. A directory that
+        // is not a checkout of anything must send the scan to its FALLBACK
+        // rather than hand it a listing of nothing to police. Measured: with
+        // `(!listed.is_empty()).then_some(listed)` weakened to `Some(listed)`
+        // the whole suite stayed green in both configurations, because every
+        // other assertion here is about a listing that is not empty. The one
+        // thing that would have caught it is the scan's file-count control,
+        // and leaning on a control in another test to police this function's
+        // contract is leaning on an accident.
+        assert!(
+            tracked_files(&root.join("ignored_scratch")).is_none(),
+            "`tracked_files` answered `Some(..)` for a directory it listed nothing for. The \r
+             scan takes that as the tree's file list and never reaches its fallback, so a \r
+             tree it cannot enumerate is policed by scanning no files at all"
         );
     }
 
@@ -6416,16 +6589,59 @@ pub(crate) mod password_lifetime_tests {
     /// runs, and were therefore inert in the configuration every number came
     /// from.
     ///
-    /// The answer is not to document the weakness but to remove it, so both
-    /// paths now decide the same question the same way, by
-    /// [`is_not_this_trees_content`]: nested clone, nested worktree, nested
-    /// bare repository, and Cargo build output under any name are out of scope
-    /// whether git listed the tree or the walk did. What remains asymmetric is
-    /// only what git alone can know -- `.gitignore`, and the fact that a
-    /// tracked file is owned by definition -- so in fallback mode a gitignored
-    /// scratch file that has nothing to do with this repository is still
-    /// scanned. That direction is the safe one: it can only report bytes that
-    /// really are sitting in the tree being measured.
+    /// The round after that one answered it by giving both paths the same
+    /// shape rule -- nested clone, nested worktree, nested bare repository,
+    /// and "a directory holding a `CACHEDIR.TAG`" as a stand-in for Cargo
+    /// build output under any name. **Both halves of that rule were wrong,
+    /// and both were measured wrong.**
+    ///
+    /// `CACHEDIR.TAG` does not mark build output. Cargo writes it only when
+    /// it creates the target directory itself: on cargo 1.96.0,
+    /// `CARGO_TARGET_DIR=<pre-existing dir> cargo test --no-run` produced 18
+    /// probe-bearing artifacts with no tag above any of them, and copying one
+    /// into `<export>/buildout/debug/` FAILED this scan in **both**
+    /// configurations -- this tree's own source reported as carrying the
+    /// probe, an `.exe` named as the file. A CI-cache-restored `target/` and
+    /// a `cp -r`'d build directory behave the same way.
+    ///
+    /// And a marker is a switch anyone can flip. With the probe in a
+    /// **tracked** `deskwarden/src/vault_window/sidebar.rs`, one empty
+    /// `deskwarden/src/vault_window/CACHEDIR.TAG` turned the fallback from
+    /// FAILED to `ok`; a planted `.git` beside it did the same. Suite green,
+    /// no control firing, an entire source subtree silently out of scope. It
+    /// did not hide `src/` itself only because `login_ui.rs` lives there and
+    /// the control below caught it -- an accident of layout.
+    ///
+    /// So there is no directory-level opt-out any more, in either path.
+    ///
+    /// * Build output is refused by what it **is**, not by what sits beside
+    ///   it: [`is_source_text`] scans a file only if its bytes are valid
+    ///   UTF-8. A compiled artifact of this crate necessarily carries the
+    ///   assembled probe -- that is what compiling a `concat!` produces -- so
+    ///   reporting one was never a finding, and no `.exe`, `.rlib`, `.pdb` or
+    ///   incremental `.o` is valid UTF-8. Nothing added to a directory
+    ///   changes that answer. The one way to forge it -- make a source file
+    ///   non-UTF-8 -- does not compile, and is asserted against below anyway.
+    /// * A tracked file passes through **no** filter at all. Git has already
+    ///   decided it is this repository's; a marker planted next to it cannot
+    ///   un-decide that.
+    /// * The two repository shapes still exist, because a nested clone's
+    ///   working files really are another checkout's bytes. On the git path
+    ///   they filter untracked entries only. In the **fallback** they are not
+    ///   an exclusion but a hard failure: the walk hands back what it
+    ///   declined to enter and this test fails naming it. Without git the
+    ///   instrument cannot tell whose bytes those are, and both available
+    ///   guesses are wrong in a way that has been measured, so it says so
+    ///   instead of running a weaker scan quietly. A planted `.git` under
+    ///   `src/` therefore reds the suite rather than deleting a subtree --
+    ///   in the configuration that ships.
+    ///
+    /// What remains asymmetric is only what git alone can know -- `.gitignore`,
+    /// and the fact that a tracked file is owned by definition -- so in
+    /// fallback mode a gitignored scratch file that has nothing to do with
+    /// this repository is still scanned. That direction is the safe one: it
+    /// can only report bytes that really are sitting in the tree being
+    /// measured.
     ///
     /// **And "owns" is wider than "tracks".** `git ls-files` is index-based:
     /// a staged-but-uncommitted file IS listed (verified), but a file written
@@ -6450,10 +6666,13 @@ pub(crate) mod password_lifetime_tests {
     /// for it. [`hold_the_probe_lock`] is the documented hatch for a test that
     /// touches probe plaintext without arming; this is one.
     ///
-    /// Four controls: the file count, this file being reached, at least one
-    /// NON-`.rs` file being reached -- without which a list that had quietly
-    /// gone back to `src/**/*.rs` would satisfy the other two -- and at least
-    /// one file outside the crate directory.
+    /// Controls, in order: nothing was refused unwalked; the file count; this
+    /// file being reached; at least one NON-`.rs` file being reached --
+    /// without which a list that had quietly gone back to `src/**/*.rs` would
+    /// satisfy the others; at least one file outside the crate directory; no
+    /// file whose extension says source text being skipped as not-UTF-8, which
+    /// is the only way the byte rule could be turned back into an opt-out; and
+    /// finally the two counts over what was actually opened and scanned.
     #[test]
     fn no_source_file_in_this_crate_contains_the_assembled_probe() {
         // Before a single byte is read: this test allocates the probe whenever
@@ -6464,11 +6683,30 @@ pub(crate) mod password_lifetime_tests {
             .parent()
             .expect("the crate has a parent directory")
             .to_path_buf();
+        let mut refused: Vec<std::path::PathBuf> = Vec::new();
         let files = tracked_files(&root).unwrap_or_else(|| {
             let mut files = Vec::new();
-            walk(&root, &mut files);
+            walk(&root, &mut files, &mut refused);
             files
         });
+        // The fallback does not get to guess. See `walk`: without git this
+        // instrument cannot tell a nested repository's bytes from this
+        // tree's, and both available guesses are wrong in a way that has
+        // been measured. This is the one place the weaker configuration is
+        // allowed to differ from the stronger one, and it differs by
+        // refusing to answer rather than by answering quietly.
+        assert!(
+            refused.is_empty(),
+            "`git ls-files` could not be run here, so this scan fell back to walking the \
+             directory tree -- and the tree holds {} nested repository shape(s), the first of \
+             them {:?}. Walking into one reports another checkout's `login_ui.rs` as a \
+             violation of THIS tree; skipping it lets a single planted `.git` file delete a \
+             whole subtree from the scan, which is a measured, one-file opt-out on a green \
+             suite. Neither is an answer. Run the suite from a git checkout, where a tracked \
+             file is owned by definition and none of this is a guess.",
+            refused.len(),
+            refused.first()
+        );
         assert!(
             files.len() > 30,
             "control: the walk found only {} files, so the check below is a check over nothing",
@@ -6492,22 +6730,31 @@ pub(crate) mod password_lifetime_tests {
              name says the whole tree"
         );
 
-        let mut read = 0usize;
-        let mut read_this_file = false;
+        let mut scanned = 0usize;
+        let mut unreadable = 0usize;
+        let mut not_source: Vec<&std::path::PathBuf> = Vec::new();
+        let mut scanned_this_file = false;
         for file in &files {
-            // Bytes, not text: an installer or any other non-UTF-8 file must be
-            // scanned rather than skipped. The buffer is dropped before the next
-            // read, so this test's own footprint is one file at a time.
+            // Bytes, not text, and no extension list: what decides whether a
+            // file is scanned is what is in it.
             //
             // A read that FAILS is skipped rather than panicked on: a tracked
             // file can be momentarily locked by an editor, an antivirus, or a
-            // concurrent build. The two counters below are what stops that
+            // concurrent build. The counters below are what stops that
             // tolerance from turning the whole check into a silent pass.
             let Ok(bytes) = std::fs::read(file) else {
+                unreadable += 1;
                 continue;
             };
-            read += 1;
-            read_this_file |= file.ends_with("login_ui.rs");
+            // A file that is not valid UTF-8 is not source, and this crate's
+            // own compiled output carries the assembled probe by
+            // construction. See `is_source_text`.
+            if !is_source_text(&bytes) {
+                not_source.push(file);
+                continue;
+            }
+            scanned += 1;
+            scanned_this_file |= file.ends_with("login_ui.rs");
             assert!(
                 !bytes.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()),
                 "{} contains the assembled probe. Any test that reads this tree back now \
@@ -6518,27 +6765,53 @@ pub(crate) mod password_lifetime_tests {
                 file.display()
             );
         }
-        // The controls above are over the LIST. These two are over what was
-        // actually opened, so a tree in which every read failed -- or in which
-        // only this file's read did -- is a failure and not a green run.
-        // `read > 30` alone tolerated 65 of 95 reads failing, which is not a
-        // tolerance for "an editor has one file open" -- it is a tolerance for
-        // two thirds of the tree going unscanned. The slack is stated against
-        // the real count instead: at most five listed files may fail to open.
-        // The listed files are sources and assets, not build output, so
-        // nothing in the concurrent-agent picture locks them in bulk; if this
-        // ever does fire spuriously it fires LOUDLY, which is the direction a
-        // guard should fail in.
-        let unread = files.len() - read;
+
+        // The one way the UTF-8 rule could be turned back into an opt-out is
+        // to make a source file non-UTF-8. That does not compile, so it
+        // cannot happen by accident -- and it is asserted anyway, over the
+        // extension, so the skip would be loud rather than silent. The
+        // extension list is not an exclusion and cannot hide anything:
+        // renaming a file off it does not stop it being scanned, it only
+        // stops this control from insisting the file be readable as text.
+        const MUST_BE_TEXT: [&str; 12] = [
+            "rs", "toml", "lock", "md", "yml", "yaml", "json", "txt", "ps1", "iss", "cfg", "html",
+        ];
+        let mangled: Vec<&&std::path::PathBuf> = not_source
+            .iter()
+            .filter(|p| {
+                p.extension().and_then(|e| e.to_str()).is_some_and(|e| MUST_BE_TEXT.contains(&e))
+            })
+            .collect();
         assert!(
-            read > 30 && unread <= 5,
-            "control: only {read} of the {} listed files could be read ({unread} failed), so \
-             the check above is a check over a fraction of the tree",
-            files.len()
+            mangled.is_empty(),
+            "control: {} listed file(s) whose extension says source text are not valid UTF-8, \
+             so they were skipped unscanned and the probe could be sitting in one of them \
+             unread. First: {:?}",
+            mangled.len(),
+            mangled.first()
+        );
+
+        // The controls above are over the LIST. These are over what was
+        // actually opened and scanned, so a tree in which every read failed
+        // -- or in which only this file's read did -- is a failure and not a
+        // green run. `scanned > 30` alone tolerated two thirds of the tree
+        // going unscanned, so the slack is stated against the real count
+        // instead: at most five listed files may fail to OPEN. Files skipped
+        // as not-source are counted separately and bounded by the assertion
+        // above, not by this one -- on a clean checkout they are the icon and
+        // the four fonts, and in a tree with build output in it they are the
+        // artifacts, which is the C1 false positive not firing.
+        assert!(
+            scanned > 30 && unreadable <= 5,
+            "control: only {scanned} of the {} listed files were scanned ({unreadable} could \
+             not be opened, {} were not source text), so the check above is a check over a \
+             fraction of the tree",
+            files.len(),
+            not_source.len()
         );
         assert!(
-            read_this_file,
-            "control: the file that declares the probe was listed but could not be read, so the \
+            scanned_this_file,
+            "control: the file that declares the probe was listed but was not scanned, so the \
              one file this test exists to police was not policed"
         );
     }
