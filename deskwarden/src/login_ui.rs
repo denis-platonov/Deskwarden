@@ -6150,6 +6150,21 @@ pub(crate) mod password_lifetime_tests {
     /// [`no_source_file_in_this_crate_contains_the_assembled_probe`], which
     /// asks this predicate about every directory above every file the REAL
     /// listing returned.
+    ///
+    /// **Retargeting an element of this array is a SUITE failure, and the
+    /// counts recorded around it are per-test.** Three separate tests read
+    /// this tree back, and two of them --
+    /// `tracked_files_lists_what_this_repository_owns_and_nothing_else` and
+    /// `the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip`
+    /// -- enumerate it without consulting this array at all, so they answer
+    /// whether or not a probe is planted anywhere. Measured at `6893515` in
+    /// the fallback configuration with nothing planted: pointing element `[1]`
+    /// at `deskwarden/examples`, growing this test's local literals to match
+    /// and neutering the `.gitignore` check's assertion -- three edits -- came
+    /// back 2,221 passed / 2 failed, those two. **A green suite therefore
+    /// costs at least five coordinated edits in this file**, and any single
+    /// test's "SURVIVED" recorded elsewhere in this module is a statement
+    /// about that test, not about the suite.
     const BUILD_OUTPUT_DIRS: [&[&str]; 2] = [&["target"], &["deskwarden", "target"]];
 
     /// True for exactly the directories named by [`BUILD_OUTPUT_DIRS`],
@@ -7576,6 +7591,37 @@ pub(crate) mod password_lifetime_tests {
         // unrelated listing firing. The oracle did not save it, because the
         // oracle subtracted by this same list.
         //
+        // **Those "GREEN" verdicts are per-TEST, and this ledger used to read
+        // as though they were per-SUITE. They were not, and the honest number
+        // is better than the one that was written here.** Every figure above
+        // is the verdict of one test, usually
+        // `no_source_file_in_this_crate_contains_the_assembled_probe`. Two
+        // other tests in this module read the same tree through enumerators
+        // that never consult `BUILD_OUTPUT_DIRS`, and they answer whether or
+        // not a probe is planted anywhere. Re-measured at `6893515` in the
+        // fallback configuration, with NO probe in the tree at all,
+        // retargeting [`BUILD_OUTPUT_DIRS`] and the literals below at
+        // `deskwarden/examples` and additionally neutering the `.gitignore`
+        // check's own assertion -- three edits -- the suite came back
+        // **2,221 passed / 2 failed**, the two being
+        // `tracked_files_lists_what_this_repository_owns_and_nothing_else`
+        // and
+        // `the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip`.
+        // The retarget is caught with nothing planted.
+        //
+        // So the floor this module actually holds is a SUITE floor, not a
+        // per-test one: every widening recorded above and below -- the
+        // two-edit retarget, the three-edit variants that silence this test's
+        // `.gitignore` check, and the push- and shadow-shaped step-arounds
+        // recorded at the reader itself -- is RED at suite level at three
+        // edits. Silencing those two further tests is at least two more
+        // edits, so **a green suite costs at least five coordinated edits**,
+        // all of them in this file. That is a lower bound: five has not been
+        // demonstrated to suffice, only that fewer than five cannot. Quoting
+        // a per-test verdict as though the suite had passed understates this
+        // module, and every count in this ledger should be read as "what one
+        // test said", with the suite floor above as the number that matters.
+        //
         // So the four layers no longer share an input:
         //
         // * the prune below is this list, and it is DECLARED circular: the
@@ -7689,72 +7735,65 @@ pub(crate) mod password_lifetime_tests {
         // every local list grown to agree -- a failure rather than a green
         // suite: `.gitignore` names no `examples/`.
         let ignore_text = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
-        let mut ignored_names: Vec<&str> = Vec::new();
-        let mut ignored_paths: Vec<std::path::PathBuf> = Vec::new();
-        for line in ignore_text.lines() {
-            let line = line.trim();
-            // Directory patterns only -- a trailing `/` is what makes a
-            // `.gitignore` line say "directory". Negations are not consulted,
-            // and a line that needs one is not a line a build output
-            // directory is named by.
-            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-                continue;
-            }
-            let Some(pat) = line.strip_suffix('/') else {
-                continue;
-            };
-            if let Some(anchored) = pat.strip_prefix('/') {
-                ignored_paths.push(anchored.split('/').fold(root.clone(), |acc, c| acc.join(c)));
-            } else if !pat.contains('/') {
-                ignored_names.push(pat);
-            }
-        }
-        assert!(
-            !ignored_names.is_empty() && !ignored_paths.is_empty(),
-            "control: `{}` parsed into {} unanchored name(s) and {} anchored path(s), so the \
-             outside input the check below rests on is not there and that check passes by \
-             having nothing to say",
-            root.join(".gitignore").display(),
-            ignored_names.len(),
-            ignored_paths.len()
-        );
-        // **The NEGATIVE control on that reader, and why it is not a list.**
-        // The assertion above is a positive control only: it says the parser
-        // produced SOMETHING. Nothing above constrains it in the
-        // over-accept direction, and the whole weight of the layer below
-        // rests on the parser being a faithful reader of a file no edit here
-        // can move. Measured at `de79a19`: retargeting `BUILD_OUTPUT_DIRS[1]`
-        // and `literals` at `deskwarden/examples` and pushing ONE extra name
-        // into `ignored_names` -- three edits, all inside this file -- took a
-        // tracked `deskwarden/examples` holding a real probe out of the scan
-        // and the test PASSED in the fallback configuration, probe unseen.
-        // The anchor was outside this file; its reader was not.
+
+        // **The patterns that could exclude this directory, derived from the
+        // directory itself.** A directory is excluded exactly when
+        // `.gitignore` contains, verbatim, one of the two lines that could
+        // say so: `<name>/` -- the unanchored form, which git matches by
+        // component at any depth -- or `/<path from the repository root>/`,
+        // the anchored form. Both are rendered from `d`, so nothing here gets
+        // to choose which line vindicates which directory.
         //
-        // So every entry the parser produced is required to be a line of the
-        // text it claims to have read. The input is DERIVED -- it is
-        // `ignore_text`, the same bytes the loop above consumed -- rather
-        // than an enumeration of names a reviewer thought of, which is the
-        // failure this file keeps repeating: every such list eventually
-        // loses a spelling race, and `["src", "examples", "docs",
-        // "installer"]` would lose it to the fifth directory this repository
-        // grows. There is no name here to lose it with. A parsed entry is
-        // rendered back into the `.gitignore` pattern that alone could have
-        // produced it and that exact line must be present, so an entry the
-        // text does not say is a failure whatever it is spelled.
+        // That is the property the previous shapes kept losing. A reader that
+        // returns "the line that excluded `d`" and is then checked against the
+        // file is NOT enough: it can return someone else's real line. Measured
+        // on exactly that design, in this file, with a real probe in a tracked
+        // `deskwarden/examples`: a reader taught to answer for `examples` while
+        // returning the pattern of whatever line it happened to be looking at
+        // handed back `target/`, a genuine line of `.gitignore`, substantiated
+        // itself against it, and the probe test PASSED with the probe unseen.
+        // The render-back is not injective across the two branches, so the
+        // only safe direction is the one taken here: render from `d` and ask
+        // the file, rather than render from the file and ask a matcher.
         //
-        // This is a check on the READER, not a second parser: it decides
-        // nothing about what a pattern means, matches no directory and
-        // consults no path of this tree. The under-accept direction is
-        // deliberately left alone -- the parser is conservative there (it
-        // requires the trailing `/`, skips `!`, `#`, blanks and unanchored
-        // interior-`/` patterns), all four patterns this repository needs
-        // parse, and a reader that accepts too LITTLE can only make the
-        // layer below fail loudly.
-        let unsubstantiated: Vec<String> = ignored_names
-            .iter()
-            .map(|n| format!("{n}/"))
-            .chain(ignored_paths.iter().map(|p| {
-                let rel = p.strip_prefix(&root).unwrap_or(p.as_path());
+        // The conservative parse this replaces is preserved by construction
+        // rather than by rules: a comment, a negation or a blank line cannot
+        // equal either rendered pattern (`#target/`, `!target/` and `""` are
+        // all different strings from `target/`), a pattern without the
+        // trailing `/` does not say "directory" and is not rendered, and an
+        // unanchored pattern containing `/` can never equal a `<name>/`
+        // rendering. Accepting too LITTLE can only make the checks below fail
+        // loudly, so that direction is deliberately left alone.
+        //
+        // And there is no value between the check and the use. At `17459e7`
+        // the parse ran into two `mut` vectors, two asserts validated those
+        // vectors, and the consumer re-read the same vectors fifteen lines
+        // below, so both asserts were POSITIONAL SNAPSHOTS -- they constrained
+        // a value at a moment, not the value that was used. Measured at
+        // `17459e7`: retargeting `BUILD_OUTPUT_DIRS[1]` and `literals` at
+        // `deskwarden/examples` and pushing `"examples"` into `ignored_names`
+        // BELOW both asserts and ABOVE the consumer -- three edits, no assert
+        // touched, the parser untouched -- passed in the fallback
+        // configuration, debug and release, with both asserts executing and
+        // passing on the way. The identical push fifteen lines earlier died
+        // loudly. Sealing the parse behind an immutable `let` was measured NOT
+        // to fix that either: `let ignored_names = [ignored_names,
+        // vec!["examples"]].concat();` is one edit at the identical site and
+        // was measured green, probe unseen. Any design that names the reader's
+        // output and consults that name later has this window, whatever the
+        // binding's mutability -- so nothing is named. `.gitignore` is
+        // tracked, so it is present in a `git archive` export as well as a
+        // checkout, and no edit inside `login_ui.rs` can move it.
+        //
+        // The old positive control ("the parse produced SOMETHING") is gone
+        // because it can no longer have a subject: this cannot pass by having
+        // nothing to say. A reader that excludes nothing makes the check below
+        // fail with both of Cargo's build directories in its message, and a
+        // reader that excludes everything makes the ancestors check fail with
+        // this crate's own source directory in its message.
+        let excluded_by_gitignore = |d: &std::path::Path| -> bool {
+            let by_name = d.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/"));
+            let by_path = d.strip_prefix(&root).ok().map(|rel| {
                 let mut pat = String::new();
                 for c in rel.components() {
                     pat.push('/');
@@ -7762,37 +7801,22 @@ pub(crate) mod password_lifetime_tests {
                 }
                 pat.push('/');
                 pat
-            }))
-            .filter(|pat| !ignore_text.lines().any(|l| l.trim() == *pat))
-            .collect();
-        assert!(
-            unsubstantiated.is_empty(),
-            "the `.gitignore` reader in this test produced {} entr(y/ies) that `{}` does not \
-             contain, the first of them {:?}. That file is the ONE input this test has that no \
-             edit inside `login_ui.rs` can move, and the layer below is only as good as this \
-             reader: teaching the reader one extra name is a single edit that makes the anchor \
-             agree to anything, and that edit -- with `BUILD_OUTPUT_DIRS` and `literals` \
-             retargeted at `deskwarden/examples` -- was measured shipping a tracked, \
-             probe-bearing directory out of the scan, green, in the fallback configuration. \
-             Every entry here must be a line of that file, rendered back exactly",
-            unsubstantiated.len(),
-            root.join(".gitignore").display(),
-            unsubstantiated.first()
-        );
-        // **And the same reader is asked about a directory it must never be
-        // able to name: the one this very file lives in.** Also derived --
-        // the path comes from the scan's own listing, which is asserted to
-        // contain `login_ui.rs` above -- so there is no second literal here
-        // either. This closes the residual the name branch leaves open: it
-        // matches by `file_name` at ANY depth, so it is not enough that
-        // `.gitignore` really says `target/`; what matters is that no
-        // directory holding this crate's source answers to a parsed entry.
-        // If a directory literally named `target`, `.vscode` or `.idea` ever
-        // appears above a source file of this crate, this fires -- and it
-        // fires for the directory that would carry the probe, which is the
-        // only one the scan cannot afford to lose. It does NOT speak for
-        // every other tracked directory of the tree; that is what the
-        // `git ls-files` oracle and the `scanned_dirs` layer below are for.
+            });
+            ignore_text.lines().map(str::trim).any(|l| {
+                !l.is_empty() && (by_name.as_deref() == Some(l) || by_path.as_deref() == Some(l))
+            })
+        };
+
+        // **The reader is asked about the directory it must never be able to
+        // name: the one this very file lives in.** Derived -- the path comes
+        // from the scan's own listing, asserted above to contain
+        // `login_ui.rs` -- so there is no literal here either. This closes the
+        // residual the unanchored branch leaves open: it matches by
+        // `file_name()` at ANY depth, so it is not enough that `.gitignore`
+        // really says `target/`; what matters is that no directory holding
+        // this crate's source answers to it. It does NOT speak for every other
+        // tracked directory of the tree; that is what the `git ls-files` oracle
+        // and the `scanned_dirs` layer below are for.
         let own = files
             .iter()
             .find(|p| p.ends_with("login_ui.rs"))
@@ -7801,12 +7825,7 @@ pub(crate) mod password_lifetime_tests {
             .ancestors()
             .skip(1)
             .take_while(|a| *a != root.as_path() && a.starts_with(&root))
-            .filter(|a| {
-                ignored_paths.iter().any(|p| p == *a)
-                    || a.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| ignored_names.iter().any(|i| *i == n))
-            })
+            .filter(|a| excluded_by_gitignore(a))
             .collect();
         assert!(
             ignored_ancestors.is_empty(),
@@ -7820,13 +7839,7 @@ pub(crate) mod password_lifetime_tests {
         );
         let unignored: Vec<&std::path::PathBuf> = const_dirs
             .iter()
-            .filter(|d| {
-                !ignored_paths.iter().any(|p| p == *d)
-                    && !d
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| ignored_names.iter().any(|i| *i == n))
-            })
+            .filter(|d| !excluded_by_gitignore(d))
             .collect();
         assert!(
             unignored.is_empty(),
