@@ -682,45 +682,70 @@ mod tests {
             .collect()
     }
 
-    /// Every `.rs` file under this crate's `src`, recursively.
+    /// EVERY file under `dir`, recursively, whatever it is named.
     ///
-    /// **The extension compare is case-INSENSITIVE, and that is the whole
-    /// point of it.** It used to be `== Some(OsStr::new("rs"))`, a
-    /// case-SENSITIVE compare run over a case-INSENSITIVE filesystem. This is
-    /// Windows: `deskwarden/aid.RS` is a file rustc happily compiles, and
-    /// measured on the commit before this one,
+    /// **There is no extension filter here, and its absence is the point.**
+    /// The three previous rounds of this one bug were `spawn_aid`->`icon_aid`,
+    /// `aid.rs`->`aid.RS`, and `aid.RS`->`aid.txt`; each one widened an
+    /// enumeration of names instead of deleting it, and the next spelling won.
     ///
-    ///     // deskwarden/aid.RS -- a NEW file
-    ///     pub fn hint() { .. <the CLI, started> .. }
+    /// rustc does not care what a module file is called. `#[path]` accepts any
+    /// name at all, and measured on the commit before this one,
+    ///
+    ///     // src/aid.txt -- a NEW file
+    ///     #[allow(dead_code)]
+    ///     pub fn hint() { .. <a child process, started> .. }
     ///
     ///     // prepended to src/tray.rs
-    ///     #[path = "../aid.RS"]
+    ///     #[path = "aid.txt"]
     ///     mod aid;
     ///
-    /// SURVIVED the whole suite at 2111 / 217 / 1 ignored / 0 failed. It
-    /// COMPILED -- so rustc read it -- while this walk did not list it, the
-    /// crate-root set equality below did not list it, and
-    /// [`direct_child_starts`] therefore never opened it. `src/aid.RS` works
-    /// the same way with no crate root involved at all. The `#[path]` refusal
-    /// elsewhere in this module covers only files inside the fenced closure;
-    /// `src/tray.rs` is not one of them.
+    /// SURVIVED the whole suite at 2113 / 217 / 2 ignored / 0 failed / 0
+    /// warnings. It COMPILED -- replacing the body with `this is not rust`
+    /// yields `error: expected one of ! or ::, found is --> src\aid.txt:1:6`,
+    /// so rustc really read it -- while an extension-filtered walk did not
+    /// list it, the crate-root set equality below did not list it, and
+    /// [`direct_child_starts`] therefore never opened it. The `#[path]`
+    /// refusal elsewhere in this module covers only files inside the fenced
+    /// reachable-module closure; `src/tray.rs` is not one of them.
     ///
-    /// A case-sensitive extension compare is a denylist with exactly one
-    /// entry in it, and `.RS`/`.Rs`/`.rS` are the spellings it loses to.
-    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    /// So: walk everything. [`the_two_job_bearing_modules_can_start_a_child_only_through_this_one`]
+    /// splits the result -- anything classified `.rs` goes through the existing
+    /// content scans, and everything else is held by a SET EQUALITY, so a new
+    /// `aid.txt` (or `aid`, or `aid.md`, or `aid.rs.bak`) is a visible edit to
+    /// a list in this file rather than a file nothing ever opens. There is no
+    /// remaining spelling to lose to, because there is no enumeration of
+    /// spellings left.
+    fn all_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                rust_sources(&path, out);
-            } else if is_rust_source(&path) {
+                all_files(&path, out);
+            } else {
                 out.push(path);
             }
         }
     }
 
-    /// Whether `path` names a Rust source file, deciding it the way the
-    /// FILESYSTEM does rather than the way a byte compare does. See
-    /// [`rust_sources`] for the mutant that made this its own function.
+    /// Every `.rs` file under `dir`, recursively -- [`all_files`] narrowed to
+    /// the ones the content scans know how to read. Callers that only scan
+    /// Rust text use this; the file-set pins use [`all_files`] directly.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut all = Vec::new();
+        all_files(dir, &mut all);
+        out.extend(all.into_iter().filter(|p| is_rust_source(p)));
+    }
+
+    /// Whether `path` is classified as Rust source, deciding it the way the
+    /// FILESYSTEM does rather than the way a byte compare does.
+    ///
+    /// This is NO LONGER a gate on whether a file is looked at -- [`all_files`]
+    /// looks at all of them. It only routes: `true` means "scan its text with
+    /// the Rust rules", `false` means "hold it by name in the set equality".
+    /// Both branches are covered, so a wrong answer here is a mis-route, not a
+    /// blind spot. The case-insensitive compare stays because `aid.RS` is a
+    /// file rustc compiles on this filesystem and it should be SCANNED, not
+    /// merely listed.
     fn is_rust_source(path: &std::path::Path) -> bool {
         path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
     }
@@ -729,15 +754,24 @@ mod tests {
     fn a_rust_source_is_recognised_however_its_extension_is_cased() {
         // The sixteenth hop, as a unit: every casing of the extension is a
         // file rustc will compile on this filesystem, so every casing has to
-        // be walked. `aid.RS` is the exact spelling that SURVIVED.
+        // be SCANNED. `aid.RS` is the exact spelling that SURVIVED.
         for name in ["aid.rs", "aid.RS", "aid.Rs", "aid.rS", "src/tray.RS"] {
             assert!(
                 is_rust_source(std::path::Path::new(name)),
-                "{name} is a Rust source file this walk would not have opened"
+                "{name} is a Rust source file whose text would not be scanned"
             );
         }
+        // These are NOT ignored -- that was the seventeenth hop, and
+        // `assert!(!is_rust_source("aid.txt"))` was the last commit asserting
+        // the hole. `#[path = "aid.txt"] mod aid;` compiles. They are held by
+        // the non-`.rs` set equality instead, which is a stronger rule than a
+        // scan: it refuses the file's EXISTENCE rather than inspecting its
+        // contents. This loop only says which of the two rules applies.
         for name in ["aid.rst", "aid.txt", "Cargo.toml", "aid", "aid.rs.bak"] {
-            assert!(!is_rust_source(std::path::Path::new(name)), "{name} is not Rust source");
+            assert!(
+                !is_rust_source(std::path::Path::new(name)),
+                "{name} is held by the non-Rust file set equality, not by the Rust text scans"
+            );
         }
     }
 
@@ -807,8 +841,15 @@ mod tests {
         // file. A walk sees whole files, and sees files that do not exist yet.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = root.join("src");
-        let mut files = Vec::new();
-        rust_sources(&src, &mut files);
+        let mut src_all = Vec::new();
+        all_files(&src, &mut src_all);
+        let mut files: Vec<std::path::PathBuf> =
+            src_all.iter().filter(|p| is_rust_source(p)).cloned().collect();
+        // Everything under `src/` that is NOT classified `.rs`. Collected, not
+        // discarded: `#[path = "aid.txt"] mod aid;` is a module, and the pin
+        // below is what makes such a file a visible edit.
+        let mut foreign: Vec<std::path::PathBuf> =
+            src_all.iter().filter(|p| !is_rust_source(p)).cloned().collect();
 
         // AND `build.rs`, WHICH IS NOT UNDER `src/`.
         //
@@ -1019,35 +1060,93 @@ mod tests {
         );
         assert_ne!(as_patched.len(), manifest.len(), "control: the length half is vacuous");
 
-        // AND NO `.cargo/` DIRECTORY, IN THIS CRATE OR BESIDE IT.
+        // AND NO `.cargo` ANYWHERE IN THE TREE.
         //
         // `.cargo/config.toml` is read by cargo and by nothing in this module.
         // `[source.crates-io] replace-with = "mine"` plus a `[source.mine]`
         // pointing at a local directory or a git mirror re-points EVERY
         // registry name at once, without touching `Cargo.toml` at all -- so
-        // the whole-file pin above would not see it. Cargo reads config from
-        // the invocation directory upward, so both the crate directory and its
-        // parent (the repo root, from which `cargo test -p deskwarden` is
-        // also run) are refused.
+        // the whole-file pin above would not see it. `[build] rustc-wrapper`
+        // is stronger still: it runs an arbitrary executable on EVERY compile
+        // unit, and it is the strongest build-time vector this module knows of.
         //
-        // Neither exists today, and neither has any reason to: this crate
-        // needs no registry, target or linker configuration. "Absent" is a
-        // property a set equality can hold; "present but harmless" is not.
-        for dir in [Some(root.join(".cargo")), root.parent().map(|p| p.join(".cargo"))]
-            .into_iter()
-            .flatten()
-        {
-            assert!(
-                !dir.exists(),
-                "{} exists. A `.cargo/config.toml` there can re-point every crates.io name at \
-                 once with `[source.crates-io] replace-with`, which is the `Cargo.toml` pin \
-                 above defeated from outside the file it pins -- the pinned `build.rs` would \
-                 then call into whatever that source serves. If this crate genuinely needs \
-                 cargo configuration, pin that file's contents here the way `Cargo.toml` and \
-                 `build.rs` are pinned; do not simply delete this assertion",
-                dir.display()
-            );
+        // This used to name TWO LOCATIONS -- the crate directory and its
+        // parent. That is the same denylist shape as the extension filter,
+        // written in paths instead of spellings, and it lost the same way.
+        // Measured on the commit before this one:
+        //
+        //     deskwarden/src/.cargo/config.toml
+        //     [build]
+        //     rustc-wrapper = "<..>/wrap.exe"
+        //
+        // run as `cd deskwarden/src && cargo test -j 8`, SURVIVED at
+        // 2113 / 217 / 2 / 0 failed -- and the wrapper's marker file was
+        // written, so an arbitrary program provably ran on every compile unit.
+        // `src/` is skipped by the crate-root loop and is neither `root` nor
+        // `root.parent()`, so nothing looked there. `examples/`, `tests/`,
+        // `installer/`, `docs/`, `.github/`, `src/injector/` and
+        // `src/vault_window/` are all the same, and all committable: cargo
+        // honours `.cargo/config.toml` in EVERY ancestor of the invocation
+        // directory, and any directory in this repo can be an invocation
+        // directory.
+        //
+        // So the rule is now a location-free one: no `.cargo` exists anywhere
+        // in the repo. Walked from the repo root, so it covers the crate, its
+        // parent, and every directory under either.
+        //
+        // What was already right and is KEPT: within a directory the check is
+        // on the `.cargo` ENTRY, not on `config.toml`. `config.toml`, an
+        // extensionless `config` (cargo still reads it), and even a plain
+        // FILE named `.cargo` all trip it. The name compare is
+        // case-insensitive for the same reason `is_rust_source` is -- this
+        // filesystem is.
+        //
+        // None exists today, and none has any reason to: this crate needs no
+        // registry, target or linker configuration. "Absent" is a property a
+        // set equality can hold; "present but harmless" is not.
+        //
+        // Disclosed: `target/` and `.git/` are not descended into. Neither is
+        // committable content, and cargo would only read a `.cargo` inside
+        // them if the invocation directory were inside them too.
+        fn dot_cargo_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+                if name == ".cargo" {
+                    out.push(path);
+                    continue;
+                }
+                if path.is_dir() && name != "target" && name != ".git" {
+                    dot_cargo_under(&path, out);
+                }
+            }
         }
+        let repo = root.parent().unwrap_or(root);
+        let mut cargo_dirs = Vec::new();
+        dot_cargo_under(repo, &mut cargo_dirs);
+        assert!(
+            cargo_dirs.is_empty(),
+            "{:?} exist(s). A `.cargo/config.toml` ANYWHERE above a directory cargo is invoked \
+             from is read: `[source.crates-io] replace-with` re-points every crates.io name at \
+             once, and `[build] rustc-wrapper` runs an arbitrary executable on every compile \
+             unit. That is the `Cargo.toml` pin above defeated from outside the file it pins. \
+             THE FIX IS NOT TO ADD A DIRECTORY TO A LIST -- a two-location version of this \
+             assertion is exactly what `src/.cargo/config.toml` walked past. If this crate \
+             genuinely needs cargo configuration, pin that file's contents here the way \
+             `Cargo.toml` and `build.rs` are pinned; do not simply delete this assertion",
+            cargo_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+        );
+
+        // DELIBERATELY OUT OF SCOPE, recorded so it is not re-litigated every
+        // round. `RUSTFLAGS`, `CARGO_TARGET_DIR`, `~/.cargo/config.toml` and
+        // cargo aliases all change what a build does, and none of them is
+        // COMMITTABLE: they live in the developer's environment or home
+        // directory, not in this repository. A test in this repository can
+        // only guard what the repository can carry, and an attacker who can
+        // already set the victim's environment does not need a build script.
+        // The one committable member of that family is a `[profile]` override,
+        // and that lives in `Cargo.toml`, which is byte-pinned above.
 
         // AND THE RESOLVED IDENTITY OF THAT DEPENDENCY, WHICH LIVES IN
         // `Cargo.lock` RATHER THAN IN `Cargo.toml`.
@@ -1063,10 +1162,27 @@ mod tests {
         // between lock files`, before a single test ran. What is left is a
         // swap to a genuinely published version, and that is what this pins.
         //
-        // The checksum is the crate archive's own hash, so pinning it pins
-        // the BYTES that get compiled and run at build time -- which is the
-        // property this whole block is about. It costs one edit when
+        // READ THIS PIN'S STATUS HONESTLY: it is UNVERIFIED IN EFFECT, not
+        // merely unmeasured. Every lock mutant that can be built offline here
+        // -- version swap, forged checksum, a second entry -- dies to CARGO'S
+        // OWN `checksum ... changed between lock files` check before a single
+        // test runs, because `winresource-0.1.31` is the only archive of that
+        // crate in the local registry cache. So no mutant has ever reached
+        // these two assertions; the line that is actually holding today is
+        // cargo's, not this one. Constructing a unique kill needs a second
+        // genuinely-published version already vendored, i.e. a network fetch.
+        // Its marginal value is confined to a swap between two published
+        // versions -- real, but narrow -- and `winresource_entries == 1` is
+        // dead weight for the same reason. KEPT anyway: the checksum is the
+        // crate archive's own hash, so pinning it pins the BYTES that get
+        // compiled and run at build time, and it costs one edit when
         // `winresource` is deliberately upgraded, which is roughly annual.
+        //
+        // The CRLF normalisation is not cosmetic: cargo REWRITES `Cargo.lock`
+        // with LF line endings on Windows after any resolve (a `[patch]`
+        // table, a version bump), so a raw compare would break on the next
+        // legitimate dependency edit for a reason that has nothing to do with
+        // what changed.
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap().replace("\r\n", "\n");
         let winresource_entries = lock.matches("name = \"winresource\"\n").count();
         assert_eq!(
@@ -1140,19 +1256,118 @@ mod tests {
         // graph lives there. Disclosed rather than claimed complete: a
         // `#[path]` reaching INTO `target/` would not be seen here. Nothing
         // in this crate writes `#[path]` at all today.
-        let mut root_files = Vec::new();
+        let mut root_all = Vec::new();
         for entry in std::fs::read_dir(root).unwrap() {
             let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // Lowercased: this is a case-insensitive filesystem, so `Target/`
+            // and `SRC/` name the same directories `target/` and `src/` do.
+            // Harmless in the skip direction, but it is the same latent shape
+            // the extension filter had and it is not worth keeping two answers
+            // to "is this the same name".
+            let name = path.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
             if path.is_dir() {
                 if name == "src" || name == "target" {
                     continue;
                 }
-                rust_sources(&path, &mut root_files);
-            } else if is_rust_source(&path) {
-                root_files.push(path);
+                all_files(&path, &mut root_all);
+            } else {
+                root_all.push(path);
             }
         }
+        let root_files: Vec<std::path::PathBuf> =
+            root_all.iter().filter(|p| is_rust_source(p)).cloned().collect();
+        foreign.extend(root_all.into_iter().filter(|p| !is_rust_source(p)));
+
+        // EVERY NON-RUST FILE IN THE CRATE, BY NAME.
+        //
+        // The seventeenth hop, closed. `#[path]` takes any name -- `aid.txt`,
+        // `aid`, `notes.md` -- so "is it `.rs`?" cannot decide whether a file
+        // is code. It decides only which RULE applies: a `.rs` goes through
+        // the scans above, and everything else has to be listed here.
+        //
+        // A set equality rather than a scan, for the same reason the crate
+        // root is one: these are assets and metadata, they do not accumulate,
+        // and the honest rule is "these files and no others". A new one is a
+        // visible edit to this list. That is strictly stronger than scanning
+        // the file would be -- it refuses the file's existence rather than
+        // inspecting its contents, so it does not matter what a `#[path]`
+        // module written in one would have contained.
+        //
+        // `src/` currently contains NO non-Rust file at all, which is why
+        // nothing below is under `src/`. That is the property being pinned.
+        //
+        // BUILD OUTPUT AND EDITOR NOISE ARE EXCLUDED, and the exclusion is
+        // tied to the file that justifies it. The threat this list answers is
+        // a COMMITTED file: a `#[path]` module only reaches a victim if the
+        // repository can carry it. Everything named in `NOT_COMMITTABLE` below
+        // is refused by the repo's own `.gitignore` -- the Inno Setup
+        // installer this crate builds lands in `installer/` and really is
+        // present in a developer's tree -- so a set equality that failed on
+        // them would be red for every developer who has ever run the installer
+        // build, and a test that is always red guards nothing. Each entry
+        // names the `.gitignore` line it relies on and that line is asserted
+        // present, so deleting the ignore rule (which is what would make such
+        // a file committable) reds this test rather than silently widening it.
+        const NOT_COMMITTABLE: &[(&str, &str)] = &[
+            ("installer/*.exe", "/deskwarden/installer/*.exe"),
+            ("*.rs.bk", "**/*.rs.bk"),
+            ("*.pdb", "*.pdb"),
+            ("Thumbs.db", "Thumbs.db"),
+            ("Desktop.ini", "Desktop.ini"),
+            (".vscode/", ".vscode/"),
+            (".idea/", ".idea/"),
+        ];
+        let gitignore = std::fs::read_to_string(repo.join(".gitignore"))
+            .expect("the repo `.gitignore` is what makes the exclusions below non-committable")
+            .replace("\r\n", "\n");
+        for (_, rule) in NOT_COMMITTABLE {
+            assert!(
+                gitignore.lines().any(|l| l.trim() == *rule),
+                "`.gitignore` no longer carries `{rule}`, so files it covers ARE committable \
+                 now and the non-Rust file set equality below must stop excusing them"
+            );
+        }
+        let excluded = |rel: &str| {
+            NOT_COMMITTABLE.iter().any(|(pat, _)| match *pat {
+                "installer/*.exe" => rel.starts_with("installer/") && rel.ends_with(".exe"),
+                p if p.starts_with('*') => rel.ends_with(p.trim_start_matches('*')),
+                p if p.ends_with('/') => rel.starts_with(p) || rel.contains(&format!("/{p}")),
+                p => rel == p || rel.ends_with(&format!("/{p}")),
+            })
+        };
+        let mut foreign_names: Vec<String> = foreign
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"))
+            .filter(|rel| !excluded(rel))
+            .collect();
+        foreign_names.sort();
+        assert_eq!(
+            foreign_names,
+            vec![
+                "Cargo.lock",
+                "Cargo.toml",
+                "LICENSE",
+                "README.md",
+                "assets/deskwarden.ico",
+                "assets/fonts/Archivo-Bold.ttf",
+                "assets/fonts/Archivo-ExtraBold.ttf",
+                "assets/fonts/Archivo-Regular.ttf",
+                "assets/fonts/Archivo-SemiBold.ttf",
+                "assets/fonts/OFL.txt",
+                "assets/generate-icon.py",
+                "deny.toml",
+                "installer/README.md",
+                "installer/bootstrap-bw.ps1",
+                "installer/deskwarden.iss",
+            ],
+            "the set of NON-Rust files in this crate changed. rustc does not care what a module \
+             file is called -- `#[path = \"aid.txt\"] mod aid;` compiles, and that exact mutant \
+             SURVIVED the round before this list existed, because every walk here filtered on \
+             the `.rs` extension first. Any file, under any name, can be a module. If this is a \
+             genuine new asset, add it here; if it is a new module reached by `#[path]`, it is \
+             the seventeenth hop and the answer is no"
+        );
+
         let mut root_names: Vec<String> = root_files
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"))
@@ -1190,6 +1405,87 @@ mod tests {
                 "the source walk never reached {expected}; it found {names:?}"
             );
         }
+
+        // AND NO `#[path]` ATTRIBUTE ANYWHERE IN THE CRATE.
+        //
+        // THE PRIMARY RULE, and the one the seventeenth hop should have got
+        // instead of a third widened enumeration. `#[path]` is the ONLY way a
+        // module can live in a file the module system would not otherwise
+        // name; without it, a Rust file's path is determined by its `mod`
+        // declarations and `aid.txt` is inert text. Every mutant in this
+        // family -- `aid.rs`, `aid.RS`, `aid.txt`, `aid` with no extension at
+        // all, and a `#[path]` reaching into `target/` or into any file the
+        // set equality above excuses -- needs this attribute, and none of them
+        // survives its absence. That is a property of the attribute rather
+        // than of the file it names, so unlike a filename list it cannot lose
+        // to a spelling.
+        //
+        // The set equality above is the SECOND layer, and it is kept: it also
+        // refuses a `build.rs`-`include!`, an `include_str!` payload, and a
+        // new asset nobody meant to ship. Two independent rules, both cheap.
+        //
+        // Read through the STRIPPED view, so `# [ path = "x" ]`,
+        // `#[/*c*/path="x"]` and an attribute split across lines are one
+        // string, and so the several dozen times this file MENTIONS the
+        // attribute in prose and in assertion messages are not hits. The
+        // needles are the three characters that can precede the key in an
+        // attribute -- `[` for `#[path]`, `,` and `(` for
+        // `#[cfg_attr(windows, path = "..")]` -- which is what keeps
+        // `let path = ..` (whitespace-stripped to `letpath=`) out.
+        //
+        // There is exactly one `#[path]` refusal elsewhere in this module and
+        // it applies only to files inside the fenced reachable-module closure.
+        // This one has no fence: it is every file the walk above found,
+        // `build.rs` and the examples included.
+        //
+        // AND NO BARE `include!` EITHER, for the same reason and measured the
+        // same way. `include!("assets/generate-icon.py")` compiles an
+        // arbitrary file's bytes as ITEMS, exactly as `#[path]` does, and it
+        // needs no new file: measured on this round, rewriting the ALREADY
+        // LISTED `assets/generate-icon.py` into Rust, `include!`-ing it from
+        // `build.rs` and RE-BASELINING the `build.rs` whole-file pin in the
+        // same edit SURVIVED at 2114 / 217 / 2 / 0 failed -- with a marker
+        // file written from the build script, so a child process really
+        // started at build time. The set equality above holds NAMES, not
+        // CONTENT, and that mutant changed no name.
+        //
+        // This is the rule the re-baselining does not satisfy. Re-pinning the
+        // hash makes the pin agree with the new `build.rs`; it does not make
+        // `build.rs` stop containing an `include!`. Two rules read the same
+        // file and only one of them moves when it is legitimately re-pinned.
+        //
+        // `include_str!` and `include_bytes!` are NOT refused and do not match
+        // this needle: this crate uses them heavily (every source pin in it is
+        // an `include_str!` of its own file), and they embed DATA. Disclosed:
+        // an `include_str!` payload is inert until something interprets it,
+        // and nothing here does.
+        let mut path_attrs = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let code = code_only(&text);
+            let hits: usize = ["[path=", ",path=", "(path=", concat!("include", "!(")]
+                .iter()
+                .map(|n| code.matches(n).count())
+                .sum();
+            if hits > 0 {
+                let rel = file.strip_prefix(root).unwrap_or(file);
+                path_attrs.push(format!("{} ({hits})", rel.to_string_lossy().replace('\\', "/")));
+            }
+        }
+        assert!(
+            path_attrs.is_empty(),
+            "{path_attrs:?} carry a `#[path = ..]` attribute or a bare `include!`. Nothing in \
+             this crate has ever needed either, and between them they are the single \
+             ingredient every module-smuggling mutant this module has measured requires: they \
+             compile a file the module system would never name on its own, under ANY \
+             extension -- `aid.rs`, `aid.RS`, `aid.txt` and `aid` all compiled, and the first \
+             three each cost a round because the fix widened a list of filenames instead of \
+             refusing the attribute. `include!` is the same thing without a new filename: it \
+             SURVIVED this round pointed at an already-listed asset with the `build.rs` pin \
+             re-baselined. `include_str!` and `include_bytes!` embed data and are untouched \
+             by this. If a module genuinely has to live somewhere unusual, say so here and \
+             say why in the commit message; do not delete this assertion"
+        );
 
         // Files allowed to start a child outside the job, each because it
         // really does today and for a reason that is not this module's to
