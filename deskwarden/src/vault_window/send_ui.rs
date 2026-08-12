@@ -658,14 +658,6 @@ pub const DELETING_LABEL: &str = "Revoking\u{2026}";
 /// its own outline.
 const TAG_PAD_X: f32 = 6.0;
 
-/// Draws the whole Sends screen and reports what was clicked.
-///
-/// `notice` is the message the window's single inline band is showing this
-/// frame, already chosen by `vault_window::inline_notice` -- this function
-/// does not decide which of the window's messages wins, it only paints the
-/// one it is handed. That is the same split every other pane in this window
-/// uses, and it is why a Sends failure is a `NoticeSource` rather than a
-/// widget of its own.
 /// The heading the Sends PANE paints at the top of its own screen.
 ///
 /// Named because the matrix test counts it: the pane's heading and
@@ -677,6 +669,14 @@ const TAG_PAD_X: f32 = 6.0;
 /// blank. The two constants are pinned equal by the matrix itself.
 pub const SENDS_HEADING: &str = "Sends";
 
+/// Draws the whole Sends screen and reports what was clicked.
+///
+/// `notice` is the message the window's single inline band is showing this
+/// frame, already chosen by `vault_window::inline_notice` -- this function
+/// does not decide which of the window's messages wins, it only paints the
+/// one it is handed. That is the same split every other pane in this window
+/// uses, and it is why a Sends failure is a `NoticeSource` rather than a
+/// widget of its own.
 pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
