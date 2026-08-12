@@ -518,6 +518,11 @@ pub fn build_frame(
     // other two, and `frame_promptness` hands one that answers instead.
     let spawn_send_list = env.send_list;
     let spawn_export = env.export;
+    // The fifth, and the destructive one. Named here rather than at the call
+    // site so that a test can press the real Delete row on a real frame
+    // without a `bw send delete` -- which is the only kind of pin that has
+    // survived over this wiring. See `VaultFrameEnv::send_delete`.
+    let spawn_send_delete = env.send_delete;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -3315,7 +3320,7 @@ pub fn build_frame(
             ui.ctx(),
             &send_delete_tx,
             &session_token,
-            send_delete_thread::spawn_send_delete,
+            spawn_send_delete,
         );
 
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
@@ -3533,15 +3538,25 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// `vault_window` can name a field or build one positionally. Inside the
 /// module there are exactly two constructors, and the only one that exists
 /// in a production build is [`VaultFrameEnv::production`], whose body names
-/// `spawn_vault_sync` and `spawn_vault_load` and nothing else. The other is
+/// the four module-level spawn functions the frame's call sites used to
+/// name directly, and defines nothing of its own. The other is
 /// `frame_env_seam::stubbed` at the very bottom of this file, inside a
 /// module gated to the test configuration: it is not compiled into the
 /// binary the user runs at all. So the set of things this seam can spawn in
-/// production is the same one-element set it was before the seam existed --
-/// the seam widens what a TEST can substitute, not what production can
-/// reach, and
+/// production is the same set it was before the seam existed -- the seam
+/// widens what a TEST can substitute, not what production can reach.
+///
+/// **Two pins, and they cover different things.**
 /// `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`
-/// holds that from the source.
+/// reads the SOURCE: it holds that there is one constructor, that the test
+/// gate on the other is intact, that this one names each of the five spawn
+/// functions exactly once, and that it defines nothing of its own. That is a
+/// pin on SPELLING: a wrapper `fn spawn_export` in some other module would
+/// satisfy the needle while doing nothing. What pins the VALUE is
+/// [`export_wiring::production_hands_the_window_the_real_functions`], which
+/// compares every field of `production()` against the real function BY
+/// ADDRESS -- so a rename, a wrapper, a feature-flagged forwarder or a no-op
+/// fails it whatever it is called and wherever it is written.
 ///
 /// **Why the substitute is not an inherent method beside**
 /// **[`VaultFrameEnv::production`].** Every source guard in this file cuts
@@ -3584,6 +3599,23 @@ pub struct VaultFrameEnv {
     /// fourth layer. `export_wiring::clicking_the_export_row_really_starts_an_export`
     /// clicks the row on a real frame and reads what came through here.
     export: ExportSpawn,
+    /// `send_delete_thread::spawn_send_delete` in production -- the Sends
+    /// row's Delete/confirm pair, the only thing in this program that starts
+    /// a `bw send delete`.
+    ///
+    /// Here for the export field's reason, arrived at from the same defeat.
+    /// The call to [`apply_send_action`] was held by BRACE DEPTH against a
+    /// sibling statement, and depth is a statement about where the call is
+    /// written, never about what its argument HOLDS when control arrives.
+    /// Two shadows were measured green through it -- `let send_action = {
+    /// drop(send_action); SendUiAction::None };` and the plausible-developer
+    /// `let send_action = if send_delete.report.is_some() { None } else {
+    /// send_action };` -- each leaving the call, its arguments and its depth
+    /// byte-identical while every control on the Sends screen did nothing.
+    /// Behind this seam the row can be PRESSED on a real frame and the
+    /// revoke observed at the point of effect, with no `bw` child: see
+    /// `send_delete_wiring::clicking_delete_on_a_send_row_really_revokes_it`.
+    send_delete: SendDeleteSpawn,
     /// `settings::default_path()` in production. A test hands a path under
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
@@ -3598,6 +3630,7 @@ impl VaultFrameEnv {
             load: spawn_vault_load,
             send_list: send_fetch_thread::spawn_send_list,
             export: export_thread::spawn_export,
+            send_delete: send_delete_thread::spawn_send_delete,
             settings_path: crate::settings::default_path(),
         }
     }
@@ -5661,12 +5694,17 @@ impl SendDeleteState {
 /// destructive path is a function instead: there is no arm here to shadow,
 /// because the `match` is inside a function the tests call.
 ///
-/// **The one thing left in the frame closure is the call**, and its
-/// reachability is held by `send_delete_wiring::the_frame_applies_the_sends_action_unconditionally`,
-/// which pins the call's BRACE DEPTH against a known sibling statement --
-/// so any wrapping `if`, `match` or block that could gate it is one level
-/// deeper than the pin allows and fails. That is a reachability pin and not a
-/// content pin, and it is the answer to the defeat above.
+/// **The one thing left in the frame closure is the call**, and what holds it
+/// is `send_delete_wiring::clicking_delete_on_a_send_row_really_revokes_it`:
+/// a real window, driven to the Sends screen the only way there is, with the
+/// real Delete row and the real confirmation pressed, and the revoke observed
+/// where it leaves the frame. `the_frame_applies_the_sends_action_unconditionally`
+/// is beside it and is SECONDARY and disclosed as such: brace depth pins
+/// WHERE THE CALL IS WRITTEN, and a call written in exactly the right place
+/// applied to an argument neutralised on the line above is a dead screen at
+/// byte-identical depth. Two such shadows were measured green against that
+/// pin alone -- see [`VaultFrameEnv::send_delete`] for both -- and neither
+/// survives the click.
 ///
 /// Nothing here blocks. `spawn` is a `std::thread::spawn` and returns at once.
 #[allow(clippy::too_many_arguments)]
@@ -17108,6 +17146,111 @@ mod export_wiring {
         );
     }
 
+
+    // -----------------------------------------------------------------
+    // What production's env HOLDS, by address
+    // -----------------------------------------------------------------
+
+    /// **Every field of the production `VaultFrameEnv` is the real function,
+    /// compared BY ADDRESS.**
+    ///
+    /// `send_ui`'s `production_is_the_only_env_a_shipping_build_has` reads the
+    /// constructor's source and requires it to name each spawn exactly once
+    /// and to define nothing of its own. That is a pin on SPELLING, and a
+    /// reviewer's measurement is why it is not the only one here. This
+    /// survived the whole suite at zero warnings:
+    ///
+    /// ```ignore
+    /// /// Exports are gated behind a setting.
+    /// fn export_when_enabled(c: egui::Context, t: ExportSender, s: Zeroizing<String>) {
+    ///     if EXPORTS_ENABLED { export_thread::spawn_export(c, t, s); }
+    /// }
+    /// const EXPORTS_ENABLED: bool = false;
+    /// // in production(): export: export_when_enabled,
+    /// ```
+    ///
+    /// The needle `export_thread::spawn_export` is still spelled, inside a
+    /// wrapper written at module level so the constructor still defines
+    /// nothing; the row is inert for every user forever; nothing warns,
+    /// because the wrapper is used and the constant is read. The behavioural
+    /// test above cannot see it either -- it substitutes the pointer through
+    /// the seam, so what it observes is what the HARNESS supplied, never what
+    /// `production` supplies.
+    ///
+    /// This is the assertion that joins the two. It takes the value
+    /// `production()` really builds and compares each field's address with the
+    /// address of the real function. `export_when_enabled` is not
+    /// `spawn_export`, whatever it is named and wherever it is written, so it
+    /// fails here -- and so does any forwarder, any rename and any no-op.
+    ///
+    /// **What this does NOT cover, plainly.** It says the pointer is the right
+    /// FUNCTION; it says nothing about what that function does. A hollowed-out
+    /// `spawn_export` passes this and is caught by `export_thread`'s own
+    /// tests. It also says nothing about whether the frame ever reads the
+    /// field -- that is the click tests, above and in `send_delete_wiring`.
+    /// The three together are what hold the seam: the source pin says the
+    /// constructor is the only one, this says its values are real, and the
+    /// clicks say the window uses them.
+    #[test]
+    fn production_hands_the_window_the_real_functions() {
+        let env = VaultFrameEnv::production();
+
+        // Typed `let`s rather than casts off the `fn` items, so each one is a
+        // `fn` POINTER of exactly the field's type before any address is
+        // taken -- a signature drift is a compile error here rather than a
+        // silently different address.
+        let real_sync: fn(mpsc::Sender<Result<(), String>>, String) = spawn_vault_sync;
+        let real_load: fn(
+            Arc<VaultCache>,
+            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            VaultLoadRequest,
+        ) = spawn_vault_load;
+        let real_send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>) =
+            send_fetch_thread::spawn_send_list;
+        let real_export: ExportSpawn = export_thread::spawn_export;
+        let real_delete: SendDeleteSpawn = send_delete_thread::spawn_send_delete;
+
+        let checked: [(&str, bool); 5] = [
+            ("sync", std::ptr::fn_addr_eq(env.sync, real_sync)),
+            ("load", std::ptr::fn_addr_eq(env.load, real_load)),
+            ("send_list", std::ptr::fn_addr_eq(env.send_list, real_send_list)),
+            ("export", std::ptr::fn_addr_eq(env.export, real_export)),
+            ("send_delete", std::ptr::fn_addr_eq(env.send_delete, real_delete)),
+        ];
+        for (field, same) in checked {
+            assert!(
+                same,
+                "`VaultFrameEnv::production` hands the window something other than the real \
+                 function in its {field:?} field. A wrapper, a forwarder or a flag-gated \
+                 no-op still SPELLS the name the source pin looks for and still leaves the \
+                 constructor defining nothing of its own, and the click tests cannot see it \
+                 because they substitute this pointer. This is the assertion it fails"
+            );
+        }
+
+        // CONTROL: the comparison discriminates. A function of the right
+        // SIGNATURE that is not the right function reads as different -- so
+        // "same" above is not something every pair of `fn` pointers has.
+        let decoy: ExportSpawn = not_the_export_spawner;
+        assert!(
+            !std::ptr::fn_addr_eq(env.export, decoy),
+            "control: a different function of the same signature compares EQUAL to the \
+             production export spawner, so every assertion above is vacuous"
+        );
+        // And the real one really does compare equal to itself, so the
+        // control above is not passing because comparison always says `false`.
+        assert!(
+            std::ptr::fn_addr_eq(real_export, real_export),
+            "control: `fn_addr_eq` answers `false` for one function against itself"
+        );
+    }
+
+    /// The decoy [`production_hands_the_window_the_real_functions`] compares
+    /// against: `ExportSpawn`'s signature exactly, and nothing else.
+    fn not_the_export_spawner(_: egui::Context, _: ExportSender, _: zeroize::Zeroizing<String>) {
+        unreachable!("never called -- this exists to have an address");
+    }
+
     // -----------------------------------------------------------------
     // THE PRIMARY HOLD: the row is observed at the point of effect
     // -----------------------------------------------------------------
@@ -18115,6 +18258,513 @@ mod send_delete_wiring {
 
     /// Invented. No real session token appears in this file.
     const SESSION: &str = "an-invented-session-token-not-a-real-one";
+
+
+    // ==================================================================
+    // THE PRIMARY HOLD: the Sends row is observed at the point of effect
+    // ==================================================================
+
+    /// Every revoke the FRAME started, as a [`SendDeleteSpawn`].
+    ///
+    /// A `static` and not a `thread_local!`, unlike [`SPAWNS`]: the seam is a
+    /// bare `fn` pointer by design, so there is nowhere to capture a recorder,
+    /// and [`FRAME_LOCK`] is what keeps two tests out of each other's records.
+    static FRAME_REVOKES: std::sync::Mutex<Vec<(String, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    static FRAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The frame's OWN report channel, kept by the spawner, so the test can
+    /// put a revoke report into the window without a `bw send delete`.
+    static FRAME_TX: std::sync::Mutex<Option<SendDeleteSender>> = std::sync::Mutex::new(None);
+
+    /// The session this harness's window is unlocked with.
+    const FRAME_SESSION: &str = "frame-harness-session-token";
+    /// The one Send this harness's account has.
+    const FRAME_SEND_ID: &str = "frame-harness-send-id";
+    const FRAME_SEND_NAME: &str = "Frame Harness Send";
+
+    fn frame_revoke(
+        _ctx: egui::Context,
+        tx: SendDeleteSender,
+        session: zeroize::Zeroizing<String>,
+        id: String,
+        name: String,
+    ) {
+        *FRAME_TX.lock().expect("not poisoned") = Some(tx);
+        FRAME_REVOKES
+            .lock()
+            .expect("not poisoned")
+            .push((id, name, session.to_string()));
+    }
+
+    /// The name in the answer [`frame_send_list`] WITHHOLDS -- different from
+    /// [`FRAME_SEND_NAME`] on purpose, so that "the withheld answer was
+    /// accepted" and "the refetch answered" are two different things on
+    /// screen rather than the same list twice.
+    const FRAME_STALE_NAME: &str = "Stale Harness Send";
+
+    /// Whether [`frame_send_list`] keeps its sender instead of answering, so
+    /// the window is left with a fetch genuinely in flight.
+    static FRAME_LIST_WITHHOLDS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// The withheld sender and the generation it was handed.
+    static FRAME_LIST_TX: std::sync::Mutex<Option<(SendListSender, u64)>> =
+        std::sync::Mutex::new(None);
+
+    /// Whether [`frame_send_list`] answers with a failure instead of a list.
+    static FRAME_LIST_FAILS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A Sends fetch that answers at once -- with one revokable Send, or, when
+    /// [`FRAME_LIST_FAILS`] is set, with the failure a `bw send list` reports
+    /// when it cannot reach the server.
+    fn frame_send_list(
+        _ctx: egui::Context,
+        tx: SendListSender,
+        generation: u64,
+        _session: zeroize::Zeroizing<String>,
+    ) {
+        if FRAME_LIST_WITHHOLDS.load(std::sync::atomic::Ordering::SeqCst) {
+            *FRAME_LIST_TX.lock().expect("not poisoned") = Some((tx, generation));
+            return;
+        }
+        if FRAME_LIST_FAILS.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = tx.send((generation, Err(crate::send::SendError::Offline)));
+            return;
+        }
+        let _ = tx.send((
+            generation,
+            Ok(vec![crate::send::SendSummary {
+                id: FRAME_SEND_ID.to_string(),
+                name: FRAME_SEND_NAME.to_string(),
+                access_url: "https://send.example.invalid/frame-harness".to_string(),
+                // Far enough out that no clock this can run under makes it
+                // expired, which is a row with different buttons.
+                deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                is_file: false,
+            }]),
+        ));
+    }
+
+    /// A vault load that answers at once with an empty but LOADED vault --
+    /// loaded, because the `Loading` arm returns before the sidebar's Sends
+    /// row is drawn, so a window left on the spinner could never reach the
+    /// screen this test is about.
+    fn frame_load(
+        _cache: Arc<VaultCache>,
+        tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        request: VaultLoadRequest,
+    ) {
+        let _ = tx.send((
+            request.generation,
+            Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+        ));
+    }
+
+    fn frame_sync(_tx: mpsc::Sender<Result<(), String>>, _session: String) {}
+
+    /// Every label painted on `output`, with the rectangle it occupies.
+    fn frame_labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+            }
+            egui::Shape::Vec(shapes) => {
+                shapes.iter().for_each(|s| frame_labelled_rects(s, out))
+            }
+            _ => {}
+        }
+    }
+
+    /// **Pressing Delete and then the confirmation on a real Sends row really
+    /// revokes that Send -- and a report card on screen does not stop it.**
+    ///
+    /// **THE PRIMARY HOLD over the frame's Sends wiring. Every source pin in
+    /// this module is secondary to it.** The call to [`apply_send_action`] was
+    /// held by BRACE DEPTH against a sibling statement, which is a statement
+    /// about WHERE THE CALL IS WRITTEN and not about what its argument holds
+    /// when control arrives. Two shadows were measured green through it, both
+    /// leaving the call, its arguments and its depth byte-identical, both
+    /// warning-free, and both making the entire Sends pane -- Copy link,
+    /// Refresh, Delete, Cancel, the confirmation -- do nothing at all:
+    ///
+    /// ```ignore
+    /// let send_action = { drop(send_action); send_ui::SendUiAction::None };
+    /// let send_action = if send_delete.report.is_some() {
+    ///     send_ui::SendUiAction::None
+    /// } else { send_action };
+    /// ```
+    ///
+    /// So this test reads no source. It builds the real vault window, presses
+    /// the real sidebar row to reach the real Sends screen, presses the real
+    /// Delete button on the real row, presses the real confirmation, and
+    /// asserts that a revoke arrived at [`VaultFrameEnv::send_delete`]
+    /// carrying that row's id, that row's name and this window's own session.
+    ///
+    /// **And the last act covers the state the second shadow is gated on**,
+    /// which is the miss the export click test made in its first draft: a
+    /// window whose report cell is `None` cannot tell a `report.is_some()`
+    /// gate from a working screen. So a report is put in through the frame's
+    /// own channel -- the one the spawner kept -- the card is confirmed to be
+    /// on screen, and the row is pressed again with it up.
+    ///
+    /// **No `bw`, no dialog, no network.** The revoke spawner is substituted
+    /// through the env seam. That the production pointer behind that seam is
+    /// the real `send_delete_thread::spawn_send_delete` is not something this
+    /// test can see, and is held by
+    /// [`export_wiring::production_hands_the_window_the_real_functions`] by
+    /// address and by `send_ui`'s
+    /// `production_is_the_only_env_a_shipping_build_has` from the source.
+    #[test]
+    fn clicking_delete_on_a_send_row_really_revokes_it() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-send-delete-frame-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            // A base URL nothing listens on, and never dialled: the only
+            // thing that would dial it is the load spawn, which is stubbed.
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                // `None`, so no favicon is fetched for any host.
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            // So the auto-lock countdown cannot end the session underneath
+            // the clicks.
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            // Somebody else owns the first frame, so this harness calls
+            // `theme::apply` itself, below.
+            true,
+            super::frame_env_seam::with_send_delete(
+                super::frame_env_seam::stubbed(
+                    frame_sync,
+                    frame_load,
+                    frame_send_list,
+                    // Under the scratch directory, so no frame reads or
+                    // writes the real `%APPDATA%\Deskwarden`.
+                    Some(scratch.join("settings.json")),
+                ),
+                frame_revoke,
+            ),
+        );
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        // Two frames: an `egui::Area` is laid out from the size it had on the
+        // previous frame, so the chrome is measured properly only from the
+        // second one on.
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let mut output = ctx.run_ui(input(), |ui| frame_fn(ui));
+
+        let labels = |output: &egui::FullOutput| {
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                frame_labelled_rects(&clipped.shape, &mut out);
+            }
+            out
+        };
+        let texts = |output: &egui::FullOutput| {
+            labels(output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+        };
+        let find = |output: &egui::FullOutput, needle: &str| -> Option<egui::Rect> {
+            labels(output).into_iter().find(|(t, _)| t == needle).map(|(_, r)| r)
+        };
+        let locate = |output: &egui::FullOutput, needle: &str| -> egui::Pos2 {
+            find(output, needle).map(|r| r.center()).unwrap_or_else(|| {
+                panic!(
+                    "the window painted no {needle:?} to press, so this test cannot reach \
+                     what it is about at all. What was painted: {:?}",
+                    texts(output)
+                )
+            })
+        };
+
+        // A press AND a release is what egui counts as a click, and the frame
+        // that locates a control cannot be the frame that clicks it.
+        let click = |ctx: &egui::Context,
+                     frame_fn: &mut dyn FnMut(&mut egui::Ui),
+                     pos: egui::Pos2|
+         -> egui::FullOutput {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), button(true)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput { events: vec![button(false)], ..input() },
+                |ui| frame_fn(ui),
+            );
+            // The fetch is started by the frame that first draws the screen
+            // and its answer is not drained until the frame after that, so
+            // what is read is the screen at rest.
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            ctx.run_ui(input(), |ui| frame_fn(ui))
+        };
+
+        // CONTROL, before anything is pressed: the window has painted frames
+        // and started no revoke, so what is asserted below is about the
+        // clicks and not about the window existing.
+        assert!(
+            FRAME_REVOKES.lock().expect("not poisoned").is_empty(),
+            "the window started a revoke without anybody clicking anything"
+        );
+
+        // 1. The Sends screen, reached the only way there is.
+        let sends_at = locate(&output, sidebar::SENDS_ROW_LABEL);
+        output = click(&ctx, &mut frame_fn, sends_at);
+
+        // Positive control on the harness: the fetch answered and the row a
+        // user reads is on screen. Without this a failure to reach the screen
+        // would look exactly like a broken Delete button.
+        assert!(
+            find(&output, FRAME_SEND_NAME).is_some(),
+            "the Sends row was pressed and {FRAME_SEND_NAME:?} is not on screen, so this \
+             window is not on the Sends screen and nothing below is about a Send row at \
+             all. What was painted: {:?}",
+            texts(&output)
+        );
+
+        // 2. Delete arms the confirmation and destroys nothing.
+        let delete_at = locate(&output, send_ui::DELETE_LABEL);
+        let armed = click(&ctx, &mut frame_fn, delete_at);
+        assert!(
+            find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            "Delete was pressed on a real Sends row and no {:?} confirmation came up, so the \
+             action the pane reported reached nothing -- the row is inert. This is the \
+             symptom a brace-depth pin over the applier cannot see: a shadowed action leaves \
+             the call, its arguments and its depth byte-identical. What was painted: {:?}",
+            send_ui::CONFIRM_LABEL,
+            texts(&armed)
+        );
+        let asked = FRAME_REVOKES.lock().expect("not poisoned").clone();
+        assert!(
+            asked.is_empty(),
+            "one click on Delete started a `bw send delete` -- {asked:?} -- so the \
+             confirmation is a decoration and a mis-aimed click destroys a public link"
+        );
+
+        // 3. The confirmation revokes, once, for the row it names.
+        let confirm_at = locate(&armed, send_ui::CONFIRM_LABEL);
+        let after = click(&ctx, &mut frame_fn, confirm_at);
+        let started = std::mem::take(&mut *FRAME_REVOKES.lock().expect("not poisoned"));
+        assert_eq!(
+            started,
+            vec![(
+                FRAME_SEND_ID.to_string(),
+                FRAME_SEND_NAME.to_string(),
+                FRAME_SESSION.to_string()
+            )],
+            "confirming the revoke on a real frame started {started:?}, not exactly one \
+             `bw send delete` for that row carrying this window's own session. What was \
+             painted: {:?}",
+            texts(&after)
+        );
+
+        // 4. **A REPORT ON SCREEN DOES NOT STOP THE ROW.**
+        //
+        // The second measured shadow is gated on exactly this state, and a
+        // window whose report cell is `None` cannot tell it from a working
+        // screen. The report goes in through the frame's own channel, the one
+        // the spawner above kept.
+        FRAME_TX
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .expect("the spawner kept the frame's sender")
+            .send(SendDeleteReport::Deleted { name: FRAME_SEND_NAME.to_string() })
+            .expect("the frame still holds the receiver");
+        // One frame to drain it, and two more so the refetch the drain
+        // triggers has answered and the card is laid out at its real size.
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let showing = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let (_, card_text) =
+            send_delete_message(&SendDeleteReport::Deleted { name: FRAME_SEND_NAME.to_string() });
+        let card = find(&showing, &card_text).unwrap_or_else(|| {
+            panic!(
+                "control: the window is not showing a revoke report card, so pressing the row \
+                 below is not the thing this step is about. What was painted: {:?}",
+                texts(&showing)
+            )
+        });
+
+        // The row is back (the report invalidated the list and the stub
+        // answered again), and its Delete button is not underneath the card --
+        // so a click there reaches the row rather than the overlay.
+        let delete_rect = find(&showing, send_ui::DELETE_LABEL).unwrap_or_else(|| {
+            panic!(
+                "control: no Delete button is on screen with the report card up, so there is \
+                 nothing to press. What was painted: {:?}",
+                texts(&showing)
+            )
+        });
+        assert!(
+            !card.expand(8.0).contains(delete_rect.center()),
+            "control: the report card {card:?} covers the Delete button {delete_rect:?}, so \
+             the click below would land on the overlay and this step would assert nothing"
+        );
+
+        let armed_again = click(&ctx, &mut frame_fn, delete_rect.center());
+        assert!(
+            find(&armed_again, send_ui::CONFIRM_LABEL).is_some(),
+            "with a revoke report on screen, pressing Delete on a Send row put up no {:?} \
+             confirmation. A previous answer is not a reason to refuse the next revoke, and \
+             a pane that silently does nothing until some other control is dismissed is the \
+             same defect as a pane that never works. What was painted: {:?}",
+            send_ui::CONFIRM_LABEL,
+            texts(&armed_again)
+        );
+        assert!(
+            FRAME_REVOKES.lock().expect("not poisoned").is_empty(),
+            "asking again started a revoke without a confirmation"
+        );
+
+        // 5. **A FAILED FETCH DOES NOT KILL THE SCREEN EITHER.**
+        //
+        // The state this covers is one the steps above cannot reach and a
+        // measured shadow IS gated on: `notice_message` is `Some` for the
+        // whole of a failed Sends fetch -- `vault_window` turns the
+        // `SendError` into `NoticeSource::Sends` whether or not the band ends
+        // up drawn, and the pane suppresses the band only because it prints
+        // the same sentence itself. A shadow reading `if
+        // notice_message.is_some() { SendUiAction::None }` therefore leaves
+        // the Sends screen with no way out of an error at all: Refresh is
+        // drawn in EVERY pane state precisely so that a failure is not
+        // permanent, and under that shadow it is.
+        //
+        // So: fail the fetch, confirm the screen really is in that state, and
+        // then press the real Refresh with the failure showing.
+        FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refresh_at = locate(&armed_again, "Refresh");
+        let failed = click(&ctx, &mut frame_fn, refresh_at);
+        assert!(
+            find(&failed, FRAME_SEND_NAME).is_none(),
+            "control: Refresh was pressed with the fetch set to fail and {FRAME_SEND_NAME:?} \
+             is still on screen, so the screen is not in the failed state this step is \
+             about. What was painted: {:?}",
+            texts(&failed)
+        );
+
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let refresh_at = locate(&failed, "Refresh");
+        let recovered = click(&ctx, &mut frame_fn, refresh_at);
+        assert!(
+            find(&recovered, FRAME_SEND_NAME).is_some(),
+            "Refresh was pressed on a Sends screen showing a failed fetch and the list never \
+             came back, so the only control that state offers does nothing and the error is \
+             permanent for the user. What was painted: {:?}",
+            texts(&recovered)
+        );
+
+        // 6. **AND A FETCH IN FLIGHT DOES NOT KILL THE SCREEN.**
+        //
+        // The last state a shadow can be gated on that the steps above do not
+        // reach: `send_fetch.in_flight`, true from the frame that starts a
+        // `bw send list` until the frame that drains its answer -- seconds,
+        // against a real `bw`. Refresh is drawn during it, and pressing it is
+        // how a user abandons an answer that is taking too long: it bumps the
+        // fetch's generation, which is what makes the answer already on its
+        // way STALE. Under `if send_fetch.in_flight { SendUiAction::None }`
+        // the press does nothing, the generation does not move, and the
+        // answer the user just abandoned is the one they get.
+        //
+        // So the fetch is left genuinely in flight -- the stub keeps its
+        // sender instead of answering -- Refresh is pressed, and then that
+        // withheld answer is delivered carrying a DIFFERENT name. Which name
+        // ends up on screen is the whole discrimination.
+        FRAME_LIST_WITHHOLDS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refresh_at = locate(&recovered, "Refresh");
+        let waiting = click(&ctx, &mut frame_fn, refresh_at);
+        let (stale_tx, stale_generation) = FRAME_LIST_TX
+            .lock()
+            .expect("not poisoned")
+            .clone()
+            .expect("control: the refetch never reached the send-list stub, so no fetch is in \
+                     flight and this step is not about the state it names");
+        assert!(
+            find(&waiting, FRAME_SEND_NAME).is_none(),
+            "control: the list is still on screen with its fetch withheld, so the window is \
+             not waiting on anything. What was painted: {:?}",
+            texts(&waiting)
+        );
+
+        // The press under test.
+        let refresh_at = locate(&waiting, "Refresh");
+        let _ = click(&ctx, &mut frame_fn, refresh_at);
+
+        // The abandoned answer arrives, late, under the generation it was
+        // started with; and the refetch that follows answers normally.
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = stale_tx.send((
+            stale_generation,
+            Ok(vec![crate::send::SendSummary {
+                id: "stale-harness-send-id".to_string(),
+                name: FRAME_STALE_NAME.to_string(),
+                access_url: "https://send.example.invalid/stale".to_string(),
+                deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                is_file: false,
+            }]),
+        ));
+        let mut settled = ctx.run_ui(input(), |ui| frame_fn(ui));
+        for _ in 0..4 {
+            assert!(
+                find(&settled, FRAME_STALE_NAME).is_none(),
+                "Refresh was pressed while a Sends fetch was in flight and the answer the \
+                 user abandoned was painted anyway ({FRAME_STALE_NAME:?}). The press did not \
+                 reach the applier, so the fetch's generation never moved and the stale list \
+                 was accepted as current. What was painted: {:?}",
+                texts(&settled)
+            );
+            settled = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        assert!(
+            find(&settled, FRAME_SEND_NAME).is_some(),
+            "control: the stale answer was dropped and no refetch replaced it, so the screen \
+             is empty for a reason that has nothing to do with the press. What was painted: \
+             {:?}",
+            texts(&settled)
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     // ==================================================================
     // Link 2: what the pane reports becomes state and a spawn
@@ -19192,10 +19842,22 @@ mod send_delete_wiring {
     /// those adds a level. A gate is the mutation this exists for and a gate
     /// is a brace.
     ///
-    /// The equality below is a second lock and is disclosed as such: it pins
+    /// The equality below is a third lock and is disclosed as such: it pins
     /// the call's ARGUMENTS -- the window's own state, the window's own
-    /// session, the production spawner -- and, like every text pin, not its
-    /// reachability. The depth assertion is what holds that.
+    /// session, the seam's spawner -- and, like every text pin, not its
+    /// reachability.
+    ///
+    /// **NEITHER ASSERTION IN HERE PINS LIVENESS, and this whole test is
+    /// secondary to [`clicking_delete_on_a_send_row_really_revokes_it`].**
+    /// Depth says where the call is WRITTEN; it says nothing about what
+    /// `send_action` holds when control reaches it. A shadowing `let
+    /// send_action = ...;` on the line above leaves the call text, its
+    /// arguments and its depth byte-identical, draws no warning, and makes
+    /// every control on the Sends screen inert. Two such were measured green
+    /// against this test. What this holds is placement -- that no `if`,
+    /// `match`, `for` or block was wrapped AROUND the call -- and that is
+    /// worth keeping, because it is a different mutation from the one the
+    /// click catches.
     #[test]
     fn the_frame_applies_the_sends_action_unconditionally() {
         let code = code_braces_only(production());
@@ -19283,15 +19945,16 @@ mod send_delete_wiring {
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
         let expected = squashed(concat!(
             "apply_send_", "action( send_action, &mut send_delete, &mut send_fetch, ui.ctx(), \
-             &send_delete_tx, &session_token, send_delete_thread::spawn_send_delete, );"
+             &send_delete_tx, &session_token, spawn_send_delete, );"
         ));
         assert_eq!(
             squashed(&code_braces_only(production())).matches(&expected).count(),
             1,
             "the frame no longer applies the Sends action with the window's own delete state, \
-             its own fetch, its own session and the production spawner. Note what this does \
-             NOT hold: it is a pin on the call's CONTENTS. Reachability is the depth assertion \
-             above"
+             its own fetch, its own session and the spawner the env seam handed it. Note what \
+             this does NOT hold: it is a pin on the call's CONTENTS. Placement is the depth \
+             assertion above, and LIVENESS is held by neither -- that is \
+             `clicking_delete_on_a_send_row_really_revokes_it`"
         );
 
         // And there is no `match` on the action left in the frame at all --
@@ -19512,17 +20175,49 @@ mod frame_env_seam {
         send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
         settings_path: Option<std::path::PathBuf>,
     ) -> VaultFrameEnv {
-        // The production export spawner, because every existing caller of
-        // this function drives a scenario that never clicks "Export
-        // vault..." -- and a scenario that DID would be starting a real
-        // save dialog, which is what `with_export` exists to prevent.
+        // **The two destructive spawns REFUSE rather than defaulting to the
+        // production ones.** They used to default to production, on the
+        // reasoning that no existing caller clicks those controls -- which
+        // was true and is not a property anything enforced. A future harness
+        // that pressed "Export vault..." without `with_export` would have
+        // opened a real save dialog under `cargo test`; one that pressed
+        // Delete without `with_send_delete` would have run a real `bw send
+        // delete` against the developer's own account. A panic is a failed
+        // test with the reason in it, and it is reached only by a harness
+        // that presses a control it never told this function about.
         VaultFrameEnv {
             sync,
             load,
             send_list,
-            export: super::export_thread::spawn_export,
+            export: refuses_to_export,
+            send_delete: refuses_to_revoke,
             settings_path,
         }
+    }
+
+    /// The default [`VaultFrameEnv::export`] of a [`stubbed`] env.
+    fn refuses_to_export(_: egui::Context, _: ExportSender, _: zeroize::Zeroizing<String>) {
+        panic!(
+            "a test pressed \"Export vault...\" on a `frame_env_seam::stubbed` window. That \
+             would have opened a real save dialog and started a real `bw export`; build the \
+             env with `with_export` and observe the spawn there instead"
+        );
+    }
+
+    /// The default [`VaultFrameEnv::send_delete`] of a [`stubbed`] env.
+    fn refuses_to_revoke(
+        _: egui::Context,
+        _: SendDeleteSender,
+        _: zeroize::Zeroizing<String>,
+        id: String,
+        _: String,
+    ) {
+        panic!(
+            "a test confirmed the revoke of Send {id:?} on a `frame_env_seam::stubbed` \
+             window. That would have run a real `bw send delete` against whatever account \
+             the developer is logged into; build the env with `with_send_delete` and observe \
+             the spawn there instead"
+        );
     }
 
     /// [`stubbed`] with the export spawner named too.
@@ -19532,5 +20227,15 @@ mod frame_env_seam {
     /// Export row -- are unchanged.
     pub(super) fn with_export(env: VaultFrameEnv, export: ExportSpawn) -> VaultFrameEnv {
         VaultFrameEnv { export, ..env }
+    }
+
+    /// [`stubbed`] with the revoke spawner named too, for [`with_export`]'s
+    /// reason: the harness that presses Delete is one test, and every other
+    /// caller should stay unable to start a `bw send delete` by accident.
+    pub(super) fn with_send_delete(
+        env: VaultFrameEnv,
+        send_delete: SendDeleteSpawn,
+    ) -> VaultFrameEnv {
+        VaultFrameEnv { send_delete, ..env }
     }
 }

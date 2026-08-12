@@ -5791,11 +5791,26 @@ mod source_pins {
     /// guards. It is not, and the reason is in the source rather than in this
     /// paragraph: the substitute constructor lives in a module gated to the
     /// test configuration, so it is not compiled into the binary the user
-    /// runs, and **all four fields are private**, so nothing outside
+    /// runs, and **all six fields are private**, so nothing outside
     /// `mod vault_window` can build one any other way. What is left is one
-    /// constructor whose body names the same **three** spawn functions the
+    /// constructor whose body names the same **five** spawn functions the
     /// call sites used to name directly, plus the settings path they used to
     /// compute inline.
+    ///
+    /// **What this holds is SPELLING, and that is not the whole seam.** Every
+    /// needle below is a name. A wrapper written at module level --
+    /// `fn export_when_enabled(..) { if ENABLED { export_thread::spawn_export(..) } }`
+    /// with `ENABLED` false, handed to the field instead -- still spells
+    /// `export_thread::spawn_export` inside the constructor's body region,
+    /// still leaves the constructor defining nothing of its own, and still
+    /// draws no warning, while the Export row is inert for every user
+    /// forever. That mutant was measured green against the whole suite. What
+    /// catches it is `vault_window::export_wiring::
+    /// production_hands_the_window_the_real_functions`, which compares each
+    /// field of the value `production()` really builds against the real
+    /// function BY ADDRESS. This test and that one answer different
+    /// questions: this one that the constructor is the only one and that it
+    /// invents nothing, that one that what it hands over is real.
     #[test]
     fn production_is_the_only_env_a_shipping_build_has() {
         let production = sanitized(&production());
@@ -5828,6 +5843,8 @@ mod source_pins {
             "spawn_vault_sync",
             "spawn_vault_load",
             concat!("send_fetch_thread::spawn_send_", "list"),
+            concat!("export_thread::spawn_", "export"),
+            concat!("send_delete_thread::spawn_send_", "delete"),
         ] {
             assert_eq!(
                 body.matches(named).count(),
@@ -5839,7 +5856,7 @@ mod source_pins {
             inside.matches("fn ").count(),
             0,
             "`VaultFrameEnv::production` defines something of its own, so what it hands the \
-             window is no longer just the two module-level spawns: {body}"
+             window is no longer just the module-level spawns named above: {body}"
         );
     }
 }
