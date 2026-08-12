@@ -873,11 +873,48 @@ mod tests {
     /// which is a stronger property because it also serialises the
     /// harness-owned threads a mutant might create.
     struct Recorder {
-        /// Which routing window is open. Bumped by [`Session::open`] and
-        /// stamped onto every entry below AT THE MOMENT OF RECORDING, so a
-        /// launch that arrives late is tagged with the window it landed in
-        /// rather than the one that caused it -- which is what makes it red
-        /// that window's assertions instead of vanishing.
+        /// Which routing window is open -- or, on the odd bumps
+        /// [`Session::drop`] makes, that NO window is open at all.
+        ///
+        /// # This tag used to be write-only, and that made the suite lie
+        ///
+        /// It was stamped onto every entry below and read by nothing:
+        /// `Session::launched()`/`verified()` were `.map(|(_, p)| p.clone())`
+        /// over the whole vector, and [`assert_no_late_launch`] only asked
+        /// whether that vector was empty. Measured on `0cd9fe0`, replacing
+        /// `let generation = r.generation;` with `let generation = 0;` in
+        /// [`record_launch`] SURVIVED at 2192 / 0 failed / 0 warnings, while
+        /// the liveness control at the identical statement
+        /// (`r.launched.push((generation, path.to_path_buf()));` becoming
+        /// `let _ = (generation, path);`) was KILLED at 2188/4. The second
+        /// tuple element was load-bearing; the first was inert.
+        ///
+        /// The doc that used to stand here claimed the stamp "is what makes
+        /// it red that window's assertions instead of vanishing". That was
+        /// exactly backwards, and it cost this suite an intermittent red whose
+        /// message was a FALSE ALARM about code signing. A launch from the
+        /// detached-thread witness that misses its own [`Session::settle`]
+        /// lands after `Session::drop` has cleared, after the NEXT
+        /// `Session::open` has cleared, and is therefore stamped with the new
+        /// window's generation -- so
+        /// [`a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam`]
+        /// reported that an installer validly signed by someone else had
+        /// reached the launch seam, in a run where nothing of the sort
+        /// happened. Measured over 30 isolated `updater::` runs under
+        /// concurrent compilation: 6 red, across three different victims.
+        ///
+        /// So the tag is READ now, in two places that between them leave a
+        /// stray nowhere to be silently attributed:
+        ///
+        ///  * [`Session::launched`] and [`Session::verified`] go through
+        ///    [`entries_of_window`], which panics -- naming the WINDOW, not
+        ///    the signature -- on any entry stamped with a different one.
+        ///  * [`Session::drop`] bumps the generation to a value no session
+        ///    owns before it releases [`ROUTE_LOCK`], and waits out
+        ///    [`CLOSE_GRACE`] while still holding it. A launch arriving in
+        ///    that band carries the unowned generation and is left in place,
+        ///    so the next [`Session::open`]'s emptiness assertion says so. It
+        ///    is no longer erased, and it can no longer be inherited.
         generation: u64,
         /// What the substitute `verify` answers on its next call.
         answer: Option<Result<SignatureInfo, String>>,
@@ -950,14 +987,108 @@ mod tests {
         );
     }
 
+    /// The directory every routing window hands to `apply_update_with`, TAGGED
+    /// WITH THE WINDOW. Never created, never touched: nothing on the routing
+    /// path reads the disk.
+    ///
+    /// The tag is what makes a late launch attributable, and it is the second
+    /// half of the fix -- the generation STAMP alone is not enough. A stamp is
+    /// read at the moment of recording, so a launch caused by window N but
+    /// landing after window N+1 has opened is stamped N+1 and looks native.
+    /// Measured: with the stamp alone, a detached launch delayed 900ms (past
+    /// both [`SETTLE_QUIET`] and [`CLOSE_GRACE`]) still landed in the next
+    /// window and reported a doubled launch vector there.
+    ///
+    /// The PATH, by contrast, is built by the window that caused the launch
+    /// and travels with it. So a stray names the window it came from however
+    /// late it arrives, and [`entries_of_window`] can say so.
+    const ROUTING_DIR_PREFIX: &str = r"Z:\deskwarden-routing-test-never-created-";
+
+    fn routing_dir(window: u64) -> PathBuf {
+        PathBuf::from(format!("{ROUTING_DIR_PREFIX}{window}"))
+    }
+
+    /// Which window built `p`, for a path that came out of [`routing_dir`].
+    /// `None` for anything else -- a real production path carries no tag, and
+    /// then the generation stamp is all there is.
+    fn window_of_path(p: &Path) -> Option<u64> {
+        let s = p.to_string_lossy().into_owned();
+        let rest = s.strip_prefix(ROUTING_DIR_PREFIX)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// Every path recorded under `window`, and a LOUD, SPECIFIC failure for
+    /// anything that belongs to a different one -- by its generation stamp, or
+    /// by the window its own path names.
+    ///
+    /// This is the read that makes [`Recorder::generation`] more than
+    /// decoration. A stray cannot be quietly folded into the window that
+    /// happens to be open when it lands: the panic names the window and says
+    /// what went wrong, so the run is red for the reason it is actually red
+    /// rather than red about code signing.
+    fn entries_of_window(entries: &[(u64, PathBuf)], window: u64, what: &str) -> Vec<PathBuf> {
+        let strays: Vec<&(u64, PathBuf)> = entries
+            .iter()
+            .filter(|(g, p)| *g != window || window_of_path(p).is_some_and(|w| w != window))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a {what} from a previous window arrived late: {strays:?}, read inside routing \
+             window {window}. It is NOT this window's -- attributing it here is how a stray \
+             detached launch used to red an unrelated signature assertion with a message that \
+             was a false alarm. Whatever else this run reports, something reached the seam \
+             after the window that caused it had closed"
+        );
+        entries.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    /// How long the recorder must go unchanged before [`Session::settle`]
+    /// calls a window settled.
+    ///
+    /// # This number is the witness, so it is pinned rather than felt
+    ///
+    /// The shape this replaced counted "12 consecutive unchanged 10ms polls",
+    /// i.e. it could return as early as **120ms** -- while its own doc claimed
+    /// the budget was 600ms, understating the gap by 5x. Nothing pinned it:
+    /// measured on `0cd9fe0`, `if stable >= 12` -> `if stable >= 0` (still one
+    /// 10ms sleep) SURVIVED at 2192 / 0 failed / 0 warnings. Only "at least
+    /// one poll" was held by anything.
+    ///
+    /// 120ms was also not enough. Under concurrent compilation a detached
+    /// thread routinely does not get scheduled inside it, which is what made
+    /// the witness miss and the stray contaminate the next window.
+    /// [`the_settle_window_waits_out_a_launch_it_did_not_start`] pins this
+    /// behaviourally against a launch delayed well past the old budget, and
+    /// [`the_settle_budget_is_not_a_token_one`] pins the number itself so a
+    /// shrink is caught even on a lucky machine.
+    const SETTLE_QUIET: Duration = Duration::from_millis(500);
+
+    /// Poll interval for [`Session::settle`].
+    const SETTLE_POLL: Duration = Duration::from_millis(10);
+
+    /// Total bound on [`Session::settle_witnessing`]. Generous on purpose: it
+    /// is not a budget anything is expected to approach, it is the point at
+    /// which a witness that will never arrive stops pretending to wait.
+    const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// How long a closing window keeps [`ROUTE_LOCK`] after retiring its own
+    /// generation, so that a launch still in flight lands under a generation
+    /// NO session owns rather than under the next window's.
+    const CLOSE_GRACE: Duration = Duration::from_millis(120);
+
     /// One routing window.
     ///
     /// Opening one takes [`ROUTE_LOCK`], asserts the recorder is EMPTY --
     /// anything in it arrived after the previous window closed, which is
     /// itself a launch nobody witnessed in time -- then bumps the generation
-    /// and installs the programmed `verify` answer. Dropping one clears the
-    /// recorder and releases the lock.
+    /// and installs the programmed `verify` answer. Dropping one retires that
+    /// generation, waits out [`CLOSE_GRACE`] still holding the lock, and only
+    /// then releases it.
     struct Session {
+        /// The generation this window owns. Everything it reads must carry
+        /// this number; see [`entries_of_window`].
+        generation: u64,
         _serial: MutexGuard<'static, ()>,
     }
 
@@ -967,19 +1098,20 @@ mod tests {
             let mut r = recorder();
             assert_no_late_launch(&r.launched);
             r.generation += 1;
+            let generation = r.generation;
             r.answer = answer;
             r.verified.clear();
             r.launched.clear();
             drop(r);
-            Session { _serial: serial }
+            Session { generation, _serial: serial }
         }
 
         fn launched(&self) -> Vec<PathBuf> {
-            recorder().launched.iter().map(|(_, p)| p.clone()).collect()
+            entries_of_window(&recorder().launched, self.generation, "launch")
         }
 
         fn verified(&self) -> Vec<PathBuf> {
-            recorder().verified.iter().map(|(_, p)| p.clone()).collect()
+            entries_of_window(&recorder().verified, self.generation, "verify")
         }
 
         /// Wait for the recorder to stop changing before it is read.
@@ -987,40 +1119,84 @@ mod tests {
         /// A launch on a thread the code under test created lands after
         /// `apply_update_with` has already returned, so reading the recorder
         /// the instant the call finishes would still miss it. This waits for
-        /// 120ms of no change, up to 600ms in total.
+        /// [`SETTLE_QUIET`] of no change.
         ///
-        /// **What this does not see, said plainly:** a launch deliberately
-        /// delayed past 600ms, or one that lands between this window closing
-        /// and the next one opening. The first is caught by the next window's
-        /// emptiness assertion in [`Session::open`] if any window follows it,
-        /// and neither is reachable at all from this module's production code,
-        /// which [`the_only_process_start_in_this_module_is_the_launch_seam`]
-        /// forbids from naming a thread.
+        /// **What this does not see, said plainly:** a launch delayed past
+        /// [`SETTLE_QUIET`] after the last change. That is no longer a launch
+        /// that VANISHES, though, which is the part that used to matter: it
+        /// lands under a generation no window owns (see [`Session::drop`]) and
+        /// reds the next [`Session::open`] with a message about a late launch,
+        /// rather than being inherited by the next window and reported as a
+        /// signature failure.
         fn settle(&self) {
-            let mut last = self.launched().len();
-            let mut stable = 0u32;
-            for _ in 0..60 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                let now = self.launched().len();
-                if now == last {
-                    stable += 1;
-                } else {
-                    stable = 0;
+            let mut last = recorder().launched.len();
+            let mut quiet_since = std::time::Instant::now();
+            while quiet_since.elapsed() < SETTLE_QUIET {
+                std::thread::sleep(SETTLE_POLL);
+                let now = recorder().launched.len();
+                if now != last {
                     last = now;
-                }
-                if stable >= 12 {
-                    return;
+                    quiet_since = std::time::Instant::now();
                 }
             }
         }
+
+        /// [`Session::settle`] for a window that is EXPECTING a launch: waits
+        /// until at least `n` have been recorded, then for the usual quiet.
+        ///
+        /// A witness that can time out has to fail loudly when it does. The
+        /// old settle could not: it returned quietly after ~120ms whether or
+        /// not the launch it existed to witness had arrived, and the caller's
+        /// `assert_eq!` then reported an empty vector -- which reads as "no
+        /// launch happened", the opposite of what had happened. This panics,
+        /// and says which.
+        fn settle_witnessing(&self, n: usize) {
+            let started = std::time::Instant::now();
+            while recorder().launched.len() < n {
+                assert!(
+                    started.elapsed() < SETTLE_DEADLINE,
+                    "the settle window timed out after {:?} still waiting for launch {n} of \
+                     this routing window; only {} arrived. This is the witness FAILING, not \
+                     the absence of a launch -- do not read it as one",
+                    SETTLE_DEADLINE,
+                    recorder().launched.len()
+                );
+                std::thread::sleep(SETTLE_POLL);
+            }
+            self.settle();
+        }
+    }
+
+    /// What closing a routing window does to the recorder, as a function so
+    /// [`a_closing_window_retires_its_generation_and_keeps_only_foreign_entries`]
+    /// can drive it. A `Drop` body no test can call is a `Drop` body nothing
+    /// knows the shape of, which is the same mistake
+    /// [`assert_no_late_launch`] was pulled out of an inline assertion to
+    /// avoid.
+    fn retire_window(r: &mut Recorder, generation: u64) {
+        r.answer = None;
+        // Only THIS window's entries are cleared. A stray carrying another
+        // generation is left where it is, for `Session::open`'s emptiness
+        // assertion to find -- clearing it here is precisely what used to
+        // erase the evidence.
+        r.verified.retain(|(g, _)| *g != generation);
+        r.launched.retain(|(g, _)| *g != generation);
+        // Retire the generation. From here until the next `open` the recorder
+        // stamps entries no session will ever claim.
+        r.generation += 1;
     }
 
     impl Drop for Session {
         fn drop(&mut self) {
-            let mut r = recorder();
-            r.answer = None;
-            r.verified.clear();
-            r.launched.clear();
+            {
+                let mut r = recorder();
+                retire_window(&mut r, self.generation);
+            }
+            // `_serial` is a field, so it is dropped AFTER this body: the lock
+            // is still held here. A launch still in flight therefore lands in
+            // this grace period, under the retired generation, and cannot be
+            // swallowed by the next window's clear.
+            std::thread::sleep(CLOSE_GRACE);
         }
     }
 
@@ -1028,7 +1204,7 @@ mod tests {
         /// The test-only substitute.
         ///
         /// An inherent impl written from `mod tests` rather than a
-        /// `#[cfg(test)]` method beside [`UpdaterEnv::production`], for the
+        /// test-gated method beside [`UpdaterEnv::production`], for the
         /// reason `vault_window`'s seam records: every source guard in a file
         /// cuts its production slice at the FIRST test gate in the text, so a
         /// gated item up beside `production` would truncate the slice
@@ -1048,6 +1224,10 @@ mod tests {
         result: Result<(), String>,
         launched: Vec<PathBuf>,
         verified: Vec<PathBuf>,
+        /// The installer path THIS window's directory produces -- what a
+        /// correct launch must equal. Carried out of the window rather than
+        /// recomputed by the caller, because the window number is part of it.
+        expected: PathBuf,
     }
 
     /// Runs `apply_update_with` against the recording seam, with `verify`
@@ -1058,8 +1238,9 @@ mod tests {
 
         // A directory that does not exist and is never created: nothing on
         // this path may touch the disk, because nothing on this path reads the
-        // disk any more.
-        let dir = PathBuf::from(r"Z:\deskwarden-routing-test-never-created");
+        // disk any more. Tagged with the window, so that whatever comes back
+        // out of the seam names the window that sent it in.
+        let dir = routing_dir(session.generation);
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
@@ -1067,7 +1248,12 @@ mod tests {
         let env = UpdaterEnv::substitute(substitute_verify, substitute_launch);
         let result = apply_update_with(&dir, &release, &env);
         session.settle();
-        Routed { result, launched: session.launched(), verified: session.verified() }
+        Routed {
+            result,
+            launched: session.launched(),
+            verified: session.verified(),
+            expected: routed_path(session.generation),
+        }
     }
 
     /// [`route_recording`] for the cases that only care about `launch`.
@@ -1085,10 +1271,11 @@ mod tests {
         }
     }
 
-    /// The path `route` builds, for the assertions below to compare against.
-    fn routed_path() -> PathBuf {
-        PathBuf::from(r"Z:\deskwarden-routing-test-never-created")
-            .join(installer_file_name(&Version::parse("9.9.9").unwrap()))
+    /// The path a routing window builds, for the assertions below to compare
+    /// against. Takes the window, because the window is IN the path -- see
+    /// [`ROUTING_DIR_PREFIX`].
+    fn routed_path(window: u64) -> PathBuf {
+        routing_dir(window).join(installer_file_name(&Version::parse("9.9.9").unwrap()))
     }
 
     /// **The gate is consulted: a valid signature by SOMEONE ELSE is never
@@ -1177,13 +1364,13 @@ mod tests {
     /// checked is the file that runs.
     #[test]
     fn the_trusted_installer_is_launched_and_it_is_the_file_that_was_verified() {
-        let Routed { result, launched, verified } =
+        let Routed { result, launched, verified, expected } =
             route_recording(Ok(signature(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
 
         assert!(result.is_ok(), "the trusted installer was refused: {result:?}");
         assert_eq!(
             launched,
-            vec![routed_path()],
+            vec![expected],
             "the launch seam did not receive exactly the one path the module constructed"
         );
         assert_eq!(
@@ -1198,13 +1385,13 @@ mod tests {
     /// asserted here through the ROUTING rather than over the predicate.
     #[test]
     fn the_trusted_thumbprint_is_matched_case_insensitively_through_the_gate() {
-        let (result, launched) = route(Ok(signature(
+        let Routed { result, launched, expected, .. } = route_recording(Ok(signature(
             true,
             Some(&EXPECTED_SIGNER_THUMBPRINT.to_ascii_lowercase()),
         )));
 
         assert!(result.is_ok(), "a lower-cased thumbprint was refused: {result:?}");
-        assert_eq!(launched, vec![routed_path()]);
+        assert_eq!(launched, vec![expected]);
     }
 
     /// **A launch on a thread this test did not create is still witnessed.**
@@ -1219,18 +1406,18 @@ mod tests {
     #[test]
     fn a_launch_on_a_thread_the_test_does_not_own_is_witnessed() {
         let session = Session::open(None);
-        let path = routed_path();
+        let path = routed_path(session.generation);
         let handle = std::thread::Builder::new()
             .spawn(move || {
                 let _ = substitute_launch(&path);
             })
             .expect("could not start the witness thread");
         handle.join().expect("the witness thread panicked");
-        session.settle();
+        session.settle_witnessing(1);
 
         assert_eq!(
             session.launched(),
-            vec![routed_path()],
+            vec![routed_path(session.generation)],
             "the recorder did not witness a launch made on another thread, so every \
              `launched.is_empty()` assertion in this module is a claim about one thread \
              rather than about this process"
@@ -1239,22 +1426,219 @@ mod tests {
 
     /// The same, DETACHED and never joined, and landing after the call that
     /// started it has already returned -- the exact shape of the survivor.
-    /// [`Session::settle`] is what closes the gap; this test is what says
-    /// settle's budget is actually long enough to close it.
+    /// [`Session::settle_witnessing`] is what closes the gap.
+    ///
+    /// This test used to be the suite's own flake. It waited on a plain
+    /// `settle()` that returned after ~120ms whether or not the thread had run
+    /// yet, and under concurrent compilation it often had not: the assertion
+    /// then read an empty vector, and -- worse -- the launch landed later, in
+    /// somebody else's window. `settle_witnessing` waits for the thing it is
+    /// witnessing and fails as a TIMEOUT if it never comes, so this test now
+    /// only goes red for its own reason.
     #[test]
     fn a_launch_on_a_detached_thread_is_witnessed_by_the_settle_window() {
         let session = Session::open(None);
-        let path = routed_path();
+        let path = routed_path(session.generation);
         let _ = std::thread::Builder::new().spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = substitute_launch(&path);
+        });
+        session.settle_witnessing(1);
+
+        assert_eq!(
+            session.launched(),
+            vec![routed_path(session.generation)],
+            "a launch on a detached thread was not witnessed inside the settle window"
+        );
+    }
+
+    /// **The settle window is wide enough to be a witness.**
+    ///
+    /// [`a_launch_on_a_detached_thread_is_witnessed_by_the_settle_window`]
+    /// waits for its launch, so it says nothing about the budget. This one
+    /// does not wait: it calls the PLAIN [`Session::settle`] -- the one
+    /// `route_recording` uses, and therefore the one that has to catch a
+    /// mutant which slips a detached spawn into `apply_update_with` -- against
+    /// a launch delayed past the 120ms the old shape actually allowed.
+    ///
+    /// With `SETTLE_QUIET` shrunk to anything under the delay below, this
+    /// fails.
+    #[test]
+    fn the_settle_window_waits_out_a_launch_it_did_not_start() {
+        let session = Session::open(None);
+        let path = routed_path(session.generation);
+        let _ = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
             let _ = substitute_launch(&path);
         });
         session.settle();
 
         assert_eq!(
             session.launched(),
-            vec![routed_path()],
-            "a launch on a detached thread was not witnessed inside the settle window"
+            vec![routed_path(session.generation)],
+            "a launch delayed 200ms was not witnessed by the plain settle window, so a mutant \
+             that puts the real launch on a detached thread would be recorded by nobody in \
+             `route_recording` -- which is the exact survivor this harness exists to kill"
+        );
+    }
+
+    /// **A launch that lands well past the quiet window is still witnessed,
+    /// because the witness WAITS for it.**
+    ///
+    /// The band this covers is the one the old shape lost things in: after
+    /// `settle` would have given up, and before `Session::drop` clears. A
+    /// launch landing there used to be erased outright and then blamed on the
+    /// next window. Here the delay is deliberately longer than
+    /// [`SETTLE_QUIET`], so a [`Session::settle_witnessing`] that stopped
+    /// waiting for its count -- and merely settled -- would miss it and this
+    /// would go red.
+    #[test]
+    fn a_launch_landing_past_the_quiet_window_is_still_waited_for() {
+        let session = Session::open(None);
+        let path = routed_path(session.generation);
+        let _ = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(SETTLE_QUIET + Duration::from_millis(400));
+            let _ = substitute_launch(&path);
+        });
+        session.settle_witnessing(1);
+
+        assert_eq!(
+            session.launched(),
+            vec![routed_path(session.generation)],
+            "a launch that landed after the quiet window expired was not waited for. It is \
+             not lost quietly any more, but a witness that gives up on the thing it is \
+             witnessing is not a witness"
+        );
+    }
+
+    /// And the number itself, so a shrink is caught on a machine lucky enough
+    /// to schedule the thread above immediately.
+    #[test]
+    fn the_settle_budget_is_not_a_token_one() {
+        assert!(
+            SETTLE_QUIET >= Duration::from_millis(400),
+            "the settle window's quiet period is {SETTLE_QUIET:?}. The shape this replaced \
+             returned after 120ms while its doc claimed 600ms, and `if stable >= 12` -> \
+             `if stable >= 0` was measured SURVIVING the whole suite: the budget was pinned \
+             by nothing at all"
+        );
+        assert!(
+            SETTLE_POLL <= Duration::from_millis(20),
+            "the poll interval is coarser than the window it is sampling"
+        );
+        assert!(
+            CLOSE_GRACE >= Duration::from_millis(100),
+            "a closing window must hold the route lock long enough that an in-flight launch \
+             lands under the RETIRED generation rather than under the next window's"
+        );
+        assert!(
+            SETTLE_DEADLINE >= Duration::from_secs(5),
+            "a witness that gives up in seconds is a flake, not a witness"
+        );
+    }
+
+    /// **A launch that missed its window is named as a LATE LAUNCH, never
+    /// counted as this window's.**
+    ///
+    /// This is the finding, reduced to an assertion. When the generation tag
+    /// was write-only, a stray detached launch that landed after the recorder
+    /// had been cleared was read as the NEXT window's launch -- and the next
+    /// window happened to be
+    /// [`a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam`],
+    /// so a run in which nothing was mis-signed reported that an installer
+    /// validly signed by someone else had reached the launch seam. Here that
+    /// is a different failure with a different message.
+    ///
+    /// Pure over the tag, so it is deterministic and touches no window: the
+    /// payload of every launch in this module is a recorded no-op, never a
+    /// real spawn.
+    #[test]
+    #[should_panic(expected = "arrived late")]
+    fn a_launch_from_a_previous_window_is_never_attributed_to_this_one() {
+        let entries = vec![(6, PathBuf::from(r"Z:\late-installer.exe"))];
+        let _ = entries_of_window(&entries, 7, "launch");
+    }
+
+    /// **And the half the generation stamp cannot see: a launch whose STAMP
+    /// says this window but whose PATH names the one before it.**
+    ///
+    /// This is precisely the shape of a launch caused by window N and landing
+    /// after window N+1 has opened -- the stamp is read at recording time, so
+    /// it says N+1 and looks native. Measured with the stamp alone in place: a
+    /// detached launch delayed 900ms (past both `SETTLE_QUIET` and
+    /// `CLOSE_GRACE`) landed in the next window and was reported there as that
+    /// window's own doubled launch. The path tag is what tells them apart.
+    #[test]
+    #[should_panic(expected = "arrived late")]
+    fn a_launch_whose_own_path_names_another_window_is_never_attributed_here() {
+        let entries = vec![(7, routed_path(6))];
+        let _ = entries_of_window(&entries, 7, "launch");
+    }
+
+    /// The control without which the two above are checks that always fire:
+    /// entries carrying the open window's own generation are read normally, in
+    /// order -- including one whose path carries this window's own tag, so the
+    /// tag check is not simply refusing every tagged path.
+    #[test]
+    fn entries_of_the_open_window_are_read_in_order() {
+        let entries = vec![
+            (7, PathBuf::from(r"Z:\a.exe")),
+            (7, PathBuf::from(r"Z:\b.exe")),
+        ];
+        assert_eq!(
+            entries_of_window(&entries, 7, "launch"),
+            vec![PathBuf::from(r"Z:\a.exe"), PathBuf::from(r"Z:\b.exe")]
+        );
+        assert!(entries_of_window(&[], 7, "launch").is_empty());
+        assert_eq!(
+            entries_of_window(&[(7, routed_path(7))], 7, "launch"),
+            vec![routed_path(7)],
+            "control: a path carrying this window's OWN tag was rejected, so the tag check \
+             refuses everything and the assertion above it is vacuous"
+        );
+    }
+
+    /// **A closing window retires its generation and clears only its OWN
+    /// entries.**
+    ///
+    /// Both halves matter and both were absent. Clearing wholesale is what
+    /// erased the evidence of a late launch; not retiring the generation is
+    /// what let the next window inherit one. Everything here happens while the
+    /// window is open -- so [`ROUTE_LOCK`] is held throughout and no other
+    /// test can observe the scratch state -- and [`retire_window`] is the same
+    /// code [`Session::drop`] runs, minus its sleep.
+    #[test]
+    fn a_closing_window_retires_its_generation_and_keeps_only_foreign_entries() {
+        let session = Session::open(None);
+        let owned = session.generation;
+        let orphan = owned.wrapping_add(1_000);
+        let left;
+        let after;
+        {
+            let mut r = recorder();
+            r.launched.push((owned, PathBuf::from(r"Z:\mine.exe")));
+            r.launched.push((orphan, PathBuf::from(r"Z:\stray.exe")));
+            retire_window(&mut r, owned);
+            after = r.generation;
+            left = r.launched.clone();
+            // Restored before the lock is released, so this scratch state is
+            // invisible to every other test.
+            r.launched.clear();
+            r.verified.clear();
+        }
+        drop(session);
+
+        assert_eq!(
+            left,
+            vec![(orphan, PathBuf::from(r"Z:\stray.exe"))],
+            "closing a window either kept its own entries or threw away a foreign one. \
+             Throwing the foreign one away is how a late launch used to vanish without \
+             anybody being told"
+        );
+        assert_ne!(
+            after, owned,
+            "a closing window left its own generation current, so a launch still in flight \
+             lands under a generation that a window is about to claim"
         );
     }
 
@@ -1361,7 +1745,13 @@ mod tests {
     ///
     /// Deliberately the gate and the module opener TOGETHER, and deliberately
     /// required to be UNIQUE -- see [`production_slice`].
-    const TEST_MODULE_MARKER: &str = "\r\n#[cfg(test)]\r\nmod tests {\r\n";
+    ///
+    /// Spelled through `concat!` so that the ATTRIBUTE ITSELF appears in this
+    /// file exactly once, at the one real gate. [`CUT_GATE`] and the walk
+    /// below count that attribute in the raw text, and a copy of it sitting
+    /// inside this constant's own source would make the count 2 for no reason
+    /// anyone could act on.
+    const TEST_MODULE_MARKER: &str = concat!("\r\n#[cfg(", "test)]\r\nmod tests {\r\n");
 
     /// Just the module opener, counted separately so that a forgery of only
     /// half the marker is caught too.
@@ -1441,7 +1831,26 @@ mod tests {
 
         let cut = text
             .find(TEST_MODULE_MARKER)
-            .expect("updater.rs no longer declares a `#[cfg(test)] mod tests`");
+            .expect("updater.rs no longer declares a test-gated `mod tests`");
+
+        // # And the slice is a PREFIX, so what is BELOW it is part of the
+        // # question
+        //
+        // Everything the two guards read is `text[..cut]`. The cut POSITION is
+        // unforgeable (above), but nothing about that says the FILE ends
+        // there, and a plain non-gated module appended after the test module's
+        // closing brace ships, is invisible to all three statements at once,
+        // and was measured surviving at a full 2192 / 0 failed / 0 warnings
+        // with a live `Command::new(..).spawn()` in it.
+        //
+        // The walk is called from HERE, rather than only from its own test, on
+        // purpose: a mutant that closes `mod tests` early and re-gates the
+        // remainder deletes any single guard test, and a guard that only one
+        // test calls is exactly that cheap to delete. Every source guard in
+        // this file goes through `production_slice`, so hiding an item below
+        // the cut now means excising the launch-seam guard as well.
+        walk_below_the_cut(&text);
+
         text[..cut].to_string()
     }
 
@@ -1887,5 +2296,256 @@ mod tests {
         assert!(code.contains("fnlaunch_installer("));
         assert!(code.contains("fnapply_update_with("));
         assert!(code.contains("pubfnapply_update("));
+    }
+
+    // ---------------------------------------------------------------------
+    // AND WHAT "PRODUCTION" MEANS, WHICH IS NO LONGER "A PREFIX"
+    //
+    // [`production_slice`] returns `text[..cut]`, and all three statements in
+    // `the_only_process_start_in_this_module_is_the_launch_seam` plus the
+    // constructor count in `production_is_the_only_updater_env_a_shipping_
+    // build_has` read that prefix and nothing else. C2 made the cut POSITION
+    // unforgeable -- the marker and the bare opener are each required to
+    // occur exactly once -- and that is a real property, but it is a property
+    // about where the prefix ENDS. Nothing said the FILE ends there.
+    //
+    // Measured on 0cd9fe0: a plain, non-gated
+    //
+    //     mod zz_below { pub fn go(p: &Path) -> Result<(), String> { .. } }
+    //
+    // appended after the test module's closing brace, containing a
+    // `Command::new(p).spawn()` behind an unsatisfiable condition, plus a call
+    // to it immediately above the `(env.verify)` call in `apply_update_with`,
+    // SURVIVED at 2192 / 0 failed / 0 warnings -- and `cargo build --lib`
+    // confirms it is genuinely compiled into a shipping build. Below the cut,
+    // `Command`, `unsafe` and `thread` are all free, so ALL THREE statements
+    // fall at once; and `job_object.rs`'s crate-wide child-start walk does not
+    // help, because `updater.rs` is on its `ALLOWED` list. The liveness
+    // control was the byte-identical module and call site with the module
+    // placed ABOVE the marker: KILLED at 2191/1, on the `Command` count of 3.
+    // The only difference between the two was which side of the cut it sat on.
+    //
+    // So production is defined here instead: everything above the cut, PLUS
+    // the standing fact that below the cut there is nothing but test-gated
+    // modules. The two-state walk that says so is the shape `breach.rs`,
+    // `vault_export.rs` and `send.rs` already carry and that survived
+    // adversarial review there, reused rather than reinvented.
+    // ---------------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a search for the real
+    /// attribute. The same reason [`TEST_MODULE_MARKER`] is a `concat!`.
+    const CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Empty today, and controlled by the walk: a line
+    /// that stops being one fails rather than being quietly forgiven.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Exact rather than a `starts_with`: a whole module
+    /// written on one line is not a module opener here and must fail.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let rest = match t.strip_prefix("mod ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let name = match rest.strip_suffix(" {") {
+            Some(name) => name,
+            None => return false,
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk from the cut to EOF over whatever text it is handed.
+    /// Returns `(visited, modules, closes, depth)` so the caller can control it
+    /// for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison is against the line's real text on
+    /// a CRLF working tree and on an LF one alike.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = source
+            .find(CUT_GATE)
+            .expect("the cut marker is controlled by the caller");
+        let mut depth = 0usize;
+        // The walked region BEGINS with the gate, so nothing inside it is
+        // taken on trust: the first line seen is the attribute itself.
+        let mut gated = false;
+        let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments, the
+                // gate and a module opener -- at ANY indentation, because an
+                // indented `fn` at file scope is still a top-level item and a
+                // column-0-only filter would walk straight past it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. `production_slice` is a PREFIX \
+                     of this file, so every guard here reads only the half above the cut: an \
+                     item down here can name `Command`, write `unsafe`, name a thread or add \
+                     a second `-> Self` and every one of those counts stays word-perfect. \
+                     Move it above the test module."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not test-gated, so it SHIPS -- and it \
+                     ships in the half of the file no guard here reads. That exact shape was \
+                     measured surviving the whole suite at 2192 / 0 failed / 0 warnings with a \
+                     live `Command::new(..).spawn()` inside it"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_guards_cut() {
+        let source = include_str!("updater.rs");
+
+        // 1. The cut lands where the guards think it does, and there is
+        //    exactly one place it could land -- so it cannot move UP into a
+        //    comment or a string and silently truncate the half they read.
+        let seen = source.matches(CUT_GATE).count();
+        assert_eq!(
+            seen, 1,
+            "the test gate occurs {seen} times in this file. `production_slice` cuts at the \
+             FIRST, so a second occurrence is a cut that can move up and vacate every guard \
+             below the truncation while their own text stays word-perfect"
+        );
+        let cut = source.find(CUT_GATE).expect("counted exactly one just above");
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the gate was matched inside a comment \
+             or a string literal rather than at a real attribute"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half still
+        //    reaches the last production item in the file.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("apply_update_with(dest_dir, release, ", "&UpdaterEnv::production())");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: the anchor is not in this file exactly once, so it pins nothing -- \
+             repoint it at the last production item above the test module"
+        );
+        let anchor = source.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, so the cut \
+             moved up and the production half every guard reads is truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, over an LF copy and a CRLF copy of the same text, which
+        //    must agree. Built both ways rather than compared against the bytes
+        //    on disk: this repository stores LF blobs and only
+        //    `core.autocrlf=true` makes a working tree CRLF, so a control that
+        //    asserted "this file is CRLF" would pass here and fail on Linux.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        assert_eq!(
+            walk_below_the_cut(&lf),
+            walk_below_the_cut(&crlf),
+            "the walk gives a different answer on an LF copy of this file than on a CRLF one"
+        );
+        let on_disk = walk_below_the_cut(source);
+        assert!(
+            on_disk == walk_below_the_cut(&lf) || on_disk == walk_below_the_cut(&crlf),
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = on_disk;
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a test \
+             module's worth -- the slice is empty and this test proves nothing"
+        );
+        assert_eq!(
+            (modules, closes, depth),
+            (1, 1, 0),
+            "below the cut there is no longer exactly one opened-and-closed test module: \
+             {modules} opened, {closes} closed, ending at depth {depth}"
+        );
+
+        // 5. Controls on the walk itself: it really refuses production code
+        //    down there. Without these the walk could be a no-op that visits
+        //    lines and asserts nothing.
+        let with_an_appended_item = format!("{lf}\npub fn sneaked() {{}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_appended_item)).is_err(),
+            "control: the walk accepted a `pub fn` appended below the test module, which is \
+             the exact mutation it exists to catch"
+        );
+        // And an INDENTED one, which a column-0 filter would miss.
+        let with_an_indented_item = format!("{lf}\n    struct Sneaked(u8);\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_indented_item)).is_err(),
+            "control: the walk accepted an INDENTED top-level item appended below the test \
+             module"
+        );
+        // And the measured survivor itself: an ungated module, which ships.
+        let with_an_ungated_module = format!("{lf}\nmod zz_below {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_ungated_module)).is_err(),
+            "control: the walk accepted an UNGATED module below the cut, which ships -- that \
+             is the survivor, verbatim"
+        );
+        // And a module whose whole body is on one line, so the brace count
+        // never sees an opener and would otherwise walk on at depth 0.
+        let with_a_one_line_module = format!("{lf}\nmod zz_below {{ pub fn go() {{}} }}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_a_one_line_module)).is_err(),
+            "control: the walk accepted a whole module written on ONE LINE below the cut"
+        );
+        // And a gate that is not THE gate: `#[cfg(not(test))]` ships.
+        let with_an_inverted_gate =
+            format!("{lf}\n#[cfg(not(test))]\nmod zz_below {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_inverted_gate)).is_err(),
+            "control: the walk accepted `#[cfg(not(test))]` as a test gate, which is the one \
+             attribute that means the OPPOSITE"
+        );
     }
 }
