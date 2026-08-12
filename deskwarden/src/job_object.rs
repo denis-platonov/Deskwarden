@@ -797,8 +797,37 @@ mod tests {
     /// the line pass already reported is not reported twice -- and if the two
     /// disagree the stripped count wins, because it is the one no spelling can
     /// hide from.
+    ///
+    /// # Both call syntaxes, from ONE list of method names
+    ///
+    /// Round six was lost to `Command::spawn(&mut command)` and the note at the
+    /// top of this module has said so for two rounds -- while this scan, the
+    /// crate-wide one, still read only the receiver spelling. That gap was
+    /// measured live this round: a `mod` child of `send.rs` calling
+    /// `std::process::Command::output(&mut c)` walked through here untouched.
+    ///
+    /// The fix is deliberately NOT three more literals. A *method call* in Rust
+    /// has exactly two syntaxes -- `recv.m(..)` and `Type::m(recv, ..)` -- so
+    /// the enumeration that is actually closed is the one over METHOD NAMES,
+    /// and `std::process::Command` has exactly three methods that start a
+    /// child: `spawn`, `output` and `status`. [`CHILD_STARTERS`] is that list,
+    /// and each name is matched in both syntaxes.
+    ///
+    /// The associated-function needle is `::NAME(` and not `Command::NAME(`,
+    /// because the type can be spelled in ways a literal cannot chase: a `use`
+    /// alias (`type C = Command; C::spawn(&mut c)`), a qualified form
+    /// (`<std::process::Command>::spawn(&mut c)`), or a plain `process::`
+    /// prefix. `::NAME(` is what all of them have in common.
+    ///
+    /// The one std method reached that way in this crate that does NOT start a
+    /// process is `std::thread::spawn`, which is written in a couple of dozen
+    /// places -- so it is subtracted by name rather than the whole needle being
+    /// abandoned. A thread is not a child process; naming that one exception is
+    /// the price of a needle that no spelling of the type can hide from.
     fn direct_child_starts(label: &str, text: &str) -> Vec<String> {
-        let needles = [
+        // The line pass reads unstripped source and exists only to name a line
+        // number, so it keeps the receiver spelling it can actually find.
+        let line_needles = [
             concat!(".spa", "wn()"),
             concat!(".out", "put()"),
             concat!(".sta", "tus()"),
@@ -806,25 +835,37 @@ mod tests {
         let mut found: Vec<String> = text
             .lines()
             .enumerate()
-            .filter(|(_, line)| needles.iter().any(|n| line.contains(n)))
+            .filter(|(_, line)| line_needles.iter().any(|n| line.contains(n)))
             .map(|(i, line)| format!("{label}:{}: {}", i + 1, line.trim()))
             .collect();
 
         let code = code_only(text);
-        for needle in needles {
-            let stripped = code.matches(needle).count();
-            let named = found.iter().filter(|f| f.contains(needle)).count();
+        for method in CHILD_STARTERS {
+            let receiver = format!(".{method}()");
+            let associated = format!("::{method}(");
+            // `std::thread::spawn(..)` is the one non-process method reached in
+            // this crate by the associated syntax.
+            let thread_form = format!("thread::{method}(");
+            let stripped = code.matches(&receiver).count() + code.matches(&associated).count()
+                - code.matches(&thread_form).count();
+            let named = found.iter().filter(|f| f.contains(&receiver)).count();
             // Fails safe in both directions: a stripped count that exceeds what
             // the line pass could name adds the difference as line-less
             // offenders, and a line pass that somehow saw more adds nothing.
             for _ in named..stripped {
                 found.push(format!(
-                    "{label}: (in the comment-, string- and whitespace-free view) {needle}"
+                    "{label}: (in the comment-, string- and whitespace-free view) a child \
+                     started by `{method}`, in either call syntax"
                 ));
             }
         }
         found
     }
+
+    /// The methods of `std::process::Command` that start a child process.
+    /// Exhaustive by the std API, which is what makes this a closed list rather
+    /// than a denylist of spellings -- see [`direct_child_starts`].
+    const CHILD_STARTERS: &[&str] = &["spawn", "output", "status"];
 
     #[test]
     fn the_two_job_bearing_modules_can_start_a_child_only_through_this_one() {
@@ -1427,11 +1468,46 @@ mod tests {
         // Read through the STRIPPED view, so `# [ path = "x" ]`,
         // `#[/*c*/path="x"]` and an attribute split across lines are one
         // string, and so the several dozen times this file MENTIONS the
-        // attribute in prose and in assertion messages are not hits. The
-        // needles are the three characters that can precede the key in an
-        // attribute -- `[` for `#[path]`, `,` and `(` for
-        // `#[cfg_attr(windows, path = "..")]` -- which is what keeps
-        // `let path = ..` (whitespace-stripped to `letpath=`) out.
+        // attribute in prose and in assertion messages are not hits.
+        //
+        // A TOKEN CHECK, NOT A LIST OF DELIMITERS -- the eighteenth hop.
+        //
+        // Until this round the needles were the three characters that can
+        // precede the key in an attribute (`[` for `#[path]`, `,` and `(` for
+        // `#[cfg_attr(windows, path = "..")]`) and one spelling of the macro,
+        // `include!(`. Both enumerations were measured through, independently,
+        // on the parent commit:
+        //
+        //  * `#[r#path = "../target/aid.rs"] mod aid;` -- a RAW IDENTIFIER.
+        //    `[r#path=` matches none of the three needles, and `code_only`'s
+        //    raw-STRING branch does not consume `r#path` (the character after
+        //    the hashes is `p`, not `"`), so the `r#` survives into the
+        //    stripped view and shifts the key one token to the right. Plain
+        //    `#[path=..]` at the same target is KILLED; this spelling
+        //    SURVIVED.
+        //  * `include!{"../assets/generate-icon.py"}` -- BRACE DELIMITERS. A
+        //    macro at item position accepts `(`, `[` or `{`, the stripper
+        //    keeps `{`, and `include!(` matches none of them. SURVIVED at
+        //    2115 / 217 / 2 / 0 failed with the payload -- a `Command::new`
+        //    starting a child -- compiled into `src/tray.rs` out of an asset
+        //    that was ALREADY on the set-equality list, so nothing new was
+        //    added to the tree at all.
+        //
+        // So neither is a needle any more:
+        //
+        //  * `include!` is matched WITHOUT its delimiter, which is all three
+        //    delimiters at once. `include_str!` and `include_bytes!` do not
+        //    match it -- the `!` in those follows a longer identifier -- which
+        //    is what keeps this crate's several dozen source pins out.
+        //  * `path=` is matched wherever the character before it is not part
+        //    of an identifier, which is every attribute position there is or
+        //    could be, at any nesting depth. `let path = ..` (stripped to
+        //    `letpath=`) and `self.path = ..` are excluded by that same test,
+        //    and a `path => ..` match arm by the `>` after the `=`.
+        //  * and raw-identifier prefixes are removed before either runs, so
+        //    `r#path` and `path` are one token. That is a normalisation rather
+        //    than a fifth needle: it applies to every rule that reads this
+        //    view, not just to the one spelling that was measured.
         //
         // There is exactly one `#[path]` refusal elsewhere in this module and
         // it applies only to files inside the fenced reachable-module closure.
@@ -1462,11 +1538,9 @@ mod tests {
         let mut path_attrs = Vec::new();
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
-            let code = code_only(&text);
-            let hits: usize = ["[path=", ",path=", "(path=", concat!("include", "!(")]
-                .iter()
-                .map(|n| code.matches(n).count())
-                .sum();
+            let code = without_raw_idents(&code_only(&text));
+            let hits: usize =
+                path_attr_hits(&code) + code.matches(concat!("include", "!")).count();
             if hits > 0 {
                 let rel = file.strip_prefix(root).unwrap_or(file);
                 path_attrs.push(format!("{} ({hits})", rel.to_string_lossy().replace('\\', "/")));
@@ -1481,11 +1555,62 @@ mod tests {
              extension -- `aid.rs`, `aid.RS`, `aid.txt` and `aid` all compiled, and the first \
              three each cost a round because the fix widened a list of filenames instead of \
              refusing the attribute. `include!` is the same thing without a new filename: it \
-             SURVIVED this round pointed at an already-listed asset with the `build.rs` pin \
-             re-baselined. `include_str!` and `include_bytes!` embed data and are untouched \
-             by this. If a module genuinely has to live somewhere unusual, say so here and \
-             say why in the commit message; do not delete this assertion"
+             SURVIVED pointed at an already-listed asset with the `build.rs` pin re-baselined, \
+             and SURVIVED AGAIN spelled with BRACE delimiters into `src/tray.rs`, which \
+             is pinned by nothing at all. Both keys are read as TOKENS now -- any delimiter, \
+             any nesting, raw-identifier spellings normalised away -- so the next escape from \
+             here cannot be a fifth spelling. `include_str!` and `include_bytes!` embed data \
+             and are untouched by this. If a module genuinely has to live somewhere unusual, \
+             say so here and say why in the commit message; do not delete this assertion"
         );
+
+        // CONTROLS, through the very same functions, on every spelling that
+        // has been measured through this rule -- because all four assertions
+        // above are "count is zero" shaped and a normalisation that broke
+        // would read exactly the same.
+        let seen = |s: &str| {
+            let code = without_raw_idents(&code_only(s));
+            path_attr_hits(&code) + code.matches(concat!("include", "!")).count()
+        };
+        assert_eq!(seen(r#"#[path = "aid.txt"] mod aid;"#), 1, "control: the plain attribute");
+        assert_eq!(
+            seen(r##"#[r#path = "../target/aid.rs"] mod aid;"##),
+            1,
+            "control: the RAW IDENTIFIER spelling, which SURVIVED on the parent commit -- \
+             `[r#path=` matched none of the three delimiter needles this replaced"
+        );
+        assert_eq!(
+            seen(r#"#[cfg_attr(windows, path = "aid.rs")] mod aid;"#),
+            1,
+            "control: nested inside another attribute"
+        );
+        assert_eq!(
+            seen(r#"include!{"../assets/generate-icon.py"}"#),
+            1,
+            "control: the BRACE-delimited macro, which SURVIVED on the parent commit carrying \
+             a `Command::new(..).spawn()` compiled into `src/tray.rs` out of an already-listed \
+             asset"
+        );
+        assert_eq!(seen(r#"include!["x.rs"]"#), 1, "control: bracket delimiters");
+        assert_eq!(seen(r#"include!("x.rs")"#), 1, "control: paren delimiters");
+        // ...and the shapes this crate really writes, which must NOT be hits,
+        // or the rule is unusable and the next person deletes it.
+        assert_eq!(seen("let path = dir.join(\"x\");"), 0, "control: a local named `path`");
+        assert_eq!(seen("self.path = other;"), 0, "control: a field named `path`");
+        assert_eq!(seen("match k { path => path.len() }"), 0, "control: a match arm binding");
+        assert_eq!(
+            seen(r#"list.iter().find(|(path, _)| path == "breach.rs");"#),
+            0,
+            "control: a closure parameter named `path` compared with `==`, which this crate \
+             writes in `breach.rs` and `http_agent.rs` -- and which sits behind a `|`, the \
+             same non-identifier position an attribute key sits in"
+        );
+        assert_eq!(
+            seen("const S: &str = include_str!(\"job_object.rs\");"),
+            0,
+            "control: `include_str!` embeds DATA and is used by every source pin in this crate"
+        );
+        assert_eq!(seen("let b = include_bytes!(\"icon.ico\");"), 0, "control: `include_bytes!`");
 
         // Files allowed to start a child outside the job, each because it
         // really does today and for a reason that is not this module's to
@@ -1778,6 +1903,50 @@ mod tests {
         out.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
+    /// A [`code_only`] view with raw-identifier prefixes removed, so `r#path`
+    /// and `path` are the same token to every rule that reads it.
+    ///
+    /// `r#` cannot survive [`code_only`] as anything else: a raw STRING is
+    /// consumed whole by that function's own branch, and a raw LIFETIME
+    /// (`'r#a`) is not a thing. So every `r#` left in the stripped view
+    /// introduces an identifier, and the prefix carries no meaning beyond "the
+    /// next token is spelled literally".
+    fn without_raw_idents(code: &str) -> String {
+        code.replace("r#", "")
+    }
+    /// Occurrences of an attribute argument `path = ..` in a stripped view.
+    ///
+    /// The test that reads this explains why it is a token check rather than a
+    /// list of the delimiters an attribute can sit behind. In short: the
+    /// character before the key must not be part of an identifier (which is
+    /// every attribute position, at any nesting depth, and excludes
+    /// `let path =` and `self.path =`), and the character after the `=` must
+    /// not be `>` (which excludes a `path => ..` match arm).
+    fn path_attr_hits(code: &str) -> usize {
+        let b = code.as_bytes();
+        let mut hits = 0;
+        let mut from = 0;
+        while let Some(at) = code[from..].find("path=") {
+            let start = from + at;
+            from = start + "path=".len();
+            let inside_identifier = start > 0
+                && (b[start - 1].is_ascii_alphanumeric()
+                    || b[start - 1] == b'_'
+                    || b[start - 1] == b'.');
+            // `path => ..` is a match arm and `path == ..` a comparison; an
+            // attribute argument is a single `=`. Both shapes are written in
+            // this crate behind a `|` or a `(`, which is exactly the position
+            // an attribute key sits in, so neither can be told apart by what
+            // precedes it.
+            let not_an_assignment =
+                matches!(b.get(from), Some(b'>') | Some(b'='));
+            if !inside_identifier && !not_an_assignment {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
     /// Production `job_object.rs`, cut at the first module-level
     /// `#[cfg(test)]`. Everything below that -- the spawn probe and this test
     /// module -- is absent from the shipped binary.
@@ -2021,32 +2190,104 @@ mod tests {
         // an identifier has exactly one spelling.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-        for file in ["vault_export.rs", "send.rs"] {
-            let raw = std::fs::read_to_string(src.join(file))
-                .unwrap()
-                .replace("\r\n", "\n");
+        // THE TWO RUNNERS, AND EVERY FILE THEY PULL IN -- the eighteenth hop.
+        //
+        // Until this round this loop was the literal pair below, and that made
+        // it the last rule in this module still keyed on a FILE NAME. The round
+        // before had already moved every COUNTING guard in `send_ui.rs` onto a
+        // transitive `mod` closure over `crate::send`, for exactly this reason;
+        // the one identifier-level wall -- RULE 1, which is what actually
+        // refuses a bare `std::process::Command` -- stayed behind on the name.
+        //
+        // Measured on the parent commit, SURVIVING twice byte-identically at
+        // 2115 lib / 217 bin / 0 failed / 0 warnings:
+        //
+        //     // send.rs, above `pub trait SendClock`:
+        //     mod inner;
+        //     // src/send/inner.rs, containing no `pub` token anywhere:
+        //     impl super::SendClock for u8 {
+        //         fn now_unix_millis(&self) -> i64 {
+        //             let exe = concat!("b", "w");
+        //             let mut c = std::process::Command::new(exe,);
+        //             c.arg("send").arg("list");
+        //             let _ = std::process::Command::output(&mut c);
+        //             0
+        //         }
+        //     }
+        //
+        // reached from a pinned `pub` item in `send.rs` under an impossible
+        // guard. Four other guards missed it and each for its own reason: the
+        // 49-item surface equality in `send_ui.rs` scans for a leading `pub`
+        // token and a trait impl method takes its visibility FROM THE TRAIT;
+        // the send seal spells none of its needles because the payload names
+        // `bw` directly; `bw_path`'s spawn scan was a per-LINE raw-text filter
+        // and the call was split across lines; and the crate-wide tree walk
+        // read three receiver-form literals, none of which UFCS spells. The
+        // file was not inert -- appending a `pub fn` to it FAILS the surface
+        // equality, so the closure really does discover and read it -- it
+        // simply presented nothing any reader was looking for.
+        //
+        // So the seeds are named and everything below them is derived, by the
+        // SAME [`mod_closure`] the fence set is derived with. A file added
+        // under either runner is governed by the identifier rules the day it
+        // appears, whatever it is called and however deep it sits.
+        //
+        // WHOLE FILES, not production halves: this loop has always read the
+        // whole file (RULE 7b makes its own cut where it needs one), so the
+        // closure reads whole files for children too. That is a superset of
+        // the production half -- a `mod` child declared inside a `#[cfg(test)]`
+        // module is fenced here as well, which is stricter, not weaker.
+        const RUNNERS: &[&str] = &["vault_export.rs", "send.rs"];
+        let whole = |f: &str| {
+            std::fs::read_to_string(src.join(f)).unwrap().replace("\r\n", "\n")
+        };
+        let (governed, _descendants) = mod_closure(
+            &RUNNERS.iter().map(|f| (*f).to_string()).collect::<Vec<_>>(),
+            &|f| code_only(&whole(f)),
+        );
+        for runner in RUNNERS {
+            assert!(
+                governed.contains(&(*runner).to_string()),
+                "control: the closure lost `{runner}`, so the rules below are not being asked \
+                 about the runner they exist for"
+            );
+        }
+
+        for file in &governed {
+            let file = file.as_str();
+            let is_runner = RUNNERS.contains(&file);
+            let raw = whole(file);
             let code = code_only(&raw);
 
             // Controls FIRST: these rules are all "count is zero" shaped, and
             // a `code_only` that returned nothing, or a module that stopped
             // spawning, would satisfy every one of them while asserting
             // nothing at all.
+            //
+            // The three below are properties of a RUNNER. A `mod` child is not
+            // required to spawn anything at all -- it is required not to be
+            // able to -- so asking it for a `JobCommand` would make adding a
+            // legitimate helper file impossible, and the rules that matter for
+            // it (1, 2, 4, 5, 6, 7) are all asserted on it unconditionally
+            // below.
             assert!(
-                code.len() > 1000,
+                code.len() > if is_runner { 1000 } else { 0 },
                 "{file} produced almost no code, so every rule below is vacuous"
             );
-            assert_eq!(
-                code.matches("JobCommand").count() >= 1,
-                true,
-                "{file} no longer names the wrapper at all, so it is not building its child \
-                 through the one type that can only be spawned into a job"
-            );
-            assert!(
-                code.contains("job_object::spawn_in_job("),
-                "control: {file} no longer spawns through the choke point at all, so the \
-                 emptiness asserted below means the module stopped spawning rather than that \
-                 it spawns correctly"
-            );
+            if is_runner {
+                assert_eq!(
+                    code.matches("JobCommand").count() >= 1,
+                    true,
+                    "{file} no longer names the wrapper at all, so it is not building its child \
+                     through the one type that can only be spawned into a job"
+                );
+                assert!(
+                    code.contains("job_object::spawn_in_job("),
+                    "control: {file} no longer spawns through the choke point at all, so the \
+                     emptiness asserted below means the module stopped spawning rather than \
+                     that it spawns correctly"
+                );
+            }
 
             // RULE 1, and the load-bearing one: every occurrence of the
             // identifier `Command` is part of `JobCommand`. So there is no
@@ -2248,7 +2489,18 @@ mod tests {
             // reached. `super::` is a synonym for `crate::` here, and a rule
             // that bans one spelling of a path and not the other bans nothing.
             //
+            // RUNNERS ONLY, and the reason is what `super::` MEANS. In a
+            // crate-root module it is the crate root, which is why it is
+            // banned here. In a `mod` CHILD of one of these files it is the
+            // runner's own module -- `send/inner.rs`'s `super::` is
+            // `crate::send`, a module every rule in this loop already governs
+            // -- so banning it there would forbid the ordinary way a child
+            // refers to its parent while closing nothing. `super::super`, which
+            // DOES land at the crate root from a child, is refused for every
+            // file above.
+            //
             // Two assertions, because the hazard has two shapes:
+            if is_runner {
             let production = raw
                 .split(concat!("#[cfg(", "test)]", "\nmod "))
                 .next()
@@ -2282,6 +2534,7 @@ mod tests {
                  every other form of it is a path to somewhere in this crate that RULE 7 \
                  cannot read"
             );
+            }
 
             // RULE 7c: A MACRO INVOCATION WRITES NO PATH EITHER.
             //
@@ -4620,6 +4873,87 @@ mod tests {
         out
     }
 
+    /// The transitive `mod` closure of `seeds`, as file paths under `src/`.
+    ///
+    /// Extracted so that the two rules which need it -- the fence-set
+    /// derivation in
+    /// [`every_file_the_runners_can_reach_writes_down_every_name_it_calls`] and
+    /// RULE 1 in
+    /// [`the_two_job_bearing_modules_cannot_name_a_bare_command`] -- cannot
+    /// drift apart. They differ only in WHICH view of a file they read for its
+    /// children (`code_of`), and in what they then do with the files they get.
+    ///
+    /// Returns `(closure, discovered)`: the seeds plus everything reachable,
+    /// sorted and deduplicated, and separately just the children -- so a caller
+    /// can pin "there are none today" and make the day there is one a visible
+    /// edit rather than a silent one.
+    ///
+    /// Every way of not finding the real child is a PANIC, never a skip: a
+    /// `#[path]` attribute (which would point the module somewhere this walk
+    /// does not look), a name with neither `x.rs` nor `x/mod.rs` beside it, and
+    /// a name with BOTH (which rustc itself refuses, E0761 -- so the tree does
+    /// not build, and if it somehow did this walk would fence one file and
+    /// leave the other entirely unread).
+    fn mod_closure(seeds: &[String], code_of: &dyn Fn(&str) -> String) -> (Vec<String>, Vec<String>) {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut required: Vec<String> = seeds.to_vec();
+        let mut discovered: Vec<String> = Vec::new();
+        let mut at = 0;
+        while at < required.len() {
+            let file = required[at].clone();
+            at += 1;
+            assert!(
+                src_dir.join(&file).is_file(),
+                "the closure wants to read `src/{file}`, which is not a file. A module was \
+                 named that this walk cannot follow -- resolve it or fix the name; do not let \
+                 the closure quietly stop here"
+            );
+            let code = code_of(&file);
+            assert!(
+                path_attr_hits(&without_raw_idents(&code)) == 0,
+                "production src/{file} carries a `path = ..` attribute. That re-points a \
+                 `mod` item at a file this closure would not look at, which puts the child \
+                 outside every fence. Put the child where its `mod` name says it goes"
+            );
+            for child in production_mod_children(&code) {
+                let dir = file.trim_end_matches(".rs").trim_end_matches("/mod");
+                let flat = format!("{dir}/{child}.rs");
+                let nested = format!("{dir}/{child}/mod.rs");
+                let present: Vec<String> = [flat, nested]
+                    .into_iter()
+                    .filter(|c| src_dir.join(c).is_file())
+                    .collect();
+                assert!(
+                    present.len() < 2,
+                    "production src/{file} declares `mod {child};` and BOTH {present:?} exist. \
+                     rustc refuses that outright (E0761), so this tree does not build -- and \
+                     if it somehow did, this closure would fence one file and leave the other \
+                     entirely unread. Delete whichever one is not the module"
+                );
+                let found = present.into_iter().next().unwrap_or_else(|| {
+                    panic!(
+                        "production src/{file} declares `mod {child};` but neither \
+                         `src/{dir}/{child}.rs` nor `src/{dir}/{child}/mod.rs` exists, so \
+                         this closure cannot fence the file it pulls in. If the `mod` item \
+                         sits inside an INLINE `mod` in this file, the real file is a \
+                         directory deeper than either name above: this scan finds `mod` \
+                         items wherever they are written but resolves them against the \
+                         FILE, so it stops here rather than guessing, and the fix is to \
+                         stop nesting it. (Measured: that shape, hiding a `CreateProcessW`, \
+                         lands on this line.)"
+                    )
+                });
+                if !required.contains(&found) {
+                    discovered.push(found.clone());
+                    required.push(found);
+                }
+            }
+        }
+        required.sort();
+        required.dedup();
+        (required, discovered)
+    }
+
     /// **This file names exactly one child-starting primitive.**
     ///
     /// RULE 9 counts SPELLINGS -- `.spawn()`, `Command::new(`, the word
@@ -5053,79 +5387,14 @@ mod tests {
         // spell is never spelled by either of them. The closure is
         // `REACHABLE` -> modules -> their `mod` children -> theirs, until it
         // stops growing. A file discovered here and not in `FENCES` fails.
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut required: Vec<String> = reachable_modules.iter().map(|m| format!("{m}.rs")).collect();
-        let mut discovered_children: Vec<String> = Vec::new();
-        let mut at = 0;
-        while at < required.len() {
-            let file = required[at].clone();
-            at += 1;
-            assert!(
-                src_dir.join(&file).is_file(),
-                "the closure wants to read `src/{file}`, which is not a file. A module was \
-                 named that this walk cannot follow -- resolve it or fix the name; do not let \
-                 the closure quietly stop here"
-            );
-            let code = code_only(&fenced_production(&file));
-            // A `#[path = ".."]` attribute re-points a `mod` item at an
-            // arbitrary file -- possibly outside `src/` entirely -- and the
-            // two candidate locations below would then both be wrong while
-            // the real child stayed unfenced. There is no such attribute in
-            // this crate and no reason for a fenced file to grow one, so it
-            // is refused outright rather than followed.
-            assert!(
-                !code.contains(concat!("#[pa", "th=")),
-                "production src/{file} carries a `#[path = ..]` attribute. That re-points a \
-                 `mod` item at a file this closure would not look at, which puts the child \
-                 outside every fence. Put the child where its `mod` name says it goes"
-            );
-            for child in production_mod_children(&code) {
-                let dir = file.trim_end_matches(".rs").trim_end_matches("/mod");
-                let flat = format!("{dir}/{child}.rs");
-                let nested = format!("{dir}/{child}/mod.rs");
-                // BOTH candidates existing is refused rather than resolved.
-                // Untested until this round: `find` took the flat file
-                // first, SILENTLY, and rustc's own resolution of `mod x;`
-                // with both `x.rs` and `x/mod.rs` present is an ERROR
-                // (E0761) -- so the two would disagree about which file is
-                // even being compiled, and this closure would happily fence
-                // the one the compiler refused to use while the other sat
-                // unread. A tie is a broken tree, not a preference.
-                let present: Vec<String> = [flat, nested]
-                    .into_iter()
-                    .filter(|c| src_dir.join(c).is_file())
-                    .collect();
-                assert!(
-                    present.len() < 2,
-                    "production src/{file} declares `mod {child};` and BOTH {present:?} exist. \
-                     rustc refuses that outright (E0761), so this tree does not build -- and \
-                     if it somehow did, this closure would fence one file and leave the other \
-                     entirely unread. Delete whichever one is not the module"
-                );
-                let found = present
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "production src/{file} declares `mod {child};` but neither \
-                             `src/{dir}/{child}.rs` nor `src/{dir}/{child}/mod.rs` exists, so \
-                             this closure cannot fence the file it pulls in. If the `mod` item \
-                             sits inside an INLINE `mod` in this file, the real file is a \
-                             directory deeper than either name above: this scan finds `mod` \
-                             items wherever they are written but resolves them against the \
-                             FILE, so it stops here rather than guessing, and the fix is to \
-                             stop nesting it. (Measured: that shape, hiding a `CreateProcessW`, \
-                             lands on this line.)"
-                        )
-                    });
-                if !required.contains(&found) {
-                    discovered_children.push(found.clone());
-                    required.push(found);
-                }
-            }
-        }
-        required.sort();
-        required.dedup();
+        // The walk itself lives in [`mod_closure`], because RULE 1 in
+        // `the_two_job_bearing_modules_cannot_name_a_bare_command` needs the
+        // very same closure over a different pair of seeds, and two hand-copied
+        // walks are how one of them quietly stops resolving what the other
+        // does. This one reads each file's PRODUCTION half for its children.
+        let seeds: Vec<String> = reachable_modules.iter().map(|m| format!("{m}.rs")).collect();
+        let (required, discovered_children) =
+            mod_closure(&seeds, &|f| code_only(&fenced_production(f)));
 
         let mut fenced: Vec<String> = FENCES.iter().map(|f| f.file.to_string()).collect();
         fenced.sort();

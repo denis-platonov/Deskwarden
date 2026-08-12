@@ -688,17 +688,189 @@ mod tests {
         }
     }
 
-    /// Lines that build a `Command` for something called `bw` directly.
+    /// A file's source with comments removed, `concat!` folded, string
+    /// delimiters removed (their CONTENTS kept) and all whitespace gone.
+    ///
+    /// Deliberately NOT `job_object`'s `code_only`, which drops string bodies:
+    /// the thing this file's guard has to see is the PROGRAM NAME, and the
+    /// program name is a string literal. So the quotes go and the text stays,
+    /// and the guard confines itself to the argument list of `Command::new(`
+    /// so that assertion prose elsewhere in a statement cannot be mistaken for
+    /// one.
+    ///
+    /// Folding `concat!` is the point of the whole function's existence beyond
+    /// whitespace: `concat!("b", "w")` is `"bw"` to the compiler and was two
+    /// unrelated one-letter strings to every reader in this crate.
+    fn spliced(text: &str) -> String {
+        let b: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            let next = b.get(i + 1).copied();
+            if c == '/' && next == Some('/') {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if c == '"' {
+                // The delimiter goes, the body stays. Escapes are skipped so a
+                // `\"` does not end the literal early.
+                i += 1;
+                while i < b.len() {
+                    if b[i] == '\\' {
+                        if let Some(&e) = b.get(i + 1) {
+                            out.push(e);
+                        }
+                        i += 2;
+                    } else if b[i] == '"' {
+                        i += 1;
+                        break;
+                    } else {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        let no_space: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+        fold_concat(&no_space)
+    }
+
+    /// Every `concat!(..)` in a spliced view replaced by its contents with the
+    /// separating commas removed, which is what the compiler makes of it.
+    fn fold_concat(text: &str) -> String {
+        let open = concat!("conc", "at!(");
+        let mut out = text.to_string();
+        while let Some(at) = out.find(open) {
+            let body_start = at + open.len();
+            let b = out.as_bytes();
+            let mut depth = 1usize;
+            let mut i = body_start;
+            while i < b.len() && depth > 0 {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth > 0 {
+                break;
+            }
+            let body: String = out[body_start..i - 1].replace(',', "");
+            out = format!("{}{}{}", &out[..at], body, &out[i..]);
+        }
+        out
+    }
+
+    /// Places that build a `Command` for something called `bw` directly.
     ///
     /// A free function so the guard below can be pointed at a *planted*
     /// violation as well as at the real tree — a source guard whose matcher is
     /// only ever run against code that passes is a guard nobody has seen work.
+    ///
+    /// # Two passes, and the second is the one that has to hold
+    ///
+    /// This was a per-LINE filter over RAW text needing `Command::new(` and
+    /// `bw` on the same physical line, and that is the FOURTH spelling it has
+    /// lost to (`spawn_aid` → `icon_aid`, `.rs` → `.RS` → `.txt`, and now
+    /// simply pressing Enter). Measured on the parent commit, inside a `mod`
+    /// child of `send.rs` and SURVIVING:
+    ///
+    /// ```text
+    /// let exe = concat!("b", "w");
+    /// let mut c = std::process::Command::new(
+    ///     exe,
+    /// );
+    /// ```
+    ///
+    /// Two evasions in three lines: the call is split across lines, and the
+    /// name is assembled by a macro. The line pass is KEPT, because a failure
+    /// that names a line number is a failure someone can act on — but it is no
+    /// longer the rule. The rule is the second pass, over [`spliced`]: whole
+    /// file, no line structure at all, whitespace gone and `concat!` folded, so
+    /// `Command :: new (\n "b" "w" .. )` and `Command::new(concat!("b","w"))`
+    /// are both just `Command::new(bw`.
+    ///
+    /// **The `bw` must sit in the ARGUMENT LIST**, matched by balanced parens
+    /// rather than "somewhere on the line", because string bodies are kept in
+    /// this view and half the crate's assertion messages mention `bw`.
+    ///
+    /// # Disclosed, not fixed
+    ///
+    /// A program name reached through a LOCAL BINDING — `let exe = ..;
+    /// Command::new(exe)` — still walks past this, because the name is not in
+    /// the argument list at all and no amount of window-widening gets it back
+    /// without swallowing the rest of the file. That shape is held elsewhere,
+    /// and it is worth writing down which elsewhere: it is
+    /// `job_object::tests::the_two_job_bearing_modules_can_start_a_child_only_through_this_one`
+    /// (no file outside `ALLOWED` may start a child, in either call syntax) and
+    /// RULE 1 in `the_two_job_bearing_modules_cannot_name_a_bare_command` (no
+    /// file in the runners' `mod` closure may NAME a bare command type). This
+    /// guard is about the ACCOUNT DIRECTORY, and it is the third of three.
     fn direct_bw_spawns(label: &str, text: &str) -> Vec<String> {
         let needle = concat!("Command", "::new(");
-        text.lines()
+        let code = spliced(text);
+        let b = code.as_bytes();
+        let mut stripped = 0usize;
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let arg_start = from + at + needle.len();
+            from = arg_start;
+            // The balanced argument list of this one call, and nothing after
+            // it.
+            let mut depth = 1usize;
+            let mut i = arg_start;
+            while i < b.len() && depth > 0 {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let args = code.get(arg_start..i.saturating_sub(1)).unwrap_or("");
+            if args.contains("bw") {
+                stripped += 1;
+            }
+        }
+        // THE STRIPPED PASS IS THE RULE. The line pass runs only once it has
+        // decided there is something to report, and only to attach line
+        // numbers to it -- a raw line that merely MENTIONS the binary near a
+        // command is not an offender, and making the line pass authoritative
+        // is what would turn every assertion message in this crate into one.
+        if stripped == 0 {
+            return Vec::new();
+        }
+        let mut found: Vec<String> = text
+            .lines()
             .filter(|line| line.contains(needle) && line.contains("bw"))
             .map(|line| format!("{label}: {}", line.trim()))
-            .collect()
+            .collect();
+        for _ in found.len()..stripped {
+            found.push(format!(
+                "{label}: (in the comment- and whitespace-free view, with `concat!` folded) a \
+                 `Command` built for `bw`"
+            ));
+        }
+        found
     }
 
     #[test]
@@ -743,23 +915,54 @@ mod tests {
 
         // Positive control, through the same matcher: it can see the violation
         // it exists to catch...
-        let planted = format!(
-            "        let mut cmd = {}\"bw.exe\");",
-            concat!("Command", "::new(")
-        );
+        let new_call = concat!("Command", "::new(");
+        let planted = format!("        let mut cmd = {new_call}\"bw.exe\");");
         assert_eq!(
             direct_bw_spawns("planted.rs", &planted).len(),
             1,
             "the guard cannot see a direct bw spawn, so its silence above means nothing"
         );
+        // ...and the two spellings that walked through the LINE pass on the
+        // parent commit, which is the whole reason there is a second pass.
+        assert_eq!(
+            direct_bw_spawns(
+                "planted.rs",
+                &format!("let mut c = std::process::{new_call}\n    \"bw.exe\",\n);")
+            )
+            .len(),
+            1,
+            "a `Command::new(..)` split across lines is invisible again -- that is the shape \
+             that SURVIVED inside a `mod` child of `send.rs`"
+        );
+        assert_eq!(
+            direct_bw_spawns(
+                "planted.rs",
+                &format!("let c = {new_call}{}(\"b\", \"w\"));", concat!("conc", "at!"))
+            )
+            .len(),
+            1,
+            "a program name assembled by `concat!` is invisible again"
+        );
         // ...and does not simply flag every spawn, which would make it
         // unmaintainable rather than useful. This crate really does spawn
         // `cmd`, `tasklist` and the updater's installer.
-        assert!(direct_bw_spawns(
-            "planted.rs",
-            &format!("let c = {}\"tasklist\");", concat!("Command", "::new("))
-        )
-        .is_empty());
+        let tasklist = format!("let c = {new_call}\"tasklist\");");
+        assert!(direct_bw_spawns("planted.rs", &tasklist).is_empty());
+        // ...nor every SENTENCE that mentions the binary. `spliced` keeps
+        // string bodies -- it has to, the program name is one -- so the
+        // argument list is matched by balanced parens rather than by proximity,
+        // and a message a few tokens later is not an offender.
+        let nearby = format!("let c = {new_call}\"cmd\"); assert!(ok, \"bw would not start\");");
+        assert!(direct_bw_spawns("planted.rs", &nearby).is_empty());
+        // The splicer itself, since every claim above is worth what it is
+        // worth.
+        assert_eq!(spliced("let a = 1; // Command::new(\"bw\")\n"), "leta=1;");
+        assert_eq!(spliced("/* x */ let p = \"bw.exe\";"), "letp=bw.exe;");
+        assert_eq!(
+            spliced(&format!("{}(\"b\", \"w\")", concat!("conc", "at!"))),
+            "bw",
+            "`concat!` is not folded, so a name assembled from pieces stays invisible"
+        );
     }
 
     #[test]
