@@ -873,17 +873,70 @@ mod tests {
     /// a bonus `thread::new(` spells no `Command::new(`, so `bw_path`'s
     /// `direct_bw_spawns` was silent too. ONE ALIAS DEFEATED TWO GUARDS.
     ///
-    /// [`is_std_thread`] replaces the subtraction, and it does so by DELETING
-    /// the guesswork rather than widening it. An exemption is granted only for
-    /// the path written out in full as `std::thread::NAME`. There is no
-    /// bare-`thread::` exemption at all.
+    /// A first replacement excused the path written out in full as
+    /// `std::thread::NAME` and nothing else, on the theory that a path spelled
+    /// in full needs no resolution. **That was wrong, and measurably so.** The
+    /// sentence three paragraphs down -- "`thread` is an ordinary identifier,
+    /// anything can rebind it" -- is equally true of `std`, and both of these
+    /// SURVIVED the whole suite in `src/accounts.rs` at 2154 lib / 217 bin /
+    /// 3 ignored / 0 failed / 0 warnings:
     ///
-    /// That is affordable because it costs this crate nothing: every one of
-    /// the couple of dozen genuine sites is already spelled
-    /// `std::thread::spawn` in full, and
-    /// [`no_bare_thread_prefix_is_relied_on_for_an_exemption`] pins that, so
-    /// the day someone writes `use std::thread;` and a bare `thread::spawn`
-    /// they get a failing test naming this rule rather than a silent hole.
+    ///     mod zz { pub use std::process::Command as thread; }
+    ///     use self::zz as std;                    // INSIDE a fn body. No lint.
+    ///     let _child = std::thread::spawn(&mut c)?;
+    ///
+    ///     pub mod outer {                         // NOT the crate root.
+    ///         mod std { pub use ::std::process::Command as thread; }
+    ///         .. std::thread::spawn(&mut c)? ..
+    ///     }
+    ///
+    /// The two reasons the previous round gave for leaving that disclosed --
+    /// that the shape "has to be written at the crate root" and that it "makes
+    /// every other `std::` path in the file ambiguous" -- are both false: the
+    /// second shape is nested in a module, and Rust's scoping confines the
+    /// shadow so tightly that the dozens of other `std::` paths in the same
+    /// file compiled with zero errors and zero warnings. Both silenced
+    /// `bw_path::direct_bw_spawns` in the same stroke, since
+    /// `std::thread::new(` spells no `Command::new(` -- the identical double
+    /// defeat the `as thread` rename scored.
+    ///
+    /// # What replaced it: a shape the forgery cannot wear, and a census
+    ///
+    /// The exemption is no longer granted to a SPELLING at all, because every
+    /// spelling is forgeable by whoever is writing the line. Two things are
+    /// required of it now, and the second is the one that matters:
+    ///
+    ///  1. the path is written out as `std::thread::spawn` (`output` and
+    ///     `status` are not functions of `std::thread`, so they are never
+    ///     excused at all), and
+    ///  2. **the argument is a CLOSURE** -- the stripped view reads
+    ///     `spawn(|` or `spawn(move|` immediately after the name.
+    ///
+    /// Point 2 is the same kind of type distinction the receiver needle's
+    /// retained `()` is, and it is why the forgery stops working:
+    /// `Command::spawn` takes `&mut self` and NOTHING ELSE, so no rebinding of
+    /// `std`, of `thread`, or of both can make `Command`'s child start accept
+    /// a closure. To satisfy this shape while still starting a child you must
+    /// write a shim `fn spawn<F>(f: F)` whose body calls `Command::spawn` --
+    /// and that body is itself a child start, in whatever file it is written,
+    /// caught by this very rule. The forgery has to move the crime, not hide
+    /// it. Measured: `P1` (a MODULE-level `use zz as std;`, a shape this
+    /// doc does not name either) and `P3` (a forgery that keeps the census
+    /// below exactly balanced) both FAIL now.
+    ///
+    /// And a CENSUS, [`THREAD_SPAWN_SITES`]: the count of excused sites is
+    /// pinned per file, exactly, in both directions. A file not on it gets a
+    /// budget of ZERO, so `accounts.rs` -- which spawns no threads -- cannot
+    /// buy an exemption at any price; a file on it that grows one more
+    /// excused site fails
+    /// [`the_thread_spawn_census_is_exact`] by name. That is the
+    /// allowlist-of-real-sites shape used elsewhere in this file, and it is
+    /// what turns "an exemption" into "these twenty-odd lines, enumerated".
+    ///
+    /// [`no_bare_thread_prefix_is_relied_on_for_an_exemption`] still pins that
+    /// no bare `thread::` prefix is relied on anywhere, so the day someone
+    /// writes `use std::thread;` and a bare `thread::spawn` they get a failing
+    /// test naming this rule rather than a silent hole.
     ///
     /// An intermediate version tried to RESOLVE a bare `thread::` -- excusing
     /// it in files that import `std::thread` and contain no `as thread`
@@ -907,7 +960,7 @@ mod tests {
     /// `#[path]` rule for exactly this reason -- it is applied here now too,
     /// which makes it a normalisation every rule in this module shares rather
     /// than a fix bolted onto one of them.
-    fn direct_child_starts(label: &str, text: &str) -> Vec<String> {
+    fn direct_child_starts(label: &str, text: &str, thread_budget: usize) -> Vec<String> {
         // The line pass reads unstripped source and exists only to name a line
         // number, so it keeps the receiver spelling it can actually find.
         let line_needles = [
@@ -923,13 +976,20 @@ mod tests {
             .collect();
 
         let code = without_raw_idents(&code_only(text));
+        // The census budget is spent ACROSS the three names, not per name,
+        // because only `spawn` can ever consume it -- see
+        // [`is_std_thread_spawning_a_closure`].
+        let mut budget = thread_budget;
         for method in CHILD_STARTERS {
             let receiver = format!(".{method}()");
-            let stripped = code.matches(&receiver).count()
-                + path_form_starts(&code, method)
-                    .into_iter()
-                    .filter(|at| !is_std_thread(&code, *at))
-                    .count();
+            let paths = path_form_starts(&code, method);
+            let excusable = paths
+                .iter()
+                .filter(|at| is_std_thread_spawning_a_closure(&code, **at, method))
+                .count();
+            let excused = excusable.min(budget);
+            budget -= excused;
+            let stripped = code.matches(&receiver).count() + paths.len() - excused;
             let named = found.iter().filter(|f| f.contains(&receiver)).count();
             // Fails safe in both directions: a stripped count that exceeds what
             // the line pass could name adds the difference as line-less
@@ -986,32 +1046,58 @@ mod tests {
         out
     }
 
-    /// Whether the hit at `at` names `std::thread`'s function rather than a
-    /// `Command` method -- the ONE non-process use of these names in this
-    /// crate, and the reason [`direct_child_starts`] does not simply fail on
-    /// every `::spawn` it sees.
+    /// Whether the hit at `at` is `std::thread::spawn` HANDED A CLOSURE -- the
+    /// ONE non-process use of these names in this crate, and the reason
+    /// [`direct_child_starts`] does not simply fail on every `::spawn` it
+    /// sees.
     ///
-    /// The prefix is required to be WRITTEN OUT, and nothing is inferred. The
-    /// exemption is granted for `std::thread::NAME` and for nothing else --
-    /// not for a bare `thread::NAME`, however plausible the file makes it look.
+    /// Three conditions, and the third is the load-bearing one:
     ///
-    /// `thread` is an ordinary identifier. `use .. as thread;` rebinds it,
-    /// `type thread = ..;` rebinds it, a local `mod thread` rebinds it, and
-    /// each of those was either measured escaping or is a trivial variant of
-    /// one that was. Deciding Rust name binding from substrings is not a thing
-    /// this file can do correctly, so it no longer tries: it reads a path it
-    /// can verify on sight, and treats every other spelling as a child start.
+    ///  1. the name is `spawn`. `std::thread` has no `output` and no `status`,
+    ///     so those two are NEVER excused, whatever prefix they are given.
+    ///  2. the prefix is written out as `std::thread`, not preceded by an
+    ///     identifier character (`my_std::thread::spawn` is not std's).
+    ///  3. **the argument is a closure** -- `(|` or `(move|` in the
+    ///     whitespace-free view, immediately after the name.
     ///
-    /// `std` itself could in principle be shadowed by a local `mod std`.
-    /// DISCLOSED, not fixed -- that shape has to be written at the crate root,
-    /// makes every other `std::` path in the file ambiguous, and is held by
-    /// nothing here. It is a much louder edit than the `as thread` rename this
-    /// replaced, which fired no lint at all.
+    /// # Why the spelling alone was not enough
+    ///
+    /// The previous version stopped at conditions 1 and 2, reasoning that a
+    /// path written out in full needs no resolution. `std` is an identifier
+    /// too, and TWO forgeries of it were measured SURVIVING at 2154 / 217 /
+    /// 3 / 0 failed / 0 warnings: a function-body-local `use zz as std;` whose
+    /// `zz::thread` is `std::process::Command`, and a `mod std` nested inside
+    /// an ordinary module. Neither fired a lint; neither made any other
+    /// `std::` path in the file ambiguous. See [`direct_child_starts`].
+    ///
+    /// Condition 3 is what those cannot wear. `Command::spawn`,
+    /// `Command::output` and `Command::status` take `&mut self` AND NOTHING
+    /// ELSE on stable; there is no rebinding of `std`, of `thread`, or of both
+    /// that makes a `Command` child start accept a closure argument. A shim
+    /// that DOES take a closure has to call `Command::spawn` in its own body,
+    /// which is a child start in whatever file that body is written -- so the
+    /// forgery is displaced rather than concealed.
+    ///
+    /// It is the same kind of distinction as the receiver needle's retained
+    /// `()`: an argument list is a fact about the callee's type, not a
+    /// spelling the caller is free to choose.
+    ///
+    /// # It is a shape AND a census
+    ///
+    /// This predicate only decides whether a site is EXCUSABLE. How many
+    /// excusable sites a file may actually spend is [`THREAD_SPAWN_SITES`],
+    /// which is exact in both directions and defaults to zero. A shape test
+    /// alone would still let a forger who could write a closure-taking shim
+    /// place arbitrarily many; the census means every excused line in this
+    /// crate is enumerated, and a new one is a visible edit.
     ///
     /// A `.thread` RECEIVER call is never excused: `std::thread::spawn` is a
     /// free function, only ever reached by the path syntax, and the receiver
     /// needle requires an empty argument list anyway.
-    fn is_std_thread(code: &str, at: usize) -> bool {
+    fn is_std_thread_spawning_a_closure(code: &str, at: usize, method: &str) -> bool {
+        if method != concat!("spa", "wn") {
+            return false;
+        }
         let Some(path) = code[..at].strip_suffix("::") else {
             return false;
         };
@@ -1019,12 +1105,200 @@ mod tests {
             return false;
         };
         // `..my_std::thread::spawn` is not `std::thread::spawn`.
-        !before.as_bytes().last().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        if before.as_bytes().last().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            return false;
+        }
+        let Some(args) = code[at + method.len()..].strip_prefix('(') else {
+            return false;
+        };
+        args.starts_with('|') || args.starts_with("move|")
+    }
+
+    /// `pub`-visible items in a [`code_only`] view that NAME one of `needles`
+    /// -- the shapes that hand a symbol out of its file under a spelling the
+    /// caller's own file never has to write.
+    ///
+    /// Four keywords, and only four: `use`, `const`, `static` and `type`. A
+    /// `pub fn` whose BODY calls the needle is deliberately NOT a hit -- that
+    /// is an ordinary call, `vault_window/mod.rs` really contains one, and
+    /// flagging it would make this rule unusable within a day of being
+    /// written. What is being caught is the RENAME, not the use.
+    ///
+    /// Item boundaries are taken from the previous `;`, `{` or `}` to the next
+    /// `;`, which is exact for the four keywords involved: none of `use`,
+    /// `const`, `static` or `type` can contain a `;` before its own, and all
+    /// four end in one. (A `const` with a block-expression initialiser could
+    /// contain a `{`; that would only SPLIT the item and lose the leading
+    /// `pub`, so the needle-bearing tail would then not start with a
+    /// visibility and would be missed. It is not a shape this crate has, and a
+    /// `pub const G: T = { ..CreateProcessW.. };` is louder than the `use` line
+    /// this exists to stop.)
+    fn pub_items_naming(code: &str, needles: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for needle in needles {
+            let mut from = 0;
+            while let Some(off) = code[from..].find(needle) {
+                let hit = from + off;
+                from = hit + needle.len();
+                let end = code[hit..].find(';').map_or(code.len(), |i| hit + i);
+                // TWO candidate starts, and a hit on EITHER counts. Neither
+                // alone is enough: a BRACE-delimited start loses the `pub` of
+                // a grouped `use a::{b, NEEDLE as g};`, and a `;`-delimited
+                // start loses it the other way round, keeping the enclosing
+                // `pub mod m {` in front of a nested `pub use`. Both shapes
+                // are re-exports; both are caught.
+                let starts = [
+                    code[..hit].rfind([';', '{', '}']).map_or(0, |i| i + 1),
+                    code[..hit].rfind(';').map_or(0, |i| i + 1),
+                ];
+                for start in starts {
+                    let item = &code[start..end];
+                    // `pub`, `pub(crate)`, `pub(super)`, `pub(in ..)` -- then
+                    // one of the four keywords, immediately.
+                    let Some(after_pub) = item.strip_prefix("pub") else { continue };
+                    let after_vis = if let Some(rest) = after_pub.strip_prefix('(') {
+                        match rest.split_once(')') {
+                            Some((_, tail)) => tail,
+                            None => continue,
+                        }
+                    } else {
+                        after_pub
+                    };
+                    if ["use", "const", "static", "type"].iter().any(|kw| after_vis.starts_with(kw))
+                    {
+                        out.push(format!("{needle} is handed out by `{item};`"));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every file in this crate that is allowed to spend a `std::thread::spawn`
+    /// exemption, and EXACTLY how many it may spend.
+    ///
+    /// The counts are over the [`code_only`] view, so a `std::thread::spawn`
+    /// written in a doc comment costs nothing and buys nothing.
+    ///
+    /// This is the enumeration that replaced a rule-shaped exemption. A file
+    /// absent from this list has a budget of ZERO -- which is the whole point:
+    /// `accounts.rs`, where four separate forgeries of `std::thread` have now
+    /// been measured, starts no threads, so no spelling of `std::thread::spawn`
+    /// can be excused there however perfectly it is dressed.
+    ///
+    /// Held exact in both directions by [`the_thread_spawn_census_is_exact`]:
+    /// a new genuine thread is a deliberate one-line edit here, and a site
+    /// that goes away must be removed rather than left as pre-paid credit.
+    const THREAD_SPAWN_SITES: &[(&str, usize)] = &[
+        ("app.rs", 1),
+        ("app_identity.rs", 1),
+        ("app_window.rs", 4),
+        ("breach.rs", 2),
+        ("http_agent.rs", 4),
+        ("injector/mod.rs", 1),
+        ("injector/sequence.rs", 1),
+        ("login_ui.rs", 10),
+        ("main.rs", 12),
+        ("picker_ui.rs", 2),
+        ("updater.rs", 3),
+        ("vault_window/mod.rs", 8),
+    ];
+
+    /// The budget [`THREAD_SPAWN_SITES`] grants a file, by the same relative
+    /// path spelling `ALLOWED` uses. Absent means zero.
+    fn thread_spawn_budget(relative: &str) -> usize {
+        THREAD_SPAWN_SITES.iter().find(|(f, _)| *f == relative).map_or(0, |(_, n)| *n)
+    }
+
+    #[test]
+    fn the_thread_spawn_census_is_exact() {
+        // The exemption granted by [`is_std_thread_spawning_a_closure`] is
+        // capped per file by [`THREAD_SPAWN_SITES`], and this is what keeps
+        // that cap honest in BOTH directions: an uncounted excusable site is a
+        // hole being opened silently, and a counted site that no longer exists
+        // is pre-paid credit sitting in a file waiting for the next editor.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        let rel = |p: &std::path::Path| {
+            p.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/")
+        };
+        let mut actual: Vec<(String, usize)> = Vec::new();
+        for file in &files {
+            let code = without_raw_idents(&code_only(&std::fs::read_to_string(file).unwrap()));
+            let n: usize = CHILD_STARTERS
+                .iter()
+                .map(|m| {
+                    path_form_starts(&code, m)
+                        .into_iter()
+                        .filter(|at| is_std_thread_spawning_a_closure(&code, *at, m))
+                        .count()
+                })
+                .sum();
+            if n > 0 {
+                actual.push((rel(file), n));
+            }
+        }
+        actual.sort();
+        let mut listed: Vec<(String, usize)> =
+            THREAD_SPAWN_SITES.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        listed.sort();
+        assert_eq!(
+            actual,
+            listed,
+            "the `std::thread::spawn` census is out of date. Every excused site in this crate is \
+             enumerated in THREAD_SPAWN_SITES, exactly, because the alternative is a rule-shaped \
+             exemption -- and four separate forgeries of `std::thread` have now walked through \
+             rule-shaped exemptions. If you added a thread, add the line; if you removed one, \
+             remove the line. Do NOT widen the shape."
+        );
+        // Controls: the shape excuses a real thread spawn, in both closure
+        // spellings, and excuses nothing else.
+        let excused = |s: &str| {
+            let code = without_raw_idents(&code_only(s));
+            CHILD_STARTERS
+                .iter()
+                .map(|m| {
+                    path_form_starts(&code, m)
+                        .into_iter()
+                        .filter(|at| is_std_thread_spawning_a_closure(&code, *at, m))
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let spawn = concat!("spa", "wn");
+        assert_eq!(excused(&format!("std::thread::{spawn}(move || w());")), 1);
+        assert_eq!(excused(&format!("std::thread::{spawn}(|| w());")), 1);
+        // ...and NOT the two forgeries of `std` that survived the spelling-only
+        // rule, because a `Command` child start cannot take a closure.
+        assert_eq!(
+            excused(&format!("use self::zz as std;\r\nlet _c = std::thread::{spawn}(&mut c)?;")),
+            0,
+            "a rebound `std` is buying an exemption again"
+        );
+        assert_eq!(
+            excused(&format!(
+                "mod std {{ pub use ::std::process::Command as thread; }}\r\n\
+                 let _c = std::thread::{spawn}(&mut c)?;"
+            )),
+            0,
+            "a nested `mod std` is buying an exemption again"
+        );
+        // ...nor `output`/`status`, which `std::thread` does not have at all.
+        for absent in [concat!("out", "put"), concat!("sta", "tus")] {
+            assert_eq!(
+                excused(&format!("let _ = std::thread::{absent}(move || w());")),
+                0,
+                "`std::thread::{absent}` is not a function; it must never be excused"
+            );
+        }
     }
 
     #[test]
     fn no_bare_thread_prefix_is_relied_on_for_an_exemption() {
-        // [`is_std_thread`] excuses ONLY a fully written `std::thread::NAME`,
+        // [`is_std_thread_spawning_a_closure`] excuses ONLY a fully written
+        // `std::thread::spawn(|..)`,
         // which costs this crate nothing TODAY -- every genuine site spells it
         // out. This is the assertion that keeps that true, so that the day
         // someone writes `use std::thread;` and a bare `thread::spawn(..)`
@@ -1045,7 +1319,9 @@ mod tests {
                 for at in path_form_starts(&code, method) {
                     let head = &code[..at];
                     let Some(path) = head.strip_suffix("::") else { continue };
-                    if path.ends_with("thread") && !is_std_thread(&code, at) {
+                    if path.ends_with("thread")
+                        && !is_std_thread_spawning_a_closure(&code, at, method)
+                    {
                         bare.push(format!(
                             "{}: a `thread::{method}` that is not `std::thread::{method}`",
                             file.display()
@@ -1057,19 +1333,25 @@ mod tests {
         assert!(
             bare.is_empty(),
             "spell these `std::thread::..` out in full; the child-start guard excuses only the \
-             fully written path, because `thread` is an identifier anything can rebind:\n{}",
+             fully written path GIVEN A CLOSURE, because `thread` is an identifier anything can rebind -- and so is `std`:\n{}",
             bare.join("\n")
         );
         // Controls: the exemption exists, and it is narrow.
         let hit = |s: &str| {
             let code = without_raw_idents(&code_only(s));
             let at = path_form_starts(&code, "spawn")[0];
-            is_std_thread(&code, at)
+            is_std_thread_spawning_a_closure(&code, at, "spawn")
         };
         assert!(hit(&format!("std::thread::{}(move || w());", concat!("spa", "wn"))));
         assert!(!hit(&format!("thread::{}(&mut c)?;", concat!("spa", "wn"))));
         assert!(!hit(&format!("my_std::thread::{}(&mut c)?;", concat!("spa", "wn"))));
         assert!(!hit(&format!("Command::{}(&mut c)?;", concat!("spa", "wn"))));
+        // ...and the two `std` forgeries the spelling-only version admitted.
+        assert!(!hit(&format!(
+            "use self::zz as std; let _c = std::thread::{}(&mut c)?;",
+            concat!("spa", "wn")
+        )));
+        assert!(!hit(&format!("std::thread::{}(&mut c)?;", concat!("spa", "wn"))));
     }
 
     #[test]
@@ -1913,7 +2195,7 @@ mod tests {
                     code.matches(&format!(".{m}()")).count()
                         + path_form_starts(&code, m)
                             .into_iter()
-                            .filter(|at| !is_std_thread(&code, *at))
+                            .filter(|at| !is_std_thread_spawning_a_closure(&code, *at, m))
                             .count()
                 })
                 .sum();
@@ -1930,7 +2212,8 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(file).unwrap();
-            offenders.extend(direct_child_starts(&file.display().to_string(), &text));
+            let budget = thread_spawn_budget(&relative(file));
+            offenders.extend(direct_child_starts(&file.display().to_string(), &text, budget));
         }
         assert!(
             offenders.is_empty(),
@@ -2004,6 +2287,109 @@ mod tests {
             "the Win32 scan cannot see the call it exists to catch"
         );
 
+        // AND THE RE-EXPORT SURFACE OF THE `ALLOWED` FILES, WHICH THE SCAN
+        // ABOVE SKIPS ENTIRELY.
+        //
+        // The scan above is a SUBSTRING scan over each file's own text, which
+        // is why an alias written in the SAME file is caught: the `use` line
+        // spells the name. What it cannot see is an alias written in a file it
+        // does not read at all. `ALLOWED` files are exactly those files.
+        //
+        // MEASURED, in `src/accounts.rs`, SURVIVING at 2154 lib / 217 bin /
+        // 3 ignored / 0 failed / 0 warnings:
+        //
+        //     // updater.rs -- on ALLOWED, so both scans skip it
+        //     pub(crate) use windows::Win32::UI::Shell::ShellExecuteW as zz_go;
+        //     // accounts.rs -- not on ALLOWED, and reads nothing like a Win32 name
+        //     crate::updater::zz_go(HWND::default(), .., SW_SHOWNORMAL);
+        //
+        // The previous round DISCLOSED an "alias hole" as reasoned rather than
+        // measured, on the strength of an E0283 it hit. That error came from
+        // its own probe's `let _ = go;` forcing inference, not from the
+        // aliasing: `ShellExecuteW` takes concrete `HWND`/`PCWSTR`/
+        // `SHOW_WINDOW_CMD` arguments and aliases perfectly cleanly. And the
+        // disclosure did not mention the re-export surface at all, which is
+        // the half that actually works.
+        //
+        // WHAT THIS RULE DOES: no `pub`-visible `use`, `const`, `static` or
+        // `type` item ANYWHERE in this crate -- `ALLOWED` files included, they
+        // are not excused from this one -- may name a `WIN32_STARTERS`
+        // function. An `ALLOWED` file may START a child; it may not hand the
+        // NAME out under a different one.
+        //
+        // WHAT IT DOES NOT COVER, said plainly rather than left to silence:
+        //
+        //  * a PRIVATE `use .. as zz;` in an `ALLOWED` file plus a
+        //    `pub(crate) fn` wrapper around the call. That is not a re-export
+        //    of the name, it is an `ALLOWED` file exposing a function that
+        //    starts a child -- the same standing surface as
+        //    `pub fn run_anything_jobless`, held for the two job-bearing
+        //    runners by `DOOR_FILES`/`DOOR_MODULES` and by nothing at all for
+        //    an arbitrary caller. Measured as `P4`: it SURVIVES. It is a
+        //    strictly louder edit than a `use` line, and closing it means
+        //    fencing the callable surface of every `ALLOWED` file, which is a
+        //    round of its own.
+        //  * a `pub` re-export of the enclosing MODULE
+        //    (`pub use ::windows::Win32::UI::Shell as zz;`). That one needs no
+        //    covering: the caller must then spell `zz::ShellExecuteW`, which
+        //    contains the needle, in ITS OWN non-`ALLOWED` file. Measured as
+        //    `P5` with a glob re-export: KILLED. Renaming is the whole trick,
+        //    and renaming is what this rule forbids.
+        //
+        // `Command` needs no equivalent rule and this is why: its child starts
+        // are METHODS, so the caller has to write `spawn`/`output`/`status` in
+        // its own file whatever the receiver type has been renamed to. A Win32
+        // starter is a FREE FUNCTION whose only appearance is its name, so
+        // renaming it once removes it from every file downstream.
+        let mut laundered = Vec::new();
+        for file in &files {
+            let code = code_only(&std::fs::read_to_string(file).unwrap());
+            for item in pub_items_naming(&code, WIN32_STARTERS) {
+                laundered.push(format!("{}: {item}", relative(file)));
+            }
+        }
+        assert!(
+            laundered.is_empty(),
+            "a raw Win32 process-starting function is re-exported under a `pub` visibility, so a \
+             file that names no Win32 symbol at all can start a child through it and the scan \
+             above sees nothing in either file. Call it where it is used, spelled out, in a file \
+             that is answerable for it:\n{}",
+            laundered.join("\n")
+        );
+        // Controls, so that silence is worth something...
+        let planted = |s: &str| pub_items_naming(&code_only(s), WIN32_STARTERS).len();
+        let shell = concat!("Shell", "ExecuteW");
+        assert_eq!(
+            planted(&format!("pub(crate) use windows::Win32::UI::Shell::{shell} as zz_go;")),
+            1,
+            "the measured `pub(crate) use .. as ..` laundering walks past"
+        );
+        assert_eq!(planted(&format!("pub use a::b::{shell};")), 1);
+        assert_eq!(planted(&format!("pub use a::b::{{c, {shell} as g}};")), 1);
+        assert_eq!(planted(&format!("pub(super) use a::{shell} as g;")), 1);
+        assert_eq!(
+            planted(&format!("pub mod m {{ pub(crate) use a::{shell} as g; }}")),
+            1,
+            "a re-export NESTED in a module walks past"
+        );
+        assert_eq!(
+            planted(&format!("pub(crate) const G: unsafe fn() = a::{shell};")),
+            1,
+            "a function POINTER is the same rename with a different keyword"
+        );
+        assert_eq!(planted(&format!("pub(crate) static G: X = a::{shell};")), 1);
+        // ...and it does not fire on the shapes that are not a rename: a
+        // PRIVATE import, and a `pub fn` whose BODY calls the thing (which is
+        // `vault_window/mod.rs`'s real `webbrowser_open`, and which the
+        // `ALLOWED` list is what excuses).
+        assert_eq!(planted(&format!("use windows::Win32::UI::Shell::{shell};")), 0);
+        assert_eq!(
+            planted(&format!("pub fn open(u: &str) {{ unsafe {{ let _ = {shell}(h, o); }} }}")),
+            0,
+            "the re-export rule is firing on an ordinary call and would have to be deleted"
+        );
+        assert_eq!(planted("pub use crate::updater::zz_go;"), 0);
+
         // The two files this guarantee is actually about are named, so that
         // silently adding either to ALLOWED is not enough to make the guard
         // shrug: they must carry ZERO occurrences, in the whole file, tests
@@ -2012,7 +2398,7 @@ mod tests {
             let path = src.join(must_be_clean);
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(
-                direct_child_starts(must_be_clean, &text).is_empty(),
+                direct_child_starts(must_be_clean, &text, 0).is_empty(),
                 "{must_be_clean} can start a child without passing `spawn_in_job`"
             );
             assert!(
@@ -2026,18 +2412,18 @@ mod tests {
         // Positive control, through the same matcher: it can see the thing it
         // exists to catch...
         assert_eq!(
-            direct_child_starts("planted.rs", &format!("let c = cmd{}?;", concat!(".spa", "wn()")))
+            direct_child_starts("planted.rs", &format!("let c = cmd{}?;", concat!(".spa", "wn()")), 0)
                 .len(),
             1,
             "the matcher cannot see a direct spawn, so its silence above means nothing"
         );
         assert_eq!(
-            direct_child_starts("planted.rs", &format!("let o = cmd{};", concat!(".out", "put()")))
+            direct_child_starts("planted.rs", &format!("let o = cmd{};", concat!(".out", "put()")), 0)
                 .len(),
             1
         );
         assert_eq!(
-            direct_child_starts("planted.rs", &format!("let s = cmd{};", concat!(".sta", "tus()")))
+            direct_child_starts("planted.rs", &format!("let s = cmd{};", concat!(".sta", "tus()")), 0)
                 .len(),
             1
         );
@@ -2048,7 +2434,7 @@ mod tests {
             direct_child_starts(
                 "planted.rs",
                 &format!("let _ = real{};", concat!(".spa", "wn ()"))
-            )
+            , 0)
             .len(),
             1,
             "`.spawn ()` is still invisible here, so this guard would lose the eighth hop again"
@@ -2059,7 +2445,7 @@ mod tests {
             direct_child_starts(
                 "planted.rs",
                 &format!("let _ = real\r\n    {}\r\n    );", concat!(".spa", "wn ("))
-            )
+            , 0)
             .len(),
             1,
             "a receiver and its `spawn` on two lines slip past"
@@ -2074,7 +2460,7 @@ mod tests {
             format!("structS{{f:fn(&mut Command)->R}}letx=S{{f:C::{}}};", concat!("sta", "tus")),
         ] {
             assert_eq!(
-                direct_child_starts("planted.rs", &value_form).len(),
+                direct_child_starts("planted.rs", &value_form, 0).len(),
                 1,
                 "a child start NAMED rather than called walks past again: {value_form}"
             );
@@ -2092,7 +2478,7 @@ mod tests {
                     "use std::process::Command as thread;\r\nlet _c = thread::{}(&mut c)?;",
                     concat!("spa", "wn")
                 )
-            )
+            , 0)
             .len(),
             1,
             "`use .. as thread` still cancels its own detection -- the exception is being taken \
@@ -2104,7 +2490,8 @@ mod tests {
         assert!(
             direct_child_starts(
                 "planted.rs",
-                &format!("let h = std::thread::{}(move || work());", concat!("spa", "wn"))
+                &format!("let h = std::thread::{}(move || work());", concat!("spa", "wn")),
+                1,
             )
             .is_empty(),
             "control: `std::thread::spawn` is not a child process"
@@ -2125,7 +2512,7 @@ mod tests {
             format!("mod thread {{ }}\r\nlet h = thread::{}(&mut c)?;", concat!("spa", "wn")),
         ] {
             assert_eq!(
-                direct_child_starts("planted.rs", &laundered).len(),
+                direct_child_starts("planted.rs", &laundered, 0).len(),
                 1,
                 "a bare `thread::` prefix is being excused on the strength of its spelling again \
                  -- `thread` is an identifier anything can rebind: {laundered}"
@@ -2135,7 +2522,8 @@ mod tests {
         assert_eq!(
             direct_child_starts(
                 "planted.rs",
-                &format!("let h = my_std::thread::{}(&mut c)?;", concat!("spa", "wn"))
+                &format!("let h = my_std::thread::{}(&mut c)?;", concat!("spa", "wn")),
+                1,
             )
             .len(),
             1,
@@ -2150,7 +2538,7 @@ mod tests {
             format!("let o = c.r#{}();", concat!("out", "put")),
         ] {
             assert_eq!(
-                direct_child_starts("planted.rs", &raw).len(),
+                direct_child_starts("planted.rs", &raw, 0).len(),
                 1,
                 "a raw-identifier spelling of a child start walks past: {raw}"
             );
@@ -2166,7 +2554,7 @@ mod tests {
             format!("let r = scope.{}(move || drain(pipe));", concat!("spa", "wn")),
         ] {
             assert!(
-                direct_child_starts("planted.rs", &not_a_command).is_empty(),
+                direct_child_starts("planted.rs", &not_a_command, 0).is_empty(),
                 "the receiver form is flagging something that is not a `Command`: {not_a_command}"
             );
         }
@@ -2174,14 +2562,14 @@ mod tests {
         assert!(direct_child_starts(
             "planted.rs",
             "let child = crate::job_object::spawn_in_job(self.job(), command)?;"
-        )
+        , 0)
         .is_empty());
         // ...nor prose about spawning, which the stripped pass must drop or
         // every doc comment in these two modules becomes an offender.
         assert!(direct_child_starts(
             "planted.rs",
             "/// The runner used to call .spawn ( ) itself; it no longer can.\r\nlet a = 1;"
-        )
+        , 0)
         .is_empty());
     }
 

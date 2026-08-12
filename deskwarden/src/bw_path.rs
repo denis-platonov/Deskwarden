@@ -838,10 +838,27 @@ mod tests {
     /// `job_object::tests::the_two_job_bearing_modules_can_start_a_child_only_through_this_one`.
     /// No file outside its `ALLOWED` list may START a child — in either of
     /// Rust's method syntaxes, whether the method is called or merely NAMED as
-    /// a path value, and with the `std::thread` exemption RESOLVED rather than
-    /// taken on the spelling of the prefix, so the `as thread` alias above is
-    /// reported there even though it is invisible here. A `Command` this guard
-    /// cannot see still cannot be STARTED outside the choke point.
+    /// a path value. The `as thread` alias above is reported there even though
+    /// it is invisible here. A `Command` this guard cannot see still cannot be
+    /// STARTED outside the choke point.
+    ///
+    /// **That backstop's own escape hatch, named precisely, because the
+    /// sentence that used to stand here was wrong too.** It said the
+    /// `std::thread` exemption was "RESOLVED rather than taken on the spelling
+    /// of the prefix". It was not: it was taken on the spelling, `std` is an
+    /// identifier like any other, and two rebindings of it — a fn-body-local
+    /// `use zz as std;` and a `mod std` nested in an ordinary module — were
+    /// measured starting a child in `accounts.rs` while this guard stayed
+    /// silent too, since `std::thread::new(` spells no `Command::new(`. ONE
+    /// ALIAS DEFEATING BOTH GUARDS is the recurring shape here, and it has now
+    /// happened three times.
+    ///
+    /// What holds today is not a resolution of `std` either — it is that the
+    /// exemption requires the argument to be a CLOSURE, which
+    /// `Command::spawn(&mut self)` cannot be handed at any spelling, and that
+    /// the exempt sites are enumerated per file, with `accounts.rs` on zero.
+    /// See `job_object`'s `is_std_thread_spawning_a_closure` and
+    /// `THREAD_SPAWN_SITES` for what that does and does not claim.
     ///
     /// RULE 1 is a real rule and it does hold — over the runners' `mod`
     /// closure. It is simply not this guard's backstop outside that closure.
