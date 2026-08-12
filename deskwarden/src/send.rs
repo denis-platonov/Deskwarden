@@ -1322,6 +1322,44 @@ pub fn cli_send_list(
     list_sends(&CliSendRunner::with_session(job, data_dir, session))
 }
 
+/// **The one `pub` route out of this module into a real `bw send delete`
+/// child**, and the exact counterpart of [`cli_send_list`] one line above.
+///
+/// Everything that function's doc comment says about the privacy wall applies
+/// here unchanged and is not repeated: `CliSendRunner` and both of its
+/// constructors are private to `crate::send`, `delete_invocation` is private
+/// to `crate::send`, and the two guards that hold the wall -- the public
+/// surface EQUALITY and the crate-wide needle counts, both in
+/// `vault_window::send_ui::source_pins` -- were updated by the same commit
+/// that added this function, deliberately, rather than widened to admit it
+/// silently.
+///
+/// **Adding this door was not optional.** `delete_send` is generic over
+/// `SendRunner` and there is no `pub` implementation of that trait in this
+/// crate; a revoke wired from `vault_window` therefore had a choice between
+/// this one function and making the runner nameable from outside, and the
+/// second is the wall itself.
+///
+/// **It blocks for up to [`SEND_TIMEOUT`], and it must never be called from
+/// the eframe frame closure.** The seal that holds that is
+/// `vault_window::send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`,
+/// which counts this name over every `.rs` file under `src` and requires
+/// every mention outside `send.rs` to be inside `mod send_delete_thread`.
+///
+/// The session, the job and the profile directory are parameters for
+/// `cli_send_list`'s reason: this function reads no process state and holds
+/// none. The session reaches the child in `BW_SESSION` and never in argv --
+/// `CliSendRunner::build_command` is the one place that decides that, and it
+/// decides it for every invocation this module has.
+pub fn cli_send_delete(
+    job: Option<&crate::job_object::KillOnCloseJob>,
+    data_dir: Option<&Path>,
+    session: &str,
+    id: &str,
+) -> Result<(), SendError> {
+    delete_send(&CliSendRunner::with_session(job, data_dir, session), id)
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2381,8 +2419,13 @@ mod runner_tests {
         // spent on prose rather than on code -- and prose is exactly what the
         // allowance is not meant to measure. Written with `concat!` so the
         // anchor's own source line is not a second occurrence of it.
+        // Repointed again when `cli_send_delete` was added below
+        // `cli_send_list`: the anchor must be the LAST production item in the
+        // file, and leaving it on `cli_send_list`'s body would have spent the
+        // 4000-byte allowance below on the new function's doc comment rather
+        // than measuring what the allowance is for.
         const LAST_PRODUCTION_ITEM: &str =
-            concat!("list_sen", "ds(&CliSendRunner::with_session(job, data_dir, session))");
+            concat!("delete_sen", "d(&CliSendRunner::with_session(job, data_dir, session), id)");
         assert_eq!(
             lf.matches(LAST_PRODUCTION_ITEM).count(),
             1,

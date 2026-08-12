@@ -806,6 +806,15 @@ pub fn build_frame(
     // The last report, until the user dismisses it. `None` is "nothing to
     // say", which is also what a cancelled dialog leaves behind.
     let mut export_report: Option<ExportReport> = None;
+    // One revoke reporting back. The whole of it -- the `bw send delete`
+    // child included -- happens on the worker thread
+    // `send_delete_thread::spawn_send_delete` starts, so nothing here waits.
+    let (send_delete_tx, send_delete_rx): (SendDeleteSender, Receiver<SendDeleteReport>) =
+        mpsc::channel();
+    // Which row is asking, which row is being revoked, and what the last
+    // revoke ended as. The rules relating those three are `apply_send_action`
+    // and `drain_send_delete`, which are plain functions the tests run.
+    let mut send_delete = SendDeleteState::default();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -1344,6 +1353,11 @@ pub fn build_frame(
             log::info!("vault export finished: {report:?}");
             export_report = Some(report);
         }
+
+        // The revoke reporting back. `try_recv`, like every other drain here;
+        // the whole of the decision -- clear the flag, decide whether the
+        // list on screen is now a lie -- is `drain_send_delete`.
+        drain_send_delete(&send_delete_rx, &mut send_delete, &mut send_fetch);
 
         // Non-blocking, like the favicon drain above: the sync thread
         // (spawned from the Sync button below) reports its outcome here, and
@@ -2521,8 +2535,12 @@ pub fn build_frame(
                 // item list, so it takes this panel whole and the read/edit
                 // pane below is not drawn at all.
                 if let Some(state) = &send_pane {
-                    send_action =
-                        send_ui::draw_send_pane(ui, state, notice_message.as_deref());
+                    send_action = send_ui::draw_send_pane(
+                        ui,
+                        state,
+                        notice_message.as_deref(),
+                        send_delete.view(),
+                    );
                     return;
                 }
                 // Resolved from the list the selection was made in, for the
@@ -3271,23 +3289,26 @@ pub fn build_frame(
             });
 
         // What the Sends screen reported. Applied out here rather than in the
-        // closure because two of the three arms write to `send_fetch`, which
-        // the closure reads through `send_pane`.
-        match send_action {
-            // The URL comes out of the row that was clicked and is carried in
-            // the action itself -- there is no second lookup here that could
-            // resolve to a different row. `copy_text` takes an owned
-            // `String`, which is why the action owns one.
-            send_ui::SendUiAction::CopyLink(url) => ui.ctx().copy_text(url),
-            // Refresh and a dismissed band are the same operation: forget the
-            // answer, so `wants_fetch` is true on the next frame and the list
-            // is asked for again. A dismissal that only hid the message would
-            // leave the pane saying the fetch failed with no way to retry.
-            send_ui::SendUiAction::Refresh | send_ui::SendUiAction::DismissNotice => {
-                send_fetch.invalidate()
-            }
-            send_ui::SendUiAction::None => {}
-        }
+        // closure because the arms write to `send_fetch`, which the closure
+        // reads through `send_pane`.
+        //
+        // **Every arm is inside `apply_send_action`, and there is no `match`
+        // on this line, deliberately.** A source-text equality over a
+        // `match`'s arm bodies pins their CONTENTS and not their
+        // REACHABILITY: a guard arm inserted above one leaves it
+        // byte-identical, draws no unreachable-pattern warning, and stops it
+        // running. That was measured on this file's export wiring. So the
+        // decision is a function the tests really call, and what is left here
+        // is one unconditional statement whose brace depth is itself pinned.
+        apply_send_action(
+            send_action,
+            &mut send_delete,
+            &mut send_fetch,
+            ui.ctx(),
+            &send_delete_tx,
+            &session_token,
+            send_delete_thread::spawn_send_delete,
+        );
 
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
         //
@@ -3387,6 +3408,22 @@ pub fn build_frame(
                     }
                 }
                 None => export_report = None,
+            }
+        }
+
+        // The revoke's report, on the same terms. There is no in-flight card
+        // for this one and there must not be: the row itself says
+        // "Revoking..." and paints no buttons while its child runs, which is
+        // both the progress indication and the lock against a second click,
+        // and a modal card over the list would hide the list the user is
+        // about to be told has changed.
+        //
+        // `draw_send_delete_report` is handed the REPORT, so the colour is
+        // decided from the report inside it rather than by this line -- see
+        // its doc for the mutant that shape refuses.
+        if let Some(report) = &send_delete.report {
+            if draw_send_delete_report(ui.ctx(), report) {
+                send_delete.report = None;
             }
         }
 
@@ -5152,6 +5189,442 @@ mod export_thread {
         std::thread::spawn(move || {
             let _ = tx.send(work());
             ctx_for_export.request_repaint();
+        });
+    }
+}
+
+// ===========================================================================
+// Sends, step 4: revoke
+// ===========================================================================
+
+/// What one confirmed revoke ended as, carried back from the worker thread it
+/// runs on.
+///
+/// **The `SendError` travels whole rather than pre-rendered to a sentence.**
+/// A `String` here would be the same "re-detect the fact by matching on the
+/// message" this file keeps having to un-write: the message, the tone and the
+/// refetch decision are three different questions about one failure, and two
+/// of them turn on `is_ambiguous`, which a rendered sentence has already
+/// thrown away.
+#[derive(Debug, Clone)]
+enum SendDeleteReport {
+    /// `bw send delete` exited zero. The link is down.
+    Deleted { name: String },
+    /// It did not, and this is why.
+    Failed {
+        name: String,
+        error: crate::send::SendError,
+    },
+}
+
+impl SendDeleteReport {
+    /// Whether this report means the account's list of Sends is now different
+    /// from the one on screen -- so the window must throw its list away and
+    /// ask again rather than keep painting a row that may no longer exist.
+    ///
+    /// **True for an AMBIGUOUS failure as well as for a success**, and that is
+    /// the whole reason this is a function rather than a `matches!` at the
+    /// call site. `SendError::TimedOut` means this app stopped waiting, not
+    /// that the server did nothing: the revoke may well have gone through.
+    /// Keeping the old list in that case leaves a Copy link button for a URL
+    /// that 404s and a Delete button for something already gone, which is the
+    /// exact staleness `send_ui`'s once-per-visit refetch policy exists to
+    /// prevent, arrived at from the other direction.
+    fn list_is_now_stale(&self) -> bool {
+        match self {
+            SendDeleteReport::Deleted { .. } => true,
+            SendDeleteReport::Failed { error, .. } => error.is_ambiguous(),
+        }
+    }
+}
+
+/// How loudly a revoke report is painted. [`ExportTone`]'s shape and its
+/// reason; a separate type because these two cards are separate features and
+/// a shared enum is a shared thing to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteTone {
+    /// The link is down.
+    Good,
+    /// It is not, or it is not known to be.
+    Bad,
+}
+
+/// **The whole of the revoke's outcome-to-user mapping**, as a pure function
+/// of the report.
+///
+/// Unlike [`export_message`] this never answers "say nothing": every confirmed
+/// revoke is an action the user took against a public link, and silence about
+/// one is the user believing a link is down when it may not be.
+///
+/// **Ambiguity gets its own words and its own tone.** `SendError::TimedOut`
+/// is the arm this exists for: `bw` was still running when the deadline
+/// passed, so the link may be down and may not be. Rendering that as a
+/// success is this app telling the user a public link is gone when it may be
+/// live -- the revoke-side form of the one lie the export mapping must not
+/// tell either. Every arm is compared pairwise by
+/// `send_delete_wiring::every_delete_outcome_says_something_different`, and
+/// exactly one of them is [`DeleteTone::Good`].
+fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
+    match report {
+        SendDeleteReport::Deleted { name } => (
+            DeleteTone::Good,
+            format!("\u{201c}{name}\u{201d} was revoked. Its link no longer works."),
+        ),
+        SendDeleteReport::Failed { name, error } if error.is_ambiguous() => (
+            DeleteTone::Bad,
+            format!(
+                "Deskwarden could not confirm that \u{201c}{name}\u{201d} was revoked, so its \
+                 link may still be live. {} Check the list below before trying again.",
+                error.user_message()
+            ),
+        ),
+        SendDeleteReport::Failed { name, error } => (
+            DeleteTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} was not revoked and its link is still live. {}",
+                error.user_message()
+            ),
+        ),
+    }
+}
+
+/// The revoke banner: [`draw_export_report`]'s card, for one report.
+///
+/// **It is handed the REPORT and not a tone and a string**, which is the
+/// difference between a rendering a test can hold and one it cannot. A card
+/// taking `(tone, text)` is a card whose caller decides the colour, and the
+/// caller is the frame closure -- so "every report painted in the success
+/// colour" would be a one-word change in code no test in this crate can run.
+/// Here the colour comes from [`send_delete_message`] inside this function,
+/// and `send_delete_wiring::a_failed_revoke_is_never_painted_in_the_success_colour`
+/// reads the glyphs this really paints.
+///
+/// Answers `true` when the user dismissed it.
+fn draw_send_delete_report(ctx: &egui::Context, report: &SendDeleteReport) -> bool {
+    let (tone, text) = send_delete_message(report);
+    let accent = match tone {
+        DeleteTone::Good => theme::BORDER,
+        DeleteTone::Bad => theme::ERROR,
+    };
+    let ink = match tone {
+        DeleteTone::Good => theme::INK,
+        DeleteTone::Bad => theme::ERROR,
+    };
+    let mut dismissed = false;
+    egui::Area::new(egui::Id::new("vault-send-delete-report"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(1.0, accent))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(theme::bold("Send", 15.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text.as_str()).size(12.0).color(ink),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(16.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_button(ui, "OK", None).clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+        });
+    dismissed
+}
+
+/// The revoke channel's sending half. Named because three signatures carry it.
+type SendDeleteSender = mpsc::Sender<SendDeleteReport>;
+
+/// The shape of "start one revoke off-thread", as a **`fn` pointer**.
+///
+/// A parameter of [`apply_send_action`] rather than a call written inside it,
+/// and a `fn` pointer rather than a closure, for `VaultFrameEnv::send_list`'s
+/// reason: it carries no captured state by construction, so the value the
+/// tests drive that function with and the value the frame closure passes are
+/// the same KIND of thing, and the only difference between the production run
+/// and the tested run is which of two `fn` items is named.
+type SendDeleteSpawn = fn(egui::Context, SendDeleteSender, zeroize::Zeroizing<String>, String, String);
+
+/// Everything the window holds between frames for the revoke.
+///
+/// **One struct rather than three locals in the frame closure**, because the
+/// three are a state machine and the rules that relate them -- a confirmation
+/// is cleared by the click that consumes it, an in-flight revoke blocks a
+/// second one, a report replaces the previous report -- are rules no test in
+/// this crate could run if they were written as `if`s between panels. They
+/// live in [`apply_send_action`] and [`drain_send_delete`], which are plain
+/// functions, and this is the value those two act on.
+#[derive(Debug, Default)]
+struct SendDeleteState {
+    /// The id of the Send whose confirmation is showing.
+    confirming: Option<String>,
+    /// The id of the Send a `bw send delete` is running for. **At most one at
+    /// a time**: a second confirmed revoke while one is in flight would be a
+    /// second `bw` child, and the pane paints no buttons at all on the row it
+    /// names, so there is no control to start one from.
+    in_flight: Option<String>,
+    /// The last report, until the user dismisses it.
+    report: Option<SendDeleteReport>,
+}
+
+impl SendDeleteState {
+    /// This state as the pane needs to draw it.
+    fn view(&self) -> send_ui::SendDeleteView<'_> {
+        send_ui::SendDeleteView {
+            confirming: self.confirming.as_deref(),
+            in_flight: self.in_flight.as_deref(),
+        }
+    }
+}
+
+/// **The whole of what a frame of the Sends pane reports back does** -- every
+/// arm, as one plain function the tests really run.
+///
+/// This used to be a `match` written inline in the frame closure, and a
+/// reviewer's measurement is why it is not. A source-text equality over an
+/// arm's body pins the arm's CONTENTS and says nothing about whether the arm
+/// is REACHED: inserting
+///
+/// ```ignore
+/// Some(AccountAction::Export) if !export_in_flight => {}
+/// ```
+///
+/// above the real arm leaves the real arm byte-identical, draws no
+/// unreachable-pattern warning from rustc because it is a *guard* rather than
+/// a duplicate pattern, and stops the row doing anything at all. The whole
+/// suite stayed green. That defeat is the reason this file's newest
+/// destructive path is a function instead: there is no arm here to shadow,
+/// because the `match` is inside a function the tests call.
+///
+/// **The one thing left in the frame closure is the call**, and its
+/// reachability is held by `send_delete_wiring::the_frame_calls_the_send_action_applier_at_the_top_of_its_own_body`,
+/// which pins the call's BRACE DEPTH against a known sibling statement --
+/// so any wrapping `if`, `match` or block that could gate it is one level
+/// deeper than the pin allows and fails. That is a reachability pin and not a
+/// content pin, and it is the answer to the defeat above.
+///
+/// Nothing here blocks. `spawn` is a `std::thread::spawn` and returns at once.
+#[allow(clippy::too_many_arguments)]
+fn apply_send_action(
+    action: send_ui::SendUiAction,
+    delete: &mut SendDeleteState,
+    fetch: &mut send_ui::SendFetch,
+    ctx: &egui::Context,
+    tx: &SendDeleteSender,
+    session: &zeroize::Zeroizing<String>,
+    spawn: SendDeleteSpawn,
+) {
+    match action {
+        // The URL comes out of the row that was clicked and is carried in the
+        // action itself -- there is no second lookup here that could resolve
+        // to a different row. `copy_text` takes an owned `String`, which is
+        // why the action owns one.
+        send_ui::SendUiAction::CopyLink(url) => ctx.copy_text(url),
+        // Refresh and a dismissed band are the same operation: forget the
+        // answer, so `wants_fetch` is true on the next frame and the list is
+        // asked for again. A dismissal that only hid the message would leave
+        // the pane saying the fetch failed with no way to retry.
+        //
+        // The pending confirmation goes with it. The list about to be
+        // replaced is the list that row came from, and a confirmation left
+        // standing across a refetch is a destructive control armed against a
+        // question the user has moved past.
+        send_ui::SendUiAction::Refresh | send_ui::SendUiAction::DismissNotice => {
+            delete.confirming = None;
+            fetch.invalidate();
+        }
+        // **Step one destroys nothing.** It arms the confirmation on exactly
+        // one row -- assigning rather than inserting into a set, so asking
+        // about a second row disarms the first.
+        send_ui::SendUiAction::AskDelete(id) => delete.confirming = Some(id),
+        send_ui::SendUiAction::CancelDelete => delete.confirming = None,
+        // **Step two, and the only place in this program that starts a
+        // `bw send delete`.**
+        send_ui::SendUiAction::ConfirmDelete { id, name } => {
+            // A revoke already running is a revoke this must not race. The
+            // pane draws no buttons on an in-flight row, so this is the
+            // second lock rather than the first.
+            if delete.in_flight.is_none() {
+                delete.confirming = None;
+                delete.in_flight = Some(id.clone());
+                // The previous report goes with the new click, for the
+                // reason the export arm gives.
+                delete.report = None;
+                spawn(
+                    ctx.clone(),
+                    tx.clone(),
+                    // The window's own session, cloned per revoke into a
+                    // `Zeroizing` the revoking thread drops -- so the token
+                    // never outlives the one `bw send delete` it
+                    // authenticates. It reaches the child in `BW_SESSION` and
+                    // never in argv.
+                    session.clone(),
+                    id,
+                    name,
+                );
+            }
+        }
+        send_ui::SendUiAction::None => {}
+    }
+}
+
+/// The revoke reporting back, as a plain function for
+/// [`apply_send_action`]'s reason.
+///
+/// `in_flight` is cleared FIRST and unconditionally: the thread that set it
+/// has finished, whatever became of its answer, and a conditional clear is how
+/// a flag like this latches forever -- leaving the row painted "Revoking..."
+/// with no control on it for the life of the window.
+///
+/// **The list is thrown away here rather than at the click**, because until
+/// the answer lands the row on screen is still true. See
+/// [`SendDeleteReport::list_is_now_stale`] for why an ambiguous failure counts
+/// as a change.
+fn drain_send_delete(
+    rx: &Receiver<SendDeleteReport>,
+    delete: &mut SendDeleteState,
+    fetch: &mut send_ui::SendFetch,
+) {
+    if let Ok(report) = rx.try_recv() {
+        delete.in_flight = None;
+        if report.list_is_now_stale() {
+            fetch.invalidate();
+        }
+        delete.report = Some(report);
+    }
+}
+
+/// The revoke's off-thread half, and its job.
+mod send_delete_thread {
+    //! **Everything about a revoke that blocks lives in here, and the frame
+    //! closure's only entry point is [`spawn_send_delete`]** -- `mod
+    //! export_thread`'s shape, for `mod send_fetch_thread`'s reason.
+    //! `crate::send::cli_send_delete` waits on a `bw` child for up to
+    //! `send::SEND_TIMEOUT`, sixty seconds, and a synchronous call from a
+    //! frame would freeze the whole window, titlebar included, for a minute
+    //! on the frame the user confirms.
+    //!
+    //! The seal is
+    //! `super::send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`:
+    //! every occurrence of `cli_send_delete` and `real_send_delete` in the
+    //! crate's production, outside `send.rs` where the first is defined, must
+    //! be inside this block. A call written in the frame closure spells the
+    //! first of those and fails.
+    //!
+    //! The session travels as a `Zeroizing<String>` this thread drops, and it
+    //! reaches the child in `BW_SESSION` and never in argv --
+    //! `CliSendRunner::build_command` is the one place that decides that.
+
+    use eframe::egui;
+
+    use super::{SendDeleteReport, SendDeleteSender};
+
+    /// The job every `bw send delete` child this window starts is placed in.
+    ///
+    /// **[`super::send_fetch_thread::sends_job`] itself, reused rather than
+    /// mirrored**, and the reasoning is the one that function's own doc gives,
+    /// not a new one. `mod export_thread` minted a second `OnceLock` because
+    /// `vault_export::CliExportRunner` takes `Arc<Option<KillOnCloseJob>>`
+    /// while `sends_job` answers `Option<&'static KillOnCloseJob>`, so
+    /// reusing it there would have meant widening a runner's signature. There
+    /// is no such difference here: `crate::send::cli_send_delete` takes
+    /// exactly `Option<&crate::job_object::KillOnCloseJob>`, which is what
+    /// `sends_job` already answers, and the child is the same `bw send`
+    /// against the same account started by the same window as the Sends
+    /// fetch. Two jobs would be two handles held for one purpose.
+    ///
+    /// It is **not** `main.rs`'s job, for `sends_job`'s reasons, which apply
+    /// unchanged. And `None` is never passed deliberately: `sends_job`
+    /// degrades to `None` only when the kernel refuses to make a job at all,
+    /// and refusing to revoke a public link because a job object could not be
+    /// created would be a strictly worse trade than revoking it unprotected.
+    ///
+    /// One cell, so every call answers the SAME job -- which is what lets
+    /// `super::send_delete_wiring::the_revoke_child_is_spawned_into_the_job_this_window_holds`
+    /// compare the job that arrived at the spawn with this function's answer
+    /// by pointer identity.
+    fn delete_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+        super::send_fetch_thread::sends_job()
+    }
+
+    /// **One whole revoke, blocking, from the id to the verdict** -- and the
+    /// wiring's own entry point, in the sense that everything above it is a
+    /// thread and everything below it is `send.rs`.
+    ///
+    /// Nothing is injected. The job, the profile directory, the runner and
+    /// the spawn are all the production ones, which is what makes
+    /// `super::send_delete_wiring::the_revoke_child_is_spawned_into_the_job_this_window_holds`
+    /// a statement about what ships: that test calls THIS function with
+    /// `job_object`'s spawn probe armed, and the probe is thread-local, so it
+    /// must be a call the test makes on its own thread -- which is why the
+    /// blocking half is a plain function and not something only reachable
+    /// through `std::thread::spawn`.
+    pub(super) fn real_send_delete(id: &str, name: &str, session: &str) -> SendDeleteReport {
+        // Read on the revoking thread, not captured from the frame:
+        // `bw_path` keeps the active account's profile directory as process
+        // state precisely so that every spawn in this crate reaches the same
+        // account, and a copy taken a frame earlier is a copy that can be
+        // stale.
+        let data_dir = crate::bw_path::active_data_dir();
+        match crate::send::cli_send_delete(delete_job(), data_dir.as_deref(), session, id) {
+            Ok(()) => SendDeleteReport::Deleted {
+                name: name.to_string(),
+            },
+            Err(error) => SendDeleteReport::Failed {
+                name: name.to_string(),
+                error,
+            },
+        }
+    }
+
+    /// Revokes one Send on a background thread. The frame closure's one entry
+    /// point, and *nothing but* the delegation.
+    pub(super) fn spawn_send_delete(
+        ctx_for_delete: egui::Context,
+        tx: SendDeleteSender,
+        session: zeroize::Zeroizing<String>,
+        id: String,
+        name: String,
+    ) {
+        spawn_send_delete_with(ctx_for_delete, tx, move || {
+            real_send_delete(&id, &name, &session)
+        });
+    }
+
+    /// The off-thread half, **generic over the work so that it can be
+    /// tested** -- `spawn_export_with`'s shape and its reason.
+    ///
+    /// **`catch_unwind`, which `spawn_export_with` does not have.** The
+    /// in-flight flag is cleared by the drain and by nothing else, so a
+    /// worker that panics before sending leaves the row painted "Revoking..."
+    /// with no button on it, for the life of the window, with no way back
+    /// short of leaving the screen. A panic is turned into a report -- the
+    /// ambiguous one, because a panicked worker may have started a child that
+    /// really did revoke the Send, and this app does not know.
+    pub(super) fn spawn_send_delete_with<F>(
+        ctx_for_delete: egui::Context,
+        tx: SendDeleteSender,
+        work: F,
+    ) where
+        F: FnOnce() -> SendDeleteReport + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| SendDeleteReport::Failed {
+                    name: String::new(),
+                    error: crate::send::SendError::TimedOut,
+                });
+            let _ = tx.send(report);
+            ctx_for_delete.request_repaint();
         });
     }
 }
@@ -15810,7 +16283,8 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 53,
+            // 54 as of Sends step 4, which added `mod send_delete_wiring`.
+            modules, 54,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -16455,6 +16929,1415 @@ mod export_wiring {
                  argv, is reachable from the menu"
             );
         }
+    }
+}
+
+/// **The Sends revoke, from the click to the `bw send delete` child.**
+///
+/// The chain has four links and each is held, because no single test can span
+/// them: the frame closure is not runnable in this crate, and
+/// `job_object::spawn_probe` is thread-local by design.
+///
+///  1. A row's Delete button really asks rather than destroys, the
+///     confirmation answers for its own row, and a second click where Delete
+///     was cancels -- `send_ui::paint_tests`, real clicks on real widgets.
+///  2. **What the pane reports becomes state and a spawn** --
+///     [`a_single_click_never_starts_a_revoke`] and its siblings, which drive
+///     the production [`apply_send_action`] and watch what it does.
+///  3. [`send_delete_thread::spawn_send_delete`] is the delegation and
+///     nothing but, pinned as a whole-body equality, and
+///     `spawn_send_delete_with` really runs its work off the caller's thread
+///     -- [`the_revoke_runs_on_a_thread_that_is_not_the_frames`].
+///  4. **And the work it delegates, driven for real, spawns the child into
+///     the very job this window holds** --
+///     [`the_revoke_child_is_spawned_into_the_job_this_window_holds`].
+///
+/// **On the frame closure's own line, and what a source pin can and cannot
+/// hold there.** The export wiring pinned its `match` arm as a whole-body
+/// equality and a reviewer defeated it: a *guard* arm inserted above the real
+/// one leaves the real one byte-identical, draws no unreachable-pattern
+/// warning from rustc, and stops it ever running. A text equality over an arm
+/// pins CONTENTS, not REACHABILITY. So this feature has no arm in the frame
+/// at all -- every arm is inside [`apply_send_action`], which the tests run --
+/// and the one statement that is left is held by
+/// [`the_frame_applies_the_sends_action_unconditionally`], which pins its
+/// BRACE DEPTH against a sibling statement known to be at the frame closure's
+/// top level. Any `if`, `match` or block that could gate the call puts it one
+/// level deeper and fails there.
+///
+/// Nothing here starts a process, touches the network, reads the real vault,
+/// deletes a real Send or opens a dialog: the probe refuses before
+/// `CreateProcess`, and the one spawner the state tests use is a recorder.
+#[cfg(test)]
+mod send_delete_wiring {
+    use super::*;
+    use crate::job_object::KillOnCloseJob;
+    use crate::send::SendError;
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    /// Invented. No real session token appears in this file.
+    const SESSION: &str = "an-invented-session-token-not-a-real-one";
+
+    // ==================================================================
+    // Link 2: what the pane reports becomes state and a spawn
+    // ==================================================================
+
+    thread_local! {
+        /// Every revoke [`recording_spawn`] was asked to start, on this
+        /// thread. Thread-local because `cargo test` runs tests in parallel
+        /// and a global would let one test read another's spawns.
+        static SPAWNS: RefCell<Vec<(String, String, String)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// A [`SendDeleteSpawn`] that records instead of spawning.
+    ///
+    /// A `fn` item with the production signature, so the only difference
+    /// between the tested run and the shipping one is which of two `fn`
+    /// pointers the caller names -- there is no captured state on either side
+    /// for a difference to hide in.
+    fn recording_spawn(
+        _ctx: egui::Context,
+        _tx: SendDeleteSender,
+        session: zeroize::Zeroizing<String>,
+        id: String,
+        name: String,
+    ) {
+        SPAWNS.with(|s| s.borrow_mut().push((id, name, session.to_string())));
+    }
+
+    /// Runs the production [`apply_send_action`] and answers every revoke it
+    /// started.
+    fn apply(
+        action: send_ui::SendUiAction,
+        delete: &mut SendDeleteState,
+        fetch: &mut send_ui::SendFetch,
+    ) -> Vec<(String, String, String)> {
+        SPAWNS.with(|s| s.borrow_mut().clear());
+        let ctx = egui::Context::default();
+        let (tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
+        apply_send_action(
+            action,
+            delete,
+            fetch,
+            &ctx,
+            &tx,
+            &zeroize::Zeroizing::new(SESSION.to_string()),
+            recording_spawn,
+        );
+        // Held so the sender cannot report "disconnected" for a reason that
+        // has nothing to do with what is being asserted.
+        drop(rx);
+        SPAWNS.with(|s| s.borrow().clone())
+    }
+
+    fn confirm() -> send_ui::SendUiAction {
+        send_ui::SendUiAction::ConfirmDelete {
+            id: "send-id-42".to_string(),
+            name: "quarterly numbers".to_string(),
+        }
+    }
+
+    /// **THE CONFIRMATION IS NOT A DECORATION.**
+    ///
+    /// One click on Delete arms the confirmation and starts NOTHING. The
+    /// mutant this exists for is the obvious simplification -- have the
+    /// Delete button revoke -- and it is the one that destroys a public link
+    /// on a mis-aimed click, with no undo.
+    #[test]
+    fn a_single_click_never_starts_a_revoke() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+
+        let spawns = apply(
+            send_ui::SendUiAction::AskDelete("send-id-42".to_string()),
+            &mut delete,
+            &mut fetch,
+        );
+        assert!(
+            spawns.is_empty(),
+            "asking about a Send started a `bw send delete` for it: {spawns:?}"
+        );
+        assert_eq!(
+            delete.confirming.as_deref(),
+            Some("send-id-42"),
+            "the first click did not arm the confirmation, so the second click has nothing to \
+             answer and the row can never be revoked"
+        );
+        assert_eq!(delete.in_flight, None, "asking marked the row as being revoked");
+
+        // LIVENESS CONTROL. Without this the assertion above is satisfied by
+        // an `apply_send_action` that starts nothing ever, and the whole
+        // feature could be missing.
+        let spawns = apply(confirm(), &mut delete, &mut fetch);
+        assert_eq!(
+            spawns.len(),
+            1,
+            "control: confirming started no revoke either, so `apply_send_action` starts \
+             nothing at all and the assertion above holds against a dead feature"
+        );
+    }
+
+    /// The confirmation starts exactly one revoke, for the row it names, with
+    /// the window's own session -- and disarms itself.
+    #[test]
+    fn confirming_starts_one_revoke_for_the_row_it_names() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        delete.confirming = Some("send-id-42".to_string());
+        delete.report = Some(SendDeleteReport::Deleted { name: "older".to_string() });
+
+        let spawns = apply(confirm(), &mut delete, &mut fetch);
+        assert_eq!(
+            spawns,
+            vec![(
+                "send-id-42".to_string(),
+                "quarterly numbers".to_string(),
+                SESSION.to_string()
+            )],
+            "the revoke did not carry the id and name off the row that was confirmed, or was \
+             started without the window's own session -- a `bw send delete` with no \
+             `BW_SESSION` answers `locked`"
+        );
+        assert_eq!(
+            delete.confirming, None,
+            "the confirmation is still armed after being answered, so the row would redraw \
+             with a live destructive button over a Send already being revoked"
+        );
+        assert_eq!(
+            delete.in_flight.as_deref(),
+            Some("send-id-42"),
+            "the row is not marked as being revoked, so the pane redraws its buttons and a \
+             second click starts a second child"
+        );
+        assert!(
+            delete.report.is_none(),
+            "the previous revoke's banner is still up over this one, answering a question the \
+             user has moved past"
+        );
+    }
+
+    /// **One `bw send delete` at a time.** The pane paints no buttons on an
+    /// in-flight row, so this is the second lock rather than the first --
+    /// and it is the one that survives a re-layout of the pane.
+    #[test]
+    fn a_second_confirmation_while_one_is_running_starts_no_second_child() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        assert_eq!(apply(confirm(), &mut delete, &mut fetch).len(), 1);
+
+        let spawns = apply(
+            send_ui::SendUiAction::ConfirmDelete {
+                id: "another-send".to_string(),
+                name: "another".to_string(),
+            },
+            &mut delete,
+            &mut fetch,
+        );
+        assert!(
+            spawns.is_empty(),
+            "a second revoke was started while one was in flight: {spawns:?}"
+        );
+        assert_eq!(
+            delete.in_flight.as_deref(),
+            Some("send-id-42"),
+            "the second confirmation retargeted the in-flight row, so the report that lands \
+             will clear the wrong one"
+        );
+    }
+
+    /// Cancelling disarms and starts nothing; asking about a second row
+    /// disarms the first, so there is never more than one live confirmation.
+    #[test]
+    fn cancelling_and_re_asking_both_leave_exactly_one_armed_row_at_most() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+
+        let _ = apply(
+            send_ui::SendUiAction::AskDelete("first".to_string()),
+            &mut delete,
+            &mut fetch,
+        );
+        let spawns = apply(
+            send_ui::SendUiAction::AskDelete("second".to_string()),
+            &mut delete,
+            &mut fetch,
+        );
+        assert!(spawns.is_empty(), "asking started a revoke: {spawns:?}");
+        assert_eq!(
+            delete.confirming.as_deref(),
+            Some("second"),
+            "asking about a second row left the first one armed as well"
+        );
+
+        let spawns = apply(send_ui::SendUiAction::CancelDelete, &mut delete, &mut fetch);
+        assert!(spawns.is_empty(), "cancelling started a revoke: {spawns:?}");
+        assert_eq!(delete.confirming, None, "cancelling left the confirmation armed");
+    }
+
+    /// A refetch disarms any pending confirmation: the list about to be
+    /// replaced is the list that row came from, and a destructive control
+    /// left armed across it points at a row that may not come back.
+    #[test]
+    fn refreshing_the_list_disarms_a_pending_confirmation() {
+        for action in [
+            send_ui::SendUiAction::Refresh,
+            send_ui::SendUiAction::DismissNotice,
+        ] {
+            let mut delete = SendDeleteState::default();
+            let mut fetch = send_ui::SendFetch::default();
+            delete.confirming = Some("send-id-42".to_string());
+            fetch.result = Some(Ok(Vec::new()));
+            let before = fetch.generation();
+
+            let spawns = apply(action.clone(), &mut delete, &mut fetch);
+            assert!(spawns.is_empty(), "{action:?} started a revoke: {spawns:?}");
+            assert_eq!(delete.confirming, None, "{action:?} left the confirmation armed");
+            assert!(fetch.result.is_none(), "{action:?} did not forget the list");
+            assert_ne!(fetch.generation(), before, "{action:?} did not move the generation");
+        }
+    }
+
+    /// Every action that is not the revoke still does exactly what it did.
+    #[test]
+    fn the_actions_that_are_not_the_revoke_are_unchanged() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        let spawns = apply(send_ui::SendUiAction::None, &mut delete, &mut fetch);
+        assert!(spawns.is_empty());
+        assert_eq!(delete.confirming, None);
+        assert!(fetch.result.is_none() && fetch.generation() == 0);
+
+        fetch.result = Some(Ok(Vec::new()));
+        let spawns = apply(
+            send_ui::SendUiAction::CopyLink("https://send.bitwarden.com/#/x".to_string()),
+            &mut delete,
+            &mut fetch,
+        );
+        assert!(spawns.is_empty(), "copying a link started a revoke: {spawns:?}");
+        assert!(
+            fetch.result.is_some(),
+            "copying a link threw the list away and refetched it"
+        );
+    }
+
+    // ==================================================================
+    // The drain: the flag, and the list
+    // ==================================================================
+
+    fn drained(report: SendDeleteReport) -> (SendDeleteState, send_ui::SendFetch) {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        delete.in_flight = Some("send-id-42".to_string());
+        fetch.result = Some(Ok(vec![crate::send::SendSummary {
+            id: "send-id-42".to_string(),
+            name: "quarterly numbers".to_string(),
+            access_url: "https://send.bitwarden.com/#/x".to_string(),
+            deletion_date: "2026-08-18T00:00:00.000Z".to_string(),
+            is_file: false,
+        }]));
+        let (tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
+        tx.send(report).expect("the receiver is alive");
+        drain_send_delete(&rx, &mut delete, &mut fetch);
+        (delete, fetch)
+    }
+
+    /// **A successful revoke throws the list away, and the row it revoked
+    /// cannot still be on screen.**
+    ///
+    /// Both halves, and the second is the requirement: a pane that kept
+    /// painting the revoked row would offer Copy link for a URL that 404s and
+    /// a Delete button for something already gone.
+    #[test]
+    fn a_successful_revoke_clears_the_flag_and_refetches_the_list() {
+        let (delete, mut fetch) = drained(SendDeleteReport::Deleted {
+            name: "quarterly numbers".to_string(),
+        });
+
+        assert_eq!(
+            delete.in_flight, None,
+            "the in-flight flag survived the report, so the row stays painted \"Revoking...\" \
+             with no button on it for the life of the window"
+        );
+        assert!(delete.report.is_some(), "the report was dropped and the user told nothing");
+        assert!(
+            fetch.result.is_none(),
+            "the list was kept after a successful revoke, so the pane goes on painting a row \
+             for a Send that no longer exists"
+        );
+
+        // The pane really shows no row for it. Not "result is None" restated
+        // -- the glyph-level question the user sees.
+        let state = send_ui::pane_state(fetch.result.as_ref(), &crate::send::FixedClock(0));
+        assert_eq!(
+            state,
+            send_ui::SendPaneState::Loading,
+            "the pane still has something to draw for a list that was just invalidated"
+        );
+        assert!(
+            !matches!(&state, send_ui::SendPaneState::Rows(rows)
+                if rows.iter().any(|r| r.id == "send-id-42")),
+            "the revoked Send is still a row in the pane"
+        );
+
+        // And the window really asks again on the next frame.
+        assert!(
+            fetch.wants_fetch(true),
+            "the Sends screen does not refetch after a successful revoke, so the list on \
+             screen stays the pre-revoke one until the user navigates away and back"
+        );
+
+        // Control: the same fixture WITHOUT the drain still holds its list,
+        // so the assertion above is about the drain and not about a fixture
+        // that never had one.
+        let mut untouched = send_ui::SendFetch::default();
+        untouched.result = Some(Ok(Vec::new()));
+        assert!(
+            !untouched.wants_fetch(true),
+            "control: a fetch holding an answer wants another one anyway, so \"it refetched\" \
+             is not distinguishable from \"it always refetches\""
+        );
+        let _ = &mut fetch;
+    }
+
+    /// **An unambiguous failure keeps the list**, because the row on screen is
+    /// still true: nothing was revoked.
+    #[test]
+    fn a_plain_failure_clears_the_flag_and_keeps_the_list() {
+        let (delete, fetch) = drained(SendDeleteReport::Failed {
+            name: "quarterly numbers".to_string(),
+            error: SendError::Locked,
+        });
+        assert_eq!(delete.in_flight, None, "the in-flight flag survived a failure");
+        assert!(delete.report.is_some(), "a failed revoke told the user nothing");
+        assert!(
+            fetch.result.is_some(),
+            "a failure that revoked nothing threw the list away, so the screen flickers back \
+             through a spinner to the identical list"
+        );
+    }
+
+    /// **An AMBIGUOUS failure refetches**, because it is not known whether the
+    /// row on screen is still true. `TimedOut` means this app stopped
+    /// waiting, not that the server did nothing.
+    #[test]
+    fn an_ambiguous_failure_refetches_because_the_row_may_be_a_lie() {
+        let (delete, fetch) = drained(SendDeleteReport::Failed {
+            name: "quarterly numbers".to_string(),
+            error: SendError::TimedOut,
+        });
+        assert_eq!(delete.in_flight, None);
+        assert!(
+            fetch.result.is_none(),
+            "a revoke that may or may not have happened left the pre-revoke list on screen, so \
+             the user cannot find out which"
+        );
+        // And the two really are different answers, so the rule is a rule.
+        assert!(
+            SendDeleteReport::Failed {
+                name: String::new(),
+                error: SendError::TimedOut
+            }
+            .list_is_now_stale()
+                != SendDeleteReport::Failed {
+                    name: String::new(),
+                    error: SendError::Locked
+                }
+                .list_is_now_stale(),
+            "control: the staleness rule answers the same thing for an ambiguous failure and a \
+             plain one, so it is not a rule"
+        );
+    }
+
+    /// The drain with nothing to drain changes nothing -- so the frame's
+    /// per-frame call cannot clear an in-flight flag on its own.
+    #[test]
+    fn an_empty_drain_leaves_an_in_flight_revoke_alone() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        delete.in_flight = Some("send-id-42".to_string());
+        fetch.result = Some(Ok(Vec::new()));
+        let (_tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
+        drain_send_delete(&rx, &mut delete, &mut fetch);
+        assert_eq!(delete.in_flight.as_deref(), Some("send-id-42"));
+        assert!(fetch.result.is_some());
+    }
+
+    // ==================================================================
+    // Link 3: off the frame's thread, and the delegation
+    // ==================================================================
+
+    /// **The blocking work happens on a thread that is not the caller's.**
+    ///
+    /// `send_ui::frame_promptness` catches freezes, not stutters, and a real
+    /// `bw send delete` blocks for up to `send::SEND_TIMEOUT` -- sixty
+    /// seconds. Held two ways, neither of which can hang the suite:
+    /// `spawn_send_delete_with`'s shape is `spawn_export_with`'s and so is
+    /// this test's.
+    #[test]
+    fn the_revoke_runs_on_a_thread_that_is_not_the_frames() {
+        const GATE_WAIT: Duration = Duration::from_secs(5);
+        const RETURNS_WITHIN: Duration = Duration::from_millis(2_000);
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let caller = std::thread::current().id();
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&ran_on);
+
+        let started = Instant::now();
+        send_delete_thread::spawn_send_delete_with(ctx, tx, move || {
+            let _ = gate_rx.recv_timeout(GATE_WAIT);
+            *recorded.lock().expect("not poisoned") = Some(std::thread::current().id());
+            SendDeleteReport::Deleted { name: "x".to_string() }
+        });
+        let returned = started.elapsed();
+        let _ = gate_tx.send(());
+
+        assert!(
+            returned < RETURNS_WITHIN,
+            "starting a revoke blocked the caller for {returned:?}; a real one blocks for as \
+             long as the `bw send delete` child runs, and the caller is the eframe frame closure"
+        );
+        let report = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the revoking thread reported back");
+        assert!(matches!(report, SendDeleteReport::Deleted { .. }));
+        assert_ne!(
+            ran_on.lock().expect("not poisoned").expect("the work ran"),
+            caller,
+            "the revoke ran on the caller's own thread, so a real one would freeze the window \
+             -- titlebar included -- for up to sixty seconds"
+        );
+    }
+
+    /// **A panicking worker still reports**, so the row cannot wedge on
+    /// "Revoking..." with no control on it for the life of the window.
+    ///
+    /// It reports the AMBIGUOUS failure, because a worker that panicked may
+    /// have started a child that really did revoke the Send.
+    #[test]
+    fn a_panicking_revoke_still_reports_rather_than_wedging_the_row() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        send_delete_thread::spawn_send_delete_with(ctx, tx, || panic!("the worker fell over"));
+        let report = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking revoke never reported, so the row wedges forever");
+        std::panic::set_hook(previous);
+
+        match &report {
+            SendDeleteReport::Failed { error, .. } => assert!(
+                error.is_ambiguous(),
+                "a panicked revoke reported an unambiguous {error:?}, which claims to know \
+                 something this app cannot know"
+            ),
+            other => panic!("a panicked revoke reported {other:?}"),
+        }
+        // And the drain really clears the flag on it.
+        let mut delete = SendDeleteState::default();
+        delete.in_flight = Some("send-id-42".to_string());
+        let mut fetch = send_ui::SendFetch::default();
+        let (tx2, rx2): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
+        tx2.send(report).expect("alive");
+        drain_send_delete(&rx2, &mut delete, &mut fetch);
+        assert_eq!(delete.in_flight, None, "the row wedged after a panicked revoke");
+    }
+
+    /// **`spawn_send_delete` is the delegation and nothing else** -- a
+    /// whole-body equality, `spawn_export_only_hands_the_real_work_to_the_tested_spawner`'s
+    /// shape and its reason.
+    ///
+    /// Said plainly, because the same shape was defeated one level out on the
+    /// export: this pins the function's CONTENTS. It is not what holds the
+    /// function's reachability from the frame -- that is
+    /// [`the_frame_applies_the_sends_action_unconditionally`] and the state
+    /// tests above, and this is the third of three locks rather than the only
+    /// one.
+    #[test]
+    fn spawn_send_delete_only_hands_the_real_work_to_the_tested_spawner() {
+        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = concat!(
+            "pub(super) fn spawn_send_", "delete( ctx_for_delete: egui::Context, tx: \
+             SendDeleteSender, session: zeroize::Zeroizing<String>, id: String, name: String, ) \
+             { spawn_send_delete_with(ctx_for_delete, tx, move || { real_send_delete(&id, \
+             &name, &session) }); }"
+        );
+        assert_eq!(
+            squashed(production()).matches(body).count(),
+            1,
+            "`spawn_send_delete` is no longer exactly the delegation to `spawn_send_delete_with` \
+             with the real revoke -- anything added to it is a line that runs on the frame's \
+             own thread, before the spawn"
+        );
+    }
+
+    // ==================================================================
+    // Link 4: THE CRITICAL ASSERTION, at the wiring's own entry point
+    // ==================================================================
+
+    /// The address of the job the Sends screen's children are placed in, or
+    /// `None` if this machine would not give the process one.
+    fn window_job_address() -> Option<usize> {
+        send_fetch_thread::sends_job().map(|job| std::ptr::from_ref(job) as usize)
+    }
+
+    /// Drives the wiring's blocking entry point for real and reports every
+    /// spawn it attempted.
+    ///
+    /// **Nothing is substituted.** The job, the profile directory, the runner,
+    /// the invocation and `job_object::spawn_in_job` are all the ones that
+    /// ship, which is what makes the recorded value a fact about production.
+    fn spawns_of_one_revoke(
+        id: &str,
+    ) -> (SendDeleteReport, Vec<crate::job_object::spawn_probe::Attempt>) {
+        // `bw_job_command_in` refuses outright unless startup recorded a
+        // signature-verified CLI. First-wins and idempotent, so this is safe
+        // however the test order falls out, and the path is a fiction nothing
+        // ever executes.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = send_delete_thread::real_send_delete(id, "quarterly numbers", SESSION);
+        let attempts = probe.attempts();
+        drop(probe);
+        (report, attempts)
+    }
+
+    /// **THE CRITICAL ASSERTION, at the wiring's own entry point.**
+    ///
+    /// The revoke child inherits the vault-unlocking session in its
+    /// environment block, which on Windows any same-user process can read
+    /// given a handle. Kill-on-close membership is what guarantees it dies
+    /// with this process however this process dies -- a panic, a
+    /// `process::exit` that runs no destructor, a Task Manager kill. Fifteen
+    /// rounds established that property below `real_runner`; this wiring is
+    /// the code above it, where it can go missing unseen, so it is asserted
+    /// again here against what actually arrived at the spawn.
+    ///
+    /// Nothing here reads a line of source: a text pin near `spawn_in_job(..)`
+    /// cannot see which value flows into it.
+    #[test]
+    fn the_revoke_child_is_spawned_into_the_job_this_window_holds() {
+        let held = window_job_address().expect(
+            "this process could not create a job object at all, so every assertion below \
+             collapses onto the `None` control and asserts nothing",
+        );
+
+        let (report, attempts) = spawns_of_one_revoke("send-id-42");
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the wiring did not reach `spawn_in_job` exactly once, so anything asserted about \
+             what it carried is about nothing: {attempts:?}"
+        );
+
+        // THE JOB, BY POINTER IDENTITY.
+        assert_eq!(
+            attempts[0].job,
+            Some(held),
+            "the `bw send delete` child was spawned with a job that is not the one this window \
+             holds, so it would not die with this process after a panic, a `process::exit` or \
+             a Task Manager kill -- leaving a child running with the vault-unlocking session \
+             in its environment"
+        );
+
+        // Control: "some job at all" is not what was asserted.
+        let other = KillOnCloseJob::new().expect("a job object is a handle, not a process");
+        assert_ne!(
+            attempts[0].job,
+            Some(std::ptr::from_ref(&other) as usize),
+            "control: the recorded job is indistinguishable from an unrelated one"
+        );
+
+        // Control: `None` is EXPRESSIBLE and DISTINGUISHABLE end to end --
+        // which is the whole difference a dropped job erases. Driven through
+        // the same `cli_send_delete`/`CliSendRunner`/`spawn_in_job` chain,
+        // jobless.
+        let jobless_probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let _ = crate::send::cli_send_delete(None, None, SESSION, "send-id-42");
+        let jobless = jobless_probe.attempts();
+        drop(jobless_probe);
+        assert_eq!(
+            jobless.iter().map(|a| a.job).collect::<Vec<_>>(),
+            vec![None],
+            "control: a jobless call did not reach the spawn jobless, so the probe cannot tell \
+             a child inside a job from one outside it"
+        );
+        assert_ne!(
+            attempts[0].job, None,
+            "control: the wiring's own spawn is indistinguishable from the jobless one"
+        );
+
+        // AND IT IS THE SENDS JOB, not a second one minted for the revoke.
+        // The `bw send delete` child is the same account's `bw send` as the
+        // Sends fetch, started by the same window; a second `OnceLock` here
+        // would be a second handle held for one purpose.
+        assert_eq!(
+            attempts[0].job,
+            window_job_address(),
+            "the revoke does not use the job the Sends fetch uses"
+        );
+
+        // THE RECORDED SPAWN IS THE REVOKE, and not merely *a* spawn that
+        // happened -- the finding a one-line decoy satisfied once already.
+        let program = attempts[0].program.to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the revoke: {program}"
+        );
+        assert_eq!(
+            attempts[0]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["send".to_string(), "delete".to_string(), "send-id-42".to_string()],
+            "the recorded spawn does not carry this revoke's arguments, so it is not the revoke"
+        );
+
+        // THE SESSION IS IN THE ENVIRONMENT AND NOT IN ARGV. On Windows any
+        // same-user process can read another's command line; it cannot read
+        // another's environment block without a handle.
+        assert!(
+            attempts[0].envs.iter().any(|(k, v)| k == "BW_SESSION"
+                && v.as_ref().map(|v| v == SESSION).unwrap_or(false)),
+            "the revoke child was not given the session in its environment: {:?}",
+            attempts[0].envs
+        );
+        assert!(
+            !attempts[0]
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().contains(SESSION)),
+            "the vault session is on the revoke child's argv, where every process on this \
+             desktop can read it: {:?}",
+            attempts[0].args
+        );
+
+        // AND THE WIRING'S ANSWER CAME FROM THAT SPAWN. The probe refuses, so
+        // a report of anything but that refusal means a child was started by
+        // a route the probe never saw -- which is exactly what a decoy is.
+        // This is also what holds the OUTCOME: the report carries the failure
+        // the runner really returned, rather than a verdict this module
+        // decided for itself.
+        match &report {
+            SendDeleteReport::Failed { name, error } => {
+                assert!(
+                    error.user_message().contains(crate::job_object::spawn_probe::REFUSED),
+                    "the revoke failed for some other reason, so its result did not come from \
+                     the call the probe recorded: {error:?}"
+                );
+                assert_eq!(name, "quarterly numbers", "the report names the wrong Send");
+            }
+            other => panic!(
+                "the probe refused the only spawn this revoke may make, yet the wiring \
+                 reported {other:?} -- so either a child was started by a route the probe \
+                 cannot see, or a failed revoke is being reported as a success"
+            ),
+        }
+    }
+
+    // ==================================================================
+    // The outcome mapping, and how it is painted
+    // ==================================================================
+
+    fn every_report() -> Vec<SendDeleteReport> {
+        let mut all = vec![SendDeleteReport::Deleted {
+            name: "quarterly numbers".to_string(),
+        }];
+        for error in [
+            SendError::NoVerifiedCli("no bw here".to_string()),
+            SendError::Locked,
+            SendError::Offline,
+            SendError::Rejected("the server said no".to_string()),
+            SendError::FailedSilently,
+            SendError::CreatedButUnreadable,
+            SendError::TimedOut,
+            SendError::SpawnFailed("bw could not be started".to_string()),
+        ] {
+            all.push(SendDeleteReport::Failed {
+                name: "quarterly numbers".to_string(),
+                error,
+            });
+        }
+        all
+    }
+
+    /// **Every outcome says something different, and only one of them says
+    /// the link is down.**
+    ///
+    /// Compared PAIRWISE rather than one at a time, because the mutant this
+    /// exists for is a mapping that renders every outcome the same -- which
+    /// passes any per-variant "it says something" check.
+    #[test]
+    fn every_delete_outcome_says_something_different() {
+        let reports = every_report();
+        assert_eq!(reports.len(), 9, "control: not every failure arm is covered");
+        let messages: Vec<(DeleteTone, String)> =
+            reports.iter().map(send_delete_message).collect();
+
+        for (i, (_, a)) in messages.iter().enumerate() {
+            for (j, (_, b)) in messages.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "{:?} and {:?} render the same words, so the user cannot tell them apart",
+                    reports[i], reports[j]
+                );
+            }
+        }
+
+        let good: Vec<&(DeleteTone, String)> = messages
+            .iter()
+            .filter(|(tone, _)| *tone == DeleteTone::Good)
+            .collect();
+        assert_eq!(
+            good.len(),
+            1,
+            "more or fewer than one report reads as a success: {messages:?}"
+        );
+        assert_eq!(
+            &send_delete_message(&SendDeleteReport::Deleted {
+                name: "quarterly numbers".to_string()
+            }),
+            good[0],
+            "the one success is not the one where `bw` said it revoked the Send"
+        );
+
+        // The Send is named in every one of them: by the time a report is
+        // read the list it came from has been thrown away and refetched.
+        for (report, (_, text)) in reports.iter().zip(&messages) {
+            assert!(
+                text.contains("quarterly numbers"),
+                "{report:?} does not say which Send it is about: {text:?}"
+            );
+        }
+
+        // **An ambiguous failure may not read as either of the other two.**
+        // It must not say the link is down, and it must not say the link is
+        // still live -- both are claims this app cannot make.
+        for report in &reports {
+            if let SendDeleteReport::Failed { error, .. } = report {
+                let (tone, text) = send_delete_message(report);
+                assert_eq!(tone, DeleteTone::Bad, "{report:?} reads as a success");
+                if error.is_ambiguous() {
+                    assert!(
+                        text.contains("may still be live"),
+                        "{report:?} does not say the link may still be live: {text:?}"
+                    );
+                } else {
+                    assert!(
+                        text.contains("still live"),
+                        "{report:?} does not say the link is still live: {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Colours and glyphs of one painted card.
+    #[derive(Default)]
+    struct Card {
+        text: Vec<String>,
+        text_colours: Vec<egui::Color32>,
+    }
+
+    fn collect_card(shape: &egui::Shape, out: &mut Card) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.text.push(t.galley.text().to_string());
+                for section in &t.galley.job.sections {
+                    out.text_colours.push(section.format.color);
+                }
+                if let Some(c) = t.override_text_color {
+                    out.text_colours.push(c);
+                }
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_card(s, out)),
+            _ => {}
+        }
+    }
+
+    fn painted_card(report: &SendDeleteReport) -> Card {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        // Drawn on EVERY frame and not only the last: an `egui::Area` is
+        // laid out from the size it had on the previous frame, so a card that
+        // appears for the first time on the frame being read is measured at
+        // zero and paints nothing at all.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |ui| {
+            let _ = draw_send_delete_report(ui.ctx(), report);
+        });
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw_send_delete_report(ui.ctx(), report);
+        });
+        let mut card = Card::default();
+        for clipped in &output.shapes {
+            collect_card(&clipped.shape, &mut card);
+        }
+        assert!(
+            !card.text.is_empty(),
+            "the card painted no text at all, so every assertion over it would pass against \
+             nothing"
+        );
+        card
+    }
+
+    /// **A failed revoke is never painted in the success colour, and the
+    /// colour is not the frame closure's to choose.**
+    ///
+    /// The card is handed the REPORT, so this reads the glyphs and strokes
+    /// that a real frame would put on screen. A card taking `(tone, text)`
+    /// would leave "paint every report as a success" a one-word change in the
+    /// frame closure, which no test in this crate can run.
+    #[test]
+    fn a_failed_revoke_is_never_painted_in_the_success_colour() {
+        for report in every_report() {
+            let card = painted_card(&report);
+            let (tone, text) = send_delete_message(&report);
+            assert!(
+                card.text.iter().any(|t| t.contains("quarterly numbers")),
+                "{report:?} painted no message naming the Send: {:?}",
+                card.text
+            );
+            assert!(
+                card.text.iter().any(|t| t == &text),
+                "the card painted something other than {text:?}: {:?}",
+                card.text
+            );
+            // The INK is what is read, and not the card's outline. The
+            // outline is painted by `egui::Frame`, whose stroke reaches the
+            // tessellator rather than the shape list at this layer, so
+            // reading it here would be reading a value that is `None` for
+            // every report and therefore discriminating nothing. Said out
+            // loud because the first draft of this test asserted on it and
+            // the assertion was vacuous in one direction and false in the
+            // other.
+            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            match tone {
+                DeleteTone::Bad => assert!(
+                    error_ink,
+                    "{report:?} is a failure but no glyph on its card is painted in the error \
+                     colour -- a revoke that did not happen reads exactly like one that did. \
+                     Painted colours were {:?}",
+                    card.text_colours
+                ),
+                DeleteTone::Good => assert!(
+                    !error_ink,
+                    "a successful revoke is painted as an error: {:?}",
+                    card.text_colours
+                ),
+            }
+        }
+
+        // **The control that makes the loop above mean something.** Every
+        // failure must be painted DIFFERENTLY from the success, in ink as
+        // well as in words -- so a card forced to one colour for every report
+        // fails here whichever colour it was forced to.
+        let good = painted_card(&SendDeleteReport::Deleted {
+            name: "quarterly numbers".to_string(),
+        });
+        for report in every_report() {
+            if matches!(report, SendDeleteReport::Deleted { .. }) {
+                continue;
+            }
+            let bad = painted_card(&report);
+            assert_ne!(
+                bad.text_colours, good.text_colours,
+                "{report:?} is painted in exactly the colours a successful revoke is painted \
+                 in, so the tone this card shows is not a function of the report it was given"
+            );
+        }
+    }
+
+    // ==================================================================
+    // The frame closure's own line
+    // ==================================================================
+
+    /// Everything before the first `#[cfg(test)]`, split with `concat!` so
+    /// this needle is not itself the first occurrence.
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(concat!("#[cfg", "(test)]"))
+            .expect("no test module in this file");
+        &source[..end]
+    }
+
+    /// `text` with `//` and `/* */` comments, string literals, raw strings and
+    /// character literals replaced by spaces -- so brace counting over the
+    /// result counts BLOCKS and not prose.
+    ///
+    /// Its own controls are [`the_brace_scanner_is_not_fooled_by_prose`].
+    fn code_braces_only(text: &str) -> String {
+        let bytes: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            let next = bytes.get(i + 1).copied();
+            // Raw string: r"..", r#".."#, r##".."##
+            if c == 'r' && matches!(next, Some('"') | Some('#')) {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while bytes.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&'"') {
+                    let close: String =
+                        std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                    let rest: String = bytes[j + 1..].iter().collect();
+                    let end = rest.find(&close).map(|at| j + 1 + at + close.len());
+                    let end = end.unwrap_or(bytes.len());
+                    out.extend(std::iter::repeat_n(' ', end - i));
+                    i = end;
+                    continue;
+                }
+            }
+            match (c, next) {
+                ('/', Some('/')) => {
+                    while i < bytes.len() && bytes[i] != '\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                ('/', Some('*')) => {
+                    let mut depth = 1usize;
+                    out.push_str("  ");
+                    i += 2;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == '/' && bytes.get(i + 1) == Some(&'*') {
+                            depth += 1;
+                            out.push_str("  ");
+                            i += 2;
+                        } else if bytes[i] == '*' && bytes.get(i + 1) == Some(&'/') {
+                            depth -= 1;
+                            out.push_str("  ");
+                            i += 2;
+                        } else {
+                            out.push(if bytes[i] == '\n' { '\n' } else { ' ' });
+                            i += 1;
+                        }
+                    }
+                }
+                ('"', _) => {
+                    out.push(' ');
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == '\\' {
+                            out.push_str("  ");
+                            i += 2;
+                            continue;
+                        }
+                        let done = bytes[i] == '"';
+                        out.push(if bytes[i] == '\n' { '\n' } else { ' ' });
+                        i += 1;
+                        if done {
+                            break;
+                        }
+                    }
+                }
+                // A character literal, which is the other place a lone brace
+                // can be written. Lifetimes (`'a`) are not literals and must
+                // survive, so this only fires on the two real shapes.
+                ('\'', Some(ch)) if ch == '\\' || bytes.get(i + 2) == Some(&'\'') => {
+                    let end = if ch == '\\' {
+                        bytes[i + 2..]
+                            .iter()
+                            .position(|c| *c == '\'')
+                            .map(|at| i + 2 + at + 1)
+                            .unwrap_or(bytes.len())
+                    } else {
+                        i + 3
+                    };
+                    out.extend(std::iter::repeat_n(' ', end - i));
+                    i = end;
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The controls on [`code_braces_only`]. Without them the depth pin below
+    /// would be a pin on a scanner nobody had tested.
+    #[test]
+    fn the_brace_scanner_is_not_fooled_by_prose() {
+        let cases = [
+            ("fn a() { }", 0i32),
+            ("// {{{\nfn a() {}", 0),
+            ("/* { */ fn a() {}", 0),
+            ("let s = \"{{{\";", 0),
+            ("let s = \"\\\"{\";", 0),
+            ("let s = r\"{{\";", 0),
+            ("let s = r#\"{\"#;", 0),
+            ("let c = '{';", 0),
+            ("let c = '\\'';", 0),
+            ("fn a<'x>(v: &'x u8) { let _ = v; }", 0),
+            ("fn a() {", 1),
+            ("fn a() { fn b() {", 2),
+        ];
+        for (source, expected) in cases {
+            let scanned = code_braces_only(source);
+            let depth = scanned.chars().fold(0i32, |d, c| match c {
+                '{' => d + 1,
+                '}' => d - 1,
+                _ => d,
+            });
+            assert_eq!(depth, expected, "the scanner read {source:?} as depth {depth}");
+        }
+        // And it does not eat the code.
+        assert!(
+            code_braces_only("// x\nlet apply = 1;").contains("let apply = 1;"),
+            "the scanner blanked live code"
+        );
+        assert_eq!(
+            code_braces_only("fn a() {}").len(),
+            "fn a() {}".len(),
+            "the scanner changed the length, so byte offsets into it are not offsets into the \
+             source"
+        );
+    }
+
+    /// The brace depth at the first occurrence of `needle` in `code`.
+    fn depth_of(code: &str, needle: &str) -> i32 {
+        let at = code
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not in the frame closure at all"));
+        code[..at].chars().fold(0i32, |d, c| match c {
+            '{' => d + 1,
+            '}' => d - 1,
+            _ => d,
+        })
+    }
+
+    /// **THE REACHABILITY PIN.**
+    ///
+    /// A source-text equality over a `match` arm pins the arm's contents and
+    /// says nothing about whether the arm runs; a reviewer defeated this
+    /// file's export equality with a guard arm inserted above the real one,
+    /// which rustc does not warn about. So the revoke's decision is a
+    /// function -- there is no arm here to shadow -- and what is asserted
+    /// about the frame is its BRACE DEPTH.
+    ///
+    /// `send_fetch.note_screen(on_sends);` is the sibling: `send_ui`'s own
+    /// pins already require it to be at the frame closure's top level, at
+    /// column 8, exactly once. If the call to [`apply_send_action`] sits at
+    /// the same brace depth as that statement, then no `if`, `match`, `for`,
+    /// `while` or bare block encloses one and not the other -- every one of
+    /// those adds a level. A gate is the mutation this exists for and a gate
+    /// is a brace.
+    ///
+    /// The equality below is a second lock and is disclosed as such: it pins
+    /// the call's ARGUMENTS -- the window's own state, the window's own
+    /// session, the production spawner -- and, like every text pin, not its
+    /// reachability. The depth assertion is what holds that.
+    #[test]
+    fn the_frame_applies_the_sends_action_unconditionally() {
+        let code = code_braces_only(production());
+        let call = concat!("apply_send_", "action(");
+        let sibling = concat!("send_fetch.note_", "screen(on_sends);");
+
+        // Controls: both anchors exist, and the call is written exactly once
+        // in the frame. Twice would be two applications of one action.
+        assert_eq!(
+            code.matches(call).count(),
+            2,
+            "{call:?} appears {} times in production, not twice (its definition and the one \
+             call in the frame closure)",
+            code.matches(call).count()
+        );
+        assert_eq!(
+            code.matches(sibling).count(),
+            1,
+            "control: the sibling statement this depth is measured against is not in the frame \
+             exactly once"
+        );
+
+        // The two occurrences are the definition, at depth 0 because it is a
+        // module-level item, and the call. Which comes FIRST in the file is
+        // not assumed -- in this file the frame closure is written above the
+        // function it calls -- so both depths are taken and the definition is
+        // identified by being the one at depth 0.
+        let mut depths: Vec<i32> = Vec::new();
+        let mut depth = 0i32;
+        let mut window = String::new();
+        for ch in code.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            window.push(ch);
+            if window.len() > call.len() {
+                window.remove(0);
+            }
+            if window == call {
+                depths.push(depth);
+            }
+        }
+        assert_eq!(
+            depths.len(),
+            2,
+            "control: the depth scan found {} occurrences of {call:?}, not the two the count \
+             above established",
+            depths.len()
+        );
+        let definitions: Vec<i32> = depths.iter().copied().filter(|d| *d == 0).collect();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "control: {call:?} is written at module level {} times, not once -- so \"the other \
+             one is the call\" does not identify anything",
+            definitions.len()
+        );
+        let call_depth = depths.into_iter().find(|d| *d != 0).unwrap_or_else(|| {
+            panic!("both occurrences of {call:?} are at module level, so the frame never calls it")
+        });
+        let sibling_depth = depth_of(&code, sibling);
+
+        assert_eq!(
+            call_depth, sibling_depth,
+            "the call to `apply_send_action` sits at brace depth {call_depth} and the frame \
+             closure's own top level is depth {sibling_depth}. Every extra level is an \
+             enclosing `if`, `match`, `for` or bare block -- which is exactly how a row comes \
+             to draw a control that never does anything, with a green suite and no compiler \
+             warning. If this call is meant to move, move the sibling with it"
+        );
+
+        // Control: the depth really discriminates. A statement known to be
+        // INSIDE something is at a greater depth, so "equal depth" is not a
+        // property every line in this file has.
+        let nested = concat!("send_fetch.in_", "flight = true;");
+        assert!(
+            depth_of(&code, nested) > sibling_depth,
+            "control: a statement known to be nested reads at the same depth as the frame's \
+             top level, so the depth measurement is not measuring nesting"
+        );
+
+        // The second lock: the call's arguments, as a whole-call equality.
+        let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = squashed(concat!(
+            "apply_send_", "action( send_action, &mut send_delete, &mut send_fetch, ui.ctx(), \
+             &send_delete_tx, &session_token, send_delete_thread::spawn_send_delete, );"
+        ));
+        assert_eq!(
+            squashed(&code_braces_only(production())).matches(&expected).count(),
+            1,
+            "the frame no longer applies the Sends action with the window's own delete state, \
+             its own fetch, its own session and the production spawner. Note what this does \
+             NOT hold: it is a pin on the call's CONTENTS. Reachability is the depth assertion \
+             above"
+        );
+
+        // And there is no `match` on the action left in the frame at all --
+        // so there is no arm for a guard arm to shadow.
+        assert!(
+            !code.contains(concat!("match send_", "action")),
+            "the frame matches on the Sends action again. Every arm belongs in \
+             `apply_send_action`, where the tests run it: an arm written here is an arm a \
+             guard arm inserted above it can silently disable, which is the defeat this \
+             design exists to answer"
+        );
+    }
+
+    // ==================================================================
+    // The seal: the blocking revoke has one call site in the whole crate
+    // ==================================================================
+
+    /// A file's production half: everything above its first **gated test
+    /// MODULE**.
+    ///
+    /// The marker is the gate followed by `mod ` and not the bare gate,
+    /// because `send.rs` opens with a `#[cfg(test)] const` at line 56 -- a
+    /// positive control for one of its own pins -- and a naive first-gate cut
+    /// puts the whole file, `cli_send_delete` included, below the line. That
+    /// is not a hypothetical: it is what the first draft of this test
+    /// measured, and it reported `send.rs` spelling the needle zero times.
+    fn production_of(text: &str) -> &str {
+        let marker = concat!("#[cfg", "(test)]\r\nmod ");
+        match text.find(marker) {
+            Some(end) => &text[..end],
+            None => text,
+        }
+    }
+
+    /// Every `.rs` file under `src`, as (path, text).
+    fn crate_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the source tree is readable") {
+                let entry = entry.expect("a readable directory entry");
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    walk(&path, &format!("{prefix}{name}/"), out);
+                } else if name.ends_with(".rs") {
+                    out.push((
+                        format!("{prefix}{name}"),
+                        std::fs::read_to_string(&path).expect("a readable source file"),
+                    ));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, "", &mut out);
+        out
+    }
+
+    /// `mod send_delete_thread`'s text, by brace matching from its opener.
+    fn sealed_module() -> String {
+        let source = production();
+        let head = concat!("mod send_delete_", "thread {");
+        let at = source
+            .rfind(head)
+            .expect("`mod send_delete_thread` is not in this file's production");
+        let after = &source[at..];
+        let code = code_braces_only(after);
+        let mut depth = 0i32;
+        for (offset, ch) in code.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after[..offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`mod send_delete_thread` is never closed");
+    }
+
+    /// **The blocking revoke is sealed inside its own module.**
+    ///
+    /// `crate::send::cli_send_delete` waits on a `bw` child for up to sixty
+    /// seconds. `mod send_fetch_thread` carries the same seal for the fetch,
+    /// and for the same measured reason: the failure mode is not a missing
+    /// guard but a call written in a third position nobody counted -- the
+    /// frame closure itself, or a forwarder in a sibling file.
+    ///
+    /// Counted over EVERY `.rs` file under `src`, walked rather than listed,
+    /// less the one definition in `send.rs`.
+    #[test]
+    fn every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module() {
+        let files = crate_sources();
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+        for required in ["vault_window/mod.rs", "send.rs"] {
+            assert!(
+                files.iter().any(|(p, _)| p == required),
+                "control: the crate walk never reached {required:?}, so a blocking revoke \
+                 written there would be counted by nothing at all"
+            );
+        }
+
+        let block = code_braces_only(&sealed_module());
+        assert!(
+            block.len() > 200,
+            "control: the sealed-module slice is only {} bytes, which is not a module's worth",
+            block.len()
+        );
+        assert!(
+            !block.contains(concat!("send_fetch.note_", "screen(on_sends);")),
+            "control: the sealed-module slice contains the frame closure, so every \
+             containment assertion here is vacuous"
+        );
+
+        for (needle, defined_in_send_rs) in [
+            (concat!("cli_send_", "delete"), 1usize),
+            (concat!("real_send_", "delete"), 0),
+            (concat!("spawn_send_delete_", "with"), 0),
+        ] {
+            let total: usize = files
+                .iter()
+                .map(|(path, text)| {
+                    let region = code_braces_only(production_of(text));
+                    let seen = region.matches(needle).count();
+                    if path == "send.rs" {
+                        assert_eq!(
+                            seen, defined_in_send_rs,
+                            "`send.rs` spells {needle:?} {seen} times, not the \
+                             {defined_in_send_rs} its definitions account for -- the extra \
+                             mention is a second blocking `bw send delete` written inside the \
+                             privacy boundary"
+                        );
+                        0
+                    } else {
+                        seen
+                    }
+                })
+                .sum();
+            let inside = block.matches(needle).count();
+            assert!(
+                total > 0,
+                "control: {needle:?} is not in production outside `send.rs` at all, so \
+                 requiring it to be inside the sealed module asserts nothing"
+            );
+            assert_eq!(
+                inside, total,
+                "{needle:?} occurs {total} times in the crate's production outside `send.rs` \
+                 but only {inside} of them are inside `mod send_delete_thread`. A mention \
+                 outside that block -- in the frame closure or in a sibling file -- is a \
+                 blocking `bw send delete` reachable from the eframe thread, where it freezes \
+                 the window, titlebar included, for up to sixty seconds"
+            );
+        }
+    }
+
+    /// The revoke is placed in the SAME job the Sends fetch is, and this file
+    /// says so once: `mod send_delete_thread` names `sends_job` and mints no
+    /// `OnceLock` of its own.
+    ///
+    /// Behaviourally this is already held by
+    /// [`the_revoke_child_is_spawned_into_the_job_this_window_holds`], which
+    /// compares by pointer identity. This is the cheap statement of intent
+    /// beside it: a second cell would be a second handle held for one purpose,
+    /// and it would still pass the pointer test on its own terms.
+    #[test]
+    fn the_revoke_module_mints_no_job_of_its_own() {
+        let block = code_braces_only(&sealed_module());
+        assert!(
+            block.contains(concat!("send_fetch_thread::sends_", "job()")),
+            "`mod send_delete_thread` no longer names the Sends job"
+        );
+        assert!(
+            !block.contains("OnceLock"),
+            "`mod send_delete_thread` mints a process-lifetime cell of its own; the revoke is \
+             the same account's `bw send` child as the fetch and belongs in the same job"
+        );
+        assert!(
+            !block.contains(concat!("KillOnCloseJob::", "new")),
+            "`mod send_delete_thread` creates a job of its own"
+        );
+        // And `None` is never written as the job.
+        assert!(
+            !block.contains(concat!("cli_send_delete(", "None")),
+            "the revoke is started with no job at all, so an orphaned `bw send delete` would \
+             outlive this process with the vault session in its environment"
+        );
     }
 }
 

@@ -448,6 +448,43 @@ pub enum SendUiAction {
     Refresh,
     /// The inline notice band was clicked away.
     DismissNotice,
+    /// **Step one of two.** The Delete button on a row was pressed. Nothing
+    /// is destroyed by this: it asks the window to put that row -- and only
+    /// that row -- into the confirming state, which is what redraws it with
+    /// the confirmation.
+    ///
+    /// The id travels in the action for [`CopyLink`](Self::CopyLink)'s
+    /// reason: it is read off the row that was clicked and off nothing else,
+    /// so there is no second lookup on the far side that could resolve to a
+    /// different Send. For a destructive operation that is not a nicety --
+    /// revoking the wrong link is not undoable.
+    AskDelete(String),
+    /// **Step two of two.** The confirmation's own destructive button was
+    /// pressed, on the row named here.
+    ///
+    /// Carries the name as well as the id, again off the clicked row, because
+    /// the report the user is shown afterwards has to say WHICH Send was
+    /// revoked -- and by then the list it came from has been thrown away and
+    /// refetched.
+    ConfirmDelete { id: String, name: String },
+    /// The confirmation was declined. Its button occupies the pixels the
+    /// Delete button was drawn in -- see [`draw_row`].
+    CancelDelete,
+}
+
+/// What the window knows about a delete, as the pane needs it in order to
+/// draw one.
+///
+/// Two `Option<&str>` rather than one enum because they answer two
+/// independent questions -- "which row is asking?" and "which row is already
+/// being deleted?" -- and the window can hold both at once when the user asks
+/// about a second row while a first is still in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendDeleteView<'a> {
+    /// The id of the row whose confirmation is showing, if any.
+    pub confirming: Option<&'a str>,
+    /// The id of the row a `bw send delete` is running for, if any.
+    pub in_flight: Option<&'a str>,
 }
 
 /// Row geometry. Two lines of text and a button, so the row is tall enough
@@ -457,6 +494,27 @@ const ROW_HEIGHT: f32 = 54.0;
 const ROW_PAD_X: f32 = 14.0;
 const COPY_BUTTON_WIDTH: f32 = 92.0;
 const COPY_BUTTON_HEIGHT: f32 = 26.0;
+/// The Delete button, and -- exactly -- the Cancel button that replaces it.
+/// See [`draw_row`] for why those two are the same rectangle.
+const DELETE_BUTTON_WIDTH: f32 = 68.0;
+/// The confirmation's destructive button. Wider, because it is labelled with
+/// the whole of what it does rather than with one verb.
+const CONFIRM_BUTTON_WIDTH: f32 = 128.0;
+/// The gap between two controls in a row.
+const BUTTON_GAP: f32 = 8.0;
+/// The row's first, non-destructive button.
+pub const DELETE_LABEL: &str = "Delete";
+/// The confirmation's destructive button. **Deliberately not "Delete"**: the
+/// two steps must not be the same word, or the second click is muscle memory
+/// rather than a decision.
+pub const CONFIRM_LABEL: &str = "Delete permanently";
+/// The confirmation's way out, drawn in the Delete button's own rectangle.
+pub const CANCEL_LABEL: &str = "Cancel";
+/// The question the row asks while it is confirming, in place of the expiry.
+pub const CONFIRM_PROMPT: &str = "Revoke this link for good? It cannot be undone.";
+/// What a row says while its `bw send delete` is running. It has no buttons
+/// at all in that state, so a second click cannot start a second child.
+pub const DELETING_LABEL: &str = "Revoking\u{2026}";
 /// The gap between the name and its FILE tag, and between the tag's text and
 /// its own outline.
 const TAG_PAD_X: f32 = 6.0;
@@ -473,6 +531,7 @@ pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
     notice: Option<&str>,
+    delete: SendDeleteView<'_>,
 ) -> SendUiAction {
     let mut action = SendUiAction::None;
 
@@ -597,8 +656,8 @@ pub fn draw_send_pane(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for row in rows {
-                        if let Some(url) = draw_row(ui, row) {
-                            action = SendUiAction::CopyLink(url);
+                        if let Some(clicked) = draw_row(ui, row, delete) {
+                            action = clicked;
                         }
                     }
                 });
@@ -608,13 +667,33 @@ pub fn draw_send_pane(
     action
 }
 
-/// One row. Returns **this row's** URL when its Copy link button was clicked.
+/// One row. Returns the action **this row** reported, if any.
 ///
-/// The URL is read off the `row` this call was handed and off nothing else --
-/// no index into the list, no lookup by name. The wrong-row copy is the
-/// classic form of this bug and the only structural defence against it is not
-/// to have a second way of naming the row.
-fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
+/// Everything the action carries is read off the `row` this call was handed
+/// and off nothing else -- no index into the list, no lookup by name. The
+/// wrong-row copy is the classic form of this bug and the only structural
+/// defence against it is not to have a second way of naming the row; for the
+/// delete, where the mistake is not undoable, that matters more and not less.
+///
+/// **The row has three states and they are mutually exclusive**, decided
+/// here and in one place:
+///
+///  * **Revoking.** `delete.in_flight` names this row: no buttons at all are
+///    put into the layout, so a second click cannot start a second
+///    `bw send delete` for a Send that is already being revoked.
+///  * **Confirming.** `delete.confirming` names this row: the destructive
+///    button appears, and [`CANCEL_LABEL`] takes over the Delete button's
+///    **exact rectangle**. That is the mis-click defence and it is
+///    deliberate: a user who double-clicks Delete, or who clicks it twice
+///    because the first click seemed not to register, lands the second click
+///    on Cancel. The destructive button is a different size, a different
+///    label and a different position, so reaching it is a decision.
+///  * **Idle.** Copy link at the row's right edge, Delete beside it.
+fn draw_row(
+    ui: &mut egui::Ui,
+    row: &SendRow,
+    delete: SendDeleteView<'_>,
+) -> Option<SendUiAction> {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::hover());
     let painter = ui.painter();
@@ -650,12 +729,30 @@ fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
         );
     }
 
+    // The three states, decided once. `is` compares the id this row carries
+    // with the id the window is holding, so a confirmation shown for one row
+    // cannot be answered by a click on another.
+    let revoking = delete.in_flight == Some(row.id.as_str());
+    let confirming = !revoking && delete.confirming == Some(row.id.as_str());
+
+    // The second line of the row: the expiry normally, the question while
+    // confirming, and the progress word while the child runs. **The expiry is
+    // replaced rather than joined**, because a row that says both "Expires in
+    // 7 days" and "Revoke this link for good?" is a row whose subject is
+    // ambiguous at the moment it matters most.
+    let (second_line, second_colour) = if revoking {
+        (DELETING_LABEL, theme::TEXT_MUTED)
+    } else if confirming {
+        (CONFIRM_PROMPT, theme::ERROR)
+    } else {
+        (row.expiry.as_str(), theme::TEXT_FAINT)
+    };
     painter.text(
         egui::pos2(rect.left() + ROW_PAD_X, rect.bottom() - 12.0),
         egui::Align2::LEFT_BOTTOM,
-        &row.expiry,
+        second_line,
         small_font,
-        theme::TEXT_FAINT,
+        second_colour,
     );
 
     // Right-aligned against the row's own right edge, so the button stays
@@ -665,13 +762,29 @@ fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
     // horizontal: a nested layout is what has repeatedly pushed a control off
     // the pane in this window, and a control drawn at zero size passes both
     // the presence and the in-pane assertions.
-    let button_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.right() - ROW_PAD_X - COPY_BUTTON_WIDTH,
-            rect.center().y - COPY_BUTTON_HEIGHT / 2.0,
-        ),
-        egui::vec2(COPY_BUTTON_WIDTH, COPY_BUTTON_HEIGHT),
-    );
+    let slot = |right: f32, width: f32| {
+        egui::Rect::from_min_size(
+            egui::pos2(right - width, rect.center().y - COPY_BUTTON_HEIGHT / 2.0),
+            egui::vec2(width, COPY_BUTTON_HEIGHT),
+        )
+    };
+    let first_right = rect.right() - ROW_PAD_X;
+    let button_rect = slot(first_right, COPY_BUTTON_WIDTH);
+    // **The Delete slot and the Cancel slot are one expression, so they
+    // cannot drift apart.** See this function's doc: the whole mis-click
+    // defence is that the second of two rapid clicks on Delete lands on
+    // Cancel, and that is only true while these two rectangles are equal.
+    let delete_rect = slot(button_rect.left() - BUTTON_GAP, DELETE_BUTTON_WIDTH);
+    let confirm_rect = slot(delete_rect.left() - BUTTON_GAP, CONFIRM_BUTTON_WIDTH);
+
+    if revoking {
+        // No widget of any kind. A disabled button would still be a button
+        // the layout has to hold, and `Button::sense`-less controls in this
+        // window have a history of coming back to life after a re-layout.
+        ui.add_space(6.0);
+        return None;
+    }
+
     // **A row with no URL has nothing to copy, and says so by being
     // unclickable.** `send.rs`'s parser rejects a *missing* `accessUrl` but
     // accepts an empty one, so a row can reach here holding `""`; copying
@@ -679,18 +792,68 @@ fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
     // whatever the user had there and reporting success. The button is still
     // drawn -- the row must not lose its shape, and a row that quietly has
     // no control is harder to understand than one that has a dead one.
+    //
+    // Nothing of the sort guards the delete: an id is what `bw send delete`
+    // needs, `parse_send_list` refuses a Send without one, and a row that
+    // could not be revoked would be a public link with no way to take it
+    // down. The `id.is_empty()` case is still refused below, for the same
+    // structural reason the URL one is.
     let has_url = !row.access_url.is_empty();
-    let clicked = ui
+    let has_id = !row.id.is_empty();
+    let copied = ui
         .put(
             button_rect,
             egui::Button::new(egui::RichText::new("Copy link").size(12.0).color(theme::INK))
                 .min_size(egui::vec2(COPY_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
         )
         .clicked();
+
+    let destructive = if confirming {
+        let confirmed = ui
+            .put(
+                confirm_rect,
+                egui::Button::new(
+                    egui::RichText::new(CONFIRM_LABEL).size(12.0).color(theme::ERROR),
+                )
+                .min_size(egui::vec2(CONFIRM_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
+            )
+            .clicked();
+        let cancelled = ui
+            .put(
+                delete_rect,
+                egui::Button::new(egui::RichText::new(CANCEL_LABEL).size(12.0).color(theme::INK))
+                    .min_size(egui::vec2(DELETE_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
+            )
+            .clicked();
+        // Cancel wins if both somehow report in one frame: the safe answer to
+        // an ambiguous frame on a destructive control is not to destroy.
+        if cancelled {
+            Some(SendUiAction::CancelDelete)
+        } else if confirmed && has_id {
+            Some(SendUiAction::ConfirmDelete {
+                id: row.id.clone(),
+                name: row.name.clone(),
+            })
+        } else {
+            None
+        }
+    } else {
+        let asked = ui
+            .put(
+                delete_rect,
+                egui::Button::new(egui::RichText::new(DELETE_LABEL).size(12.0).color(theme::ERROR))
+                    .min_size(egui::vec2(DELETE_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
+            )
+            .clicked();
+        (asked && has_id).then(|| SendUiAction::AskDelete(row.id.clone()))
+    };
+
     ui.add_space(6.0);
-    // Belt and braces: the guard is on the *returned action* as well as on
-    // the widget, so no future re-layout of the button can reopen the path.
-    (clicked && has_url).then(|| row.access_url.clone())
+    // The destructive control wins over Copy link when both report, so a
+    // stray copy cannot swallow a delete the user asked for. Belt and braces
+    // on the URL: the guard is on the *returned action* as well as on the
+    // widget, so no future re-layout of the button can reopen the path.
+    destructive.or_else(|| (copied && has_url).then(|| SendUiAction::CopyLink(row.access_url.clone())))
 }
 
 /// The inline band. Same shape the item list's band has -- one line, clicking
@@ -1500,6 +1663,17 @@ mod paint_tests {
     /// Runs `draw_send_pane` in a pane of `size` and returns everything it
     /// painted, plus the action of the last frame.
     fn paint(state: &SendPaneState, notice: Option<&str>, size: egui::Vec2) -> (Painted, SendUiAction) {
+        paint_with(state, notice, size, SendDeleteView::default())
+    }
+
+    /// [`paint`], with the window's delete state as the pane would really be
+    /// handed it.
+    fn paint_with(
+        state: &SendPaneState,
+        notice: Option<&str>,
+        size: egui::Vec2,
+        delete: SendDeleteView<'_>,
+    ) -> (Painted, SendUiAction) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -1511,7 +1685,7 @@ mod paint_tests {
 
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice);
+            action = draw_send_pane(ui, state, notice, delete);
         });
 
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
@@ -1661,6 +1835,17 @@ mod paint_tests {
     /// frame that locates the control cannot be the frame that clicks it --
     /// both learned the hard way elsewhere in this window.
     fn click_nth(state: &SendPaneState, label: &str, nth: usize) -> SendUiAction {
+        click_nth_with(state, SendDeleteView::default(), label, nth)
+    }
+
+    /// [`click_nth`], with the window's delete state as the pane would really
+    /// be handed it -- so a confirmation can be armed and then answered.
+    fn click_nth_with(
+        state: &SendPaneState,
+        delete: SendDeleteView<'_>,
+        label: &str,
+        nth: usize,
+    ) -> SendUiAction {
         let size = min_pane_size();
         let ctx = egui::Context::default();
         let base = || egui::RawInput {
@@ -1672,7 +1857,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None);
+            let _ = draw_send_pane(ui, state, None, delete);
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -1706,7 +1891,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None);
+            let _ = draw_send_pane(ui, state, None, delete);
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -1718,7 +1903,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None);
+            action = draw_send_pane(ui, state, None, delete);
         });
         action
     }
@@ -1846,7 +2031,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"));
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -1866,7 +2051,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"));
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -1879,9 +2064,281 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"));
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default());
         });
         assert_eq!(action, SendUiAction::DismissNotice);
+    }
+
+    // ---- the revoke affordance, step 4 -----------------------------------
+
+    /// Presses the pane at an EXACT position and returns what it reported.
+    ///
+    /// Separate from [`click_nth_with`] because the mis-click test below has
+    /// to click a remembered *pixel* rather than a label: the whole question
+    /// there is what is under the pointer after the pane has been redrawn,
+    /// and looking the target up by name a second time is precisely the step
+    /// a mis-clicking user does not take.
+    fn click_at_with(
+        state: &SendPaneState,
+        delete: SendDeleteView<'_>,
+        pos: egui::Pos2,
+    ) -> SendUiAction {
+        let size = min_pane_size();
+        let ctx = egui::Context::default();
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(base(), |_ui| {});
+        let _ = ctx.run_ui(base(), |ui| {
+            let _ = draw_send_pane(ui, state, None, delete);
+        });
+        let press = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..base()
+        };
+        let _ = ctx.run_ui(press, |ui| {
+            let _ = draw_send_pane(ui, state, None, delete);
+        });
+        let release = egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            ..base()
+        };
+        let mut action = SendUiAction::None;
+        let _ = ctx.run_ui(release, |ui| {
+            action = draw_send_pane(ui, state, None, delete);
+        });
+        action
+    }
+
+    /// Where the `nth` widget labelled `label` was painted, in the pane drawn
+    /// with `delete`.
+    fn rect_of_nth(state: &SendPaneState, delete: SendDeleteView<'_>, label: &str, nth: usize) -> egui::Rect {
+        let (painted, _) = paint_with(state, None, min_pane_size(), delete);
+        let targets: Vec<egui::Rect> = painted
+            .text_rects
+            .iter()
+            .filter(|(t, _)| t == label)
+            .map(|(_, r)| *r)
+            .collect();
+        assert!(
+            targets.len() > nth,
+            "only {} widgets labelled {label:?} were painted, so there is no {nth}th to locate",
+            targets.len()
+        );
+        targets[nth]
+    }
+
+    /// **Every row can be revoked, and the first click revokes nothing.**
+    ///
+    /// Both halves matter and the second is the requirement: `bw send delete`
+    /// takes a public link down and there is no undo, so a control that acted
+    /// on one click would be a control that destroys on a mis-aim.
+    #[test]
+    fn every_row_has_a_delete_button_and_one_click_only_asks() {
+        let state = rows(6);
+        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == DELETE_LABEL).count(),
+            6,
+            "six rows were drawn but not six Delete buttons: {:?}",
+            painted.text
+        );
+        // Nothing destructive is even OFFERED before the first click.
+        assert!(
+            !painted.has(CONFIRM_LABEL),
+            "the destructive button is painted before anything was asked: {:?}",
+            painted.text
+        );
+
+        for nth in [0usize, 5] {
+            let action = click_nth_with(&state, SendDeleteView::default(), DELETE_LABEL, nth);
+            assert_eq!(
+                action,
+                SendUiAction::AskDelete(format!("id{nth}")),
+                "the Delete button on row {nth} did not ask about row {nth}"
+            );
+        }
+    }
+
+    /// **The confirmation is shown on exactly one row, and it is the row that
+    /// was asked about.**
+    #[test]
+    fn only_the_row_asked_about_shows_the_confirmation() {
+        let state = rows(4);
+        let armed = SendDeleteView { confirming: Some("id2"), in_flight: None };
+        let (painted, _) = paint_with(&state, None, min_pane_size(), armed);
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == CONFIRM_LABEL).count(),
+            1,
+            "the destructive button is on {} rows, not one: {:?}",
+            painted.text_rects.iter().filter(|(t, _)| t == CONFIRM_LABEL).count(),
+            painted.text
+        );
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == CANCEL_LABEL).count(),
+            1,
+            "the way out of the confirmation is not on exactly one row"
+        );
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == DELETE_LABEL).count(),
+            3,
+            "the other three rows lost their Delete button, or the armed row kept its own"
+        );
+        assert!(
+            painted.has(CONFIRM_PROMPT),
+            "the row that is about to be revoked does not say what that means: {:?}",
+            painted.text
+        );
+
+        // And it answers for its own row and no other.
+        assert_eq!(
+            click_nth_with(&state, armed, CONFIRM_LABEL, 0),
+            SendUiAction::ConfirmDelete {
+                id: "id2".to_string(),
+                name: "send-number-2".to_string(),
+            },
+            "the confirmation answered for a row other than the one it was asked about"
+        );
+    }
+
+    /// **THE MIS-CLICK DEFENCE, as a click on a remembered pixel.**
+    ///
+    /// A user who double-clicks Delete, or who clicks it twice because the
+    /// first click did not seem to register, puts the second click at the
+    /// same coordinates as the first. Those coordinates must not be a
+    /// destructive control on the redrawn frame. They are `Cancel`, and this
+    /// asserts it the only way that means anything: by clicking the position
+    /// the first click was made at, without looking anything up again.
+    #[test]
+    fn a_second_click_where_delete_was_cancels_and_never_destroys() {
+        let state = rows(3);
+        let idle = SendDeleteView::default();
+        let where_delete_was = rect_of_nth(&state, idle, DELETE_LABEL, 1).center();
+
+        // The first click arms the confirmation for that row.
+        assert_eq!(
+            click_at_with(&state, idle, where_delete_was),
+            SendUiAction::AskDelete("id1".to_string()),
+            "control: the remembered position is not the Delete button of row 1"
+        );
+
+        // The second click, at the very same pixel, on the redrawn pane.
+        let armed = SendDeleteView { confirming: Some("id1"), in_flight: None };
+        let second = click_at_with(&state, armed, where_delete_was);
+        assert_eq!(
+            second,
+            SendUiAction::CancelDelete,
+            "the pixel the Delete button occupied does something other than cancel once the \
+             confirmation is up -- a double-click on Delete would revoke a public link with \
+             no decision taken"
+        );
+        assert!(
+            !matches!(second, SendUiAction::ConfirmDelete { .. }),
+            "a second click at the Delete button's own position REVOKED the Send"
+        );
+
+        // And the destructive button is really somewhere else, so the
+        // assertion above is about geometry and not about a button that was
+        // never drawn.
+        let confirm = rect_of_nth(&state, armed, CONFIRM_LABEL, 0);
+        assert!(
+            !confirm.contains(where_delete_was),
+            "control: the destructive button covers the Delete button's own position \
+             ({confirm:?} contains {where_delete_was:?}), so cancelling there is an accident \
+             of hit-testing order rather than a layout decision"
+        );
+    }
+
+    /// **A row whose revoke is running has no control on it at all**, so a
+    /// second click cannot start a second `bw send delete` for a Send that is
+    /// already being revoked.
+    #[test]
+    fn a_row_being_revoked_has_no_buttons_and_says_so() {
+        let state = rows(3);
+        let busy = SendDeleteView { confirming: None, in_flight: Some("id1") };
+        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
+
+        assert!(
+            painted.has(DELETING_LABEL),
+            "the row being revoked does not say that anything is happening: {:?}",
+            painted.text
+        );
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == DELETE_LABEL).count(),
+            2,
+            "the revoking row kept a Delete button, or the other two lost theirs"
+        );
+        assert_eq!(
+            painted.text_rects.iter().filter(|(t, _)| t == "Copy link").count(),
+            2,
+            "the revoking row kept its Copy link button"
+        );
+        assert!(
+            !painted.has(CONFIRM_LABEL),
+            "a destructive button is painted on a row already being revoked"
+        );
+
+        // Every pixel of the row reports nothing. Swept across the whole row
+        // rather than at one point, because "no button" has to be true of the
+        // whole strip and a single sample can miss a control by ten pixels.
+        let row_line = painted
+            .rect_of(DELETING_LABEL)
+            .expect("counted above");
+        for x in [0.15f32, 0.35, 0.55, 0.75, 0.85, 0.93, 0.98] {
+            let pos = egui::pos2(min_pane_size().x * x, row_line.center().y);
+            assert_eq!(
+                click_at_with(&state, busy, pos),
+                SendUiAction::None,
+                "a click at {pos:?} on a row that is already being revoked reported an action"
+            );
+        }
+    }
+
+    /// A Send whose id did not survive the parse cannot be revoked, for the
+    /// reason a row with no URL cannot be copied: the button keeps the row's
+    /// shape, and the action it would report is refused.
+    #[test]
+    fn a_row_with_no_id_paints_its_button_but_revokes_nothing() {
+        let state = SendPaneState::Rows(vec![SendRow {
+            id: String::new(),
+            name: "no id".into(),
+            expiry: "Expires in 7 days".into(),
+            is_file: false,
+            access_url: "https://send.bitwarden.com/#/x".into(),
+        }]);
+        assert_eq!(
+            click_nth_with(&state, SendDeleteView::default(), DELETE_LABEL, 0),
+            SendUiAction::None,
+            "a row with no id asked to revoke something `bw` could not name"
+        );
+    }
+
+    /// The two steps do not share a word, so the second click is a decision
+    /// rather than muscle memory.
+    #[test]
+    fn the_two_steps_are_not_labelled_the_same_thing() {
+        assert_ne!(DELETE_LABEL, CONFIRM_LABEL);
+        assert_ne!(CANCEL_LABEL, CONFIRM_LABEL);
+        assert!(
+            CONFIRM_LABEL.len() > DELETE_LABEL.len(),
+            "the destructive label says no more than the harmless one does"
+        );
     }
 }
 
@@ -4167,9 +4624,28 @@ mod source_pins {
             (concat!("real_send_", "list"), 0, true),
             (concat!("spawn_send_list_", "with"), 0, true),
             (concat!("list_", "sends"), 2, false),
-            (concat!("CliSendRunner", "::with_session"), 1, false),
-            (concat!("CliSendRunner", ""), 4, false),
+            // **Both of these moved by one when `cli_send_delete` landed**,
+            // and the move is the deliberate decision this comment records
+            // rather than a number that drifted: `cli_send_delete`'s body
+            // hands a `CliSendRunner::with_session(job, data_dir, session)`
+            // to the generic revoke, which is one more `CliSendRunner` and one more
+            // `CliSendRunner::with_session` than the file had. Five is now
+            // `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`,
+            // `impl SendRunner for CliSendRunner<'_>` and the two entry
+            // points -- the definitions and the two pinned constructions, and
+            // no third.
+            (concat!("CliSendRunner", "::with_session"), 2, false),
+            (concat!("CliSendRunner", ""), 5, false),
             (concat!("CliSendRunner", "::new"), 0, false),
+            // The revoke's two, on the same terms as `list_sends` and
+            // `list_invocation` above. `delete_send` is its definition plus
+            // the one call in `cli_send_delete`; `delete_invocation` is its
+            // definition plus the one use in `delete_send`. A third mention
+            // of either is a second blocking `bw send delete` written inside
+            // the privacy boundary, where the private runner and the private
+            // `delete_invocation` are both still in scope.
+            (concat!("delete_", "send"), 2, false),
+            (concat!("delete_", "invocation"), 2, false),
             // **The bypass, counted.** `runner.run(&list_invocation(..))` is
             // a complete blocking `bw send list` that spells neither
             // `list_sends` nor `cli_send_list`; the author documented it for
@@ -4462,6 +4938,14 @@ mod source_pins {
         "send.rs: pub fn wait_decision(exited: bool, elapsed: Duration, cap: Duration) -> WaitDecision {",
         "send.rs: pub fn raw_output_from(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> RawOutput {",
         "send.rs: pub fn cli_send_list(",
+        // **Added by Sends step 4, deliberately.** `delete_send` is generic
+        // over `SendRunner` and this crate has no `pub` implementation of
+        // that trait, so a revoke wired from `vault_window` had a choice
+        // between one new door here and making the runner nameable from
+        // outside -- and the second is the wall itself. It is the exact
+        // counterpart of the line above it and carries the same three
+        // parameters plus the id.
+        "send.rs: pub fn cli_send_delete(",
     ];
 
     /// **Nothing waits on the Sends channel from the frame's own thread.**
@@ -4929,18 +5413,33 @@ mod source_pins {
             );
         }
 
-        let pane = concat!("send_ui::draw_send_", "pane(ui, state, notice_message.as_deref())");
+        // Squashed, because step 4 wrapped this call over five lines when it
+        // grew the delete-state argument. The needle is still the WHOLE call
+        // -- the argument list included -- so a second draw site, or a site
+        // handed a delete state that is not the window's own, fails here.
+        let pane = squashed(concat!(
+            "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
+             send_delete.view(), )"
+        ));
         assert_eq!(
-            production.matches(pane).count(),
+            squashed(&production).matches(pane.as_str()).count(),
             1,
             "{pane:?} is not in production exactly once -- the Sends pane is drawn from more \
-             than one place, or from none"
+             than one place, from none, or with a delete state that is not the window's own"
         );
     }
 
-    /// **Nothing outside `send.rs` can publish or revoke a Send.** The design
-    /// puts revocation before publication and this step is the read-only one;
-    /// a call site appearing here is the whole ordering undone.
+    /// **Nothing outside `send.rs` builds a Send invocation of its own.**
+    ///
+    /// Step 4 landed the revoke, so the old wording -- "this step is the
+    /// read-only one; a call site appearing here is the whole ordering
+    /// undone" -- is no longer what this holds. It is narrowed rather than
+    /// deleted, because what is left is still load-bearing: `delete_send` is
+    /// the GENERIC entry point, over any `SendRunner`, and the window may not
+    /// reach it. The window's one route is `crate::send::cli_send_delete`,
+    /// which is the only one that carries the job, the profile directory and
+    /// the session together. `create_send` is step 5 and still has no call
+    /// site anywhere.
     #[test]
     fn this_window_can_neither_create_nor_delete_a_send() {
         let source = include_str!("mod.rs");
