@@ -6089,6 +6089,7 @@ mod source_pins {
             concat!("send_fetch_thread::spawn_send_", "list"),
             concat!("export_thread::spawn_", "export"),
             concat!("send_delete_thread::spawn_send_", "delete"),
+            concat!("spawn_aux_", "load"),
         ] {
             assert_eq!(
                 body.matches(named).count(),

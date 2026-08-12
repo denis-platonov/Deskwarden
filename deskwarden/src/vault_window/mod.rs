@@ -517,6 +517,16 @@ pub fn build_frame(
     // would spawn a process. Behind the seam it is a `fn` pointer like the
     // other two, and `frame_promptness` hands one that answers instead.
     let spawn_send_list = env.send_list;
+    // The Trash and Archive lists' one entry point. Seamed for the reason
+    // every other spawn here is: behind `VaultCache` it dials the vault
+    // backend, so until it was a `fn` pointer a test could not put a window
+    // into the state "the user has opened Trash and its list came back" at
+    // all -- and that state is precisely where the seventh measured shadow
+    // lived (`let show_sends = show_sends && trash_list.items.is_none();`,
+    // green across the whole suite, and after one visit to Trash the entire
+    // window body paints nothing for the rest of the session). A state no
+    // fixture can build is a state a gate is free to hide in.
+    let spawn_aux_load_fn = env.aux_load;
     let spawn_export = env.export;
     // The fifth, and the destructive one. Named here rather than at the call
     // site so that a test can press the real Delete row on a real frame
@@ -1794,28 +1804,35 @@ pub fn build_frame(
         // are two things that can disagree, and the one that decides which
         // panels are drawn must be the one the body state actually returned.
         let show_sends = matches!(body, VaultBodyState::Sends);
-        // **THE SEARCH BOX IS NOT DRAWN ON THE SENDS SCREEN, SO IT IS
-        // EMPTIED ON THE WAY IN.**
+        // **NOTHING IS DONE TO `search` HERE, AND THAT IS THE FIX.**
         //
-        // The field lives below in `if !show_sends`, so text left in it
-        // survives the sidebar switch while nothing on screen shows it. That
-        // is invisible state, and invisible state is what a gate hides in:
+        // This used to be `if show_sends { search.clear(); }`, which threw
+        // the user's own filter away on entry to the Sends screen -- and
+        // permanently: the box is not drawn there, so there was nothing to
+        // type it back into, and every other sidebar row (Trash, Archive, a
+        // folder) preserves it. A production behaviour change was made in
+        // order to render a test-only gate inert, which is backwards; the
+        // filter is the user's, not the suite's to spend.
+        //
+        // The gate it was spent on was
         // `let send_pane = if search.is_empty() { send_pane } else { None };`
-        // was measured GREEN across the whole suite, because no test in the
-        // crate had ever typed into the box before opening Sends -- the same
-        // race `items` won two rounds earlier, with a different state.
+        // -- measured GREEN for a whole round, because no test in this crate
+        // had ever typed into the box before opening Sends. Emptying
+        // `search` made that mutant INERT rather than caught, which closes
+        // one state and leaves the class. What catches it now is that the
+        // state is DRIVEN: see
+        // `send_delete_wiring::the_sends_screen_works_in_every_state_the_user_can_reach`,
+        // whose `SearchTyped` variant types into the real box through the
+        // real Ctrl+K and then presses every control on the Sends screen. A
+        // gate on `search` is a dead screen in that state and the matrix
+        // says so.
         //
-        // Two answers, and both are here on purpose. The suite now DRIVES
-        // it: `clicking_delete_on_a_send_row_really_revokes_it` types into
-        // the real box through the real Ctrl+K before it presses Sends. And
-        // this line REMOVES it: on the Sends screen `search` is empty by
-        // construction, so a gate on it is no longer a defect to catch. The
-        // driving alone would only have closed the states this fixture
-        // happens to build, which is exactly the loop this window has been
-        // going round.
-        if show_sends {
-            search.clear();
-        }
+        // A "park and restore" pair was measured too, and it is
+        // indistinguishable from this: `SEARCH_park_removed` was green in
+        // both profiles. It bought only the invisible invariant "`search` is
+        // empty while Sends is up" -- and buying that costs a second frame
+        // local, which is one more thing a shadow can be gated on. So: no
+        // clear, no park, nothing.
         match body {
             VaultBodyState::Loading => {
                 egui::CentralPanel::default()
@@ -1926,7 +1943,7 @@ pub fn build_frame(
         ] {
             if list.wants_fetch(selected_source == Some(which)) {
                 list.in_flight = true;
-                spawn_aux_load(cache.clone(), which, load_generation, window_era, aux_tx.clone());
+                (spawn_aux_load_fn)(cache.clone(), which, load_generation, window_era, aux_tx.clone());
             }
         }
         // The Sends list, on the same terms and for the same reasons: the
@@ -3672,6 +3689,16 @@ pub struct VaultFrameEnv {
     /// revoke observed at the point of effect, with no `bw` child: see
     /// `send_delete_wiring::clicking_delete_on_a_send_row_really_revokes_it`.
     send_delete: SendDeleteSpawn,
+    /// `spawn_aux_load` in production -- the Trash and Archive lists.
+    ///
+    /// Here so that "the user has opened Trash, and its list arrived" is a
+    /// state a test can put a real window into. It was not, and the seventh
+    /// measured shadow lived in exactly that gap: `let show_sends =
+    /// show_sends && trash_list.items.is_none();` written inside the central
+    /// panel is green across the whole suite, and in production it empties
+    /// the ENTIRE window body -- the Sends screen and the item list both --
+    /// from the first time the user visits Trash until the session ends.
+    aux_load: AuxLoadSpawn,
     /// `settings::default_path()` in production. A test hands a path under
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
@@ -3687,6 +3714,7 @@ impl VaultFrameEnv {
             send_list: send_fetch_thread::spawn_send_list,
             export: export_thread::spawn_export,
             send_delete: send_delete_thread::spawn_send_delete,
+            aux_load: spawn_aux_load,
             settings_path: crate::settings::default_path(),
         }
     }
@@ -4636,6 +4664,17 @@ impl AuxList {
 /// six lines of it -- see `VaultCache::list_trash_unless_superseded`, which
 /// performs the check where the fetch happens, and returns a superseded
 /// result as `Ok(None)`.
+/// The shape of "fetch one out-of-vault list off-thread", as a **`fn`
+/// pointer** -- see [`VaultFrameEnv::aux_load`] and [`SendDeleteSpawn`] for
+/// why these seams are `fn` items and not closures.
+type AuxLoadSpawn = fn(
+    std::sync::Arc<VaultCache>,
+    OutOfVault,
+    u64,
+    crate::vault_cache::VaultEra,
+    mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+);
+
 fn spawn_aux_load(
     cache: std::sync::Arc<VaultCache>,
     which: OutOfVault,
@@ -18860,23 +18899,57 @@ mod send_delete_wiring {
             texts(&output)
         );
 
-        // 1b. **AND THE BOX WAS EMPTIED ON THE WAY IN.**
+        // 1b. **AND THE USER GOT THEIR QUERY BACK.**
         //
         // The search field is not drawn on the Sends screen, so the vault
-        // is the only place it can be read: go back and look. Without this,
-        // deleting the `if show_sends { search.clear(); }` in `run` was
-        // measured GREEN across the whole suite -- the invariant that makes
-        // a `search`-gated shadow inert rather than a defect would have been
-        // free to delete, and the sixth state would have come straight back.
+        // is the only place it can be read: go back and look. The visit
+        // leaves it alone -- it used to `clear()` it, which is a user's
+        // filter silently destroyed on every round trip through one sidebar
+        // row while every other row preserves it.
         let all_items_at = locate(&output, "All items");
         let back = click(&ctx, &mut frame_fn, all_items_at);
         assert!(
+            find(&back, "zq").is_some(),
+            "the search box is empty after a round trip through the Sends screen, so the \
+             user's own query was destroyed by visiting a sidebar row. Every other row -- \
+             Trash, Archive, a folder -- preserves it. What was painted: {:?}",
+            texts(&back)
+        );
+
+        // Emptied again, through the real box, so the steps below (which
+        // press a real item row) are not looking at a filtered list. The
+        // window no longer throws the query away, so the test has to.
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                modifiers: egui::Modifiers::CTRL,
+                ..input()
+            },
+            |ui| frame_fn(ui),
+        );
+        let backspace = || egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run_ui(
+            egui::RawInput { events: vec![backspace(), backspace()], ..input() },
+            |ui| frame_fn(ui),
+        );
+        let back = ctx.run_ui(input(), |ui| frame_fn(ui));
+        assert!(
             find(&back, "zq").is_none(),
-            "the search box still holds \"zq\" after a visit to the Sends screen. The box \
-             is not drawn there, so that is text the user cannot see filtering the list \
-             they come back to -- and it is live frame state at the point the Sends pane \
-             is asked for, which is exactly where the sixth measured shadow was gated. \
-             What was painted: {:?}",
+            "control: two backspaces did not empty the search box, so the vault list below \
+             is still filtered and the item row this test presses is not on screen. What \
+             was painted: {:?}",
             texts(&back)
         );
 
@@ -19292,6 +19365,623 @@ mod send_delete_wiring {
             send_ui::abandoned_in_this_thread(),
             0,
             "a Sends verdict was dropped rather than applied over an empty vault -- see \
+             `send_ui::SendUiVerdict`"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // ==================================================================
+    // The state matrix: the Sends screen, in every state the PRODUCT can
+    // reach rather than in every place a gate could be written
+    // ==================================================================
+
+    /// **A state the user can put this window into while the Sends screen is
+    /// up.**
+    ///
+    /// This is an enumeration, and it is deliberately a different KIND of
+    /// enumeration from the one that has lost seven rounds. Every previous
+    /// hold over this wiring named a PLACE -- a line, a body, a brace depth,
+    /// a binding, a call count -- and each round a shadow was written one
+    /// place further out: above the `let`, inside the panel closure, in the
+    /// pane itself. The set of places a boolean can be re-bound is unbounded
+    /// and nothing can enumerate it.
+    ///
+    /// The set of states the PRODUCT can be in is not unbounded. It is a
+    /// property of the feature, it is auditable by reading the window's own
+    /// frame locals against this list, and it grows when the feature grows --
+    /// a new list, a new in-flight cell, a new screen adds a variant here and
+    /// the matrix covers it everywhere at once. A gate can be written in any
+    /// place at all; what it must be gated ON, to be green, is a state no
+    /// fixture builds. So this closes the states instead of the places.
+    ///
+    /// **The honest boundary:** this does not make a green mutant impossible.
+    /// It makes a green mutant require a frame-local that is NOT in this
+    /// list -- and adding a state to a window is a visible act, whereas
+    /// moving a `let` one brace inward is not. See the test below for what a
+    /// ninth site would have to look like.
+    #[derive(Clone, Copy, Debug)]
+    enum ReachableState {
+        /// The window as it opens: vault loaded, nothing pressed.
+        Fresh,
+        /// A brand-new account. `items` and `folders` both empty.
+        EmptyVault,
+        /// A folder row pressed -- `filter` is `SidebarFilter::Folder`.
+        FolderSelected,
+        /// A real item row pressed -- `selected_id` is `Some`.
+        ItemSelected,
+        /// Trash opened once, so `trash_list.items` is `Some`. **The
+        /// seventh measured shadow's state**, and one no test could build
+        /// before `VaultFrameEnv::aux_load` existed.
+        TrashVisited,
+        /// Archive opened once, so `archive_list.items` is `Some`.
+        ArchiveVisited,
+        /// Text typed into the real search box before leaving for Sends, so
+        /// `search` is non-empty for every frame the Sends screen is up.
+        /// **The sixth measured shadow's state.**
+        SearchTyped,
+        /// The Sends fetch failed, so `notice_message` is `Some` and the
+        /// pane is on its error screen.
+        NoticeUp,
+        /// A `bw send list` genuinely in flight -- the stub keeps its sender.
+        FetchInFlight,
+        /// A `bw send delete` genuinely in flight -- the revoke stub keeps
+        /// its sender and reports nothing. **The eighth measured shadow's
+        /// state:** `let action = if delete.in_flight.is_none() { action }
+        /// else { SendUiAction::None };` at the end of `draw_send_pane` is
+        /// green without this, and it makes the whole Sends screen inert for
+        /// the seconds a real revoke takes.
+        RevokeInFlight,
+    }
+
+    impl ReachableState {
+        const ALL: [Self; 10] = [
+            Self::Fresh,
+            Self::EmptyVault,
+            Self::FolderSelected,
+            Self::ItemSelected,
+            Self::TrashVisited,
+            Self::ArchiveVisited,
+            Self::SearchTyped,
+            Self::NoticeUp,
+            Self::FetchInFlight,
+            Self::RevokeInFlight,
+        ];
+    }
+
+    fn matrix_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn matrix_labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            frame_labelled_rects(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn matrix_texts(output: &egui::FullOutput) -> Vec<String> {
+        matrix_labels(output).into_iter().map(|(t, _)| t).collect()
+    }
+
+    fn matrix_find(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        matrix_labels(output)
+            .into_iter()
+            .find(|(t, _)| t == needle)
+            .map(|(_, r)| r)
+    }
+
+    fn matrix_count(output: &egui::FullOutput, needle: &str) -> usize {
+        matrix_labels(output).iter().filter(|(t, _)| t == needle).count()
+    }
+
+    fn matrix_locate(state: ReachableState, output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
+        matrix_find(output, needle)
+            .map(|r| r.center())
+            .unwrap_or_else(|| {
+                panic!(
+                    "in state {state:?} the window painted no {needle:?} to press, so this \
+                     test cannot reach what it is about at all. What was painted: {:?}",
+                    matrix_texts(output)
+                )
+            })
+    }
+
+    fn matrix_frame(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        ctx.run_ui(matrix_input(), |ui| frame_fn(ui))
+    }
+
+    /// A press AND a release, then two settling frames -- a fetch started by
+    /// the frame that draws a screen is not drained until the frame after.
+    fn matrix_click(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+        pos: egui::Pos2,
+    ) -> egui::FullOutput {
+        matrix_click_watching_the_clipboard(ctx, frame_fn, pos).0
+    }
+
+    /// Every string this window put on the clipboard on one frame.
+    fn matrix_copied(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A click, plus everything it copied. **The clipboard is read across
+    /// ALL of the click's frames**: the command is emitted on the frame the
+    /// button is released and would be gone by the frame the screen is read
+    /// from.
+    fn matrix_click_watching_the_clipboard(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+        pos: egui::Pos2,
+    ) -> (egui::FullOutput, Vec<String>) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut copied = Vec::new();
+        let down = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pos), button(true)],
+                ..matrix_input()
+            },
+            |ui| frame_fn(ui),
+        );
+        copied.extend(matrix_copied(&down));
+        let up = ctx.run_ui(
+            egui::RawInput { events: vec![button(false)], ..matrix_input() },
+            |ui| frame_fn(ui),
+        );
+        copied.extend(matrix_copied(&up));
+        let settling = matrix_frame(ctx, frame_fn);
+        copied.extend(matrix_copied(&settling));
+        let last = matrix_frame(ctx, frame_fn);
+        copied.extend(matrix_copied(&last));
+        (last, copied)
+    }
+
+    /// The real Ctrl+K, then real text events -- the way a user fills the
+    /// search box.
+    fn matrix_type(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+        text: &str,
+    ) -> egui::FullOutput {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                // `i.modifiers` is read off the RawInput, not off the event.
+                modifiers: egui::Modifiers::CTRL,
+                ..matrix_input()
+            },
+            |ui| frame_fn(ui),
+        );
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Text(text.to_string())],
+                ..matrix_input()
+            },
+            |ui| frame_fn(ui),
+        );
+        matrix_frame(ctx, frame_fn)
+    }
+
+    /// **THE SENDS SCREEN PAINTS ITS CONTROLS AND ITS CONTROLS DO THEIR WORK,
+    /// IN EVERY STATE THE PRODUCT CAN REACH.**
+    ///
+    /// One real window per state, driven the way a user drives it, with no
+    /// `bw`, no dialog and no network. For each state:
+    ///
+    ///  1. the Sends screen is really on screen (its own header, not just the
+    ///     sidebar row that leads to it);
+    ///  2. Refresh is drawn, and pressing it really refetches -- proved in
+    ///     BOTH directions, once into a failure and once back out of it, so a
+    ///     press that does nothing cannot pass by accident;
+    ///  3. a row's Delete really arms the confirmation and starts no revoke,
+    ///     and Cancel really disarms it;
+    ///  4. no verdict was dropped instead of applied.
+    ///
+    /// Step 1 is what a shadow gated on a list or a flag OUTSIDE the pane
+    /// fails: `let show_sends = show_sends && trash_list.items.is_none();`
+    /// leaves the whole window body empty from the first visit to Trash, and
+    /// `TrashVisited` sees exactly that. Step 2 is what a shadow gated on a
+    /// flag INSIDE the pane fails: `let action = if delete.in_flight.is_none()
+    /// { action } else { SendUiAction::None };` swallows every press for the
+    /// seconds a revoke takes, and `RevokeInFlight` presses during exactly
+    /// those seconds.
+    ///
+    /// **What this does NOT close.** A gate on a frame-local that is not one
+    /// of these states is still green -- a ninth site would look like `let
+    /// show_sends = show_sends && export.in_flight.is_none();`, or a gate on
+    /// `icons`, on `move_error`, on the folder-modal's cell, on
+    /// `last_activity`. That is the boundary, and it is stated rather than
+    /// papered over: the answer to a ninth site is a tenth VARIANT here, not
+    /// an eighth source pin, because a variant is a state the product has and
+    /// a pin is a place a person chose.
+    #[test]
+    fn the_sends_screen_works_in_every_state_the_user_can_reach() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for state in ReachableState::ALL {
+            drive_the_sends_screen_in(state);
+        }
+    }
+
+    fn drive_the_sends_screen_in(state: ReachableState) {
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_WITHHOLDS.store(
+            matches!(state, ReachableState::FetchInFlight),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        FRAME_LIST_FAILS.store(
+            matches!(state, ReachableState::NoticeUp),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _empty_vault =
+            matches!(state, ReachableState::EmptyVault).then(EmptyVaultFixture::armed);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-sends-matrix-{state:?}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::with_send_delete(
+                super::frame_env_seam::stubbed(
+                    frame_sync,
+                    frame_load,
+                    frame_send_list,
+                    Some(scratch.join("settings.json")),
+                ),
+                frame_revoke,
+            ),
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        let _ = matrix_frame(&ctx, &mut frame_fn);
+        let mut output = matrix_frame(&ctx, &mut frame_fn);
+
+        // ---- reach the state, on the vault side ----
+        match state {
+            ReachableState::Fresh
+            | ReachableState::EmptyVault
+            | ReachableState::NoticeUp
+            | ReachableState::FetchInFlight
+            | ReachableState::RevokeInFlight => {}
+            ReachableState::FolderSelected => {
+                let at = matrix_locate(state, &output, "Frame Harness Folder");
+                output = matrix_click(&ctx, &mut frame_fn, at);
+            }
+            ReachableState::ItemSelected => {
+                let at = matrix_locate(state, &output, FRAME_ITEM_NAME);
+                output = matrix_click(&ctx, &mut frame_fn, at);
+            }
+            ReachableState::TrashVisited | ReachableState::ArchiveVisited => {
+                let row = if matches!(state, ReachableState::TrashVisited) {
+                    "Trash"
+                } else {
+                    "Archive"
+                };
+                // A row whose list has not been fetched draws
+                // `UNKNOWN_COUNT` for its badge, and a resolved one draws a
+                // number. So: one fewer unknown badge is the list ARRIVING,
+                // i.e. `items` becoming `Some` -- which is the whole of what
+                // this state is, and what no fixture could build until
+                // `VaultFrameEnv::aux_load` was a seam.
+                let unknown_before = matrix_count(&output, sidebar::UNKNOWN_COUNT);
+                let at = matrix_locate(state, &output, row);
+                output = matrix_click(&ctx, &mut frame_fn, at);
+                assert!(
+                    matrix_count(&output, sidebar::UNKNOWN_COUNT) < unknown_before,
+                    "control: {row} was opened and no badge resolved, so its list never \
+                     arrived and `items` is still `None` -- {state:?} is not the state being \
+                     driven. What was painted: {:?}",
+                    matrix_texts(&output)
+                );
+            }
+            ReachableState::SearchTyped => {
+                output = matrix_type(&ctx, &mut frame_fn, "zq");
+                assert!(
+                    matrix_find(&output, "zq").is_some(),
+                    "control: the search box does not paint \"zq\" after Ctrl+K and two \
+                     letters, so `search` is still empty and this state is not being built \
+                     at all. What was painted: {:?}",
+                    matrix_texts(&output)
+                );
+            }
+        }
+
+        // ---- the Sends screen, reached the only way there is ----
+        let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
+        output = matrix_click(&ctx, &mut frame_fn, sends_at);
+
+        // 1. **THE SCREEN IS THERE.** The pane paints its own "Sends"
+        //    heading, so the sidebar row that leads to it and the screen
+        //    itself are two different labels: one occurrence is a window
+        //    whose body painted NOTHING, which is what a gate on the outer
+        //    `show_sends` does -- the item list is skipped by `if
+        //    !show_sends` and the pane by the gate, and the user is left
+        //    looking at an empty window for the rest of the session.
+        assert!(
+            matrix_count(&output, sidebar::SENDS_ROW_LABEL) >= 2,
+            "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
+             its own heading -- only the sidebar row that leads to it is on screen. The \
+             window body is empty: the item list is skipped because `show_sends` is true \
+             and the pane was not asked for. What was painted: {:?}",
+            matrix_texts(&output)
+        );
+
+        // The state really is the one this iteration names, checked on
+        // screen before anything is pressed.
+        match state {
+            ReachableState::NoticeUp => assert!(
+                matrix_find(&output, send_ui::FAILED_HEADLINE).is_some(),
+                "control: the fetch was set to fail and the Sends pane is not on its error \
+                 screen, so {state:?} is not the state being driven. What was painted: {:?}",
+                matrix_texts(&output)
+            ),
+            ReachableState::FetchInFlight => {
+                assert!(
+                    matrix_find(&output, send_ui::LOADING_LABEL).is_some(),
+                    "control: the send-list stub withheld its answer and the pane is not \
+                     waiting, so no fetch is in flight. What was painted: {:?}",
+                    matrix_texts(&output)
+                );
+            }
+            _ => assert!(
+                matrix_find(&output, FRAME_SEND_NAME).is_some(),
+                "control: in state {state:?} the Sends screen is up but {FRAME_SEND_NAME:?} \
+                 is not on it, so there is no row below to press. What was painted: {:?}",
+                matrix_texts(&output)
+            ),
+        }
+
+        // The revoke, for the one state that is about a revoke being in
+        // flight. The stub reports NOTHING, so `send_delete.in_flight` stays
+        // `Some` for every frame below -- which is exactly how long a real
+        // `bw send delete` holds it.
+        if matches!(state, ReachableState::RevokeInFlight) {
+            let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
+            let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
+            let confirm_at = matrix_locate(state, &armed, send_ui::CONFIRM_LABEL);
+            output = matrix_click(&ctx, &mut frame_fn, confirm_at);
+            assert_eq!(
+                FRAME_REVOKES.lock().expect("not poisoned").len(),
+                1,
+                "control: confirming started no revoke, so nothing is in flight and \
+                 {state:?} is not the state being driven"
+            );
+            assert!(
+                matrix_find(&output, send_ui::DELETING_LABEL).is_some(),
+                "control: the row does not say {:?} with a revoke in flight, so the pane is \
+                 not in the state this iteration is about. What was painted: {:?}",
+                send_ui::DELETING_LABEL,
+                matrix_texts(&output)
+            );
+        }
+
+        // The press that has to happen WHILE the fetch is in flight, for the
+        // one state that is about that. Refresh during a wait is how a user
+        // abandons an answer that is taking too long: it moves the fetch's
+        // generation, which is what makes the answer already on its way
+        // stale. A press that reaches nothing leaves the generation where it
+        // was and the abandoned list is the one the user gets.
+        //
+        // (It also unsticks the window: `invalidate` deliberately does not
+        // clear `in_flight`, because a thread really is still running, so
+        // nothing refetches until that thread answers.)
+        if matches!(state, ReachableState::FetchInFlight) {
+            let refresh_at = matrix_locate(state, &output, "Refresh");
+            let _ = matrix_click(&ctx, &mut frame_fn, refresh_at);
+            FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+            let (stale_tx, stale_generation) = FRAME_LIST_TX
+                .lock()
+                .expect("not poisoned")
+                .clone()
+                .expect("control: the send-list stub was never asked, so no fetch is in flight");
+            let _ = stale_tx.send((
+                stale_generation,
+                Ok(vec![crate::send::SendSummary {
+                    id: "stale-matrix-send-id".to_string(),
+                    name: FRAME_STALE_NAME.to_string(),
+                    access_url: "https://send.example.invalid/stale".to_string(),
+                    deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
+                    is_file: false,
+                }]),
+            ));
+            let mut settled = matrix_frame(&ctx, &mut frame_fn);
+            for _ in 0..4 {
+                settled = matrix_frame(&ctx, &mut frame_fn);
+                assert!(
+                    matrix_find(&settled, FRAME_STALE_NAME).is_none(),
+                    "Refresh was pressed while a Sends fetch was in flight and the answer the \
+                     user abandoned was painted anyway ({FRAME_STALE_NAME:?}), so the press \
+                     reached nothing and the fetch's generation never moved. What was \
+                     painted: {:?}",
+                    matrix_texts(&settled)
+                );
+            }
+            assert!(
+                matrix_find(&settled, FRAME_SEND_NAME).is_some(),
+                "control: the stale answer was dropped and no refetch replaced it. What was \
+                 painted: {:?}",
+                matrix_texts(&settled)
+            );
+            output = settled;
+        }
+
+        // 2. **REFRESH IS DRAWN AND PRESSING IT WORKS -- IN BOTH
+        //    DIRECTIONS.** Refresh is present in every pane state on purpose
+        //    (a screen whose only way out of an error is to navigate away is
+        //    a screen that says the error is permanent), so this is the one
+        //    control every state has. One press into a failure and one back
+        //    out of it: a press that reaches nothing leaves the screen where
+        //    it was, and "where it was" is a different answer in each half.
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refresh_at = matrix_locate(state, &output, "Refresh");
+        let failed = matrix_click(&ctx, &mut frame_fn, refresh_at);
+        assert!(
+            matrix_find(&failed, send_ui::FAILED_HEADLINE).is_some(),
+            "in state {state:?} Refresh was pressed with the send list set to fail and the \
+             pane never reached its error screen, so the press reached nothing. Every \
+             control on this screen is inert in this state, for as long as the state lasts. \
+             What was painted: {:?}",
+            matrix_texts(&failed)
+        );
+
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let refresh_at = matrix_locate(state, &failed, "Refresh");
+        let recovered = matrix_click(&ctx, &mut frame_fn, refresh_at);
+        assert!(
+            matrix_find(&recovered, FRAME_SEND_NAME).is_some(),
+            "in state {state:?} Refresh was pressed on a Sends screen showing a failed fetch \
+             and the list never came back, so the error is permanent for the user. What was \
+             painted: {:?}",
+            matrix_texts(&recovered)
+        );
+
+        // The revoke is answered before the row is pressed: a row with a
+        // `bw send delete` running against it deliberately has no buttons at
+        // all, which is the pane's own rule and not a defect.
+        let mut output = recovered;
+        if matches!(state, ReachableState::RevokeInFlight) {
+            FRAME_TX
+                .lock()
+                .expect("not poisoned")
+                .as_ref()
+                .expect("the revoke stub kept the frame's sender")
+                .send(SendDeleteReport::Deleted { name: FRAME_SEND_NAME.to_string() })
+                .expect("the frame still holds the receiver");
+            for _ in 0..4 {
+                output = matrix_frame(&ctx, &mut frame_fn);
+            }
+        }
+
+        // 3. **THE ROW'S OWN CONTROLS.** Copy link is drawn, Delete arms the
+        //    confirmation and destroys nothing, and Cancel really disarms it.
+        let copy_at = matrix_locate(state, &output, "Copy link");
+        let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
+        assert_eq!(
+            copied,
+            vec!["https://send.example.invalid/frame-harness".to_string()],
+            "in state {state:?} pressing Copy link on a real Sends row put {copied:?} on the \
+             clipboard, not exactly that row's own access URL. Copy link is the whole point \
+             of a Send -- a row that publishes a link the user cannot get hold of is a dead \
+             feature, and a press that reaches nothing looks identical on screen. What was \
+             painted: {:?}",
+            matrix_texts(&after_copy)
+        );
+        let output = after_copy;
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
+        let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
+        assert!(
+            matrix_find(&armed, send_ui::CONFIRM_LABEL).is_some(),
+            "in state {state:?} pressing Delete on a real Sends row put up no {:?} \
+             confirmation, so the row is inert. What was painted: {:?}",
+            send_ui::CONFIRM_LABEL,
+            matrix_texts(&armed)
+        );
+        let started = FRAME_REVOKES.lock().expect("not poisoned").clone();
+        assert!(
+            started.is_empty(),
+            "in state {state:?} one click on Delete started a `bw send delete` -- \
+             {started:?} -- so the confirmation is a decoration"
+        );
+
+        let cancel_at = matrix_locate(state, &armed, send_ui::CANCEL_LABEL);
+        let disarmed = matrix_click(&ctx, &mut frame_fn, cancel_at);
+        assert!(
+            matrix_find(&disarmed, send_ui::CONFIRM_LABEL).is_none(),
+            "in state {state:?} Cancel was pressed and the destructive button is still on \
+             screen, so the way out of a confirmation does nothing -- and the next click in \
+             that rectangle destroys a public link. What was painted: {:?}",
+            matrix_texts(&disarmed)
+        );
+        assert!(
+            matrix_find(&disarmed, send_ui::DELETE_LABEL).is_some(),
+            "in state {state:?} Cancel left the row with no Delete button at all. What was \
+             painted: {:?}",
+            matrix_texts(&disarmed)
+        );
+        assert!(
+            FRAME_REVOKES.lock().expect("not poisoned").is_empty(),
+            "in state {state:?} Cancel started a revoke"
+        );
+
+        // 3b. **AND THE USER'S QUERY SURVIVED THE VISIT.** The whole of this
+        //     state is that `search` is NON-EMPTY at the point the Sends
+        //     pane is asked for -- which is what makes a `search`-gated
+        //     shadow a caught defect rather than an inert line -- and the
+        //     text is still in the box when the user comes back. It used to
+        //     be `search.clear()`ed on the way in: a filter thrown away on
+        //     every round trip through one sidebar row while every other row
+        //     preserved it.
+        if matches!(state, ReachableState::SearchTyped) {
+            let vault_at = matrix_locate(state, &disarmed, "All items");
+            let back = matrix_click(&ctx, &mut frame_fn, vault_at);
+            assert!(
+                matrix_find(&back, "zq").is_some(),
+                "the search box is empty after a round trip through the Sends screen, so the \
+                 user's query was destroyed by visiting a sidebar row. What was painted: {:?}",
+                matrix_texts(&back)
+            );
+        }
+
+        // 4. Nothing the pane reported was thrown away, on any frame above.
+        assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "in state {state:?} a Sends verdict was dropped rather than applied -- see \
              `send_ui::SendUiVerdict`"
         );
 
@@ -20879,8 +21569,28 @@ mod frame_env_seam {
             send_list,
             export: refuses_to_export,
             send_delete: refuses_to_revoke,
+            // **Answers with an EMPTY list rather than dialling the vault.**
+            // Not a refusal, unlike the two above: opening Trash is not a
+            // destructive act and a harness reaches it by pressing an
+            // ordinary sidebar row, so a panic here would make an innocent
+            // click fatal. Answering is also the point -- `items` becomes
+            // `Some`, which is the state the seventh shadow was gated on and
+            // which no test could previously construct.
+            aux_load: answers_with_no_aux_items,
             settings_path,
         }
+    }
+
+    /// The default [`VaultFrameEnv::aux_load`] of a [`stubbed`] env: the
+    /// list arrives, and it is empty.
+    fn answers_with_no_aux_items(
+        _: std::sync::Arc<VaultCache>,
+        which: OutOfVault,
+        generation: u64,
+        _: crate::vault_cache::VaultEra,
+        tx: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+    ) {
+        let _ = tx.send((generation, which, Ok(Some(Vec::new()))));
     }
 
     /// The default [`VaultFrameEnv::export`] of a [`stubbed`] env.
