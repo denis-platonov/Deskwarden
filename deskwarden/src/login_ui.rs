@@ -6657,8 +6657,31 @@ pub(crate) mod password_lifetime_tests {
         // -- three TRACKED sources -- satisfied every assertion in this test,
         // the whole set equality below, and both positive controls, in both
         // configurations. This says what the exclusion IS rather than a few
-        // things it is not, so a third entry fails here by construction and
-        // does not need to be guessed at by name.
+        // things it is not, and does not need to be guessed at by name.
+        //
+        // **What it does and does not catch, measured at `0cd9fe0` rather
+        // than asserted.** The previous round's summary said a third entry
+        // "fails HERE by construction". It does not reach here: a third entry
+        // is a type error at the comparison -- `error[E0277]: can't compare
+        // [&[&str]; 3] with [&[&str]; 2]` -- and the crate does not build, so
+        // this assertion never runs. What fails HERE, at runtime, is a
+        // SAME-ARITY edit: the second entry retargeted to
+        // `deskwarden/installer` compiles fine and dies with three failing
+        // tests in both configurations; so do a reordering, and so does
+        // `&["deskwarden/target"]` written as one component. The conclusion
+        // survives the correction, but the mechanism is value comparison plus
+        // the structural control below, not an arity check.
+        //
+        // **And this equality is a RESTATEMENT of the const, not an observer
+        // of it.** A widening that edits both -- which is what the edit
+        // actually looks like when someone means it -- passes this line
+        // untouched: measured, a third entry naming `.github` with this
+        // literal grown to match is KILLED by the probe scan's structural
+        // control alone and by nothing here. Loosening this to
+        // `BUILD_OUTPUT_DIRS.len() == 2` is therefore a survivor, and the
+        // only mutants it loses are the reordering and the one-component
+        // spelling, both of which are behaviourally IDENTICAL to the
+        // original. The behavioural half is held below, not here.
         assert_eq!(
             BUILD_OUTPUT_DIRS,
             [&["target"][..], &["deskwarden", "target"][..]],
@@ -7492,13 +7515,69 @@ pub(crate) mod password_lifetime_tests {
         // difference. That half is held by the array equality over
         // `BUILD_OUTPUT_DIRS`, which fails on a third element whether or not
         // the directory it names exists.
+        //
+        // **And "pruned by the list written HERE" was one plausible edit from
+        // vacuous, which is what this round exists for.** Rewriting the prune
+        // below to `build_output_dir(root, &path)` -- the exact circularity
+        // the paragraph above warns against -- SURVIVED the whole suite in
+        // BOTH configurations at `0cd9fe0`, because with the prune intact it
+        // changes nothing: the predicate and the list agree. It is not a
+        // behavioural mutant on its own. It is a mutant that BLINDS this
+        // control, and measured on top of it:
+        //
+        // * a third `BUILD_OUTPUT_DIRS` entry naming `.github`, or
+        //   `.github/workflows`, SURVIVED in both configurations with nothing
+        //   firing -- and `.github/workflows/release.yml` is a TRACKED file
+        //   that silently stops being scanned. With the prune intact those
+        //   same two are KILLED in both configurations, by
+        //   `no_source_file_in_this_crate_contains_the_assembled_probe`
+        //   alone, one failing test. So the deletion IS observable and this
+        //   control was its SOLE observer.
+        // * the `deskwarden/installer` term was killed only by the
+        //   `ends_with("installer")` clause below -- a hardcoded NAME, the
+        //   same positional species this module keeps relapsing into -- and
+        //   deleting that clause is itself a survivor, so the three-edit
+        //   combination `build_output_dir` prune + dropped name clause +
+        //   `installer` term was green in both configurations.
+        //
+        // So the enumeration is no longer trusted on its own word. There are
+        // two of them: `directories` below, pruned by the literals written
+        // here, and `every_directory`, which takes **no predicate at all and
+        // prunes nothing** -- `target/` and the sibling worktrees included.
+        // The pruned set must equal the unpruned set minus exactly the two
+        // literals' subtrees and the subtrees of the repositories the pruned
+        // walk RECORDED. Nothing in `every_directory` can be widened, because
+        // there is nothing in it to widen; a prune that deletes a directory
+        // the tree really has now disagrees with a second enumeration that
+        // never consulted a predicate to begin with.
+        //
+        // Recording the refusals rather than dropping them is the other half,
+        // and it is what closes the second-order version: dropping
+        // `nested_repository_shape` from the prune was ALSO a survivor at
+        // `0cd9fe0` -- inert in a `git archive` export, which has no nested
+        // repositories, but live on the real checkout, where
+        // `.claude/worktrees/` holds two. Because the refusals are subtracted
+        // by the paths the pruned walk actually recorded, widening the prune
+        // without recording is now a set difference.
+        //
+        // Cost, measured on the real checkout: 2,083 directories in the
+        // unpruned enumeration, under two seconds, because it reads no file's
+        // bytes -- the two-minute figure elsewhere in this module is the cost
+        // of READING 6,178 files, not of listing directories.
         let literals = [root.join("target"), root.join("deskwarden").join("target")];
+        // `root` is carried and unused by the prune ON PURPOSE: the mutation
+        // this control exists to survive is `build_output_dir(root, &path)`
+        // in place of the literals below, and a signature that made that
+        // mutation fail to COMPILE would be a defence by accident -- it would
+        // hide whether the two enumerations below actually catch it.
         fn directories(
             root: &std::path::Path,
             dir: &std::path::Path,
             literals: &[std::path::PathBuf; 2],
             out: &mut Vec<std::path::PathBuf>,
+            refused: &mut Vec<std::path::PathBuf>,
         ) {
+            debug_assert!(dir.starts_with(root), "the enumeration left the tree");
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
             };
@@ -7508,18 +7587,40 @@ pub(crate) mod password_lifetime_tests {
                     continue;
                 }
                 // Pruned by the literals this test states, never by the
-                // predicate it is measuring, and at the repository shapes the
-                // rest of this module refuses -- a live sibling worktree holds
-                // its own `target/` and is not this tree's to enumerate.
-                if literals.iter().any(|l| *l == path) || nested_repository_shape(&path) {
+                // predicate it is measuring.
+                if literals.iter().any(|l| *l == path) {
+                    continue;
+                }
+                // And at the repository shapes the rest of this module
+                // refuses -- a live sibling worktree holds its own `target/`
+                // and is not this tree's to enumerate. NAMED, not dropped:
+                // the count below subtracts exactly these paths, so widening
+                // this predicate cannot shrink both sides together.
+                if nested_repository_shape(&path) {
+                    refused.push(path);
                     continue;
                 }
                 out.push(path.clone());
-                directories(root, &path, literals, out);
+                directories(root, &path, literals, out, refused);
+            }
+        }
+        // No predicate, no prune, nothing to widen. The second opinion.
+        fn every_directory(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                    continue;
+                }
+                out.push(path.clone());
+                every_directory(&path, out);
             }
         }
         let mut reached: Vec<std::path::PathBuf> = Vec::new();
-        directories(&root, &root, &literals, &mut reached);
+        let mut refused_dirs: Vec<std::path::PathBuf> = Vec::new();
+        directories(&root, &root, &literals, &mut reached, &mut refused_dirs);
         let excluded: Vec<&std::path::PathBuf> =
             reached.iter().filter(|d| build_output_dir(&root, d)).collect();
         assert!(
@@ -7541,15 +7642,140 @@ pub(crate) mod password_lifetime_tests {
              the emptiness asserted above is emptiness for the wrong reason -- a predicate \
              that never fires excludes nothing and also polices nothing"
         );
+        // **The floor.** Named directories the enumeration must have reached,
+        // each asserted to EXIST first so the floor cannot pass by naming
+        // nothing. This half is positional and says so -- it is a floor, not
+        // the pin -- but a floor is what makes a blinded enumeration loud at
+        // the four places where a deletion costs tracked files.
+        for floor in [
+            std::path::Path::new(".github").to_path_buf(),
+            std::path::Path::new(".github").join("workflows"),
+            std::path::Path::new("deskwarden").join("installer"),
+            std::path::Path::new("deskwarden").join("src"),
+            std::path::Path::new("docs").to_path_buf(),
+        ] {
+            let want = root.join(&floor);
+            assert!(
+                want.is_dir(),
+                "control: `{}` is not a directory of this tree, so the floor below is a floor \
+                 over something that is not here -- it passes by naming nothing",
+                floor.display()
+            );
+            assert!(
+                reached.contains(&want),
+                "the directory enumeration did not reach `{}`, so the closed statement above \
+                 ran over a tree that already had that subtree deleted from it. This is the \
+                 shape a circular prune has: rewrite the prune to `build_output_dir` and the \
+                 mutated exclusion deletes the very directory that would have reported it",
+                floor.display()
+            );
+        }
+
+        // **The pin: non-circularity, by a second enumeration that takes no
+        // predicate.** `every_directory` prunes nothing. The pruned walk must
+        // equal it minus exactly the two literals' subtrees and the subtrees
+        // of the repositories the pruned walk RECORDED -- both subtractions
+        // by path prefix over paths, never by asking a predicate. A prune
+        // rewritten to `build_output_dir` agrees with this while
+        // `BUILD_OUTPUT_DIRS` is the two literals and disagrees the moment it
+        // is not, which is the whole of what "circular" meant.
+        let mut all: Vec<std::path::PathBuf> = Vec::new();
+        every_directory(&root, &mut all);
         assert!(
-            reached.len() > 10
-                && reached.iter().any(|d| d.ends_with("installer"))
-                && reached.iter().any(|d| d.ends_with("src")),
-            "control: the directory enumeration reached {} director(ies) and did not find both \
-             `deskwarden/installer` and a `src`, so the check above ran over a tree it never \
-             walked. `installer` in particular is the directory whose disappearance this \
-             control exists to notice",
+            all.len() >= reached.len() && all.len() > 10,
+            "control: the unpruned enumeration found {} director(ies) against the pruned \
+             walk's {}, so it did not walk this tree and the equality below is an equality \
+             between two things that are both empty",
+            all.len(),
             reached.len()
+        );
+        let expected: std::collections::BTreeSet<&std::path::PathBuf> = all
+            .iter()
+            .filter(|d| {
+                !literals.iter().any(|l| d.starts_with(l))
+                    && !refused_dirs.iter().any(|r| d.starts_with(r))
+            })
+            .collect();
+        assert_eq!(
+            reached.iter().collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "the pruned directory enumeration ({} director(ies)) is not the unpruned one ({} \
+             of {}) minus the two literals {:?} and the {} recorded nested repositor(y/ies) \
+             {:?}. A directory missing from the left is a subtree this control can no longer \
+             see, and a prune that cannot see a subtree cannot notice the exclusion growing \
+             into it -- which is exactly how a third `BUILD_OUTPUT_DIRS` entry naming \
+             `.github/workflows`, deleting a tracked file from the probe scan, survived in \
+             both configurations once the prune was made to consult the predicate under test",
+            reached.len(),
+            expected.len(),
+            all.len(),
+            literals,
+            refused_dirs.len(),
+            refused_dirs
+        );
+        // **A third opinion, and the only one that comes from outside this
+        // file at all: `git ls-files`, raw.** Both enumerations above are
+        // written here, so a forgery that teaches BOTH of them the predicate
+        // under test still agrees with itself -- measured: with
+        // `every_directory` given the same `build_output_dir` prune, a third
+        // entry naming `deskwarden/src/vault_window` SURVIVED. That is three
+        // coordinated edits rather than one, but it is the residual, and this
+        // closes it wherever git can answer: every directory holding a
+        // TRACKED file, minus the two literals, must have been reached. The
+        // listing consults no predicate of ours and is not the one
+        // [`tracked_files`] filters.
+        //
+        // It runs in the git configuration only, and that is stated rather
+        // than hidden: a `git archive` export has no repository to ask, and
+        // there the two enumerations above are the whole of the pin.
+        let raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "-z"])
+            .output();
+        if let Some(listed) = raw.ok().filter(|o| o.status.success()) {
+            let mut tracked_dirs: std::collections::BTreeSet<std::path::PathBuf> =
+                std::collections::BTreeSet::new();
+            for rel in listed.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+                let mut at = root.join(String::from_utf8_lossy(rel).as_ref());
+                while let Some(parent) = at.parent().map(|p| p.to_path_buf()) {
+                    if parent == root || !parent.starts_with(&root) {
+                        break;
+                    }
+                    tracked_dirs.insert(parent.clone());
+                    at = parent;
+                }
+            }
+            let missing: Vec<&std::path::PathBuf> = tracked_dirs
+                .iter()
+                .filter(|d| !literals.iter().any(|l| d.starts_with(l)))
+                .filter(|d| !reached.contains(*d))
+                .collect();
+            assert!(
+                tracked_dirs.len() > 10,
+                "control: `git ls-files` named {} director(ies) of tracked files, so the check \
+                 below is a check over nothing",
+                tracked_dirs.len()
+            );
+            assert!(
+                missing.is_empty(),
+                "{} director(ies) holding TRACKED files were never reached by the enumeration \
+                 above, the first of them {:?}. git is the one listing in this test that no \
+                 edit here can teach a predicate to, so this fires even when both enumerations \
+                 above have been taught the same one and agree with each other",
+                missing.len(),
+                missing.first()
+            );
+        }
+
+        assert!(
+            refused_dirs.iter().all(|r| !files.iter().any(|f| f.starts_with(r))),
+            "control: a directory refused as SOMEONE ELSE's repository holds a file this \
+             repository's own listing claims. The subtraction above trusts these paths, so a \
+             `nested_repository_shape` widened to match a directory of this tree would \
+             otherwise shrink both sides of that equality together and go unnoticed -- the \
+             second-order form of the circular prune. Refused: {:?}",
+            refused_dirs
         );
 
         // **Three needles over the same bytes, and no encoding DECISION.**
