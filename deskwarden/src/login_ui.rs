@@ -6291,13 +6291,23 @@ pub(crate) mod password_lifetime_tests {
                 continue;
             }
             // Tracked content is this repository's by definition, and git
-            // has already decided that -- so a tracked path passes through
-            // NO directory filter here, and no marker planted beside it can
-            // take it out of scope. An untracked path has had only
-            // `.gitignore` applied to it, which does not know about a
-            // nested bare repository, so it gets the same repository-shape
-            // test the fallback walk uses -- and, as there, the answer is
-            // to REFUSE and say so, not to drop the file in silence.
+            // has already decided that -- so no PLANTED MARKER beside a
+            // tracked path can take it out of scope: the repository-shape
+            // test below runs on untracked entries only. An untracked path
+            // has had only `.gitignore` applied to it, which does not know
+            // about a nested bare repository, so it gets the same
+            // repository-shape test the fallback walk uses -- and, as
+            // there, the answer is to REFUSE and say so, not to drop the
+            // file in silence.
+            //
+            // This paragraph used to say a tracked path passes through NO
+            // directory filter here at all. That stopped being true fifty
+            // lines below, in the same `for` body, and the sentence was
+            // left standing above the change that falsified it -- the same
+            // failure mode as the `.gitignore` justification this round
+            // deleted, a comment outliving the code it described. The
+            // filter a tracked path DOES pass through is the literal build
+            // output one, and only that one:
             //
             // **Build output IS this filter's business, on tracked entries
             // too.** The previous round asserted the opposite -- ".gitignore
@@ -6347,14 +6357,19 @@ pub(crate) mod password_lifetime_tests {
             // the fallback refuses it and fails. Measured. This repository
             // has no submodules, so the pin for it would have to be built
             // rather than observed; it belongs with the shape pin below.
-            if path
-                .ancestors()
-                .skip(1)
-                .take_while(|a| *a != root)
-                .any(|a| build_output_dir(root, a))
-            {
-                continue;
-            }
+            //
+            // **Order matters, and it is REFUSE-before-SKIP.** The build
+            // output test used to run first, so an untracked entry under a
+            // nested repository that happened to sit below `target/` was
+            // `continue`d in silence instead of being pushed into
+            // `refused`. That is unreachable today -- `--others
+            // --exclude-standard` obeys `.gitignore`, which names both
+            // `target/` directories, so nothing untracked is ever offered
+            // from under one -- but it is a NEW silent skip inside a fix
+            // whose entire stated purpose is that skips must be loud, and
+            // "unreachable" is what the `.gitignore` justification deleted
+            // above also claimed. The loud answer goes first; the quiet one
+            // only sees what the loud one had nothing to say about.
             if !is_tracked {
                 if let Some(nested) = path
                     .ancestors()
@@ -6367,6 +6382,14 @@ pub(crate) mod password_lifetime_tests {
                     }
                     continue;
                 }
+            }
+            if path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| *a != root)
+                .any(|a| build_output_dir(root, a))
+            {
+                continue;
             }
             listed.push(path);
         }
@@ -6515,6 +6538,11 @@ pub(crate) mod password_lifetime_tests {
         // construction while `.gitignore` -- which the fallback cannot read
         // -- already takes it out on the git path.
         let _ = plant(&root, "target/debug/deskwarden.exe");
+        // And the SECOND literal, which is the one a workspace member's
+        // artifacts land in and which nothing here reached before: the
+        // predicate is a two-term disjunction and the second term was free
+        // to delete. Neither of these may appear in `found` below.
+        let _ = plant(&root, "deskwarden/target/debug/deskwarden.exe");
 
         // And one ordinary file, which is the control: a walk that refuses
         // everything satisfies the assertions above and measures nothing.
@@ -6567,7 +6595,19 @@ pub(crate) mod password_lifetime_tests {
              crate's own `.exe` as a violation of its own source -- and reads 6,178 files \
              getting there"
         );
-        for kept in ["buildout", "src", "docs"] {
+        assert!(
+            build_output_dir(&root, &root.join("deskwarden").join("target")),
+            "control: the SECOND literal of the disjunction is gone. On a workspace checkout \
+             this crate's artifacts land in `deskwarden/target/`, not in `root/target/`, so \
+             deleting this term is what the measurements above were actually taken against"
+        );
+        // `docs/target` is the one that catches a NAME match. Measured: with
+        // the predicate rewritten to `dir.file_name() == Some("target")` the
+        // whole suite stayed green without it -- and a name match is exactly
+        // the directory-level opt-out this module removed, `mkdir target`
+        // anywhere in the tree deleting a subtree from the scan.
+        for kept in ["buildout", "src", "docs", "docs/target", "deskwarden", "deskwarden/targeted"]
+        {
             assert!(
                 !build_output_dir(&root, &root.join(kept)),
                 "control: `{kept}` was taken for Cargo build output, so the exclusion above is \
@@ -6773,6 +6813,42 @@ pub(crate) mod password_lifetime_tests {
         // `.gitignore` DOES name never reach here at all.
         let tag = write("buildout/CACHEDIR.TAG", "Signature: 8a477f597d28d172");
         let rlib = write("buildout/deskwarden.rlib", "// listed and scanned");
+        // **Build output that is TRACKED.** This is the claim the change it
+        // pins shipped with zero assertions behind it. `.gitignore` governs
+        // `--others`, not `git ls-files`, so a force-added file under either
+        // `target/` is tracked and IS offered here -- and if it is not
+        // filtered, the git path FAILS on bytes the fallback (the
+        // release-tarball configuration, which `git archive` ships that same
+        // file into) never even lists. The two configurations then return
+        // OPPOSITE verdicts on identical bytes, with the silent one shipping.
+        // Both literal paths are covered, because the predicate is a
+        // two-term disjunction and one term is free to be deleted.
+        let forced_root = write("target/forced.rs", "// force-added under the root `target/`");
+        assert!(git(&root, &["add", "-f", "target/forced.rs"]), "the forced root add ran");
+        let forced_crate =
+            write("deskwarden/target/forced.rs", "// force-added under the crate `target/`");
+        assert!(
+            git(&root, &["add", "-f", "deskwarden/target/forced.rs"]),
+            "the forced crate add ran"
+        );
+        // The control on both, and it is what keeps the two assertions above
+        // from being satisfied by a filter that drops everything tracked, or
+        // by one that matches the NAME `target` at any depth -- which would
+        // make `mkdir target` the directory-level opt-out this module has
+        // spent three rounds removing. A tracked sibling whose path merely
+        // starts with the same letters stays listed.
+        let kept_sibling = write("deskwarden/targeted/keep.rs", "// beside `target/`, not under it");
+        assert!(
+            git(&root, &["add", "-f", "deskwarden/targeted/keep.rs"]),
+            "the sibling add ran"
+        );
+        // And the second control, which is the one that catches a NAME
+        // match rather than the two literal paths. `docs/target/` is not
+        // Cargo's build directory for anything and stays in scope; the
+        // divergence from `.gitignore`'s UNANCHORED `target/` is disclosed
+        // in `tracked_files` and runs the loud way, so the git path listing
+        // this file is the intended behaviour, not the residual hole.
+        let kept_depth = write("docs/target/notes.rs", "// a directory named `target`, not one");
 
         let mut refused: Vec<std::path::PathBuf> = Vec::new();
         let listed: std::collections::BTreeSet<std::path::PathBuf> =
@@ -6790,9 +6866,35 @@ pub(crate) mod password_lifetime_tests {
             untracked_three,
             tag,
             rlib,
+            kept_sibling.clone(),
+            kept_depth.clone(),
         ]
         .into_iter()
         .collect();
+        for forced in [&forced_root, &forced_crate] {
+            assert!(
+                !listed.contains(forced),
+                "`tracked_files` listed {forced:?}, a TRACKED file under Cargo's build \
+                 directory. `.gitignore` names both `target/` directories but governs \
+                 `--others` only, so `git ls-files` offers this path and the git path scans \
+                 it -- while the fallback, which is the configuration a release tarball runs \
+                 in, never lists it. The two paths then disagree on identical bytes and the \
+                 quiet one is the one that ships. Deleting the ancestor test in \
+                 `tracked_files` is what puts it back."
+            );
+        }
+        assert!(
+            listed.contains(&kept_depth),
+            "control: `tracked_files` dropped {kept_depth:?}. The two assertions above are              then satisfied by a predicate matching the NAME `target` at any depth instead of              the two literal paths, which is the one-command directory opt-out this module              spent three rounds removing -- `mkdir target` beside any file and it is gone."
+        );
+        assert!(
+            listed.contains(&kept_sibling),
+            "control: `tracked_files` dropped {kept_sibling:?}, which is a tracked source file \
+             beside `target/` and not under it. The two assertions above are then satisfied by \
+             a filter that drops tracked files wholesale, or by one matching the NAME `target` \
+             rather than the two literal paths -- and a name match makes `mkdir target` \
+             anywhere in the tree the one-command directory opt-out this module removed."
+        );
         assert_eq!(
             listed, expected,
             "`tracked_files` did not name exactly the files this repository owns. An entry              missing from the left is a file the probe scan no longer polices -- an untracked              source under `src/` is the one this round added. An extra entry is another              repository's or a build output's bytes being reported as this tree's, which is              the false positive the git bound was introduced to remove"
@@ -7101,7 +7203,8 @@ pub(crate) mod password_lifetime_tests {
             probe_utf16le.len() == PROBE.len() * 2
                 && probe_utf16be.len() == PROBE.len() * 2
                 && probe_utf16le != probe_utf16be
-                && probe_utf16le != PROBE.as_bytes(),
+                && probe_utf16le != PROBE.as_bytes()
+                && probe_utf16be != PROBE.as_bytes(),
             "control: the UTF-16 transcodings of the probe are not two distinct non-empty \
              needles, so the two extra passes below are not two extra passes"
         );
