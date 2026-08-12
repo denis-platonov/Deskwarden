@@ -5212,8 +5212,9 @@ pub(crate) mod password_lifetime_tests {
         // That was answered TWICE, and only one of the two answers was a fix.
         // [`PROBE`] is assembled by `concat!`, so no file in this tree contains
         // it and a source reader allocates no probe at all -- pinned by
-        // `no_source_file_in_this_crate_contains_the_assembled_probe`, over the
-        // whole tree and not over a list. On top of that, this store used to be
+        // `no_source_file_in_this_crate_contains_the_assembled_probe`, over
+        // every file this repository tracks rather than over a hand-kept list
+        // of names. On top of that, this store used to be
         // filtered to "threads the window can speak for": the arming thread, and
         // threads whose first visit to this allocator postdated the window.
         //
@@ -6009,31 +6010,88 @@ pub(crate) mod password_lifetime_tests {
     /// this module exists to catch. `build.rs`, `examples/`, `installer/`,
     /// `docs/`, the `*.md` files, `Cargo.lock`, `.github/` and `.claude/` are
     /// all read by something at some point, and a probe pasted into any of them
-    /// is a probe a test can allocate. So the walk starts at the repository
-    /// root and reads BYTES rather than text, so that a binary -- the
-    /// installers in `installer/` are two of them -- is scanned rather than
-    /// skipped by a `read_to_string` that would fail on it.
+    /// is a probe a test can allocate. So the scan covers the whole repository
+    /// and reads BYTES rather than text, so that a binary -- the installers in
+    /// `installer/` are two of them -- is scanned rather than skipped by a
+    /// `read_to_string` that would fail on it.
     ///
-    /// Exactly three directories are skipped, by name, and none of them for
-    /// convenience: `target/` is build output and contains this crate's own
-    /// rlib, which of course carries the assembled probe because that is what
-    /// compiling a `concat!` produces; `.git/` is the same content again in
-    /// packed form; `.superpowers/` is gitignored scratch that is not part of
-    /// this tree at all. A blanket "skip dot directories" would have taken
-    /// `.github/` and `.claude/` with them, which are neither.
+    /// **And "the repository" means the files this repository OWNS, which is
+    /// `git ls-files` and not `read_dir` from the root.** This used to walk the
+    /// directory tree and skip three names -- `target/`, `.git/`,
+    /// `.superpowers/` -- while explicitly refusing a blanket dot-directory
+    /// skip on the grounds that it "would have taken `.github/` and `.claude/`
+    /// with them, which are neither". `.claude/` is exactly the problem. On
+    /// this user's checkout `.claude/worktrees/` holds four sibling git
+    /// worktrees belonging to other agents, two of them parked on commits that
+    /// predate the `concat!` split -- so the walk read another checkout's
+    /// `login_ui.rs`, found the probe in it as a single literal, and failed
+    /// this test 6 runs out of 6. Nothing was wrong with THIS tree.
     ///
-    /// Three controls: the file count, this file being reached, and at least
-    /// one NON-`.rs` file being reached -- without the third, a walk that had
-    /// quietly gone back to `src/**/*.rs` would satisfy the other two.
+    /// A fourth skip name would have been the fourth widening of a filter, and
+    /// this module's whole thesis is that a filter on the verdict cannot
+    /// distinguish "not ours" from "ours, elsewhere". So the producer is
+    /// removed instead: the list is what `git ls-files` says this repository
+    /// tracks. Build output, `.git/` in any of its forms, gitignored scratch,
+    /// and every nested worktree are then not skipped -- they were never in
+    /// the list. Three further hazards close with it:
+    ///
+    /// * `read_dir(..).expect(..)` and `fs::read(..).expect(..)` panicked on
+    ///   any locked or permission-denied file. Concurrent agents building
+    ///   in-tree produce those.
+    /// * An agent that points `CARGO_TARGET_DIR` at an in-repo directory NOT
+    ///   literally named `target` planted this crate's own rlib -- which of
+    ///   course carries the assembled probe, because that is what compiling a
+    ///   `concat!` produces -- inside the walk.
+    /// * In a worktree `.git` is a **file**, not a directory, so the `is_dir`
+    ///   skip did not fire on it and it was read rather than skipped.
+    ///
+    /// If `git` cannot be run at all (an unpacked source tarball, a build
+    /// sandbox with no `git`), the test falls back to the directory walk with
+    /// nested worktrees skipped explicitly -- a directory holding a `.git`
+    /// **file** rather than a `.git` directory is a worktree. The tradeoff is
+    /// stated rather than hidden: in that mode an in-repo `CARGO_TARGET_DIR`
+    /// under another name is still in scope, and a gitignored file that has
+    /// nothing to do with this repository is still scanned. The fallback is
+    /// strictly the weaker instrument; it exists so the test does not become
+    /// vacuous off a git checkout, not because it is equivalent.
+    ///
+    /// **And this test takes [`PROBE_LOCK`] before it reads anything.** It is
+    /// the largest reader of bytes in the crate and it arms nothing, so on any
+    /// tree where a violation *does* exist it allocates and -- during the
+    /// unwind of its own assertion -- frees probe-bearing blocks on a bare
+    /// libtest thread while another probe test may be armed. That is the exact
+    /// original flake shape, and it would have been reintroduced by the fix
+    /// for it. [`hold_the_probe_lock`] is the documented hatch for a test that
+    /// touches probe plaintext without arming; this is one.
+    ///
+    /// Four controls: the file count, this file being reached, at least one
+    /// NON-`.rs` file being reached -- without which a list that had quietly
+    /// gone back to `src/**/*.rs` would satisfy the other two -- and at least
+    /// one file outside the crate directory.
     #[test]
     fn no_source_file_in_this_crate_contains_the_assembled_probe() {
+        // Before a single byte is read: this test allocates the probe whenever
+        // the property it checks is violated, and it never arms. See the doc.
+        hold_the_probe_lock();
+
+        /// The fallback, used only when `git` cannot be run. Skips nested
+        /// worktrees (a `.git` *file*, not directory) and unreadable
+        /// directories rather than panicking on them.
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("the source tree is readable") {
-                let path = entry.expect("the entry is readable").path();
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 if path.is_dir() {
-                    // The three, and only the three, named in this test's doc.
                     if matches!(name.as_str(), "target" | ".git" | ".superpowers") {
+                        continue;
+                    }
+                    // A directory holding a `.git` FILE is a sibling worktree:
+                    // another checkout of this repository, at whatever commit
+                    // that agent is parked on. Not this tree's content.
+                    if path.join(".git").is_file() {
                         continue;
                     }
                     walk(&path, out);
@@ -6043,12 +6101,42 @@ pub(crate) mod password_lifetime_tests {
             }
         }
 
+        /// The files this repository tracks, as absolute paths, or `None` if
+        /// `git` could not be run or reported failure.
+        fn tracked_files(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-files", "-z"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let listed: Vec<std::path::PathBuf> = out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| root.join(String::from_utf8_lossy(s).as_ref()))
+                // A tracked path can be absent from the working tree (deleted
+                // but not yet staged). Nothing to scan, and not this test's
+                // business to complain about.
+                .filter(|p| p.is_file())
+                .collect();
+            // An empty listing means this is not a checkout of anything, which
+            // is the fallback's case and not a pass.
+            (!listed.is_empty()).then_some(listed)
+        }
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("the crate has a parent directory")
             .to_path_buf();
-        let mut files = Vec::new();
-        walk(&root, &mut files);
+        let files = tracked_files(&root).unwrap_or_else(|| {
+            let mut files = Vec::new();
+            walk(&root, &mut files);
+            files
+        });
         assert!(
             files.len() > 30,
             "control: the walk found only {} files, so the check below is a check over nothing",
@@ -6072,11 +6160,22 @@ pub(crate) mod password_lifetime_tests {
              name says the whole tree"
         );
 
+        let mut read = 0usize;
+        let mut read_this_file = false;
         for file in &files {
             // Bytes, not text: an installer or any other non-UTF-8 file must be
             // scanned rather than skipped. The buffer is dropped before the next
             // read, so this test's own footprint is one file at a time.
-            let bytes = std::fs::read(file).expect("a file in this tree is readable");
+            //
+            // A read that FAILS is skipped rather than panicked on: a tracked
+            // file can be momentarily locked by an editor, an antivirus, or a
+            // concurrent build. The two counters below are what stops that
+            // tolerance from turning the whole check into a silent pass.
+            let Ok(bytes) = std::fs::read(file) else {
+                continue;
+            };
+            read += 1;
+            read_this_file |= file.ends_with("login_ui.rs");
             assert!(
                 !bytes.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()),
                 "{} contains the assembled probe. Any test that reads this tree back now \
@@ -6087,6 +6186,20 @@ pub(crate) mod password_lifetime_tests {
                 file.display()
             );
         }
+        // The controls above are over the LIST. These two are over what was
+        // actually opened, so a tree in which every read failed -- or in which
+        // only this file's read did -- is a failure and not a green run.
+        assert!(
+            read > 30,
+            "control: only {read} of the {} listed files could be read, so the check above is a \
+             check over nothing",
+            files.len()
+        );
+        assert!(
+            read_this_file,
+            "control: the file that declares the probe was listed but could not be read, so the \
+             one file this test exists to police was not policed"
+        );
     }
 
     /// A heap copy of [`PROBE`], built *before* any watch is armed so that the
