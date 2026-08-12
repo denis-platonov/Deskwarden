@@ -129,6 +129,32 @@ pub struct Account {
     pub server_url: Option<String>,
 }
 
+/// One switchable account, as an [`AccountsState`], for the windows' tests.
+///
+/// **Here rather than in the window that wants it**, because
+/// `no_window_answers_may_i_switch_for_itself` forbids `vault_window/mod.rs`
+/// and four of its siblings from naming `MultiAccountAvailability` at all --
+/// and that guard is right: whether this process may switch accounts is this
+/// module's answer and nothing else's. A test fixture that named the enum in
+/// one of those files would weaken a guard rather than satisfy it, so the
+/// fixture lives on this side of the line and the window's test asks for a
+/// state rather than deciding what one should say.
+#[cfg(test)]
+pub(crate) fn one_available_account(email: &str) -> AccountsState {
+    let account = Account {
+        id: AccountId::generate(),
+        email: email.to_string(),
+        server_url: None,
+    };
+    let active = account.id.clone();
+    AccountsState::new(
+        crate::bw_path::MultiAccountAvailability::Available,
+        vec![account],
+        active,
+    )
+    .expect("one account is one account")
+}
+
 /// `<config_dir>\accounts` — the one directory every account lives under.
 pub fn accounts_root(config_dir: &Path) -> PathBuf {
     config_dir.join("accounts")

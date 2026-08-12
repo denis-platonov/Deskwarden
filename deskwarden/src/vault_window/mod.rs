@@ -517,6 +517,7 @@ pub fn build_frame(
     // would spawn a process. Behind the seam it is a `fn` pointer like the
     // other two, and `frame_promptness` hands one that answers instead.
     let spawn_send_list = env.send_list;
+    let spawn_export = env.export;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -802,10 +803,13 @@ pub fn build_frame(
     // the drain, so a second click while one is in flight starts no second
     // `bw` -- two exports racing on one destination is two processes writing
     // one `.dw-partial`.
-    let mut export_in_flight = false;
-    // The last report, until the user dismisses it. `None` is "nothing to
-    // say", which is also what a cancelled dialog leaves behind.
-    let mut export_report: Option<ExportReport> = None;
+    // Both facts live in ONE value for `SendDeleteState`'s reason: the rules
+    // that relate them -- a click is refused while one is in flight, the
+    // previous report goes with the new click, the flag is cleared by the
+    // drain and by nothing else -- are rules no test in this crate could run
+    // if they were written as `if`s between panels. They live in
+    // `apply_export_action` and `drain_export`, which are plain functions.
+    let mut export = ExportState::default();
     // One revoke reporting back. The whole of it -- the `bw send delete`
     // child included -- happens on the worker thread
     // `send_delete_thread::spawn_send_delete` starts, so nothing here waits.
@@ -1344,15 +1348,10 @@ pub fn build_frame(
             }
         }
 
-        // The export reporting back. `try_recv`, like every other drain here,
-        // and `export_in_flight` is cleared FIRST for the reason the Sends
-        // drain gives: the thread that set the flag has finished, whatever
-        // became of its answer.
-        if let Ok(report) = export_rx.try_recv() {
-            export_in_flight = false;
-            log::info!("vault export finished: {report:?}");
-            export_report = Some(report);
-        }
+        // The export reporting back. The whole of the decision -- clear the
+        // flag, keep the report -- is `drain_export`, a plain function, for
+        // `drain_send_delete`'s reason.
+        drain_export(&export_rx, &mut export);
 
         // The revoke reporting back. `try_recv`, like every other drain here;
         // the whole of the decision -- clear the flag, decide whether the
@@ -1514,6 +1513,13 @@ pub fn build_frame(
         // it would silently become their ambient `item_spacing.y` too (they
         // don't set their own), collapsing the vertical gap between e.g. the
         // sidebar's VAULT/FOLDERS rows.
+        // **The account menu's answer, brought out to the frame closure's own
+        // top level.** Four of the five rows are still applied inside the
+        // chrome closure, where the `RefCell`s they write live; the fifth --
+        // Export, the only one that STARTS something -- is applied out here by
+        // `apply_export_action`, because a `match` arm is a thing a guard arm
+        // can silently disable and a call at a pinned brace depth is not.
+        let mut account_action: Option<AccountAction> = None;
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
         match draw_window_chrome_with_extra(
@@ -1596,7 +1602,13 @@ pub fn build_frame(
                 // this menu. `CTRL+L` still works -- it is handled by the key
                 // check a few lines below, which never went through the pill --
                 // and its hint rides the menu row so it stays discoverable.
-                match account_menu(
+                // **Recorded rather than matched here.** The Export row's
+                // decision is `apply_export_action`, called at the frame
+                // closure's own top level -- see that function's doc for the
+                // measured defeat that shape exists to answer. The four rows
+                // below still end in this closure because each of them writes
+                // a `RefCell` this closure owns and then closes the window.
+                account_action = account_menu(
                     ui,
                     accounts.as_ref(),
                     // Empty until the details land, and empty rather than
@@ -1614,14 +1626,15 @@ pub fn build_frame(
                     // this window already has exactly one name for that
                     // distinction.
                     icon_base_known,
-                ) {
+                );
+                match &account_action {
                     // The gear's two-step dance, for the same reason and one more:
                     // `main` cannot tear this account's backend down and bring the
                     // other one up while this window owns the event loop, and the
                     // master-password prompt the switch may raise is itself
                     // another eframe window on this same thread.
                     Some(AccountAction::Switch(picked)) => {
-                        *switch_to_for_closure.borrow_mut() = Some(picked);
+                        *switch_to_for_closure.borrow_mut() = Some(picked.clone());
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     // **The `locked` flag the pill used to set**, not a path of
@@ -1645,34 +1658,14 @@ pub fn build_frame(
                         *remove_account_for_closure.borrow_mut() = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    // **The one row that stays**, and the one that starts work
-                    // rather than recording a request -- see
-                    // `AccountAction::Export`. Nothing on this line blocks:
-                    // `spawn_export` is a `std::thread::spawn` and returns
-                    // immediately, and both of the waits (the shell's modal
-                    // save dialog and the `bw export` child) happen on the
-                    // thread it starts.
-                    Some(AccountAction::Export) => {
-                        if !export_in_flight {
-                            export_in_flight = true;
-                            // The previous report goes with the new click: a
-                            // banner from the last export sitting over this
-                            // one's would be answering a question the user has
-                            // already moved past.
-                            export_report = None;
-                            export_thread::spawn_export(
-                                ui.ctx().clone(),
-                                export_tx.clone(),
-                                // The window's own session, cloned per export
-                                // into a `Zeroizing` the exporting thread
-                                // drops -- so the token never outlives the one
-                                // `bw export` it authenticates. It reaches the
-                                // child in `BW_SESSION` and never in argv.
-                                session_token.clone(),
-                            );
-                        }
-                    }
-                    None => {}
+                    // **The Export row has no arm here, and that is the whole
+                    // point.** It is the one row that starts work rather than
+                    // recording a request, and a `match` arm is precisely what
+                    // a guard arm inserted above it can silently disable with
+                    // no compiler warning and a green suite. The decision is
+                    // `apply_export_action`, below, and there is no arm here to
+                    // shadow.
+                    Some(AccountAction::Export) | None => {}
                 }
                 // Manual sync: this app has nowhere that auto-syncs on a timer
                 // (see `main()`'s own single startup-time `bw sync` -- everything
@@ -1770,6 +1763,21 @@ pub fn build_frame(
         // visit finds `result` already `None` and asks straight away; the
         // order is pinned by `leaving_the_sends_screen_invalidates_the_list`.
         send_fetch.note_screen(on_sends);
+        // **The Export row's whole decision**, applied out here rather than in
+        // the chrome closure for `apply_send_action`'s reason, and there is no
+        // `match` on `account_action` on this line, deliberately: a source-text
+        // equality over a `match` arm pins the arm's CONTENTS and says nothing
+        // about whether the arm is REACHED. What is left here is one
+        // unconditional statement whose brace depth is itself pinned against
+        // `send_fetch.note_screen(on_sends);` above.
+        apply_export_action(
+            account_action.as_ref(),
+            &mut export,
+            ui.ctx(),
+            &export_tx,
+            &session_token,
+            spawn_export,
+        );
         let body = vault_body_state(
             vault_loading,
             items.is_empty(),
@@ -3398,16 +3406,14 @@ pub fn build_frame(
         // button: the export is a child process that will report either way,
         // and a banner the user can close would leave a `bw` running with
         // nothing on screen accounting for it.
-        if export_in_flight {
+        // `draw_export_report` is handed the REPORT, so the colour is decided
+        // from the report inside it rather than by this line -- see its doc for
+        // the mutant that shape refuses.
+        if export.in_flight {
             draw_export_in_flight(ui.ctx());
-        } else if let Some(report) = &export_report {
-            match export_message(report) {
-                Some((tone, text)) => {
-                    if draw_export_report(ui.ctx(), tone, &text) {
-                        export_report = None;
-                    }
-                }
-                None => export_report = None,
+        } else if let Some(report) = &export.report {
+            if draw_export_report(ui.ctx(), report) {
+                export.report = None;
             }
         }
 
@@ -3563,6 +3569,21 @@ pub struct VaultFrameEnv {
     /// covered by source scanning alone. See
     /// `send_ui::frame_promptness::the_sends_screen_returns_promptly`.
     send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
+    /// `export_thread::spawn_export` in production -- the "Export vault..."
+    /// row's one entry point.
+    ///
+    /// Here so that the row can be OBSERVED AT THE POINT OF EFFECT, which is
+    /// the only thing three rounds of source pins over it established will
+    /// hold. In order: a `contains` over the arm lost THE LINE (`if false
+    /// &&`); a whole-body equality over the arm lost the arm's REACHABILITY
+    /// (a guard arm above it, which draws no rustc warning); and a brace
+    /// depth over the extracted call lost the ARGUMENT'S LIVENESS (a
+    /// shadowing `let account_action = None;` immediately above it, call text
+    /// and depth byte-identical). Each pin was correct about the thing it
+    /// pinned and lost the property one layer out, and a fourth would lose a
+    /// fourth layer. `export_wiring::clicking_the_export_row_really_starts_an_export`
+    /// clicks the row on a real frame and reads what came through here.
+    export: ExportSpawn,
     /// `settings::default_path()` in production. A test hands a path under
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
@@ -3576,6 +3597,7 @@ impl VaultFrameEnv {
             sync: spawn_vault_sync,
             load: spawn_vault_load,
             send_list: send_fetch_thread::spawn_send_list,
+            export: export_thread::spawn_export,
             settings_path: crate::settings::default_path(),
         }
     }
@@ -4849,6 +4871,22 @@ enum ExportReport {
     /// The destination was refused before anything ran. See
     /// [`crate::vault_export::plan_export`].
     Refused(crate::vault_export::ExportRefusal),
+    /// **The exporting thread died before it answered.** A panic anywhere
+    /// under `pick_and_export` -- a COM failure in `file_picker::with_com`,
+    /// an `expect` under `plan_export` or `run_export` -- used to send
+    /// nothing at all, and because `export_tx` lives in the frame and is
+    /// cloned per click the channel never disconnects either, so `try_recv`
+    /// never yielded `Err`, the in-flight flag never cleared, and the
+    /// "Exporting the vault..." card (which has no dismiss button, by
+    /// design) stayed up for the life of the window with no second export
+    /// possible. `spawn_export_with`'s `catch_unwind` turns that into this.
+    ///
+    /// **Ambiguous, and painted as a failure.** The worker may have started
+    /// a `bw export` that really wrote something, and `run_export`'s rename
+    /// is its last step, so a panic before it leaves the user's chosen path
+    /// untouched -- but this side does not know that, and "could not check"
+    /// must never render as success.
+    Interrupted,
     /// An export really ran, and this is what it did.
     Done {
         outcome: crate::vault_export::ExportOutcome,
@@ -4858,6 +4896,38 @@ enum ExportReport {
         /// the dialog has long closed.
         destination: std::path::PathBuf,
     },
+}
+
+impl ExportReport {
+    /// This report's SHAPE, for the log, with nothing the CLI wrote in it.
+    ///
+    /// `{self:?}` would put `ExportOutcome::Failed`'s payload -- `bw`'s own
+    /// stderr, trimmed -- verbatim onto the info channel. `bw` is not known
+    /// to echo `BW_SESSION`, so this is a small hole, but it is a
+    /// non-redacting `Debug` over text this process did not write, and the
+    /// destination path is a path the user chose. Neither belongs in a log
+    /// line whose whole job is to say which of six things happened.
+    fn log_shape(&self) -> &'static str {
+        match self {
+            ExportReport::Cancelled => "cancelled",
+            ExportReport::Interrupted => "interrupted",
+            ExportReport::Refused(crate::vault_export::ExportRefusal::NoDirectory) => {
+                "refused: no directory"
+            }
+            ExportReport::Refused(crate::vault_export::ExportRefusal::IntoConfigDir) => {
+                "refused: into the config directory"
+            }
+            ExportReport::Refused(crate::vault_export::ExportRefusal::EmptyFileName) => {
+                "refused: no file name"
+            }
+            ExportReport::Done { outcome, .. } => match outcome {
+                crate::vault_export::ExportOutcome::Written => "written",
+                crate::vault_export::ExportOutcome::SessionInvalid => "session invalid",
+                crate::vault_export::ExportOutcome::Failed(_) => "failed",
+                crate::vault_export::ExportOutcome::Unconfirmed => "unconfirmed",
+            },
+        }
+    }
 }
 
 /// How loudly an export report is painted.
@@ -4894,6 +4964,12 @@ fn export_message(report: &ExportReport) -> Option<(ExportTone, String)> {
     let bad = |text: String| Some((ExportTone::Bad, text));
     match report {
         ExportReport::Cancelled => None,
+        ExportReport::Interrupted => bad(
+            "The vault export stopped unexpectedly, so Deskwarden cannot tell whether \
+             anything was written. Treat this as a failed backup, check the folder you \
+             chose, and try again."
+                .to_string(),
+        ),
         ExportReport::Refused(ExportRefusal::NoDirectory) => bad(
             "That destination names no folder to write into. Choose a folder and a file name."
                 .to_string(),
@@ -4934,10 +5010,29 @@ fn export_message(report: &ExportReport) -> Option<(ExportTone, String)> {
 /// panels the way [`draw_folder_edit_modal`] is, for the one report the frame
 /// is holding.
 ///
-/// Answers `true` when the user dismissed it. Nothing else is decided here --
-/// the words and the colour are [`export_message`]'s, so this function has
-/// nothing in it a test would want to reach.
-fn draw_export_report(ctx: &egui::Context, tone: ExportTone, text: &str) -> bool {
+/// **It is handed the REPORT and not a tone and a string**, which is the
+/// difference between a rendering a test can hold and one it cannot. This
+/// used to take `(tone, text)`, and a reviewer measured what that costs:
+/// forcing the tone to [`ExportTone::Good`] at the CALL SITE -- one word, in
+/// the frame closure, where no test in this crate runs -- painted
+/// `SessionInvalid`, `Failed`, `Unconfirmed` and all three `Refused`
+/// messages in the success colour, at 2154 lib / 217 bin / 0 failed / 0
+/// warnings. Colour is what a user reads before they read a word of it.
+///
+/// The tone is now [`export_message`]'s and is read inside this function, so
+/// there is no tone at the call site to force, and
+/// `export_wiring::a_failed_export_is_never_painted_in_the_success_colour`
+/// reads the glyph colours this really paints.
+///
+/// Answers `true` when the card should go: the user dismissed it, **or**
+/// [`export_message`] had nothing to say about it -- which is
+/// [`ExportReport::Cancelled`] and nothing else. Folding those two into one
+/// answer is what leaves the frame closure with a single `if`.
+fn draw_export_report(ctx: &egui::Context, report: &ExportReport) -> bool {
+    let Some((tone, text)) = export_message(report) else {
+        return true;
+    };
+    let text = text.as_str();
     let mut dismissed = false;
     egui::Area::new(egui::Id::new("vault-export-report"))
         .order(egui::Order::Foreground)
@@ -5015,8 +5110,121 @@ fn draw_export_in_flight(ctx: &egui::Context) {
         });
 }
 
-/// The export channel's sending half. Named because two signatures carry it.
+/// The export channel's sending half. Named because three signatures carry it.
 type ExportSender = mpsc::Sender<ExportReport>;
+
+/// The shape of "start one export off-thread", as a **`fn` pointer**.
+///
+/// A parameter of [`apply_export_action`] rather than a call written inside
+/// it, and a `fn` pointer rather than a closure, for [`SendDeleteSpawn`]'s
+/// reason: it carries no captured state by construction, so the value the
+/// tests drive that function with and the value the frame closure passes are
+/// the same KIND of thing, and the only difference between the production
+/// run and the tested run is which of two `fn` items is named.
+type ExportSpawn = fn(egui::Context, ExportSender, zeroize::Zeroizing<String>);
+
+/// Everything the window holds between frames for the export.
+///
+/// One struct rather than two locals in the frame closure, for
+/// [`SendDeleteState`]'s reason.
+#[derive(Debug, Default)]
+struct ExportState {
+    /// Whether an export is running. Latched by [`apply_export_action`] and
+    /// cleared by [`drain_export`], so a second click while one is in flight
+    /// starts no second `bw` -- two exports racing on one destination is two
+    /// processes writing one `.dw-partial`.
+    in_flight: bool,
+    /// The last report, until the user dismisses it.
+    report: Option<ExportReport>,
+}
+
+/// **The whole of what the account menu's Export row does** -- as one plain
+/// function the tests really run.
+///
+/// This used to be a `match` arm written inline in the chrome closure, and a
+/// reviewer's measurement is why it is not. A source-text equality over an
+/// arm's body pins the arm's CONTENTS and says nothing about whether the arm
+/// is REACHED. The arm was pinned by exactly such an equality, and inserting
+///
+/// ```ignore
+/// Some(AccountAction::Export) if !export_in_flight => {}
+/// ```
+///
+/// above it left the real arm byte-identical, drew **no** unreachable-pattern
+/// warning from rustc -- it is a *guard*, not a duplicate pattern, so the
+/// zero-warnings rule missed it too -- and stopped the row doing anything at
+/// all on a first click, because the real arm then ran only when
+/// `export_in_flight` was already true. Measured: 2154 lib / 217 bin / 0
+/// failed / 0 warnings, and "Export vault..." inert forever. That is the
+/// previously-disclosed `if false &&` survivor reproduced through its own
+/// fix, one line further out, and it is the reason this is a function: there
+/// is no arm here to shadow, because the `match` is inside a function the
+/// tests call.
+///
+/// **The one thing left in the frame closure is the call**, and its
+/// reachability is held by
+/// `export_wiring::the_frame_applies_the_export_action_unconditionally`,
+/// which pins the call's BRACE DEPTH against a known sibling statement -- so
+/// any wrapping `if`, `match` or block that could gate it is one level deeper
+/// than the pin allows and fails. That is a reachability pin and not a
+/// content pin, and it is the answer to the defeat above.
+///
+/// Nothing here blocks. `spawn` is a `std::thread::spawn` and returns at once.
+fn apply_export_action(
+    action: Option<&AccountAction>,
+    export: &mut ExportState,
+    ctx: &egui::Context,
+    tx: &ExportSender,
+    session: &zeroize::Zeroizing<String>,
+    spawn: ExportSpawn,
+) {
+    if !matches!(action, Some(AccountAction::Export)) {
+        return;
+    }
+    // An export already running is an export this must not race. The menu
+    // draws the row either way, so this is the only lock there is.
+    if export.in_flight {
+        return;
+    }
+    export.in_flight = true;
+    // The previous report goes with the new click: a banner from the last
+    // export sitting over this one's would be answering a question the user
+    // has already moved past.
+    export.report = None;
+    spawn(
+        ctx.clone(),
+        tx.clone(),
+        // The window's own session, cloned per export into a `Zeroizing` the
+        // exporting thread drops -- so the token never outlives the one `bw
+        // export` it authenticates. It reaches the child in `BW_SESSION` and
+        // never in argv.
+        session.clone(),
+    );
+}
+
+/// The export reporting back, as a plain function for
+/// [`apply_export_action`]'s reason.
+///
+/// `in_flight` is cleared FIRST and unconditionally: the thread that set it
+/// has finished, whatever became of its answer, and a conditional clear is
+/// how a flag like this latches forever. Deleting this one line was measured
+/// at 2154 / 217 / 0 failed / 0 warnings, and it wedges the window: the draw
+/// block is `if in_flight { .. } else if let Some(report) { .. }`, so the
+/// "Exporting the vault..." card -- which has no dismiss button, by design --
+/// stays up for the life of the window and no second export is possible.
+/// `export_wiring::a_drained_report_clears_the_in_flight_card` is the answer.
+///
+/// The log line is deliberately **not** `{report:?}`. `classify` builds
+/// `ExportOutcome::Failed` out of the CLI's own stderr, so a `Debug` of the
+/// whole report is CLI-controlled text on the info channel; the shape is what
+/// is worth logging and the words are what the card is for.
+fn drain_export(rx: &Receiver<ExportReport>, export: &mut ExportState) {
+    if let Ok(report) = rx.try_recv() {
+        export.in_flight = false;
+        log::info!("vault export finished: {}", report.log_shape());
+        export.report = Some(report);
+    }
+}
 
 /// The vault export's off-thread half, and its job.
 mod export_thread {
@@ -5144,6 +5352,42 @@ mod export_thread {
     where
         P: FnOnce() -> Option<PathBuf>,
     {
+        pick_and_export_with(pick, session, || {
+            vault_export::real_runner(export_job())
+        })
+    }
+
+    /// [`pick_and_export`] with the runner as a value too, **and the only one
+    /// of the two that has a body**.
+    ///
+    /// The seam exists for one measured reason. [`super::export_message`] is
+    /// exhaustively tested, but it is a pure function tested in isolation, and
+    /// nothing asserted that the outcome [`vault_export::run_export`] returned
+    /// is the outcome this function puts in the report. Remapping
+    /// `Unconfirmed` to `Written` on this line SURVIVED at 2154 lib / 217 bin
+    /// / 0 failed / 0 warnings -- and it is the one lie this feature must not
+    /// tell: `bw` exits 0, `classify` finds no encrypted envelope,
+    /// `run_export` discards the partial, **nothing is on disk**, and the
+    /// window paints, in the success colour, "Encrypted vault export saved to
+    /// C:\\Backups\\vault.json."
+    ///
+    /// Coverage missed it because the only test that ever observed a report
+    /// from here was the job test, which only ever sees a `Failed`, so any
+    /// mutation preserving the `Failed` shape was invisible.
+    /// `export_wiring::the_report_carries_the_outcome_the_runner_produced`
+    /// drives this with a substituted runner and asserts all four.
+    ///
+    /// **`run_export` is not bypassed and must not be.** It sweeps stale
+    /// partials, discards this run's own staging file before the runner
+    /// starts, and promotes the staged file onto the user's chosen path on
+    /// `Written` and on nothing else -- see its own doc for what a version
+    /// that pointed the CLI straight at the destination destroys. So the
+    /// runner is what is injected here and never the verdict.
+    pub(super) fn pick_and_export_with<P, R>(pick: P, session: &str, runner: R) -> ExportReport
+    where
+        P: FnOnce() -> Option<PathBuf>,
+        R: FnOnce() -> vault_export::ExportRunner,
+    {
         let Some(destination) = pick() else {
             return ExportReport::Cancelled;
         };
@@ -5152,11 +5396,7 @@ mod export_thread {
             Err(refusal) => return ExportReport::Refused(refusal),
         };
         let destination = plan.final_path().to_path_buf();
-        let outcome = vault_export::run_export(
-            &plan,
-            session,
-            &vault_export::real_runner(export_job()),
-        );
+        let outcome = vault_export::run_export(&plan, session, &runner());
         ExportReport::Done { outcome, destination }
     }
 
@@ -5178,6 +5418,20 @@ mod export_thread {
     /// above the spawn, and here the work is a value this function cannot see
     /// inside of, so there is nothing to hoist.
     ///
+    /// **`catch_unwind`, and it is a fix for a wedge reachable in UNMUTATED
+    /// code rather than a nicety.** The in-flight flag is cleared by
+    /// [`super::drain_export`] and by nothing else. If the worker panics -- a
+    /// COM failure under `file_picker::with_com`, an `expect` under
+    /// `plan_export` or `run_export` -- `tx.send` never runs; and the channel
+    /// does not disconnect either, because `export_tx` lives in the frame and
+    /// is cloned per click, so `try_recv` never yields `Err`. The flag stays
+    /// `true`, the "Exporting the vault..." card has no dismiss button, and
+    /// the window is wedged with no second export possible for its whole
+    /// life. A panic is turned into a report instead -- the ambiguous one,
+    /// [`super::ExportReport::Interrupted`], because a panicked worker may
+    /// have started a `bw` that really wrote something and this app does not
+    /// know.
+    ///
     /// `request_repaint` is what makes the answer visible: the drain is a
     /// `try_recv` in the frame closure, so without a frame to run in, a
     /// finished export sits in the channel until some unrelated input
@@ -5187,7 +5441,9 @@ mod export_thread {
         F: FnOnce() -> ExportReport + Send + 'static,
     {
         std::thread::spawn(move || {
-            let _ = tx.send(work());
+            let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| ExportReport::Interrupted);
+            let _ = tx.send(report);
             ctx_for_export.request_repaint();
         });
     }
@@ -5406,7 +5662,7 @@ impl SendDeleteState {
 /// because the `match` is inside a function the tests call.
 ///
 /// **The one thing left in the frame closure is the call**, and its
-/// reachability is held by `send_delete_wiring::the_frame_calls_the_send_action_applier_at_the_top_of_its_own_body`,
+/// reachability is held by `send_delete_wiring::the_frame_applies_the_sends_action_unconditionally`,
 /// which pins the call's BRACE DEPTH against a known sibling statement --
 /// so any wrapping `if`, `match` or block that could gate it is one level
 /// deeper than the pin allows and fails. That is a reachability pin and not a
@@ -12530,7 +12786,7 @@ mod settings_gear_placement_tests {
     /// strip was reordered. What is in the strip is the `account_menu` call,
     /// which draws the chevron and then the avatar.
     fn account_menu_needle() -> String {
-        concat!("match account_", "menu(").to_string()
+        concat!("account_action = account_", "menu(").to_string()
     }
 
     /// **The gear must be added BEFORE the account menu**, because the strip
@@ -14305,7 +14561,7 @@ mod switcher_wiring_tests {
     }
 
     fn switcher_needle() -> String {
-        concat!("match account_", "menu(").to_string()
+        concat!("account_action = account_", "menu(").to_string()
     }
 
     fn gear_needle() -> String {
@@ -14365,7 +14621,7 @@ mod switcher_wiring_tests {
         for (arm, records) in [
             (
                 "Switch(picked)",
-                concat!("*switch_to_for_", "closure.borrow_mut() = Some(picked);"),
+                concat!("*switch_to_for_", "closure.borrow_mut() = Some(picked.clone());"),
             ),
             (
                 "Lock",
@@ -14936,7 +15192,7 @@ mod account_details_tests {
     #[test]
     fn the_account_menu_waits_for_the_server_url_the_way_the_favicons_do() {
         let production = production();
-        let call = concat!("match account_", "menu(");
+        let call = concat!("account_action = account_", "menu(");
         let at = production
             .find(call)
             .expect("the titlebar account menu is gone");
@@ -14945,7 +15201,10 @@ mod account_details_tests {
         // comment above the argument names `icon_base_known` out loud, and a
         // window that included it would pass against an argument that had been
         // changed to `true`.
-        let end = rest.find(") {").expect("the account menu call is never closed");
+        // `);` and not `) {`: the menu's answer is ASSIGNED and then matched
+        // on a separate line -- the Export row is applied out at the frame
+        // closure's top level, so this call is no longer the head of a `match`.
+        let end = rest.find(");").expect("the account menu call is never closed");
         let args = code_only(&rest[..end]);
         assert!(
             args.contains("icon_base_known"),
@@ -16341,7 +16600,7 @@ mod export_wiring {
     use super::*;
     use crate::job_object::KillOnCloseJob;
     use crate::vault_export::{
-        export_args, plan_export, ExportOutcome, ExportRefusal, ExportRequest,
+        export_args, plan_export, ExportOutcome, ExportRefusal, ExportRequest, RawExport,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -16690,138 +16949,703 @@ mod export_wiring {
         );
     }
 
-    /// **The Export arm starts the export, off-thread, and does NOT close the
-    /// window** -- as a whole-body EQUALITY, not a set of needles.
+    /// **THE REACHABILITY PIN**, and the replacement for a whole-body
+    /// EQUALITY over the frame's `Some(AccountAction::Export) => { .. }` arm
+    /// that a reviewer defeated.
     ///
-    /// **The equality is the fix for a survivor this test measured on its own
-    /// first draft.** That draft asserted the arm `contains` the call to
-    /// `export_thread::spawn_export(` and does not contain
-    /// `ViewportCommand::Close` or any of the session flags. Measured:
-    /// changing the arm's one condition to
+    /// **What was here before, and why a better text pin is not the fix.**
+    /// The old test sliced that arm's interior by brace-walking from
+    /// `"Some(AccountAction::Export) => {"` and asserted equality over it. That
+    /// equality really did kill the previously-disclosed `if false &&`
+    /// survivor. It did not survive its own fix: inserting
     ///
     /// ```ignore
-    /// if false && !export_in_flight {
+    /// Some(AccountAction::Export) if !export_in_flight => {}
     /// ```
     ///
-    /// gave 2125 lib / 217 bin / 0 failed / 0 warnings. Every needle was
-    /// word-perfect -- the call is still written, three lines below a
-    /// condition that is never true -- and the menu's export row did
-    /// absolutely nothing. That is verbatim the "decision correct, renderer
-    /// inert" shape this whole feature set keeps producing, and a
-    /// `contains` cannot see it, because what went wrong is not a missing
-    /// line but a line that no longer runs.
+    /// one line ABOVE the real arm leaves the real arm byte-identical -- the
+    /// equality still passes, word for word -- and draws no
+    /// unreachable-pattern warning, because it is a *guard* and not a
+    /// duplicate pattern, so the crate's zero-warnings rule missed it too.
+    /// Measured at 2154 lib / 217 bin / 0 failed / 0 warnings, and the real
+    /// arm then ran only when `export_in_flight` was ALREADY true, i.e. never
+    /// on a first click: **the "Export vault..." row did nothing, ever.**
     ///
-    /// An equality can: there is no gate, no early return and no shadowing
-    /// binding that survives an exact match of the whole block. It is
-    /// compared with comments removed and whitespace squashed, so it is a pin
-    /// on the code and not on the prose or the formatter.
+    /// An equality pins an arm's CONTENTS and can say nothing about its
+    /// REACHABILITY. So the arm is gone -- see [`apply_export_action`] -- and
+    /// what is asserted about the frame closure is BRACE DEPTH.
     ///
-    /// The three `!contains` checks are kept below it. They are redundant
-    /// against the equality and they are what SAYS, in the failure message,
-    /// which of the several things this arm must not do it started doing.
+    /// `send_fetch.note_screen(on_sends);` is the sibling, the same one the
+    /// revoke's pin uses: `send_ui`'s own pins already require it to be at the
+    /// frame closure's top level, exactly once. If the call to
+    /// [`apply_export_action`] sits at that statement's brace depth then no
+    /// `if`, `match`, `for`, `while` or bare block encloses one and not the
+    /// other -- every one of those adds a level. A gate is the mutation this
+    /// exists for and a gate is a brace.
+    ///
+    /// The equality below is a second lock and is disclosed as such: it pins
+    /// the call's ARGUMENTS -- the window's own export state, its own channel,
+    /// its own session, the production spawner -- and, like every text pin,
+    /// not its reachability. The depth assertion is what holds that.
     #[test]
-    fn the_export_arm_starts_the_export_off_thread_and_keeps_the_window() {
-        let body = code_only(export_arm_body());
-        // The expected text goes through `code_only` too, so that the
-        // continuation lines this literal is wrapped over cannot make the
-        // comparison fail for a reason that is about the formatter.
+    fn the_frame_applies_the_export_action_unconditionally() {
+        let code = super::send_delete_wiring::code_braces_only(production());
+        let call = concat!("apply_export_", "action(");
+        let sibling = concat!("send_fetch.note_", "screen(on_sends);");
+
+        // Controls: both anchors exist, and the call is written exactly once
+        // in the frame. Twice would be two applications of one click.
         assert_eq!(
-            body,
-            code_only(concat!(
-                "if !export_in_flight { export_in_flight = true; export_report = None;                  export_thread::spawn_", "export( ui.ctx().clone(), export_tx.clone(),                  session_token.clone(), ); }"
-            )),
-            "the Export arm is no longer exactly \"start one export off-thread, and only if              one is not already running\". Anything else here is either a second `bw export`              racing the first onto one destination, a condition that stops the row doing              anything at all, or work done on the eframe thread"
+            code.matches(call).count(),
+            2,
+            "{call:?} appears {} times in production, not twice (its definition and the \
+             one call in the frame closure)",
+            code.matches(call).count()
+        );
+        assert_eq!(
+            code.matches(sibling).count(),
+            1,
+            "control: the sibling statement this depth is measured against is not in the \
+             frame exactly once"
         );
 
-        // What the equality already forbids, said in words, so a failure
-        // names the hazard rather than a diff.
-        assert!(
-            !body.contains(concat!("ViewportCommand::", "Close")),
-            "the Export row closes the window, so the export it just started reports back into              a window that is gone and the user never learns whether they have a backup"
-        );
-        for flag in [
-            concat!("switch_to_for_", "closure"),
-            concat!("locked_for_", "closure"),
-            concat!("add_account_for_", "closure"),
-            concat!("remove_account_for_", "closure"),
-            concat!("needs_reauth_for_", "closure"),
-        ] {
-            assert!(
-                !body.contains(flag),
-                "the Export row also writes {flag:?}, so an export ends this vault session"
-            );
-        }
-        // The session reaches the export, and as the window's own
-        // `Zeroizing` clone rather than a fresh `String`.
-        assert!(
-            body.contains(concat!("session_", "token.clone()")),
-            "the export is started without the window's own session, so a real `bw export`              answers `locked`"
-        );
-    }
-
-    /// `text` with `//` comments removed and all whitespace squashed to single
-    /// spaces -- so the equality above is a pin on the code and not on the
-    /// prose beside it or on the formatter's line breaks.
-    ///
-    /// Line comments only, which is all the sliced arm has; a `/* */` would
-    /// survive this and show up in the equality as a difference, which fails
-    /// loudly rather than silently.
-    fn code_only(text: &str) -> String {
-        text.lines()
-            .map(|line| match line.find("//") {
-                Some(at) => &line[..at],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// The body of the frame's `Some(AccountAction::Export) => { .. }` arm.
-    fn export_arm_body() -> &'static str {
-        let production = production();
-        let head = format!("{}Export) => {{", concat!("Some(AccountAction", "::"));
-        let at = production.find(&head).unwrap_or_else(|| {
-            panic!("the strip's `match` has no {head:?} arm -- the Export row decides something nothing acts on")
-        });
-        let after = &production[at + head.len()..];
-        let mut depth = 1usize;
-        for (offset, ch) in after.char_indices() {
+        // The two occurrences are the definition, at depth 0 because it is a
+        // module-level item, and the call. Which comes FIRST in the file is
+        // not assumed, so both depths are taken and the definition is
+        // identified by being the one at depth 0.
+        let mut depths: Vec<i32> = Vec::new();
+        let mut depth = 0i32;
+        let mut window = String::new();
+        for ch in code.chars() {
             match ch {
                 '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let body = &after[..offset];
-                        assert!(
-                            !body.trim().is_empty(),
-                            "the Export arm's block is empty, so every assertion over it would \
-                             pass against nothing"
-                        );
-                        assert!(
-                            body.len() < production.len() / 4,
-                            "control: the slice isolated one arm"
-                        );
-                        return body;
-                    }
-                }
+                '}' => depth -= 1,
                 _ => {}
             }
+            window.push(ch);
+            if window.len() > call.len() {
+                window.remove(0);
+            }
+            if window == call {
+                depths.push(depth);
+            }
         }
-        panic!("the Export arm's block is never closed");
+        assert_eq!(
+            depths.len(),
+            2,
+            "control: the depth scan found {} occurrences of {call:?}, not the two the \
+             count above established",
+            depths.len()
+        );
+        let definitions: Vec<i32> = depths.iter().copied().filter(|d| *d == 0).collect();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "control: {call:?} is written at module level {} times, not once -- so \"the \
+             other one is the call\" does not identify anything",
+            definitions.len()
+        );
+        let call_depth = depths.into_iter().find(|d| *d != 0).unwrap_or_else(|| {
+            panic!("both occurrences of {call:?} are at module level, so the frame never \
+                    calls it")
+        });
+        let sibling_depth = super::send_delete_wiring::depth_of(&code, sibling);
+
+        assert_eq!(
+            call_depth, sibling_depth,
+            "the call to `apply_export_action` sits at brace depth {call_depth} and the \
+             frame closure's own top level is depth {sibling_depth}. Every extra level is \
+             an enclosing `if`, `match`, `for` or bare block -- which is exactly how the \
+             \"Export vault...\" row comes to draw a control that never does anything, \
+             with a green suite and no compiler warning. If this call is meant to move, \
+             move the sibling with it"
+        );
+
+        // Control: the depth really discriminates. A statement known to be
+        // INSIDE something is at a greater depth, so "equal depth" is not a
+        // property every line in this file has.
+        let nested = concat!("account_action = account_", "menu(");
+        assert!(
+            super::send_delete_wiring::depth_of(&code, nested) > sibling_depth,
+            "control: a statement known to be nested reads at the same depth as the \
+             frame's top level, so the depth measurement is not measuring nesting"
+        );
+
+        // The second lock: the call's arguments, as a whole-call equality.
+        let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = squashed(concat!(
+            "apply_export_", "action( account_action.as_ref(), &mut export, ui.ctx(), \
+             &export_tx, &session_token, spawn_export, );"
+        ));
+        assert_eq!(
+            squashed(&code).matches(&expected).count(),
+            1,
+            "the frame no longer applies the account menu's answer with the window's own \
+             export state, its own channel, its own session and the production spawner. \
+             Note what this does NOT hold: it is a pin on the call's CONTENTS. \
+             Reachability is the depth assertion above"
+        );
+
+        // And there is no arm for a guard arm to shadow: the Export row is not
+        // decided by a `match` arm in the frame at all.
+        assert!(
+            !code.contains(concat!("AccountAction::", "Export) => {")),
+            "the frame has a `Some(AccountAction::Export) => {{ .. }}` arm again. That is \
+             an arm a guard arm inserted above it can silently disable, with no compiler \
+             warning and a green suite, which is the measured defeat this design exists \
+             to answer. The decision belongs in `apply_export_action`, where the tests \
+             run it"
+        );
+
+        // And the menu's answer really is recorded, unconditionally, on the
+        // one line that draws the menu -- so there is nothing between the
+        // click and the applier to hollow out either.
+        assert_eq!(
+            code.matches(concat!("account_action = account_", "menu(")).count(),
+            1,
+            "the account menu's answer is no longer assigned straight into the value the \
+             frame's applier reads"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // THE PRIMARY HOLD: the row is observed at the point of effect
+    // -----------------------------------------------------------------
+
+    /// Every export the FRAME started, as an [`ExportSpawn`].
+    ///
+    /// A `static` because the seam is a bare `fn` pointer by design, so there
+    /// is nowhere to capture a recorder. Serialised by [`FRAME_LOCK`].
+    static FRAME_STARTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static FRAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The frame's OWN report channel, kept by the spawner so the test can put
+    /// a report into the window without a `bw`.
+    static FRAME_TX: std::sync::Mutex<Option<ExportSender>> = std::sync::Mutex::new(None);
+
+    fn frame_spawn(_ctx: egui::Context, tx: ExportSender, session: zeroize::Zeroizing<String>) {
+        *FRAME_TX.lock().expect("not poisoned") = Some(tx);
+        FRAME_STARTED.lock().expect("not poisoned").push(session.to_string());
+    }
+
+    /// The session this harness's window is unlocked with.
+    const HARNESS_SESSION: &str = "harness-session-token";
+
+    /// **`crate::accounts`'s own fixture, not one built here.**
+    ///
+    /// `accounts::no_window_answers_may_i_switch_for_itself` forbids this file
+    /// from naming the multi-account availability enum at all, and that guard
+    /// is right: whether this process may switch accounts is `AccountsState`'s
+    /// answer and nothing else's. So this asks for a state instead of deciding
+    /// what one should say.
+    fn harness_accounts() -> crate::accounts::AccountsState {
+        crate::accounts::one_available_account("harness@example.invalid")
+    }
+
+    /// A vault load that answers at once with an EMPTY but loaded vault.
+    ///
+    /// Loaded rather than loading, because the `Loading` arm of the frame
+    /// closure returns about a third of the way down -- before the export
+    /// card is drawn -- so a window left on the spinner could not show this
+    /// test the card the click puts up. Empty rather than populated, because
+    /// nothing here is about an item.
+    fn loads_an_empty_vault(
+        _cache: Arc<VaultCache>,
+        tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        request: VaultLoadRequest,
+    ) {
+        let _ = tx.send((
+            request.generation,
+            Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+        ));
+    }
+
+    fn no_sync(_tx: mpsc::Sender<Result<(), String>>, _session: String) {}
+
+    fn no_send_list(
+        _ctx: egui::Context,
+        _tx: SendListSender,
+        _generation: u64,
+        _session: zeroize::Zeroizing<String>,
+    ) {
+    }
+
+    /// Every label painted on `output`, with the rectangle it occupies.
+    fn labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| labelled_rects(s, out)),
+            _ => {}
+        }
+    }
+
+    /// **A click on "Export vault..." really starts an export, and nothing
+    /// else on the frame does.**
+    ///
+    /// **THE PRIMARY HOLD, and every source pin in this module is secondary to
+    /// it.** Three rounds of text pins over this one row were each defeated by
+    /// a mutation one layer outside what they pinned:
+    ///
+    ///  1. `contains("spawn_export(")` over the arm lost THE LINE: `if false
+    ///     && !export_in_flight {` left every needle word-perfect.
+    ///  2. A whole-body EQUALITY over the arm lost the arm's REACHABILITY: a
+    ///     `Some(AccountAction::Export) if !export_in_flight => {}` guard arm
+    ///     inserted above it left the real arm byte-identical and drew no
+    ///     unreachable-pattern warning, because a guard is not a duplicate
+    ///     pattern.
+    ///  3. A BRACE DEPTH pin over the extracted call lost the ARGUMENT'S
+    ///     LIVENESS: `let account_action = None;` written immediately above
+    ///     the call leaves the call text, its arguments and its depth all
+    ///     byte-identical.
+    ///
+    /// Every one of those is a statement about the CALL. None is a statement
+    /// about what the argument holds when control arrives, and a fourth text
+    /// pin would lose a fourth layer. So this test does not read the source at
+    /// all: it builds the real vault window, presses the real avatar to open
+    /// the real menu, presses the real "Export vault..." row, and asserts that
+    /// an export arrived at [`VaultFrameEnv::export`] carrying this window's
+    /// own session. All three mutants above die here, and so does any fourth,
+    /// because what is observed is the effect and not the spelling.
+    ///
+    /// **No `bw`, no dialog, no network.** The export spawner is substituted
+    /// through the env seam, which is where the substitution belongs: the
+    /// production pointer is `export_thread::spawn_export`, named exactly once
+    /// in `VaultFrameEnv::production`, which `send_ui`'s
+    /// `production_is_the_only_env_a_shipping_build_has` holds.
+    #[test]
+    fn clicking_the_export_row_really_starts_an_export() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("frame-click");
+        FRAME_STARTED.lock().expect("not poisoned").clear();
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            // A base URL nothing listens on, and never dialled: the only
+            // thing that would dial it is the load spawn, which is stubbed.
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                // `None`, so no favicon is fetched for any host.
+                server_url: None,
+            }),
+            HARNESS_SESSION.to_string(),
+            dir.0.join("icons"),
+            // So the auto-lock countdown cannot end the session underneath
+            // the clicks.
+            AutoLock::Never,
+            true,
+            Some(harness_accounts()),
+            // Somebody else owns the first frame, so this harness calls
+            // `theme::apply` itself, below.
+            true,
+            super::frame_env_seam::with_export(
+                super::frame_env_seam::stubbed(
+                    no_sync,
+                    loads_an_empty_vault,
+                    no_send_list,
+                    // Under the scratch directory, so no frame reads or
+                    // writes the real `%APPDATA%\Deskwarden`.
+                    Some(dir.0.join("settings.json")),
+                ),
+                frame_spawn,
+            ),
+        );
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        // Two frames: an `egui::Area` is laid out from the size it had on the
+        // previous frame, so the titlebar is measured properly only from the
+        // second one on.
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let output = ctx.run_ui(input(), |ui| frame_fn(ui));
+
+        let labels = |output: &egui::FullOutput| {
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                labelled_rects(&clipped.shape, &mut out);
+            }
+            out
+        };
+        let locate = |output: &egui::FullOutput, needle: &str| -> egui::Pos2 {
+            let found = labels(output);
+            found
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the window painted no {needle:?} to press, so this test cannot \
+                         reach what it is about at all. What was painted: {:?}",
+                        found.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        // A press AND a release is what egui counts as a click, and the frame
+        // that locates a control cannot be the frame that clicks it.
+        let click = |ctx: &egui::Context,
+                         frame_fn: &mut dyn FnMut(&mut egui::Ui),
+                         pos: egui::Pos2|
+         -> egui::FullOutput {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), button(true)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![button(false)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            // One settling frame, so the popup this click opened is laid out
+            // at its real size before anything inside it is located.
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            let _ = out;
+            ctx.run_ui(input(), |ui| frame_fn(ui))
+        };
+
+        // CONTROL, before anything is pressed: the window has painted two
+        // frames and started no export, so the assertion below is about the
+        // click and not about the window existing.
+        assert!(
+            FRAME_STARTED.lock().expect("not poisoned").is_empty(),
+            "the window started an export without anybody clicking the row"
+        );
+
+        // The avatar carries the account's initials and the menu is hung off
+        // `chevron | avatar`, so pressing the initials opens it. The chevron
+        // paints no text and could not be located this way.
+        let initials = theme::initials("harness@example.invalid");
+        let avatar_at = locate(&output, &initials);
+        let opened = click(&ctx, &mut frame_fn, avatar_at);
+
+        // The menu is up. Positive control on the harness itself: without it a
+        // failure to open the popup would look exactly like a broken row.
+        let export_at = locate(&opened, EXPORT_VAULT);
+        assert!(
+            FRAME_STARTED.lock().expect("not poisoned").is_empty(),
+            "opening the account menu started an export, before the row was pressed"
+        );
+
+        let _after = click(&ctx, &mut frame_fn, export_at);
+
+        let started = std::mem::take(&mut *FRAME_STARTED.lock().expect("not poisoned"));
+        assert_eq!(
+            started,
+            vec![HARNESS_SESSION.to_string()],
+            "clicking \"Export vault...\" on a real frame started {started:?}, not exactly \
+             one export carrying this window's own session. This is the row doing nothing \
+             -- the symptom every source pin over it has missed at least once: a gated \
+             line, an unreachable arm, or an argument neutralised above the call"
+        );
+
+        // AND THE CARD SAYS SO. The click latched the in-flight flag, so the
+        // window is now painting the progress card -- which is the other half
+        // of "the row did something" and the half the user sees.
+        let painting = ctx.run_ui(input(), |ui| frame_fn(ui));
+        assert!(
+            labels(&painting).iter().any(|(t, _)| t == EXPORTING),
+            "the row started an export but the window paints no {EXPORTING:?} card, so a \
+             user has nothing on screen accounting for the `bw` that is now running. \
+             Painted: {:?}",
+            labels(&painting).iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
+        );
+
+        // AND A SECOND CLICK STARTS NO SECOND `bw`. Two exports racing on one
+        // destination is two processes writing one `.dw-partial`.
+        let reopened = click(&ctx, &mut frame_fn, avatar_at);
+        let export_at = locate(&reopened, EXPORT_VAULT);
+        let _ = click(&ctx, &mut frame_fn, export_at);
+        let again = std::mem::take(&mut *FRAME_STARTED.lock().expect("not poisoned"));
+        assert!(
+            again.is_empty(),
+            "a second click while an export was in flight started {again:?}"
+        );
+
+        // **AND A REPORT ON SCREEN DOES NOT STOP THE ROW.**
+        //
+        // This is the mutant a brace-depth pin cannot see and the first draft
+        // of THIS test could not see either, because its window never had a
+        // report up. Written as the shape a developer would plausibly reach
+        // for -- "don't act on the menu while the answer card is showing" --
+        //
+        // ```ignore
+        // let account_action = if export.report.is_some() { None } else { account_action };
+        // apply_export_action(account_action.as_ref(), ..);
+        // ```
+        //
+        // it leaves the call text, its arguments and its brace depth
+        // byte-identical, draws no warning, and makes the row inert for every
+        // user who has not dismissed the previous card. So the window is given
+        // a report -- through its own channel, the one the spawner kept -- and
+        // the row is pressed with the card up.
+        FRAME_TX
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .expect("the spawner kept the frame's sender")
+            .send(ExportReport::Interrupted)
+            .expect("the frame still holds the receiver");
+        // One frame to drain it, one to lay the card out at its real size.
+        let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let showing = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let (_, card_text) = export_message(&ExportReport::Interrupted).expect("it renders");
+        assert!(
+            labels(&showing).iter().any(|(t, _)| *t == card_text),
+            "control: the window is not showing a report card, so pressing the row with one              up is not what the click below does. Painted: {:?}",
+            labels(&showing).iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
+        );
+
+        let reopened = click(&ctx, &mut frame_fn, avatar_at);
+        let export_at = locate(&reopened, EXPORT_VAULT);
+        let _ = click(&ctx, &mut frame_fn, export_at);
+        let with_card_up = std::mem::take(&mut *FRAME_STARTED.lock().expect("not poisoned"));
+        assert_eq!(
+            with_card_up,
+            vec![HARNESS_SESSION.to_string()],
+            "with a report card on screen, clicking \"Export vault...\" started              {with_card_up:?}. A previous answer is not a reason to refuse the next backup,              and a row that silently does nothing until some other control is dismissed is              the same defect as a row that never works"
+        );
+    }
+    // -----------------------------------------------------------------
+    // What the applier does, run for real
+    // -----------------------------------------------------------------
+
+    /// Every export [`apply_export_action`] started, as an `ExportSpawn`.
+    ///
+    /// A `static` because the seam is a bare `fn` pointer by design (see
+    /// [`ExportSpawn`]), so there is nowhere to capture a recorder.
+    static STARTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn recording_spawn(
+        _ctx: egui::Context,
+        _tx: ExportSender,
+        session: zeroize::Zeroizing<String>,
+    ) {
+        STARTED.lock().expect("not poisoned").push(session.to_string());
+    }
+
+    /// Runs the production [`apply_export_action`] and answers every export it
+    /// started. Serialised on `STARTED`'s own lock by taking it at the end.
+    fn exports_started_by(action: Option<&AccountAction>, export: &mut ExportState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        STARTED.lock().expect("not poisoned").clear();
+        apply_export_action(
+            action,
+            export,
+            &ctx,
+            &tx,
+            &zeroize::Zeroizing::new("session-token".to_string()),
+            recording_spawn,
+        );
+        std::mem::take(&mut *STARTED.lock().expect("not poisoned"))
+    }
+
+    /// **The row starts exactly one export, on a first click, with the
+    /// window's own session -- and nothing else does.**
+    ///
+    /// This is the property the deleted arm equality was standing in for, and
+    /// it is asserted by RUNNING the decision rather than by reading it.
+    #[test]
+    fn the_export_row_starts_one_export_and_no_other_row_starts_any() {
+        let mut export = ExportState::default();
+        let started = exports_started_by(Some(&AccountAction::Export), &mut export);
+        assert_eq!(
+            started,
+            vec!["session-token".to_string()],
+            "a first click on \"Export vault...\" started {started:?}, not exactly one \
+             export carrying the window's own session"
+        );
+        assert!(export.in_flight, "the first click did not latch the in-flight flag");
+
+        // A second click while one is running starts no second `bw`.
+        let again = exports_started_by(Some(&AccountAction::Export), &mut export);
+        assert!(
+            again.is_empty(),
+            "a second click while an export was in flight started {again:?} -- two `bw \
+             export` children racing onto one destination is two processes writing one \
+             `.dw-partial`"
+        );
+
+        // And the click drops the previous report, so a banner from the last
+        // export is not left sitting over this one's.
+        let mut fresh = ExportState {
+            in_flight: false,
+            report: Some(ExportReport::Cancelled),
+        };
+        let _ = exports_started_by(Some(&AccountAction::Export), &mut fresh);
+        assert!(
+            fresh.report.is_none(),
+            "a new click left the previous export's banner up"
+        );
+
+        // CONTROLS: nothing else in the menu starts an export, and neither
+        // does an empty answer. Without these the assertion above is passed
+        // by an applier that exports on every frame.
+        for other in [
+            None,
+            Some(AccountAction::Lock),
+            Some(AccountAction::Add),
+            Some(AccountAction::Remove),
+            Some(AccountAction::Switch(crate::accounts::AccountId::generate())),
+        ] {
+            let mut idle = ExportState::default();
+            let started = exports_started_by(other.as_ref(), &mut idle);
+            assert!(
+                started.is_empty() && !idle.in_flight,
+                "{other:?} started an export: {started:?}"
+            );
+        }
+    }
+
+    /// **The drain clears the in-flight card, always.**
+    ///
+    /// Deleting `in_flight = false` from [`drain_export`] was measured at 2154
+    /// lib / 217 bin / 0 failed / 0 warnings, and nothing in the suite touched
+    /// the drain. It wedges the window: the draw block is `if in_flight { .. }
+    /// else if let Some(report) { .. }`, the in-flight card has no dismiss
+    /// button by design, and no second export is possible for the window's
+    /// life.
+    #[test]
+    fn a_drained_report_clears_the_in_flight_card() {
+        for report in [
+            ExportReport::Cancelled,
+            ExportReport::Interrupted,
+            ExportReport::Refused(ExportRefusal::EmptyFileName),
+            done(ExportOutcome::Written),
+            done(ExportOutcome::Unconfirmed),
+        ] {
+            let shape = report.log_shape();
+            let (tx, rx) = mpsc::channel();
+            tx.send(report).expect("the receiver is alive");
+            let mut export = ExportState { in_flight: true, report: None };
+            drain_export(&rx, &mut export);
+            assert!(
+                !export.in_flight,
+                "a drained {shape:?} left the in-flight flag set -- the \"Exporting the \
+                 vault...\" card has no dismiss button, so the window is wedged for its \
+                 whole life and no second export is possible"
+            );
+            assert!(export.report.is_some(), "a drained {shape:?} was thrown away");
+        }
+
+        // Control: an empty channel changes nothing, so the clear above is the
+        // drain's answer to a REPORT and not an unconditional assignment.
+        let (_tx, rx) = mpsc::channel::<ExportReport>();
+        let mut export = ExportState { in_flight: true, report: None };
+        drain_export(&rx, &mut export);
+        assert!(
+            export.in_flight,
+            "control: the drain cleared the flag with nothing in the channel, so an export \
+             still running would paint no card at all"
+        );
+    }
+
+    /// **A worker that panics reports back, and the window recovers.**
+    ///
+    /// End to end, through the real spawner and the real drain. Without the
+    /// `catch_unwind` in `spawn_export_with` this is reachable in UNMUTATED
+    /// code: `tx.send` never runs, the channel does not disconnect either
+    /// (`export_tx` lives in the frame and is cloned per click, so `try_recv`
+    /// never yields `Err`), the flag stays `true` and the card has no dismiss.
+    #[test]
+    fn a_panicking_worker_reports_an_ambiguous_failure_instead_of_wedging_the_window() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let mut export = ExportState { in_flight: true, report: None };
+
+        // The panic is expected and its message would otherwise be printed by
+        // the default hook, which reads like a test failure in the log.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        export_thread::spawn_export_with(ctx, tx, || panic!("the exporting thread fell over"));
+        let report = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a panicking exporter still reports back, or the window wedges");
+        std::panic::set_hook(previous);
+
+        assert!(
+            matches!(report, ExportReport::Interrupted),
+            "a panicking exporter reported {report:?}"
+        );
+        let (send_tx, send_rx) = mpsc::channel();
+        send_tx.send(report).expect("the receiver is alive");
+        drain_export(&send_rx, &mut export);
+        assert!(
+            !export.in_flight,
+            "the window is still painting \"Exporting the vault...\" after the exporting \
+             thread died, with no dismiss button and no way to start another"
+        );
+
+        // AND IT IS NOT PAINTED AS A BACKUP. A panicked worker may have
+        // started a `bw` that wrote something and this app does not know.
+        let (tone, text) = export_message(&ExportReport::Interrupted)
+            .expect("an interrupted export says something");
+        assert_eq!(
+            tone,
+            ExportTone::Bad,
+            "an export whose thread died reads as a successful backup: {text:?}"
+        );
     }
 
     // -----------------------------------------------------------------
     // The outcome mapping
     // -----------------------------------------------------------------
 
+    /// The destination `done` uses, and the one the messages must name.
+    const DESTINATION: &str = r"C:\Backups\vault.json";
+
+    /// A second destination, differing from [`DESTINATION`] in every
+    /// component. Used by [`every_outcome_says_something_different`] to make
+    /// "the message names the file" a property a fixed path cannot fake.
+    const OTHER_DESTINATION: &str = r"D:\elsewhere\other-backup.json";
+
     fn done(outcome: ExportOutcome) -> ExportReport {
+        done_at(outcome, DESTINATION)
+    }
+
+    fn done_at(outcome: ExportOutcome, destination: &str) -> ExportReport {
         ExportReport::Done {
             outcome,
-            destination: PathBuf::from(r"C:\Backups\vault.json"),
+            destination: PathBuf::from(destination),
         }
+    }
+
+    /// Every report shape there is, at one destination.
+    fn every_report_at(destination: &str) -> Vec<ExportReport> {
+        vec![
+            done_at(ExportOutcome::Written, destination),
+            done_at(ExportOutcome::SessionInvalid, destination),
+            done_at(ExportOutcome::Failed("the CLI said no".to_string()), destination),
+            done_at(ExportOutcome::Unconfirmed, destination),
+            ExportReport::Interrupted,
+            ExportReport::Refused(ExportRefusal::NoDirectory),
+            ExportReport::Refused(ExportRefusal::IntoConfigDir),
+            ExportReport::Refused(ExportRefusal::EmptyFileName),
+        ]
     }
 
     /// **Every report says something different, and only one of them says
@@ -16832,15 +17656,8 @@ mod export_wiring {
     /// same -- which passes any per-variant "it says something" check.
     #[test]
     fn every_outcome_says_something_different() {
-        let reports = [
-            done(ExportOutcome::Written),
-            done(ExportOutcome::SessionInvalid),
-            done(ExportOutcome::Failed("the CLI said no".to_string())),
-            done(ExportOutcome::Unconfirmed),
-            ExportReport::Refused(ExportRefusal::NoDirectory),
-            ExportReport::Refused(ExportRefusal::IntoConfigDir),
-            ExportReport::Refused(ExportRefusal::EmptyFileName),
-        ];
+        let reports = every_report_at(DESTINATION);
+        assert_eq!(reports.len(), 8, "control: not every report shape is covered");
         let messages: Vec<(ExportTone, String)> = reports
             .iter()
             .map(|r| {
@@ -16872,6 +17689,326 @@ mod export_wiring {
             &export_message(&done(ExportOutcome::Written)).expect("Written renders"),
             good[0],
             "the one success is not `Written`"
+        );
+
+        // **THE MESSAGE NAMES THE FILE.** This used to be measured at ONE
+        // fixed destination, and a reviewer showed what that costs: dropping
+        // `destination.display()` from the `Written` arm left all seven
+        // messages pairwise distinct with exactly one `Good`, so the loop
+        // above stayed green -- and the user was told an export had been
+        // saved without being told where. Same gap for `Failed`'s and
+        // `Unconfirmed`'s `<path>`. Every report that HAS a destination must
+        // now say it, and a second run at a different path is what makes that
+        // a statement about the value rather than about a constant.
+        for destination in [DESTINATION, OTHER_DESTINATION] {
+            for report in every_report_at(destination) {
+                // `SessionInvalid` is deliberately not in this list: nothing
+                // was attempted at a path, and the user's next step is to
+                // unlock the vault rather than to look in a folder.
+                let ExportReport::Done { outcome, .. } = &report else {
+                    continue;
+                };
+                if matches!(outcome, ExportOutcome::SessionInvalid) {
+                    continue;
+                }
+                let (_, text) = export_message(&report).expect("a `Done` renders");
+                assert!(
+                    text.contains(destination),
+                    "{report:?} does not name the file it is about: {text:?}. A backup \
+                     the user is not told the location of is a backup they cannot find, \
+                     and a failure they are not told the location of is a failure they \
+                     cannot tell from the previous one"
+                );
+                assert!(
+                    !text.contains(OTHER_DESTINATION) || destination == OTHER_DESTINATION,
+                    "control: {report:?} names a destination that is not its own: {text:?}"
+                );
+            }
+        }
+
+        // And the two destinations really do differ, so the loop above is not
+        // comparing a string with itself.
+        assert_ne!(DESTINATION, OTHER_DESTINATION, "control: one fixture, twice");
+    }
+
+    // -----------------------------------------------------------------
+    // The report carries the outcome the runner produced
+    // -----------------------------------------------------------------
+
+    /// **The verdict `run_export` returned is the verdict that reaches the
+    /// card**, for every shape a verdict can have.
+    ///
+    /// [`export_message`] is exhaustively tested, but it is a PURE FUNCTION
+    /// TESTED IN ISOLATION, and nothing asserted that the outcome
+    /// `run_export` returned is the outcome `pick_and_export` puts in the
+    /// report. Remapping `Unconfirmed` to `Written` inside the wiring
+    /// SURVIVED at 2154 lib / 217 bin / 0 failed / 0 warnings, and it is the
+    /// one lie this feature must not tell: `bw` exits 0, `classify` finds no
+    /// encrypted envelope, `run_export` discards the partial, nothing is on
+    /// disk, and the window paints, in the success colour, "Encrypted vault
+    /// export saved to C:\\Backups\\vault.json."
+    ///
+    /// Coverage missed it because the only test that observed a report from
+    /// `pick_and_export` was
+    /// [`the_export_child_is_spawned_into_the_job_this_window_holds`], and it
+    /// only ever sees `Failed(REFUSED)` -- so any mutation preserving the
+    /// `Failed` shape was invisible. That test now asserts its report carries
+    /// the probe's own refusal; this one drives the whole blocking entry
+    /// point with a substituted RUNNER (and nothing else substituted -- the
+    /// plan and `run_export` itself are the production ones, because
+    /// `run_export` is what discards the partial and promotes on `Written`
+    /// alone) and reads all four verdicts back off the report.
+    #[test]
+    fn the_report_carries_the_outcome_the_runner_produced() {
+        let dir = TempDir::new("outcome-fidelity");
+        let envelope: &[u8] = b"{\"encrypted\":true,\"encKeyValidation_DO_NOT_EDIT\":\"x\"}";
+
+        // Four runners, one per verdict `classify` can reach. Each is
+        // described by what the CLI DID, never by the verdict itself, so the
+        // expected value below is `run_export`'s answer and not this test's
+        // opinion of it.
+        let cases: Vec<(&str, ExportOutcome, bool, RawExport)> = vec![
+            (
+                "written",
+                ExportOutcome::Written,
+                true,
+                RawExport {
+                    exit_ok: true,
+                    stderr: String::new(),
+                    written: Ok(envelope.len() as u64),
+                    head: envelope.to_vec(),
+                },
+            ),
+            (
+                "unconfirmed",
+                ExportOutcome::Unconfirmed,
+                false,
+                RawExport {
+                    exit_ok: true,
+                    stderr: String::new(),
+                    written: Ok(0),
+                    head: Vec::new(),
+                },
+            ),
+            (
+                "session-invalid",
+                ExportOutcome::SessionInvalid,
+                false,
+                RawExport {
+                    exit_ok: false,
+                    stderr: "You are not logged in.".to_string(),
+                    written: Err("nothing looked".to_string()),
+                    head: Vec::new(),
+                },
+            ),
+            (
+                "failed",
+                ExportOutcome::Failed("the CLI fell over".to_string()),
+                false,
+                RawExport {
+                    exit_ok: false,
+                    stderr: "the CLI fell over".to_string(),
+                    written: Err("nothing looked".to_string()),
+                    head: Vec::new(),
+                },
+            ),
+        ];
+
+        for (tag, expected, writes_envelope, raw) in cases {
+            let destination = dir.0.join(format!("{tag}.json"));
+            let bytes = envelope.to_vec();
+            let staged = std::sync::Arc::new(std::sync::Mutex::new(raw));
+            let runner = {
+                let staged = std::sync::Arc::clone(&staged);
+                move || {
+                    let staged = std::sync::Arc::clone(&staged);
+                    let bytes = bytes.clone();
+                    crate::vault_export::ExportRunner::from_fn(move |plan, _session| {
+                        // A real `Written` run leaves the envelope at the
+                        // partial path for `run_export` to promote; this
+                        // fake does the same, so the rename is exercised.
+                        if writes_envelope {
+                            std::fs::write(plan.partial_path(), &bytes)
+                                .expect("the scratch directory is writable");
+                        }
+                        let raw = staged.lock().expect("not poisoned");
+                        RawExport {
+                            exit_ok: raw.exit_ok,
+                            stderr: raw.stderr.clone(),
+                            written: raw.written.clone(),
+                            head: raw.head.clone(),
+                        }
+                    })
+                }
+            };
+
+            let picked = destination.clone();
+            let report = export_thread::pick_and_export_with(
+                move || Some(picked),
+                "session-token",
+                runner,
+            );
+
+            match report {
+                ExportReport::Done { outcome, destination: reported } => {
+                    assert_eq!(
+                        outcome, expected,
+                        "the runner produced {expected:?} and the wiring reported \
+                         {outcome:?}. A report that is not the verdict is this app \
+                         telling the user about an export that did not happen -- and \
+                         `Unconfirmed` rendered as `Written` says \"saved\" over an \
+                         empty disk"
+                    );
+                    assert_eq!(
+                        reported, destination,
+                        "the report names a destination the user did not pick"
+                    );
+                }
+                other => panic!("a run that produced {expected:?} reported {other:?}"),
+            }
+
+            // The disk agrees, which is what makes the verdict a fact rather
+            // than a label: `Written` and only `Written` promotes.
+            assert_eq!(
+                destination.exists(),
+                expected == ExportOutcome::Written,
+                "{tag}: the file at {} does not match the verdict {expected:?}",
+                destination.display()
+            );
+        }
+    }
+
+    /// **`pick_and_export` is the delegation and nothing else** --
+    /// `spawn_export`'s shape and its reason. The seam above is a runner and
+    /// never a verdict, and this is what keeps the production path pointed at
+    /// the production runner and the window's own job.
+    #[test]
+    fn pick_and_export_only_hands_the_real_runner_to_the_tested_entry_point() {
+        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = concat!(
+            "pub(super) fn pick_and_", "export<P>(pick: P, session: &str) -> ExportReport \
+             where P: FnOnce() -> Option<PathBuf>, { pick_and_export_with(pick, session, \
+             || { vault_export::real_runner(export_job()) }) }"
+        );
+        assert_eq!(
+            squashed(production()).matches(body).count(),
+            1,
+            "`pick_and_export` is no longer exactly the delegation to \
+             `pick_and_export_with` with the production runner over this window's own \
+             job -- anything else here is a verdict decided above `run_export`"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // How a report is painted
+    // -----------------------------------------------------------------
+
+    fn painted_export_card(report: &ExportReport) -> super::send_delete_wiring::Card {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        // Drawn on EVERY frame and not only the last: an `egui::Area` is laid
+        // out from the size it had on the previous frame, so a card appearing
+        // for the first time on the frame being read is measured at zero and
+        // paints nothing at all.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |ui| {
+            let _ = draw_export_report(ui.ctx(), report);
+        });
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw_export_report(ui.ctx(), report);
+        });
+        let mut card = super::send_delete_wiring::Card::default();
+        for clipped in &output.shapes {
+            super::send_delete_wiring::collect_card(&clipped.shape, &mut card);
+        }
+        card
+    }
+
+    /// **A failed export is never painted in the success colour, and the
+    /// colour is not the frame closure's to choose.**
+    ///
+    /// [`draw_export_report`] used to take `(tone, text)`. Forcing the tone to
+    /// [`ExportTone::Good`] AT THE CALL SITE -- one word, in the frame
+    /// closure, where no test in this crate runs -- SURVIVED at 2154 lib / 217
+    /// bin / 0 failed / 0 warnings, and painted `SessionInvalid`, `Failed`,
+    /// `Unconfirmed`, `Interrupted` and all three `Refused` messages in the
+    /// success chrome. Colour is what a user reads before they read a word.
+    ///
+    /// The card is now handed the REPORT, so this reads the glyphs a real
+    /// frame would put on screen, and the control below requires every failure
+    /// card's colour set to DIFFER from the success card's -- so a card forced
+    /// to one colour for every report fails here whichever colour it was
+    /// forced to.
+    #[test]
+    fn a_failed_export_is_never_painted_in_the_success_colour() {
+        for report in every_report_at(DESTINATION) {
+            let card = painted_export_card(&report);
+            let (tone, text) = export_message(&report).expect("every report here renders");
+            assert!(
+                !card.text.is_empty(),
+                "{report:?} painted no text at all, so every assertion over it would pass \
+                 against nothing"
+            );
+            assert!(
+                card.text.iter().any(|t| t == &text),
+                "the card painted something other than {text:?}: {:?}",
+                card.text
+            );
+            // The INK, not the card's outline: `egui::Frame`'s stroke reaches
+            // the tessellator rather than the shape list at this layer, so
+            // reading it here would discriminate nothing.
+            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            match tone {
+                ExportTone::Bad => assert!(
+                    error_ink,
+                    "{report:?} is a failure but no glyph on its card is painted in the \
+                     error colour -- an export that produced no backup reads exactly like \
+                     one that did. Painted colours were {:?}",
+                    card.text_colours
+                ),
+                ExportTone::Good => assert!(
+                    !error_ink,
+                    "a successful export is painted as an error: {:?}",
+                    card.text_colours
+                ),
+            }
+        }
+
+        // **The control that makes the loop above mean something.** Every
+        // failure must be painted DIFFERENTLY from the success, in ink as well
+        // as in words.
+        let good = painted_export_card(&done(ExportOutcome::Written));
+        assert!(!good.text_colours.is_empty(), "control: the success card painted no ink");
+        for report in every_report_at(DESTINATION) {
+            if matches!(report, ExportReport::Done { outcome: ExportOutcome::Written, .. }) {
+                continue;
+            }
+            let bad = painted_export_card(&report);
+            assert_ne!(
+                bad.text_colours, good.text_colours,
+                "{report:?} is painted in exactly the colours a successful export is \
+                 painted in, so the card's chrome tells the user they have a backup they \
+                 do not have"
+            );
+        }
+
+        // A cancelled dialog paints nothing and asks to be dropped -- the user
+        // closed a dialog they opened, which is not an event this app narrates
+        // back at them.
+        assert!(
+            export_message(&ExportReport::Cancelled).is_none(),
+            "a dismissed save dialog now narrates itself back at the user"
+        );
+        assert!(
+            draw_export_report(&egui::Context::default(), &ExportReport::Cancelled),
+            "a report with nothing to say is not dropped, so the frame holds it forever"
         );
     }
 
@@ -17742,13 +18879,17 @@ mod send_delete_wiring {
     }
 
     /// Colours and glyphs of one painted card.
+    ///
+    /// `pub(super)` so `export_wiring` reads the SAME collector: both cards
+    /// are held to "no failure is painted in the success colours", and two
+    /// copies of the shape walk would be two things that can disagree.
     #[derive(Default)]
-    struct Card {
-        text: Vec<String>,
-        text_colours: Vec<egui::Color32>,
+    pub(super) struct Card {
+        pub(super) text: Vec<String>,
+        pub(super) text_colours: Vec<egui::Color32>,
     }
 
-    fn collect_card(shape: &egui::Shape, out: &mut Card) {
+    pub(super) fn collect_card(shape: &egui::Shape, out: &mut Card) {
         match shape {
             egui::Shape::Text(t) => {
                 out.text.push(t.galley.text().to_string());
@@ -17883,7 +19024,7 @@ mod send_delete_wiring {
     /// result counts BLOCKS and not prose.
     ///
     /// Its own controls are [`the_brace_scanner_is_not_fooled_by_prose`].
-    fn code_braces_only(text: &str) -> String {
+    pub(super) fn code_braces_only(text: &str) -> String {
         let bytes: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
         let mut i = 0usize;
@@ -18018,7 +19159,12 @@ mod send_delete_wiring {
     }
 
     /// The brace depth at the first occurrence of `needle` in `code`.
-    fn depth_of(code: &str, needle: &str) -> i32 {
+    ///
+    /// `pub(super)` so `export_wiring` reads the SAME scanner rather than a
+    /// second copy of it: this one has its own twelve-fixture control,
+    /// [`the_brace_scanner_is_not_fooled_by_prose`], and a duplicate would be
+    /// a brace counter nobody had tested.
+    pub(super) fn depth_of(code: &str, needle: &str) -> i32 {
         let at = code
             .find(needle)
             .unwrap_or_else(|| panic!("{needle:?} is not in the frame closure at all"));
@@ -18366,6 +19512,25 @@ mod frame_env_seam {
         send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
         settings_path: Option<std::path::PathBuf>,
     ) -> VaultFrameEnv {
-        VaultFrameEnv { sync, load, send_list, settings_path }
+        // The production export spawner, because every existing caller of
+        // this function drives a scenario that never clicks "Export
+        // vault..." -- and a scenario that DID would be starting a real
+        // save dialog, which is what `with_export` exists to prevent.
+        VaultFrameEnv {
+            sync,
+            load,
+            send_list,
+            export: super::export_thread::spawn_export,
+            settings_path,
+        }
+    }
+
+    /// [`stubbed`] with the export spawner named too.
+    ///
+    /// A separate function rather than a fifth parameter on [`stubbed`], so
+    /// that the callers in `send_ui`'s frame harness -- which never click the
+    /// Export row -- are unchanged.
+    pub(super) fn with_export(env: VaultFrameEnv, export: ExportSpawn) -> VaultFrameEnv {
+        VaultFrameEnv { export, ..env }
     }
 }
