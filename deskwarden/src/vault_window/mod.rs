@@ -19527,6 +19527,17 @@ mod send_delete_wiring {
     /// witness that goes quietly stale: reword the placeholder, or put a
     /// second item in the harness's folder, and a literal would stop
     /// matching and take the control with it while still looking like one.
+    ///
+    /// **ITS MEASURED LIMIT, RECORDED RATHER THAN FIXED.** This is the same
+    /// expression production computes, so what it pins is "the placeholder
+    /// moved when the scope did" -- not that production feeds `search_hint`
+    /// the SCOPE count. Change the production call site in `item_list` to
+    /// pass the filtered-result count instead of `sidebar::count_for`, and
+    /// this constant follows it: the search-immunity that makes this the
+    /// half a search cannot forge would evaporate while the strings still
+    /// matched. Holding that needs a check on the production call site's
+    /// argument, which is a different test in a different module; it is
+    /// written down here rather than claimed closed.
     static FRAME_FOLDER_SCOPE_HINT: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| {
             let items = frame_items();
@@ -19601,8 +19612,25 @@ mod send_delete_wiring {
         Scoped { gone: &'static str, kept: &'static str, narrowed: &'static str },
         /// Strictly more occurrences than before the setup.
         More(&'static str),
-        /// Strictly fewer occurrences than before the setup.
-        Fewer(&'static str),
+        /// **The badge beside `row` resolved, and the badge beside `other`
+        /// did NOT.** For the two aux lists, which were otherwise the same
+        /// state written twice.
+        ///
+        /// The shape here used to be `Fewer(sidebar::UNKNOWN_COUNT)` -- "one
+        /// fewer unknown badge anywhere on screen" -- and, MEASURED, that is
+        /// satisfied by pressing EITHER aux row, because neither half of it
+        /// is scoped to a row: collapsing the setup's row selector to
+        /// `"Archive"`, so both states press the Archive row, was green on
+        /// the whole matrix in both profiles. `TrashVisited` had stopped
+        /// existing and the matrix went on counting it. A count taken over
+        /// the whole screen cannot tell two rows apart, so this reads the
+        /// badge BELONGING TO the row, found by its y-position the way
+        /// `sidebar`'s own `badge_beside` finds it, and the negative half --
+        /// the other row's badge is still unresolved -- is what stops a
+        /// press on the wrong row from passing and what stops a fixture
+        /// that answered both queries at once from making either press
+        /// vacuous.
+        BadgeResolvedOnRow { row: &'static str, other: &'static str },
         /// Not painted AT ALL -- for the one state whose whole content is an
         /// absence and which is armed before the window is built, so it has
         /// no "before" to differ from.
@@ -19641,13 +19669,18 @@ mod send_delete_wiring {
             // whose detail pane is a different KIND), and that is one of the
             // sixteen missing variants, not a tweak to this one.
             ReachableState::ItemSelected => Witness::More(FRAME_LOOSE_ITEM_NAME),
-            // A row whose list has not been fetched draws `UNKNOWN_COUNT` for
-            // its badge and a resolved one draws a number, so one fewer
-            // unknown badge is `items` becoming `Some`. **Trash and Archive
-            // share this witness and are therefore not distinguished FROM
-            // EACH OTHER** -- see the matrix's closing note.
-            ReachableState::TrashVisited | ReachableState::ArchiveVisited => {
-                Witness::Fewer(sidebar::UNKNOWN_COUNT)
+            // A row whose list has not been fetched draws `UNKNOWN_COUNT`
+            // for its badge and a resolved one draws a number. **The two aux
+            // rows name each other**, so the witness is scoped to the row
+            // that was pressed and is falsified by pressing the other one --
+            // which is also where the setup below gets the row to press
+            // from, so there is still exactly one place that decides which
+            // row this state is about.
+            ReachableState::TrashVisited => {
+                Witness::BadgeResolvedOnRow { row: "Trash", other: "Archive" }
+            }
+            ReachableState::ArchiveVisited => {
+                Witness::BadgeResolvedOnRow { row: "Archive", other: "Trash" }
             }
             ReachableState::SearchTyped => Witness::Appeared("zq"),
         }
@@ -19669,6 +19702,17 @@ mod send_delete_wiring {
     /// thing that consumes it, and it cannot be conjured anywhere else in
     /// the module.
     ///
+    /// **That sentence was false for four rounds and is now true.** This was
+    /// a plain `enum` whose variants carried nothing private, and an enum
+    /// variant is exactly as constructible as its type is visible -- so
+    /// `Reached::Now(state)` could be written anywhere in this module, and
+    /// MEASURED: deleting `FolderSelected`'s click and returning
+    /// `Reached::Now(state)` for that one state instead of calling
+    /// [`Reached::proved`] was green on the whole matrix in both profiles.
+    /// The teeth are therefore a private module: `Which` is not `pub`, so a
+    /// `Reached` cannot be named complete outside `proof`, and `proved` is
+    /// the only `pub fn` there that returns one.
+    ///
     /// **What this does NOT close.** [`Reached::on_the_sends_screen`] is
     /// open to any variant, and a lazy eleventh variant could pass a label
     /// that its setup did not cause -- see the doc comment on that
@@ -19683,141 +19727,28 @@ mod send_delete_wiring {
     enum Reached {
         /// Already proved, on the vault side, before the Sends row was
         /// pressed. The Sends screen still has to carry a row to press.
-        Now(ReachableState),
+        Now(ReachableState, proof::Seal),
         /// To be proved by a label on the Sends screen itself, once step 1
         /// has established that the screen is up. The matrix performs this
         /// assertion; the variant only names the label.
-        OnTheSendsScreen(ReachableState, &'static str),
+        OnTheSendsScreen(ReachableState, &'static str, proof::Seal),
         /// Proved by the variant's own block further down, which does
         /// something no shared helper can (starts a real revoke and reads
-        /// the spawn ledger). Restricted by [`Reached::its_own_block`] to
-        /// the one variant that has such a block, so it is not a hatch a
-        /// new variant can climb through.
-        ItsOwnBlock(ReachableState),
+        /// the spawn ledger). Reserved to the one state [`witness_for`] maps
+        /// to [`Witness::OwnBlock`] -- pinned to exactly one -- so it is not
+        /// a hatch a new variant can climb through.
+        ItsOwnBlock(ReachableState, proof::Seal),
     }
 
     impl Reached {
         /// **THE ONLY ROUTE INTO THIS TYPE, AND IT DOES NOT TAKE A LABEL.**
         ///
-        /// There used to be seven constructors and the arm picked one and
-        /// handed it a literal. Both of those were degrees of freedom the
-        /// arm did not need and a defanged arm used: pick `the_baseline`
-        /// (three tokens, since its guard was a single `matches!` with no
-        /// second holder) and the variant asserts nothing; keep the
-        /// constructor and change what caused the label and the variant
-        /// asserts something a different state produced. Now the check is
-        /// [`witness_for`]'s to choose, the arm's only power is to drive the
-        /// window, and a setup swapped out from under a variant fails the
-        /// pairing rather than riding it.
+        /// A one-line delegation to [`proof::proved`], which lives in a
+        /// module of its own so that the [`proof::Seal`] every variant
+        /// carries cannot be made anywhere else. Keeping the name here keeps
+        /// the one call site and every doc link pointing at one thing.
         fn proved(state: ReachableState, before: &[String], after: &egui::FullOutput) -> Self {
-            match witness_for(state) {
-                Witness::Baseline => Self::Now(state),
-                Witness::OwnBlock => Self::ItsOwnBlock(state),
-                Witness::OnTheSendsScreen(needle) => {
-                    assert_ne!(
-                        needle, FRAME_SEND_NAME,
-                        "control for {state:?}: {needle:?} is painted in EVERY state, so \
-                         naming it as this variant's witness is the same as having no \
-                         witness. Name a label only this state's Sends screen produces."
-                    );
-                    Self::OnTheSendsScreen(state, needle)
-                }
-                Witness::Appeared(needle) => {
-                    assert!(
-                        !before.iter().any(|t| t == needle),
-                        "control for {state:?}: {needle:?} was already on screen BEFORE this \
-                         variant's setup ran, so its appearance afterwards proves nothing \
-                         about the setup."
-                    );
-                    assert!(
-                        matrix_find(after, needle).is_some(),
-                        "control for {state:?}: the setup ran and {needle:?} never appeared, \
-                         so this state is not being driven at all -- every step below is \
-                         running against `Fresh` under another name. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    Self::Now(state)
-                }
-                Witness::Scoped { gone, kept, narrowed } => {
-                    assert!(
-                        before.iter().any(|t| t == gone),
-                        "control for {state:?}: {gone:?} was not on screen before this \
-                         variant's setup ran either, so its absence afterwards proves \
-                         nothing about the setup."
-                    );
-                    assert!(
-                        before.iter().any(|t| t == kept),
-                        "control for {state:?}: {kept:?} was not on screen before this \
-                         variant's setup ran, so \"it is still there\" afterwards is \
-                         vacuous and this control has only one real half."
-                    );
-                    assert!(
-                        matrix_find(after, gone).is_none(),
-                        "control for {state:?}: the setup ran and {gone:?} is still on \
-                         screen, so nothing was scoped and this state is not being driven \
-                         at all. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    assert!(
-                        matrix_find(after, kept).is_some(),
-                        "control for {state:?}: the setup ran and it took {kept:?} off \
-                         screen as well as {gone:?}. That is a filter over EVERYTHING -- a \
-                         search box, an empty list, a blanked pane -- not this state's \
-                         scope, and a one-sided \"it vanished\" is exactly what let this \
-                         variant be swapped for two search keystrokes with its witness \
-                         untouched. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    assert!(
-                        !before.iter().any(|t| t == narrowed),
-                        "control for {state:?}: {narrowed:?} was already on screen BEFORE                          this variant's setup ran, so it cannot witness the scope narrowing."
-                    );
-                    assert!(
-                        matrix_find(after, narrowed).is_some(),
-                        "control for {state:?}: {gone:?} went away and {kept:?} stayed, but                          the search box still does not read {narrowed:?} -- so the SCOPE did                          not narrow and something narrower than the scope did the filtering.                          `item_list::search_hint` counts `sidebar::count_for(items, filter)`,                          which is the scope and not the search results, so a search string                          picked to match {kept:?} and miss {gone:?} -- which satisfies both                          halves above, measured -- cannot move it. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    Self::Now(state)
-                }
-                Witness::More(needle) => {
-                    let was = before.iter().filter(|t| *t == needle).count();
-                    assert!(
-                        matrix_count(after, needle) > was,
-                        "control for {state:?}: the setup ran and {needle:?} is still on \
-                         screen {was} time(s), so nothing was selected and this state is \
-                         not being driven -- every step below is running against `Fresh` \
-                         under another name. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    Self::Now(state)
-                }
-                Witness::Fewer(needle) => {
-                    let was = before.iter().filter(|t| *t == needle).count();
-                    assert!(
-                        was > 0,
-                        "control for {state:?}: there were no {needle:?} on screen before \
-                         the setup ran, so \"one fewer\" cannot be observed and this \
-                         control is vacuous."
-                    );
-                    assert!(
-                        matrix_count(after, needle) < was,
-                        "control for {state:?}: the setup ran and there are still {was} \
-                         {needle:?} on screen, so nothing resolved and this state is not \
-                         being driven. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    Self::Now(state)
-                }
-                Witness::NeverPaints(needle) => {
-                    assert!(
-                        matrix_find(after, needle).is_none(),
-                        "control for {state:?}: {needle:?} is on screen, so this is not the \
-                         state this variant names. What was painted: {:?}",
-                        matrix_texts(after)
-                    );
-                    Self::Now(state)
-                }
-            }
+            proof::proved(state, before, after)
         }
 
         /// **Consumes the witness.** For `Now` and `ItsOwnBlock` this is
@@ -19825,13 +19756,15 @@ mod send_delete_wiring {
         /// at all; for `OnTheSendsScreen` it is the variant's own witness.
         fn check_the_sends_screen(self, output: &egui::FullOutput) {
             let (state, needle) = match self {
-                Reached::Now(state) | Reached::ItsOwnBlock(state) => (state, FRAME_SEND_NAME),
-                Reached::OnTheSendsScreen(state, needle) => (state, needle),
+                Reached::Now(state, _) | Reached::ItsOwnBlock(state, _) => {
+                    (state, FRAME_SEND_NAME)
+                }
+                Reached::OnTheSendsScreen(state, needle, _) => (state, needle),
             };
             if matches!(state, ReachableState::Fresh) {
                 FRESH_SENDS_SCREEN.with(|c| *c.borrow_mut() = Some(matrix_texts(output)));
             }
-            if let Reached::OnTheSendsScreen(_, needle) = self {
+            if let Reached::OnTheSendsScreen(_, needle, _) = self {
                 let baseline = FRESH_SENDS_SCREEN
                     .with(|c| c.borrow().clone())
                     .expect(
@@ -19849,6 +19782,220 @@ mod send_delete_wiring {
                  below to press. What was painted: {:?}",
                 matrix_texts(output)
             );
+        }
+    }
+
+    /// **THE TEETH.** `Seal`'s field is private to this module, so a
+    /// [`Reached`] cannot be built anywhere in `send_delete_wiring` -- the
+    /// only code that can make a `Seal` is the code below it, and the only
+    /// thing below it that returns one is [`proved`], which performs the
+    /// assertion first.
+    ///
+    /// This is what the doc on [`Reached`] claimed for four rounds while the
+    /// type was a plain `enum` with nothing private in it. An enum variant is
+    /// exactly as constructible as its type is visible, so `Reached::Now(state)`
+    /// was writable anywhere in the module, and MEASURED: deleting
+    /// `FolderSelected`'s click and handing back `Reached::Now(state)` for
+    /// that one state instead of calling `proved` was green on the whole
+    /// matrix in both profiles.
+    mod proof {
+        use super::*;
+
+        /// Permission to have been proved. Not constructible outside this
+        /// module: the field is private and there is no constructor.
+        #[derive(Debug)]
+        pub struct Seal(());
+
+    /// **THE ONLY ROUTE INTO [`Reached`], AND IT DOES NOT TAKE A LABEL.**
+    ///
+    /// There used to be seven constructors and the arm picked one and
+    /// handed it a literal. Both of those were degrees of freedom the
+    /// arm did not need and a defanged arm used: pick `the_baseline`
+    /// (three tokens, since its guard was a single `matches!` with no
+    /// second holder) and the variant asserts nothing; keep the
+    /// constructor and change what caused the label and the variant
+    /// asserts something a different state produced. Now the check is
+    /// [`witness_for`]'s to choose, the arm's only power is to drive the
+    /// window, and a setup swapped out from under a variant fails the
+    /// pairing rather than riding it.
+    pub fn proved(
+        state: ReachableState,
+        before: &[String],
+        after: &egui::FullOutput,
+    ) -> Reached {
+        match witness_for(state) {
+            Witness::Baseline => Reached::Now(state, Seal(())),
+            Witness::OwnBlock => Reached::ItsOwnBlock(state, Seal(())),
+            Witness::OnTheSendsScreen(needle) => {
+                assert_ne!(
+                    needle, FRAME_SEND_NAME,
+                    "control for {state:?}: {needle:?} is painted in EVERY state, so \
+                     naming it as this variant's witness is the same as having no \
+                     witness. Name a label only this state's Sends screen produces."
+                );
+                Reached::OnTheSendsScreen(state, needle, Seal(()))
+            }
+            Witness::Appeared(needle) => {
+                assert!(
+                    !before.iter().any(|t| t == needle),
+                    "control for {state:?}: {needle:?} was already on screen BEFORE this \
+                     variant's setup ran, so its appearance afterwards proves nothing \
+                     about the setup."
+                );
+                assert!(
+                    matrix_find(after, needle).is_some(),
+                    "control for {state:?}: the setup ran and {needle:?} never appeared, \
+                     so this state is not being driven at all -- every step below is \
+                     running against `Fresh` under another name. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                Reached::Now(state, Seal(()))
+            }
+            Witness::Scoped { gone, kept, narrowed } => {
+                assert!(
+                    before.iter().any(|t| t == gone),
+                    "control for {state:?}: {gone:?} was not on screen before this \
+                     variant's setup ran either, so its absence afterwards proves \
+                     nothing about the setup."
+                );
+                assert!(
+                    before.iter().any(|t| t == kept),
+                    "control for {state:?}: {kept:?} was not on screen before this \
+                     variant's setup ran, so \"it is still there\" afterwards is \
+                     vacuous and this control has only one real half."
+                );
+                assert!(
+                    matrix_find(after, gone).is_none(),
+                    "control for {state:?}: the setup ran and {gone:?} is still on \
+                     screen, so nothing was scoped and this state is not being driven \
+                     at all. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                assert!(
+                    matrix_find(after, kept).is_some(),
+                    "control for {state:?}: the setup ran and it took {kept:?} off \
+                     screen as well as {gone:?}. That is a filter over EVERYTHING -- a \
+                     search box, an empty list, a blanked pane -- not this state's \
+                     scope, and a one-sided \"it vanished\" is exactly what let this \
+                     variant be swapped for two search keystrokes with its witness \
+                     untouched. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                assert!(
+                    !before.iter().any(|t| t == narrowed),
+                    "control for {state:?}: {narrowed:?} was already on screen BEFORE                          this variant's setup ran, so it cannot witness the scope narrowing."
+                );
+                assert!(
+                    matrix_find(after, narrowed).is_some(),
+                    "control for {state:?}: {gone:?} went away and {kept:?} stayed, but                          the search box still does not read {narrowed:?} -- so the SCOPE did                          not narrow and something narrower than the scope did the filtering.                          `item_list::search_hint` counts `sidebar::count_for(items, filter)`,                          which is the scope and not the search results, so a search string                          picked to match {kept:?} and miss {gone:?} -- which satisfies both                          halves above, measured -- cannot move it. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                Reached::Now(state, Seal(()))
+            }
+            Witness::More(needle) => {
+                let was = before.iter().filter(|t| *t == needle).count();
+                assert!(
+                    matrix_count(after, needle) > was,
+                    "control for {state:?}: the setup ran and {needle:?} is still on \
+                     screen {was} time(s), so nothing was selected and this state is \
+                     not being driven -- every step below is running against `Fresh` \
+                     under another name. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                Reached::Now(state, Seal(()))
+            }
+            Witness::BadgeResolvedOnRow { row, other } => {
+                assert!(
+                    before
+                        .iter()
+                        .filter(|t| *t == sidebar::UNKNOWN_COUNT)
+                        .count()
+                        >= 2,
+                    "control for {state:?}: fewer than two badges read \
+                     {:?} before this variant's setup ran, so the two aux rows were \
+                     not both unresolved to begin with and \"this one resolved and \
+                     that one did not\" cannot be observed. What was painted: {before:?}",
+                    sidebar::UNKNOWN_COUNT
+                );
+                let pressed = matrix_badge_beside(state, after, row);
+                let untouched = matrix_badge_beside(state, after, other);
+                assert_ne!(
+                    pressed,
+                    sidebar::UNKNOWN_COUNT,
+                    "control for {state:?}: the setup ran and the badge beside the \
+                     {row:?} row still reads {:?}, so that row's list never answered \
+                     and this state is not being driven at all. What was painted: {:?}",
+                    sidebar::UNKNOWN_COUNT,
+                    matrix_texts(after)
+                );
+                assert_eq!(
+                    untouched,
+                    sidebar::UNKNOWN_COUNT,
+                    "control for {state:?}: the badge beside the {other:?} row \
+                     resolved too. Either the press landed on the wrong row -- which \
+                     is exactly the edit that made `TrashVisited` and \
+                     `ArchiveVisited` the same state, and which a whole-screen count \
+                     of unknown badges could not see -- or the fixture answers both \
+                     aux queries at once, in which case neither press proves anything. \
+                     What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                Reached::Now(state, Seal(()))
+            }
+            Witness::NeverPaints(needle) => {
+                assert!(
+                    matrix_find(after, needle).is_none(),
+                    "control for {state:?}: {needle:?} is on screen, so this is not the \
+                     state this variant names. What was painted: {:?}",
+                    matrix_texts(after)
+                );
+                Reached::Now(state, Seal(()))
+            }
+        }
+    }
+
+    }
+
+    /// **The badge belonging to `row`**, found the way `sidebar`'s own
+    /// `badge_beside` finds it: the one label on the same row, within half a
+    /// row height, that is not the row's own name.
+    ///
+    /// A whole-screen count of `sidebar::UNKNOWN_COUNT` cannot tell the Trash
+    /// row from the Archive row -- measured, pressing Archive for both states
+    /// was green -- so the aux states read their own row's badge instead.
+    /// Rows are `ROW_HEIGHT + ROW_GAP` apart, so a window of half a row
+    /// cannot reach a neighbour.
+    fn matrix_badge_beside(state: ReachableState, output: &egui::FullOutput, row: &str) -> String {
+        let labels = matrix_labels(output);
+        let row_rect = matrix_find(output, row).unwrap_or_else(|| {
+            panic!(
+                "in state {state:?} the sidebar painted no {row:?} row at all, so it \
+                 has no badge to read. What was painted: {:?}",
+                matrix_texts(output)
+            )
+        });
+        let row_y = row_rect.center().y;
+        // Half a row vertically -- rows are `ROW_HEIGHT + ROW_GAP` apart --
+        // and, horizontally, to the RIGHT of the row's own name and inside
+        // the sidebar's own column. The vertical window alone is not enough:
+        // the detail pane's empty-state text sits on the same line as the
+        // Archive row and would be read as its badge.
+        let beside: Vec<&(String, egui::Rect)> = labels
+            .iter()
+            .filter(|(text, rect)| {
+                text != row
+                    && (rect.center().y - row_y).abs() < 16.0
+                    && rect.center().x > row_rect.right()
+                    && rect.center().x - row_rect.right() < 150.0
+            })
+            .collect();
+        match beside.as_slice() {
+            [(badge, _)] => badge.clone(),
+            other => panic!(
+                "in state {state:?} the {row:?} row has {} labels beside it rather than \
+                 exactly one badge, so there is nothing unambiguous to read: {other:?}",
+                other.len()
+            ),
         }
     }
 
@@ -20115,16 +20262,28 @@ mod send_delete_wiring {
     ///
     /// **AND WHAT THE WITNESS PAIRING DOES NOT CLOSE EITHER.** [`Witness`]
     /// stops an arm choosing its own control and stops a rewritten arm
-    /// riding a control it did not cause. It does not make every pair of
-    /// states distinguishable FROM EACH OTHER: `TrashVisited` and
-    /// `ArchiveVisited` map to the same `Witness::Fewer(UNKNOWN_COUNT)`,
-    /// and swapping which of the two rows an arm presses is green, because
-    /// either press resolves one badge and neither is scoped to a row.
-    /// Telling them apart needs a row-scoped read of the badge belonging to
-    /// the row that was pressed, which the aux-list fixture does not yet
-    /// give this test; it is written down here rather than claimed closed.
-    /// `ItemSelected` is likewise a liveness check rather than coverage --
-    /// see its note in [`witness_for`].
+    /// riding a control it did not cause. Two states sharing a witness that
+    /// is scoped to NEITHER of them used to be open, and it was worse than
+    /// the note that stood here said: `TrashVisited` and `ArchiveVisited`
+    /// both mapped to `Witness::Fewer(UNKNOWN_COUNT)`, and collapsing the
+    /// setup's row selector so that both states pressed the ARCHIVE row was
+    /// green on the whole matrix in both profiles -- one edit, and
+    /// `TrashVisited` ceased to exist while the matrix went on counting it.
+    /// That is now closed by [`Witness::BadgeResolvedOnRow`], which reads
+    /// the badge belonging to the row and asserts the OTHER row's badge is
+    /// still unresolved, and by the setup arm taking the row it presses
+    /// FROM that map instead of choosing one.
+    ///
+    /// `ItemSelected` is still a liveness check rather than coverage -- see
+    /// its note in [`witness_for`].
+    ///
+    /// **The remaining honest hole in this direction** is not a pair of
+    /// states, it is the fixture: the two aux states are distinguished by
+    /// WHICH ROW ANSWERED, not by what is IN the two lists, so nothing here
+    /// would notice a `trash_list`/`archive_list` swap inside the window
+    /// itself. Closing that needs the aux fixture to give the two lists
+    /// items with different names and the witness to name one of them, and
+    /// that is a fixture change rather than a witness change.
     #[test]
     fn the_sends_screen_works_in_every_state_the_user_can_reach() {
         let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -20138,98 +20297,174 @@ mod send_delete_wiring {
         }
     }
 
-    /// **THE SECOND HOLDER OVER [`witness_for`].**
+    /// **The one-line shape of a witness, for the pin below to compare.**
     ///
-    /// One place to choose a state's control is the right number of places
-    /// to choose it, and it is also one edit to weaken it. The previous
-    /// round's `the_baseline` was guarded by a single
-    /// `matches!(state, ReachableState::Fresh)` and nothing else, and
-    /// widening it to `Fresh | FolderSelected` -- three tokens -- put the
-    /// production gate `!matches!(filter, SidebarFilter::Folder(_))` back
-    /// to green with the whole suite passing.
+    /// Payloads are interpolated with `{}` rather than `{:?}` so that what is
+    /// pinned is the STRING A STATE IS CHECKED AGAINST, not the name of the
+    /// constant an arm happened to spell it with.
+    fn witness_description(witness: Witness) -> String {
+        match witness {
+            Witness::Baseline => "Baseline".to_string(),
+            Witness::OwnBlock => "OwnBlock".to_string(),
+            Witness::OnTheSendsScreen(needle) => format!("OnTheSendsScreen|{needle}"),
+            Witness::Appeared(needle) => format!("Appeared|{needle}"),
+            Witness::Scoped { gone, kept, narrowed } => {
+                format!("Scoped|{gone}|{kept}|{narrowed}")
+            }
+            Witness::More(needle) => format!("More|{needle}"),
+            Witness::BadgeResolvedOnRow { row, other } => {
+                format!("BadgeResolvedOnRow|{row}|{other}")
+            }
+            Witness::NeverPaints(needle) => format!("NeverPaints|{needle}"),
+        }
+    }
+
+    /// **THE SECOND HOLDER OVER [`witness_for`], AND IT CALLS IT.**
     ///
-    /// So the map is pinned to the bytes it was MEASURED with. Re-pointing a
-    /// state at a weaker witness is now two edits, and the second one is
-    /// this test, which says in its own message what the first one did.
-    /// Needles are split with `concat!` so they cannot match their own
-    /// declaration here; do not re-join them.
+    /// One place to choose a state's control is the right number of places to
+    /// choose it, and it is also one edit to weaken it. The previous round's
+    /// `the_baseline` was guarded by a single
+    /// `matches!(state, ReachableState::Fresh)` and nothing else, and widening
+    /// it to `Fresh | FolderSelected` -- three tokens -- put the production
+    /// gate `!matches!(filter, SidebarFilter::Folder(_))` back to green with
+    /// the whole suite passing.
+    ///
+    /// **This used to hold the map by its SOURCE TEXT, and source text is not
+    /// what a `match` means.** `include_str!("mod.rs")` was searched for
+    /// `"ReachableState::Fresh => Witness::Baseline,"` and friends, and
+    /// `"=> Witness::Baseline,"` was required to occur exactly once. Every one
+    /// of those needles can be left exactly where it is while the map is
+    /// re-pointed, because a `match` is ORDER-SENSITIVE and a text search is
+    /// not: an EARLIER arm wins, and the measured arm's bytes never move.
+    /// MEASURED, on the commit before this one, and green on the whole matrix
+    /// in both profiles:
+    ///
+    /// * `ReachableState::FolderSelected =>` + TWO spaces + `Witness::Baseline,`
+    ///   inserted above the `Fresh` arm, with `FolderSelected`'s click deleted.
+    ///   The count needle demanded exactly one space, so it counted one; the
+    ///   `contains` needles were all still true; `FolderSelected` asserted
+    ///   nothing and the production gate above went green. **One character
+    ///   from the liveness control:** with ONE space it was killed.
+    /// * The same thing written `FolderSelected if true =>` + two spaces.
+    ///   The plain double-space form at least emits `unreachable_patterns`;
+    ///   an `if true` guard suppresses reachability analysis entirely, so
+    ///   that one compiled green with zero warnings.
+    ///
+    /// So the map is no longer pinned to its bytes. It is CALLED, over
+    /// [`ReachableState::ALL`], and compared to the descriptions it was
+    /// measured with. Whitespace, arm order, guards, `#[allow]`, a second
+    /// occurrence and rewording are all invisible to this; only what
+    /// `witness_for` RETURNS is not. There is deliberately no source-text
+    /// assertion left here: every one this replaces was a strictly weaker
+    /// statement about the same function.
     #[test]
     fn every_reachable_state_is_pinned_to_the_witness_it_was_measured_with() {
-        let source = include_str!("mod.rs");
-        for (needle, what) in [
+        /// State by state, the control it was MEASURED with. Payloads are
+        /// values, not identifiers: renaming the constant behind
+        /// `FRAME_ITEM_NAME` changes nothing here, but pointing it at a
+        /// different string does.
+        const MEASURED: [(ReachableState, &str); 10] = [
+            (ReachableState::Fresh, "Baseline"),
+            (ReachableState::EmptyVault, "NeverPaints|Frame Harness Item"),
             (
-                concat!("ReachableState::Fresh => Witness", "::Baseline,"),
-                "the baseline is `Fresh`",
+                ReachableState::FolderSelected,
+                "Scoped|Frame Harness Loose Item|Frame Harness Item|Search 1 item",
+            ),
+            (ReachableState::ItemSelected, "More|Frame Harness Loose Item"),
+            (ReachableState::TrashVisited, "BadgeResolvedOnRow|Trash|Archive"),
+            (ReachableState::ArchiveVisited, "BadgeResolvedOnRow|Archive|Trash"),
+            (ReachableState::SearchTyped, "Appeared|zq"),
+            (
+                ReachableState::NoticeUp,
+                "OnTheSendsScreen|Your Sends could not be listed.",
             ),
             (
-                concat!("ReachableState::RevokeInFlight => Witness", "::OwnBlock,"),
-                "the one state with a block of its own is `RevokeInFlight`",
+                ReachableState::FetchInFlight,
+                "OnTheSendsScreen|Asking Bitwarden for your Sends\u{2026}",
             ),
-            (
-                concat!("ReachableState::NoticeUp => Witness", "::OnTheSendsScreen(send_ui::FAILED_HEADLINE)"),
-                "`NoticeUp` is proved by the error screen's headline",
-            ),
-            (
-                concat!("ReachableState::FetchInFlight => Witness", "::OnTheSendsScreen(send_ui::LOADING_LABEL)"),
-                "`FetchInFlight` is proved by the loading label",
-            ),
-            (
-                concat!("ReachableState::EmptyVault => Witness", "::NeverPaints(FRAME_ITEM_NAME)"),
-                "`EmptyVault` is proved by the item that is nowhere on screen",
-            ),
-            (
-                concat!("ReachableState::FolderSelected => Witness", "::Scoped {"),
-                "`FolderSelected` is proved by a SCOPE -- two-sided, because \
-                 one-sided \"it vanished\" is satisfied by a search",
-            ),
-            (
-                concat!("gone: FRAME_LOOSE_ITEM", "_NAME,"),
-                "the folder scope takes the item that is in no folder off screen",
-            ),
-            (
-                concat!("kept: FRAME_ITEM", "_NAME,"),
-                "the folder scope KEEPS the item that is in the folder -- this is \
-                 the half a search cannot forge",
-            ),
-            (
-                concat!("ReachableState::ItemSelected => Witness", "::More(FRAME_LOOSE_ITEM_NAME)"),
-                "`ItemSelected` is proved by a second occurrence of the row's name",
-            ),
-            (
-                concat!("Witness::Fewer(sidebar::UNKNOWN", "_COUNT)"),
-                "the aux rows are proved by an unknown badge resolving",
-            ),
-            (
-                concat!("ReachableState::SearchTyped => Witness", "::Appeared(\"zq\")"),
-                "`SearchTyped` is proved by the typed text appearing",
-            ),
-        ] {
-            assert!(
-                source.contains(needle),
-                "`witness_for` no longer reads {needle:?}, so the control for that state is \
-                 not the one that was measured ({what}). A state re-pointed at a weaker \
-                 witness -- `Witness::Baseline` above all, which asserts nothing -- is a \
-                 state that has stopped existing while the matrix goes on counting it: \
-                 measured, `FolderSelected` moved to the baseline put the production gate \
-                 `!matches!(filter, SidebarFilter::Folder(_))` back to green with the whole \
-                 suite passing. If this witness really should change, change it here too and \
-                 say what the new one observes."
+            (ReachableState::RevokeInFlight, "OwnBlock"),
+        ];
+
+        // The table is over EVERY state and no others. Without this an
+        // eleventh state -- or a state quietly dropped from `ALL` -- would
+        // simply not be checked.
+        assert_eq!(
+            format!("{:?}", MEASURED.map(|(state, _)| state)),
+            format!("{:?}", ReachableState::ALL),
+            "the states this test was measured over are no longer the states the matrix \
+             drives. A state added to `ReachableState::ALL` without a row here is a state \
+             whose control nothing holds; a state removed from `ALL` has stopped being \
+             driven at all."
+        );
+
+        for (state, expected) in MEASURED {
+            assert_eq!(
+                witness_description(witness_for(state)),
+                expected,
+                "`witness_for({state:?})` no longer returns the control this state was \
+                 measured with. A state re-pointed at a weaker witness -- `Baseline` above \
+                 all, which asserts NOTHING -- is a state that has stopped existing while \
+                 the matrix goes on counting it: measured, `FolderSelected` moved to the \
+                 baseline put the production gate `!matches!(filter, \
+                 SidebarFilter::Folder(_))` back to green with the whole suite passing. \
+                 This holds what the function RETURNS, so it is not moved by how the arm \
+                 is spelled, where it sits in the `match`, or whether it carries a guard. \
+                 If this control really should change, change it here too and say what the \
+                 new one observes."
             );
         }
-        for (needle, only) in [
-            (concat!("=> Witness", "::Baseline,"), "Fresh"),
-            (concat!("=> Witness", "::OwnBlock,"), "RevokeInFlight"),
+
+        // **NO TWO STATES ARE CHECKED THE SAME WAY.** Two states sharing a
+        // control is two states that cannot be told apart by it, which is
+        // how `TrashVisited` and `ArchiveVisited` were one state wearing two
+        // names for four rounds. It is also the cheapest way to retire a
+        // state through this table: point it at another state's control and
+        // update its row here, two edits, both of which this catches.
+        let mut seen: Vec<(String, ReachableState)> = Vec::new();
+        for state in ReachableState::ALL {
+            let description = witness_description(witness_for(state));
+            if let Some((_, first)) = seen.iter().find(|(d, _)| *d == description) {
+                panic!(
+                    "{state:?} and {first:?} are both checked by {description:?}. A control \
+                     that does not distinguish the two states holding it cannot notice \
+                     either of them being driven in place of the other -- measured, with \
+                     the two aux rows: one edit to the row the setup pressed and \
+                     `TrashVisited` had stopped existing with the whole matrix green."
+                );
+            }
+            seen.push((description, state));
+        }
+
+        // The two witnesses that assert nothing about the state are each
+        // reserved to one state -- checked by CALLING the map, so a second
+        // state routed to one of them by an earlier arm is caught even
+        // though the measured arm's text never moved.
+        for (what, only, hits) in [
+            (
+                "Baseline",
+                "Fresh",
+                ReachableState::ALL
+                    .into_iter()
+                    .filter(|s| matches!(witness_for(*s), Witness::Baseline))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "OwnBlock",
+                "RevokeInFlight",
+                ReachableState::ALL
+                    .into_iter()
+                    .filter(|s| matches!(witness_for(*s), Witness::OwnBlock))
+                    .collect::<Vec<_>>(),
+            ),
         ] {
             assert_eq!(
-                source.matches(needle).count(),
+                hits.len(),
                 1,
-                "{needle:?} is written {} times in this module. It is reserved to `{only}` \
-                 because it is a witness that asserts NOTHING -- a second state mapped to it \
-                 is a second state driving `Fresh` under another name, which is the defect \
-                 this whole apparatus exists to stop, arriving as a one-token widening of a \
-                 pattern. There is exactly one baseline and exactly one variant with a block \
-                 of its own.",
-                source.matches(needle).count()
+                "`Witness::{what}` is returned for {hits:?}. It is reserved to `{only}` \
+                 because it is a witness that checks NOTHING this state produces -- a \
+                 second state mapped to it is a second state driving `Fresh` under another \
+                 name, which is the defect this whole apparatus exists to stop. There is \
+                 exactly one baseline and exactly one variant with a block of its own."
             );
         }
     }
@@ -20332,10 +20567,22 @@ mod send_delete_wiring {
                 output = matrix_click(&ctx, &mut frame_fn, at);
             }
             ReachableState::TrashVisited | ReachableState::ArchiveVisited => {
-                let row = if matches!(state, ReachableState::TrashVisited) {
-                    "Trash"
-                } else {
-                    "Archive"
+                // **THE ROW IS NOT THIS ARM'S TO CHOOSE EITHER.** These two
+                // states used to share a witness that counted unknown badges
+                // over the whole screen, and this arm used to pick its own
+                // row: collapsing the selector to `"Archive"` so both states
+                // pressed the Archive row was green on the whole matrix in
+                // both profiles, and `TrashVisited` stopped existing. The row
+                // now comes from the same map the control comes from, so
+                // pressing the wrong row is not a thing this arm can express,
+                // and moving the row in the map is caught by
+                // `every_reachable_state_is_pinned_to_the_witness_it_was_measured_with`.
+                let Witness::BadgeResolvedOnRow { row, .. } = witness_for(state) else {
+                    panic!(
+                        "{state:?} is an aux-list state but `witness_for` no longer gives \
+                         it a row-scoped badge witness, so there is no row for this arm \
+                         to press and nothing that could tell the two aux states apart."
+                    )
                 };
                 let at = matrix_locate(state, &output, row);
                 output = matrix_click(&ctx, &mut frame_fn, at);
