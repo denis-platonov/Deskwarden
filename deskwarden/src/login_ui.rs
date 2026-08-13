@@ -7943,17 +7943,91 @@ pub(crate) mod password_lifetime_tests {
                      entirely. This test does not run without git; see the panics above."
                 )
             });
-        let mut ignored_paths: Vec<&[u8]> = Vec::new();
-        for path in ignored_raw
+        // **The two producers are parsed into two SEPARATE bindings, and the
+        // union is measured against both -- because the union used to be one
+        // statement behind one guard, and that guard was the whole defence.**
+        //
+        // As written before, both parses were inlined into a single `for` over
+        // `a.chain(b)` whose body was `if !ignored_paths.contains(&path) {
+        // push }`. Deleting that one `!` -- ONE character, in a line that
+        // reads like a de-duplication detail -- made the condition false for
+        // every path, because the vector starts empty and `contains` is never
+        // true on an empty vector. `ignored_paths` then stayed empty no matter
+        // what EITHER producer said, and every check downstream passed
+        // vacuously: an empty feed makes `check-ignore` exit 1 with empty
+        // stdout (a normal answer, so the status assert passes), zero fields
+        // is a whole number of four-field records, `0 == 0 * 4` holds, and
+        // `chunks(4)` never iterates so `foreign` is empty. Measured with a
+        // real probe in `docs/scratch_note.md` hidden by an UNTRACKED
+        // `docs/.gitignore`: pristine KILLED at the `foreign.is_empty()`
+        // assert, the one-character mutant SURVIVED the filtered run AND the
+        // full suite, in debug and in `--release`, with the probe unseen.
+        //
+        // Note what that mutant actually deleted. The probe file is never
+        // scanned even on pristine code -- it is untracked and excluded, so no
+        // producer offers it to the scanner. ATTRIBUTION is the only thing in
+        // this test that can report it at all. Emptying the attributed list
+        // does not skip a scan; it deletes the sole detector.
+        //
+        // So: two bindings, two names, and the yardsticks below are taken from
+        // the bindings rather than from the fed list. See the two asserts
+        // immediately after the union, and the coverage assert at the audit.
+        let status_ignored: std::collections::HashSet<&[u8]> = ignored_raw
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
             .filter_map(|record| record.strip_prefix(b"!! ".as_slice()))
-            .chain(ignored_second_raw.split(|b| *b == 0).filter(|s| !s.is_empty()))
-        {
-            if !ignored_paths.contains(&path) {
+            .collect();
+        let listed_ignored: std::collections::HashSet<&[u8]> = ignored_second_raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .collect();
+        // **A `HashSet` for the de-duplication, not `Vec::contains`.** The
+        // linear scan was O(n^2) over byte slices, and this repository ignores
+        // 29 778 paths, so it was doing ~440 million slice comparisons.
+        // Measured over exactly that list, taken from these two producers on
+        // the real tree: 2.63 s unoptimized and 468 ms optimized, against
+        // 47.9 ms and 5.0 ms hashed -- so it was material in both profiles,
+        // and dominated the ~1.2 s the two `git` calls themselves cost. This
+        // is a data-structure change only, and it is not a behaviour change to
+        // chase it: verified over that same list that both loops produce
+        // byte-identical `ignored_paths` -- the same paths, in the same
+        // first-seen order.
+        let mut seen_ignored: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut ignored_paths: Vec<&[u8]> = Vec::new();
+        for path in status_ignored.iter().chain(listed_ignored.iter()).copied() {
+            if seen_ignored.insert(path) {
                 ignored_paths.push(path);
             }
         }
+        // **The union is measured against each PART, and the parts are bound
+        // where the union is not.** A union of two sets contains each of them,
+        // so on honest code these hold by construction and cost nothing -- the
+        // point is that the right-hand side comes from a binding the union
+        // statement does not produce. Any edit inside the loop that drops
+        // paths on the floor shrinks the left side ONLY, and is named here.
+        // Both are vacuously true on a tree that ignores nothing (0 >= 0),
+        // which the exported fixture tree is, so this is not a false red
+        // there; the reviewer's "assert each part is non-empty" would be one.
+        assert!(
+            ignored_paths.len() >= status_ignored.len(),
+            "control: `git status --ignored` named {} excluded path(s) in {root:?} but the \
+             union fed to the attribution audit holds only {}. The union is what gets \
+             attributed to a `.gitignore`; anything missing from it is excluded by a source \
+             nothing checks. An empty union makes the whole \
+             `.git/info/exclude` / `core.excludesFile` / untracked-`.gitignore` defence inert \
+             while every check below passes vacuously.",
+            status_ignored.len(),
+            ignored_paths.len()
+        );
+        assert!(
+            ignored_paths.len() >= listed_ignored.len(),
+            "control: `git ls-files --others --ignored` named {} excluded path(s) in {root:?} \
+             but the union fed to the attribution audit holds only {}. The second producer \
+             exists so that emptying the first does not empty the audit; a union smaller than \
+             it means the union statement, not either producer, is dropping paths.",
+            listed_ignored.len(),
+            ignored_paths.len()
+        );
         {
             use std::io::Write as _;
 
@@ -8111,7 +8185,9 @@ pub(crate) mod password_lifetime_tests {
                 .map(|raw| String::from_utf8_lossy(raw).replace('\\', "/").to_ascii_lowercase())
                 .collect();
             let mut foreign: Vec<String> = Vec::new();
+            let mut audited: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
             for record in fields.chunks(4) {
+                audited.insert(record[3]);
                 let source = String::from_utf8_lossy(record[0]).into_owned();
                 let pathname = String::from_utf8_lossy(record[3]).into_owned();
                 // The ONLY legitimate exclusion source: a `.gitignore` that is
@@ -8123,10 +8199,43 @@ pub(crate) mod password_lifetime_tests {
                 // UNTRACKED `.gitignore` fails on `cached`, which is the case
                 // that would otherwise be a one-file, no-diff bypass wearing a
                 // legitimate name.
+                // **Both comparisons now fold by the SAME rule, and the
+                // residual is stated rather than left as an asymmetry.** They
+                // disagreed: the file name was matched case-SENSITIVELY
+                // against `".gitignore"` while `source_rel` was matched
+                // case-INSENSITIVELY against `cached_rel`, so one half of this
+                // predicate believed `Docs` and `docs` were different files
+                // and the other half believed they were the same. Reading a
+                // predicate should not require knowing which half you are in,
+                // so `fold` is applied to both.
+                //
+                // The residual, plainly: on a CASE-SENSITIVE checkout, a
+                // tracked `Docs/.gitignore` makes an untracked
+                // `docs/.gitignore` legitimate. Folding the file name does not
+                // close that -- only a case-SENSITIVE path comparison would,
+                // and that is the comparison this block deliberately gave up,
+                // because on Windows (where this crate ships, and where the
+                // two ARE one file) git reports a tracked `Docs/.gitignore` as
+                // `docs/.gitignore` and an exact comparison red-lines the
+                // suite for nothing. A configuration macro cannot arbitrate it
+                // either, because this
+                // crate refuses configuration-dependent compilation outright
+                // (`nothing_in_this_crate_is_compiled_differently_when_it_is_tested`),
+                // and rightly, since a suite green about a different program
+                // is the failure mode all of this exists to prevent. So the
+                // cost of the residual is: two `.gitignore` files whose paths
+                // differ only in case, on a filesystem that distinguishes
+                // them, one of the two committed. This tree has exactly one
+                // tracked `.gitignore`, so the set of spellings available to
+                // borrow is empty.
                 let as_path = root.join(&source);
-                let source_rel = source.replace('\\', "/").to_ascii_lowercase();
-                let legitimate = std::path::Path::new(&source).file_name()
-                    == Some(std::ffi::OsStr::new(".gitignore"))
+                let fold = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
+                let source_rel = fold(&source);
+                let named_gitignore = std::path::Path::new(&source)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| fold(name) == fold(".gitignore"));
+                let legitimate = named_gitignore
                     && as_path.starts_with(&root)
                     && cached_rel.iter().any(|tracked| *tracked == source_rel);
                 if !legitimate {
@@ -8146,6 +8255,50 @@ pub(crate) mod password_lifetime_tests {
                  this repository's tracked `.gitignore`, where review can see it.",
                 foreign.len(),
                 foreign
+            );
+            // **THE YARDSTICK THAT DOES NOT MOVE WITH THE FED LIST.**
+            //
+            // `fields.len() == ignored_paths.len() * 4` above is
+            // self-referential and always was: `fields` is `check-ignore`'s
+            // answer TO `ignored_paths`, so it compares the child's output
+            // against the child's own input. It detects the child
+            // under-ANSWERING -- a truncated stdout, which is why it stays --
+            // and it cannot detect the producers under-REPORTING, because
+            // shrinking the fed list shrinks both sides of it together. It is
+            // the same family as `scanned == files.len()` and `closes_read ==
+            // gates_seen`.
+            //
+            // These two are not. The left side is the set of pathnames the
+            // audit above actually attributed; the right side is a producer's
+            // OWN parse, bound before the union and never fed to anything. An
+            // edit that shrinks what reaches `check-ignore` -- the deleted
+            // `!`, a truncated union, a pathspec, a `.filter()` -- shrinks the
+            // left side and leaves the right side exactly where it was, so it
+            // is named here rather than passing vacuously. There is no single
+            // binding both sides read.
+            //
+            // Vacuous on a tree that ignores nothing, which is correct: with
+            // nothing excluded there is nothing to attribute.
+            let mut unaudited: Vec<String> = status_ignored
+                .iter()
+                .chain(listed_ignored.iter())
+                .filter(|path| !audited.contains(*path))
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect();
+            unaudited.sort();
+            unaudited.dedup();
+            assert!(
+                unaudited.is_empty(),
+                "{} path(s) that `git status --ignored` or `git ls-files --others --ignored` \
+                 called excluded in {root:?} were never attributed to any exclusion source: \
+                 {:?}. Every path either producer names as excluded must be traced back to a \
+                 tracked `.gitignore`, and one that never reached `git check-ignore` was not \
+                 traced back to anything -- the audit reported green about a set it never \
+                 examined. This assert takes its expectation from the producers' own parses \
+                 rather than from the list that was fed to `check-ignore`, precisely so that \
+                 an edit shrinking the fed list cannot shrink the expectation with it.",
+                unaudited.len(),
+                unaudited
             );
         }
 
