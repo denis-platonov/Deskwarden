@@ -14,6 +14,18 @@ target/
 # `.gitignore` with `*`; this covers anything added alongside it later).
 /.superpowers/
 
+# Agent tooling state, including `.claude/worktrees/`. Those worktrees are
+# real checkouts of this repository, so the probe scan in `login_ui.rs`
+# would otherwise enumerate them via `git ls-files --others
+# --exclude-standard` and red-line the suite -- as a nested-repository
+# refusal, or by finding a pre-`concat!` copy of the probe in one of their
+# own sources and printing a path that looks like a plaintext master
+# password. Until now the ONLY thing keeping them out was
+# `.git/info/exclude`, which is machine-local and is never cloned, so the
+# suite was green here and red on any fresh clone whose agent tooling
+# created the directory. Nothing under `.claude/` is tracked.
+/.claude/
+
 # Editor / OS noise
 .vscode/
 .idea/

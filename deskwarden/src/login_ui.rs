@@ -6115,10 +6115,31 @@ pub(crate) mod password_lifetime_tests {
     /// the source, which is the remedy this test recommends.
     ///
     /// I/O errors are RETURNED, not swallowed. See the caller.
+    ///
+    /// **And so is the number of bytes actually consumed**, which is the whole
+    /// reason the return type is a pair. The round before this one closed the
+    /// silent-*error* return and then asserted `scanned == files.len()` over
+    /// the caller's loop -- but `scanned` counted LOOP TRIPS, not evidence, so
+    /// a silent-*success* return from the top of this function
+    /// (`if path.ends_with("probe_fixture.bin") { return Ok(None); }`, one
+    /// line) left `unreadable` empty, `scanned` at its full value, and BOTH
+    /// new equalities holding while a real committed probe went unseen.
+    /// Measured on an export: SURVIVED in debug and in release.
+    ///
+    /// A counter the caller derives from this function's control flow is a
+    /// counter this function can satisfy without doing any work. A byte total
+    /// is not: the caller checks it against `std::fs::metadata(..).len()`, an
+    /// independent syscall this function never makes, and an early return
+    /// therefore shows up as MISSING BYTES on a named file. Fabricating it
+    /// means writing the true length in here -- a `metadata` call of its own,
+    /// not a bare `return` -- which is no longer a silent success.
+    ///
+    /// On a HIT the count is short by design; the caller asserts the byte
+    /// equality only after it has already asserted there was no hit.
     fn scan_for_needles(
         path: &std::path::Path,
         needles: &[(&'static str, &[u8])],
-    ) -> std::io::Result<Option<&'static str>> {
+    ) -> std::io::Result<(u64, Option<&'static str>)> {
         use std::io::Read as _;
 
         const CHUNK: usize = 1 << 20;
@@ -6131,17 +6152,19 @@ pub(crate) mod password_lifetime_tests {
         let mut handle = std::fs::File::open(path)?;
         let mut window: Vec<u8> = Vec::with_capacity(overlap + CHUNK);
         let mut chunk = vec![0u8; CHUNK];
+        let mut consumed: u64 = 0;
         loop {
             let read = handle.read(&mut chunk)?;
             if read == 0 {
-                return Ok(None);
+                return Ok((consumed, None));
             }
+            consumed += read as u64;
             window.extend_from_slice(&chunk[..read]);
             if let Some((label, _)) = needles
                 .iter()
                 .find(|(_, n)| !n.is_empty() && window.windows(n.len()).any(|w| w == *n))
             {
-                return Ok(Some(label));
+                return Ok((consumed, Some(label)));
             }
             let keep = window.len().min(overlap);
             let drop_to = window.len() - keep;
@@ -6895,7 +6918,18 @@ pub(crate) mod password_lifetime_tests {
     /// coordinated edits because the file list is the union of three separately
     /// written invocations -- `ls-files` plus `--others`, `ls-tree -r HEAD`, and
     /// `ls-files --cached` -- each at its own call site, with a named
-    /// cross-check between the first two. Measured on an export with a real
+    /// cross-check between the first two.
+    ///
+    /// **Three call sites, but only TWO distinct questions**, and the earlier
+    /// wording here ("three independent producers") overclaimed. `ls-files`
+    /// defaults to `--cached`, so the first and third invocations ask git the
+    /// same thing in two spellings; `ls-tree -r HEAD` asks a different one (the
+    /// commit, not the index). What the three-edit floor rests on is that a
+    /// pathspec is written per `Command`, so the same question asked twice
+    /// still has to be corrupted twice -- the floor is real and it is measured.
+    /// The INDEPENDENCE is not, and is not claimed any more: corrupting the
+    /// index question at both of its sites plus the tree question is three
+    /// edits over two questions, not over three. Measured on an export with a real
     /// probe in the tracked `deskwarden/examples/ui_preview.rs`: one edit
     /// (a pathspec on `ls-files`) is KILLED and inert; two edits (that plus an
     /// `ls-tree` rewritten to a positive pathspec, since `ls-tree` refuses
@@ -7249,6 +7283,7 @@ pub(crate) mod password_lifetime_tests {
         );
 
         let mut scanned = 0usize;
+        let mut consumed_total: u64 = 0;
         let mut unreadable: Vec<String> = Vec::new();
         let mut scanned_this_file = false;
         for file in &files {
@@ -7284,8 +7319,8 @@ pub(crate) mod password_lifetime_tests {
             // property it could not check, and a test that cannot check its
             // property says so instead of quietly checking a weaker one. The
             // remedy for a real lock is to re-run, not to tolerate it.
-            let found = match scan_for_needles(file, &needles) {
-                Ok(found) => found,
+            let (consumed, found) = match scan_for_needles(file, &needles) {
+                Ok(result) => result,
                 Err(error) => {
                     unreadable.push(format!("{} ({error})", file.display()));
                     continue;
@@ -7309,6 +7344,38 @@ pub(crate) mod password_lifetime_tests {
                 file.display(),
                 found.unwrap_or("")
             );
+
+            // **The evidence, per file, against a source the reader cannot
+            // fabricate.** `consumed` is what the read loop actually pulled
+            // off the disk; `len()` here is a separate `stat` this test makes
+            // for itself. A `scan_for_needles` that returns early -- for one
+            // file name, for a size, for anything -- reports fewer bytes than
+            // the file has and is named right here. The hit assert above has
+            // already run, so a short count from a genuine hit cannot reach
+            // this line.
+            let on_disk = std::fs::metadata(file)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} was scanned but could not be measured ({error}), so the byte \
+                         evidence below cannot be checked against anything",
+                        file.display()
+                    )
+                })
+                .len();
+            assert!(
+                consumed == on_disk,
+                "{} is {on_disk} bytes on disk but the scan consumed only {consumed} of them, \
+                 so the probe could be sitting in the {} bytes that were never looked at. This \
+                 is the control the previous round did not have: `scanned == files.len()` \
+                 counted LOOP TRIPS, and a `scan_for_needles` that returns `Ok(None)` without \
+                 reading anything satisfies a trip count for free -- measured, that one line \
+                 SURVIVED in both profiles with a real committed probe unseen. A byte total \
+                 checked against `std::fs::metadata` cannot be satisfied for free, because \
+                 this number comes from a syscall the scan function never makes",
+                file.display(),
+                on_disk.saturating_sub(consumed)
+            );
+            consumed_total += consumed;
         }
 
         // The controls above are over the LIST. This is over what was
@@ -7343,6 +7410,247 @@ pub(crate) mod password_lifetime_tests {
             scanned_this_file,
             "control: the file that declares the probe was listed but was not scanned, so the \
              one file this test exists to police was not policed"
+        );
+
+        // **And the same evidence in aggregate.** The per-file equality above
+        // lives inside the loop, so it is only reached by a file the loop
+        // reached; this one is computed from `files` afresh and catches a file
+        // that was listed and then skipped entirely. It is deliberately a
+        // second `metadata` pass rather than a sum accumulated alongside
+        // `consumed_total`, so that the two sides of this equality come from
+        // two different walks of the list.
+        let expected_total: u64 = files
+            .iter()
+            .map(|file| {
+                std::fs::metadata(file)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} is in the list this test scanned but could not be measured \
+                             ({error})",
+                            file.display()
+                        )
+                    })
+                    .len()
+            })
+            .sum();
+        assert!(
+            consumed_total == expected_total && expected_total > 0,
+            "the {} listed files hold {expected_total} bytes between them but the scan \
+             consumed {consumed_total}, a shortfall of {}. Every listed file must be read \
+             end to end; a byte that was never read is a byte the probe could be in. Unlike \
+             `scanned` this is not a count of loop trips, and unlike anything the read loop \
+             reports about itself it is measured by `std::fs::metadata` here, which is why a \
+             silent-success return inside `scan_for_needles` cannot satisfy it",
+            files.len(),
+            expected_total.saturating_sub(consumed_total)
+        );
+
+        // **A SECOND READER, separately written, over the same files.**
+        //
+        // The byte total above closes the *silent* success return -- a bare
+        // `return Ok((0, None))` at the top of `scan_for_needles` is now named,
+        // with the file and the shortfall. It does NOT close a return that
+        // LIES about the count, and that was measured rather than assumed:
+        // `return Ok((std::fs::metadata(path)?.len(), None))`, one line, keeps
+        // `unreadable` empty, `scanned` full, the per-file equality satisfied
+        // and the aggregate satisfied, with a real committed probe unseen --
+        // SURVIVED. Any quantity a single reader reports about itself can be
+        // fabricated by that reader; the only thing a reader cannot fake is
+        // another reader.
+        //
+        // So the bytes are searched twice, by two loops written out separately,
+        // the way the file list is asked for by two separately written
+        // `Command`s rather than one builder called twice. This one is not a
+        // call to `scan_for_needles` and shares no line with it: its own
+        // `File`, its own buffer at a DIFFERENT size (64 KiB, so a needle at a
+        // 1 MiB boundary is mid-buffer here and split there, and vice versa),
+        // its own carry computed from the same needles, its own byte total.
+        // Corrupting the scan now costs TWO coordinated edits at two call
+        // sites -- and either one alone is both loud and inert, because the
+        // byte totals of the two passes are asserted equal to each other and
+        // to the `metadata` sum.
+        //
+        // The cost is honest: every listed file is read twice. On this tree
+        // that is ~10 MB and unmeasurable; on a force-added multi-gigabyte
+        // artifact it doubles the disclosed 9.75 s release / 40.5 s debug.
+        // Memory does not double -- this loop is chunked for the same reason
+        // the other is, and there is no size predicate here either, because a
+        // size predicate is the exact shape six rounds were spent deleting.
+        const VERIFY_CHUNK: usize = 64 << 10;
+        let carry = needles
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        assert!(
+            carry >= PROBE.len(),
+            "control: the second reader's carry is {carry} bytes, which is shorter than the \
+             probe itself, so it could not span any boundary at all"
+        );
+        let mut verified_total: u64 = 0;
+        for file in &files {
+            use std::io::Read as _;
+
+            let mut handle = std::fs::File::open(file).unwrap_or_else(|error| {
+                panic!("{} could not be re-opened for the second pass ({error})", file.display())
+            });
+            let mut tail: Vec<u8> = Vec::with_capacity(carry + VERIFY_CHUNK);
+            let mut buffer = vec![0u8; VERIFY_CHUNK];
+            loop {
+                let read = handle.read(&mut buffer).unwrap_or_else(|error| {
+                    panic!("{} could not be re-read for the second pass ({error})", file.display())
+                });
+                if read == 0 {
+                    break;
+                }
+                verified_total += read as u64;
+                tail.extend_from_slice(&buffer[..read]);
+                for (label, needle) in &needles {
+                    assert!(
+                        needle.is_empty()
+                            || !tail.windows(needle.len()).any(|window| window == *needle),
+                        "{} contains the assembled probe ({label}), and it took a SECOND, \
+                         separately written reader to see it -- the first pass reported this \
+                         file clean. Whatever `scan_for_needles` is doing, it is not searching \
+                         this file. Split the literal with `concat!`; if this named a build \
+                         artifact, point `CARGO_TARGET_DIR` outside the repository",
+                        file.display()
+                    );
+                }
+                let keep = tail.len().min(carry);
+                let drop_to = tail.len() - keep;
+                tail.drain(..drop_to);
+            }
+        }
+        assert!(
+            verified_total == expected_total && verified_total == consumed_total,
+            "the two readers did not cover the same bytes: the first consumed {consumed_total}, \
+             the second {verified_total}, and `std::fs::metadata` says the {} listed files hold \
+             {expected_total}. Two passes that disagree mean one of them skipped something, and \
+             a skipped byte is a byte the probe could be in",
+            files.len()
+        );
+    }
+
+    /// **The chunk carry, pinned.** [`scan_for_needles`] reads in 1 MiB chunks
+    /// and carries `max_needle_len - 1` bytes of each chunk into the next, so a
+    /// probe lying across a chunk boundary is still found. That carry was
+    /// correct when it shipped and NOTHING TESTED IT: deleting it outright
+    /// (`.saturating_sub(1) * 0`) SURVIVED the whole 2243-test suite in debug
+    /// and in release, and with a real probe committed at a boundary offset the
+    /// scan test itself came back `ok. 1 passed` with the probe unseen. The
+    /// liveness pair at the identical site -- same mutant, probe at offset 0 --
+    /// was KILLED, so the mutation was reachable and simply unobserved.
+    ///
+    /// The tracked tree has no file big enough to have a 1 MiB boundary in it,
+    /// which is exactly why this needs a fixture rather than a committed one.
+    /// The fixture is written to the OS temp directory and deleted before the
+    /// assertions run -- **never into the tracked tree**, because a committed
+    /// file with the probe at a boundary would be a file containing the probe,
+    /// which is the property this module exists to deny. The needle comes from
+    /// [`PROBE`], so this source file does not contain it whole either.
+    ///
+    /// What is covered: the probe straddling the first 1 MiB boundary; the
+    /// same for the UTF-16LE transcoding, whose 74 bytes are what makes the
+    /// carry `max()` over all three needles rather than the first one's length;
+    /// the probe at the file's very first byte; the probe at its last bytes;
+    /// and a clean file of the same size, which is the liveness control that
+    /// stops all of the above from being four passes over a function that
+    /// answers `Some` unconditionally. Every case also asserts the byte total,
+    /// so the evidence the scan now relies on is pinned here too.
+    #[test]
+    fn the_chunk_carry_finds_a_probe_that_straddles_a_chunk_boundary() {
+        // This test writes the assembled probe into heap buffers. See the doc
+        // on `hold_the_probe_lock`; it must not race an armed allocator watch.
+        hold_the_probe_lock();
+
+        const CHUNK: usize = 1 << 20;
+        const SIZE: usize = 2 << 20;
+
+        let probe_utf16le: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let probe_utf16be: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        // The same three needles the scan uses, so `overlap` here is the same
+        // 73 bytes it is there.
+        let needles: [(&'static str, &[u8]); 3] = [
+            ("as bytes", PROBE.as_bytes()),
+            ("encoded UTF-16LE", &probe_utf16le),
+            ("encoded UTF-16BE", &probe_utf16be),
+        ];
+
+        let plant = |offset: usize, needle: &[u8]| -> Vec<u8> {
+            let mut bytes = vec![b'.'; SIZE];
+            bytes[offset..offset + needle.len()].copy_from_slice(needle);
+            bytes
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-chunk-carry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("the OS temp directory is writable");
+
+        let run = |name: &str, body: Vec<u8>| -> (usize, u64, Option<&'static str>) {
+            let path = dir.join(name);
+            std::fs::write(&path, &body).expect("the fixture is writable");
+            let (consumed, found) =
+                scan_for_needles(&path, &needles).expect("the fixture is readable");
+            (body.len(), consumed, found)
+        };
+
+        // Straddling the first chunk boundary: 10 bytes before it, the rest
+        // after. Without the carry the two halves are never in one window.
+        let straddle = run("straddle.bin", plant(CHUNK - 10, PROBE.as_bytes()));
+        // The 74-byte UTF-16LE needle split across the same boundary. A carry
+        // sized from the FIRST needle rather than the longest would be 36 bytes
+        // and would miss this one while still passing the case above.
+        let straddle_utf16 = run("straddle-utf16le.bin", plant(CHUNK - 37, &probe_utf16le));
+        // The first byte of the file: found in the first chunk, before any
+        // carry exists. This is the liveness half -- it is what the deleted
+        // carry still finds, so a case that fails here is a broken fixture and
+        // not a broken carry.
+        let first = run("first.bin", plant(0, PROBE.as_bytes()));
+        // The last bytes of the file, in a final short read.
+        let last = run("last.bin", plant(SIZE - PROBE.len(), PROBE.as_bytes()));
+        // The control: same size, no probe anywhere.
+        let clean = run("clean.bin", vec![b'.'; SIZE]);
+
+        // Deleted BEFORE the assertions, so a failure does not leave a file
+        // holding the assembled probe behind in the temp directory.
+        std::fs::remove_dir_all(&dir).expect("the fixture directory is removable");
+
+        assert!(
+            clean.2.is_none(),
+            "control: a 2 MiB file with no probe in it was reported as containing one ({:?}), \
+             so the four cases below are not evidence of anything",
+            clean.2
+        );
+        for (label, (size, consumed, found)) in [
+            ("straddling the first 1 MiB chunk boundary", straddle),
+            ("straddling that boundary as UTF-16LE", straddle_utf16),
+            ("at the file's first byte", first),
+            ("at the file's last bytes", last),
+        ] {
+            assert!(
+                found.is_some(),
+                "a probe {label} was NOT found in a {size}-byte fixture. The reader chunks at \
+                 1 MiB and carries `max_needle_len - 1` bytes forward for exactly this case; \
+                 measured, deleting that carry SURVIVED the entire suite, which is why this \
+                 test exists. A tracked file large enough to have a chunk boundary in it would \
+                 hide the probe across that boundary from the whole scan"
+            );
+            assert!(
+                consumed == size as u64 || found.is_some(),
+                "control: the fixture {label} reported {consumed} of {size} bytes consumed"
+            );
+        }
+        assert!(
+            clean.1 == clean.0 as u64 && clean.0 == SIZE,
+            "control: the clean 2 MiB fixture reported {} of {} bytes consumed, so the byte \
+             evidence the scan asserts against is not what this reader actually reads",
+            clean.1,
+            clean.0
         );
     }
 
