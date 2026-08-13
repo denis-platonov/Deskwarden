@@ -884,3 +884,516 @@ mod tests {
         );
     }
 }
+
+/// **Every Rust source file in this crate, walked, in one test.**
+///
+/// # Why this module exists
+///
+/// Fifteen per-file guards were written, converted and repaired over roughly
+/// ten rounds, and a census at `0097883` found that **35 of the crate's 49
+/// then-source files carried no below-the-cut guard at all**. The measured
+/// consequence, in `vault_window/item_list.rs` -- 5,200 lines, no guard, and a
+/// comment pointing at `vault_window/mod.rs`'s guard, which reads
+/// `include_str!("mod.rs")` and never looks at `item_list.rs`:
+///
+/// ```text
+/// pub fn shipped_il(x: u64) -> u64 { x.wrapping_mul(97) }
+/// ```
+///
+/// appended at column 0 to EOF SURVIVED the whole suite in debug AND release
+/// at 2225 lib / 217 bin / 6 ignored / 0 failed / 0 warnings, and appeared
+/// three times in the lib's DEBUG LLVM IR. It shipped.
+///
+/// The per-file approach lost that race because it is an ENUMERATION: a guard
+/// exists for a file only if somebody wrote one, and the files nobody thought
+/// of are exactly the files nobody read. So the file list here is DERIVED from
+/// the tree -- every `.rs` under the crate directory, cross-checked against a
+/// `git ls-files` oracle -- and the walk is the same
+/// [`crate::below_cut::match_brace`] the per-file guards use.
+///
+/// # What is asserted, and for which files
+///
+/// * A file whose cut exists is walked from that cut: below it there may be
+///   NOTHING but gated, column-0 module blocks, blank lines and comments.
+/// * A file that INTERLEAVES -- production code below its first test module,
+///   which three files in this crate legitimately do -- cannot satisfy that,
+///   so it is walked from its LAST gated module instead: after that module's
+///   real closing brace only blanks and comments may follow. The set of
+///   interleaving files is not a knob: it is compared against a written list
+///   and a file that joins it reds the suite.
+/// * A file with no cut at all is NOT skipped. A silent skip is how 35 files
+///   were missed. It is asserted to carry no test at all, which is the only
+///   reading under which "nothing lives below its cut" is true of a file that
+///   has no cut.
+#[cfg(test)]
+mod every_file_in_the_crate {
+    use super::{is_module_opener, match_brace};
+
+    /// The test gate, assembled so this module does not contain a column-0
+    /// occurrence of the string it searches for.
+    const GATE: &str = concat!("#[cfg", "(test)]");
+
+    /// The three files that carry production code BELOW their first gated
+    /// test module.
+    ///
+    /// Not an exemption a file can take by growing into it: this list is
+    /// compared for EQUALITY against the set derived from the tree, so a
+    /// fourth file that starts interleaving fails here by name, and a file
+    /// that stops interleaving fails here too. What membership costs is
+    /// stated in this module's report: in these three files the strict rule
+    /// is not available, only the tail rule, so a `pub fn` planted BETWEEN
+    /// two of their test modules is not caught. In every other file that
+    /// same payload is caught, and reaching it requires editing this list --
+    /// a second edit, in a test, naming the file.
+    const INTERLEAVED: &[&str] = &["src/app.rs", "src/injector/sequence.rs", "src/theme.rs"];
+
+    /// Every line of `source` as `(byte offset, line without its terminator)`.
+    ///
+    /// Offsets are into `source` itself and are used to slice `source`
+    /// itself. An offset taken in one copy of a file and used in another --
+    /// CRLF working-tree bytes against an LF `replace` -- was measured 7355
+    /// bytes off in this crate, and passed silently forever.
+    fn numbered(source: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for raw in source.split_inclusive('\n') {
+            out.push((at, raw.trim_end_matches('\n').trim_end_matches('\r')));
+            at += raw.len();
+        }
+        out
+    }
+
+    /// `true` for a line that is exactly one outer attribute and nothing
+    /// else.
+    ///
+    /// **Not `starts_with("#[")`.** That form skips the whole line, and
+    /// `#[allow(dead_code)] pub fn shipped() -> u64 { 7 }` is one line
+    /// beginning with `#[`. Requiring the line to END at the attribute's
+    /// bracket refuses that shape as top-level source, which is what it is.
+    fn is_lone_attribute(trimmed: &str) -> bool {
+        trimmed.starts_with("#[") && trimmed.ends_with(']')
+    }
+
+    /// The byte offset of the gate line of the FIRST gated, column-0 module
+    /// block in `source`, or `None` when the file has none.
+    ///
+    /// **Not the first gate in the file, and not the first gate that begins a
+    /// line either.** `own_cut_index` in `send_ui.rs` established that the
+    /// gate must at least begin a line, because that file spells it inside a
+    /// doc comment 490 lines above its first test module; that rule is kept
+    /// here and is the `line == GATE` comparison below. But a line-start gate
+    /// is still not always a cut: `lib.rs` gates a `pub mod` DECLARATION,
+    /// `accounts.rs` and `vault_bridge.rs` gate test-only helper `fn`s, and
+    /// `detail.rs` gates a `use`. Cutting at those put the walk in the middle
+    /// of production code, where it refused the next production line and
+    /// reported a violation that was really its own cut being wrong -- eleven
+    /// files did that when this rule was first measured. The cut is where the
+    /// file's test HALF begins, so it is the gate of the first gated module.
+    fn cut_index(source: &str) -> Option<usize> {
+        gate_offsets_opening_a_module(source).first().copied()
+    }
+
+    /// The offsets of every gate line in `source` that opens a column-0
+    /// module block, in order.
+    fn gate_offsets_opening_a_module(source: &str) -> Vec<usize> {
+        let lines = numbered(source);
+        let mut out = Vec::new();
+        for (i, &(offset, line)) in lines.iter().enumerate() {
+            if line != GATE {
+                continue;
+            }
+            // Between the gate and the module it gates there may be further
+            // attributes and comments, and nothing else.
+            let opener = lines[i + 1..].iter().find(|(_, l)| {
+                let t = l.trim();
+                !(t.is_empty() || t.starts_with("//") || is_lone_attribute(t))
+            });
+            if let Some(&(_, l)) = opener {
+                if !l.starts_with(char::is_whitespace) && is_module_opener(l.trim()) {
+                    out.push(offset);
+                }
+            }
+        }
+        out
+    }
+
+    /// Walk `region` -- a file from one of its cuts to EOF -- and require it
+    /// to be a sequence of gated, column-0 module blocks and nothing else.
+    ///
+    /// Returns the number of module blocks, or the reason the region is not
+    /// that shape.
+    ///
+    /// # Why the module's interior is not walked at all
+    ///
+    /// Every per-file walk in this crate reads the lines INSIDE a test module
+    /// looking for the column-0 line that closes it, which forces each of
+    /// them to carry a list of the column-0 lines that are really the
+    /// contents of a string literal -- an enumeration, per file, that goes
+    /// stale. It is unnecessary. The interior of a gated module cannot ship
+    /// whatever is written in it, and [`match_brace`] already says exactly
+    /// where the module ends, so this walk JUMPS from a module opener to the
+    /// byte past its real close and looks at nothing in between. A module
+    /// closed early by an INDENTED brace -- the balanced payload that beat
+    /// the line walks -- therefore lands its `pub fn` in the region this walk
+    /// is looking at, not in the region it is skipping.
+    fn walk(region: &str) -> Result<usize, String> {
+        let mut gated = false;
+        let mut modules = 0usize;
+        let mut resume = 0usize;
+        for (offset, line) in numbered(region) {
+            if offset < resume {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            if line == GATE {
+                gated = true;
+                continue;
+            }
+            if is_lone_attribute(trimmed) {
+                continue;
+            }
+            if !line.starts_with(char::is_whitespace) && is_module_opener(trimmed) {
+                if !gated {
+                    return Err(format!(
+                        "the module {line:?} below the cut is not test-gated, so it SHIPS, \
+                         and it ships in the half of the file no reviewer reads"
+                    ));
+                }
+                let Some(rel) = line.rfind('{') else {
+                    return Err(format!(
+                        "the module opener {line:?} does not end in an opening brace"
+                    ));
+                };
+                resume = match_brace(region, offset + rel) + 1;
+                modules += 1;
+                gated = false;
+                continue;
+            }
+            return Err(format!(
+                "top-level source below the cut: {line:?} at byte {offset} of the region. An \
+                 item down here is compiled into the shipped binary and sits in the half of \
+                 the file every guard in this crate stops reading at. Move it above the test \
+                 modules."
+            ));
+        }
+        Ok(modules)
+    }
+
+    /// Every `.rs` file under the crate directory, as absolute paths, sorted.
+    ///
+    /// `target/` is pruned by name at every depth: the user runs the built
+    /// application out of `deskwarden/target`, it holds no source of ours,
+    /// and reading it is minutes of I/O.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The `.rs` files git says this crate has, or `None` where git cannot
+    /// be run -- a release tarball, a `git archive` export.
+    ///
+    /// Tracked UNION untracked-and-not-ignored, because this repository is
+    /// developed write-then-compile-before-`add` and a file that is not yet
+    /// added is still a file that compiles into the binary.
+    fn git_listed(dir: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+        fn list(dir: &std::path::Path, extra: &[&str]) -> Option<Vec<String>> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["ls-files", "-z"])
+                .args(extra)
+                .output()
+                .ok()?;
+            out.status.success().then(|| {
+                out.stdout
+                    .split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect()
+            })
+        }
+        let mut all = list(dir, &[])?;
+        all.extend(list(dir, &["--others", "--exclude-standard"]).unwrap_or_default());
+        let mut out: Vec<std::path::PathBuf> = all
+            .iter()
+            .filter(|rel| rel.ends_with(".rs") && !rel.starts_with("target/"))
+            .map(|rel| dir.join(rel))
+            .filter(|p| p.is_file())
+            .collect();
+        out.sort();
+        out.dedup();
+        Some(out)
+    }
+
+    /// `path` relative to the crate directory, with forward slashes.
+    fn relative(crate_dir: &std::path::Path, path: &std::path::Path) -> String {
+        path.strip_prefix(crate_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// **Nothing but gated test modules lives below the cut of ANY file in
+    /// this crate.**
+    ///
+    /// See this module's documentation for what shipped through the hole
+    /// this closes and why the file list is derived rather than written.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_any_files_cut() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        rust_sources(crate_dir, &mut files);
+        files.sort();
+
+        // ---- Non-vacuity of the LIST itself. A derived list that misses a
+        // file is the defect this test exists to fix, so the list is measured
+        // before it is used.
+        assert!(
+            files.len() >= 55,
+            "control: only {} `.rs` files were derived from {crate_dir:?}. This crate has had \
+             sixty-one since the census; a list this short means the walk below is a walk over \
+             a fraction of the crate, which is precisely the failure being fixed",
+            files.len()
+        );
+        for known in [
+            "src/below_cut.rs",
+            "src/lib.rs",
+            "src/login_ui.rs",
+            "src/vault_window/mod.rs",
+            "src/vault_window/send_ui.rs",
+            "src/vault_window/item_list.rs",
+            "src/vault_window/folder_modal.rs",
+            "src/injector/sequence.rs",
+            "src/hotkey.rs",
+            "build.rs",
+        ] {
+            assert!(
+                files.iter().any(|p| relative(crate_dir, p) == known),
+                "control: the derived list does not contain {known:?}, so whatever is below \
+                 that file's cut is not being read by this test"
+            );
+        }
+        // ---- And against an independent oracle, where one can be had. The
+        // walk and `git ls-files` disagreeing means one of them is wrong
+        // about what this crate is made of.
+        if let Some(listed) = git_listed(crate_dir) {
+            let derived: Vec<String> = files.iter().map(|p| relative(crate_dir, p)).collect();
+            let oracle: Vec<String> = listed.iter().map(|p| relative(crate_dir, p)).collect();
+            assert!(
+                oracle.len() >= 55,
+                "control: git listed only {} `.rs` files, so it is not an oracle for anything",
+                oracle.len()
+            );
+            for rel in &oracle {
+                assert!(
+                    derived.contains(rel),
+                    "git says this crate owns {rel:?} and the directory walk did not reach \
+                     it, so it would never have been walked"
+                );
+            }
+            for rel in &derived {
+                assert!(
+                    oracle.contains(rel),
+                    "the directory walk reached {rel:?} and git does not list it: it is \
+                     ignored, or it is build output this walk should not be reading"
+                );
+            }
+        }
+
+        // ---- The property, file by file. Every file lands in exactly one of
+        // the three buckets and NONE of them is a skip.
+        let mut with_cut = 0usize;
+        let mut modules_seen = 0usize;
+        let mut interleaved: Vec<String> = Vec::new();
+        for path in &files {
+            let rel = relative(crate_dir, path);
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{rel} is readable to be walked: {e}"));
+
+            let Some(cut) = cut_index(&source) else {
+                // **A file with no cut is not skipped.** A silent skip is
+                // how thirty-five files went unguarded. "No gated test
+                // module" is only the same as "nothing lives below a cut"
+                // if the file really has no tests, so that is asserted
+                // rather than assumed: a `#[test]` here would be a test
+                // outside any gated module, which SHIPS.
+                let ungated_test = source
+                    .lines()
+                    .find(|l| l.trim().starts_with(concat!("#[", "test]")));
+                assert!(
+                    ungated_test.is_none(),
+                    "{rel} has no gated test module, so this test read it as production from \
+                     the first byte to the last -- and it contains {ungated_test:?}, a test \
+                     attribute outside any `cfg(test)` module. That test, and everything it \
+                     touches, is compiled into the shipped binary."
+                );
+                continue;
+            };
+            with_cut += 1;
+            assert!(
+                cut == 0 || source.as_bytes()[cut - 1] == b'\n',
+                "{rel}: the cut landed in the middle of a line, so the gate was matched \
+                 inside a comment or a string literal rather than at a real attribute"
+            );
+
+            match walk(&source[cut..]) {
+                Ok(modules) => {
+                    assert!(modules > 0, "{rel}: the walk below the cut opened no module");
+                    modules_seen += modules;
+                }
+                Err(why) => {
+                    // The file carries production below its first test
+                    // module. That is legal Rust and three files here do it
+                    // deliberately; it is NOT licence to stop reading the
+                    // file. The tail -- the region below its LAST gated
+                    // module, which is the half nobody reads and the half
+                    // every measured payload landed in -- is walked under
+                    // exactly the same rule.
+                    assert!(
+                        why.starts_with("top-level source below the cut"),
+                        "{rel} was refused below its first cut, and not for the interleaved \
+                         production this test tolerates: {why}"
+                    );
+                    interleaved.push(rel.clone());
+                    let tail = *gate_offsets_opening_a_module(&source)
+                        .last()
+                        .expect("the cut exists, so at least one gate opens a module");
+                    let modules = walk(&source[tail..]).unwrap_or_else(|why| {
+                        panic!(
+                            "{rel}: below the LAST gated test module in this file -- the tail \
+                             no guard in this crate reads -- {why}"
+                        )
+                    });
+                    assert_eq!(
+                        modules, 1,
+                        "control: the walk from the LAST gate in {rel} opened {modules} \
+                         modules rather than one, so `tail` is not the last gate"
+                    );
+                    modules_seen += modules;
+                }
+            }
+        }
+
+        // ---- Non-vacuity of the WALK.
+        assert!(
+            with_cut >= 44,
+            "control: only {with_cut} of {} files had a cut at all, so the property was \
+             asserted about almost nothing and the rest of this test is the no-cut branch",
+            files.len()
+        );
+        assert!(
+            modules_seen >= 130,
+            "control: only {modules_seen} gated test modules were walked across the crate, \
+             so the cut-finding rule has stopped finding cuts"
+        );
+
+        // ---- The interleaving set is compared, not consulted.
+        interleaved.sort();
+        assert_eq!(
+            interleaved.iter().map(String::as_str).collect::<Vec<&str>>(),
+            INTERLEAVED.to_vec(),
+            "the set of files carrying production BELOW their first test module has changed. \
+             This is not a list to update without reading `INTERLEAVED`: a file on it gets \
+             the tail rule only, so a `pub fn` planted between two of its test modules is not \
+             caught. If a file has newly joined, move its production above its test modules \
+             instead of adding it here."
+        );
+
+        // ---- Liveness, at the site the census measured, on the real bytes.
+        //
+        // A guard that no longer refuses anything reports `ok` forever. Both
+        // payloads below are the ones measured SHIPPING in this crate, and
+        // both are applied to a real file's real text.
+        let victim = files
+            .iter()
+            .find(|p| relative(crate_dir, p) == "src/vault_window/item_list.rs")
+            .expect("checked in the known-names control above");
+        let source = std::fs::read_to_string(victim).expect("readable");
+        let cut = cut_index(&source).expect("`item_list.rs` has a cut");
+        assert!(
+            walk(&source[cut..]).is_ok(),
+            "control: the walk refuses `item_list.rs` as it actually is, so the two refusals \
+             below are a walk that refuses everything"
+        );
+
+        // 1. The census payload: appended at column 0 to EOF. Measured
+        //    SURVIVING at 2225 lib / 217 bin / 6 ignored / 0 failed / 0
+        //    warnings in both profiles, with three occurrences in the debug
+        //    LLVM IR.
+        let appended = format!("{source}pub fn shipped_il(x: u64) -> u64 {{ x.wrapping_mul(97) }}\n");
+        // The cut is recomputed IN the string being sliced. `cut` above is an
+        // offset into `source`; slicing a different string with it was
+        // measured 7355 bytes off in this crate.
+        let cut_of_appended = cut_index(&appended).expect("the append does not move the cut");
+        let why = walk(&appended[cut_of_appended..])
+            .expect_err("the walk accepted a column-0 `pub fn` appended below the cut");
+        assert!(
+            why.starts_with("top-level source below the cut"),
+            "the appended `pub fn` was refused, but not by the rule this control names: {why}"
+        );
+
+        // 2. The BALANCED payload, which beat every line walk in this crate:
+        //    the last module is closed by an INDENTED brace, the `pub fn`
+        //    sits at file scope after it, and a column-0 `}` further down
+        //    restores the brace count. Nothing here is a lexer trick; the
+        //    file parses.
+        //
+        //    It is written by INSERTING before the file's last column-0 `}`
+        //    rather than by appending after it, because appending cannot
+        //    produce this shape: the payload has to STEAL the module's own
+        //    closing brace to stay balanced, and an appended one has nothing
+        //    to steal. The stolen brace becomes the `pub fn`'s close.
+        let last_close = source.rfind("\n}").expect("`item_list.rs` ends in a column-0 brace");
+        let mut balanced = source.clone();
+        balanced.insert_str(
+            last_close + 1,
+            "    }\npub fn shipped_bal(x: u64) -> u64 {\n    x.wrapping_mul(97)\n",
+        );
+        // Balanced means balanced: the payload adds as many closes as opens
+        // plus the one it steals, so a brace count over the whole file cannot
+        // tell it from the original. That is the control on the control.
+        assert_eq!(
+            balanced.matches('{').count() - balanced.matches('}').count(),
+            source.matches('{').count() - source.matches('}').count(),
+            "control: the balanced payload changed the file's brace balance, so it is the \
+             column-0 payload again under another name and the refusal below proves nothing \
+             about the indented close"
+        );
+        let cut_of_balanced = cut_index(&balanced).expect("the append does not move the cut");
+        let why = walk(&balanced[cut_of_balanced..])
+            .expect_err("the walk accepted a file-scope `pub fn` between an indented module \
+                         close and a column-0 rebalancing brace");
+        assert!(
+            why.starts_with("top-level source below the cut") && why.contains("shipped_bal"),
+            "the balanced payload was refused, but not for the file-scope `pub fn` it plants: \
+             {why}"
+        );
+
+        // 3. And the shape that hides an item behind an attribute on the same
+        //    line, which a `starts_with` skip over attribute lines would walk
+        //    straight past. See `is_lone_attribute`.
+        let attributed =
+            format!("{source}#[allow(dead_code)] pub fn shipped_attr(x: u64) -> u64 {{ x }}\n");
+        let cut_of_attributed = cut_index(&attributed).expect("the append does not move the cut");
+        assert!(
+            walk(&attributed[cut_of_attributed..]).is_err(),
+            "the walk accepted a `pub fn` written on the same line as an outer attribute, so \
+             one attribute is all it costs to put an item below any cut in this crate"
+        );
+    }
+}

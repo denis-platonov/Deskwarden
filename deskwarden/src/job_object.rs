@@ -1602,6 +1602,50 @@ mod tests {
         )));
     }
 
+    /// **The crate-wide below-the-cut guard still exists.**
+    ///
+    /// A census at `0097883` found thirty-five of the crate's forty-nine
+    /// source files carrying no below-the-cut guard at all, and the fix was a
+    /// single test in `below_cut.rs` that walks every `.rs` file in the crate.
+    /// A single test is a single edit: nothing in the crate referenced that
+    /// function, so DELETING it was one edit, everywhere, and the suite went
+    /// green over thirty-five files again. Its helpers going unused would
+    /// leave `warning: function is never used` behind, which the zero-warning
+    /// discipline catches -- but deleting the whole module leaves nothing at
+    /// all.
+    ///
+    /// This is the second holder, and it is deliberately cheap: it makes that
+    /// deletion cost TWO edits in two files rather than one, and the second
+    /// one is a test that says out loud what is being removed. It cannot
+    /// check that the guard is CORRECT -- the guard's own controls do that --
+    /// only that it is still there and still derives its file list rather
+    /// than naming files.
+    #[test]
+    fn the_crate_wide_below_the_cut_guard_has_not_been_deleted() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/below_cut.rs"),
+        )
+        .expect("`below_cut.rs` is readable");
+        for needle in [
+            "fn nothing_but_gated_test_modules_lives_below_any_files_cut(",
+            // The list must stay DERIVED. A guard that enumerated its files
+            // would be the shape the census found failing.
+            "fn rust_sources(",
+            "ls-files",
+            // And the no-cut files must stay asserted about rather than
+            // skipped: a silent skip is how thirty-five files were missed.
+            "has no gated test module",
+        ] {
+            assert!(
+                source.contains(needle),
+                "`below_cut.rs` no longer contains {needle:?}. The crate-wide walk over every \
+                 source file's tail has been deleted or rewritten into something that no \
+                 longer derives what it reads. Thirty-five of this crate's files have no \
+                 guard of their own; that test is the only thing reading their tails."
+            );
+        }
+    }
+
     #[test]
     fn the_two_job_bearing_modules_can_start_a_child_only_through_this_one() {
         // THE OTHER HALF OF THE SEAM. The probe proves what arrives at
@@ -2392,6 +2436,13 @@ mod tests {
         // is the point: it is not a hole, it is a signature.
         //
         //   job_object.rs  -- the choke point itself, and its own tests.
+        //   below_cut.rs   -- `git ls-files`, run as the independent oracle on
+        //                     the crate-wide below-the-cut walk's derived file
+        //                     list. That whole file is declared `#[cfg(test)]`
+        //                     in `lib.rs`, so the child it starts cannot exist
+        //                     in a shipped binary at all -- which is a weaker
+        //                     claim than "it is in the job" and is why it is
+        //                     written here rather than left implicit.
         //   login_ui.rs, main.rs, updater.rs, vault_window/mod.rs
         //                  -- pre-existing spawns outside this change's scope.
         //
@@ -2402,6 +2453,7 @@ mod tests {
         // only one of them spawns, and a name-keyed list would have excused
         // both.
         const ALLOWED: &[&str] = &[
+            "below_cut.rs",
             "job_object.rs",
             "login_ui.rs",
             "main.rs",
