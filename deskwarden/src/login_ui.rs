@@ -6241,7 +6241,30 @@ pub(crate) mod password_lifetime_tests {
             // on the git path while the fallback refused it. It is the same
             // hole as the planted marker, reached by a real repository
             // rather than a forged one, so it gets the same answer.
-            if !is_tracked && path.is_dir() && nested_repository_shape(&path) {
+            // **Before `is_file`, and for TRACKED entries too -- this is the
+            // gitlink hole, and it cost ZERO source edits.** A nested clone
+            // COMMITTED as a gitlink (`160000 commit <sha> vendor/nested`) is
+            // listed by `git ls-files` as one TRACKED entry, so the old
+            // `!is_tracked` gate here sent it straight to the `is_file` guard
+            // below, which dropped it in silence -- a whole probe-bearing
+            // working tree out of scope with the source completely unmodified
+            // and `git status` clean. The three-producer floor bought nothing:
+            // `ls-tree -r HEAD` and `ls-files --cached` each apply their own
+            // `.filter(|p| p.is_file())`, so all three producers dropped it
+            // independently. Measured, and then measured again after this
+            // change: refused, loudly.
+            //
+            // A gitlink IS a repository shape by definition -- the directory
+            // on disk holds a `.git` (a FILE, `gitdir: ../.git/modules/...`,
+            // for a submodule; a DIRECTORY for a plain nested clone) -- so
+            // `nested_repository_shape` already recognises it and the only
+            // thing that had to change was the order and the gate. A tracked
+            // FILE is never `is_dir()`, so dropping the `!is_tracked` gate
+            // changes nothing about ordinary tracked entries; a gitlink whose
+            // directory is not checked out at all is not a repository shape
+            // and falls through to the guard below, where there is genuinely
+            // nothing on disk to read.
+            if path.is_dir() && nested_repository_shape(&path) {
                 if !refused.iter().any(|r| *r == path) {
                     refused.push(path);
                 }
@@ -6256,9 +6279,11 @@ pub(crate) mod password_lifetime_tests {
                 continue;
             }
             // Tracked content is this repository's by definition, and git
-            // has already decided that -- so no PLANTED MARKER beside a
-            // tracked path can take it out of scope: the repository-shape
-            // test below runs on untracked entries only. An untracked path
+            // has already decided that -- so no PLANTED MARKER beside or
+            // above a tracked FILE can take it out of scope: the ANCESTOR
+            // repository-shape test below runs on untracked entries only,
+            // and the entry-level test above cannot fire on a tracked file
+            // because a tracked file is not a directory. An untracked path
             // has had only `.gitignore` applied to it, which does not know
             // about a nested bare repository, so it gets the same
             // repository-shape test the fallback walk uses -- and, as
@@ -6276,12 +6301,13 @@ pub(crate) mod password_lifetime_tests {
             // scanned; that is the loud direction, and it is the intended
             // one.
             //
-            // Also disclosed, and not fixed here: a nested clone COMMITTED
-            // as a gitlink is listed by `git ls-files` as one tracked entry
-            // that is not a file, so the `is_file` guard above drops it and
-            // its whole working tree is out of scope. Measured. This
-            // repository has no submodules, so the pin for it would have to
-            // be built rather than observed.
+            // The gitlink case that used to be disclosed here and NOT fixed
+            // -- a nested clone committed as `160000 commit <sha> path`,
+            // dropped by the `is_file` guard with its whole working tree out
+            // of scope at zero source edits -- is fixed above: the
+            // repository-shape refusal now runs BEFORE `is_file` and on
+            // tracked entries too. It is the cheapest hole this test ever
+            // had and it left no diff at all.
             if !is_tracked {
                 if let Some(nested) = path
                     .ancestors()
@@ -7106,6 +7132,15 @@ pub(crate) mod password_lifetime_tests {
         // reproduce `CARGO_MANIFEST_DIR` exactly -- not by suffix, not by
         // containment, by equality of the whole path.
         //
+        // That equality is `Path::eq`, which compares `components()`, so it
+        // is COMPONENT-WISE and not byte-wise: a trailing separator, a
+        // doubled separator and a `.` component are all absorbed, while `..`
+        // is preserved as a component and therefore never absorbed. No
+        // path-arithmetic dressing of a decoy -- `root/./sub/`, `root//sub`,
+        // `root/sub/` -- can make an unequal path compare equal here, and
+        // none can make the real one compare unequal either. If any comment
+        // in this file claims this comparison is byte-wise, it is wrong.
+        //
         // **Why the two `env!` expansions are written out separately, and
         // must stay that way.** The obvious tidy-up is
         //
@@ -7120,10 +7155,36 @@ pub(crate) mod password_lifetime_tests {
         // compiler and there is no binding between them, so the pin costs an
         // attacker TWO edits at two sites. Do not factor these together.
         //
-        // **And the ELEVENTH shared input, named now rather than found
-        // later.** Ten rounds, ten shared inputs, each one level up from the
-        // last; this pin is the tenth, so the honest question is what the
-        // eleventh is. It is `CARGO_MANIFEST_DIR` itself. Both expansions
+        // **The ELEVENTH shared input was NOT what the last round guessed.**
+        // It guessed `CARGO_MANIFEST_DIR`, the deepest and most expensive
+        // vector there is; the eleventh was `crate_dir`, one `let` in this
+        // same function, added by the very commit that wrote the warning
+        // above -- two edits, no `Command`, no pathspec, measured SURVIVED in
+        // both profiles. It is written up in full at its old site below. The
+        // lesson is that the next shared input is never the exotic one.
+        //
+        // **The TWELFTH shared input, named now rather than found later, is
+        // `git` itself.** With `root` pinned and re-asserted and every
+        // yardstick spelled at its own site, the remaining thing that ALL
+        // FIVE enumerations -- `ls-files`, `ls-files --others`, `ls-tree -r
+        // HEAD`, `ls-files --cached`, `status --porcelain -uall` -- take as a
+        // single shared input is the ONE program resolved from the ONE name
+        // `"git"` on `PATH`, running in an environment this test does not
+        // control. A `git.exe` earlier on `PATH` that filters one path out of
+        // every answer subtracts from all five at once. So does
+        // `GIT_CEILING_DIRECTORIES`, `GIT_DIR`/`GIT_WORK_TREE`, a
+        // `core.excludesFile` or a `.git/info/exclude` entry (which both
+        // halves of `--exclude-standard` and `status -uall` honour and which
+        // is not a tracked file), and `~/.gitconfig`'s `[alias]`/`[include]`
+        // machinery. Every one of those costs ZERO source edits and leaves no
+        // diff -- the same shape as the gitlink hole this round closed, and
+        // strictly cheaper than any in-file mutation. It is NOT defended
+        // here, because it cannot be: a test that asks git what is in the
+        // tree is only as honest as the git it asked, and re-deriving the
+        // answer without git is the directory walk six rounds were spent
+        // deleting. This is the disclosed boundary, not an oversight.
+        //
+        // And `CARGO_MANIFEST_DIR` remains the deepest one. Both expansions
         // read the same compile-time value, so the pin does not prove `root`
         // is THIS repository -- it proves `root` is the parent of wherever
         // this crate's manifest sits when it is compiled. Move the manifest
@@ -7154,6 +7215,66 @@ pub(crate) mod password_lifetime_tests {
              unread. That is not a stale path to repair in place: it is the scan measuring \
              something other than the repository it claims to police."
         );
+        // **The `--others` half's SECOND PRODUCER, asked FIRST.**
+        //
+        // Undisclosed asymmetry, found by attacking this design rather than
+        // by review, and measured both ways: `ls-tree -r HEAD` and `ls-files
+        // --cached` enumerate the COMMITTED and CACHED trees, so between them
+        // they are two extra opinions about the TRACKED half of the listing
+        // and ZERO opinions about the untracked half. But the scan does list
+        // `--others --exclude-standard` today, so untracked files ARE inside
+        // this test's property -- and with a real probe in an untracked,
+        // non-ignored `docs/scratch_note.md` the unmutated test KILLED,
+        // naming the file, while ONE edit appending `:!docs` to that single
+        // `--others` invocation SURVIVED. A one-edit narrowing that no
+        // control can see is a hole, not a scope statement.
+        //
+        // So the untracked half gets its own second opinion, at its own call
+        // site with its own arguments and its own output format: `git status
+        // --porcelain -z --untracked-files=all`, whose `?? ` records are the
+        // same question ("what is here that git is not tracking and
+        // `.gitignore` does not exclude?") put through a different plumbing
+        // command. A pathspec added to either invocation alone is now both
+        // loud (the assert below) and inert (the union below).
+        //
+        // **It is asked BEFORE the listing on purpose**, and that ordering is
+        // the whole race handling. Other agents land commits in this tree
+        // while this suite runs, so an untracked file can appear or vanish
+        // mid-test. Asked first, a file CREATED between the two questions is
+        // in the listing and not in this set, which the subset check below
+        // does not mind; a file DELETED between them is in this set and not
+        // in the listing, and the `is_file` filter here re-checked at use
+        // drops it. Asked the other way round both directions would red.
+        let untracked_raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git status --porcelain` could not enumerate \
+                     {root:?}, so the UNTRACKED half of the listing has no second opinion to \
+                     be checked against and a pathspec added to the `--others` producer would \
+                     be invisible. This test does not run without git; see the panic below."
+                )
+            });
+        let untracked_second: Vec<std::path::PathBuf> = untracked_raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|record| {
+                // `?? <path>`; every other status code is about a path git
+                // already knows, which the committed and cached enumerations
+                // speak for. `-z` means no quoting and no rename pairs among
+                // the `??` records, so this is a plain three-byte prefix.
+                let rest = record.strip_prefix(b"?? ".as_slice())?;
+                std::str::from_utf8(rest).ok()
+            })
+            .map(|rel| root.join(rel))
+            .collect();
+
         let mut refused: Vec<std::path::PathBuf> = Vec::new();
         let mut files = tracked_files(&root, &mut refused).unwrap_or_else(|| {
             panic!(
@@ -7180,11 +7301,14 @@ pub(crate) mod password_lifetime_tests {
         assert!(
             refused.is_empty(),
             "{} nested repository shape(s) hold files this scan was asked to police and cannot \
-             attribute, the first of them {:?}. On the git path these are UNTRACKED entries \
-             `git ls-files --others` did list, one directory entry standing for a whole \
-             working tree. The bytes inside are not knowably this repository's, and the two \
-             guesses are both wrong in a way that has been measured. Remove the nested \
-             repository, or commit what is under it so git can attribute it.",
+             attribute, the first of them {:?}. This is either an UNTRACKED entry `git ls-files \
+             --others` listed as one directory standing for a whole working tree, or a TRACKED \
+             GITLINK (`160000 commit <sha> <path>`) -- a nested clone committed as a submodule \
+             reference, which every enumeration below would otherwise drop through its own \
+             `is_file` filter, at ZERO source edits and with `git status` clean. The bytes \
+             inside are not knowably this repository's, and the two guesses are both wrong in \
+             a way that has been measured. Remove the nested repository, or commit what is \
+             under it so git can attribute it.",
             refused.len(),
             refused.first()
         );
@@ -7193,13 +7317,76 @@ pub(crate) mod password_lifetime_tests {
             "control: the walk found only {} files, so the check below is a check over nothing",
             files.len()
         );
-        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // **The pin, RE-ASSERTED now that the listing exists.** The one at the
+        // top of this function is a statement about a VALUE at one instant;
+        // this one closes the window between that instant and here, which is
+        // precisely where the measured two-edit defeat put its `let root =
+        // root.join(".claude").join("worktrees").join("w1");`. Its `env!` is
+        // spelled out again rather than shared with the pin above or with the
+        // controls below, for the reason this whole function is written the
+        // way it is.
+        assert_eq!(
+            root.join(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .file_name()
+                    .expect("the crate directory has a name")
+            ),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            "the_probe_scan_reads_the_wrong_tree: `root` was this crate's own parent directory \
+             when it was pinned above and is {root:?} now that the listing has been produced. \
+             A `let root = ...` between the pin and here redirects the listing while leaving \
+             the pin's own `assert_eq!` already run and satisfied, which is a MEASURED defeat \
+             and not a hypothetical: two edits, no `Command` touched, no pathspec, a real \
+             probe committed in this tree unseen through the full suite in debug and release"
+        );
+
+        // **`crate_dir` WAS the eleventh shared input, and it cost TWO edits.**
+        //
+        // The round that added the `root` pin warned, at length and
+        // correctly, that factoring the two `env!` expansions in that pin
+        // into one `let crate_dir` would reintroduce the defect one level up
+        // -- and then it factored a THIRD `env!` into exactly that binding,
+        // feeding all three of the controls it introduced or repaired from
+        // one `let`. Measured, with a real probe committed in the tracked
+        // `deskwarden/examples/ui_preview.rs` and a clean checkout at the
+        // gitignored `<root>/.claude/worktrees/w1`: TWO edits -- `let root =
+        // root.join(".claude").join("worktrees").join("w1");` immediately
+        // after the pin's `assert_eq!`, and `let crate_dir = &root.join(
+        // "deskwarden");` here -- SURVIVED debug filtered, debug full and
+        // release full, with the probe unseen. Liveness at the identical site
+        // KILLED. Neither edit touched a `Command` or a pathspec, so the
+        // "three producers in lockstep" floor stated below was false at two.
+        //
+        // The pin asserts a VALUE, not a BINDING. `assert_eq!` runs once,
+        // before a file is listed, and `let root = ...` one line later
+        // shadows it for every producer, both readers, both `metadata` walks
+        // and the post-scan re-check, with nothing looking at `root` again.
+        // Two things close that window and both are done:
+        //
+        // * every yardstick below is spelled `env!("CARGO_MANIFEST_DIR")` AT
+        //   ITS OWN USE SITE, so corrupting them costs one edit each rather
+        //   than one edit total. Do not factor these back together, for the
+        //   same reason the pin's own two expansions are unfactored;
+        // * the pin is RE-ASSERTED after the listing is produced and again
+        //   after both readers have finished, so a shadow rebind of `root`
+        //   anywhere in this function is caught by the assertion it was
+        //   inserted to get past rather than by luck.
+        //
+        // And the record the previous round left is corrected here: it
+        // credited the new pin with killing the one-edit shadow rebinds.
+        // Measured, it does not -- the ABSOLUTE-PATH `this_file` control just
+        // below kills them on its own, because a pure `let root = ...` moves
+        // the listing without moving the yardstick. The positive controls are
+        // the load-bearing half; the pin is close to redundant against one
+        // edit and earns its place only against the second one.
+        //
         // This used to read `any(|p| p.ends_with("login_ui.rs"))`, and a
         // suffix is exactly what a substituted checkout supplies for free:
         // every other tree with this crate in it has a `login_ui.rs` too. The
         // file that declares the probe is identified by its WHOLE absolute
         // path instead, built from the compiled-in crate directory.
-        let this_file = crate_dir.join("src").join("login_ui.rs");
+        let this_file =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("login_ui.rs");
         assert!(
             files.iter().any(|p| *p == this_file),
             "control: the listing does not contain {this_file:?} -- the file that declares the \
@@ -7224,15 +7411,16 @@ pub(crate) mod password_lifetime_tests {
         // file under this crate's own compiled-in directory only if it is a
         // listing of this crate's own tree.
         assert!(
-            files.iter().any(|p| p.starts_with(crate_dir)),
-            "control: NO file the listing reached is inside {crate_dir:?}, this crate's own \
+            files.iter().any(|p| p.starts_with(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))),
+            "control: NO file the listing reached is inside {:?}, this crate's own \
              compiled-in directory. The listing is not of this repository at all. Note that \
              the complementary assertion below -- that something lies OUTSIDE the crate \
              directory -- is satisfied automatically by any foreign tree, which is why it \
-             cannot stand alone"
+             cannot stand alone",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         );
         assert!(
-            files.iter().any(|p| !p.starts_with(crate_dir)),
+            files.iter().any(|p| !p.starts_with(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))),
             "control: every file the walk reached is inside the crate directory, so `docs/`, \
              the top-level `*.md` and `.github/` are outside what this test measures while its \
              name says the whole tree"
@@ -7326,9 +7514,21 @@ pub(crate) mod password_lifetime_tests {
         // and it too is unioned in. Hiding a tracked file now requires all
         // three producers corrupted in lockstep, or one corrupted and the
         // other two deleted -- three edits either way, in the configuration
-        // that ships, with no gitless configuration left to hide in. This is
-        // a lower bound and it is stated as one: it says three cannot be
-        // beaten by fewer, not that three suffices.
+        // that ships, with no gitless configuration left to hide in.
+        //
+        // **That "three" was stated as a lower bound and it was FALSE, twice
+        // over, and both refutations are now closed.** It was beaten at TWO
+        // edits by the `crate_dir` rebind (neither edit a `Command`, neither
+        // a pathspec -- see the write-up at the controls below), and at ZERO
+        // edits by a gitlink, which all three producers dropped independently
+        // through their own `is_file` filters. It was also silent about the
+        // UNTRACKED half entirely: `ls-tree` and `ls-files --cached` speak
+        // only for the tracked tree, so a pathspec on the `--others`
+        // invocation was ONE edit and unobserved until `git status
+        // --porcelain -uall` was added above as its second producer. A floor
+        // in a comment is a claim, and every claim in this file has now been
+        // beaten at least once. Read this one as "no route BELOW is cheaper
+        // than three", not as a proof about routes nobody has tried.
         //
         // **That lower bound was FALSE for ten rounds, and it holds now only
         // because `root` is asserted.** All three producers take the
@@ -7394,6 +7594,36 @@ pub(crate) mod password_lifetime_tests {
         // lockstep. That cost is stated in this test's doc and it is a lower
         // bound, not a proof.
         for path in committed.iter().chain(cached.iter()) {
+            if !files.contains(path) {
+                files.push(path.clone());
+            }
+        }
+
+        // The untracked half's second opinion, checked and then unioned in on
+        // exactly the same terms as the tracked half's two. `is_file` is
+        // evaluated HERE rather than when the records were parsed, so a file
+        // `git status` named and something else has since removed is simply
+        // gone rather than a red; and a nested repository, which `status`
+        // reports as one directory record, is not a file and is therefore
+        // spoken for by `refused` above rather than by this list.
+        let untracked_present: Vec<&std::path::PathBuf> =
+            untracked_second.iter().filter(|path| path.is_file()).collect();
+        let unlisted_untracked: Vec<&std::path::PathBuf> =
+            untracked_present.iter().copied().filter(|path| !files.contains(path)).collect();
+        assert!(
+            unlisted_untracked.is_empty(),
+            "{} untracked, non-ignored file(s) are present in the working tree and were named \
+             by `git status --porcelain --untracked-files=all` but are NOT in the list this \
+             test is about to scan, the first of them {:?}. The two enumerations are two \
+             separately spelled questions put to git about the same half of the tree, so this \
+             is what a PATHSPEC added to the `git ls-files --others --exclude-standard` \
+             invocation in `tracked_files` looks like -- until this cross-check existed that \
+             single edit was invisible, because `ls-tree -r HEAD` and `ls-files --cached` both \
+             speak only for the tracked half",
+            unlisted_untracked.len(),
+            unlisted_untracked.first()
+        );
+        for path in untracked_present.iter().copied() {
             if !files.contains(path) {
                 files.push(path.clone());
             }
@@ -7822,6 +8052,7 @@ pub(crate) mod password_lifetime_tests {
         let dropped: Vec<&std::path::PathBuf> = committed
             .iter()
             .chain(cached.iter())
+            .chain(untracked_present.iter().copied())
             .filter(|path| !files.contains(path))
             .collect();
         assert!(
@@ -7833,6 +8064,26 @@ pub(crate) mod password_lifetime_tests {
              equality above over a smaller tree, silently",
             dropped.len(),
             dropped.first()
+        );
+
+        // **And the pin a THIRD time, after everything has been read.** The
+        // two above cover the window before the listing and the window
+        // between the listing and the controls; this one covers the rest of
+        // the function, so there is no line in it at which a `let root = ...`
+        // survives to the end. Same reason the list is re-checked after the
+        // readers rather than only when it was built: an assertion is about
+        // the instant it runs, and the shared input outlives the instant.
+        assert_eq!(
+            root.join(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .file_name()
+                    .expect("the crate directory has a name")
+            ),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            "the_probe_scan_reads_the_wrong_tree: `root` is {root:?} now that both readers \
+             have finished, which is not the parent of this crate's own compiled-in \
+             directory. Everything this test just read, cross-checked and re-checked was read \
+             from a tree that is not this repository"
         );
     }
 
