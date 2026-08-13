@@ -1664,72 +1664,7 @@ mod tests {
             //
             // With no real file shaped that way, the refusal branch is
             // unreachable from the tree, so what holds it live is a synthetic
-            // fixture. Both are pinned below.
-            //
-            // **BUT THIS PIN IS NOT WHAT HOLDS THE RULE, AND THE CLAIM THAT
-            // IT IS COST THE NINTH TEXT-PIN LOSS IN THIS REPOSITORY.** Both
-            // needles here were, at first, satisfiable by text that was
-            // already in the file with no attacker edit at all:
-            //
-            // * the bare token `"INTERLEAVES"` occurs FOUR times in
-            //   `below_cut.rs` -- a doc comment, the fixture's own assert
-            //   argument, the refusal string, and a section comment. Deleting
-            //   the refusal branch outright leaves three, so the needle stayed
-            //   GREEN over a deleted rule. Measured (M8).
-            // * the second needle pinned only the fixture's FUNCTION NAME,
-            //   which a hollowed body still carries. Measured (M8b): with the
-            //   `TOP_LEVEL` arm rewritten to tolerate interleaving AND the
-            //   fixture's body emptied, this whole test PASSED.
-            //
-            // So both are replaced by phrases that live INSIDE the construct
-            // they are meant to hold and nowhere else: a clause of the refusal
-            // `format!` itself, up to and including its closing quote, and a
-            // clause of the fixture's own panic message, likewise up to its
-            // closing quote. Neither survives deleting the thing it names, and
-            // neither is a token that prose about the rule naturally repeats
-            // -- which is exactly how the previous pair failed.
-            //
-            // HONEST COST, corrected TWICE. The claim that weakening the
-            // refusal costs "an edit in `verdict`, plus the fixture, plus both
-            // needles here" was wrong: the needles as first written were free,
-            // and the holder that actually killed both mutants was never
-            // named. `verdict` is driven over every file's REAL bytes by the
-            // sweep's shipping-payload loop, which requires a refusal per
-            // payload, so a `verdict` that tolerates interleaving reds there
-            // whatever this file says. That loop is the load-bearing holder;
-            // the fixture is what keeps the branch's own words reachable and
-            // its message legible.
-            //
-            // The replacement claim -- that these two needles "make deleting
-            // either one cost an edit in a SECOND file" -- was wrong in the
-            // same direction. Measured: with the `TOP_LEVEL` arm neutered and
-            // the fixture hollowed, adding TWO `//` COMMENT LINES inside
-            // `below_cut.rs` carrying these clauses verbatim turns this test
-            // GREEN, with no edit to this file at all. The read below is a
-            // raw `read_to_string` -- no `sanitized()`, no comment stripping
-            // -- so a comment satisfies it exactly as the code does. (Comment
-            // stripping was considered and NOT done: this file has lost text
-            // pins nine times, and a stripper that mis-parses a raw string or
-            // a `//` inside a literal would red the suite over nothing. An
-            // honest statement of what the needles buy is worth more than a
-            // fragile barrier.)
-            //
-            // So what these needles ACTUALLY buy is not a second file's worth
-            // of work. It is VISIBILITY: the cheapest defeat is no longer a
-            // silent one-line change to a match arm, but a diff that has to
-            // add the refusal's own words back as dead comment text next to
-            // the branch it just deleted -- an edit no reviewer reads as
-            // innocent. They are a TRIPWIRE, not a barrier. The barrier is
-            // holder 1, the sweep, which reds on all of the above regardless.
-            //
-            // The clauses stop one word short of their closing quote ON
-            // PURPOSE. Each is the tail line of a `\`-continued literal, so
-            // including the `"` meant that APPENDING A SENTENCE to the
-            // refusal -- an unambiguous improvement -- moved the quote and
-            // red-lined the suite while blaming a deletion that had not
-            // happened. Each clause is unique in `below_cut.rs` without it.
-            "set of tolerated files to join, and adding one is not the fix",
-            "back and a `pub fn` between two gated modules ships again",
+            // fixture. Both are pinned by the second loop below.
         ] {
             assert!(
                 source.contains(needle),
@@ -1740,6 +1675,126 @@ mod tests {
                  the refusal message or the fixture's panic message was legitimately reworded \
                  or re-wrapped. If it was reworded, that is fine: update this needle to a \
                  clause of the new wording that lives inside the construct and nowhere else."
+            );
+        }
+
+        // **BUT THIS PIN IS NOT WHAT HOLDS THE RULE, AND THE CLAIM THAT
+        // IT IS COST THE NINTH TEXT-PIN LOSS IN THIS REPOSITORY.** Both
+        // needles here were, at first, satisfiable by text that was
+        // already in the file with no attacker edit at all:
+        //
+        // * the bare token `"INTERLEAVES"` occurs FOUR times in
+        //   `below_cut.rs` -- a doc comment, the fixture's own assert
+        //   argument, the refusal string, and a section comment. Deleting
+        //   the refusal branch outright leaves three, so the needle stayed
+        //   GREEN over a deleted rule. Measured (M8).
+        // * the second needle pinned only the fixture's FUNCTION NAME,
+        //   which a hollowed body still carries. Measured (M8b): with the
+        //   `TOP_LEVEL` arm rewritten to tolerate interleaving AND the
+        //   fixture's body emptied, this whole test PASSED.
+        //
+        // So both are replaced by phrases that live INSIDE the construct
+        // they are meant to hold and nowhere else: a clause of the refusal
+        // `format!` itself, and a clause of the fixture's own panic
+        // message. Each stops one word SHORT of its literal's closing
+        // quote -- deliberately, for the reason spelled out at the bottom
+        // of this comment -- and each is still unique in `below_cut.rs`
+        // without it. Neither survives deleting the thing it names, and
+        // neither is a token that prose about the rule naturally repeats
+        // -- which is exactly how the previous pair failed.
+        //
+        // HONEST COST, corrected TWICE. The claim that weakening the
+        // refusal costs "an edit in `verdict`, plus the fixture, plus both
+        // needles here" was wrong: the needles as first written were free,
+        // and the holder that actually killed both mutants was never
+        // named. `verdict` is driven over every file's REAL bytes by the
+        // sweep's shipping-payload loop, which requires a refusal per
+        // payload, so a `verdict` that tolerates interleaving reds there
+        // whatever this file says. That loop is the load-bearing holder;
+        // the fixture is what keeps the branch's own words reachable and
+        // its message legible.
+        //
+        // The replacement claim -- that these two needles "make deleting
+        // either one cost an edit in a SECOND file" -- was wrong in the
+        // same direction. Measured: with the `TOP_LEVEL` arm neutered and
+        // the fixture hollowed, adding TWO `//` COMMENT LINES inside
+        // `below_cut.rs` carrying these clauses verbatim turned this test
+        // GREEN, with no edit to this file at all. The read that produced
+        // `source` is a raw `read_to_string` -- no `sanitized()`, no
+        // comment stripping -- so a comment satisfies a `contains` exactly
+        // as the code does. (Comment stripping was considered and NOT
+        // done: this file has lost text pins nine times, and a stripper
+        // that mis-parses a raw string or a `//` inside a literal would
+        // red the suite over nothing. An honest statement of what the
+        // needles buy is worth more than a fragile barrier.)
+        //
+        // That paste is what the count below now catches: a commented copy
+        // takes the clause from one occurrence to two, and two is a RED
+        // with its own message. It is still not a barrier -- the same
+        // defeat is available by MOVING the code's copy into the comment,
+        // which keeps the count at one -- but the cheap, additive version
+        // of it is gone.
+        //
+        // So what these needles ACTUALLY buy is not a second file's worth
+        // of work. It is VISIBILITY: the cheapest defeat is no longer a
+        // silent one-line change to a match arm, but a diff that has to
+        // carry the refusal's own words back as dead comment text next to
+        // the branch it just deleted, in the one place that count leaves
+        // for them -- an edit no reviewer reads as innocent. They are a
+        // TRIPWIRE, not a barrier. The barrier is holder 1, the sweep,
+        // which reds on all of the above regardless.
+        //
+        // The clauses stop one word short of their closing quote ON
+        // PURPOSE. Each is the tail line of a `\`-continued literal, so
+        // including the `"` meant that APPENDING A SENTENCE to the
+        // refusal -- an unambiguous improvement -- moved the quote and
+        // red-lined the suite while blaming a deletion that had not
+        // happened. Each clause is unique in `below_cut.rs` without it.
+        //
+        // The two CLAUSE needles are held to a stricter rule than the tokens
+        // above: not `contains`, but a count of exactly one. The tokens above
+        // legitimately recur (`ls-files` occurs four times), so a count is
+        // wrong for them; these two do not, and a count is the only thing that
+        // notices a second copy arriving.
+        for needle in [
+            "set of tolerated files to join, and adding one is not the fix",
+            "back and a `pub fn` between two gated modules ships again",
+        ] {
+            // COUNT, NOT `contains`. Each clause occurs exactly ONCE in
+            // `below_cut.rs` today, and `contains` cannot tell the difference
+            // between that one occurrence and a second one pasted into a
+            // comment. Both files now carry long explanations OF these
+            // needles, and the natural way to illustrate such an explanation
+            // is to paste the clause it is about -- which would take the count
+            // from 1 to 2 and leave this pin permanently satisfiable by prose
+            // alone, over a deleted branch, with no test edit to notice.
+            // Measured before this was written: with one clause pasted
+            // verbatim into a comment in `below_cut.rs`, the old `contains`
+            // pin stayed GREEN. Pinning the count to 1 makes that paste a RED
+            // with its own message instead of a silent disarming.
+            let hits = source.matches(needle).count();
+            assert_eq!(
+                hits, 1,
+                "`below_cut.rs` holds {hits} occurrences of {needle:?}, and this pin requires \
+                 exactly one.\n\
+                 \n\
+                 ZERO means the construct that owns those words is gone: either the crate-wide \
+                 walk over every source file's tail has been deleted or rewritten into \
+                 something that no longer derives what it reads -- thirty-five of this crate's \
+                 files have no guard of their own, and that test is the only thing reading \
+                 their tails -- OR the refusal message or the fixture's panic message was \
+                 legitimately reworded or re-wrapped. If it was reworded, that is fine: update \
+                 this needle to a clause of the new wording that lives inside the construct and \
+                 nowhere else.\n\
+                 \n\
+                 TWO OR MORE means someone quoted this needle verbatim into prose -- a comment \
+                 or a doc comment -- inside `below_cut.rs`. That is not cosmetic. The read that \
+                 produced `source` is a raw `read_to_string`: it does not strip comments, so a \
+                 quoted copy satisfies a mere `contains` all by itself, and this pin would then \
+                 pass over a branch or a fixture that had been DELETED. Move that quotation out \
+                 of `below_cut.rs`, or paraphrase it -- change any word of it -- so that it is \
+                 no longer this needle byte for byte. Do not relax this assertion to make the \
+                 quotation legal."
             );
         }
     }
