@@ -18240,6 +18240,55 @@ mod export_wiring {
             std::ptr::fn_addr_eq(real_export, real_export),
             "control: `fn_addr_eq` answers `false` for one function against itself"
         );
+        // **The remaining FOUR fields, through the macro, for the reason the
+        // three above were routed through it -- but per FIELD and not merely
+        // per macro.** `macro_rules!` matches literal idents, so an arm
+        // written for one field's own name is vacuous for exactly that field
+        // while every control that names a DIFFERENT field still passes. That
+        // mutant was measured green -- 2253 lib tests, zero warnings, in both
+        // profiles -- with a gated forwarder in the `send_delete` slot that
+        // meant no revoke the user asked for ever started. Every field of
+        // `VaultFrameEnv` now has a decoy running through `seam!` under that
+        // field's own literal ident, so an arm keyed to any one of them reds
+        // here. The arm keyed to a BINDING's name instead is refused by
+        // [`the_seam_macro_has_one_arm_and_keys_it_to_no_field`].
+        let sync_decoy: fn(mpsc::Sender<Result<(), String>>, String) = not_the_sync_spawner;
+        let (name, same) = seam!(sync, sync_decoy);
+        assert_eq!(name, "sync", "control: `seam!` misnames `sync`");
+        assert!(
+            !same,
+            "control: a different function of the same signature compares EQUAL to the \
+             production sync spawner, so the `sync` assertion is vacuous"
+        );
+        let load_decoy: fn(
+            Arc<VaultCache>,
+            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            VaultLoadRequest,
+        ) = not_the_load_spawner;
+        let (name, same) = seam!(load, load_decoy);
+        assert_eq!(name, "load", "control: `seam!` misnames `load`");
+        assert!(
+            !same,
+            "control: a different function of the same signature compares EQUAL to the \
+             production load spawner, so the `load` assertion is vacuous"
+        );
+        let list_decoy: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>) =
+            not_the_send_list_spawner;
+        let (name, same) = seam!(send_list, list_decoy);
+        assert_eq!(name, "send_list", "control: `seam!` misnames `send_list`");
+        assert!(
+            !same,
+            "control: a different function of the same signature compares EQUAL to the \
+             production send-list spawner, so the `send_list` assertion is vacuous"
+        );
+        let delete_decoy: SendDeleteSpawn = not_the_delete_spawner;
+        let (name, same) = seam!(send_delete, delete_decoy);
+        assert_eq!(name, "send_delete", "control: `seam!` misnames `send_delete`");
+        assert!(
+            !same,
+            "control: a different function of the same signature compares EQUAL to the \
+             production revoke spawner, so the `send_delete` assertion is vacuous"
+        );
     }
 
     /// How many fields `VaultFrameEnv` has.
@@ -18558,6 +18607,113 @@ mod export_wiring {
         );
     }
 
+    /// **`seam!` has exactly ONE arm, and that arm is keyed to no field.**
+    ///
+    /// The decoy controls in [`production_hands_the_window_the_real_functions`]
+    /// now run all seven fields through the macro, which refuses any arm
+    /// keyed to a field's literal ident. They cannot refuse an arm keyed to
+    /// the OTHER literal ident in the invocation: an arm matching the pair
+    /// `send_delete` and `real_delete` matches the row in `checked` and NOT
+    /// the control, whose second argument is spelled `delete_decoy`. One
+    /// edit, one field, every control green.
+    ///
+    /// So the SHAPE is pinned rather than enumerated over. A `macro_rules!`
+    /// with literal-ident arms is an enumeration, and enumerations have lost
+    /// every race recorded in this module. With one arm whose matcher binds
+    /// `$field:ident` and `$real:expr`, there is no syntax left that can
+    /// treat any field, or any binding, differently from the others -- the
+    /// macro cannot tell what it was given except through `stringify!`, which
+    /// is the very name each row is asserted by.
+    ///
+    /// Read from `include_str!("mod.rs")`, so it is a fact about the SOURCE
+    /// that ships. The needles are `concat!`-split because this test's own
+    /// body is part of that source.
+    #[test]
+    fn the_seam_macro_has_one_arm_and_keys_it_to_no_field() {
+        let source = include_str!("mod.rs");
+        let opener = concat!("macro_rules! ", "seam {");
+        let defined = source.matches(opener).count();
+        assert_eq!(
+            defined,
+            1,
+            "`seam!` is defined {defined} times in this file. The whole hold on the frame \
+             env's seams is that ONE macro expands every row of `checked` and every decoy \
+             control, so a second definition is a second expansion nothing here has looked at"
+        );
+        let start = source.find(opener).expect("the opener was just counted");
+        // The macro's body, by brace depth from its own opening brace, so a
+        // reindent, a longer arm or a moved definition cannot change what is
+        // read -- only the braces can.
+        let brace = start + opener.len() - 1;
+        let bytes = source.as_bytes();
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, byte) in bytes[brace..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[brace..end.expect("`seam!`'s definition has unbalanced braces")];
+        // ONE arm. An arm is one `=>`, and the expansion contains none of its
+        // own -- a second one anywhere in here is a second arm, or a `match`
+        // that could hold one, and both are the enumeration this pin refuses.
+        let arms = body.matches(concat!("=", ">")).count();
+        assert_eq!(
+            arms,
+            1,
+            "`seam!` has {arms} arms. It must have exactly one, keyed to no particular field. \
+             `macro_rules!` matches LITERAL idents, so an arm written for one field's own \
+             name is vacuous for that field ALONE while every other field's decoy control \
+             still passes. That mutant was measured green across the whole suite in both \
+             profiles, with zero warnings, holding a forwarder that meant a revoke the user \
+             asked for never started. Do not add an arm: the macro must not be able to tell \
+             one field from another"
+        );
+        // **...and that one arm is EXACTLY the comparison, character for
+        // character, modulo whitespace.**
+        //
+        // A list of required needles is not enough here, and that was
+        // measured rather than reasoned. An arm reading
+        // `fn_addr_eq($field, $real) || stringify!($real).len() == 11` has
+        // one arm, binds both metavariables, contains `stringify!($field)`
+        // and contains `fn_addr_eq($field, $real)` -- and is still a
+        // special case for exactly one row, keyed on the length of the
+        // BINDING's name, which the decoy controls cannot see because they
+        // pass a differently spelled binding. A needle list is an
+        // enumeration of what an attacker must keep; this is a statement of
+        // what the arm must BE, so there is nothing left to add to it.
+        //
+        // Whitespace-collapsed, so `rustfmt` and any reindent of this file
+        // are free -- the false-red class this module keeps losing to.
+        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = concat!(
+            "{ (",
+            "$field:ident, ",
+            "$real:expr) => { (stringify!(",
+            "$field), std::ptr::fn_addr_eq(",
+            "$field, $real)) }; }"
+        );
+        assert_eq!(
+            collapsed,
+            expected,
+            "`seam!` is no longer exactly the address comparison. Its body reads\n  \
+             {collapsed}\nand must read\n  {expected}\nThe macro expands every row of \
+             `checked` AND every decoy control, so anything it can do beyond naming the \
+             field and comparing two addresses is something it can do to one row and not \
+             to the control beside it. Measured: `|| stringify!($real).len() == 11` passes \
+             an arm count, passes every metavariable check, and hands one field's seam to \
+             a forwarder with the whole suite green"
+        );
+    }
+
     /// The decoy [`production_hands_the_window_the_real_functions`] compares
     /// against: `ExportSpawn`'s signature exactly, and nothing else.
     fn not_the_export_spawner(_: egui::Context, _: ExportSender, _: zeroize::Zeroizing<String>) {
@@ -18589,6 +18745,47 @@ mod export_wiring {
         _: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
     ) {
         unreachable!("never called -- this exists to have an address");
+    }
+
+    /// The `sync` decoy. [`not_the_create_spawner`]'s reasoning exactly:
+    /// every field of `VaultFrameEnv` now runs a decoy THROUGH `seam!`, so a
+    /// macro arm keyed to one field's literal ident cannot be vacuous for
+    /// that field while the other fields' controls still pass.
+    fn not_the_sync_spawner(_: mpsc::Sender<Result<(), String>>, _: String) {
+        unreachable!("never called -- the sync decoy exists only to have an address");
+    }
+
+    /// The `load` decoy. [`not_the_sync_spawner`]'s reasoning exactly.
+    fn not_the_load_spawner(
+        _: Arc<VaultCache>,
+        _: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        _: VaultLoadRequest,
+    ) {
+        unreachable!("never called -- the load decoy exists only to have an address");
+    }
+
+    /// The `send_list` decoy. [`not_the_sync_spawner`]'s reasoning exactly.
+    fn not_the_send_list_spawner(
+        _: egui::Context,
+        _: SendListSender,
+        _: u64,
+        _: zeroize::Zeroizing<String>,
+    ) {
+        unreachable!("never called -- the send-list decoy exists only to have an address");
+    }
+
+    /// The `send_delete` decoy. [`not_the_sync_spawner`]'s reasoning exactly,
+    /// and this is the field the measured vacuous-arm attack occupied: a
+    /// forwarder here leaves a revoke that never starts and a row stuck on
+    /// "Revoking...".
+    fn not_the_delete_spawner(
+        _: egui::Context,
+        _: SendDeleteSender,
+        _: zeroize::Zeroizing<String>,
+        _: String,
+        _: String,
+    ) {
+        unreachable!("never called -- the revoke decoy exists only to have an address");
     }
 
     // -----------------------------------------------------------------
@@ -22806,6 +23003,48 @@ mod send_delete_wiring {
             "`spawn_send_delete` is no longer exactly the delegation to `spawn_send_delete_with` \
              with the real revoke -- anything added to it is a line that runs on the frame's \
              own thread, before the spawn"
+        );
+    }
+
+    /// **`spawn_send_create` is the delegation and nothing else** --
+    /// [`spawn_send_delete_only_hands_the_real_work_to_the_tested_spawner`]'s
+    /// shape and its reason, for the one seam in `VaultFrameEnv` that
+    /// publishes to the public internet.
+    ///
+    /// **This is a gap that was measured, not a symmetry that was tidied.**
+    /// The frame env's address pin discloses that it says nothing about what
+    /// a seam's function DOES, and argued from `spawn_export` that no seam is
+    /// protected against its own body being emptied. That generalisation is
+    /// false, and it was hiding a live hole. Emptying `spawn_send_delete`'s
+    /// body is caught, by the test above. Emptying `spawn_vault_sync`'s,
+    /// `spawn_vault_load`'s and `spawn_send_list`'s is caught. Emptying
+    /// `spawn_send_create`'s body was measured GREEN across the whole suite
+    /// -- 2254 lib tests, zero warnings -- leaving every Send the user
+    /// composes silently unpublished, the composer frozen on "Publishing...",
+    /// and the typed secret still resident, with the address pin above
+    /// perfectly satisfied because the POINTER was still the right one.
+    ///
+    /// It survived because this spawner reaches its thread through
+    /// `spawn_reporting` rather than writing `std::thread::spawn` itself, so
+    /// even the crate's thread census -- which is what incidentally catches a
+    /// hollow `spawn_aux_load` -- had nothing to notice.
+    #[test]
+    fn spawn_send_create_only_hands_the_real_work_to_the_tested_spawner() {
+        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = concat!(
+            "pub(super) fn spawn_send_", "create( ctx_for_create: egui::Context, tx: \
+             SendCreateSender, session: zeroize::Zeroizing<String>, plan: \
+             crate::send::SendPlan, ) { spawn_send_create_with(ctx_for_create, tx, move || { \
+             real_send_create(&plan, &session) }); }"
+        );
+        assert_eq!(
+            squashed(production()).matches(body).count(),
+            1,
+            "`spawn_send_create` is no longer exactly the delegation to \
+             `spawn_send_create_with` with the real publish. Anything ADDED to it is a line \
+             that runs on the frame's own thread before the spawn; anything REMOVED from it \
+             is a Send the user asked to publish that is never published, with the composer \
+             latched and the address pin over `VaultFrameEnv` still green"
         );
     }
 
