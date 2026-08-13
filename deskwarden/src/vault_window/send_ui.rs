@@ -5772,68 +5772,57 @@ mod source_pins {
         !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     }
 
-    /// The two-state walk from the cut to EOF over whatever text it is handed.
-    /// Returns `(visited, modules, closes, depth)` so the caller can control
-    /// it for non-vacuity.
+    /// What the region below `mod.rs`'s cut is walked under.
     ///
-    /// **Line-ending agnostic on purpose**: `lines()` strips a trailing
-    /// carriage return, so every comparison is against the line's real text on
-    /// a CRLF tree and on an LF one alike.
+    /// The walk itself is [`crate::below_cut::walk`] and is NOT written here.
+    /// It used to be, in fifteen near-identical copies, which is how the
+    /// escaped-quote off-by-one in the brace matcher reached three files at
+    /// once and how every fix since has had to be applied N times or silently
+    /// fail to propagate. What the copies really disagreed about is this
+    /// struct's worth of text, so that is what stayed local.
+    ///
+    /// Every knob here is the one the inline walk this replaced actually had,
+    /// field by field: `gated_at_start: false` is its `let mut gated = false`,
+    /// so the region begins with the gate itself and nothing outside it is
+    /// taken on trust; `gate_at_column_zero: false` is its `trimmed ==
+    /// CUT_GATE`; `string_lines` is the same [`BELOW_CUT_STRING_LINES`]; and
+    /// the `line == "}"` close rule is the shared walk's, with the byte-offset
+    /// check the inline copy did not have added on top. Nothing the old walk
+    /// caught stopped being caught.
+    ///
+    /// `is_module_opener` is this module's OWN [`below_cut_is_module_opener`]
+    /// and not [`crate::below_cut::is_module_opener`], deliberately: the
+    /// `modules == column_zero_module_openers(..)` cross-check compares the
+    /// walk's count against that OTHER instance, so a one-edit widening of
+    /// either predicate desynchronizes the two and reds the suite. Pointing
+    /// the walk at the shared predicate would make both sides move together
+    /// and throw that property away.
+    const BELOW_CUT_RULES: crate::below_cut::WalkRules = crate::below_cut::WalkRules {
+        gate: CUT_GATE,
+        gated_at_start: false,
+        gate_at_column_zero: false,
+        is_module_opener: below_cut_is_module_opener,
+        string_lines: BELOW_CUT_STRING_LINES,
+        top_level_item_note:
+            "Every pin in this module reads only the half of `mod.rs` ABOVE the cut, so an \
+             item down here is read by none of them: it can spawn a process on the eframe \
+             thread, reintroduce a blocking `list_sends`, or duplicate a call site pinned at \
+             exactly one -- and the suite stays green.",
+        ungated_module_note:
+            "A `pub(crate) mod ext { .. }` written down there is the same escape, one `mod` \
+             deep.",
+    };
+
+    /// `(visited, modules, closes, depth)` for the region below `mod.rs`'s
+    /// cut, by the one shared walk, so the caller can control it for
+    /// non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose**: the shared walk strips a trailing
+    /// carriage return from every line, so every comparison is against the
+    /// line's real text on a CRLF tree and on an LF one alike.
     fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
         let cut = cut_index(source);
-        let mut depth = 0usize;
-        // The walked region BEGINS with the gate, so nothing outside it is
-        // taken on trust: the first line seen is the attribute itself.
-        let mut gated = false;
-        let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
-        for line in source[cut..].lines() {
-            visited += 1;
-            if depth == 0 {
-                // Between modules NOTHING is allowed but blanks, comments,
-                // the gate and a module opener -- at ANY indentation, because
-                // an indented `fn` at file scope is still a top-level item
-                // and a column-0-only filter would walk straight past it.
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("//") {
-                    continue;
-                }
-                if trimmed == CUT_GATE {
-                    gated = true;
-                    continue;
-                }
-                assert!(
-                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
-                    "top-level source below the cut: {line:?}. Every pin in this module reads \
-                     only the half of `mod.rs` ABOVE the cut, so an item down here is read by \
-                     none of them: it can spawn a process on the eframe thread, reintroduce a \
-                     blocking `list_sends`, or duplicate a call site pinned at exactly one -- \
-                     and the suite stays green. Move it above the first test module."
-                );
-                assert!(
-                    gated,
-                    "the module {line:?} below the cut is not test-gated, so it SHIPS -- and it \
-                     ships in the half of the file no pin here reads"
-                );
-                gated = false;
-                depth = 1;
-                modules += 1;
-            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
-                // Inside a test module every item is indented, so the only
-                // column-0 line is the module's own closing brace.
-                if line == "}" {
-                    depth = 0;
-                    closes += 1;
-                    continue;
-                }
-                assert!(
-                    BELOW_CUT_STRING_LINES.contains(&line),
-                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
-                     top-level item escaped the brace count, or this is the contents of a \
-                     string literal and belongs in BELOW_CUT_STRING_LINES"
-                );
-            }
-        }
-        (visited, modules, closes, depth)
+        crate::below_cut::walk(&source[cut..], &BELOW_CUT_RULES)
     }
 
     #[test]
@@ -5967,6 +5956,251 @@ mod source_pins {
         assert!(
             std::panic::catch_unwind(|| walk_below_the_cut(&with_an_ungated_module)).is_err(),
             "control: the walk accepted an UNGATED module below the cut, which ships"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The region of THIS FILE below ITS OWN cut -- which nothing read.
+    //
+    // The walk above reads `mod.rs`, and `mod.rs`'s own sibling guard reads
+    // `mod.rs` too. Nothing in the crate read `send_ui.rs`'s tail: this file
+    // has no guard over itself at all, and `job_object`'s crate-wide tail
+    // fence covers `bw_path.rs` and `job_object.rs` only.
+    //
+    // Measured at `8906835`: a column-0
+    // `pub fn shipped(x: u64) -> u64 { x.wrapping_mul(97) }` appended at EOF
+    // SURVIVED the whole suite at 2224 lib / 217 bin / 0 failed / 0 warnings
+    // in BOTH profiles and shipped three times over in the lib's DEBUG LLVM
+    // IR. One edit, zero guard edits -- the cheapest surviving route to a
+    // shipping `pub fn` below a cut anywhere in the crate. The identical
+    // payload is KILLED in `signature.rs` by that file's guard and in
+    // `send.rs` by its `runner_tests` sibling; the difference was that those
+    // files are read and this one was not. This is the guard that reads it.
+    // -----------------------------------------------------------------
+
+    /// The FIRST [`CUT_GATE`] in `source` that begins a line.
+    ///
+    /// **Not a plain `find`, and that is the whole reason this helper exists.**
+    /// This file spells the gate inside a doc comment some five hundred lines
+    /// above its first test module -- the paragraph about the abandonment
+    /// counter's two hard assertions being test-only -- so
+    /// [`cut_index`]'s first-occurrence rule would cut there and hand the walk
+    /// a region beginning in the middle of production code. Every line of that
+    /// production half would then be refused as top-level source, which is a
+    /// guard that fails for a reason that is not the one it names, and the tail
+    /// it exists to read would never be reached.
+    ///
+    /// The line-start rule is also, by itself, the protection the anchor
+    /// control below gives after the fact: a gate spelled inside a string or a
+    /// comment cannot satisfy it. Both are kept -- the anchor also catches the
+    /// cut moving DOWN, which the line-start rule cannot see.
+    fn own_cut_index(source: &str) -> usize {
+        let bytes = source.as_bytes();
+        source
+            .match_indices(CUT_GATE)
+            .map(|(at, _)| at)
+            .find(|&at| at == 0 || bytes[at - 1] == b'\n')
+            .expect("no column-0 test gate in `send_ui.rs`, so this file has no cut to walk from")
+    }
+
+    /// What the region below THIS file's cut is walked under.
+    ///
+    /// A second [`crate::below_cut::WalkRules`] rather than a reuse of
+    /// [`BELOW_CUT_RULES`]: the notes name the concrete damage, and the damage
+    /// an item below THIS file's cut does is not the damage an item below
+    /// `mod.rs`'s cut does. The predicate is the same local
+    /// [`below_cut_is_module_opener`], which is what keeps the
+    /// `column_zero_module_openers` cross-check below comparing two genuinely
+    /// different instances.
+    const OWN_BELOW_CUT_RULES: crate::below_cut::WalkRules = crate::below_cut::WalkRules {
+        gate: CUT_GATE,
+        gated_at_start: false,
+        gate_at_column_zero: false,
+        is_module_opener: below_cut_is_module_opener,
+        string_lines: BELOW_CUT_STRING_LINES,
+        top_level_item_note:
+            "Nothing in this crate reads the tail of `send_ui.rs`: the pins in this module \
+             read `mod.rs`, the source pins above slice this file at its first test gate and \
+             read only what is ABOVE it, and the crate-wide tail fence in `job_object` names \
+             `bw_path.rs` and `job_object.rs`. An item down here ships and no guard has \
+             looked at it.",
+        ungated_module_note:
+            "A `pub(crate) mod ext { .. }` written down there is the same escape, one `mod` \
+             deep, and its contents are read by nothing either.",
+    };
+
+    /// `(visited, modules, closes, depth)` for the region below THIS file's
+    /// own cut.
+    ///
+    /// The cut is recomputed INSIDE the string being sliced, every time. A
+    /// byte offset taken in [`include_str!`]'s CRLF working-tree bytes and
+    /// used to slice an LF copy is off by one byte per line -- measured at
+    /// 7355 bytes in `below_cut.rs`, which landed a control's slice in the
+    /// middle of a function body and made it pass forever for the wrong
+    /// reason.
+    fn walk_below_this_files_own_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = own_cut_index(source);
+        crate::below_cut::walk(&source[cut..], &OWN_BELOW_CUT_RULES)
+    }
+
+    /// **Below THIS file's own cut there is nothing but test-only modules.**
+    ///
+    /// See the block comment above for what was measured shipping through the
+    /// hole this closes.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_this_files_own_cut() {
+        let source = include_str!("send_ui.rs");
+
+        // 1. The cut lands at the start of a line, so the gate was matched at
+        //    a real attribute and not inside a comment or a string.
+        let cut = own_cut_index(source);
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the gate was matched inside a comment \
+             or a string literal rather than at a real attribute"
+        );
+
+        // 2. Positive control on WHERE the cut is: the last production item in
+        //    this file is still above it, and close to it. Were the cut to
+        //    move UP -- into the doc comment that spells the gate, say -- this
+        //    anchor would fall below it instead.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("CornerRadius::same(6), ", "theme::BLUE_WASH");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: {LAST_PRODUCTION_ITEM:?} is not in this file exactly once, so it pins \
+             nothing -- repoint it at the last production item above the first test module"
+        );
+        let anchor = source.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, so the cut \
+             moved up and the region walked below it is not this file's test half"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, over an LF copy and a CRLF copy of the same text, which
+        //    must agree. Built both ways rather than compared against the bytes
+        //    on disk: this repository stores LF blobs and only
+        //    `core.autocrlf=true` makes a working tree CRLF, so a control that
+        //    asserted "this file is CRLF" would pass here and fail on Linux.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        let as_lf = walk_below_this_files_own_cut(&lf);
+        let as_crlf = walk_below_this_files_own_cut(&crlf);
+        assert_eq!(
+            as_lf, as_crlf,
+            "the walk gives a different answer on an LF copy of this file than on a CRLF one, \
+             so something in it is sensitive to line endings"
+        );
+        let on_disk = walk_below_this_files_own_cut(source);
+        assert!(
+            on_disk == as_lf || on_disk == as_crlf,
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = on_disk;
+        assert!(
+            visited > 1_000,
+            "control: the walk visited only {visited} lines below this file's cut, which is \
+             not this file's worth of test modules -- the slice is empty and this test proves \
+             nothing"
+        );
+        assert_eq!(
+            closes, modules,
+            "below this file's cut {modules} test modules are opened and {closes} closed"
+        );
+        assert_eq!(depth, 0, "the walk ended inside a module, at depth {depth}");
+        assert_eq!(
+            modules, 6,
+            "the number of top-level test modules below this file's cut changed. That is fine \
+             -- but this count is the control that proves the walk really visited them, so \
+             update it deliberately rather than loosening it"
+        );
+
+        // The opener count, cross-checked against a SECOND instance of the
+        // opener predicate. `column_zero_module_openers` uses
+        // `below_cut::is_module_opener`; the walk used this module's own
+        // `below_cut_is_module_opener`. Widening either one alone
+        // desynchronizes them and fails here, which is the property that
+        // sharing a single predicate would have cost.
+        assert_eq!(
+            modules,
+            crate::below_cut::column_zero_module_openers(&source[cut..]),
+            "the walk opened {modules} modules but there are {} column-0 gated module openers \
+             below this file's cut -- the walk's opener predicate and \
+             `below_cut::is_module_opener` no longer agree",
+            crate::below_cut::column_zero_module_openers(&source[cut..])
+        );
+
+        // 5. Controls on the walk itself. Without these it could be a no-op
+        //    that visits lines and asserts nothing.
+        //
+        //    THE measured survivor, at its measured site: a column-0 `pub fn`
+        //    appended at EOF.
+        let appended = format!("{source}\npub fn sneaked(x: u64) -> u64 {{ x }}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_this_files_own_cut(&appended)).is_err(),
+            "control: the walk accepted a `pub fn` appended below this file's test modules -- \
+             the exact payload measured surviving the whole suite green and shipping in the \
+             lib's DEBUG LLVM IR"
+        );
+        // An INDENTED top-level item, which a column-0-only filter would miss.
+        // The payload is an indented, GATED module opener and not a `struct`:
+        // a struct is refused whether or not indentation is checked, because
+        // it is not a module opener either way, so it leaves the indentation
+        // rule unmeasured. This shape the opener predicate ACCEPTS, so only
+        // the indentation rule can refuse it -- and the trailing column-0 `}`
+        // makes it a payload the walk would otherwise take.
+        let indented = format!("{source}\n{CUT_GATE}\n    mod sneaked_indented {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_this_files_own_cut(&indented)).is_err(),
+            "control: the walk accepted an INDENTED, gated module opener appended below this \
+             file's test modules, which a column-0-only filter would miss"
+        );
+        // An ungated module, which ships.
+        let ungated = format!("{source}\nmod shipped {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_this_files_own_cut(&ungated)).is_err(),
+            "control: the walk accepted an UNGATED module below this file's cut, which ships"
+        );
+        // And the one a LINE walk cannot catch: this file's own text with its
+        // last test module closed by an INDENTED brace, a `pub fn` at file
+        // scope after it, and a column-0 `}` further down to rebalance the
+        // count. Perfectly balanced source, no lexer trick -- every payload
+        // line is indented, so a line walk's `depth == 1` branch skips all of
+        // it and ends with `closes == modules` and `depth == 0`. Only the
+        // byte-offset close check in the shared walk kills it.
+        let balanced = format!(
+            "{}    }}\n    pub fn sneaked(x: u64) -> u64 {{ x }}\n    \
+             #[allow(dead_code)]\n    mod filler {{\n}}\n",
+            lf.strip_suffix("}\n").expect("this file ends with a column-0 closing brace")
+        );
+        assert!(
+            std::panic::catch_unwind(|| walk_below_this_files_own_cut(&balanced)).is_err(),
+            "control: the walk accepted this file's last test module closed by an INDENTED \
+             brace with a `pub fn` at file scope after it"
+        );
+        // Liveness for all four at the identical site: the file as it really
+        // is must still be ACCEPTED, or a walk that refuses everything would
+        // pass every control above.
+        assert!(
+            crate::below_cut::try_walk(&lf[own_cut_index(&lf)..], &OWN_BELOW_CUT_RULES).is_ok(),
+            "control: the walk refuses this file as it actually is, so the four refusals above \
+             measure nothing"
         );
     }
 
