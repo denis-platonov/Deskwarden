@@ -17372,6 +17372,77 @@ mod export_wiring {
         &source[..end]
     }
 
+    /// **The field names `VaultFrameEnv` really declares**, read out of this
+    /// file's production region.
+    ///
+    /// **Why this exists.** Everything downstream of the width pin used to
+    /// bottom out in `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS`, and
+    /// `checked` was an array of `(&str, bool)` whose strings nothing
+    /// connected to anything. So the "forced chain" the width pin advertised
+    /// -- width red, bump the constant, red the length, need a `checked`
+    /// entry, need a BINDING, so name the field -- had a false last link: a
+    /// `checked` entry needs no binding and no field, only a row. Measured:
+    /// a ninth field `aux_load_2` fed a no-op, `..` in the destructuring, and
+    /// the `("aux_load", ..)` row DUPLICATED VERBATIM, was green across 2249
+    /// lib tests in debug and in `--release` with zero warnings, shipping an
+    /// Archive list that never loads. The incriminating artifact was one
+    /// changed digit and one copy-pasted line.
+    ///
+    /// The names are therefore no longer free text. They come from the
+    /// struct's own declaration here, from `stringify!` of the destructured
+    /// bindings in [`production_hands_the_window_the_real_functions`], and
+    /// from the destructuring pattern in
+    /// [`the_frame_envs_destructuring_names_every_field_it_has`] -- three
+    /// readings of the same set, compared as SETS, so a duplicate row is a
+    /// duplicate name and a duplicate name is red.
+    ///
+    /// **Read from the production region and not from the whole file**, so
+    /// that a second `VaultFrameEnv` written below the cut cannot be the one
+    /// this answers about.
+    fn frame_env_field_names() -> Vec<&'static str> {
+        let source = production();
+        let opener = concat!("pub struct VaultFrame", "Env {\r\n");
+        assert_eq!(
+            source.matches(opener).count(),
+            1,
+            "`VaultFrameEnv` is not declared exactly once in this file's production region, \
+             so the field names every pin over that struct is compared against could not be \
+             read. If the declaration was reformatted, fix this reader; if there are two of \
+             them, the window can be handed a struct nothing here pins"
+        );
+        let at = source.find(opener).expect("counted just above") + opener.len();
+        let body = &source[at..];
+        let body = &body[..body
+            .find("\r\n}\r\n")
+            .expect("`VaultFrameEnv`'s declaration is unterminated")];
+        // A field line is indented EXACTLY four spaces and is `name:`. The
+        // four-space test is what keeps the continuation lines of the
+        // multi-line `load: fn(` type out -- `std::sync::Arc<..>,` is
+        // indented eight and would otherwise read as a field called `std`.
+        let names: Vec<&'static str> = body
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                if rest.starts_with(' ') || !rest.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    return None;
+                }
+                let len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+                rest[len..].starts_with(':').then(|| &rest[..len])
+            })
+            .collect();
+        // CONTROLS: the reader really read something, and it read the field
+        // this module knows by name is last, so a parse that silently
+        // returned the empty list -- which would make every set comparison
+        // below pass by both sides being empty -- says so here instead.
+        assert!(
+            names.len() > 1 && names.contains(&"settings_path"),
+            "control: reading `VaultFrameEnv`'s declaration produced {names:?}, which does \
+             not contain the `settings_path` field this module knows that struct has. The \
+             reader is broken, and every comparison against these names is vacuous"
+        );
+        names
+    }
+
     /// The address of the job [`export_thread::export_job`] hands out, or
     /// `None` if this machine would not give the process one.
     fn window_job_address() -> Option<usize> {
@@ -17984,12 +18055,29 @@ mod export_wiring {
         let real_create: SendCreateSpawn = send_create_thread::spawn_send_create;
         let real_aux_load: AuxLoadSpawn = spawn_aux_load;
 
+        // **A row's NAME is its BINDING's name, spelled by the compiler.**
+        // These used to be free string literals sitting beside the
+        // comparison, which is how a DUPLICATED row -- `("aux_load", ..)`
+        // written twice -- paid for a ninth field with the whole suite green:
+        // `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS` counts rows, and
+        // nothing required the rows to be about different fields. `$field` is
+        // used twice here, as the name and as the value, so the two cannot
+        // disagree and a row about a field that has no binding does not
+        // compile. Combined with the distinctness and set assertions below,
+        // a second row about `aux_load` is now a duplicate NAME rather than
+        // an eighth ROW.
+        macro_rules! seam {
+            ($field:ident, $real:expr) => {
+                (stringify!($field), std::ptr::fn_addr_eq($field, $real))
+            };
+        }
+
         let checked: [(&str, bool); 7] = [
-            ("sync", std::ptr::fn_addr_eq(sync, real_sync)),
-            ("load", std::ptr::fn_addr_eq(load, real_load)),
-            ("send_list", std::ptr::fn_addr_eq(send_list, real_send_list)),
-            ("export", std::ptr::fn_addr_eq(export, real_export)),
-            ("send_delete", std::ptr::fn_addr_eq(send_delete, real_delete)),
+            seam!(sync, real_sync),
+            seam!(load, real_load),
+            seam!(send_list, real_send_list),
+            seam!(export, real_export),
+            seam!(send_delete, real_delete),
             // The field that PUBLISHES. A forwarder here does not merely make
             // a button inert: `if plan.password.is_none() { real(..) }` in
             // this slot leaves every password-protected create silently
@@ -17998,8 +18086,8 @@ mod export_wiring {
             // secret still resident. That mutant was measured green across
             // 2243 lib / 217 bin tests with zero warnings before this line
             // existed.
-            ("send_create", std::ptr::fn_addr_eq(send_create, real_create)),
-            ("aux_load", std::ptr::fn_addr_eq(aux_load, real_aux_load)),
+            seam!(send_create, real_create),
+            seam!(aux_load, real_aux_load),
         ];
         // The tie to `VAULT_FRAME_ENV_FIELDS`, and the reason it is an
         // assertion and not a comment: the destructuring above stops a ninth
@@ -18017,6 +18105,50 @@ mod export_wiring {
              field a wrapper, a forwarder or a flag-gated no-op can occupy with the whole \
              suite green -- which is what happened to `aux_load` and then to `send_create`",
             checked.len()
+        );
+        // **The rows are about DISTINCT fields**, and the fields are the ones
+        // the struct actually declares.
+        //
+        // The count above is a count of ROWS, and until these two assertions
+        // existed a row cost one copy-pasted line: `("aux_load", ..)` written
+        // twice made `checked.len()` eight, paid for a ninth field, and left
+        // the ninth field itself absorbed by a `..` in the pattern above. The
+        // whole suite was green, in both profiles, with no warning, and the
+        // ninth field held a no-op that silently stopped the Archive list
+        // from ever loading. What was missing was any statement that these
+        // seven names have anything to do with `VaultFrameEnv`.
+        let mut named: Vec<&str> = checked.iter().map(|(field, _)| *field).collect();
+        // The one field this test compares by VALUE rather than by address,
+        // a dozen lines below. It is accounted for here so that the two sides
+        // are the whole struct and not "the struct minus whatever this test
+        // forgot".
+        named.push("settings_path");
+        named.sort_unstable();
+        let mut distinct = named.clone();
+        distinct.dedup();
+        assert_eq!(
+            named,
+            distinct,
+            "two rows of `checked` are about the SAME field of `VaultFrameEnv`, so the \
+             `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS` count above is being paid by a \
+             duplicate rather than by a field. That is the measured mutation: duplicate the \
+             `aux_load` row, bump the constant, and a ninth field holding a no-op reaches the \
+             shipping build with this suite green. Every row here names a distinct field or \
+             this test is counting lines"
+        );
+        let mut declared = frame_env_field_names();
+        declared.sort_unstable();
+        assert_eq!(
+            named,
+            declared,
+            "the fields this test compares are not the fields `VaultFrameEnv` declares. \
+             Each row's name above is `stringify!` of the binding the destructuring produced, \
+             and the right-hand list is read from the struct's own declaration in this file's \
+             production region, so a mismatch means one of: a field exists that nothing here \
+             compares -- which is a seam a fake can occupy with the whole suite green, as \
+             `aux_load` and then `send_create` both did -- or this test compares something \
+             that is no longer a field. Name the new field in the destructuring above, give \
+             it a `seam!` row against its real spawn function, and pin it"
         );
         // THE ONE NON-`fn` FIELD, by value. `default_path` is where the real
         // `%APPDATA%\\Deskwarden` is decided, and a window handed anything
@@ -18064,9 +18196,22 @@ mod export_wiring {
         // CONTROL: the comparison discriminates. A function of the right
         // SIGNATURE that is not the right function reads as different -- so
         // "same" above is not something every pair of `fn` pointers has.
+        //
+        // **Run THROUGH `seam!`, and not around it.** Every row of `checked`
+        // is now that macro's expansion, so a `seam!` that quietly stopped
+        // comparing -- `(stringify!($field), true)`, one line -- would leave
+        // the names, the distinctness and the set comparison all correct and
+        // make every address assertion above vacuous. These controls use the
+        // macro on a decoy, so that edit reds here instead of passing.
         let decoy: ExportSpawn = not_the_export_spawner;
+        let (name, same) = seam!(export, decoy);
+        assert_eq!(
+            name, "export",
+            "control: `seam!` does not name the field it is given, so the names in `checked` \
+             are not the bindings' own names"
+        );
         assert!(
-            !std::ptr::fn_addr_eq(export, decoy),
+            !same,
             "control: a different function of the same signature compares EQUAL to the \
              production export spawner, so every assertion above is vacuous"
         );
@@ -18074,14 +18219,18 @@ mod export_wiring {
         // compare at all, so neither new assertion is trusted on the
         // export field's evidence.
         let create_decoy: SendCreateSpawn = not_the_create_spawner;
+        let (name, same) = seam!(send_create, create_decoy);
+        assert_eq!(name, "send_create", "control: `seam!` misnames `send_create`");
         assert!(
-            !std::ptr::fn_addr_eq(send_create, create_decoy),
+            !same,
             "control: a different function of the same signature compares EQUAL to the \
              production create spawner, so the `send_create` assertion is vacuous"
         );
         let aux_decoy: AuxLoadSpawn = not_the_aux_load_spawner;
+        let (name, same) = seam!(aux_load, aux_decoy);
+        assert_eq!(name, "aux_load", "control: `seam!` misnames `aux_load`");
         assert!(
-            !std::ptr::fn_addr_eq(aux_load, aux_decoy),
+            !same,
             "control: a different function of the same signature compares EQUAL to the \
              production aux-load spawner, so the `aux_load` assertion is vacuous"
         );
@@ -18212,6 +18361,99 @@ mod export_wiring {
     #[test]
     fn a_ninth_field_cannot_be_added_to_the_frame_env_without_being_named() {
         the_frame_env_is_exactly_as_wide_as_the_fields_this_module_pins();
+    }
+
+    /// **[`VAULT_FRAME_ENV_FIELDS`] is the number of fields that struct
+    /// really has**, and not a number somebody is free to choose.
+    ///
+    /// The width pin turns a ninth field into arithmetic that only rebalances
+    /// when this constant is bumped, and everything downstream hangs off the
+    /// bump. That made the constant the single number a dishonest edit had to
+    /// move -- and nothing checked it against anything. This does: the count
+    /// comes from the struct's own declaration, so the constant cannot be
+    /// bumped to buy slack that no field paid for, and cannot be left behind
+    /// when a field is added.
+    #[test]
+    fn the_pinned_field_count_is_the_structs_own() {
+        let declared = frame_env_field_names();
+        assert_eq!(
+            declared.len(),
+            VAULT_FRAME_ENV_FIELDS,
+            "`VAULT_FRAME_ENV_FIELDS` is {VAULT_FRAME_ENV_FIELDS} but `VaultFrameEnv` \
+             declares {} fields: {declared:?}. This constant is what the width pin, the \
+             `checked` count and `send_ui`'s constructor counter all balance against, so a \
+             number that does not match the struct silences all three at once",
+            declared.len()
+        );
+    }
+
+    /// **The destructuring in
+    /// [`production_hands_the_window_the_real_functions`] NAMES every field,
+    /// and elides none.**
+    ///
+    /// That pattern is exhaustive by E0027, and `..` satisfies E0027 while
+    /// mentioning nobody -- the measured one-token repair that absorbed a
+    /// ninth field twice. Nothing in the compiler distinguishes the two, so
+    /// it is stated here as text: this is the one place in this file where
+    /// the difference between "acknowledged" and "named" is the property, and
+    /// the property is that each field of that struct arrives as a BINDING,
+    /// which is what makes `seam!`'s `stringify!` a fact about the struct
+    /// rather than a string somebody typed.
+    ///
+    /// Read from the whole file rather than the production region, because
+    /// the pattern this is about lives below the cut.
+    #[test]
+    fn the_frame_envs_destructuring_names_every_field_it_has() {
+        let source = include_str!("mod.rs");
+        // Split, so this test's own text is not what it finds.
+        let opener = concat!("let VaultFrame", "Env {\r\n");
+        assert_eq!(
+            source.matches(opener).count(),
+            1,
+            "this file destructures a `VaultFrameEnv` value {} times, not once, so the \
+             pattern this test polices is not the only one and the others are unread",
+            source.matches(opener).count()
+        );
+        let at = source.find(opener).expect("counted just above") + opener.len();
+        let rest = &source[at..];
+        let closer = concat!("\r\n        } = VaultFrame", "Env::production();");
+        let pattern = &rest[..rest
+            .find(closer)
+            .expect("the destructuring of `VaultFrameEnv::production()` is unterminated")];
+
+        let mut named: Vec<&str> = Vec::new();
+        for line in pattern.lines() {
+            let entry = line.trim();
+            assert!(
+                !entry.starts_with(".."),
+                "the destructuring of `VaultFrameEnv::production()` elides fields with \
+                 `..`. E0027 is satisfied by that token and it names nobody, which is how a \
+                 ninth field reached a shipping build twice: `..` absorbs it, no binding \
+                 exists, and the `checked` array below is free to keep its old rows. Name \
+                 every field: {pattern}"
+            );
+            let entry = entry.strip_suffix(',').unwrap_or(entry);
+            assert!(
+                !entry.is_empty()
+                    && entry
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "the destructuring of `VaultFrameEnv::production()` contains {entry:?}, \
+                 which is not a plain field name. A binding pattern that renames or nests \
+                 breaks the tie between the struct's fields and `seam!`'s `stringify!`"
+            );
+            named.push(entry);
+        }
+        named.sort_unstable();
+        let mut declared = frame_env_field_names();
+        declared.sort_unstable();
+        assert_eq!(
+            named,
+            declared,
+            "the destructuring of `VaultFrameEnv::production()` binds {named:?} but that \
+             struct declares {declared:?}. Every field has to arrive as a binding of its own \
+             name, or the row that pins it in `checked` is a string rather than a field"
+        );
     }
 
     /// The body of

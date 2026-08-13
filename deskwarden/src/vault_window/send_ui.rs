@@ -6798,6 +6798,47 @@ mod source_pins {
         // Past the opener, so the constructor's own signature is not
         // counted as a definition made inside it.
         let inside = &body[opener.len()..];
+        // **Whole-identifier matching, not substring.** These needles used to
+        // be counted with `matches(..).count() == 1`, so an HONEST new field
+        // whose spawn is called `spawn_aux_load_2` made the `spawn_aux_load`
+        // needle match twice and reddened this test for doing the right
+        // thing. The reviewer who hit it renamed the honest function to get
+        // around it. A guard that reds on legitimate work gets weakened by
+        // whoever hits it next, and two of the holes in this wiring were made
+        // exactly that way -- so the guard is fixed instead of the name.
+        fn whole_identifier_matches(hay: &str, needle: &str) -> usize {
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            let mut count = 0;
+            let mut from = 0;
+            while let Some(at) = hay[from..].find(needle) {
+                let start = from + at;
+                let end = start + needle.len();
+                let before = hay[..start].chars().next_back();
+                let after = hay[end..].chars().next();
+                if before.map_or(true, |c| !ident(c)) && after.map_or(true, |c| !ident(c)) {
+                    count += 1;
+                }
+                from = start + 1;
+            }
+            count
+        }
+        // CONTROL: the anchoring really discriminates, both ways. A needle
+        // that is a strict prefix of a longer identifier does not match it,
+        // and the same needle standing alone does -- otherwise this could be
+        // anchored so tightly that it matches nothing and every assertion
+        // below passes vacuously.
+        assert_eq!(
+            whole_identifier_matches("a spawn_aux_load_2(x)", concat!("spawn_aux_", "load")),
+            0,
+            "control: whole-identifier matching still matches a strict prefix of a longer \
+             name, so an honest sibling field reds the needle for the field it is a sibling of"
+        );
+        assert_eq!(
+            whole_identifier_matches("a spawn_aux_load(x)", concat!("spawn_aux_", "load")),
+            1,
+            "control: whole-identifier matching does not match the identifier itself, so \
+             every needle assertion below is vacuous"
+        );
         for named in [
             "spawn_vault_sync",
             "spawn_vault_load",
@@ -6813,7 +6854,7 @@ mod source_pins {
             concat!("spawn_aux_", "load"),
         ] {
             assert_eq!(
-                body.matches(named).count(),
+                whole_identifier_matches(body, named),
                 1,
                 "`VaultFrameEnv::production` does not name {named:?} exactly once: {body}"
             );
