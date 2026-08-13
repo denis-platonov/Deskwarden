@@ -17443,6 +17443,328 @@ mod export_wiring {
         names
     }
 
+    /// `text` as CODE, whitespace-collapsed: every line that is ONLY a
+    /// comment is dropped and all remaining whitespace becomes single spaces.
+    ///
+    /// Comment lines are dropped LINE-WISE rather than by scanning for a `//`
+    /// anywhere, so a `//` inside a string literal cannot swallow the rest of
+    /// its line. The cost is disclosed on
+    /// [`every_frame_env_seam_has_a_whole_body_pin`]: a function pinned whole
+    /// may not contain a whole-line comment of its own.
+    fn code_squashed(text: &str) -> String {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The whole source text of the production function called `name`, as
+    /// [`code_squashed`] renders it.
+    ///
+    /// From the start of the DEFINITION's own line -- so a visibility is part
+    /// of what comes back -- to the closing brace found by brace depth.
+    fn spawner_body(name: &str) -> String {
+        let source = production();
+        let needle = format!("fn {name}(");
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            1,
+            "{needle:?} is not written exactly once in this file's production region, so the \
+             body of the function `VaultFrameEnv::production` hands that seam could not be \
+             read"
+        );
+        let at = source.find(needle.as_str()).expect("counted just above");
+        let start = source[..at].rfind("\r\n").map_or(0, |line_end| line_end + 2);
+        let open = at + source[at..].find('{').expect("a function definition with no body");
+        let bytes = source.as_bytes();
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, byte) in bytes[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code_squashed(&source[start..end.expect("that function's braces are unbalanced")])
+    }
+
+    /// The field assignments `VaultFrameEnv::production` really makes, in
+    /// source order, as `(field, expression)`.
+    ///
+    /// Read from the constructor's own text, so nothing here is a written
+    /// list of what someone believed it assigns.
+    fn frame_env_production_assignments() -> Vec<(&'static str, &'static str)> {
+        let source = production();
+        let opener = concat!("pub fn produc", "tion() -> Self {");
+        assert_eq!(
+            source.matches(opener).count(),
+            1,
+            "`VaultFrameEnv::production` is not written exactly once in this file's \
+             production region, so the assignments every question below asks about could \
+             not be read"
+        );
+        let at = source.find(opener).expect("counted just above") + opener.len();
+        let body = &source[at..];
+        let body = &body[..body
+            .find(concat!("\r\n", "    }", "\r\n"))
+            .expect("`VaultFrameEnv::production` is unterminated")];
+        let rows: Vec<(&'static str, &'static str)> = body
+            .lines()
+            .filter_map(|line| {
+                let (name, rest) = line.trim().split_once(':')?;
+                let named = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                named.then(|| (name, rest.trim().trim_end_matches(',')))
+            })
+            .collect();
+        // CONTROL: the parse read the WHOLE constructor, and it read the same
+        // fields the struct declares. A field whose assignment this reader
+        // silently skipped -- a value spelled across two lines, say -- would
+        // otherwise be a seam the derived pin below never asks about.
+        let mut read: Vec<&str> = rows.iter().map(|(field, _)| *field).collect();
+        read.sort_unstable();
+        let mut declared = frame_env_field_names();
+        declared.sort_unstable();
+        assert_eq!(
+            read, declared,
+            "control: the assignments read out of `VaultFrameEnv::production` are not the \
+             fields `VaultFrameEnv` declares, so this reader is broken and every question \
+             asked of it is vacuous"
+        );
+        rows
+    }
+
+    /// **Every seam of `VaultFrameEnv` has a WHOLE-BODY pin over the function
+    /// production hands it -- one required PER FIELD, derived from the
+    /// struct's own declaration.**
+    ///
+    /// **Why.** `production_hands_the_window_the_real_functions` compares
+    /// POINTERS. It is satisfied by the right function with its body emptied,
+    /// and that is not hypothetical: `spawn_aux_load` keeping its
+    /// `std::thread` call and its cache read but never sending its answer was
+    /// measured green across the whole suite, in both profiles, with zero
+    /// warnings, leaving Archive and Trash spinning forever. The only thing
+    /// that noticed anything at that site was the crate's thread census, and
+    /// what the census holds is a TOKEN, not the work.
+    ///
+    /// **Why this is a derivation and not a list.** The three whole-body pins
+    /// that existed were written one at a time, after the fact, each because
+    /// someone measured a hole. A list of pinned spawners cannot notice a
+    /// spawner nobody added to it, which is exactly how `aux_load` and then
+    /// `send_create` each shipped unpinned. This walks the fields
+    /// `VaultFrameEnv` DECLARES, reads what the constructor assigns each one,
+    /// and requires that function's body to be pinned somewhere in this
+    /// file's tests. A ninth field gets no pin for free.
+    ///
+    /// **What it does NOT hold, said plainly.** A whole-body text pin is
+    /// satisfied by text, and text can be written that does not do the work.
+    /// This makes a hollow seam a DELIBERATE two-place edit -- the function
+    /// and its pin -- where it used to be a one-place edit nothing looked at.
+    /// It is not a behavioural proof, and the behavioural tests beside these
+    /// pins remain the thing that says the work happens.
+    ///
+    /// Two further boundaries, disclosed rather than argued away:
+    ///
+    ///  * The pin must be findable as TEXT. Comment-only lines are dropped
+    ///    before the search, so quoting a body in a doc comment does not
+    ///    satisfy this -- but a dead `let _ = "..";` in a test would. What is
+    ///    required is that the text exist, not that it be asserted.
+    ///  * A pinned function may not contain a whole-line comment, and its
+    ///    pin must be spelled as a `concat!` of string literals joined `", "`
+    ///    with `\` continuations, because that is the normalisation applied
+    ///    here. Any other spelling REDS rather than passes, which is the
+    ///    right direction but is a false red waiting for a reformatter.
+    #[test]
+    fn every_frame_env_seam_has_a_whole_body_pin() {
+        let source = include_str!("mod.rs");
+        let cut = source
+            .find(concat!("#[cfg", "(test)]"))
+            .expect("no test module in this file");
+        // The test region as CODE, with the two things a Rust string literal
+        // does to the text it quotes undone: a `\` line continuation, and a
+        // `concat!` joint. So a pin spelled `concat!("fn spawn_", "x() {}")`
+        // reads here as the text it builds -- which is the only form these
+        // pins may take, since spelling a production spawner's name whole in
+        // a test would move needle counts elsewhere in the crate.
+        let pins = code_squashed(&source[cut..])
+            .replace(" \\ ", " ")
+            .replace("\", \"", "");
+        assert!(
+            pins.len() > 100_000,
+            "control: the text searched for pins is {} bytes, which is not this file's test \
+             region, so every search below is vacuous",
+            pins.len()
+        );
+
+        let mut by_value = Vec::new();
+        for (field, expression) in frame_env_production_assignments() {
+            // A field production fills with a CALL is not a spawn function's
+            // own address and has no body of its own to pin. Exactly one
+            // field of this struct is like that, and which one is asserted
+            // below -- so `aux_load: some_gate(spawn_aux_load)`, a measured
+            // mutation, cannot buy itself an exemption here.
+            if expression.contains('(') {
+                by_value.push(field);
+                continue;
+            }
+            let spawner = expression.rsplit("::").next().expect("a non-empty expression");
+            let body = spawner_body(spawner);
+            assert!(
+                body.len() > 60,
+                "control: the body read for {spawner:?} is {body:?}, which is too short to be \
+                 a spawn function -- the reader is broken and the search below is vacuous"
+            );
+            assert!(
+                pins.contains(&body),
+                "`VaultFrameEnv::{field}` is handed `{spawner}`, and NOTHING IN THIS FILE'S \
+                 TESTS PINS THAT FUNCTION'S BODY.\n\
+                 \n\
+                 The address pin over this struct compares POINTERS, so it is satisfied by \
+                 the right function with its body emptied -- measured, on this exact seam, \
+                 green across the whole suite in both profiles. The text a pin must hold is\
+                 \n  {body}\n\
+                 and it must appear, character for character modulo whitespace, in this \
+                 file's test region as a `concat!` of literals. Write the pin; do not \
+                 reformat the function to make this question go away."
+            );
+        }
+        assert_eq!(
+            by_value,
+            ["settings_path"],
+            "the fields `VaultFrameEnv::production` fills with a CALL rather than with a \
+             function's own name are {by_value:?}. Exactly one field may be, and it is \
+             `settings_path` -- a VALUE, compared by value in \
+             `production_hands_the_window_the_real_functions`. Any other is a gate, a \
+             wrapper or a factory standing between the constructor and the real spawner, \
+             which is a fake seam with the address pin still green"
+        );
+
+        // CONTROL: the search discriminates. A production function that is
+        // not a seam has no whole-body pin, so `contains` is not answering
+        // `true` for every body this file happens to contain.
+        let unpinned = spawner_body(concat!("avatar_", "initials"));
+        assert!(
+            !pins.contains(&unpinned),
+            "control: the body of a function no test pins whole was found in the pin text \
+             anyway, so every assertion above passes without any pin existing"
+        );
+    }
+
+    /// **`spawn_vault_sync` is the wipe, the spawn and nothing else** -- a
+    /// whole-body equality, [`spawn_export_only_hands_the_real_work_to_the_tested_spawner`]'s
+    /// shape and its reason, required of this seam by
+    /// [`every_frame_env_seam_has_a_whole_body_pin`].
+    #[test]
+    fn spawn_vault_sync_only_hands_the_real_sync_to_a_thread() {
+        let body = concat!(
+            "fn spawn_vault_", "sync(tx: mpsc::Sender<Result<(), String>>, session_token: \
+             String) { let session_token = zeroize::Zeroizing::new(session_token); \
+             std::thread::sp", "awn(move || { let _ = \
+             tx.send(bw_serve::run_bw_sync(&session_token)); }); }"
+        );
+        assert_eq!(
+            code_squashed(production()).matches(body).count(),
+            1,
+            "`spawn_vault_sync` is no longer exactly the arrival wipe plus the spawn of the \
+             real sync. Anything ADDED to it runs on the frame's own thread; anything \
+             REMOVED is either the token left in a freed heap block or a Sync the user asked \
+             for that never runs, with the address pin over `VaultFrameEnv` still green"
+        );
+    }
+
+    /// **`spawn_vault_load` is the delegation and nothing else** --
+    /// [`spawn_vault_sync_only_hands_the_real_sync_to_a_thread`]'s shape,
+    /// required of this seam by [`every_frame_env_seam_has_a_whole_body_pin`].
+    #[test]
+    fn spawn_vault_load_only_hands_the_real_load_to_the_tested_spawner() {
+        let body = concat!(
+            "fn spawn_vault_", "load( cache: std::sync::Arc<VaultCache>, tx: \
+             mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>, request: \
+             VaultLoadRequest, ) { spawn_vault_load_with_schedule(cache, tx, request, \
+             readiness_schedule(READINESS_DEADLINE)); }"
+        );
+        assert_eq!(
+            code_squashed(production()).matches(body).count(),
+            1,
+            "`spawn_vault_load` is no longer exactly the delegation to \
+             `spawn_vault_load_with_schedule` with the real readiness schedule. Anything \
+             ADDED to it runs on the frame's own thread before the spawn; anything REMOVED \
+             is a vault load that never happens, with the window's list empty and the \
+             address pin over `VaultFrameEnv` still green"
+        );
+    }
+
+    /// **`spawn_send_list` is the delegation and nothing else** --
+    /// [`spawn_vault_sync_only_hands_the_real_sync_to_a_thread`]'s shape,
+    /// required of this seam by [`every_frame_env_seam_has_a_whole_body_pin`].
+    ///
+    /// **This body is pinned twice, and that is disclosed rather than tidied.**
+    /// `send_ui`'s `spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`
+    /// already pins it, and pins it well -- but it pins the PARAMETER LIST and
+    /// the body, not the definition's opening line, and it builds its
+    /// expectation with `format!` rather than as one text. The derived
+    /// requirement above reads pins as text and could not see it without a
+    /// normaliser wide enough to be worth defeating. One redundant equality
+    /// costs a line; widening the reader costs the property.
+    #[test]
+    fn spawn_send_list_is_the_delegation_and_nothing_else() {
+        let body = concat!(
+            "pub(super) fn spawn_send_", "list( ctx_for_sends: egui::Context, tx: \
+             SendListSender, generation: u64, session: zeroize::Zeroizing<String>, ) { \
+             spawn_send_list_with(ctx_for_sends, tx, generation, move || \
+             real_send_list(&session)); }"
+        );
+        assert_eq!(
+            code_squashed(production()).matches(body).count(),
+            1,
+            "`spawn_send_list` is no longer exactly the delegation to `spawn_send_list_with` \
+             with the real fetch. Anything ADDED to it is a blocking line on the frame's own \
+             thread; anything REMOVED is a Sends screen that spins forever, with the address \
+             pin over `VaultFrameEnv` still green"
+        );
+    }
+
+    /// **`spawn_aux_load` is the thread, the cache read and the SEND** -- and
+    /// the send is the part nothing held.
+    ///
+    /// **Measured.** With `std::thread` and the cache read left in place and
+    /// only the `tx.send(..)` removed, the whole suite was green -- 2255 lib
+    /// tests, both profiles, zero warnings -- and Archive and Trash spun
+    /// forever for the life of the window. The crate's thread census sees the
+    /// token `std::thread::spawn` and cannot see whether the thread does
+    /// anything; the address pin over `VaultFrameEnv` sees the pointer and
+    /// cannot see the body. This is the assertion that sees the body.
+    #[test]
+    fn spawn_aux_load_only_hands_the_real_lists_to_a_thread_and_reports_them() {
+        let body = concat!(
+            "fn spawn_aux_", "load( cache: std::sync::Arc<VaultCache>, which: OutOfVault, \
+             generation: u64, era: crate::vault_cache::VaultEra, tx: mpsc::Sender<(u64, \
+             OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>, ) { \
+             std::thread::sp", "awn(move || { let result = match which { OutOfVault::Trash \
+             => cache.list_trash_unless_superseded(era), OutOfVault::Archive => \
+             cache.list_archive_unless_superseded(era), }; let _ = tx.send((generation, \
+             which, result.map_err(AuxLoadError::of))); }); }"
+        );
+        assert_eq!(
+            code_squashed(production()).matches(body).count(),
+            1,
+            "`spawn_aux_load` is no longer exactly the thread that reads the requested list \
+             out of the cache and SENDS it back. Dropping the send alone leaves Archive and \
+             Trash spinning forever with no error, no warning and every other pin over this \
+             seam green -- that is the measured mutation this assertion exists for"
+        );
+    }
+
     /// The address of the job [`export_thread::export_job`] hands out, or
     /// `None` if this machine would not give the process one.
     fn window_job_address() -> Option<usize> {
@@ -18607,6 +18929,102 @@ mod export_wiring {
         );
     }
 
+    /// Every `macro_rules` definition in `source`, as its macro NAME and the
+    /// byte offset of its opening delimiter.
+    ///
+    /// A name of `None` is a definition whose name is a METAVARIABLE -- a
+    /// `macro_rules` written inside another macro's expansion, so that the
+    /// name it defines is chosen by the outer macro's argument. See
+    /// [`the_seam_macro_has_one_arm_and_keys_it_to_no_field`] for why that is
+    /// not a hypothetical shape.
+    ///
+    /// **A scan over tokens rather than a substring search**, because a
+    /// substring search is a search for ONE SPELLING and every spelling-shaped
+    /// guard in this module has been defeated by writing the other spelling.
+    /// Between `macro_rules`, `!` and the name Rust admits any amount of
+    /// whitespace and any comment; the name itself may carry a raw-identifier
+    /// prefix, which names the same macro; and the definition's delimiter may
+    /// be any of the three bracket pairs. All of that is normalised here, so
+    /// what is counted is what the compiler would resolve.
+    fn macro_definitions(source: &str) -> Vec<(Option<&str>, usize)> {
+        fn is_ident(byte: u8) -> bool {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        }
+        /// Past whitespace and past comments -- the only things Rust allows
+        /// BETWEEN these tokens.
+        fn skip_trivia(source: &str, mut at: usize) -> usize {
+            let bytes = source.as_bytes();
+            loop {
+                while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                    at += 1;
+                }
+                if source[at..].starts_with("//") {
+                    match source[at..].find('\n') {
+                        Some(end) => at += end + 1,
+                        None => return bytes.len(),
+                    }
+                } else if source[at..].starts_with("/*") {
+                    match source[at..].find("*/") {
+                        Some(end) => at += end + 2,
+                        None => return bytes.len(),
+                    }
+                } else {
+                    return at;
+                }
+            }
+        }
+        /// The identifier at `at`, with a raw-identifier prefix stripped:
+        /// `r#seam` and `seam` are the SAME name to the compiler, and a pin
+        /// that could not see that is a pin one `r#` defeats.
+        fn ident_at(source: &str, at: usize) -> Option<(&str, usize)> {
+            let bytes = source.as_bytes();
+            let start = if source[at..].starts_with("r#") { at + 2 } else { at };
+            let mut end = start;
+            while end < bytes.len() && is_ident(bytes[end]) {
+                end += 1;
+            }
+            (end > start).then_some((&source[start..end], end))
+        }
+        let keyword = concat!("macro_", "rules");
+        let bytes = source.as_bytes();
+        let mut found: Vec<(Option<&str>, usize)> = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            if !is_ident(bytes[at]) || (at > 0 && is_ident(bytes[at - 1])) {
+                at += 1;
+                continue;
+            }
+            let Some((word, after)) = ident_at(source, at) else {
+                at += 1;
+                continue;
+            };
+            at = after;
+            if word != keyword {
+                continue;
+            }
+            let bang = skip_trivia(source, after);
+            if bang >= bytes.len() || bytes[bang] != b'!' {
+                continue;
+            }
+            let names_at = skip_trivia(source, bang + 1);
+            let Some((defined, after_name)) = ident_at(source, names_at) else {
+                // A `$` here is a metavariable standing where the macro's
+                // name goes, which is only writable inside another macro's
+                // expansion. Reported so it can be REFUSED; anything else
+                // after the `!` is prose about macros and is ignored.
+                if names_at < bytes.len() && bytes[names_at] == b'$' {
+                    found.push((None, names_at));
+                }
+                continue;
+            };
+            let open = skip_trivia(source, after_name);
+            if open < bytes.len() && matches!(bytes[open], b'{' | b'(' | b'[') {
+                found.push((Some(defined), open));
+            }
+        }
+        found
+    }
+
     /// **`seam!` has exactly ONE arm, and that arm is keyed to no field.**
     ///
     /// The decoy controls in [`production_hands_the_window_the_real_functions`]
@@ -18631,21 +19049,116 @@ mod export_wiring {
     #[test]
     fn the_seam_macro_has_one_arm_and_keys_it_to_no_field() {
         let source = include_str!("mod.rs");
-        let opener = concat!("macro_rules! ", "seam {");
-        let defined = source.matches(opener).count();
-        assert_eq!(
-            defined,
-            1,
-            "`seam!` is defined {defined} times in this file. The whole hold on the frame \
-             env's seams is that ONE macro expands every row of `checked` and every decoy \
-             control, so a second definition is a second expansion nothing here has looked at"
+        // **Aimed at the macro's NAME.** What was here was `matches("macro_rules!
+        // seam {").count() == 1`: one spelling, of name-plus-space-plus-brace,
+        // counted as a substring. A second definition written any other way --
+        // no space, two spaces, a newline before the brace, a comment between
+        // the tokens, `r#seam` -- was invisible to that counter, and
+        // `macro_rules!` is TEXTUALLY SCOPED, so the later definition shadows
+        // the earlier one for every invocation below it. The decoy controls
+        // sit below too, and an arm keyed to the `(field, real_binding)` pair
+        // that only a `checked` row spells sends every decoy to the honest
+        // arm. One edit, in one region of this file, defeated this pin AND
+        // all seven decoys at once; it was measured green across 2255 lib
+        // tests in both profiles with a shipping build clean of warnings,
+        // holding an `aux_load` seam that never loaded anything.
+        //
+        // The lesson is the one this whole module keeps relearning: a guard
+        // aimed by a LITERAL is defeated by not matching the literal. So the
+        // scanner below is aimed by the name the compiler resolves -- the
+        // token `macro_rules`, the token `!`, and the macro's identifier with
+        // any raw-identifier prefix stripped, with whitespace AND comments
+        // skipped between them, which is every spelling Rust admits.
+        let named = concat!("se", "am");
+        let definitions = macro_definitions(source);
+        // **No macro in this file is defined with a METAVARIABLE for a name.**
+        //
+        // This is the one hole the token scan above still had, and it was
+        // MEASURED rather than imagined: an outer macro taking an `ident` and
+        // expanding to a definition whose NAME is that metavariable compiles
+        // on edition 2021 -- inner arms and all -- and defines whatever macro
+        // its caller names, so one invocation of it writes a second
+        // `seam` that no scan for the NAME `seam` can see -- the name is not
+        // in the source. A generated definition is never legitimate in this
+        // file, so it is refused outright rather than chased.
+        let generated: Vec<usize> = definitions
+            .iter()
+            .filter_map(|(name, at)| name.is_none().then_some(*at))
+            .collect();
+        assert!(
+            generated.is_empty(),
+            "a `macro_rules` definition in this file takes its NAME from a metavariable, at \
+             byte offsets {generated:?}. That is a macro written by another macro, and the \
+             name it defines does not appear in this source at all -- so the count below, \
+             which is a count of definitions NAMED {named:?}, cannot see it, and \
+             `macro_rules!` is textually scoped, so it would shadow the honest one for every \
+             invocation after it. Nothing in this file needs to generate a macro"
         );
-        let start = source.find(opener).expect("the opener was just counted");
-        // The macro's body, by brace depth from its own opening brace, so a
-        // reindent, a longer arm or a moved definition cannot change what is
-        // read -- only the braces can.
-        let brace = start + opener.len() - 1;
+        let defined: Vec<usize> = definitions
+            .iter()
+            .filter_map(|(name, at)| (*name == Some(named)).then_some(*at))
+            .collect();
+        assert_eq!(
+            defined.len(),
+            1,
+            "the `seam` macro is defined {} times in this file. The whole hold on the frame \
+             env's seams is that ONE macro expands every row of `checked` and every decoy \
+             control, and `macro_rules!` is textually scoped: a SECOND definition anywhere \
+             below the first shadows it for every invocation after it, including all seven \
+             decoy controls, while this pin reads the honest one. A second definition is \
+             never legitimate here",
+            defined.len()
+        );
+        // CONTROLS on the scanner itself, which is now the thing that aims
+        // this test. Every fixture is BUILT at run time out of split pieces:
+        // written as a literal it would be a real definition in this file's
+        // source and would break the count above.
+        let keyword = concat!("macro_", "rules");
+        for spelling in [
+            format!("{keyword}! {named} {{ () => {{}}; }}"),
+            format!("{keyword}!{named}{{}}"),
+            format!("{keyword}  !  {named}  {{}}"),
+            format!("{keyword}! r#{named} {{}}"),
+            format!("{keyword}!/* a comment */{named}{{}}"),
+            format!("{keyword}!\r\n{named}\r\n{{}}"),
+            format!("{keyword}! {named} ( () => (); );"),
+        ] {
+            assert_eq!(
+                macro_definitions(&spelling)
+                    .iter()
+                    .filter(|(name, _)| *name == Some(named))
+                    .count(),
+                1,
+                "control: the scanner misses a definition of this macro spelled {spelling:?}, \
+                 so a shadow written that way is invisible and the count above holds nothing"
+            );
+        }
+        assert!(
+            !definitions
+                .iter()
+                .any(|(name, _)| *name == Some(concat!("no_macro_in_this_file_is_", "called_this"))),
+            "control: the scanner reports a definition of a macro this file does not define, \
+             so it is not answering about names at all"
+        );
+        // CONTROL: the metavariable refusal above really fires. Built at run
+        // time, for the same reason every fixture here is: written as a
+        // literal it would be a generated definition IN THIS FILE.
+        let generator = format!("{keyword}! $m {{ () => {{}}; }}");
+        assert_eq!(
+            macro_definitions(&generator).iter().filter(|(name, _)| name.is_none()).count(),
+            1,
+            "control: a `macro_rules` whose name is a metavariable is not reported, so the \
+             refusal above holds nothing"
+        );
+        let brace = defined[0];
         let bytes = source.as_bytes();
+        assert_eq!(
+            bytes[brace],
+            b'{',
+            "the `seam` macro is defined with a delimiter other than braces. That is legal \
+             Rust and nothing below can read it -- rewrite the definition with braces rather \
+             than widening this reader"
+        );
         let mut depth = 0usize;
         let mut end = None;
         for (offset, byte) in bytes[brace..].iter().enumerate() {
@@ -18737,6 +19250,14 @@ mod export_wiring {
     }
 
     /// The `aux_load` decoy. [`not_the_create_spawner`]'s reasoning exactly.
+    ///
+    /// **Its own sentence**, not the export decoy's. Those two carried the
+    /// identical panic string while the reasoning beside them claimed a
+    /// message no other function carries; the claim was false. It could not
+    /// have mattered -- identical-COMDAT-folding needs identical bodies and
+    /// these two have different signatures, and folding one decoy onto the
+    /// other would still answer `false` against the real spawner -- but a
+    /// reason that is not true is not a reason.
     fn not_the_aux_load_spawner(
         _: std::sync::Arc<VaultCache>,
         _: OutOfVault,
@@ -18744,7 +19265,7 @@ mod export_wiring {
         _: crate::vault_cache::VaultEra,
         _: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
     ) {
-        unreachable!("never called -- this exists to have an address");
+        unreachable!("never called -- the aux-load decoy exists only to have an address");
     }
 
     /// The `sync` decoy. [`not_the_create_spawner`]'s reasoning exactly:
