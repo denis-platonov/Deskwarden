@@ -933,19 +933,45 @@ mod every_file_in_the_crate {
     /// occurrence of the string it searches for.
     const GATE: &str = concat!("#[cfg", "(test)]");
 
-    /// The three files that carry production code BELOW their first gated
-    /// test module.
+    /// The opening words of the refusal that says an item sits at file scope
+    /// below a cut. Interleaved files are recognised by it, so it is spelled
+    /// once rather than at every comparison.
+    const TOP_LEVEL: &str = "top-level source below the cut";
+
+    /// The opening words of the refusal that says something shares a line with
+    /// a test module's closing brace. Deliberately a DIFFERENT prefix from
+    /// [`TOP_LEVEL`]: interleaving tolerates the latter and must never
+    /// tolerate this one. See [`walk`].
+    const CLOSING_LINE: &str = "source on the line that closes a test module below the cut";
+
+    /// How many files carry production code BELOW their first gated test
+    /// module, and how many gated test modules those files carry between them.
     ///
-    /// Not an exemption a file can take by growing into it: this list is
-    /// compared for EQUALITY against the set derived from the tree, so a
-    /// fourth file that starts interleaving fails here by name, and a file
-    /// that stops interleaving fails here too. What membership costs is
-    /// stated in this module's report: in these three files the strict rule
-    /// is not available, only the tail rule, so a `pub fn` planted BETWEEN
-    /// two of their test modules is not caught. In every other file that
-    /// same payload is caught, and reaching it requires editing this list --
-    /// a second edit, in a test, naming the file.
-    const INTERLEAVED: &[&str] = &["src/app.rs", "src/injector/sequence.rs", "src/theme.rs"];
+    /// **These are pins, not a list.** The set itself is derived from the tree
+    /// and its members are named in the failure message, but nothing here
+    /// names a file, because every previous round in this area was lost by an
+    /// enumeration that could be widened by spelling one more name. What a pin
+    /// buys is cost, and cost is all it buys:
+    ///
+    /// * A file that starts interleaving moves `INTERLEAVED_FILES` and moves
+    ///   `INTERLEAVED_GATES` by that file's whole gate count, so the two-edit
+    ///   route measured against the old name list -- payload plus one string
+    ///   -- now needs THREE edits.
+    /// * A decoy gated module appended to a file that already interleaves
+    ///   moves `INTERLEAVED_GATES` on its own, so the one-edit route measured
+    ///   inside `app.rs` now needs TWO.
+    ///
+    /// `INTERLEAVED_GATES` counts gates only in the interleaving files, not
+    /// crate-wide, so ordinary test-writing in the other fifty-eight files
+    /// never touches it.
+    ///
+    /// What membership still costs is stated in this module's report: in an
+    /// interleaving file the strict rule is not available, only the tail rule,
+    /// so a `pub fn` planted BETWEEN two of its test modules is not caught.
+    /// That region is ordinary mid-file production and is read as such; the
+    /// tail, which is the half nobody reads, is held in every file.
+    const INTERLEAVED_FILES: usize = 3;
+    const INTERLEAVED_GATES: usize = 12;
 
     /// Every line of `source` as `(byte offset, line without its terminator)`.
     ///
@@ -1036,6 +1062,31 @@ mod every_file_in_the_crate {
     /// closed early by an INDENTED brace -- the balanced payload that beat
     /// the line walks -- therefore lands its `pub fn` in the region this walk
     /// is looking at, not in the region it is skipping.
+    ///
+    /// # Why the jump is not allowed to overshoot to end-of-line
+    ///
+    /// The jump resumes at the next LINE whose start offset is at or past the
+    /// byte after the close. The closing brace's OWN line starts before that
+    /// byte, so resuming line-wise skips the whole of it -- and everything to
+    /// the right of a test module's `}` is then read by nothing at all. One
+    /// line changed, no line added, brace balance provably unchanged:
+    ///
+    /// ```text
+    /// }    ->    } pub fn shipped_eol(x: u64) -> u64 { x.wrapping_mul(97) }
+    /// ```
+    ///
+    /// Measured on the tree before this rule existed: SURVIVED the full suite
+    /// in `vault_window/item_list.rs` in DEBUG and RELEASE at 2243 lib / 217
+    /// bin / 6 ignored / 0 failed / 0 warnings, and SURVIVED in `accounts.rs`,
+    /// with three occurrences of the symbol in the lib's DEBUG LLVM IR. It
+    /// shipped. So the remainder of the closing brace's line is read, and
+    /// refused unless it is blank or a comment -- the same rule
+    /// [`is_lone_attribute`] already applies to `#[allow(dead_code)] pub fn`
+    /// written on one line, for the same reason.
+    ///
+    /// The refusal carries [`CLOSING_LINE`] and not [`TOP_LEVEL`] on purpose.
+    /// A [`TOP_LEVEL`] refusal is how an interleaving file is recognised, and
+    /// is therefore tolerated in three files; this shape is tolerated nowhere.
     fn walk(region: &str) -> Result<usize, String> {
         let mut gated = false;
         let mut modules = 0usize;
@@ -1068,12 +1119,30 @@ mod every_file_in_the_crate {
                     ));
                 };
                 resume = match_brace(region, offset + rel) + 1;
+                // The jump lands one byte past the real close. Read the REST
+                // of that byte's line before resuming line-wise, because the
+                // line-wise resume is about to skip it. See the note above.
+                let line_end =
+                    region[resume..].find('\n').map_or(region.len(), |n| resume + n);
+                let after = region[resume..line_end].trim();
+                if !(after.is_empty() || after.starts_with("//")) {
+                    return Err(format!(
+                        "{CLOSING_LINE}: {after:?} at byte {resume} of the region, sharing a \
+                         line with the `}}` that really closes the module opened at {line:?}. \
+                         The walk jumps from a module opener to the byte past its real close \
+                         and then resumes at the next LINE, so the remainder of the closing \
+                         brace's own line is the one place below a cut that nothing reads. An \
+                         item written there is compiled into the shipped binary: measured \
+                         SURVIVING the whole suite in both profiles and appearing three times \
+                         in the lib's DEBUG LLVM IR. Move it above the test modules."
+                    ));
+                }
                 modules += 1;
                 gated = false;
                 continue;
             }
             return Err(format!(
-                "top-level source below the cut: {line:?} at byte {offset} of the region. An \
+                "{TOP_LEVEL}: {line:?} at byte {offset} of the region. An \
                  item down here is compiled into the shipped binary and sits in the half of \
                  the file every guard in this crate stops reading at. Move it above the test \
                  modules."
@@ -1148,6 +1217,137 @@ mod every_file_in_the_crate {
             .replace('\\', "/")
     }
 
+    /// What the property says about one file's TEXT: whether it interleaves,
+    /// and how many gated module blocks it carries.
+    struct Verdict {
+        interleaved: bool,
+        gates: usize,
+    }
+
+    /// **The whole property, applied to one file's text.**
+    ///
+    /// `Ok(None)` for a file with no cut -- the caller still has an assertion
+    /// to make about those and must not treat them as a skip. `Err` is the
+    /// property being violated, in the words the violation deserves.
+    ///
+    /// This is the one place the rule lives, so the liveness controls below
+    /// drive exactly the code the crate-wide sweep drives, over exactly the
+    /// same files. The previous version of this test wrote the sweep inline
+    /// and then proved liveness against ONE hardcoded victim path -- an
+    /// enumeration of a single file, protecting a single file, in a test whose
+    /// entire purpose is that enumerations lose. There is no victim name here;
+    /// the controls run over the derived set.
+    fn verdict(source: &str) -> Result<Option<Verdict>, String> {
+        let Some(cut) = cut_index(source) else {
+            return Ok(None);
+        };
+        if !(cut == 0 || source.as_bytes()[cut - 1] == b'\n') {
+            return Err("the cut landed in the middle of a line, so the gate was matched \
+                        inside a comment or a string literal rather than at a real attribute"
+                .to_string());
+        }
+        let offsets = gate_offsets_opening_a_module(source);
+        let gates = offsets.len();
+        match walk(&source[cut..]) {
+            Ok(0) => Err("the walk below the cut opened no module".to_string()),
+            Ok(_) => Ok(Some(Verdict { interleaved: false, gates })),
+            Err(why) => {
+                // The file carries production below its FIRST test module.
+                // That is legal Rust and three files here do it deliberately;
+                // it is not licence to stop reading the file, and it is not
+                // licence for every other refusal either. Only the file-scope
+                // item refusal means "interleaved" -- an item sharing a line
+                // with a module's closing brace is refused in every file,
+                // interleaving or not, because no file legitimately does that.
+                if !why.starts_with(TOP_LEVEL) {
+                    return Err(why);
+                }
+                // The tail -- the region below the LAST gated module, which is
+                // the half nobody reads and the half every measured payload
+                // landed in -- is walked under exactly the same rule.
+                let tail = *offsets
+                    .last()
+                    .expect("the cut exists, so at least one gate opens a module");
+                let modules = walk(&source[tail..]).map_err(|why| {
+                    format!(
+                        "below the LAST gated test module in this file -- the tail no guard \
+                         in this crate reads -- {why}"
+                    )
+                })?;
+                if modules != 1 {
+                    return Err(format!(
+                        "control: the walk from the LAST gate opened {modules} modules rather \
+                         than one, so the tail is not the last gate"
+                    ));
+                }
+                Ok(Some(Verdict { interleaved: true, gates }))
+            }
+        }
+    }
+
+    /// The three payloads measured SHIPPING out of this crate, each written
+    /// into `source` at the site it was measured at, with the name of the
+    /// shape for the failure message.
+    ///
+    /// Every one of them is applied to every file that has a cut. A payload
+    /// that a file's real bytes happen to defeat is a payload that file was
+    /// never protected from.
+    fn shipping_payloads(source: &str) -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            // 1. The census payload: appended at column 0 to EOF. Measured
+            //    surviving the whole suite in both profiles with three
+            //    occurrences in the debug LLVM IR.
+            (
+                "a `pub fn` appended at column 0 below the cut",
+                format!("{source}pub fn shipped_census(x: u64) -> u64 {{ x.wrapping_mul(97) }}\n"),
+            ),
+            // 2. The same, hidden behind an attribute on the SAME line, which
+            //    a `starts_with(\"#[\")` skip would walk straight past. See
+            //    `is_lone_attribute`.
+            (
+                "a `pub fn` sharing a line with an outer attribute",
+                format!(
+                    "{source}#[allow(dead_code)] pub fn shipped_attr(x: u64) -> u64 {{ x }}\n"
+                ),
+            ),
+        ];
+        if let Some(last_close) = source.rfind("\n}") {
+            // 3. The END-OF-LINE payload, written on the closing brace's own
+            //    line. One line changed, no line added, brace balance
+            //    unchanged. This is what the closing-brace-line rule in
+            //    `walk` exists for, and before that rule it survived the full
+            //    suite in debug and release and shipped.
+            let mut eol = source.to_string();
+            eol.insert_str(
+                last_close + 2,
+                " pub fn shipped_eol(x: u64) -> u64 { x.wrapping_mul(97) }",
+            );
+            out.push(("a `pub fn` sharing a line with a module's closing brace", eol));
+            // 4. The BALANCED payload, which beat every line walk in this
+            //    crate: the last module is closed by an INDENTED brace, the
+            //    `pub fn` sits at file scope after it, and the module's own
+            //    column-0 `}` is STOLEN to close it, so a brace count over the
+            //    whole file cannot tell the mutant from the original.
+            let mut balanced = source.to_string();
+            balanced.insert_str(
+                last_close + 1,
+                "    }\npub fn shipped_bal(x: u64) -> u64 {\n    x.wrapping_mul(97)\n",
+            );
+            let balance = |s: &str| {
+                s.matches('{').count() as isize - s.matches('}').count() as isize
+            };
+            assert_eq!(
+                balance(&balanced),
+                balance(source),
+                "control: the balanced payload changed the file's brace balance, so it is the \
+                 column-0 payload again under another name and its refusal proves nothing \
+                 about the indented close"
+            );
+            out.push(("a file-scope `pub fn` behind an indented module close", balanced));
+        }
+        out
+    }
+
     /// **Nothing but gated test modules lives below the cut of ANY file in
     /// this crate.**
     ///
@@ -1191,7 +1391,16 @@ mod every_file_in_the_crate {
         // ---- And against an independent oracle, where one can be had. The
         // walk and `git ls-files` disagreeing means one of them is wrong
         // about what this crate is made of.
-        if let Some(listed) = git_listed(crate_dir) {
+        {
+            // Loud, not optional. `if let Some(listed) = ..` meant that an
+            // environment where git cannot be run silently dropped the entire
+            // oracle and left the floors as the only control on the file list.
+            let listed = git_listed(crate_dir).expect(
+                "`git ls-files` could not be run in the crate directory, so the independent \
+                 oracle for the file list is gone and the directory walk is checking itself. \
+                 This test requires git, the way `login_ui`'s probe scan does: run it in a \
+                 checkout rather than an unpacked archive.",
+            );
             let derived: Vec<String> = files.iter().map(|p| relative(crate_dir, p)).collect();
             let oracle: Vec<String> = listed.iter().map(|p| relative(crate_dir, p)).collect();
             assert!(
@@ -1218,14 +1427,16 @@ mod every_file_in_the_crate {
         // ---- The property, file by file. Every file lands in exactly one of
         // the three buckets and NONE of them is a skip.
         let mut with_cut = 0usize;
-        let mut modules_seen = 0usize;
         let mut interleaved: Vec<String> = Vec::new();
+        let mut interleaved_gates = 0usize;
+        let mut gates_seen = 0usize;
         for path in &files {
             let rel = relative(crate_dir, path);
             let source = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("{rel} is readable to be walked: {e}"));
 
-            let Some(cut) = cut_index(&source) else {
+            let Some(found) = verdict(&source).unwrap_or_else(|why| panic!("{rel}: {why}"))
+            else {
                 // **A file with no cut is not skipped.** A silent skip is
                 // how thirty-five files went unguarded. "No gated test
                 // module" is only the same as "nothing lives below a cut"
@@ -1245,47 +1456,10 @@ mod every_file_in_the_crate {
                 continue;
             };
             with_cut += 1;
-            assert!(
-                cut == 0 || source.as_bytes()[cut - 1] == b'\n',
-                "{rel}: the cut landed in the middle of a line, so the gate was matched \
-                 inside a comment or a string literal rather than at a real attribute"
-            );
-
-            match walk(&source[cut..]) {
-                Ok(modules) => {
-                    assert!(modules > 0, "{rel}: the walk below the cut opened no module");
-                    modules_seen += modules;
-                }
-                Err(why) => {
-                    // The file carries production below its first test
-                    // module. That is legal Rust and three files here do it
-                    // deliberately; it is NOT licence to stop reading the
-                    // file. The tail -- the region below its LAST gated
-                    // module, which is the half nobody reads and the half
-                    // every measured payload landed in -- is walked under
-                    // exactly the same rule.
-                    assert!(
-                        why.starts_with("top-level source below the cut"),
-                        "{rel} was refused below its first cut, and not for the interleaved \
-                         production this test tolerates: {why}"
-                    );
-                    interleaved.push(rel.clone());
-                    let tail = *gate_offsets_opening_a_module(&source)
-                        .last()
-                        .expect("the cut exists, so at least one gate opens a module");
-                    let modules = walk(&source[tail..]).unwrap_or_else(|why| {
-                        panic!(
-                            "{rel}: below the LAST gated test module in this file -- the tail \
-                             no guard in this crate reads -- {why}"
-                        )
-                    });
-                    assert_eq!(
-                        modules, 1,
-                        "control: the walk from the LAST gate in {rel} opened {modules} \
-                         modules rather than one, so `tail` is not the last gate"
-                    );
-                    modules_seen += modules;
-                }
+            gates_seen += found.gates;
+            if found.interleaved {
+                interleaved.push(rel.clone());
+                interleaved_gates += found.gates;
             }
         }
 
@@ -1297,103 +1471,89 @@ mod every_file_in_the_crate {
             files.len()
         );
         assert!(
-            modules_seen >= 130,
-            "control: only {modules_seen} gated test modules were walked across the crate, \
+            gates_seen >= 130,
+            "control: only {gates_seen} gated test modules were walked across the crate, \
              so the cut-finding rule has stopped finding cuts"
         );
 
-        // ---- The interleaving set is compared, not consulted.
+        // ---- The interleaving set is PINNED, not enumerated.
+        //
+        // Nothing here names a file. The set is derived from the tree and its
+        // members are printed so a reader of a red run learns which file
+        // moved, but what is COMPARED is two integers -- see
+        // `INTERLEAVED_FILES` for why, and for what each of them costs an
+        // attacker. The old form of this assertion compared a written array of
+        // three paths, and a fourth string added to it was the entire second
+        // edit of a measured two-edit escape.
         interleaved.sort();
         assert_eq!(
-            interleaved.iter().map(String::as_str).collect::<Vec<&str>>(),
-            INTERLEAVED.to_vec(),
-            "the set of files carrying production BELOW their first test module has changed. \
-             This is not a list to update without reading `INTERLEAVED`: a file on it gets \
-             the tail rule only, so a `pub fn` planted between two of its test modules is not \
-             caught. If a file has newly joined, move its production above its test modules \
-             instead of adding it here."
+            (interleaved.len(), interleaved_gates),
+            (INTERLEAVED_FILES, INTERLEAVED_GATES),
+            "the files carrying production BELOW their first test module, or the number of \
+             gated test modules in them, have changed. Derived now: {interleaved:?} carrying \
+             {interleaved_gates} gated modules between them; pinned at {INTERLEAVED_FILES} \
+             files and {INTERLEAVED_GATES} gates. A file in this set gets the TAIL rule only, \
+             so a `pub fn` planted between two of its test modules is not caught -- which is \
+             why joining it, and why adding a gated module to a file already in it, both cost \
+             an edit here. If a file has newly joined, move its production above its test \
+             modules rather than moving this number."
         );
 
-        // ---- Liveness, at the site the census measured, on the real bytes.
+        // ---- Liveness, over the DERIVED set, on every file's real bytes.
         //
-        // A guard that no longer refuses anything reports `ok` forever. Both
-        // payloads below are the ones measured SHIPPING in this crate, and
-        // both are applied to a real file's real text.
-        let victim = files
-            .iter()
-            .find(|p| relative(crate_dir, p) == "src/vault_window/item_list.rs")
-            .expect("checked in the known-names control above");
-        let source = std::fs::read_to_string(victim).expect("readable");
-        let cut = cut_index(&source).expect("`item_list.rs` has a cut");
+        // A guard that no longer refuses anything reports `ok` forever. Every
+        // payload below is one measured SHIPPING out of this crate, every one
+        // is written into a real file's real text, and every one is applied to
+        // EVERY file that has a cut. The previous version of this control
+        // named one victim path and so protected one file; a mutation planted
+        // anywhere else was measured surviving with the control still green.
+        let mut live = 0usize;
+        let mut shapes = 0usize;
+        for path in &files {
+            let rel = relative(crate_dir, path);
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{rel} is readable: {e}"));
+            if cut_index(&source).is_none() {
+                continue;
+            }
+            // The control on the controls: the file as it ACTUALLY is passes,
+            // so the refusals below are not a walk that refuses everything.
+            assert!(
+                matches!(verdict(&source), Ok(Some(_))),
+                "control: the property refuses {rel} as it actually is, so every refusal \
+                 measured against it below proves nothing"
+            );
+            for (shape, mutant) in shipping_payloads(&source) {
+                // Each payload is re-cut IN the string being sliced, inside
+                // `verdict`. An offset taken in one copy of a file and used to
+                // slice another -- CRLF working-tree bytes against an LF
+                // `replace` -- was measured 7355 bytes off in this crate and
+                // passed silently forever.
+                let why = verdict(&mutant).err().unwrap_or_else(|| {
+                    panic!(
+                        "{rel}: the property ACCEPTED {shape}. That item is at file scope \
+                         below this file's cut and is compiled into the shipped binary."
+                    )
+                });
+                assert!(
+                    why.contains("shipped_"),
+                    "{rel}: {shape} was refused, but for something other than the item it \
+                     plants, so this control is measuring the wrong defect: {why}"
+                );
+                shapes += 1;
+            }
+            live += 1;
+        }
         assert!(
-            walk(&source[cut..]).is_ok(),
-            "control: the walk refuses `item_list.rs` as it actually is, so the two refusals \
-             below are a walk that refuses everything"
+            live >= 44,
+            "control: the liveness payloads were driven over only {live} files, so most of \
+             the crate has no measured proof that this guard refuses anything in it"
         );
-
-        // 1. The census payload: appended at column 0 to EOF. Measured
-        //    SURVIVING at 2225 lib / 217 bin / 6 ignored / 0 failed / 0
-        //    warnings in both profiles, with three occurrences in the debug
-        //    LLVM IR.
-        let appended = format!("{source}pub fn shipped_il(x: u64) -> u64 {{ x.wrapping_mul(97) }}\n");
-        // The cut is recomputed IN the string being sliced. `cut` above is an
-        // offset into `source`; slicing a different string with it was
-        // measured 7355 bytes off in this crate.
-        let cut_of_appended = cut_index(&appended).expect("the append does not move the cut");
-        let why = walk(&appended[cut_of_appended..])
-            .expect_err("the walk accepted a column-0 `pub fn` appended below the cut");
         assert!(
-            why.starts_with("top-level source below the cut"),
-            "the appended `pub fn` was refused, but not by the rule this control names: {why}"
-        );
-
-        // 2. The BALANCED payload, which beat every line walk in this crate:
-        //    the last module is closed by an INDENTED brace, the `pub fn`
-        //    sits at file scope after it, and a column-0 `}` further down
-        //    restores the brace count. Nothing here is a lexer trick; the
-        //    file parses.
-        //
-        //    It is written by INSERTING before the file's last column-0 `}`
-        //    rather than by appending after it, because appending cannot
-        //    produce this shape: the payload has to STEAL the module's own
-        //    closing brace to stay balanced, and an appended one has nothing
-        //    to steal. The stolen brace becomes the `pub fn`'s close.
-        let last_close = source.rfind("\n}").expect("`item_list.rs` ends in a column-0 brace");
-        let mut balanced = source.clone();
-        balanced.insert_str(
-            last_close + 1,
-            "    }\npub fn shipped_bal(x: u64) -> u64 {\n    x.wrapping_mul(97)\n",
-        );
-        // Balanced means balanced: the payload adds as many closes as opens
-        // plus the one it steals, so a brace count over the whole file cannot
-        // tell it from the original. That is the control on the control.
-        assert_eq!(
-            balanced.matches('{').count() - balanced.matches('}').count(),
-            source.matches('{').count() - source.matches('}').count(),
-            "control: the balanced payload changed the file's brace balance, so it is the \
-             column-0 payload again under another name and the refusal below proves nothing \
-             about the indented close"
-        );
-        let cut_of_balanced = cut_index(&balanced).expect("the append does not move the cut");
-        let why = walk(&balanced[cut_of_balanced..])
-            .expect_err("the walk accepted a file-scope `pub fn` between an indented module \
-                         close and a column-0 rebalancing brace");
-        assert!(
-            why.starts_with("top-level source below the cut") && why.contains("shipped_bal"),
-            "the balanced payload was refused, but not for the file-scope `pub fn` it plants: \
-             {why}"
-        );
-
-        // 3. And the shape that hides an item behind an attribute on the same
-        //    line, which a `starts_with` skip over attribute lines would walk
-        //    straight past. See `is_lone_attribute`.
-        let attributed =
-            format!("{source}#[allow(dead_code)] pub fn shipped_attr(x: u64) -> u64 {{ x }}\n");
-        let cut_of_attributed = cut_index(&attributed).expect("the append does not move the cut");
-        assert!(
-            walk(&attributed[cut_of_attributed..]).is_err(),
-            "the walk accepted a `pub fn` written on the same line as an outer attribute, so \
-             one attribute is all it costs to put an item below any cut in this crate"
+            shapes >= 4 * 44,
+            "control: only {shapes} payload-shape pairs were measured across {live} files, so \
+             some file silently offered fewer shapes than the four this crate has measured \
+             shipping"
         );
     }
 }
