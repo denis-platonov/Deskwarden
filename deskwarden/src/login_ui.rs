@@ -7045,10 +7045,20 @@ pub(crate) mod password_lifetime_tests {
     /// for it. [`hold_the_probe_lock`] is the documented hatch for a test that
     /// touches probe plaintext without arming; this is one.
     ///
-    /// Controls, in order: nothing was refused unwalked; the file count; this
-    /// file being reached; at least one NON-`.rs` file being reached --
-    /// without which a list that had quietly gone back to `src/**/*.rs` would
-    /// satisfy the others; at least one file outside the crate directory; no
+    /// Controls, in order: **`root` being this crate's own repository, by
+    /// absolute-path identity against a separately spelled
+    /// `env!("CARGO_MANIFEST_DIR")`** -- the first thing checked, before a
+    /// file is listed, because every producer and every cross-check below
+    /// reads that one binding and a single edit to it made all of them agree
+    /// about another checkout; nothing was refused unwalked; the file count;
+    /// this file being reached, **named by whole absolute path rather than by
+    /// the `ends_with("login_ui.rs")` suffix any other checkout also
+    /// supplies**; at least one NON-`.rs` file being reached -- without which
+    /// a list that had quietly gone back to `src/**/*.rs` would satisfy the
+    /// others; at least one file **inside** the crate directory, which is the
+    /// load-bearing half, and at least one outside it, which is the half a
+    /// foreign tree satisfies for free and which therefore cannot stand
+    /// alone; no
     /// file whose extension says source text being skipped as not-UTF-8, which
     /// is the only way the byte rule could be turned back into an opt-out; and
     /// finally the two counts over what was actually opened and scanned.
@@ -7062,6 +7072,88 @@ pub(crate) mod password_lifetime_tests {
             .parent()
             .expect("the crate has a parent directory")
             .to_path_buf();
+        // **`root` is the tenth shared input, and it used to cost ONE edit.**
+        //
+        // Every producer below reads this one binding: `tracked_files(&root,
+        // ..)`, `git -C &root ls-tree -r HEAD`, `git -C &root ls-files
+        // --cached`. Both readers, both `metadata` walks and the post-scan
+        // re-check are all downstream of it. The claim that hiding a tracked
+        // file "requires all three producers corrupted in lockstep" was
+        // therefore false: point the ONE binding at another checkout and all
+        // three agree perfectly about the wrong tree.
+        //
+        // Measured, both with the real probe committed in the tracked
+        // `deskwarden/examples/ui_preview.rs` and going UNSEEN:
+        //
+        // * `.to_path_buf().parent().unwrap().join("exp")`, a clean sibling
+        //   export -- SURVIVED the full lib suite in debug AND release.
+        // * `.to_path_buf().join(".claude/worktrees/w1")`, a clean sibling
+        //   checkout INSIDE this repository -- SURVIVED, and `git status`
+        //   stayed clean, because `/.claude/` is gitignored. The decoy tree
+        //   was invisible to review and to the scan at once.
+        //
+        // Every control held over the substituted tree, because every control
+        // was written as a SUFFIX test (`ends_with("login_ui.rs")`) or as a
+        // NEGATION (`any(|p| !p.starts_with(crate_dir))`) -- and another
+        // checkout satisfies a suffix test, while a tree outside
+        // `CARGO_MANIFEST_DIR` satisfies the negation *by being outside it*.
+        // The negation was not merely blind to the substitution; it was
+        // ENTAILED by it.
+        //
+        // So `root` is now pinned by ABSOLUTE-PATH IDENTITY, immediately, to
+        // the compiled-in location of this crate. `root` is the parent of the
+        // crate directory, so re-joining the crate's own directory name must
+        // reproduce `CARGO_MANIFEST_DIR` exactly -- not by suffix, not by
+        // containment, by equality of the whole path.
+        //
+        // **Why the two `env!` expansions are written out separately, and
+        // must stay that way.** The obvious tidy-up is
+        //
+        //     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        //     let root = crate_dir.parent().unwrap().to_path_buf();
+        //
+        // and it would REINTRODUCE the exact defect this round exists to
+        // close, one level up: `crate_dir` becomes a single binding that
+        // feeds both the tree that is scanned and the yardstick it is checked
+        // against, so one edit moves them together and the assertion below
+        // passes over the decoy. `env!` is expanded at each site by the
+        // compiler and there is no binding between them, so the pin costs an
+        // attacker TWO edits at two sites. Do not factor these together.
+        //
+        // **And the ELEVENTH shared input, named now rather than found
+        // later.** Ten rounds, ten shared inputs, each one level up from the
+        // last; this pin is the tenth, so the honest question is what the
+        // eleventh is. It is `CARGO_MANIFEST_DIR` itself. Both expansions
+        // read the same compile-time value, so the pin does not prove `root`
+        // is THIS repository -- it proves `root` is the parent of wherever
+        // this crate's manifest sits when it is compiled. Move the manifest
+        // and both sides move together and the assertion still passes. That
+        // is deliberately not defended here: it cannot be done from inside
+        // this file at all. It needs `Cargo.toml` moved or a workspace member
+        // added, which is a structural change to the build, visible in a
+        // diff in a way an expression buried at line seven thousand is not,
+        // and defending it from in here would mean hard-coding a repository
+        // name -- which breaks every fork and every worktree while stopping
+        // nobody who is already editing the manifest. The boundary is stated
+        // instead: this test polices the repository the crate is compiled
+        // from, and whoever can move the crate can move what it polices.
+        assert_eq!(
+            root.join(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .file_name()
+                    .expect("the crate directory has a name")
+            ),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            "the_probe_scan_reads_the_wrong_tree: `root` is {root:?}, which is not the parent \
+             of this crate's own compiled-in directory. Everything below -- both file \
+             listings, the `ls-tree` cross-check, the `ls-files --cached` cross-check and the \
+             post-scan re-check -- reads that one path, so a `root` pointing at ANY other \
+             checkout makes all of them agree, unanimously, about a tree that is not this one. \
+             A clean sibling export (or a clean checkout under the gitignored `.claude/`) then \
+             passes the whole suite green while the real probe sits committed in this tree \
+             unread. That is not a stale path to repair in place: it is the scan measuring \
+             something other than the repository it claims to police."
+        );
         let mut refused: Vec<std::path::PathBuf> = Vec::new();
         let mut files = tracked_files(&root, &mut refused).unwrap_or_else(|| {
             panic!(
@@ -7101,9 +7193,19 @@ pub(crate) mod password_lifetime_tests {
             "control: the walk found only {} files, so the check below is a check over nothing",
             files.len()
         );
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // This used to read `any(|p| p.ends_with("login_ui.rs"))`, and a
+        // suffix is exactly what a substituted checkout supplies for free:
+        // every other tree with this crate in it has a `login_ui.rs` too. The
+        // file that declares the probe is identified by its WHOLE absolute
+        // path instead, built from the compiled-in crate directory.
+        let this_file = crate_dir.join("src").join("login_ui.rs");
         assert!(
-            files.iter().any(|p| p.ends_with("login_ui.rs")),
-            "control: the walk did not reach the file that declares the probe"
+            files.iter().any(|p| *p == this_file),
+            "control: the listing does not contain {this_file:?} -- the file that declares the \
+             probe, named by absolute path rather than by suffix. Either the listing dropped \
+             it, or the listing is of a DIFFERENT checkout that merely also has a file whose \
+             name ends `login_ui.rs`"
         );
         assert!(
             files.iter().any(|p| p.extension().is_some_and(|e| e != "rs")),
@@ -7111,7 +7213,24 @@ pub(crate) mod password_lifetime_tests {
              the source directory, and the claim in this test's name is again wider than what \
              it measures"
         );
-        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // **Both directions, and the positive one is the load-bearing half.**
+        //
+        // Only the negation used to be asserted, and a substituted `root`
+        // does not merely evade it -- it SATISFIES it, because a tree outside
+        // `CARGO_MANIFEST_DIR` puts *every* listed file outside the crate
+        // directory. The control that was supposed to prove the listing
+        // reaches beyond the crate was the one the mutant passed most easily.
+        // The positive half cannot be satisfied that way: a listing has a
+        // file under this crate's own compiled-in directory only if it is a
+        // listing of this crate's own tree.
+        assert!(
+            files.iter().any(|p| p.starts_with(crate_dir)),
+            "control: NO file the listing reached is inside {crate_dir:?}, this crate's own \
+             compiled-in directory. The listing is not of this repository at all. Note that \
+             the complementary assertion below -- that something lies OUTSIDE the crate \
+             directory -- is satisfied automatically by any foreign tree, which is why it \
+             cannot stand alone"
+        );
         assert!(
             files.iter().any(|p| !p.starts_with(crate_dir)),
             "control: every file the walk reached is inside the crate directory, so `docs/`, \
@@ -7210,6 +7329,23 @@ pub(crate) mod password_lifetime_tests {
         // that ships, with no gitless configuration left to hide in. This is
         // a lower bound and it is stated as one: it says three cannot be
         // beaten by fewer, not that three suffices.
+        //
+        // **That lower bound was FALSE for ten rounds, and it holds now only
+        // because `root` is asserted.** All three producers take the
+        // repository they enumerate from the SAME `let root` binding --
+        // `tracked_files(&root, ..)`, `git -C &root ls-tree -r HEAD`, `git -C
+        // &root ls-files --cached`. Independence of the three QUESTIONS buys
+        // nothing when all three are asked about the same wrong TREE: one
+        // edit to `root` pointed them at a clean sibling export -- and, worse,
+        // at a clean checkout under the gitignored `.claude/`, invisible to
+        // `git status` as well as to the scan -- and all three then agreed
+        // perfectly while a probe committed in this tree went unread through
+        // the full suite in debug AND release. Every control held over the
+        // substituted tree, including the one asserting that some file lies
+        // outside `CARGO_MANIFEST_DIR`, which a foreign tree satisfies by
+        // construction. This floor is conditional on the tree being the right
+        // one, and that condition is now an assertion at the `root` binding
+        // rather than an assumption in this paragraph.
         //
         // These are three separate `Command`s, not one statement written
         // three times and not one binding read three times. That distinction
@@ -7408,7 +7544,14 @@ pub(crate) mod password_lifetime_tests {
                 }
             };
             scanned += 1;
-            scanned_this_file |= file.ends_with("login_ui.rs");
+            // By absolute path, not by suffix: `ends_with("login_ui.rs")` is
+            // satisfied by ANY checkout's copy of this file, so under a
+            // substituted `root` this control reported that "the one file
+            // this test exists to police was policed" while the real file
+            // went unread. `this_file` is built from `CARGO_MANIFEST_DIR`
+            // and is checked against the listing above, so a mutation that
+            // moves it to a decoy tree reds that control instead.
+            scanned_this_file |= *file == this_file;
             assert!(
                 found.is_none(),
                 "{} contains the assembled probe ({}). Any test that reads this tree back now \
