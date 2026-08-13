@@ -6215,6 +6215,119 @@ pub(crate) mod password_lifetime_tests {
                 })
                 .unwrap_or_default()
         };
+        // **The INDEX MODE, asked directly -- because the on-disk marker the
+        // shape predicate needs can be DELETED, and deleting it costs zero
+        // source edits.**
+        //
+        // The round before this one routed committed gitlinks through
+        // `nested_repository_shape` below, and that predicate asks the WORKING
+        // TREE: it wants a `.git` directory holding `HEAD`, a `.git` file
+        // saying `gitdir:`, or the bare layout. Commit the gitlink, then
+        // `rm -rf vendor/nested/.git`, and the shape is gone while the index
+        // entry stays. Measured on an export, with a real probe in
+        // `vendor/nested/lib.rs` and NO source edit of any kind:
+        // `git status --porcelain` empty, `git status --porcelain -uall --
+        // vendor` empty, `git ls-files -s vendor/nested` still
+        // `160000 commit <sha> vendor/nested` -- and the probe test came back
+        // `ok. 1 passed` filtered in debug, with the probe unseen (the
+        // previous round's report has the same mutant SURVIVING the full
+        // suite at 2253/0 in both profiles; only the filtered debug run was
+        // re-measured here, because the filtered run is the verdict and the
+        // full suite is the number). The liveness pair at the identical path,
+        // tracked as an ordinary file, was KILLED by the main hit assert. `is_dir()` was true, `nested_repository_shape` was now
+        // false, so the entry fell through to `if !path.is_file() { continue; }`
+        // -- the silent drop the previous round existed to remove. That is
+        // STRICTLY CHEAPER than the hole that round closed: same zero edits,
+        // same clean status, and now invisible to `refused` as well.
+        //
+        // So the refusal no longer depends on anything in the working tree.
+        // A gitlink is a MODE in the index -- `160000` -- and no amount of
+        // deleting, creating or renaming files under the path can change what
+        // git recorded there. `git ls-files -s -z` is asked for it directly
+        // and every `160000` entry is refused UNCONDITIONALLY. Un-asserting
+        // this needs `git rm --cached <path>` or a re-commit, which is an
+        // index change and therefore a diff.
+        //
+        // **Two producers, for the same reason everything else here has two.**
+        // `ls-files -s` speaks for the INDEX, so it also catches a gitlink
+        // staged and not yet committed; `ls-tree -r -z HEAD` (without
+        // `--name-only`, which is what threw the mode away at the existing
+        // call site) speaks for the COMMITTED tree. Both are written out here
+        // with their own arguments, so a pathspec on one leaves the other
+        // answering. Neither is filtered by `is_file`, which is precisely how
+        // all three of the old producers dropped this entry independently.
+        // Measured: `:!vendor` on the `ls-files -s` invocation alone is
+        // KILLED by `ls-tree`; a positive pathspec on the `ls-tree`
+        // invocation alone (it will not take an exclude pathspec) is KILLED
+        // by `ls-files -s`. One edit is loud either way; it takes two.
+        //
+        // **This WIDENS the submodule trade, and the widening is deliberate.**
+        // The previous round documented that an INITIALISED submodule
+        // hard-fails this suite, and kept the trade because this repository
+        // has none. Keying on the index mode makes that "ANY submodule",
+        // initialised or not: an unchecked-out gitlink has no working-tree
+        // shape at all, and refusing it is the point -- a gitlink with an
+        // empty directory today is a probe-bearing checkout after one `git
+        // submodule update`, and the index entry is the thing that is
+        // unattributable either way. Measured: with `vendor/nested` REMOVED
+        // from disk entirely and only the `160000` entry left, this still
+        // refuses. If this repository ever takes a real submodule, this
+        // assert is the thing to revisit, deliberately and in a diff -- not
+        // something to soften by re-introducing a working-tree predicate,
+        // which is exactly what was just defeated at zero edits.
+        let mut gitlinked: Vec<std::path::PathBuf> = Vec::new();
+        {
+            // `<mode> SP <object> SP <stage> TAB <path>`, and `-z` means the
+            // path is verbatim: no quoting, no escaping, nothing to unwrap.
+            let staged = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-files", "-s", "-z"])
+                .output()
+                .ok()?;
+            if !staged.status.success() {
+                return None;
+            }
+            // `<mode> SP <type> SP <object> TAB <path>`. `-r` does NOT recurse
+            // into a commit entry -- it cannot, the objects are not here -- so
+            // a gitlink is reported at its own path, at any depth.
+            let committed = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-tree", "-r", "-z", "HEAD"])
+                .output()
+                .ok()?;
+            let committed_records: &[u8] =
+                if committed.status.success() { &committed.stdout } else { &[] };
+            for record in staged
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .filter(|record| record.starts_with(b"160000 "))
+                .chain(
+                    committed_records
+                        .split(|b| *b == 0)
+                        .filter(|s| !s.is_empty())
+                        .filter(|record| record.starts_with(b"160000 commit ")),
+                )
+            {
+                let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+                    continue;
+                };
+                // Lossy on purpose: this path is only ever REPORTED, never
+                // opened, so a non-UTF-8 gitlink name still produces a loud
+                // refusal naming a mangled path rather than a silent skip.
+                let path = root.join(String::from_utf8_lossy(&record[tab + 1..]).as_ref());
+                if !gitlinked.iter().any(|g| *g == path) {
+                    gitlinked.push(path);
+                }
+            }
+        }
+        for path in gitlinked {
+            if !refused.iter().any(|r| *r == path) {
+                refused.push(path);
+            }
+        }
 
         let mut undecodable: Vec<String> = Vec::new();
         let mut listed: Vec<std::path::PathBuf> = Vec::new();
@@ -6264,6 +6377,18 @@ pub(crate) mod password_lifetime_tests {
             // directory is not checked out at all is not a repository shape
             // and falls through to the guard below, where there is genuinely
             // nothing on disk to read.
+            //
+            // **This is no longer what catches a gitlink, and it is kept
+            // anyway.** It asks the working tree, and the working tree can be
+            // edited to answer differently -- `rm -rf vendor/nested/.git`
+            // after committing the gitlink took the shape away at zero source
+            // edits and put the entry straight back into the silent drop
+            // below; see the index-mode refusal above, which is what actually
+            // refuses a gitlink now and which no file operation can reach.
+            // What this line still does, and the index-mode check cannot, is
+            // refuse an UNTRACKED nested clone: `--others` reports one of
+            // those as a bare directory with no index entry at all. It is an
+            // addition, not a replacement, in both directions.
             if path.is_dir() && nested_repository_shape(&path) {
                 if !refused.iter().any(|r| *r == path) {
                     refused.push(path);
@@ -7171,18 +7296,39 @@ pub(crate) mod password_lifetime_tests {
         // single shared input is the ONE program resolved from the ONE name
         // `"git"` on `PATH`, running in an environment this test does not
         // control. A `git.exe` earlier on `PATH` that filters one path out of
-        // every answer subtracts from all five at once. So does
-        // `GIT_CEILING_DIRECTORIES`, `GIT_DIR`/`GIT_WORK_TREE`, a
-        // `core.excludesFile` or a `.git/info/exclude` entry (which both
-        // halves of `--exclude-standard` and `status -uall` honour and which
-        // is not a tracked file), and `~/.gitconfig`'s `[alias]`/`[include]`
-        // machinery. Every one of those costs ZERO source edits and leaves no
-        // diff -- the same shape as the gitlink hole this round closed, and
-        // strictly cheaper than any in-file mutation. It is NOT defended
-        // here, because it cannot be: a test that asks git what is in the
+        // every answer subtracts from all five at once.
+        //
+        // **That paragraph used to list five vectors here and call all five
+        // undefendable. Measured, four of them were not, and four are now
+        // closed.** "Cannot be defended" was doing the work of "was not
+        // measured", which is the class this file keeps losing to:
+        //
+        // * `GIT_WORK_TREE` genuinely shifted the tree -- `git -C <export>
+        //   rev-parse --show-toplevel` returned the PARENT of the export.
+        //   Closed immediately below by pinning `--show-toplevel` against
+        //   `root`: one invocation, one assert.
+        // * `.git/info/exclude` and `core.excludesFile` each genuinely hid a
+        //   file from BOTH `--others --exclude-standard` and `status -uall`.
+        //   Closed after the third enumeration by `git check-ignore -v`, which
+        //   NAMES the excluding file, plus an assert that every exclusion
+        //   source is a tracked `.gitignore` under `root`.
+        // * `GIT_DIR` alone and `GIT_CEILING_DIRECTORIES` shifted NOTHING.
+        //   Under `git -C <absolute path>` -- which is how every invocation
+        //   here is spelled -- `--show-toplevel` came back as the export with
+        //   either one set. Listing them as live vectors was simply wrong, and
+        //   the `--show-toplevel` pin covers them anyway if a future git
+        //   changes its mind.
+        //
+        // What remains genuinely undefendable is the FIRST item only: a
+        // wrapper `git.exe` earlier on `PATH`, and with it `~/.gitconfig`'s
+        // `[alias]`/`[include]` machinery, which can rewrite what any of these
+        // invocations means. That subtracts from all seven questions at once,
+        // including the two added to close the other four, and it cannot be
+        // caught by asking git anything -- a test that asks git what is in the
         // tree is only as honest as the git it asked, and re-deriving the
         // answer without git is the directory walk six rounds were spent
-        // deleting. This is the disclosed boundary, not an oversight.
+        // deleting. THAT is the disclosed boundary. The other four were an
+        // oversight dressed as one.
         //
         // And `CARGO_MANIFEST_DIR` remains the deepest one. Both expansions
         // read the same compile-time value, so the pin does not prove `root`
@@ -7215,6 +7361,68 @@ pub(crate) mod password_lifetime_tests {
              unread. That is not a stale path to repair in place: it is the scan measuring \
              something other than the repository it claims to police."
         );
+        // **`GIT_WORK_TREE`, closed -- the pin above is about `root`, this one
+        // is about the tree git decides `root` NAMES.**
+        //
+        // `root` being this crate's own parent directory says nothing about
+        // what `git -C <root>` will answer, and the two are not the same
+        // question. Measured: with `GIT_WORK_TREE` set to the parent of an
+        // export, `git -C <export> rev-parse --show-toplevel` returned the
+        // PARENT, not the export -- every one of the five enumerations below
+        // is then answered about a different working tree while `root` itself
+        // is untouched and all three `assert_eq!`s on it pass. Zero source
+        // edits, no diff.
+        //
+        // One invocation and one assert close it: whatever tree git thinks it
+        // is standing in must BE `root`. Both sides go through
+        // `canonicalize`, because `--show-toplevel` prints forward slashes,
+        // resolves symlinks and normalises the drive letter while
+        // `CARGO_MANIFEST_DIR` does none of those -- comparing the two raw
+        // would be a false red on any checkout reached through a symlink or a
+        // differently-cased path. `canonicalize` puts both into the same
+        // verbatim form, so this compares trees rather than spellings.
+        //
+        // It is sound on a linked worktree (`--show-toplevel` is that
+        // worktree's own root, which is what `root` is) and on a fork (no
+        // repository name appears anywhere in it).
+        //
+        // **And the in-file comment below overstated its neighbours, which is
+        // corrected there:** measured under `git -C <absolute path>`,
+        // `GIT_DIR` alone and `GIT_CEILING_DIRECTORIES` shifted NOTHING --
+        // `--show-toplevel` came back as the export in both cases. Only
+        // `GIT_WORK_TREE` moved it.
+        let toplevel_raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git rev-parse --show-toplevel` could not \
+                     answer for {root:?}, so there is no way to tell which working tree the \
+                     five enumerations below are actually about. This test does not run \
+                     without git; see the panics below."
+                )
+            });
+        let toplevel_seen = std::fs::canonicalize(&toplevel_raw);
+        let toplevel_want = std::fs::canonicalize(&root);
+        assert!(
+            matches!(
+                (toplevel_seen.as_deref(), toplevel_want.as_deref()),
+                (Ok(seen), Ok(want)) if seen == want
+            ),
+            "the_probe_scan_reads_the_wrong_tree: `git -C {root:?}` reports its working tree \
+             as {toplevel_raw:?} ({toplevel_seen:?}), which is not {root:?} \
+             ({toplevel_want:?}). `root` can be pinned to this crate's own parent directory \
+             and still name a tree git answers about differently -- `GIT_WORK_TREE` does \
+             exactly that, at ZERO source edits, and every listing, cross-check and re-check \
+             below would then agree unanimously about a tree that is not this repository. \
+             Unset `GIT_WORK_TREE` and re-run."
+        );
+
         // **The `--others` half's SECOND PRODUCER, asked FIRST.**
         //
         // Undisclosed asymmetry, found by attacking this design rather than
@@ -7516,12 +7724,22 @@ pub(crate) mod password_lifetime_tests {
         // other two deleted -- three edits either way, in the configuration
         // that ships, with no gitless configuration left to hide in.
         //
-        // **That "three" was stated as a lower bound and it was FALSE, twice
-        // over, and both refutations are now closed.** It was beaten at TWO
-        // edits by the `crate_dir` rebind (neither edit a `Command`, neither
-        // a pathspec -- see the write-up at the controls below), and at ZERO
-        // edits by a gitlink, which all three producers dropped independently
-        // through their own `is_file` filters. It was also silent about the
+        // **That "three" was stated as a lower bound and it was FALSE, three
+        // times over, and all three refutations are now closed.** It was
+        // beaten at TWO edits by the `crate_dir` rebind (neither edit a
+        // `Command`, neither a pathspec -- see the write-up at the controls
+        // below), and at ZERO edits by a gitlink, which all three producers
+        // dropped independently through their own `is_file` filters. The
+        // round that fixed the gitlink then restated the floor at three and
+        // was beaten at ZERO again, by the same gitlink with its `.git`
+        // marker DELETED after the commit: the fix keyed on a working-tree
+        // shape, and a working-tree shape can be removed. The floor for a
+        // TRACKED file has therefore been 0, not 3, for two rounds running.
+        // It is stated at three again only now that the refusal keys on the
+        // INDEX MODE (`ls-files -s`, `ls-tree -r` without `--name-only`),
+        // which no file operation can reach -- and it should be read as "no
+        // route BELOW has been found cheaper than three", which is the same
+        // sentence that was wrong the last two times. It was also silent about the
         // UNTRACKED half entirely: `ls-tree` and `ls-files --cached` speak
         // only for the tracked tree, so a pathspec on the `--others`
         // invocation was ONE edit and unobserved until `git status
@@ -7582,6 +7800,189 @@ pub(crate) mod password_lifetime_tests {
             cached.len(),
             if cached.iter().any(|p| p.ends_with("login_ui.rs")) { "reached" } else { "missed" }
         );
+
+        // **`.git/info/exclude` and `core.excludesFile`, closed -- and they
+        // were the two cheapest holes left in the whole test.**
+        //
+        // Both halves of the untracked listing honour them: `--others
+        // --exclude-standard` and `status --porcelain -uall` alike. So one
+        // line in a file that is NOT tracked, that no diff shows and that no
+        // control below can see, deletes an untracked probe-bearing file from
+        // BOTH untracked producers at once -- the second opinion added last
+        // round is not a second opinion about this at all, because it is
+        // subtracted from too. Zero source edits.
+        //
+        // It looked undefendable and it is not, because git will name the
+        // source: `git check-ignore -v <path>` prints
+        // `.git/info/exclude:1:docs/secret.md<TAB>docs/secret.md` for the
+        // local case and the configured file's ABSOLUTE path for the
+        // `core.excludesFile` case. That turns "something invisible excluded a
+        // file" into an ordinary assert of exactly the shape everything else
+        // in this function has: the only thing allowed to exclude anything
+        // from this tree is a TRACKED `.gitignore` inside `root`, which is a
+        // file review sees and this scan reads.
+        //
+        // Two invocations. `status --porcelain -z -uall --ignored` names what
+        // is excluded -- traditional `--ignored`, not `--ignored=matching`, so
+        // a wholly-ignored directory collapses to ONE record and `target/` is
+        // not enumerated file by file. Then one `check-ignore -v -z --stdin`
+        // over that whole set, whose output is four NUL-separated fields per
+        // record: source, line number, pattern, pathname. `check-ignore` exits
+        // 1 when nothing it was given is ignored, which is a normal answer and
+        // not a failure, so the status is not filtered on -- only the parse is.
+        //
+        // Measured, all four ways, each against a liveness pair with the same
+        // probe and the exclusion removed: `.git/info/exclude` KILLED,
+        // `core.excludesFile` KILLED, an UNTRACKED `docs/.gitignore` KILLED
+        // (that one was not previously disclosed at all), and a TRACKED,
+        // COMMITTED `docs/.gitignore` GREEN.
+        //
+        // **That last one is the boundary and it is not a bug.** A tracked
+        // `.gitignore` line does take an untracked file out of this scan's
+        // scope, at ONE edit -- but that edit is a committed line in a file
+        // whose whole purpose is to say what this repository does not track,
+        // and it shows up in a diff like any other. That is the difference
+        // this assert is drawing: not "nothing may be excluded", but "nothing
+        // may be excluded by something review cannot see". Cost on this tree:
+        // ~1.2 s for the two calls over ~30 000 ignored paths, whose sole
+        // exclusion source is the tracked root `.gitignore`.
+        //
+        // The two vectors this does NOT reach are stated rather than implied:
+        // an exclusion that hides a file from the untracked listing AND from
+        // `--ignored` at the same time is not reachable through the exclude
+        // machinery (that machinery is what `--ignored` reports), but a
+        // wrapper `git.exe` on `PATH` subtracts from this pair exactly as it
+        // subtracts from the other five. See the boundary note above.
+        let ignored_raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain", "-z", "--untracked-files=all", "--ignored"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git status --ignored` could not enumerate \
+                     {root:?}, so there is no way to tell whether an untracked exclusion \
+                     source outside this repository's tracked `.gitignore` files is hiding \
+                     something from both untracked producers. This test does not run without \
+                     git; see the panics above."
+                )
+            });
+        let ignored_paths: Vec<&str> = ignored_raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|record| record.strip_prefix(b"!! ".as_slice()))
+            .filter_map(|rest| std::str::from_utf8(rest).ok())
+            .collect();
+        if !ignored_paths.is_empty() {
+            use std::io::Write as _;
+
+            // **The path list goes through a FILE, not through a pipe, and
+            // that is not a style choice.** This tree ignores ~30 000 paths
+            // (`target/` and the gitignored agent directories), so
+            // `check-ignore` answers with well over a megabyte -- far more
+            // than a pipe buffer holds. Writing the list to the child's stdin
+            // while it is writing that answer back deadlocks unless one side
+            // is drained concurrently, and draining it concurrently means a
+            // `std::thread::spawn`, which this crate's spawn census counts
+            // exactly and rightly refuses to widen for a test's convenience.
+            // A file has no buffer to fill, so `output()` is safe as written:
+            // there is no stdin to write once the child is running.
+            let feed_path = std::env::temp_dir()
+                .join(format!("deskwarden-probe-scan-excluded-{}.lst", std::process::id()));
+            let feed: Vec<u8> = ignored_paths
+                .iter()
+                .flat_map(|rel| rel.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+                .collect();
+            std::fs::File::create(&feed_path)
+                .and_then(|mut file| file.write_all(&feed))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "the {} excluded path(s) in {root:?} could not be written to \
+                         {feed_path:?} ({error}), so they cannot be traced back to the files \
+                         that excluded them",
+                        ignored_paths.len()
+                    )
+                });
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["check-ignore", "-v", "-z", "--stdin"])
+                .stdin(std::fs::File::open(&feed_path).unwrap_or_else(|error| {
+                    panic!("{feed_path:?} could not be re-opened as stdin ({error})")
+                }))
+                .stderr(std::process::Stdio::null())
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "the_probe_scan_requires_git: `git check-ignore` could not be run \
+                         ({error}), so the {} excluded path(s) in {root:?} cannot be traced \
+                         back to the file that excluded them",
+                        ignored_paths.len()
+                    )
+                });
+            // Best-effort: a leftover list in the temp directory is litter,
+            // not a hole, and failing the scan over it would be a false red.
+            let _ = std::fs::remove_file(&feed_path);
+            // Four NUL-separated fields per record: source, line, pattern,
+            // pathname. Anything that does not come in fours is a format this
+            // parser does not understand, and an unparsed answer is not a
+            // clean one -- so it is reported rather than skipped.
+            let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+            let fields = match fields.split_last() {
+                // `-z` terminates every field, so the split leaves one
+                // trailing empty piece; an empty answer is just that piece.
+                Some((last, rest)) if last.is_empty() => rest.to_vec(),
+                _ => fields,
+            };
+            assert!(
+                fields.len() % 4 == 0,
+                "control: `git check-ignore -v -z` produced {} NUL-separated fields for {} \
+                 excluded path(s), which is not a whole number of four-field records. This \
+                 parser does not understand the answer it got, and an answer it cannot read \
+                 is not an answer that the exclusion sources were legitimate",
+                fields.len(),
+                ignored_paths.len()
+            );
+            let mut foreign: Vec<String> = Vec::new();
+            for record in fields.chunks(4) {
+                let source = String::from_utf8_lossy(record[0]).into_owned();
+                let pathname = String::from_utf8_lossy(record[3]).into_owned();
+                // The ONLY legitimate exclusion source: a `.gitignore` that is
+                // itself a tracked file of this repository, named relative to
+                // `root`. `.git/info/exclude` fails on the file name;
+                // `core.excludesFile` fails on both -- `check-ignore` prints
+                // it as the absolute path it was configured as, which is not a
+                // path under `root` and is not in `cached` either. An
+                // UNTRACKED `.gitignore` fails on `cached`, which is the case
+                // that would otherwise be a one-file, no-diff bypass wearing a
+                // legitimate name.
+                let as_path = root.join(&source);
+                let legitimate = std::path::Path::new(&source).file_name()
+                    == Some(std::ffi::OsStr::new(".gitignore"))
+                    && as_path.starts_with(&root)
+                    && cached.iter().any(|tracked| *tracked == as_path);
+                if !legitimate {
+                    foreign.push(format!("{source} (excluding {pathname})"));
+                }
+            }
+            assert!(
+                foreign.is_empty(),
+                "{} path(s) in {root:?} are excluded from BOTH untracked producers by a source \
+                 that is not a tracked `.gitignore` of this repository: {:?}. \
+                 `--others --exclude-standard` and `status --untracked-files=all` both honour \
+                 `.git/info/exclude` and `core.excludesFile`, and neither is a tracked file, \
+                 so ONE line in one of them removes an untracked probe-bearing file from every \
+                 listing this test has -- at zero source edits, leaving no diff, and with the \
+                 second opinion added for the untracked half subtracted from as well. If this \
+                 named a global `core.excludesFile` you genuinely want, move the pattern into \
+                 this repository's tracked `.gitignore`, where review can see it.",
+                foreign.len(),
+                foreign
+            );
+        }
 
         // **And the second opinion is UNIONED IN, not merely compared.** The
         // assert above detects a corrupted producer; this makes a corrupted
