@@ -6869,6 +6869,37 @@ pub(crate) mod password_lifetime_tests {
     /// `login_ui.rs`, found the probe in it as a single literal, and failed
     /// this test 6 runs out of 6. Nothing was wrong with THIS tree.
     ///
+    /// **And `/.claude/` in `.gitignore` is that skip, re-entering by another
+    /// door -- say so rather than call it housekeeping.** The rule committed at
+    /// `.gitignore:27` is a DIRECTORY-LEVEL OPT-OUT from this scan: it is the
+    /// same shape -- "this name is not ours, do not look in it" -- that the six
+    /// rounds above were spent deleting from *this file*, moved into a file
+    /// git reads instead. It is not neutral because it is spelled in
+    /// `.gitignore`; it is the exclusion predicate with a different owner.
+    ///
+    /// It is nevertheless defended, on three grounds that are checkable rather
+    /// than rhetorical:
+    ///
+    /// * Nothing under `.claude/` is tracked, so it subtracts nothing from the
+    ///   committed tree this test exists to police.
+    /// * It governs the UNTRACKED enumeration only. A `git add -f` under
+    ///   `.claude/` puts the file in the index, and all three producers above
+    ///   -- `ls-files`, `ls-tree -r HEAD`, `ls-files --cached` -- then offer
+    ///   it and it IS scanned. The opt-out cannot be used to hide a file this
+    ///   repository actually owns.
+    /// * It fixes a real red on a fresh clone rather than a hypothetical one:
+    ///   agent tooling creates `.claude/worktrees/`, those are checkouts of
+    ///   this repository parked on pre-`concat!` commits, and the scan printed
+    ///   a path to what looks like a plaintext master password in a tree that
+    ///   was not this one.
+    ///
+    /// The honest residual is stated once and not softened: an untracked probe
+    /// under `.claude/` is invisible to this scan, at a cost of zero edits to
+    /// this crate. Untracked is out of scope by construction here -- this test
+    /// polices what the repository OWNS -- but `.claude/` is the one place
+    /// where that scope boundary was drawn by a rule someone wrote for
+    /// convenience rather than by git's own notion of ownership.
+    ///
     /// A fourth skip name would have been the fourth widening of a filter, and
     /// this module's whole thesis is that a filter on the verdict cannot
     /// distinguish "not ours" from "ours, elsewhere". So the producer is
@@ -7226,9 +7257,9 @@ pub(crate) mod password_lifetime_tests {
         // BOTH enumerations, at two separately written call sites, in
         // lockstep. That cost is stated in this test's doc and it is a lower
         // bound, not a proof.
-        for path in committed.into_iter().chain(cached) {
-            if !files.contains(&path) {
-                files.push(path);
+        for path in committed.iter().chain(cached.iter()) {
+            if !files.contains(path) {
+                files.push(path.clone());
             }
         }
 
@@ -7267,19 +7298,69 @@ pub(crate) mod password_lifetime_tests {
             ("encoded UTF-16LE", &probe_utf16le),
             ("encoded UTF-16BE", &probe_utf16be),
         ];
-        // Control: the three needles are three DIFFERENT byte strings of
-        // non-zero length. Without it, two transcodings that silently
-        // collapsed to the same bytes -- or to an empty window, which
-        // `windows(0)` would make match nothing at all -- would look like
-        // three passes while being one.
+        // **Control over the TABLE, not over the locals beside it.**
+        //
+        // The previous spelling of this control compared `probe_utf16le`,
+        // `probe_utf16be` and `PROBE.as_bytes()` to *each other*, and never
+        // once mentioned `needles`. That left the table -- the single binding
+        // both readers below take their needles from, and therefore the input
+        // this whole test is *about* -- unpoliced, and the hole was one edit
+        // wide and measured rather than argued: rewrite line one of the table
+        // to `("as bytes", &probe_utf16le)` and the scan searches the UTF-16LE
+        // transcoding twice and the raw bytes never. With a real probe
+        // committed as a literal in the tracked
+        // `deskwarden/examples/ui_preview.rs`, that single edit came back
+        // `2247 passed; 0 failed` with the probe UNSEEN, in debug AND in
+        // release. Every equality in the old control still held, because not
+        // one of them was about the table -- the same shape as the seven
+        // rounds before it, a shared input one level up from where the
+        // controls were pointing.
+        //
+        // So the entries themselves are checked, and each is checked to be the
+        // transcoding its own label claims. `PROBE` is ASCII, which is what
+        // makes the two UTF-16 forms checkable against `PROBE.as_bytes()`
+        // *without* going back through `encode_utf16` -- so this control does
+        // not merely restate the two lines above it, it re-derives them by a
+        // second route and compares.
+        assert!(PROBE.is_ascii(), "control: the probe is not ASCII, so the byte-level checks \
+             below are not the transcodings they claim to check");
         assert!(
-            probe_utf16le.len() == PROBE.len() * 2
-                && probe_utf16be.len() == PROBE.len() * 2
-                && probe_utf16le != probe_utf16be
-                && probe_utf16le != PROBE.as_bytes()
-                && probe_utf16be != PROBE.as_bytes(),
-            "control: the UTF-16 transcodings of the probe are not two distinct non-empty \
-             needles, so the two extra passes below are not two extra passes"
+            needles[0].1 == PROBE.as_bytes()
+                && needles[1].1 == probe_utf16le.as_slice()
+                && needles[2].1 == probe_utf16be.as_slice(),
+            "control: the needle table does not hold the three transcodings of the probe that \
+             its labels say it holds, so both readers below are searching for something that \
+             is not the probe. This is the exact one-edit hole the previous control could not \
+             see: it compared the locals and never the table"
+        );
+        assert!(
+            needles[1].1.len() == PROBE.len() * 2
+                && needles[2].1.len() == PROBE.len() * 2
+                && needles[1]
+                    .1
+                    .chunks(2)
+                    .zip(PROBE.as_bytes())
+                    .all(|(pair, byte)| pair.len() == 2 && pair[0] == *byte && pair[1] == 0)
+                && needles[2]
+                    .1
+                    .chunks(2)
+                    .zip(PROBE.as_bytes())
+                    .all(|(pair, byte)| pair.len() == 2 && pair[0] == 0 && pair[1] == *byte),
+            "control: the second and third needles are not the UTF-16LE and UTF-16BE \
+             transcodings of the probe, checked byte by byte against `PROBE` itself rather \
+             than against the `encode_utf16` call that produced them"
+        );
+        // And they are three DIFFERENT byte strings of non-zero length.
+        // Without this, two transcodings that silently collapsed to the same
+        // bytes -- or to an empty window, which `windows(0)` would make match
+        // nothing at all -- would look like three passes while being one.
+        assert!(
+            !needles[0].1.is_empty()
+                && needles[0].1 != needles[1].1
+                && needles[1].1 != needles[2].1
+                && needles[0].1 != needles[2].1,
+            "control: the needle table is not three distinct non-empty byte strings, so the \
+             three passes below are not three passes"
         );
 
         let mut scanned = 0usize;
@@ -7476,8 +7557,49 @@ pub(crate) mod password_lifetime_tests {
         // Memory does not double -- this loop is chunked for the same reason
         // the other is, and there is no size predicate here either, because a
         // size predicate is the exact shape six rounds were spent deleting.
+        //
+        // **AND ITS OWN NEEDLES, which is this round's change.** As shipped,
+        // the two "independent" readers both iterated `needles` and both
+        // `max()`ed their carry out of it, so the two loops shared the one
+        // binding the search is *about*: corrupt that table's first entry and
+        // BOTH readers dutifully searched for the wrong bytes, agreed with
+        // each other perfectly, agreed with both `metadata` walks, and passed.
+        // Two readers over one needle table are one reader. The disclosed
+        // "two coordinated edits, one in each loop" floor was, measured, ONE.
+        //
+        // So this loop builds its own table from `PROBE` by a DIFFERENT route:
+        // an interleave over `PROBE.as_bytes()` rather than a fold over
+        // `encode_utf16`, which is sound because `PROBE` is ASCII (asserted
+        // above). The two tables are then asserted equal -- and note that the
+        // assert is belt and the loop below is braces: even with this
+        // cross-check deleted, this reader still searches the RIGHT bytes and
+        // still names a file the first reader was steered past. What the two
+        // readers now share is `PROBE` itself and the file list, and nothing
+        // else; the file list already has three independently spelled
+        // producers above, and `PROBE` is pinned by
+        // `the_probe_is_the_string_this_test_was_built_around`.
         const VERIFY_CHUNK: usize = 64 << 10;
-        let carry = needles
+        let verify_utf16le: Vec<u8> =
+            PROBE.as_bytes().iter().flat_map(|byte| [*byte, 0u8]).collect();
+        let verify_utf16be: Vec<u8> =
+            PROBE.as_bytes().iter().flat_map(|byte| [0u8, *byte]).collect();
+        let verify_needles: [(&'static str, &[u8]); 3] = [
+            ("as bytes", PROBE.as_bytes()),
+            ("encoded UTF-16LE", &verify_utf16le),
+            ("encoded UTF-16BE", &verify_utf16be),
+        ];
+        assert!(
+            verify_needles.len() == needles.len()
+                && verify_needles.iter().zip(needles.iter()).all(|(mine, theirs)| {
+                    mine.0 == theirs.0 && mine.1 == theirs.1 && !mine.1.is_empty()
+                }),
+            "the two readers are not searching for the same thing: the first reader's needle \
+             table is {:?} and the second reader's, derived from `PROBE` by a separate route, \
+             is {:?}. One of the two tables has been steered off the probe",
+            needles.iter().map(|(label, bytes)| (label, bytes.len())).collect::<Vec<_>>(),
+            verify_needles.iter().map(|(label, bytes)| (label, bytes.len())).collect::<Vec<_>>()
+        );
+        let carry = verify_needles
             .iter()
             .map(|(_, bytes)| bytes.len())
             .max()
@@ -7506,7 +7628,7 @@ pub(crate) mod password_lifetime_tests {
                 }
                 verified_total += read as u64;
                 tail.extend_from_slice(&buffer[..read]);
-                for (label, needle) in &needles {
+                for (label, needle) in &verify_needles {
                     assert!(
                         needle.is_empty()
                             || !tail.windows(needle.len()).any(|window| window == *needle),
@@ -7530,6 +7652,44 @@ pub(crate) mod password_lifetime_tests {
              {expected_total}. Two passes that disagree mean one of them skipped something, and \
              a skipped byte is a byte the probe could be in",
             files.len()
+        );
+
+        // **And the LIST is checked again, after both readers have finished.**
+        //
+        // Found by attacking this round's own design rather than by review.
+        // The three producers above are cross-checked against each other at
+        // the moment the list is BUILT, which polices the producers and not
+        // the binding they produce. `files` is itself a shared input -- of
+        // both readers AND of both `metadata` walks -- so a single
+        // `files.retain(..)` or `files.remove(..)` inserted anywhere between
+        // that cross-check and this line subtracts a file from all four at
+        // once, and every equality above is then satisfied over the smaller
+        // list for free: `scanned == files.len()` holds, both per-file byte
+        // totals hold, both aggregates hold, and the two readers agree
+        // perfectly about a tree with the probe-bearing file removed from it.
+        // `scanned_this_file` pins only THIS file; any other tracked file
+        // could go. That is the same shape as every defeat in this test's
+        // history -- controls pointed at the derivation while the shared
+        // binding one level up went unasserted -- and it was one edit.
+        //
+        // So the same question is asked after the fact, against paths captured
+        // from separately spelled `git` invocations before the scan began. The
+        // window that edit lived in is closed; the honest cost of hiding a
+        // tracked file is back to corrupting all three producers in lockstep.
+        let dropped: Vec<&std::path::PathBuf> = committed
+            .iter()
+            .chain(cached.iter())
+            .filter(|path| !files.contains(path))
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "{} committed file(s) were in the list when the three enumerations were \
+             cross-checked against each other and are NOT in it now that both readers have \
+             finished, the first of them {:?}. The list is a shared input of both readers and \
+             of both `metadata` walks, so one subtraction from it satisfies every byte \
+             equality above over a smaller tree, silently",
+            dropped.len(),
+            dropped.first()
         );
     }
 
@@ -7626,11 +7786,40 @@ pub(crate) mod password_lifetime_tests {
              so the four cases below are not evidence of anything",
             clean.2
         );
-        for (label, (size, consumed, found)) in [
-            ("straddling the first 1 MiB chunk boundary", straddle),
-            ("straddling that boundary as UTF-16LE", straddle_utf16),
-            ("at the file's first byte", first),
-            ("at the file's last bytes", last),
+        // **The byte total a HIT must report, computed here from the offset
+        // this test planted at.** `scan_for_needles` returns the moment a
+        // window matches, so on a hit `consumed` is the end of the chunk in
+        // which the needle completes, capped at the file: `CHUNK` for the
+        // probe at byte 0, `SIZE` for the other three. What used to stand
+        // below was `consumed == size || found.is_some()`, asserted nine lines
+        // under `assert!(found.is_some(), ..)` -- a disjunction whose right
+        // half this test had *just proved true* on all four cases, so it was
+        // unconditionally satisfied and could not fail. It was a dead control
+        // wearing the word "control", of exactly the kind this module's other
+        // comments are about. This is an equality against a number the test
+        // computes rather than one the reader reports, so an early return, a
+        // short read, or a `consumed` fabricated from `metadata` is named.
+        let stop_after = |offset: usize, len: usize| -> u64 {
+            let end = offset + len;
+            (end.next_multiple_of(CHUNK).min(SIZE)) as u64
+        };
+        for (label, (size, consumed, found), expected) in [
+            (
+                "straddling the first 1 MiB chunk boundary",
+                straddle,
+                stop_after(CHUNK - 10, PROBE.len()),
+            ),
+            (
+                "straddling that boundary as UTF-16LE",
+                straddle_utf16,
+                stop_after(CHUNK - 37, probe_utf16le.len()),
+            ),
+            ("at the file's first byte", first, stop_after(0, PROBE.len())),
+            (
+                "at the file's last bytes",
+                last,
+                stop_after(SIZE - PROBE.len(), PROBE.len()),
+            ),
         ] {
             assert!(
                 found.is_some(),
@@ -7641,8 +7830,10 @@ pub(crate) mod password_lifetime_tests {
                  hide the probe across that boundary from the whole scan"
             );
             assert!(
-                consumed == size as u64 || found.is_some(),
-                "control: the fixture {label} reported {consumed} of {size} bytes consumed"
+                consumed == expected,
+                "control: the fixture {label} is {size} bytes and the reader must stop at the \
+                 end of the 1 MiB chunk the needle completes in, which is {expected} bytes, \
+                 but it reported {consumed}"
             );
         }
         assert!(
@@ -7651,6 +7842,60 @@ pub(crate) mod password_lifetime_tests {
              evidence the scan asserts against is not what this reader actually reads",
             clean.1,
             clean.0
+        );
+    }
+
+    /// **The probe itself, pinned** -- the last input the two readers of
+    /// `no_source_file_in_this_crate_contains_the_assembled_probe` still share.
+    ///
+    /// Whether to build this took an argument, so the argument is written down
+    /// rather than the conclusion. `PROBE` is not the guard; it is the guard's
+    /// INPUT, and that is the whole distinction. Editing `"password"` to
+    /// `"passwordX"` inside the `concat!` that declares it is ONE edit and reds
+    /// NOTHING: the file scan, its second reader and the chunk-carry test all
+    /// draw their needle from `PROBE`, so all three agree perfectly with each
+    /// other about the wrong string. Measured, with a real probe committed as a
+    /// literal in the tracked `deskwarden/examples/ui_preview.rs`: `2247
+    /// passed; 0 failed`, probe UNSEEN. And in a diff that edit reads as a
+    /// rename.
+    ///
+    /// Deleting a test is also one edit. The difference is legibility: a
+    /// deletion is visible AS a deletion at review time, and a swapped string
+    /// literal is not. This control converts a SILENT one-edit defeat into a
+    /// LOUD two-edit one. That is its entire claim, and it does not claim to
+    /// survive its own deletion -- nothing here does, or can.
+    ///
+    /// It pins by DIGEST rather than by a second spelling of the same words,
+    /// deliberately. A reconstruction such as `concat!("deskwarden-drop-",
+    /// "probe-master-", "password")` would be defeated by the SAME
+    /// find-and-replace over `"password"` that defeats the original: one
+    /// mechanical operation, not two independent edits, so it would raise the
+    /// cost by nothing and would be theatre. A hex digest is not hit by that
+    /// replace.
+    #[test]
+    fn the_probe_is_the_string_this_test_was_built_around() {
+        // Nothing here puts the probe's bytes on the heap -- `Sha256::digest`
+        // buffers into its own state and the hex string is not the probe -- but
+        // the lock is cheap and this module's convention is that anything
+        // naming `PROBE` takes it.
+        hold_the_probe_lock();
+
+        assert!(
+            PROBE.len() == 37,
+            "the probe is {} bytes, not the 37 every scan in this module was measured against",
+            PROBE.len()
+        );
+        use sha2::Digest as _;
+        let digest = format!("{:x}", sha2::Sha256::digest(PROBE.as_bytes()));
+        assert!(
+            digest == "94f3994cc703054bbed55ac331f24ed69cfe7fa9c4b5297c8cecf1bff52587e0",
+            "the probe hashes to {digest}, which is not the value this test pins. `PROBE` is \
+             the input from which every probe scan in this module derives its needle, so \
+             changing it changes what all of them look for WITHOUT reddening any of them -- \
+             measured, that one edit inside the `concat!` left a real committed probe unseen \
+             with the whole suite green. If the change is deliberate, update this digest in \
+             the same commit and say why in the message. If it is not, this is the test that \
+             was supposed to notice."
         );
     }
 
