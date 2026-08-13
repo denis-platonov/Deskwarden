@@ -6824,17 +6824,44 @@ mod source_pins {
         // nothing pinning them. This counts the field assignments the
         // constructor actually makes and requires the number `VaultFrameEnv`
         // really has, so a ninth field is red HERE even if its author never
-        // touches this list. The other half of the pair is
-        // `vault_window::export_wiring::production_hands_the_window_the_real_functions`,
-        // whose exhaustive destructuring makes a ninth field fail to COMPILE.
+        // touches this list.
+        //
+        // **This is now the WEAKEST of the three walls over that struct, and
+        // it is written down as such.** It still reads TEXT, and the previous
+        // spelling of this filter required the line to contain `": "` -- so
+        // mutation `m14` wrote the ninth assignment in field-init shorthand
+        // (`aux_load_2,`, fed by a `let` above the literal) and this counter
+        // saw 8, silently. `aux_load_2:fake,` with no space did the same. Both
+        // spellings are accepted below, which closes those two, but the
+        // lesson is that a text counter is a list of the spellings its author
+        // thought of. What actually stops a ninth field now is
+        // `vault_window::export_wiring::a_ninth_field_cannot_be_added_to_the_frame_env_without_being_named`,
+        // which compares `size_of::<VaultFrameEnv>()` against the fields that
+        // module pins: rustc's layout of the real struct, which has no
+        // spelling to get wrong. This stays because it answers a question
+        // that one does not -- whether the CONSTRUCTOR assigns the fields the
+        // struct has -- and because two cheap guards over the field that
+        // publishes public links is the right trade.
         let assigned = body
             .lines()
             .filter(|line| {
                 let line = line.trim_end();
-                line.starts_with("            ")
-                    && line.ends_with(',')
-                    && line.trim_start().starts_with(|c: char| c.is_ascii_lowercase())
-                    && line.contains(": ")
+                if !(line.starts_with("            ") && line.ends_with(',')) {
+                    return false;
+                }
+                let line = line.trim_start();
+                if !line.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    return false;
+                }
+                let name_len = line
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(0);
+                let rest = &line[name_len..];
+                // `field: value,` in ANY spacing -- including none at all --
+                // or field-init SHORTHAND, where the whole line is the name
+                // and a comma. Each of the last two is a measured survivor of
+                // the spelling this filter used to have.
+                rest.starts_with(':') || rest == ","
             })
             .count();
         assert_eq!(

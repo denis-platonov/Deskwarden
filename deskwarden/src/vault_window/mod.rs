@@ -3672,11 +3672,28 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// ADDRESS -- so a rename, a wrapper, a feature-flagged forwarder or a no-op
 /// fails it whatever it is called and wherever it is written.
 ///
-/// **A new field is now a COMPILE ERROR until it is pinned**, which is the
-/// one thing neither guard used to be. Both of them held written lists, and
-/// both lists were short: `aux_load` shipped missing from each, and
-/// `send_create` -- the field that puts a public link on the internet --
-/// shipped missing from each behind it. See
+/// **A new field is a COMPILE ERROR until it is MENTIONED, which is not the
+/// same as until it is pinned, and the difference was measured.** The claim
+/// that used to stand here -- "a new field is now a compile error until it is
+/// pinned" -- was FALSE. The error is E0027 from the exhaustive destructuring
+/// in `export_wiring::production_hands_the_window_the_real_functions`, and
+/// `..` satisfies E0027 while naming nobody. Mutation `m14` added a ninth
+/// field wired to a do-nothing spawn, repaired that pattern with `..`, wrote
+/// the constructor's assignment in field-init shorthand so the line counter
+/// in `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`
+/// (which looked for `": "`) did not see it, and passed 2246 tests with zero
+/// warnings in debug AND `--release`. That is the third fake field to reach a
+/// shipping shape here: `aux_load` shipped missing from both written lists,
+/// then `send_create` -- the field that puts a public link on the internet --
+/// shipped missing from both behind it.
+///
+/// What refuses a ninth field now is none of those things. It is
+/// `export_wiring::a_ninth_field_cannot_be_added_to_the_frame_env_without_being_named`,
+/// which compares `size_of::<VaultFrameEnv>()` -- rustc's own layout of this
+/// struct -- against the fields that module pins. A width has no spelling, so
+/// there is nothing there to reword, reformat, abbreviate, shorten or omit;
+/// read that test's doc for the full chain and for what it deliberately does
+/// not cover. See
 /// `export_wiring::VAULT_FRAME_ENV_FIELDS`, which is declared BELOW THE CUT
 /// for the reason in the paragraph above: a test-gated constant written
 /// beside this struct truncates every source guard's production slice, and
@@ -12603,9 +12620,31 @@ mod window_era_placement_tests {
         );
         assert!(
             production().contains(LAST_PRODUCTION_ITEM),
-            "the production slice stops before {LAST_PRODUCTION_ITEM:?}, so the first \
-             {TESTS_BEGIN:?} has moved up and every guard in this module is now inspecting a \
-             fraction of the production code and passing for the wrong reason"
+            "A {TESTS_BEGIN} ITEM WAS ADDED ABOVE THE CUT IN `vault_window/mod.rs`. That is \
+             the whole diagnosis; the rest of this message is why you are also looking at \
+             about sixteen other red tests that have nothing to do with each other.\n\
+             \n\
+             Every source guard in this file takes its \"production slice\" as everything \
+             before the FIRST {TESTS_BEGIN:?} in the text. A test-gated item written above \
+             that point -- a `const`, a `use`, an `fn`, a whole module -- becomes the first \
+             one, and every guard in the file silently starts inspecting the fraction of the \
+             file above it. They then fail about THEIR OWN subject: a missing spawn era tag, \
+             a missing repaint schedule, a bare `Command`, an export pin, a send-delete pin. \
+             Not one of those is really broken. There is ONE cause and it is this line.\n\
+             \n\
+             Measured twice, at 18 red tests and at 17. The second time the gate attribute \
+             was not even code: it was SPELLED INSIDE A DOC COMMENT on `VaultFrameEnv`, \
+             which is text in the file and so is exactly as good a cut marker as the real \
+             thing. `mod.rs` has no doc-comment exception -- `send_ui.rs` does -- so do not \
+             write the literal attribute above the cut here in any context at all, comments \
+             included; split it with `concat!` the way the needles in this module do.\n\
+             \n\
+             THE FIX: move the test-only item BELOW the cut, into the test module that uses \
+             it. `export_wiring::VAULT_FRAME_ENV_FIELDS` is down there for precisely this \
+             reason and its doc records the cost of learning it. If the item genuinely \
+             belongs above the cut, then {LAST_PRODUCTION_ITEM:?} is no longer the last \
+             production item and this needle needs updating instead -- but check the first \
+             answer before believing the second."
         );
     }
 }
@@ -17894,14 +17933,25 @@ mod export_wiring {
     /// (`.github/workflows/release.yml`), never `cargo test --release`.
     #[test]
     fn production_hands_the_window_the_real_functions() {
+        the_frame_env_is_exactly_as_wide_as_the_fields_this_module_pins();
+
         // THE STRUCTURAL PART, and the reason this is a destructuring and not
-        // `env.sync`, `env.load`, ... : the pattern is EXHAUSTIVE and has no
-        // `..`. Adding a ninth field to `VaultFrameEnv` makes this line fail
-        // to COMPILE -- E0027, "pattern does not mention field" -- so the new
-        // field cannot reach a shipping build while this test stays green and
-        // silent, which is exactly what `aux_load` and then `send_create`
-        // both did. A field-by-field read would have accepted them; a written
-        // list of names in the array below did accept them.
+        // `env.sync`, `env.load`, ... : the pattern is EXHAUSTIVE. Adding a
+        // ninth field to `VaultFrameEnv` makes this line fail to COMPILE --
+        // E0027, "pattern does not mention field" -- so the new field cannot
+        // reach a shipping build while this test stays green and silent,
+        // which is exactly what `aux_load` and then `send_create` both did. A
+        // field-by-field read would have accepted them; a written list of
+        // names in the array below did accept them.
+        //
+        // **This pattern must never grow a `..`, and it is no longer the
+        // thing that stops one.** E0027 makes a new field an error until it
+        // is MENTIONED, and `..` mentions nothing -- one token repairs the
+        // compile error and absorbs the field, which is measured mutation
+        // `m14`. What refuses that now is the size pin called on the line
+        // above, which is arithmetic the COMPILER owns and no spelling in
+        // this file can reach. `..` here is still wrong, and still worth not
+        // writing, but it is not load-bearing any more.
         //
         // Every binding is then USED below, so a field that is destructured
         // and quietly not compared is an `unused_variables` warning, and this
@@ -18084,6 +18134,187 @@ mod export_wiring {
     /// The struct's own doc warned about exactly this and it happened anyway,
     /// which is why the number is recorded rather than the lesson.
     pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 8;
+
+    /// **`VaultFrameEnv` is exactly as WIDE as the fields this module pins --
+    /// asked of the compiler, not of any source text.**
+    ///
+    /// **Why this exists.** Every previous wall over that struct was a
+    /// statement about how the source is SPELLED, and this codebase has now
+    /// lost a spelling race seven times: to rewording, to reformatting, to a
+    /// second occurrence, to a single missing space, and -- measured as `m14`
+    /// -- to field-init shorthand. The last one is worth stating in full,
+    /// because it defeated the two guards that were supposed to make a ninth
+    /// field impossible:
+    ///
+    /// ```ignore
+    /// // struct:        aux_load_2: AuxLoadSpawn,
+    /// // production():  let aux_load_2 = fake_aux_load_2;   ... aux_load_2,
+    /// // this test:     aux_load, settings_path, ..     <-- one token
+    /// ```
+    ///
+    /// 2246 passed, 0 failed, 0 warnings, debug AND `--release`. Both walls
+    /// missed, each for a reason that reads as a technicality and is not:
+    ///
+    ///  * the destructuring below is E0027 "pattern does not mention field"
+    ///    -- and `..` MENTIONS NOTHING, so one token repairs the compile
+    ///    error and swallows the field. The struct's own doc claimed "a new
+    ///    field is now a COMPILE ERROR until it is pinned"; what E0027
+    ///    actually buys is an error until it is *acknowledged*, and `..` is
+    ///    an acknowledgement that names nobody.
+    ///  * `send_ui`'s `production_is_the_only_env_a_shipping_build_has`
+    ///    counted constructor lines containing `": "`. Shorthand has no
+    ///    `": "`. Neither does `aux_load_2:fake,`.
+    ///  * `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS` still held, because
+    ///    `..` had absorbed the field and left `checked` at 7.
+    ///
+    /// **What this pin derives from instead.** `size_of::<VaultFrameEnv>()`
+    /// is decided by rustc's layout of the real struct. It is not text, so it
+    /// has no spelling; there is nothing to reword, reformat, abbreviate or
+    /// omit. A ninth field that can hold a spawn is a `fn` pointer, and every
+    /// field of this struct is 8-aligned with a size that is a multiple of 8,
+    /// so there is no padding for one to hide in -- the struct gets 8 bytes
+    /// wider and the arithmetic below stops balancing. That is true of
+    /// `aux_load_2` under EVERY spelling `m14` and its variants use, because
+    /// none of them changes the layout question.
+    ///
+    /// **And it forces a NAMED edit, which is the actual goal.** The only way
+    /// to rebalance this is to bump [`VAULT_FRAME_ENV_FIELDS`], which
+    /// immediately reds `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS` in
+    /// [`production_hands_the_window_the_real_functions`], which needs a new
+    /// entry in `checked`, which needs a BINDING for the new field -- and
+    /// `..` supplies no bindings, so the destructuring has to name it. An
+    /// honest ninth field walks that chain in the honest direction and passes;
+    /// a fake one has to arrive at `("aux_load_2", fn_addr_eq(..))` and write
+    /// something knowingly false there. That is the boundary, and it is a
+    /// deliberate lie in a named place rather than a one-token repair.
+    ///
+    /// **The two probes are the control.** An assertion about a size is
+    /// worthless if the arithmetic model is wrong, so this does not assume
+    /// rustc's layout -- it measures it, on this target, in this profile, on
+    /// structs of exactly the shape in question. `EightFieldProbe` proves
+    /// that a struct of this shape really is the sum of its fields' widths --
+    /// no packing, no padding; `NinthFieldProbe` proves a ninth
+    /// `fn`-pointer field really does move that number rather than vanishing
+    /// into padding or a niche. If either ever stops holding, this pin says
+    /// so in its own output instead of passing vacuously.
+    ///
+    /// **What it does NOT cover, plainly.** A ZERO-SIZED field (`PhantomData`,
+    /// `()`, `[fn(); 0]`) does not change the width and is not caught here.
+    /// It is also not a seam: nothing zero-sized can carry a per-instance
+    /// function pointer, so it cannot substitute a fake. A TEST-GATED field is
+    /// caught -- it exists in the build this runs in, so the width moves --
+    /// and the negation of that gate is refused crate-wide by
+    /// `job_object::tests::nothing_in_this_crate_is_compiled_differently_when_it_is_tested`,
+    /// which is the shape that would remove a field from the tested build and
+    /// keep it in the shipped one. (Neither gate is spelled here; the
+    /// attribute is a cut marker for every source guard in this file and
+    /// writing it in a comment has twice cost about seventeen red tests.)
+    #[test]
+    fn a_ninth_field_cannot_be_added_to_the_frame_env_without_being_named() {
+        the_frame_env_is_exactly_as_wide_as_the_fields_this_module_pins();
+    }
+
+    /// The body of
+    /// [`a_ninth_field_cannot_be_added_to_the_frame_env_without_being_named`],
+    /// factored out so that
+    /// [`production_hands_the_window_the_real_functions`] can run it FIRST.
+    /// That test's own diagnostics are all about the eight fields it knows
+    /// about; if a ninth exists, the useful sentence is this one and it
+    /// should be what the reader sees.
+    fn the_frame_env_is_exactly_as_wide_as_the_fields_this_module_pins() {
+        // One `fn` pointer. Every spawn field of `VaultFrameEnv` is one of
+        // these whatever its signature, since a `fn` pointer is a thin
+        // pointer.
+        const SPAWN: usize = std::mem::size_of::<fn()>();
+        // Seven spawns and one `Option<PathBuf>` today: "all of them but the
+        // settings path". Written against `VAULT_FRAME_ENV_FIELDS` rather
+        // than as a literal, so the ONLY way to rebalance this after adding a
+        // field is to bump that constant -- which is the edit the rest of the
+        // chain hangs off.
+        let accounted = (VAULT_FRAME_ENV_FIELDS - 1) * SPAWN
+            + std::mem::size_of::<Option<std::path::PathBuf>>();
+
+        // CONTROLS. These are structs of the shape in question, laid out by
+        // the same compiler on the same target in the same profile, so they
+        // answer "is this arithmetic what rustc really does?" instead of
+        // assuming it.
+        #[allow(dead_code)]
+        struct EightFieldProbe {
+            a: fn(),
+            b: fn(),
+            c: fn(),
+            d: fn(),
+            e: fn(),
+            f: fn(),
+            g: fn(),
+            h: Option<std::path::PathBuf>,
+        }
+        #[allow(dead_code)]
+        struct NinthFieldProbe {
+            a: fn(),
+            b: fn(),
+            c: fn(),
+            d: fn(),
+            e: fn(),
+            f: fn(),
+            g: fn(),
+            h: Option<std::path::PathBuf>,
+            ninth: fn(),
+        }
+        // The probes' own arithmetic is written against the probes' own field
+        // counts -- literals describing the two structs a dozen lines up --
+        // and NOT against `VAULT_FRAME_ENV_FIELDS`. That separation is the
+        // point: these two assertions are facts about how rustc lays out this
+        // SHAPE, and they have to stay true when someone legitimately bumps
+        // the constant to nine. Tying them to the constant made an honest
+        // ninth field fail here, with a message about layout, which is
+        // exactly the "guard that rejects legitimate work" this pin must not
+        // be.
+        assert_eq!(
+            std::mem::size_of::<EightFieldProbe>(),
+            7 * SPAWN + std::mem::size_of::<Option<std::path::PathBuf>>(),
+            "control: a struct of seven `fn` pointers and one `Option<PathBuf>` is not the \
+             sum of its fields' widths, so `fn`-pointer fields are being packed or padded \
+             on this target and the arithmetic below does not describe its layout"
+        );
+        assert_eq!(
+            std::mem::size_of::<NinthFieldProbe>(),
+            std::mem::size_of::<EightFieldProbe>() + SPAWN,
+            "control: adding a ninth `fn`-pointer field to that shape does NOT change its \
+             width on this target -- it is being absorbed into padding or a niche -- so a \
+             width comparison cannot notice a ninth field and this pin is vacuous"
+        );
+
+        assert_eq!(
+            std::mem::size_of::<VaultFrameEnv>(),
+            accounted,
+            "`VaultFrameEnv` is {} bytes wide but the {VAULT_FRAME_ENV_FIELDS} fields this \
+             module pins account for {accounted}. A FIELD HAS BEEN ADDED TO THAT STRUCT AND \
+             NOTHING HERE PINS IT.\n\
+             \n\
+             Every field of `VaultFrameEnv` is a way for the vault window's frame closure to \
+             reach outside this process, and one nothing compares is a field a fake can \
+             occupy with the whole suite green -- which is what happened to `aux_load`, then \
+             to `send_create`, and what mutation `m14` did a third time by repairing the \
+             destructuring in `production_hands_the_window_the_real_functions` with `..` and \
+             writing the constructor's assignment in field-init shorthand. `..` mentions no \
+             field, so E0027 is satisfied; shorthand contains no `\": \"`, so `send_ui`'s \
+             line counter is satisfied. This assertion is neither of those things: it is the \
+             compiler's own layout of the real struct, and it does not care how anything is \
+             spelled.\n\
+             \n\
+             IF THE NEW FIELD IS HONEST, pin it -- there is no way to silence this that does \
+             not: (1) bump `VAULT_FRAME_ENV_FIELDS` to the real count, which reds \
+             `checked.len() + 1 == VAULT_FRAME_ENV_FIELDS`; (2) add the field to `checked` \
+             with a `fn_addr_eq` against the real spawn function, which needs a binding; \
+             (3) name the field in the destructuring to get that binding -- do NOT reach for \
+             `..`; (4) add its spawn's name to the needle list in \
+             `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`; and \
+             (5) add a decoy of its signature and a control that the comparison \
+             discriminates.",
+            std::mem::size_of::<VaultFrameEnv>()
+        );
+    }
 
     /// The decoy [`production_hands_the_window_the_real_functions`] compares
     /// against: `ExportSpawn`'s signature exactly, and nothing else.
