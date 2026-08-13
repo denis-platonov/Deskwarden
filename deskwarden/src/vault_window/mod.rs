@@ -17448,9 +17448,26 @@ mod export_wiring {
     ///
     /// Comment lines are dropped LINE-WISE rather than by scanning for a `//`
     /// anywhere, so a `//` inside a string literal cannot swallow the rest of
-    /// its line. The cost is disclosed on
-    /// [`every_frame_env_seam_has_a_whole_body_pin`]: a function pinned whole
-    /// may not contain a whole-line comment of its own.
+    /// its line.
+    ///
+    /// **What that costs, stated the right way round.** A WHOLE-LINE comment
+    /// inside a pinned function is free: it is dropped from the production
+    /// side here exactly as it is dropped from the pin side, so the two still
+    /// agree. What breaks a pin is a TRAILING comment on a line that also
+    /// carries code -- `trim_start().starts_with("//")` is false for that
+    /// line, so the comment survives into the production text and no pin
+    /// spells it. The doc on [`every_frame_env_seam_has_a_whole_body_pin`]
+    /// said the opposite of this, and was measured wrong: a
+    /// `// which list the user asked for` added inside `spawn_aux_load`'s body
+    /// left every pin green. A disclosed boundary that is backwards is worse
+    /// than none -- it sends the next person to reformat the one thing that
+    /// was never the problem.
+    ///
+    /// Trailing comments are NOT stripped, deliberately. Stripping them means
+    /// finding a `//` that is not inside a string, a char literal or a raw
+    /// string -- a second literal-aware hand parser, over production bodies
+    /// this time -- and every byte it got wrong would be a FALSE RED on honest
+    /// code. The rule as it stands is narrow, true, and now written down.
     fn code_squashed(text: &str) -> String {
         text.lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -17477,23 +17494,18 @@ mod export_wiring {
         let at = source.find(needle.as_str()).expect("counted just above");
         let start = source[..at].rfind("\r\n").map_or(0, |line_end| line_end + 2);
         let open = at + source[at..].find('{').expect("a function definition with no body");
-        let bytes = source.as_bytes();
-        let mut depth = 0usize;
-        let mut end = None;
-        for (offset, byte) in bytes[open..].iter().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(open + offset + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        code_squashed(&source[start..end.expect("that function's braces are unbalanced")])
+        // **The shared brace matcher, which skips literals.** This counted raw
+        // `{` and `}`, and this function is the DERIVED control's only reader
+        // -- the control exists for a FUTURE field whose spawner nobody has
+        // vetted. A `\"}\"` or a `'}'` anywhere in such a body ended it early,
+        // and the `body.len() > 60` control below still passed while
+        // `pins.contains(&body)` then succeeded on a PREFIX, leaving the tail
+        // of the function unpinned; a `'{'` ran past the function's end and
+        // false-redded. No spawner has a brace in a literal today, so this was
+        // latent -- but a latent hole in the one reader that is supposed to
+        // notice new work is a hole aimed at exactly the case it was built for.
+        let end = crate::below_cut::match_brace(&source, open) + 1;
+        code_squashed(&source[start..end])
     }
 
     /// The field assignments `VaultFrameEnv::production` really makes, in
@@ -17579,11 +17591,20 @@ mod export_wiring {
     ///    before the search, so quoting a body in a doc comment does not
     ///    satisfy this -- but a dead `let _ = "..";` in a test would. What is
     ///    required is that the text exist, not that it be asserted.
-    ///  * A pinned function may not contain a whole-line comment, and its
-    ///    pin must be spelled as a `concat!` of string literals joined `", "`
-    ///    with `\` continuations, because that is the normalisation applied
-    ///    here. Any other spelling REDS rather than passes, which is the
-    ///    right direction but is a false red waiting for a reformatter.
+    ///  * A pinned function may not carry a TRAILING comment on a line that
+    ///    also carries code, and its pin must be spelled as a `concat!` of
+    ///    string literals joined `", "` with `\` continuations, because that
+    ///    is the normalisation [`code_squashed`] applies. Any other spelling
+    ///    REDS rather than passes, which is the right direction but is a false
+    ///    red waiting for a reformatter.
+    ///
+    ///    A WHOLE-LINE comment inside a pinned function is fine, and this
+    ///    said the reverse until it was measured: comment-only lines are
+    ///    dropped from the production side by [`code_squashed`] too, so both
+    ///    sides lose them and the pin stays green. Adding
+    ///    `// which list the user asked for` inside `spawn_aux_load` left the
+    ///    whole suite green. Believing the old sentence would have cost the
+    ///    next reader a comment they were entitled to write.
     #[test]
     fn every_frame_env_seam_has_a_whole_body_pin() {
         let source = include_str!("mod.rs");
@@ -17613,6 +17634,16 @@ mod export_wiring {
             // field of this struct is like that, and which one is asserted
             // below -- so `aux_load: some_gate(spawn_aux_load)`, a measured
             // mutation, cannot buy itself an exemption here.
+            // JUDGED AND LEFT AS IT IS. Any assignment containing a `(` counts
+            // as a value, so a future field filled by a `const fn`, a
+            // `Some(..)` or a tuple reds here with a message accusing its
+            // author of shipping a fake seam. That is a false red, and it is
+            // the one shape where a false red is the safe direction: the
+            // natural repair is to widen the `by_value` list below, which is
+            // precisely the exemption the assertion exists to deny, so the
+            // message must be read rather than routed around. Narrowing it to
+            // "a call" means parsing an expression, and the parser would be a
+            // third hand-written one in this test module.
             if expression.contains('(') {
                 by_value.push(field);
                 continue;
@@ -18950,6 +18981,129 @@ mod export_wiring {
         fn is_ident(byte: u8) -> bool {
             byte.is_ascii_alphanumeric() || byte == b'_'
         }
+        /// The byte offset just past the terminator of a raw string whose
+        /// body starts at `from` and which was opened with `hashes` hashes.
+        /// `crate::below_cut::end_of_raw`, which is private to that module.
+        fn end_of_raw(b: &[u8], from: usize, hashes: usize) -> usize {
+            let mut i = from;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    let mut k = 0usize;
+                    while k < hashes && i + 1 + k < b.len() && b[i + 1 + k] == b'#' {
+                        k += 1;
+                    }
+                    if k == hashes {
+                        return i + 1 + hashes;
+                    }
+                }
+                i += 1;
+            }
+            b.len()
+        }
+        /// The byte offset just past the comment, string, char literal or raw
+        /// string that BEGINS at `at`, or `None` when `at` begins none of
+        /// them.
+        ///
+        /// **This is `crate::below_cut::match_brace`'s literal walk, arm for
+        /// arm.** It is copied rather than re-derived on purpose: that walk is
+        /// the one this crate has already measured a payload against, escape
+        /// by escape -- its header records a mutant that SURVIVED 2202 tests
+        /// on an off-by-one in `'\\''` alone -- and a second hand parser with
+        /// its own off-by-one is the shape this module keeps losing to. It
+        /// cannot be CALLED because that function is a brace matcher, not a
+        /// token skipper, and that file is not this one's to widen.
+        ///
+        /// **Block comments NEST.** The `/*` arm counts depth rather than
+        /// searching for the first `*/`, because it did search for the first
+        /// `*/` and that was measured wrong: a `macro_rules /* /* x */ */ !
+        /// seam` written below the honest macro left this pin GREEN with two
+        /// real `seam` definitions in the file, the second shadowing the
+        /// first for every invocation below it -- including all seven decoy
+        /// controls.
+        fn past_comment_or_literal(source: &str, at: usize) -> Option<usize> {
+            let b = source.as_bytes();
+            if at >= b.len() {
+                return None;
+            }
+            let mut i = at;
+            match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    Some(i)
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    i += 2;
+                    let mut nest = 1usize;
+                    while i < b.len() && nest > 0 {
+                        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                            nest += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
+                            nest -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    Some(i)
+                }
+                b'r' | b'b' => {
+                    // A raw string -- `r".."`, `r#".."#`, `br#".."#` -- but
+                    // only when the letter STARTS a token, so `for` and
+                    // `breach` are not read as string openers, and neither is
+                    // the `r` of a raw IDENTIFIER, which the caller must go on
+                    // to read as the name it is.
+                    let starts = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                    let mut j = i;
+                    if b[j] == b'b' {
+                        j += 1;
+                    }
+                    if starts && j < b.len() && b[j] == b'r' {
+                        j += 1;
+                        let from = j;
+                        while j < b.len() && b[j] == b'#' {
+                            j += 1;
+                        }
+                        let hashes = j - from;
+                        if j < b.len() && b[j] == b'"' {
+                            return Some(end_of_raw(b, j + 1, hashes));
+                        }
+                    }
+                    None
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    Some((i + 1).min(b.len()))
+                }
+                b'\'' => {
+                    // `'x'` and `'\x'` are char literals; anything else with a
+                    // leading tick is a lifetime, and a lifetime is not a
+                    // literal -- so it is NOT skipped, and the ident after it
+                    // is read normally.
+                    if i + 2 < b.len() && b[i + 1] == b'\\' {
+                        // Start PAST the escaped character: starting on it made
+                        // `'\''` end one byte early, and the tick left over
+                        // opened a phantom token. See `below_cut`'s header for
+                        // the measurement that cost.
+                        let mut j = i + 3;
+                        while j < b.len() && b[j] != b'\'' {
+                            j += 1;
+                        }
+                        Some((j + 1).min(b.len()))
+                    } else if i + 2 < b.len() && b[i + 2] == b'\'' {
+                        Some(i + 3)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
         /// Past whitespace and past comments -- the only things Rust allows
         /// BETWEEN these tokens.
         fn skip_trivia(source: &str, mut at: usize) -> usize {
@@ -18958,18 +19112,18 @@ mod export_wiring {
                 while at < bytes.len() && bytes[at].is_ascii_whitespace() {
                     at += 1;
                 }
-                if source[at..].starts_with("//") {
-                    match source[at..].find('\n') {
-                        Some(end) => at += end + 1,
-                        None => return bytes.len(),
-                    }
-                } else if source[at..].starts_with("/*") {
-                    match source[at..].find("*/") {
-                        Some(end) => at += end + 2,
-                        None => return bytes.len(),
-                    }
-                } else {
+                if at >= bytes.len() {
+                    return bytes.len();
+                }
+                // Only a COMMENT may stand between these tokens. A string or
+                // a char literal here is not trivia -- it is a syntax error --
+                // so it ends the skip rather than being stepped over.
+                if !(source[at..].starts_with("//") || source[at..].starts_with("/*")) {
                     return at;
+                }
+                match past_comment_or_literal(source, at) {
+                    Some(past) if past > at => at = past,
+                    _ => return bytes.len(),
                 }
             }
         }
@@ -18990,6 +19144,21 @@ mod export_wiring {
         let mut found: Vec<(Option<&str>, usize)> = Vec::new();
         let mut at = 0usize;
         while at < bytes.len() {
+            // **Past strings, char literals and comments FIRST**, so this scan
+            // answers about CODE. It had no literal awareness at all at the
+            // top level -- only between the three tokens -- and that was
+            // measured as a FALSE RED, which is the worse direction: one
+            // ordinary prose line reading `// ...written 'macro_rules! seam {'
+            // today.` reported a second definition and failed the count below
+            // with nothing whatever defined. The undocumented rule that
+            // created was `no comment or string in these 26 000 lines may
+            // spell this macro's name after the keyword`, and the next person
+            // to hit it fixes it by LOOSENING the scanner -- which is how two
+            // of this file's holes were made.
+            if let Some(past) = past_comment_or_literal(source, at) {
+                at = past;
+                continue;
+            }
             if !is_ident(bytes[at]) || (at > 0 && is_ident(bytes[at - 1])) {
                 at += 1;
                 continue;
@@ -19120,6 +19289,11 @@ mod export_wiring {
             format!("{keyword}  !  {named}  {{}}"),
             format!("{keyword}! r#{named} {{}}"),
             format!("{keyword}!/* a comment */{named}{{}}"),
+            // NESTED. Rust's block comments nest, and the skip between these
+            // tokens searched for the first `*/` -- so this exact spelling,
+            // written below the honest macro, was a second real definition
+            // this scanner could not see, measured green.
+            format!("{keyword} /* /* nested */ */ ! {named} {{}}"),
             format!("{keyword}!\r\n{named}\r\n{{}}"),
             format!("{keyword}! {named} ( () => (); );"),
         ] {
@@ -19140,6 +19314,45 @@ mod export_wiring {
             "control: the scanner reports a definition of a macro this file does not define, \
              so it is not answering about names at all"
         );
+        // CONTROLS in the OTHER direction: text that only MENTIONS the shape
+        // is not a definition. These are not more spellings -- they are the
+        // false-red class, and a false red is the failure this file's guards
+        // have twice been WEAKENED to escape. Measured before the fix: the
+        // first of these, as one ordinary comment line anywhere in this file,
+        // failed the count above with nothing defined.
+        for prose in [
+            format!("// the honest definition is written '{keyword}! {named} {{' today."),
+            format!("/* {keyword}! {named} {{ */"),
+            format!("/* /* {keyword}! {named} {{ */ */"),
+            format!("let _ = \"{keyword}! {named} {{\";"),
+            format!("let _ = r#\"{keyword}! {named} {{\"#;"),
+            format!("//! {keyword}! {named} {{"),
+            format!("let _ = ('{{', \"{keyword}! {named} {{\");"),
+        ] {
+            assert!(
+                macro_definitions(&prose).is_empty(),
+                "control: the scanner reports a macro definition in {prose:?}, which DEFINES \
+                 NOTHING -- it is a comment or a string literal. A scan that reds on prose \
+                 makes the real rule `no comment or string in this file may spell this \
+                 macro's name`, and the next person to trip it loosens the scanner"
+            );
+        }
+        // ...and the literal skipping does not swallow the code AFTER it: a
+        // definition standing beyond a string, a char literal and a comment is
+        // still found. Without this, `past_comment_or_literal` could return
+        // `source.len()` for everything and every assertion above would pass.
+        let after_literals = format!(
+            "let _ = (\"a \\\" b\", '\\'', r#\"x\"#); // c\n{keyword}! {named} {{ () => {{}}; }}"
+        );
+        assert_eq!(
+            macro_definitions(&after_literals)
+                .iter()
+                .filter(|(name, _)| *name == Some(named))
+                .count(),
+            1,
+            "control: the literal and comment skipping runs past the code that follows it, \
+             so the refusals above are satisfied by a scanner that finds nothing at all"
+        );
         // CONTROL: the metavariable refusal above really fires. Built at run
         // time, for the same reason every fixture here is: written as a
         // literal it would be a generated definition IN THIS FILE.
@@ -19159,22 +19372,11 @@ mod export_wiring {
              Rust and nothing below can read it -- rewrite the definition with braces rather \
              than widening this reader"
         );
-        let mut depth = 0usize;
-        let mut end = None;
-        for (offset, byte) in bytes[brace..].iter().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(brace + offset + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let body = &source[brace..end.expect("`seam!`'s definition has unbalanced braces")];
+        // The shared brace matcher rather than a raw depth count: a shadow
+        // definition is free to carry a `\"}\"` in its expansion, and a count
+        // that could not see that would read a PREFIX of the body and compare
+        // the wrong text against the equality below.
+        let body = &source[brace..crate::below_cut::match_brace(source, brace) + 1];
         // ONE arm. An arm is one `=>`, and the expansion contains none of its
         // own -- a second one anywhere in here is a second arm, or a `match`
         // that could hold one, and both are the enumeration this pin refuses.
