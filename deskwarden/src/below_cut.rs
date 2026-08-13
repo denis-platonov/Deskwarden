@@ -926,7 +926,7 @@ mod tests {
 ///   reading under which "nothing lives below its cut" is true of a file that
 ///   has no cut.
 #[cfg(test)]
-mod every_file_in_the_crate {
+pub(crate) mod every_file_in_the_crate {
     use super::{is_module_opener, match_brace};
 
     /// The test gate, assembled so this module does not contain a column-0
@@ -956,8 +956,8 @@ mod every_file_in_the_crate {
     /// in the crate -- moves this number, so such a payload needs an edit here
     /// too.
     ///
-    /// # Why this number is pinned from ANOTHER FILE, and why the gate count
-    /// is gone
+    /// # Why this number is DECLARED in another file rather than pinned as
+    /// text, and why the gate count is gone
     ///
     /// The previous round pinned two integers, `INTERLEAVED_FILES` and
     /// `INTERLEAVED_GATES`, and claimed that between them they made the escape
@@ -967,12 +967,44 @@ mod every_file_in_the_crate {
     /// decoy gated module appended to `vault_cache.rs`, and that one line
     /// changed to `(INTERLEAVED_FILES + 1, INTERLEAVED_GATES + 2)`, SURVIVED
     /// the whole suite at 2248 lib / 0 failed / 0 warnings and shipped three
-    /// times over in the lib's DEBUG LLVM IR. Two edits, both inside this
-    /// file. Only a pin OUTSIDE the file being edited costs a real second
-    /// edit, so the literal below is pinned by
-    /// `job_object::the_crate_wide_below_the_cut_guard_has_not_been_deleted`,
-    /// which reads this file as text and requires this exact declaration. That
-    /// route now costs three edits in two files.
+    /// times over in the lib's DEBUG LLVM IR.
+    ///
+    /// The round after that kept the literal HERE and had `job_object.rs` look
+    /// for its text with
+    /// `source.contains("const INTERLEAVED_FILES: usize = 3;")`, claiming
+    /// "three edits in two files". `contains` is satisfied by the text
+    /// appearing anywhere, so one line --
+    /// `const INTERLEAVED_FILES: usize = 4; // was: const INTERLEAVED_FILES: usize = 3;`
+    /// -- satisfied the pin and moved the number at the same time. Measured
+    /// with the same `vault_cache.rs` payload: SURVIVED in debug AND release at
+    /// 2249 lib / 217 bin / 6 ignored / 0 failed / 0 warnings, three
+    /// occurrences in the lib's DEBUG LLVM IR. Liveness at the identical site,
+    /// payload alone with this file pristine: KILLED, naming the newly derived
+    /// fourth file. The outside pin had added ZERO edits. That was the eighth
+    /// text-pin loss in this repository.
+    ///
+    /// A pin an attacker can satisfy with a comment is decoration, and no
+    /// amount of `contains` fixes that -- eight rounds here have now been lost
+    /// to exactly one weakness in exactly one direction. So there is no text
+    /// pin at all any more.
+    ///
+    /// What costs a second edit is a second HOLDER, and what makes a holder
+    /// real is that it derives the same quantity for itself and compares it
+    /// against a number of its own. `job_object.rs` declares its own
+    /// `INTERLEAVED_FILES`, calls [`interleaved_files`] -- the same derivation
+    /// the sweep below uses, reached across the module boundary so the compiler
+    /// enforces that it still exists -- and asserts the size against its own
+    /// literal. The two numbers are INDEPENDENT: nothing imports anything, so
+    /// moving the set means editing this line AND that one. Three edits in two
+    /// files, and neither of the two is a string another file greps for.
+    ///
+    /// This does not red on ordinary work. The number moves only when a file
+    /// starts carrying production below its first test module, which adding a
+    /// test never does and adding a new source file never does -- unlike the
+    /// deleted gate count, whose remedy for ordinary test-writing was
+    /// byte-for-byte the mutant's edit.
+    ///
+    /// Read the honest boundary at the foot of this module for what remains.
     ///
     /// The gate count is DELETED rather than pinned from outside, because it
     /// was red on ORDINARY WORK: appending a plain new test module to `app.rs`
@@ -997,6 +1029,39 @@ mod every_file_in_the_crate {
     /// in every file -- and so, now, is the closing LINE of every gated module
     /// in every file.
     const INTERLEAVED_FILES: usize = 3;
+
+    /// **The interleaving set, derived, for the second holder to check.**
+    ///
+    /// `job_object::the_interleaving_set_is_still_three_files` calls this and
+    /// compares its size against `job_object`'s OWN copy of the number. That is
+    /// what makes the count cost a real second edit: two files each derive the
+    /// set and each compare it against a literal they own, so widening it means
+    /// changing a number in both. The previous round tried to buy the same
+    /// thing with `source.contains("const INTERLEAVED_FILES: usize = 3;")` from
+    /// `job_object.rs` and bought nothing at all -- see [`INTERLEAVED_FILES`].
+    ///
+    /// It is the SAME derivation the sweep uses, not a second implementation of
+    /// it: the sweep asserts its own list equals this one, so a divergence
+    /// between the two reds rather than quietly leaving the second holder
+    /// checking something else.
+    pub(crate) fn interleaved_files() -> Vec<String> {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        rust_sources(crate_dir, &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in &files {
+            let rel = relative(crate_dir, path);
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{rel} is readable to be walked: {e}"));
+            let found = verdict(&source).unwrap_or_else(|why| panic!("{rel}: {why}"));
+            if found.is_some_and(|v| v.interleaved) {
+                out.push(rel);
+            }
+        }
+        out.sort();
+        out
+    }
 
     /// Every line of `source` as `(byte offset, line without its terminator)`.
     ///
@@ -1130,6 +1195,19 @@ mod every_file_in_the_crate {
         source: &str,
         blocks: &[Block<'_>],
     ) -> Result<usize, String> {
+        // A REAL per-close counter, incremented once per close actually read.
+        //
+        // This used to end `Ok(blocks.len())`, which is the length of the very
+        // vector the caller compares the result against: `verdict` sets
+        // `gates = blocks.len()` and `closes_read =
+        // closing_brace_lines_carry_no_source(source, &blocks)?`, so both sides
+        // of the crate-wide `assert_eq!(closes_read, gates_seen)` were the same
+        // `Vec::len()` and the equality could not fail. Measured: mutating the
+        // loop header to `for block in blocks.iter().take(1)` -- which then
+        // reads one of `app.rs`'s five closes -- STILL reported equality. That
+        // mutant was killed, but by the per-module liveness payload, never by
+        // the control written to catch exactly it.
+        let mut checked = 0usize;
         for block in blocks {
             let Some(rel) = block.opener.rfind('{') else {
                 return Err(format!(
@@ -1152,8 +1230,46 @@ mod every_file_in_the_crate {
                     block.opener
                 ));
             }
+            checked += 1;
         }
-        Ok(blocks.len())
+        Ok(checked)
+    }
+
+    /// The closing-line count is a COUNT and not a restatement of its input.
+    ///
+    /// The crate-wide `assert_eq!(closes_read, gates_seen)` compares a sum of
+    /// this function's return values against a sum of `module_blocks(..).len()`
+    /// values. While this function ended `Ok(blocks.len())` those were the same
+    /// number by construction and the assertion could not fail for any mutation
+    /// whatsoever. This test is local, synthetic and cheap, so the property is
+    /// measured here rather than only at the end of a thirteen-second sweep:
+    /// a walk that reads fewer closes than the file has modules must return a
+    /// smaller number.
+    #[test]
+    fn the_closing_line_walk_returns_how_many_closes_it_actually_read() {
+        let source = concat!(
+            "#[cfg", "(test)]\nmod a {\n}\n",
+            "#[cfg", "(test)]\nmod b {\n    fn f() {}\n}\n",
+            "#[cfg", "(test)]\nmod c {\n}\n",
+        );
+        let blocks = module_blocks(source);
+        assert_eq!(blocks.len(), 3, "control: the fixture does not carry three gated modules");
+        assert_eq!(
+            closing_brace_lines_carry_no_source(source, &blocks),
+            Ok(3),
+            "the closing-line walk did not report one close per module"
+        );
+        // The mutation the crate-wide equality was blind to, written out: a
+        // walk that reads only the FIRST block must report 1, not 3. If this
+        // function ever returns `blocks.len()` again, these two disagree.
+        assert_eq!(
+            closing_brace_lines_carry_no_source(source, &blocks[..1]),
+            Ok(1),
+            "the closing-line walk reported the length of the whole file's block list rather \
+             than the number of closes it read, so the crate-wide equality it feeds is an \
+             identity and cannot fail"
+        );
+        assert_eq!(closing_brace_lines_carry_no_source(source, &[]), Ok(0));
     }
 
     /// Walk `region` -- a file from one of its cuts to EOF -- and require it
@@ -1648,6 +1764,15 @@ mod every_file_in_the_crate {
         // happened to reach. The round this rule was added to lost nine of the
         // crate's one hundred and sixty-one closing lines to a walk that
         // aborted before them, so the count is compared rather than assumed.
+        //
+        // This is now a real comparison. It was written as one and was not:
+        // `closing_brace_lines_carry_no_source` returned `Ok(blocks.len())`
+        // and `gates` was set to `blocks.len()` of the SAME vector, so both
+        // sides were one `Vec::len()` and no mutation could separate them --
+        // `for block in blocks.iter().take(1)` reported equality while reading
+        // one of `app.rs`'s five closes. The function now counts what it reads,
+        // and `the_closing_line_walk_returns_how_many_closes_it_actually_read`
+        // measures that directly.
         assert_eq!(
             closes_read, gates_seen,
             "control: {gates_seen} gated test modules were found across the crate but only \
@@ -1666,6 +1791,17 @@ mod every_file_in_the_crate {
         // three paths, and a fourth string added to it was the entire second
         // edit of a measured two-edit escape.
         interleaved.sort();
+        // The exported derivation the SECOND holder in `job_object.rs` reads is
+        // this same set. If the two ever diverge, that holder is checking
+        // something other than what this test found, and its literal stops
+        // being a second edit for anybody.
+        assert_eq!(
+            interleaved,
+            interleaved_files(),
+            "the interleaving set this sweep derived and the one `interleaved_files` exports \
+             for `job_object.rs` to check are different sets, so the second holder of this \
+             number is guarding something else"
+        );
         assert_eq!(
             interleaved.len(),
             INTERLEAVED_FILES,
@@ -1673,8 +1809,10 @@ mod every_file_in_the_crate {
              changed. Derived now: {interleaved:?}; pinned at {INTERLEAVED_FILES}. A file in \
              this set gets the tail rule and the closing-line rule but not the strict one, so \
              a `pub fn` planted between two of its test modules is not caught -- which is why \
-             joining the set costs an edit here, and a second one in `job_object.rs`, which \
-             pins this file's declaration of that number as text. If a file has newly joined, \
+             joining the set costs an edit here, and a SECOND one in `job_object.rs`, which \
+             derives the same set through `interleaved_files` and compares it against a \
+             literal of its own. Neither number is text the other file greps for; the round \
+             that tried that was beaten by a trailing comment. If a file has newly joined, \
              move its production above its test modules rather than moving this number. \
              Adding a TEST to a file in this set moves nothing and must stay that way: the \
              count of gated modules used to be pinned alongside this, it went red on ordinary \
@@ -1751,4 +1889,43 @@ mod every_file_in_the_crate {
             4 * live + gates_seen
         );
     }
+
+    /// **What still gets a `pub fn` below a cut, where, and at what price.**
+    ///
+    /// Written down rather than implied, because every round in this area has
+    /// been lost to a cost that was claimed and not measured.
+    ///
+    /// * **Three edits, any of the fifty-eight non-interleaving files.** Append
+    ///   `pub fn shipped(..) {..}` and a decoy `#[cfg(test)] mod d {}` to a file
+    ///   (edit one); move [`INTERLEAVED_FILES`] here from 3 to 4 (edit two);
+    ///   move `job_object`'s own copy from 3 to 4 (edit three, second file).
+    ///   The decoy makes the file interleave, so only the tail rule and the
+    ///   closing-line rule apply and the `pub fn` above the decoy is read by
+    ///   nothing. Two edits bought this before -- the outside "pin" was a
+    ///   `contains` a trailing comment satisfied, so the second file was free.
+    ///
+    ///   The count is still ONLY a cost, not a refusal: an attacker willing to
+    ///   spend three edits gets through. Closing it properly needs the
+    ///   interleaving set to be self-declaring -- each interleaving file
+    ///   carrying a marker in its own header, so a file cannot join the set at
+    ///   all without an edit in the file being attacked. That costs an edit in
+    ///   three files outside this module and was out of scope for this round.
+    ///
+    /// * **One edit, `app.rs`, `theme.rs`, `injector/sequence.rs`.** These
+    ///   three interleave legitimately, so the strict rule is not available for
+    ///   them: a `pub fn` written at file scope BETWEEN two of their gated
+    ///   modules is ordinary mid-file production as far as this walk is
+    ///   concerned. The region is roughly 4,343 lines -- `app.rs` 664..2557,
+    ///   `theme.rs` 1707..3005, `injector/sequence.rs` 839..1991. (An earlier
+    ///   note put this at "~5,300"; that was overstated.) The tail of those
+    ///   files, and the closing LINE of every one of their modules, are held.
+    ///   The byte-identical shape in a non-interleaved file is KILLED.
+    ///
+    /// * **Nothing below one edit.** Every whole-file shape measured shipping
+    ///   out of this crate -- column-0 append, attribute-shared line,
+    ///   closing-brace line on any module, and the balanced indented close --
+    ///   is refused in every file that has a cut, and the refusals are driven
+    ///   over every such file's real bytes above.
+    #[allow(dead_code)]
+    const HONEST_BOUNDARY: () = ();
 }

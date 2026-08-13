@@ -494,6 +494,89 @@ pub(crate) mod spawn_probe {
 mod tests {
     use super::*;
 
+    /// **How many files in this crate carry production code BELOW their first
+    /// gated test module.**
+    ///
+    /// # Why this number lives HERE and not where it is used
+    ///
+    /// `below_cut.rs` derives the interleaving set from the tree and compares
+    /// its SIZE against this constant. A payload plus a decoy gated module
+    /// appended to any of the fifty-eight files that do not interleave makes
+    /// that file join the set, so the escape needs this number moved as well.
+    ///
+    /// The previous round kept the literal in `below_cut.rs` and "pinned" it
+    /// from this file with
+    /// `source.contains("const INTERLEAVED_FILES: usize = 3;")`. That is not a
+    /// pin. `contains` is satisfied by the text appearing ANYWHERE in the file,
+    /// including in a comment, so the attacker rewrote the one line as
+    ///
+    /// ```text
+    /// const INTERLEAVED_FILES: usize = 4; // was: const INTERLEAVED_FILES: usize = 3;
+    /// ```
+    ///
+    /// -- one line, one file, the pinned text still present, this test still
+    /// green. Measured: that mutation plus a `pub fn` and a decoy gated module
+    /// appended to `vault_cache.rs` SURVIVED the whole suite in debug AND
+    /// release at 2249 lib / 217 bin / 6 ignored / 0 failed / 0 warnings, with
+    /// three occurrences of the planted symbol in the lib's DEBUG LLVM IR. It
+    /// shipped. That was the EIGHTH text-pin loss in this repository:
+    /// rewording, reformatting, a second occurrence, whitespace, a single
+    /// space, field-init shorthand, and now a trailing comment carrying the
+    /// pinned text.
+    ///
+    /// So the number is no longer text that another file looks for. It is a
+    /// `const` that `below_cut.rs` IMPORTS. A comment cannot satisfy an import:
+    /// the coupling is the compiler's, the value is read rather than matched,
+    /// and there is exactly one declaration of it in the crate because a second
+    /// one would be a second item and not a second occurrence of a string.
+    ///
+    /// # This number is INDEPENDENT of the one in `below_cut.rs`
+    ///
+    /// Nothing is imported in either direction. `below_cut.rs` declares its own
+    /// literal and compares the set it derived against that; the test below
+    /// derives the set again -- through `below_cut`'s exported
+    /// `interleaved_files`, so it is the same derivation and not a second
+    /// implementation -- and compares it against THIS literal. Two holders, two
+    /// numbers, one in each file. Widening the set therefore costs an edit in
+    /// each, on top of the payload: three edits in two files, and neither of
+    /// the two guard edits is a string the other file greps for.
+    ///
+    /// It does not red on ordinary work. This number moves only when a file
+    /// starts carrying production code below its first gated test module.
+    /// Adding a test does not do that, and neither does adding a new source
+    /// file -- which is what killed the deleted `INTERLEAVED_GATES`, whose
+    /// remedy for ordinary test-writing was byte-for-byte the mutant's edit.
+    const INTERLEAVED_FILES: usize = 3;
+
+    /// **The second holder of the interleaving count.**
+    ///
+    /// See [`INTERLEAVED_FILES`] above, and
+    /// `below_cut::every_file_in_the_crate::INTERLEAVED_FILES` for what
+    /// membership of this set costs an attacker and what it stops costing him.
+    #[test]
+    fn the_interleaving_set_is_still_three_files() {
+        let derived = crate::below_cut::every_file_in_the_crate::interleaved_files();
+        assert_eq!(
+            derived.len(),
+            INTERLEAVED_FILES,
+            "the number of files carrying production code BELOW their first gated test module \
+             has changed. Derived now: {derived:?}; this file pins {INTERLEAVED_FILES}. A file \
+             in that set is walked only by the tail rule and the closing-line rule, never by \
+             the strict one, so a `pub fn` planted between two of its test modules is not \
+             caught -- and a payload plus a decoy gated module appended to any of the other \
+             fifty-eight files puts that file in the set. Move the production above the test \
+             modules rather than moving this number. If it must move, it moves HERE and in \
+             `below_cut.rs`, which holds its own copy: that is the whole of what the count \
+             buys."
+        );
+        assert!(
+            derived.iter().all(|f| f.ends_with(".rs")),
+            "control: {derived:?} does not look like a list of source files, so the derivation \
+             this test reads has stopped returning one and the count above is a count of \
+             nothing"
+        );
+    }
+
     /// `spawn_in_job` must keep the child windowless as well as suspended.
     ///
     /// The two flags are independent bits, and the bug this guards was
@@ -1642,20 +1725,19 @@ mod tests {
             // `app.rs`'s five gated modules SURVIVED the whole suite in both
             // profiles and shipped three times over in the debug LLVM IR.
             "fn closing_brace_lines_carry_no_source(",
-            // THE PIN THAT COSTS THE SECOND EDIT. The set of files carrying
-            // production below their first test module is derived, and its
-            // SIZE is compared against this literal. It is pinned from HERE
-            // because a pin inside `below_cut.rs` costs nothing: the previous
-            // round's two integers were declared on two lines but consumed on
-            // one, and a payload plus that ONE line -- rewritten
-            // `(INTERLEAVED_FILES + 1, INTERLEAVED_GATES + 2)` -- was measured
-            // surviving the whole suite at 2248 lib / 0 failed / 0 warnings and
-            // shipping. Widening that set now means editing this file too. If
-            // a file legitimately starts interleaving, move its production
-            // above its test modules; if that is truly impossible, the number
-            // moves in two files and the second edit is this one, in a test
-            // that says out loud what is being widened.
-            "const INTERLEAVED_FILES: usize = 3;",
+            // NOTE: the interleaving count is deliberately NOT pinned here as
+            // text any more. It was --
+            // `contains("const INTERLEAVED_FILES: usize = 3;")` -- and
+            // `contains` is satisfied by the same text in a trailing comment,
+            // so `const INTERLEAVED_FILES: usize = 4; // was: const
+            // INTERLEAVED_FILES: usize = 3;` moved the number, satisfied the
+            // pin, and left this test green. That was the eighth text-pin loss
+            // in this repository. The count is now held by
+            // `the_interleaving_set_is_still_three_files` above, which derives
+            // the set itself and compares it against a literal of its own; no
+            // comment can satisfy a second derivation, and the call into
+            // `below_cut::every_file_in_the_crate::interleaved_files` is
+            // checked by the compiler rather than by a substring search.
         ] {
             assert!(
                 source.contains(needle),
