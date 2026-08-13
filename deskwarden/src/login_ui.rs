@@ -6069,180 +6069,6 @@ pub(crate) mod password_lifetime_tests {
                 && dir.join("refs").is_dir())
     }
 
-    /// The two directories the FALLBACK walk does not descend, named
-    /// literally: `<root>/target` and `<root>/deskwarden/target`.
-    ///
-    /// **This is not a content rule and it is deliberately not one.** Its
-    /// predecessor, `is_source_text` -- "scan a file only if its bytes are
-    /// valid UTF-8" -- was an exclusion wearing a byte test's clothes, and
-    /// it was wrong in both directions:
-    ///
-    /// * It **red-lined legitimate source.** Rewriting the tracked
-    ///   `deskwarden/installer/bootstrap-bw.ps1` as UTF-16LE with a BOM --
-    ///   content identical, still valid PowerShell, and exactly what
-    ///   Windows PowerShell 5.1's `>`, `Out-File` and `Set-Content
-    ///   -Encoding Unicode` produce by DEFAULT -- failed this scan in both
-    ///   configurations with a message about the probe. `.iss` is the same:
-    ///   Inno Setup's non-Unicode IDE writes Windows-1252. A routine
-    ///   regeneration of a tracked file turned the security suite red.
-    /// * It **hid a probe.** `docs/probe_notes.bak`, being the probe plus
-    ///   three trailing `\xff` bytes, survived in both configurations: not
-    ///   valid UTF-8, so never scanned, and its extension was not on the
-    ///   twelve-name `MUST_BE_TEXT` list that was supposed to make such a
-    ///   skip loud. Three appended bytes and any name off that list was a
-    ///   complete, silent evasion. The list was an exclusion after all.
-    ///
-    /// The resolution is that the scan **is a byte-window search and never
-    /// needed UTF-8 at all**: [`no_source_file_in_this_crate_contains_the_assembled_probe`]
-    /// now reads every listed file's bytes and looks for the probe's bytes
-    /// in them. UTF-16, Latin-1, a `.ttf`, the icon and the two built
-    /// installers are all scanned, so the five unscanned binary assets the
-    /// previous round disclosed as a cost are a cost no longer, and no
-    /// encoding accident can either fail the suite or take a file out of it.
-    ///
-    /// What that leaves is the one true positive-by-construction: a
-    /// compiled artifact of this crate **necessarily** carries the assembled
-    /// probe, because that is what compiling a `concat!` produces.
-    ///
-    /// **This predicate is applied by BOTH paths, and that is the fix this
-    /// round exists for.** The previous round applied it in the fallback
-    /// walk alone and justified the asymmetry by reasoning that
-    /// "`.gitignore` names both directories, so git never offers one here in
-    /// the first place". That is false. `.gitignore` governs `--others`; it
-    /// does not govern `git ls-files`. A force-added file under `target/` is
-    /// tracked, and the git path listed it. Measured on a `git archive`
-    /// export carrying a force-added `deskwarden/target/notes.rs`: the git
-    /// path FAILED naming the file (96 listed, 96 scanned, one hit) and the
-    /// fallback PASSED (95 listed, 95 scanned, no hit) -- opposite verdicts
-    /// on the same bytes, with the silent verdict belonging to the
-    /// configuration that ships, since `git archive` puts tracked files into
-    /// the tarball and a tarball has no `.git`. [`tracked_files`] now
-    /// applies these same two literal paths, and both configurations list 95
-    /// and scan 95 on that export.
-    ///
-    /// Stated plainly, because it is a weakness -- and it is now a symmetric
-    /// one rather than a divergence: this is a directory-level
-    /// exclusion in both paths, and moving a source file into
-    /// `deskwarden/target/` hides it there. It is not a marker and cannot be
-    /// asserted by adding a file, and it hides the file on the git path too
-    /// so the two configurations do not disagree about it -- the previous
-    /// round's `CACHEDIR.TAG` and
-    /// `.git` opt-outs both worked by writing one empty file into a
-    /// directory of someone else's choosing, and neither works here. It is
-    /// also not a widening of the old skip list: `.git/` and `.superpowers/`
-    /// are not on it.
-    ///
-    /// The cost of NOT having it, measured: the forced fallback listed
-    /// 29,865 files and read 6,178 of them, all of `deskwarden/target/`,
-    /// taking over two minutes -- and with the byte scan above it would
-    /// report this crate's own `.exe` as a violation of its own source.
-    ///
-    /// **It is a LIST, not a chain of `||`, and that is the pin.** As a
-    /// disjunction its negative space could only be held name by name, and a
-    /// six-name kept list holds six names: measured at `e7327f9`, a third
-    /// disjunct `|| dir == root.join("deskwarden").join("installer")` SURVIVED
-    /// the whole suite in BOTH configurations while silently deleting three
-    /// tracked sources -- `README.md`, `bootstrap-bw.ps1`, `deskwarden.iss` --
-    /// from the probe scan. Expressed as data the same mutation is a third
-    /// element of [`BUILD_OUTPUT_DIRS`], and the equality control over that
-    /// array fails on it whether or not the directory it names holds
-    /// anything. The behavioural half of the pin is in
-    /// [`no_source_file_in_this_crate_contains_the_assembled_probe`], which
-    /// asks this predicate about every directory above every file the REAL
-    /// listing returned.
-    ///
-    /// **Retargeting an element of this array is a SUITE failure, and the
-    /// counts recorded around it are per-test.** Three separate tests read
-    /// this tree back, and two of them --
-    /// `tracked_files_lists_what_this_repository_owns_and_nothing_else` and
-    /// `the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip`
-    /// -- enumerate it without consulting this array at all, so they answer
-    /// whether or not a probe is planted anywhere. Measured at `6893515` in
-    /// the fallback configuration with nothing planted: pointing element `[1]`
-    /// at `deskwarden/examples`, growing this test's local literals to match
-    /// and neutering the `.gitignore` check's assertion -- three edits -- came
-    /// back 2,221 passed / 2 failed, those two.
-    ///
-    /// The `.gitignore` check is now stated TWICE, in two independent
-    /// expressions bound to no name (see the reader in that test), so
-    /// neutering it is two edits rather than one and the per-test cost of the
-    /// retarget is four. **A green suite therefore costs at least six
-    /// coordinated edits in this file**, and any single test's "SURVIVED"
-    /// recorded elsewhere in this module is a statement about that test, not
-    /// about the suite. Both figures are lower bounds: neither has been shown
-    /// to SUFFICE, only that fewer cannot.
-    const BUILD_OUTPUT_DIRS: [&[&str]; 2] = [&["target"], &["deskwarden", "target"]];
-
-    /// True for exactly the directories named by [`BUILD_OUTPUT_DIRS`],
-    /// relative to `root`. Pure component-wise text: both sides are built
-    /// from the same `root`, so nothing here touches the filesystem.
-    fn build_output_dir(root: &std::path::Path, dir: &std::path::Path) -> bool {
-        BUILD_OUTPUT_DIRS
-            .iter()
-            .any(|rel| *dir == rel.iter().fold(root.to_path_buf(), |acc, c| acc.join(c)))
-    }
-
-    /// The fallback, used only when `git` cannot be run.
-    ///
-    /// Every file below `root` is listed and later scanned byte for byte,
-    /// binary assets included, with two exceptions and no content rule:
-    /// [`build_output_dir`], and `root`'s OWN `.git`. Unreadable directories
-    /// are skipped rather than panicked on; concurrent agents building
-    /// in-tree produce those.
-    ///
-    /// `root/.git` is skipped because it is not a NESTED repository, it is
-    /// this one. Measured on the real checkout with the fallback forced, the
-    /// bare-layout clause matched it and the scan refused three directories
-    /// -- the two live sibling worktrees under `.claude/worktrees/` and the
-    /// repository's own git directory -- which made the shipping
-    /// configuration red on every checkout by construction. The worktrees
-    /// are a genuine refusal and stay one; our own `.git` was never a
-    /// question.
-    ///
-    /// A nested repository shape is recorded into `refused` and left
-    /// unwalked, and that is **not** a quiet skip: the scan asserts `refused`
-    /// is empty and fails naming it. Without git this instrument cannot tell
-    /// whose bytes are inside such a directory. Walking in reports another
-    /// checkout's `login_ui.rs` as a violation of THIS tree; skipping it lets
-    /// one planted `.git` delete a subtree from the scan. Neither is an
-    /// answer, so the answer is to say so. That is what turns the planted
-    /// marker from a silent opt-out into a red suite -- and the git path now
-    /// says it the same way; see [`tracked_files`].
-    fn walk(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut Vec<std::path::PathBuf>,
-        refused: &mut Vec<std::path::PathBuf>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // Our OWN `.git`, whichever shape it has. This test used to be
-            // inside the `is_dir` arm, so in a LINKED WORKTREE -- where
-            // `root/.git` is a FILE holding a `gitdir:` line -- it did not
-            // fire and the file was pushed into `out` and scanned. Harmless
-            // in content, but the skip did not do what its comment said in
-            // that layout, and the layout is one two live checkouts of this
-            // repository are in.
-            if path == root.join(".git") {
-                continue;
-            }
-            if path.is_dir() {
-                if build_output_dir(root, &path) {
-                    continue;
-                }
-                if nested_repository_shape(&path) {
-                    refused.push(path);
-                    continue;
-                }
-                walk(root, &path, out, refused);
-            } else {
-                out.push(path);
-            }
-        }
-    }
 
     /// The files this repository OWNS, as absolute paths, or `None` if
     /// `git` could not be run or reported failure.
@@ -6342,89 +6168,23 @@ pub(crate) mod password_lifetime_tests {
             // there, the answer is to REFUSE and say so, not to drop the
             // file in silence.
             //
-            // This paragraph used to say a tracked path passes through NO
-            // directory filter here at all. That stopped being true fifty
-            // lines below, in the same `for` body, and the sentence was
-            // left standing above the change that falsified it -- the same
-            // failure mode as the `.gitignore` justification this round
-            // deleted, a comment outliving the code it described. The
-            // filter a tracked path DOES pass through is the literal build
-            // output one, and only that one:
-            //
-            // **Build output IS this filter's business, on tracked entries
-            // too.** The previous round asserted the opposite -- ".gitignore
-            // names both `target/` directories, so git never offers one here
-            // in the first place" -- and that was reasoned, not measured,
-            // and it is false: `.gitignore` governs `--others`, not `git
-            // ls-files`. A force-added file under `target/` is TRACKED and
-            // IS listed. Measured on a `git archive` export with
-            // `deskwarden/target/notes.rs` force-added: the git path listed
-            // 96, scanned 96 and FAILED naming it, while the fallback --
-            // which is the release-tarball configuration, and which
-            // `git archive` ships that same file into -- listed 95, scanned
-            // 95 and passed. The two paths returned OPPOSITE verdicts on
-            // identical bytes, with the silent one shipping.
-            //
-            // So the two literal paths are applied here as well, and the
-            // configurations agree again. That direction was chosen over
-            // dropping the fallback's exclusion because the fallback cannot
-            // read `.gitignore` and has no other way to know: without the
-            // exclusion the forced fallback listed 29,865 files, read 6,178,
-            // took over two minutes, and reported this crate's own `.exe` as
-            // a violation of its own source. The cost of this direction is
-            // stated plainly in [`build_output_dir`]: a source file MOVED
-            // into `target/` is hidden, now genuinely in both configurations
-            // rather than in one of them.
-            //
-            // **What this does NOT make identical, disclosed rather than
-            // implied.** `.gitignore`'s `target/` is UNANCHORED, so on the
-            // git path it takes out a directory named `target` at ANY depth,
-            // while this predicate is two literal paths. Measured on the
-            // export: a probe in `docs/target/notes.rs` is GREEN on the git
-            // path (95 listed) and RED in the fallback (96 listed, one hit).
-            // The same holds for every other gitignored name -- `.vscode/`,
-            // `.idea/`, `*.pdb`, `**/*.rs.bk`, `/.superpowers/`. That
-            // residual divergence runs the OTHER way from the one fixed
-            // above: the fallback, which is the configuration that ships, is
-            // the LOUDER of the two, so no file is silently green in the
-            // shipping configuration because of it. It is left rather than
-            // closed because closing it means reimplementing `.gitignore`,
-            // which is the sniffing this test has spent three rounds
-            // deleting. It is a latent red, not a latent miss.
+            // This paragraph used to describe a second filter here, the
+            // literal build output one. It is gone. A tracked path now passes
+            // through NO directory filter at all, and an untracked one
+            // through the repository-shape test only. Build output is out of
+            // scope because it is gitignored and therefore untracked, so
+            // `--others --exclude-standard` never offers it -- there is no
+            // list of directory names in this file left to widen. A file
+            // FORCE-ADDED under `target/` is tracked and IS listed and
+            // scanned; that is the loud direction, and it is the intended
+            // one.
             //
             // Also disclosed, and not fixed here: a nested clone COMMITTED
             // as a gitlink is listed by `git ls-files` as one tracked entry
             // that is not a file, so the `is_file` guard above drops it and
-            // its whole working tree is out of scope on the git path, while
-            // the fallback refuses it and fails. Measured. This repository
-            // has no submodules, so the pin for it would have to be built
-            // rather than observed; it belongs with the shape pin below.
-            //
-            // **Order matters, and it is REFUSE-before-SKIP.** The build
-            // output test used to run first, so an untracked entry under a
-            // nested repository that happened to sit below `target/` was
-            // `continue`d in silence instead of being pushed into
-            // `refused`. That is unreachable today -- `--others
-            // --exclude-standard` obeys `.gitignore`, which names both
-            // `target/` directories, so nothing untracked is ever offered
-            // from under one -- but it is a NEW silent skip inside a fix
-            // whose entire stated purpose is that skips must be loud, and
-            // "unreachable" is what the `.gitignore` justification deleted
-            // above also claimed. The loud answer goes first; the quiet one
-            // only sees what the loud one had nothing to say about.
-            //
-            // Both halves of that are now pinned rather than argued. The
-            // ordering itself is measured in
-            // `tracked_files_refuses_a_nested_repository_before_it_skips_build_output`,
-            // which builds the distinguishing state -- a bare repository shape
-            // at `target/nest/`, untracked -- in a repository whose
-            // `.gitignore` does NOT name `target/`; the two orderings give
-            // opposite answers there. The unreachability is pinned in
-            // `the_gitignore_line_the_ordering_argument_rests_on`, because it
-            // rests entirely on `.gitignore:3` and nothing else held that
-            // line. And the consequence is a NEW failure mode rather than a
-            // no-op: with this ordering a nested checkout under a build output
-            // directory REDS the scan instead of being ignored.
+            // its whole working tree is out of scope. Measured. This
+            // repository has no submodules, so the pin for it would have to
+            // be built rather than observed.
             if !is_tracked {
                 if let Some(nested) = path
                     .ancestors()
@@ -6437,14 +6197,6 @@ pub(crate) mod password_lifetime_tests {
                     }
                     continue;
                 }
-            }
-            if path
-                .ancestors()
-                .skip(1)
-                .take_while(|a| *a != root)
-                .any(|a| build_output_dir(root, a))
-            {
-                continue;
             }
             listed.push(path);
         }
@@ -6461,8 +6213,8 @@ pub(crate) mod password_lifetime_tests {
         (!listed.is_empty()).then_some(listed)
     }
 
-    /// **The pin on [`nested_repository_shape`], [`build_output_dir`] and the
-    /// fallback [`walk`], which nothing else can reach.**
+    /// **The pin on [`nested_repository_shape`], which nothing else can
+    /// reach.**
     ///
     /// The shapes that predicate refuses only ever occur in someone's working
     /// directory: a nested clone, a sibling worktree, a bare repository. None
@@ -6483,19 +6235,16 @@ pub(crate) mod password_lifetime_tests {
     ///   miniature: a probe-bearing source file with a tag planted in its own
     ///   directory is still walked to. On the old predicate this file was
     ///   invisible;
-    /// * the walk reaches build output under a name that is not `target`,
-    ///   and both files in it are listed and would be scanned -- the byte
-    ///   search has no encoding rule to be evaded by, and Cargo's own
-    ///   `target/`, which `.gitignore` takes out on the git path, is named
-    ///   literally by [`build_output_dir`] rather than sniffed;
     /// * an EMPTY `.git`, of either kind, hides nothing -- the C1 mutation
-    ///   in miniature;
+    ///   in miniature. Cargo build output needs no clause here at all: it is
+    ///   gitignored, so git never offers it and no predicate of ours decides
+    ///   anything about it;
     /// * a nested repository is REFUSED rather than skipped -- it comes back
     ///   in `refused`, which the scan turns into a failure. A `.git` planted
     ///   inside `src/` therefore reds the suite instead of deleting a
     ///   subtree, in the configuration that ships.
     #[test]
-    fn the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip() {
+    fn the_nested_repository_shape_predicate_recognises_repositories_and_nothing_else() {
         // This test writes the assembled probe to disk and reads it back, and
         // it never arms. Same reason as the scan above.
         hold_the_probe_lock();
@@ -6560,23 +6309,21 @@ pub(crate) mod password_lifetime_tests {
         // The C2 mutation in miniature: a probe-bearing source file with a
         // tag planted in its own directory. Under the old predicate this
         // whole directory left the scan.
-        let hidden = plant(&root, "src/vault_window/sidebar.rs");
+        let _ = plant(&root, "src/vault_window/sidebar.rs");
         std::fs::write(root.join("src/vault_window/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172")
             .expect("writable");
-        let hidden_tag = root.join("src/vault_window/CACHEDIR.TAG");
 
         // The C1 mutation in miniature, and the reason `.exists()` is gone:
         // an EMPTY `.git` directory is not a repository. On the old
         // predicate `mkdir docs/scratch/.git` -- one command, no content --
         // deleted this file from the scan on the GIT path with the suite
         // full green. It must be walked to.
-        let empty_marker = plant(&root, "docs/scratch/notes.md");
+        let _ = plant(&root, "docs/scratch/notes.md");
         std::fs::create_dir_all(root.join("docs/scratch/.git")).expect("creatable");
         // And the same forgery in its file form: `touch .git` also passed
         // `.exists()`. A worktree's `.git` says `gitdir:`; this one does not.
-        let touched_marker = plant(&root, "docs/touched/notes.md");
+        let _ = plant(&root, "docs/touched/notes.md");
         std::fs::write(root.join("docs/touched/.git"), b"").expect("writable");
-        let touched_forgery = root.join("docs/touched/.git");
 
         // `root`'s OWN git directory, in the bare layout the third clause
         // matches. It is not a NESTED repository, it is this one, and
@@ -6601,9 +6348,9 @@ pub(crate) mod password_lifetime_tests {
 
         // And one ordinary file, which is the control: a walk that refuses
         // everything satisfies the assertions above and measures nothing.
-        let ordinary = plant(&root, "docs/notes.md");
+        let _ = plant(&root, "docs/notes.md");
         std::fs::create_dir_all(root.join("docs/nested")).expect("creatable");
-        let ordinary_deep = plant(&root, "docs/nested/more.md");
+        let _ = plant(&root, "docs/nested/more.md");
 
         for shape in ["nested_clone", "nested_worktree", "nested_bare"] {
             assert!(
@@ -6641,117 +6388,6 @@ pub(crate) mod password_lifetime_tests {
         assert!(
             !bytes.is_empty(),
             "control: the artifact fixture is empty, so nothing below is about build output"
-        );
-
-        assert!(
-            build_output_dir(&root, &root.join("target")),
-            "control: the fallback descended Cargo's build directory. Every artifact of this \
-             crate carries the assembled probe by construction, so the byte scan reports this \
-             crate's own `.exe` as a violation of its own source -- and reads 6,178 files \
-             getting there"
-        );
-        assert!(
-            build_output_dir(&root, &root.join("deskwarden").join("target")),
-            "control: the SECOND literal of the disjunction is gone. On a workspace checkout \
-             this crate's artifacts land in `deskwarden/target/`, not in `root/target/`, so \
-             deleting this term is what the measurements above were actually taken against"
-        );
-        // `docs/target` is the one that catches a NAME match. Measured: with
-        // the predicate rewritten to `dir.file_name() == Some("target")` the
-        // whole suite stayed green without it -- and a name match is exactly
-        // the directory-level opt-out this module removed, `mkdir target`
-        // anywhere in the tree deleting a subtree from the scan.
-        for kept in ["buildout", "src", "docs", "docs/target", "deskwarden", "deskwarden/targeted"]
-        {
-            assert!(
-                !build_output_dir(&root, &root.join(kept)),
-                "control: `{kept}` was taken for Cargo build output, so the exclusion above is \
-                 satisfied by one that excludes everything. It is two literal paths and must \
-                 stay two: the moment it becomes a name match, `mkdir target` anywhere in the \
-                 tree is the directory-level opt-out this round removed"
-            );
-        }
-
-        // **The closure over the exclusion, as opposed to the enumeration
-        // above.** The six kept names hold six names and nothing else:
-        // measured at `e7327f9`, a third term naming `deskwarden/installer`
-        // -- three TRACKED sources -- satisfied every assertion in this test,
-        // the whole set equality below, and both positive controls, in both
-        // configurations. This says what the exclusion IS rather than a few
-        // things it is not, and does not need to be guessed at by name.
-        //
-        // **What it does and does not catch, measured at `0cd9fe0` rather
-        // than asserted.** The previous round's summary said a third entry
-        // "fails HERE by construction". It does not reach here: a third entry
-        // is a type error at the comparison -- `error[E0277]: can't compare
-        // [&[&str]; 3] with [&[&str]; 2]` -- and the crate does not build, so
-        // this assertion never runs. What fails HERE, at runtime, is a
-        // SAME-ARITY edit: the second entry retargeted to
-        // `deskwarden/installer` compiles fine and dies with three failing
-        // tests in both configurations; so do a reordering, and so does
-        // `&["deskwarden/target"]` written as one component. The conclusion
-        // survives the correction, but the mechanism is value comparison plus
-        // the structural control below, not an arity check.
-        //
-        // **And this equality is a RESTATEMENT of the const, not an observer
-        // of it.** A widening that edits both -- which is what the edit
-        // actually looks like when someone means it -- passes this line
-        // untouched: measured, a third entry naming `.github` with this
-        // literal grown to match is KILLED by the probe scan's structural
-        // control alone and by nothing here. Loosening this to
-        // `BUILD_OUTPUT_DIRS.len() == 2` is therefore a survivor, and the
-        // only mutants it loses are the reordering and the one-component
-        // spelling, both of which are behaviourally IDENTICAL to the
-        // original. The behavioural half is held below, not here.
-        assert_eq!(
-            BUILD_OUTPUT_DIRS,
-            [&["target"][..], &["deskwarden", "target"][..]],
-            "control: the set of directories excluded from the scan is no longer exactly the \
-             two build directories. Every name added here is a directory deleted from the \
-             probe scan in BOTH configurations with nothing else in this suite able to \
-             notice -- which is precisely how a third term naming `deskwarden/installer`, \
-             holding three tracked sources, survived a full mutation round"
-        );
-
-        let mut found = Vec::new();
-        let mut refused = Vec::new();
-        walk(&root, &root, &mut found, &mut refused);
-        assert_eq!(
-            found.iter().collect::<std::collections::BTreeSet<_>>(),
-            [
-                &ordinary,
-                &ordinary_deep,
-                &hidden,
-                &hidden_tag,
-                &tag,
-                &artifact,
-                &depfile,
-                &empty_marker,
-                &touched_marker,
-                &touched_forgery,
-            ]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-            "the fallback walk did not reach exactly the files outside the nested \
-             repositories, Cargo's build directory and this tree's own `.git`. `sidebar.rs` \
-             missing from the left is the C2 finding: a planted `CACHEDIR.TAG` deleted a \
-             probe-bearing tracked source file from the scan. `docs/scratch/notes.md` or \
-             `docs/touched/notes.md` missing is the C1 finding: an empty `.git` deleting a \
-             directory. A file under one of the three nested repositories appearing on the \
-             left is the another-checkout false positive; anything under `.git/` or `target/` \
-             appearing is this tree's own git objects or its own compiled probe"
-        );
-        assert_eq!(
-            refused.iter().collect::<std::collections::BTreeSet<_>>(),
-            [&root.join("nested_clone"), &root.join("nested_worktree"), &root.join("nested_bare")]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
-            "the walk did not hand back exactly the three nested repositories it declined to \
-             enter. The scan asserts this list is empty, so an entry missing from the left is a \
-             directory quietly dropped from the scan with nothing said about it -- which is the \
-             silent opt-out this round removes. `{root:?}/.git` appearing on the right is the \
-             other direction: this tree's OWN git directory matches the bare layout, and \
-             refusing it made the fallback red on every real checkout by construction"
         );
     }
 
@@ -6959,16 +6595,12 @@ pub(crate) mod password_lifetime_tests {
         // `.gitignore` names `target/` unanchored, exactly as this
         // repository's does, so `docs/target/` is ignored and `--others
         // --exclude-standard` would never offer this path. Force-adding it
-        // makes it TRACKED -- which is the production divergence in its real
-        // shape: git's unanchored rule takes a `target` at any depth out of
-        // `--others`, `build_output_dir` is two literal paths and takes
-        // neither this one nor a tracked path anywhere, and the two rules
-        // therefore disagree about this file. Tracked, it is offered to
-        // `tracked_files` and must survive the ancestor filter. Before this
-        // round the fixture ignored nothing at all, so this file was listed
-        // merely because nothing excluded it, and the comment claiming it
-        // demonstrated the `.gitignore` divergence described a mechanism the
-        // fixture did not have.
+        // makes it TRACKED -- and a tracked path is this repository's by
+        // git's own decision, so it is listed and scanned no matter what
+        // directory it sits in. That is the whole of the build-output story
+        // now: gitignored means untracked means never offered, and
+        // force-added means tracked means scanned. There is no directory
+        // list anywhere in this file to disagree with git about it.
         let kept_depth = write("docs/target/notes.rs", "// a directory named `target`, not one");
         assert!(git(&root, &["add", "-f", "docs/target/notes.rs"]), "the depth control add ran");
 
@@ -7017,32 +6649,53 @@ pub(crate) mod password_lifetime_tests {
             rlib,
             kept_sibling.clone(),
             kept_depth.clone(),
+            forced_root.clone(),
+            forced_crate.clone(),
         ]
         .into_iter()
         .collect();
+        // **Force-added build output is TRACKED, and tracked is scanned.**
+        // This assertion used to run the other way: `tracked_files` carried
+        // two literal build-output paths and dropped these two, so that the
+        // git listing would agree with a directory walk that could not read
+        // `.gitignore`. The walk is gone and so are the literals, and with
+        // them the last directory-name list in this file. What is left is
+        // git's own answer and only that: `.gitignore` governs `--others`,
+        // not `git ls-files`, so a force-added path under `target/` is
+        // tracked, is listed, and is scanned.
+        //
+        // That is the LOUD direction, and it is the one worth having. The
+        // failure it produces is "this crate's own artifact carries the probe
+        // because compiling a `concat!` is what produces it" -- a false
+        // positive that names a file and tells you to un-force-add it. The
+        // direction it replaces was a SILENT one: a source file force-added
+        // under `target/` was invisible to the scan in both configurations.
         for forced in [&forced_root, &forced_crate] {
             assert!(
-                !listed.contains(forced),
-                "`tracked_files` listed {forced:?}, a TRACKED file under Cargo's build \
-                 directory. `.gitignore` names both `target/` directories but governs \
-                 `--others` only, so `git ls-files` offers this path and the git path scans \
-                 it -- while the fallback, which is the configuration a release tarball runs \
-                 in, never lists it. The two paths then disagree on identical bytes and the \
-                 quiet one is the one that ships. Deleting the ancestor test in \
-                 `tracked_files` is what puts it back."
+                listed.contains(forced),
+                "`tracked_files` did not list {forced:?}, a TRACKED file under Cargo's build \
+                 directory. Nothing in this crate is entitled to drop a tracked path: git has \
+                 already decided it is this repository's. A filter here that takes it out is a \
+                 directory-name list coming back, and a directory-name list is the surface six \
+                 rounds of this test were lost on. Gitignored build output never reaches this \
+                 function at all, because `--others --exclude-standard` does not offer it."
             );
         }
         assert!(
             listed.contains(&kept_depth),
-            "control: `tracked_files` dropped {kept_depth:?}. The two assertions above are              then satisfied by a predicate matching the NAME `target` at any depth instead of              the two literal paths, which is the one-command directory opt-out this module              spent three rounds removing -- `mkdir target` beside any file and it is gone."
+            "control: `tracked_files` dropped {kept_depth:?}, a tracked source file in a \
+             directory that merely happens to be NAMED `target`. Nothing in this function \
+             is entitled to drop a tracked path, and a name match would make `mkdir \
+             target` beside any file the one-command directory opt-out this module spent \
+             four rounds removing."
         );
         assert!(
             listed.contains(&kept_sibling),
-            "control: `tracked_files` dropped {kept_sibling:?}, which is a tracked source file \
-             beside `target/` and not under it. The two assertions above are then satisfied by \
-             a filter that drops tracked files wholesale, or by one matching the NAME `target` \
-             rather than the two literal paths -- and a name match makes `mkdir target` \
-             anywhere in the tree the one-command directory opt-out this module removed."
+            "control: `tracked_files` dropped {kept_sibling:?}, which is a tracked source \
+             file beside `target/` and not under it. This is then satisfied by a filter \
+             that drops tracked files wholesale, or by one matching the NAME `target` -- \
+             and a name match makes `mkdir target` anywhere in the tree the one-command \
+             directory opt-out this module removed."
         );
         assert_eq!(
             listed, expected,
@@ -7079,200 +6732,6 @@ pub(crate) mod password_lifetime_tests {
             "`tracked_files` answered `Some(..)` for a directory it listed nothing for. The \r
              scan takes that as the tree's file list and never reaches its fallback, so a \r
              tree it cannot enumerate is policed by scanning no files at all"
-        );
-    }
-
-    /// **The pin on REFUSE-before-SKIP, which nothing else in this module can
-    /// reach.**
-    ///
-    /// [`tracked_files`] runs the nested-repository test before the build
-    /// output test, and the commit that made that ordering explicit disclosed
-    /// it as unpinned AND unreachable. Unpinned it certainly was: restoring
-    /// SKIP-before-REFUSE was measured SURVIVED across the whole suite in both
-    /// configurations. Unreachable it is only because of one line of this
-    /// repository's `.gitignore` -- see
-    /// [`the_gitignore_line_the_ordering_argument_rests_on`] -- and
-    /// "unreachable" is exactly what the justification the same commit deleted
-    /// also claimed.
-    ///
-    /// The distinguishing state is four files: a BARE repository shape at
-    /// `target/nest/`, untracked. `--others --exclude-standard` offers those
-    /// paths, every one of them has both a nested repository and a build
-    /// output directory above it, and the two orderings answer differently:
-    ///
-    /// * shipped: the shape is recorded in `refused`, and the scan turns a
-    ///   non-empty `refused` into a FAILURE naming it;
-    /// * old: the build output ancestor matched first and every path was
-    ///   `continue`d in silence, `refused` came back empty, green.
-    ///
-    /// **This needs its own repository, and the reason is the finding.** The
-    /// fixture above names `target/` in its `.gitignore` because this
-    /// repository does, and that line is precisely what makes this state
-    /// unreachable -- git never offers an untracked path from under `target/`.
-    /// The two fixtures differ on exactly the line the unreachability argument
-    /// rests on, which is the cleanest available statement of what that
-    /// argument is worth.
-    ///
-    /// **Second-order effect, stated rather than implied.** Under the shipped
-    /// ordering a nested checkout that happens to sit under a build output
-    /// directory now REDS the scan instead of being ignored. That is correct
-    /// by this module's thesis -- a skip must be loud -- but it is a new
-    /// failure mode, not a no-op: `git clone` into `target/scratch/` in a tree
-    /// whose `.gitignore` did not name `target/` would fail this suite.
-    #[test]
-    fn tracked_files_refuses_a_nested_repository_before_it_skips_build_output() {
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
-        fn git(root: &std::path::Path, args: &[&str]) -> bool {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .is_ok_and(|o| o.status.success())
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "deskwarden-order-pin-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _scratch = Scratch(root.clone());
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("the scratch directory is creatable");
-        assert!(
-            git(&root, &["init", "-q", "."]),
-            "`git init` failed in a fresh temporary directory. Without git this test measures \
-             nothing at all and reports `ok`, which is the silent pass this module exists to \
-             prevent"
-        );
-
-        // **No `target/` in this `.gitignore`, and that is the whole point.**
-        // With it, `--others --exclude-standard` never offers a path from
-        // under `target/`, the ordering below is unreachable, and this test
-        // goes inert -- which is the state this repository is really in and
-        // the reason the ordering was shipped unpinned.
-        std::fs::write(root.join(".gitignore"), "ignored_scratch/\n").expect("writable");
-        std::fs::create_dir_all(root.join("src")).expect("creatable");
-        std::fs::write(root.join("src/committed.rs"), "// committed").expect("writable");
-        assert!(git(&root, &["add", ".gitignore", "src/committed.rs"]), "the add ran");
-        assert!(
-            git(&root, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"]),
-            "the commit ran"
-        );
-
-        // A bare repository shape UNDER a build output directory, untracked.
-        let nest = root.join("target").join("nest");
-        std::fs::create_dir_all(nest.join("objects")).expect("creatable");
-        std::fs::create_dir_all(nest.join("refs")).expect("creatable");
-        std::fs::write(nest.join("HEAD"), "ref: refs/heads/main").expect("writable");
-        std::fs::write(nest.join("objects/loose"), "// not our bytes").expect("writable");
-
-        // Controls on the STATE, before the ordering is read off it. If the
-        // plant stops being a repository shape, or stops being under a build
-        // output directory, or git stops offering it, the two orderings agree
-        // and the assertion below passes for neither of them.
-        assert!(
-            nested_repository_shape(&nest),
-            "control: the plant at {nest:?} is not a nested repository shape, so the REFUSE arm \
-             has nothing to refuse and both orderings `continue` alike"
-        );
-        assert!(
-            build_output_dir(&root, &root.join("target")),
-            "control: `target/` is not a build output directory here, so the SKIP arm has \
-             nothing to skip and both orderings refuse alike"
-        );
-        // And the third condition, which is the one this fixture exists to
-        // arrange and which the ownership fixture deliberately does NOT have:
-        // git must OFFER the plant. Measured rather than assumed, because the
-        // whole production unreachability argument is this one answer coming
-        // out the other way on the real tree.
-        assert!(
-            !git(&root, &["check-ignore", "-q", "target/nest/HEAD"]),
-            "control: this fixture's `.gitignore` ignores `target/`, so `--others \
-             --exclude-standard` never offers the plant, both orderings `continue` alike and \
-             this test is inert -- which is exactly the state the real repository is in and \
-             the reason the ordering shipped unpinned"
-        );
-
-        let mut refused: Vec<std::path::PathBuf> = Vec::new();
-        let listed: std::collections::BTreeSet<std::path::PathBuf> =
-            tracked_files(&root, &mut refused)
-                .expect("the listing is not empty")
-                .into_iter()
-                .collect();
-        assert_eq!(
-            refused,
-            [nest.clone()],
-            "`tracked_files` did not refuse the nested repository under `target/`. An EMPTY \
-             list is SKIP-before-REFUSE: the build output ancestor matched first and four \
-             untracked files belonging to another repository were dropped with nothing said \
-             about them, inside a change whose entire stated purpose is that a skip must be \
-             loud. The scan turns a non-empty `refused` into a failure naming the directory, \
-             which is the answer; `continue` is not."
-        );
-        assert!(
-            listed.contains(&root.join("src").join("committed.rs")),
-            "control: the ordinary tracked file is missing, so the assertion above is \
-             satisfied by a listing that refused or dropped everything"
-        );
-        assert!(
-            !listed.iter().any(|p| p.starts_with(&nest)),
-            "`tracked_files` listed a file from inside the nested repository under `target/`. \
-             Refusing it and then listing it anyway reports another checkout's bytes as this \
-             tree's, which is the false positive the git bound exists to remove"
-        );
-    }
-
-    /// **The one line the ordering argument above rests on.**
-    ///
-    /// `tracked_files` documents its REFUSE-before-SKIP ordering as
-    /// unreachable in production, and the whole of that claim is
-    /// `.gitignore`'s UNANCHORED `target/`: with it, `git ls-files --others
-    /// --exclude-standard` never offers a path from under either build output
-    /// directory, so no untracked entry ever has a build output ancestor.
-    /// Verified at `e7327f9`: `git check-ignore -v target/nest/HEAD` answers
-    /// `.gitignore:3:target/`, and `git ls-files --others --exclude-standard`
-    /// matches nothing under `target/`.
-    ///
-    /// Nothing pinned that line. Anchoring it to `/target/`, or deleting it in
-    /// favour of the `/deskwarden/target/` rule above it, silently makes the
-    /// state in [`tracked_files_refuses_a_nested_repository_before_it_skips_build_output`]
-    /// reachable on this tree -- and with the shipped ordering that is a RED
-    /// suite for anyone who clones something into `target/`, not a no-op. This
-    /// says so where the line lives.
-    ///
-    /// It reads `.gitignore` from the repository root rather than asking git,
-    /// so it holds in the fallback configuration -- a `git archive` export,
-    /// which ships that file -- exactly as it does on a checkout.
-    #[test]
-    fn the_gitignore_line_the_ordering_argument_rests_on() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the crate has a parent directory")
-            .to_path_buf();
-        let text = std::fs::read_to_string(root.join(".gitignore"))
-            .expect("this repository has a `.gitignore` at its root");
-        let lines: Vec<&str> = text.lines().map(str::trim).collect();
-        assert!(
-            lines.contains(&"target/"),
-            "`.gitignore` no longer carries an UNANCHORED `target/` line. That line is the \
-             entire reason `tracked_files` can call its REFUSE-before-SKIP ordering \
-             unreachable: without it `git ls-files --others --exclude-standard` offers \
-             untracked paths from under `target/`, and a nested checkout there REDS the probe \
-             scan rather than being ignored. Anchored (`/target/`) is not the same rule -- it \
-             stops covering a `target/` at any depth. Lines found: {lines:?}"
-        );
-        assert!(
-            lines.contains(&"/deskwarden/target/"),
-            "control: `.gitignore` no longer names the crate's own build directory, so the \
-             assertion above is satisfied by a file whose build-output rules have been \
-             rewritten wholesale. Lines found: {lines:?}"
         );
     }
 
@@ -7332,56 +6791,71 @@ pub(crate) mod password_lifetime_tests {
     /// * In a worktree `.git` is a **file**, not a directory, so the `is_dir`
     ///   skip did not fire on it and it was read rather than skipped.
     ///
-    /// **The fallback is not a corner case; it is what ships, and it is what
-    /// every isolated measurement of this repository runs.** If `git` cannot
-    /// be run, or is run and fails, the test falls back to the directory walk.
-    /// A `git archive` export has no `.git`, so `git -C <export> ls-files`
-    /// exits 128 and the fallback runs -- and this repository's standing
-    /// measurement protocol is an isolated `git archive` export for every
-    /// number. So is a release tarball, an unpacked source drop, and a
-    /// `cargo package` staging directory. The claim that the in-repo
-    /// `CARGO_TARGET_DIR`-under-another-name hazard "closes with" the git
-    /// bound was true only on a git checkout: measured at `c09140a`,
-    /// `mkdir buildout && <probe> > buildout/deskwarden.rlib` FAILED in a
-    /// plain export and passed in a `git init`-ed one. Four of that round's
-    /// reported kills mutated `tracked_files`, which a plain export never
-    /// runs, and were therefore inert in the configuration every number came
-    /// from.
+    /// **There is no fallback, and that is this round's change.** If `git`
+    /// cannot be run, or runs and reports failure, or lists nothing, this test
+    /// PANICS naming itself rather than falling back to a directory walk. The
+    /// walk is gone, and so are the four layers that existed to keep its
+    /// build-output exclusion honest: `BUILD_OUTPUT_DIRS`, `build_output_dir`,
+    /// the `.gitignore` reader and the two asserts over it.
     ///
-    /// The round after that one answered it by giving both paths the same
-    /// shape rule -- nested clone, nested worktree, nested bare repository,
-    /// and "a directory holding a `CACHEDIR.TAG`" as a stand-in for Cargo
-    /// build output under any name. **Both halves of that rule were wrong,
-    /// and both were measured wrong.**
+    /// The reason is measured rather than argued. That exclusion list was the
+    /// only surface this test ever lost on. Six rounds hardened it and six
+    /// mutations defeated it, each one the previous round's defect a level up
+    /// -- shared list, positional snapshot, `let`-bound closure, single
+    /// `.gitignore` binding -- and the last of them (`X7`, three edits, no
+    /// assert and no rendering touched) put a probe in a tracked directory and
+    /// went UNSEEN in debug and in release. Every one of those holes lived in
+    /// the GITLESS configuration, where nothing can second-guess a constant in
+    /// this file; on the git path the tracked-file controls killed all of them.
     ///
-    /// `CACHEDIR.TAG` does not mark build output. Cargo writes it only when
-    /// it creates the target directory itself: on cargo 1.96.0,
-    /// `CARGO_TARGET_DIR=<pre-existing dir> cargo test --no-run` produced 18
-    /// probe-bearing artifacts with no tag above any of them, and copying one
-    /// into `<export>/buildout/debug/` FAILED this scan in **both**
-    /// configurations -- this tree's own source reported as carrying the
-    /// probe, an `.exe` named as the file. A CI-cache-restored `target/` and
-    /// a `cp -r`'d build directory behave the same way.
+    /// So the surface is deleted rather than defended. `git ls-files` reports
+    /// exactly what is tracked, `--others --exclude-standard` adds what is
+    /// present and not ignored, and build output -- gitignored by
+    /// `.gitignore:2` and `:3` -- is in neither. There is no list of directory
+    /// names left in this file to widen.
     ///
-    /// And a marker is a switch anyone can flip. With the probe in a
-    /// **tracked** `deskwarden/src/vault_window/sidebar.rs`, one empty
-    /// `deskwarden/src/vault_window/CACHEDIR.TAG` turned the fallback from
-    /// FAILED to `ok`; a planted `.git` beside it did the same. Suite green,
-    /// no control firing, an entire source subtree silently out of scope. It
-    /// did not hide `src/` itself only because `login_ui.rs` lives there and
-    /// the control below caught it -- an accident of layout.
+    /// **The new edit cost, measured rather than claimed.** There is no
+    /// directory list, but there is still one lever: a `git` invocation takes
+    /// arguments, and git argument syntax includes PATHSPECS. That lever is
+    /// named here rather than left to be found, and it is priced at THREE
+    /// coordinated edits because the file list is the union of three separately
+    /// written invocations -- `ls-files` plus `--others`, `ls-tree -r HEAD`, and
+    /// `ls-files --cached` -- each at its own call site, with a named
+    /// cross-check between the first two. Measured on an export with a real
+    /// probe in the tracked `deskwarden/examples/ui_preview.rs`: one edit
+    /// (a pathspec on `ls-files`) is KILLED and inert; two edits (that plus an
+    /// `ls-tree` rewritten to a positive pathspec, since `ls-tree` refuses
+    /// exclude magic) SURVIVED the whole suite with the probe unseen before the
+    /// third enumeration existed, and is KILLED with it. Three is a LOWER
+    /// BOUND: it says fewer cannot, not that three suffices.
     ///
-    /// So there is no directory-level opt-out any more, in either path.
+    /// **What that costs, disclosed rather than implied.** A `git archive`
+    /// export, a release tarball or a `cargo package` staging directory cannot
+    /// run this test at all -- it fails loudly there. That is a real
+    /// regression in reach and it is accepted: no `cargo package`, `cargo
+    /// publish`, `cargo vendor` or source-tarball step exists anywhere in this
+    /// repository, `.github/workflows/release.yml` is the only CI and uses
+    /// `actions/checkout@v5` with a real `.git`, and the release ships an
+    /// `.exe` and an installer rather than source. The gitless configuration
+    /// is a measurement convenience, and a measurement convenience is not
+    /// worth the one surface this test keeps losing on. Isolated measurement
+    /// is still available: export, then `git init && git add -A && git
+    /// commit`.
     ///
-    /// * Build output is out of scope because `.gitignore` names it, which
-    ///   is git's answer and not a guess. The round that replaced the marker
-    ///   with "scan a file only if its bytes are valid UTF-8" traded one
-    ///   forgeable exclusion for another: it red-lined a tracked `.ps1`
-    ///   regenerated as UTF-16LE by PowerShell's own defaults, and it let a
-    ///   probe-bearing file survive in both configurations behind three
-    ///   appended `ÿ` bytes and a name off a twelve-item extension list.
-    ///   The scan is a byte-window search and never needed UTF-8; see
-    ///   [`build_output_dir`], which is what the fallback names instead.
+    /// So there is no directory-level opt-out any more, and no directory-level
+    /// exclusion either.
+    ///
+    /// * Build output is out of scope because `.gitignore` names it and git
+    ///   therefore never offers it -- git's answer, not a guess, and not a
+    ///   literal path list in this file. A file FORCE-ADDED under `target/` is
+    ///   tracked and IS scanned; that direction is loud and it is intended.
+    ///   The round that instead replaced the marker with "scan a file only if
+    ///   its bytes are valid UTF-8" traded one forgeable exclusion for
+    ///   another: it red-lined a tracked `.ps1` regenerated as UTF-16LE by
+    ///   PowerShell's own defaults, and it let a probe-bearing file survive in
+    ///   both configurations behind three appended 0xff bytes and a name off
+    ///   a twelve-item extension list. The scan is a byte-window search and
+    ///   never needed UTF-8.
     /// * A tracked file passes through **no** filter at all. Git has already
     ///   decided it is this repository's; a marker planted next to it cannot
     ///   un-decide that.
@@ -7450,30 +6924,34 @@ pub(crate) mod password_lifetime_tests {
             .expect("the crate has a parent directory")
             .to_path_buf();
         let mut refused: Vec<std::path::PathBuf> = Vec::new();
-        let files = tracked_files(&root, &mut refused).unwrap_or_else(|| {
-            let mut files = Vec::new();
-            refused.clear();
-            walk(&root, &root, &mut files, &mut refused);
-            files
+        let mut files = tracked_files(&root, &mut refused).unwrap_or_else(|| {
+            panic!(
+                "the_probe_scan_requires_git: `git ls-files` could not enumerate {root:?}, so \
+                 the list of files this test polices could not be produced, and NOTHING was \
+                 scanned. There is deliberately no directory-walk fallback any more. A walk \
+                 needs an exclusion list for build output, and that list -- and the \
+                 `.gitignore` cross-check propping it up -- was the entire attack surface of \
+                 this test for six rounds: every defeat was a coordinated widening of it. \
+                 Deriving the list from git excludes build output BY CONSTRUCTION, because \
+                 build output is gitignored and therefore untracked, and leaves no directory \
+                 list in this file for a mutation to widen. The price is stated here rather \
+                 than paid silently: without git this property cannot be checked at all, and a \
+                 test that cannot check its property says so instead of quietly checking a \
+                 weaker one. Run the suite in a real checkout with `git` on `PATH`."
+            )
         });
-        // Neither path gets to guess. Whichever produced the list, a nested
-        // repository holding files this scan would otherwise have read is
-        // recorded rather than dropped, and recorded is a FAILURE. Walking
-        // into one reports another checkout's `login_ui.rs` as a violation
-        // of THIS tree; skipping it lets a planted `.git` delete a whole
-        // subtree from the scan. Neither is an answer, so this says so.
-        //
-        // This assertion used to be reachable from the fallback alone, and
-        // that was the hole: on the git path the same shapes silently
-        // dropped untracked files, which is the class the `--others` union
-        // exists for. See `tracked_files`.
+        // The listing does not get to guess. A nested repository holding
+        // files this scan would otherwise have read is recorded rather than
+        // dropped, and recorded is a FAILURE. Walking into one reports
+        // another checkout's `login_ui.rs` as a violation of THIS tree;
+        // skipping it lets a planted `.git` delete a whole subtree from the
+        // scan. Neither is an answer, so this says so. See `tracked_files`.
         assert!(
             refused.is_empty(),
             "{} nested repository shape(s) hold files this scan was asked to police and cannot \
              attribute, the first of them {:?}. On the git path these are UNTRACKED entries \
-             `git ls-files --others` did list; in the fallback -- a `git archive` export, a \
-             release tarball, any tree without a `.git` -- they are whole subtrees. Either way \
-             the bytes inside are not knowably this repository's, and the two available \
+             `git ls-files --others` did list, one directory entry standing for a whole \
+             working tree. The bytes inside are not knowably this repository's, and the two \
              guesses are both wrong in a way that has been measured. Remove the nested \
              repository, or commit what is under it so git can attribute it.",
             refused.len(),
@@ -7502,728 +6980,149 @@ pub(crate) mod password_lifetime_tests {
              name says the whole tree"
         );
 
-        // **The structural control on `build_output_dir`'s negative space.**
+        // **The second opinion, and it is git's own -- not a directory
+        // walk's, and not this file's.**
         //
-        // The unit test's kept list names six directories, so it holds six
-        // directories: measured at `e7327f9`, a third disjunct naming
-        // `deskwarden/installer` -- which holds three TRACKED sources --
-        // SURVIVED the entire suite in both configurations. Enumerating the
-        // names a reviewer happens to try cannot close that.
+        // Deleting the exclusion list removed the six-round attack surface,
+        // but it did not remove EVERY in-file lever over what gets scanned.
+        // One remains and it is named here rather than left to be found: the
+        // `git ls-files` invocation in `tracked_files` takes arguments, and
+        // git argument syntax includes PATHSPECS. A single edit --
+        // `.args(["ls-files", "-z", ":!deskwarden/examples"])` -- deletes a
+        // tracked directory from the listing while satisfying every control
+        // above, because the controls above are floors and a floor cannot
+        // see a subtraction that leaves ninety files behind.
         //
-        // **And the obvious closure does not work either, measured.** Asking
-        // the predicate about every ancestor of every file in `files` is
-        // VACUOUS for exactly this mutation: `files` is the listing AFTER the
-        // exclusion has been applied, so a directory the mutant excludes has
-        // already had its contents removed and its ancestors are never
-        // offered. Written that way this control let the `deskwarden/installer`
-        // term SURVIVE in both configurations -- it caught only terms naming a
-        // directory above a file that survives the filter, which is the parent
-        // case that was already held.
+        // So the listing is checked against a SECOND, independently spelled
+        // question put to git: `git ls-tree -r HEAD`, which enumerates the
+        // committed tree and takes its own arguments at its own call site.
+        // Every committed path that is present as a file must be in `files`.
+        // This is not a directory walk and it carries no exclusion list of
+        // any kind -- there is nothing here to widen, only two separate
+        // invocations to corrupt in lockstep. That is the honest new edit
+        // cost, stated as a lower bound and not as "impossible": a pathspec
+        // added to the producer alone is KILLED here; hiding a tracked
+        // directory needs the producer edited AND this cross-check defeated,
+        // and this cross-check is a named assert whose deletion is itself an
+        // edit.
         //
-        // So the directories are enumerated from the TREE, and the two
-        // literals are pruned by the list written HERE rather than by the
-        // predicate under test. Pruning with `build_output_dir` itself would
-        // be circular in the mutant's favour: the mutated term would prune the
-        // very directory it deletes and the walk would never report it. What
-        // this asserts is the closed statement -- over every directory this
-        // tree actually has, the set `build_output_dir` excludes is exactly
-        // the two literals.
-        //
-        // What it still does NOT close, and this is a genuine equivalent
-        // rather than a gap: a term naming a directory that does not exist
-        // here. `docs/vendored` was measured SURVIVED and is unobservable for
-        // the same reason T1 is -- nothing in any configuration can tell the
-        // difference. That half is held by the array equality over
-        // `BUILD_OUTPUT_DIRS`, which fails on a third element whether or not
-        // the directory it names exists.
-        //
-        // **And "pruned by the list written HERE" was one plausible edit from
-        // vacuous, which is what this round exists for.** Rewriting the prune
-        // below to `build_output_dir(root, &path)` -- the exact circularity
-        // the paragraph above warns against -- SURVIVED the whole suite in
-        // BOTH configurations at `0cd9fe0`, because with the prune intact it
-        // changes nothing: the predicate and the list agree. It is not a
-        // behavioural mutant on its own. It is a mutant that BLINDS this
-        // control, and measured on top of it:
-        //
-        // * a third `BUILD_OUTPUT_DIRS` entry naming `.github`, or
-        //   `.github/workflows`, SURVIVED in both configurations with nothing
-        //   firing -- and `.github/workflows/release.yml` is a TRACKED file
-        //   that silently stops being scanned. With the prune intact those
-        //   same two are KILLED in both configurations, by
-        //   `no_source_file_in_this_crate_contains_the_assembled_probe`
-        //   alone, one failing test. So the deletion IS observable and this
-        //   control was its SOLE observer.
-        // * the `deskwarden/installer` term was killed only by the
-        //   `ends_with("installer")` clause below -- a hardcoded NAME, the
-        //   same positional species this module keeps relapsing into -- and
-        //   deleting that clause is itself a survivor, so the three-edit
-        //   combination `build_output_dir` prune + dropped name clause +
-        //   `installer` term was green in both configurations.
-        //
-        // So the enumeration is no longer trusted on its own word. There are
-        // two of them: `directories` below, pruned by the literals written
-        // here, and `every_directory`, which takes **no predicate at all and
-        // prunes nothing** -- `target/` and the sibling worktrees included.
-        // The pruned set must equal the unpruned set minus exactly the two
-        // literals' subtrees and the subtrees of the repositories the pruned
-        // walk RECORDED. Nothing in `every_directory` can be widened, because
-        // there is nothing in it to widen; a prune that deletes a directory
-        // the tree really has now disagrees with a second enumeration that
-        // never consulted a predicate to begin with.
-        //
-        // Recording the refusals rather than dropping them is the other half,
-        // and it is what closes the second-order version: dropping
-        // `nested_repository_shape` from the prune was ALSO a survivor at
-        // `0cd9fe0` -- inert in a `git archive` export, which has no nested
-        // repositories, but live on the real checkout, where
-        // `.claude/worktrees/` holds two. Because the refusals are subtracted
-        // by the paths the pruned walk actually recorded, widening the prune
-        // without recording is now a set difference.
-        //
-        // Cost, measured on the real checkout: 2,083 directories in the
-        // unpruned enumeration, under two seconds, because it reads no file's
-        // bytes -- the two-minute figure elsewhere in this module is the cost
-        // of READING 6,178 files, not of listing directories.
-        // **And "pruned by the list written HERE" was itself the next
-        // circularity, measured.** The list below prunes the walk; before
-        // this round it was ALSO the subtrahend in the set equality's filter
-        // and in the `git ls-files` oracle's filter, so one edit to it moved
-        // all three together. Measured at `fb4bf7d` with a real probe planted
-        // in the TRACKED `deskwarden/examples/`: retargeting this list at
-        // `deskwarden/examples` and growing [`BUILD_OUTPUT_DIRS`] to match --
-        // two coordinated edits, both in this file -- was GREEN in both
-        // configurations, probe and all, with only `job_object`'s own
-        // unrelated listing firing. The oracle did not save it, because the
-        // oracle subtracted by this same list.
-        //
-        // **Those "GREEN" verdicts are per-TEST, and this ledger used to read
-        // as though they were per-SUITE. They were not, and the honest number
-        // is better than the one that was written here.** Every figure above
-        // is the verdict of one test, usually
-        // `no_source_file_in_this_crate_contains_the_assembled_probe`. Two
-        // other tests in this module read the same tree through enumerators
-        // that never consult `BUILD_OUTPUT_DIRS`, and they answer whether or
-        // not a probe is planted anywhere. Re-measured at `6893515` in the
-        // fallback configuration, with NO probe in the tree at all,
-        // retargeting [`BUILD_OUTPUT_DIRS`] and the literals below at
-        // `deskwarden/examples` and additionally neutering the `.gitignore`
-        // check's own assertion -- three edits -- the suite came back
-        // **2,221 passed / 2 failed**, the two being
-        // `tracked_files_lists_what_this_repository_owns_and_nothing_else`
-        // and
-        // `the_fallback_walk_excludes_nothing_and_a_nested_repository_is_a_failure_not_a_skip`.
-        // The retarget is caught with nothing planted.
-        //
-        // So the floor this module actually holds is a SUITE floor, not a
-        // per-test one: every widening recorded above and below -- the
-        // two-edit retarget, the three-edit variants that silence this test's
-        // `.gitignore` check, and the push- and shadow-shaped step-arounds
-        // recorded at the reader itself -- is RED at suite level at three
-        // edits.
-        //
-        // Since `484b628` the `.gitignore` statement is made TWICE, in two
-        // independent expressions bound to no name, so the per-test cost of
-        // the retarget is FOUR edits rather than three: measured in the
-        // fallback configuration with a real probe in a tracked
-        // `deskwarden/examples`, the retarget plus a fold of EITHER statement
-        // alone is red here, and only the retarget plus a fold of BOTH is
-        // green -- and that four-edit form is still red at suite level, at the
-        // same two tests. Silencing those two is at least two more edits, so
-        // **a green suite costs at least six coordinated edits**,
-        // all of them in this file. That is a lower bound: six has not been
-        // demonstrated to suffice, only that fewer than six cannot. Quoting
-        // a per-test verdict as though the suite had passed understates this
-        // module, and every count in this ledger should be read as "what one
-        // test said", with the suite floor above as the number that matters.
-        //
-        // So the four layers no longer share an input:
-        //
-        // * the prune below is this list, and it is DECLARED circular: the
-        //   assertion under it pins the list to the const's own expansion, so
-        //   the two restatements cannot drift apart in silence;
-        // * the const's expansion must be NAMED BY `.gitignore` -- the only
-        //   input this test reads from outside this file, present in both
-        //   configurations because it is tracked. A term naming a directory
-        //   `.gitignore` does not exclude fails here whatever this test's
-        //   local lists say;
-        // * the set equality subtracts the const's expansion and the recorded
-        //   refusals, never this list;
-        // * the `git ls-files` oracle subtracts NOTHING, and a fourth check
-        //   -- the directories of the files the SCAN's own listing returned,
-        //   which is a different enumerator entirely and runs in both
-        //   configurations -- must all have been reached.
-        let literals = [root.join("target"), root.join("deskwarden").join("target")];
-        // `root` is carried and unused by the prune ON PURPOSE: the mutation
-        // this control exists to survive is `build_output_dir(root, &path)`
-        // in place of the literals below, and a signature that made that
-        // mutation fail to COMPILE would be a defence by accident -- it would
-        // hide whether the two enumerations below actually catch it.
-        fn directories(
-            root: &std::path::Path,
-            dir: &std::path::Path,
-            literals: &[std::path::PathBuf; 2],
-            out: &mut Vec<std::path::PathBuf>,
-            refused: &mut Vec<std::path::PathBuf>,
-        ) {
-            debug_assert!(dir.starts_with(root), "the enumeration left the tree");
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() || path.file_name() == Some(std::ffi::OsStr::new(".git")) {
-                    continue;
-                }
-                // Pruned by the literals this test states, never by the
-                // predicate it is measuring.
-                if literals.iter().any(|l| *l == path) {
-                    continue;
-                }
-                // And at the repository shapes the rest of this module
-                // refuses -- a live sibling worktree holds its own `target/`
-                // and is not this tree's to enumerate. NAMED, not dropped:
-                // the count below subtracts exactly these paths, so widening
-                // this predicate cannot shrink both sides together.
-                if nested_repository_shape(&path) {
-                    refused.push(path);
-                    continue;
-                }
-                out.push(path.clone());
-                directories(root, &path, literals, out, refused);
-            }
-        }
-        // **The second opinion, and what it is and is not.** It consults no
-        // predicate of ours and prunes nothing by name of ours -- but it is
-        // NOT filter-free, and the comment here used to say it was. It
-        // carries a `.git` name filter byte-identical to the pruned walk's,
-        // and a silent `let Ok(entries) = .. else { return }`. Widening this
-        // filter ALONE is caught, because `reached` then strictly contains
-        // `expected`; widening BOTH in lockstep is not caught by the equality
-        // at all, and was not caught by the floor either for any directory
-        // the floor does not name. That is what the fourth check below --
-        // over the directories of the files the scan's own listing returned
-        // -- is for, and it holds in both configurations.
-        fn every_directory(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() || path.file_name() == Some(std::ffi::OsStr::new(".git")) {
-                    continue;
-                }
-                out.push(path.clone());
-                every_directory(&path, out);
-            }
-        }
-        let mut reached: Vec<std::path::PathBuf> = Vec::new();
-        let mut refused_dirs: Vec<std::path::PathBuf> = Vec::new();
-        directories(&root, &root, &literals, &mut reached, &mut refused_dirs);
-
-        // **The const's own expansion, and the declared circularity.** The
-        // prune above is a restatement of this; saying so out loud is the
-        // point. The two cannot drift, so an edit to one of them alone is a
-        // failure here rather than a silent widening of the other three
-        // layers below.
-        let const_dirs: Vec<std::path::PathBuf> = BUILD_OUTPUT_DIRS
-            .iter()
-            .map(|rel| rel.iter().fold(root.clone(), |acc, c| acc.join(c)))
-            .collect();
-        assert_eq!(
-            literals.as_slice(),
-            const_dirs.as_slice(),
-            "the list this test prunes by is no longer the expansion of `BUILD_OUTPUT_DIRS`. \
-             These two are the SAME statement written twice, and this test used to let them \
-             drift: the prune list, the set equality's subtrahend and the `git ls-files` \
-             oracle's subtrahend were all this one list, so retargeting it and the const \
-             together shipped a probe-bearing tracked directory out of the scan, green in \
-             both configurations"
-        );
-
-        // **The one input this test reads from OUTSIDE this file.** Every
-        // directory `BUILD_OUTPUT_DIRS` excludes must be a directory
-        // `.gitignore` excludes. `.gitignore` is tracked, so it is present in
-        // a `git archive` export as well as in a checkout, and no edit inside
-        // `login_ui.rs` can move it. This is what makes the widening
-        // measured above -- a third entry naming `deskwarden/examples`, with
-        // every local list grown to agree -- a failure rather than a green
-        // suite: `.gitignore` names no `examples/`.
-        let ignore_text = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
-
-        // **The patterns that could exclude this directory, derived from the
-        // directory itself.** A directory is excluded exactly when
-        // `.gitignore` contains, verbatim, one of the two lines that could
-        // say so: `<name>/` -- the unanchored form, which git matches by
-        // component at any depth -- or `/<path from the repository root>/`,
-        // the anchored form. Both are rendered from `d`, so nothing here gets
-        // to choose which line vindicates which directory.
-        //
-        // That is the property the previous shapes kept losing. A reader that
-        // returns "the line that excluded `d`" and is then checked against the
-        // file is NOT enough: it can return someone else's real line. Measured
-        // on exactly that design, in this file, with a real probe in a tracked
-        // `deskwarden/examples`: a reader taught to answer for `examples` while
-        // returning the pattern of whatever line it happened to be looking at
-        // handed back `target/`, a genuine line of `.gitignore`, substantiated
-        // itself against it, and the probe test PASSED with the probe unseen.
-        // The render-back is not injective across the two branches, so the
-        // only safe direction is the one taken here: render from `d` and ask
-        // the file, rather than render from the file and ask a matcher.
-        //
-        // The conservative parse this replaces is preserved by construction
-        // rather than by rules: a comment, a negation or a blank line cannot
-        // equal either rendered pattern (`#target/`, `!target/` and `""` are
-        // all different strings from `target/`), a pattern without the
-        // trailing `/` does not say "directory" and is not rendered, and an
-        // unanchored pattern containing `/` can never equal a `<name>/`
-        // rendering. Accepting too LITTLE can only make the checks below fail
-        // loudly, so that direction is deliberately left alone.
-        //
-        // And there is no value between the check and the use. At `17459e7`
-        // the parse ran into two `mut` vectors, two asserts validated those
-        // vectors, and the consumer re-read the same vectors fifteen lines
-        // below, so both asserts were POSITIONAL SNAPSHOTS -- they constrained
-        // a value at a moment, not the value that was used. Measured at
-        // `17459e7`: retargeting `BUILD_OUTPUT_DIRS[1]` and `literals` at
-        // `deskwarden/examples` and pushing `"examples"` into `ignored_names`
-        // BELOW both asserts and ABOVE the consumer -- three edits, no assert
-        // touched, the parser untouched -- passed in the fallback
-        // configuration, debug and release, with both asserts executing and
-        // passing on the way. The identical push fifteen lines earlier died
-        // loudly. Sealing the parse behind an immutable `let` was measured NOT
-        // to fix that either: `let ignored_names = [ignored_names,
-        // vec!["examples"]].concat();` is one edit at the identical site and
-        // was measured green, probe unseen. Any design that names the reader's
-        // output and consults that name later has this window, whatever the
-        // binding's mutability -- so nothing is named. `.gitignore` is
-        // tracked, so it is present in a `git archive` export as well as a
-        // checkout, and no edit inside `login_ui.rs` can move it.
-        //
-        // The old positive control ("the parse produced SOMETHING") is gone
-        // because it can no longer have a subject: this cannot pass by having
-        // nothing to say. A reader that excludes nothing makes the check below
-        // fail with both of Cargo's build directories in its message, and a
-        // reader that excludes everything makes the ancestors check fail with
-        // this crate's own source directory in its message.
-        //
-        // **And the reader is not NAMED.** The shape this replaces bound the
-        // rendering to `let excluded_by_gitignore = |d| ..` and called that
-        // name at both sites below, which is the round-`17459e7` defect
-        // wearing new clothes: a name consulted twice can be REBOUND once
-        // between the two consultations. Measured on exactly that shape, at
-        // `484b628`, with a real probe in a tracked `deskwarden/examples`:
-        // retargeting `BUILD_OUTPUT_DIRS[1]` and `literals` at
-        // `deskwarden/examples` and inserting
-        // `let excluded_by_gitignore = |_d: &std::path::Path| -> bool { true };`
-        // immediately after the ancestors assert's closing `);` -- three
-        // edits, NO assert touched and the rendering itself untouched --
-        // passed in the fallback configuration in debug and in release, with
-        // the ancestors assert executing against the honest reader on the way
-        // and the probe unseen. The shadow does not have to beat the check; it
-        // only has to arrive after it.
-        //
-        // So the rendering below is written out at each place it is needed and
-        // bound nowhere. There is no name to rebind, and the two statements of
-        // the property are DELIBERATELY DUPLICATED rather than factored: the
-        // duplication is the point, because one shadow cannot stand in for two
-        // independent expressions. The second statement lives far below, after
-        // the `git ls-files` oracle, is written in a different shape (it
-        // records WHICH line of `.gitignore` names each directory, so its
-        // failure names the line), and its value is consumed by an assert
-        // further down still -- so a single contiguous deletion spanning both
-        // statements does not compile.
-
-        // **The reader is asked about the directory it must never be able to
-        // name: the one this very file lives in.** Derived -- the path comes
-        // from the scan's own listing, asserted above to contain
-        // `login_ui.rs` -- so there is no literal here either. This closes the
-        // residual the unanchored branch leaves open: it matches by
-        // `file_name()` at ANY depth, so it is not enough that `.gitignore`
-        // really says `target/`; what matters is that no directory holding
-        // this crate's source answers to it. It does NOT speak for every other
-        // tracked directory of the tree; that is what the `git ls-files` oracle
-        // and the `scanned_dirs` layer below are for.
-        let own = files
-            .iter()
-            .find(|p| p.ends_with("login_ui.rs"))
-            .expect("the scan's listing holds this file; asserted above");
-        let ignored_ancestors: Vec<&std::path::Path> = own
-            .ancestors()
-            .skip(1)
-            .take_while(|a| *a != root.as_path() && a.starts_with(&root))
-            .filter(|a| {
-                ignore_text.lines().map(str::trim).any(|l| {
-                    !l.is_empty()
-                        && (a.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/")).as_deref()
-                            == Some(l)
-                            || a.strip_prefix(&root)
-                                .ok()
-                                .map(|rel| {
-                                    let mut pat = String::new();
-                                    for c in rel.components() {
-                                        pat.push('/');
-                                        pat.push_str(&c.as_os_str().to_string_lossy());
-                                    }
-                                    pat.push('/');
-                                    pat
-                                })
-                                .as_deref()
-                                == Some(l))
-                })
-            })
-            .collect();
-        assert!(
-            ignored_ancestors.is_empty(),
-            "the `.gitignore` reader in this test calls {} director(ies) above `{}` ignored, \
-             the first of them {:?}. A directory holding this crate's own source is not build \
-             output, and a reader that says it is hands the layer below permission to delete \
-             the probe scan's own subtree",
-            ignored_ancestors.len(),
-            own.display(),
-            ignored_ancestors.first()
-        );
-        let unignored: Vec<&std::path::PathBuf> = const_dirs
-            .iter()
-            .filter(|d| {
-                !ignore_text.lines().map(str::trim).any(|l| {
-                    !l.is_empty()
-                        && (d.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/")).as_deref()
-                            == Some(l)
-                            || d.strip_prefix(&root)
-                                .ok()
-                                .map(|rel| {
-                                    let mut pat = String::new();
-                                    for c in rel.components() {
-                                        pat.push('/');
-                                        pat.push_str(&c.as_os_str().to_string_lossy());
-                                    }
-                                    pat.push('/');
-                                    pat
-                                })
-                                .as_deref()
-                                == Some(l))
-                })
-            })
-            .collect();
-        assert!(
-            unignored.is_empty(),
-            "`BUILD_OUTPUT_DIRS` excludes {} director(ies) that `.gitignore` does not exclude, \
-             the first of them {:?}. A directory this repository TRACKS files in is not build \
-             output, and deleting it from the probe scan deletes tracked source text from the \
-             one test that reads this tree back. `.gitignore` is the only input this test has \
-             that does not live in this file, so this is the one line here that a coordinated \
-             edit to the const and to every local list in this test cannot satisfy",
-            unignored.len(),
-            unignored.first()
-        );
-        let excluded: Vec<&std::path::PathBuf> =
-            reached.iter().filter(|d| build_output_dir(&root, d)).collect();
-        assert!(
-            excluded.is_empty(),
-            "`build_output_dir` excludes {} directory/directories of this tree beyond Cargo's \
-             two build directories, the first of them {:?}. Every name it grows deletes that \
-             directory from the probe scan in BOTH configurations, in silence: the round that \
-             found this had a third term naming `deskwarden/installer`, holding three tracked \
-             sources, survive a full mutation sweep against a kept-name list that enumerates \
-             six names instead of saying what the exclusion is. The exclusion may name {:?} \
-             and nothing else.",
-            excluded.len(),
-            excluded.first(),
-            literals
-        );
-        assert!(
-            literals.iter().all(|l| build_output_dir(&root, l)),
-            "control: `build_output_dir` no longer excludes the two directories it is FOR, so \
-             the emptiness asserted above is emptiness for the wrong reason -- a predicate \
-             that never fires excludes nothing and also polices nothing"
-        );
-        // **The floor.** Named directories the enumeration must have reached,
-        // each asserted to EXIST first so the floor cannot pass by naming
-        // nothing. This half is positional and says so -- it is a floor, not
-        // the pin -- but a floor is what makes a blinded enumeration loud at
-        // the four places where a deletion costs tracked files.
-        for floor in [
-            std::path::Path::new(".github").to_path_buf(),
-            std::path::Path::new(".github").join("workflows"),
-            std::path::Path::new("deskwarden").join("installer"),
-            std::path::Path::new("deskwarden").join("src"),
-            std::path::Path::new("docs").to_path_buf(),
-        ] {
-            let want = root.join(&floor);
-            assert!(
-                want.is_dir(),
-                "control: `{}` is not a directory of this tree, so the floor below is a floor \
-                 over something that is not here -- it passes by naming nothing",
-                floor.display()
-            );
-            assert!(
-                reached.contains(&want),
-                "the directory enumeration did not reach `{}`, so the closed statement above \
-                 ran over a tree that already had that subtree deleted from it. This is the \
-                 shape a circular prune has: rewrite the prune to `build_output_dir` and the \
-                 mutated exclusion deletes the very directory that would have reported it",
-                floor.display()
-            );
-        }
-
-        // **The pin: non-circularity, by a second enumeration that takes no
-        // predicate.** `every_directory` prunes nothing. The pruned walk must
-        // equal it minus exactly the two literals' subtrees and the subtrees
-        // of the repositories the pruned walk RECORDED -- both subtractions
-        // by path prefix over paths, never by asking a predicate. A prune
-        // rewritten to `build_output_dir` agrees with this while
-        // `BUILD_OUTPUT_DIRS` is the two literals and disagrees the moment it
-        // is not, which is the whole of what "circular" meant.
-        let mut all: Vec<std::path::PathBuf> = Vec::new();
-        every_directory(&root, &mut all);
-        assert!(
-            all.len() >= reached.len() && all.len() > 10,
-            "control: the unpruned enumeration found {} director(ies) against the pruned \
-             walk's {}, so it did not walk this tree and the equality below is an equality \
-             between two things that are both empty",
-            all.len(),
-            reached.len()
-        );
-        let expected: std::collections::BTreeSet<&std::path::PathBuf> = all
-            .iter()
-            .filter(|d| {
-                !const_dirs.iter().any(|l| d.starts_with(l))
-                    && !refused_dirs.iter().any(|r| d.starts_with(r))
-            })
-            .collect();
-        assert_eq!(
-            reached.iter().collect::<std::collections::BTreeSet<_>>(),
-            expected,
-            "the pruned directory enumeration ({} director(ies)) is not the unpruned one ({} \
-             of {}) minus the two literals {:?} and the {} recorded nested repositor(y/ies) \
-             {:?}. A directory missing from the left is a subtree this control can no longer \
-             see, and a prune that cannot see a subtree cannot notice the exclusion growing \
-             into it -- which is exactly how a third `BUILD_OUTPUT_DIRS` entry naming \
-             `.github/workflows`, deleting a tracked file from the probe scan, survived in \
-             both configurations once the prune was made to consult the predicate under test",
-            reached.len(),
-            expected.len(),
-            all.len(),
-            literals,
-            refused_dirs.len(),
-            refused_dirs
-        );
-        // **A third opinion, and the only one that comes from outside this
-        // file at all: `git ls-files`, raw.** Both enumerations above are
-        // written here, so a forgery that teaches BOTH of them the predicate
-        // under test still agrees with itself -- measured: with
-        // `every_directory` given the same `build_output_dir` prune, a third
-        // entry naming `deskwarden/src/vault_window` SURVIVED. That is three
-        // coordinated edits rather than one, but it is the residual, and this
-        // closes it wherever git can answer: every directory holding a
-        // TRACKED file, minus the two literals, must have been reached. The
-        // listing consults no predicate of ours and is not the one
-        // [`tracked_files`] filters.
-        //
-        // It runs in the git configuration only, and that is stated rather
-        // than hidden: a `git archive` export has no repository to ask, and
-        // there the two enumerations above are the whole of the pin.
-        let raw = std::process::Command::new("git")
+        // It fails loudly rather than degrading if git cannot answer, for
+        // the same reason the listing does.
+        let committed_raw = std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
-            .args(["ls-files", "-z"])
-            .output();
-        let listed = match &raw {
-            Ok(out) if out.status.success() => Some(out),
-            // **The degradation is loud now.** This used to be
-            // `raw.ok().filter(|o| o.status.success())`, so a `git` that
-            // could not be run, or that ran and failed, dropped the whole
-            // oracle in silence and left the fallback's layers standing in
-            // for a check the comment above says is the only outside one.
-            // A tree with no repository to ask is the stated case and stays
-            // silent; a tree that HAS a `.git` and still cannot be asked is
-            // a broken instrument and says so.
-            Ok(out) => {
-                assert!(
-                    !root.join(".git").exists(),
-                    "control: `git ls-files` ran in a tree that HAS a `.git` and reported {} \
-                     ({:?}), so the outside oracle below did not run and this test silently \
-                     degraded to the two enumerations written in this file",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                None
+            .args(["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git ls-tree -r HEAD` could not enumerate \
+                     {root:?}, so the listing this test scans has no second opinion to be \
+                     checked against and a pathspec added to the producer would be invisible. \
+                     This test does not run without git; see the panic above."
+                )
+            });
+        let committed: Vec<std::path::PathBuf> = committed_raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|raw| std::str::from_utf8(raw).ok())
+            .map(|rel| root.join(rel))
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(
+            committed.len() > 30,
+            "control: `git ls-tree -r HEAD` named only {} present files, so the cross-check \
+             below is a cross-check over nothing",
+            committed.len()
+        );
+        let unscanned: Vec<&std::path::PathBuf> =
+            committed.iter().filter(|p| !files.contains(p)).collect();
+        assert!(
+            unscanned.is_empty(),
+            "{} file(s) are committed to HEAD and present in the working tree but are NOT in \
+             the list this test is about to scan, the first of them {:?}. The two enumerations \
+             are two separately spelled questions put to git, so this is what a PATHSPEC added \
+             to the `git ls-files` invocation in `tracked_files` looks like -- the one \
+             remaining in-file lever over what gets scanned, and the reason it is not a \
+             one-edit hole. If a file was legitimately removed from the index but left on \
+             disk (`git rm --cached`), commit that removal; the scan will not quietly police \
+             a smaller tree than the one that is committed.",
+            unscanned.len(),
+            unscanned.first()
+        );
+
+        // **The third enumeration, and why there are three.** Two producers
+        // put the floor at two coordinated edits, and two was measured, not
+        // guessed: a pathspec on `ls-files` plus a rewritten `ls-tree` whose
+        // positive pathspec enumerates the tree's top level minus one
+        // directory made a real probe in a real tracked file UNSEEN, whole
+        // suite green. `ls-tree` will not take an exclude pathspec -- `git`
+        // answers `pathspec magic not supported by this command` -- so that
+        // second edit has to be a hand-written list of the repository's
+        // layout, but it is still one edit and one edit is not a floor worth
+        // reporting.
+        //
+        // So there is a third, at its own call site with its own arguments,
+        // and it too is unioned in. Hiding a tracked file now requires all
+        // three producers corrupted in lockstep, or one corrupted and the
+        // other two deleted -- three edits either way, in the configuration
+        // that ships, with no gitless configuration left to hide in. This is
+        // a lower bound and it is stated as one: it says three cannot be
+        // beaten by fewer, not that three suffices.
+        //
+        // These are three separate `Command`s, not one statement written
+        // three times and not one binding read three times. That distinction
+        // is the whole history of this test: the round before last was
+        // defeated by shadow-rebinding a single `let`-bound closure, and the
+        // last one by refilling a single `let ignore_text` that two
+        // deliberately-different sites both read. There is no binding here
+        // for a fourth edit to refill.
+        let cached_raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "--cached", "--full-name", "-z"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git ls-files --cached` could not enumerate \
+                     {root:?}. This test does not run without git; see the panic above."
+                )
+            });
+        let cached: Vec<std::path::PathBuf> = cached_raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|raw| std::str::from_utf8(raw).ok())
+            .map(|rel| root.join(rel))
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(
+            cached.len() > 30 && cached.iter().any(|p| p.ends_with("login_ui.rs")),
+            "control: the third enumeration named {} present files and {} the file that \
+             declares the probe, so it is not a third opinion about anything",
+            cached.len(),
+            if cached.iter().any(|p| p.ends_with("login_ui.rs")) { "reached" } else { "missed" }
+        );
+
+        // **And the second opinion is UNIONED IN, not merely compared.** The
+        // assert above detects a corrupted producer; this makes a corrupted
+        // producer INERT. A pathspec on the `git ls-files` invocation alone
+        // now removes nothing from the scan, because everything committed is
+        // added back here -- so that single edit is both loud and useless,
+        // and deleting the assert above on its own accomplishes nothing at
+        // all. Every remaining route to hiding a tracked file has to corrupt
+        // BOTH enumerations, at two separately written call sites, in
+        // lockstep. That cost is stated in this test's doc and it is a lower
+        // bound, not a proof.
+        for path in committed.into_iter().chain(cached) {
+            if !files.contains(&path) {
+                files.push(path);
             }
-            Err(e) => {
-                assert!(
-                    !root.join(".git").exists(),
-                    "control: `git` could not be started ({e}) in a tree that HAS a `.git`, so \
-                     the outside oracle below did not run and this test silently degraded to \
-                     the two enumerations written in this file"
-                );
-                None
-            }
-        };
-        if let Some(listed) = listed {
-            let mut tracked_dirs: std::collections::BTreeSet<std::path::PathBuf> =
-                std::collections::BTreeSet::new();
-            for rel in listed.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-                let mut at = root.join(String::from_utf8_lossy(rel).as_ref());
-                while let Some(parent) = at.parent().map(|p| p.to_path_buf()) {
-                    if parent == root || !parent.starts_with(&root) {
-                        break;
-                    }
-                    tracked_dirs.insert(parent.clone());
-                    at = parent;
-                }
-            }
-            // **No subtraction.** The filter that used to sit here was
-            // `!literals.iter().any(..)`, which handed the oracle the same
-            // input the prune and the set equality already had -- one edit
-            // moved all three, and that is the finding this round closes.
-            // Nothing is subtracted from the tracked listing now: every
-            // directory holding a tracked file must have been reached, full
-            // stop. That is sound only because git tracks no file under a
-            // build output directory, and that is asserted rather than
-            // assumed, immediately below and by name. If someone ever
-            // `git add -f`s into `target/`, this reds loudly with its own
-            // message instead of quietly widening the oracle.
-            let tracked_in_build: Vec<&std::path::PathBuf> = tracked_dirs
-                .iter()
-                .filter(|d| const_dirs.iter().any(|l| d.starts_with(l)))
-                .collect();
-            let missing: Vec<&std::path::PathBuf> =
-                tracked_dirs.iter().filter(|d| !reached.contains(*d)).collect();
-            assert!(
-                tracked_in_build.is_empty(),
-                "control: git TRACKS a file under a directory `BUILD_OUTPUT_DIRS` excludes, \
-                 the directory being {:?}. The oracle below subtracts nothing from the tracked \
-                 listing, which is what stops one edit from moving the prune, the set equality \
-                 and the oracle together -- and that is sound exactly while this holds. A \
-                 force-added file under a build output directory is tracked source text the \
-                 probe scan never reads: remove it, or stop calling that directory build output",
-                tracked_in_build.first()
-            );
-            assert!(
-                tracked_dirs.len() > 10,
-                "control: `git ls-files` named {} director(ies) of tracked files, so the check \
-                 below is a check over nothing",
-                tracked_dirs.len()
-            );
-            assert!(
-                missing.is_empty(),
-                "{} director(ies) holding TRACKED files were never reached by the enumeration \
-                 above, the first of them {:?}. git is the one listing in this test that no \
-                 edit here can teach a predicate to, so this fires even when both enumerations \
-                 above have been taught the same one and agree with each other",
-                missing.len(),
-                missing.first()
-            );
         }
-
-        // **The same statement, a second time, on purpose.** Every directory
-        // `BUILD_OUTPUT_DIRS` excludes must be named by `.gitignore` -- said
-        // once far above at the `unignored` filter and again here, both times
-        // as an expression written out in full and bound to no name. The two
-        // are not factored into a helper and must never be: a helper is a
-        // name, and a name consulted twice can be rebound once between the two
-        // consultations, which is precisely how the three-edit shadow quoted
-        // at the rendering above walked a probe-bearing tracked directory out
-        // of the scan while every assert in this test passed. One shadow
-        // cannot stand in for two expressions, so silencing this check costs
-        // an edit of its own.
-        //
-        // The shape is deliberately different from the one above -- it records
-        // the INDEX of the `.gitignore` line that names each directory, so a
-        // failure says which line was expected to be there and was not -- and
-        // the boolean it produces is read again by the `unwalked` assert far
-        // below, so deleting this block in one stroke, or deleting any region
-        // that spans both statements, leaves an unresolved name behind rather
-        // than a green test.
-        let gitignore_lines_naming: Vec<(&std::path::PathBuf, Option<usize>)> = const_dirs
-            .iter()
-            .map(|d| {
-                let named = d.file_name().and_then(|n| n.to_str()).map(|n| n.to_owned() + "/");
-                let anchored = d.strip_prefix(&root).ok().map(|rel| {
-                    rel.components().fold(String::new(), |mut p, c| {
-                        p.push('/');
-                        p.push_str(&c.as_os_str().to_string_lossy());
-                        p
-                    }) + "/"
-                });
-                let at = ignore_text.lines().position(|l| {
-                    Some(l.trim()) == named.as_deref() || Some(l.trim()) == anchored.as_deref()
-                });
-                (d, at)
-            })
-            .collect();
-        let gitignore_names_every_excluded_dir =
-            gitignore_lines_naming.iter().all(|(_, at)| at.is_some());
-        assert!(
-            gitignore_names_every_excluded_dir,
-            "`.gitignore` names no line for at least one directory `BUILD_OUTPUT_DIRS` excludes: \
-             {:?} (the second element of each pair is the index of the `.gitignore` line that \
-             names that directory). This is the same statement the `unignored` assert far above \
-             makes, written a second time and on purpose: a single rebinding cannot stand in for \
-             two independent expressions, so a directory this repository TRACKS files in cannot \
-             be walked out of the probe scan by shadowing one reader",
-            gitignore_lines_naming
-        );
-
-        assert!(
-            refused_dirs.iter().all(|r| !files.iter().any(|f| f.starts_with(r))),
-            "control: a directory refused as SOMEONE ELSE's repository holds a file this \
-             repository's own listing claims. The subtraction above trusts these paths, so a \
-             `nested_repository_shape` widened to match a directory of this tree would \
-             otherwise shrink both sides of that equality together and go unnoticed -- the \
-             second-order form of the circular prune. Refused: {:?}",
-            refused_dirs
-        );
-
-        // **The fourth layer, and the only one that works in the fallback
-        // too: a THIRD enumerator, already computed above for another
-        // purpose.** `files` is what the probe scan itself will read --
-        // produced by [`tracked_files`] on the git path and by [`walk`] in
-        // the fallback, neither of which is either of the two walks in this
-        // test. Every directory holding one of those files must have been
-        // reached by the pruned walk.
-        //
-        // This is what catches the lockstep widening of the `.git` NAME
-        // FILTER, which the set equality cannot see by construction -- widen
-        // it in both walks and the same subtree leaves both sides together --
-        // and which the floor only saw for the five names it happens to
-        // list. Measured before this check existed: widening both filters at
-        // `deskwarden/examples`, a tracked directory the floor does not name,
-        // SURVIVED in both configurations; at `.github`, which the floor does
-        // name, it was killed. That is a pin that depends on which name a
-        // reviewer picks, which is the species this whole control exists to
-        // stop shipping.
-        let scanned_dirs: std::collections::BTreeSet<&std::path::Path> = files
-            .iter()
-            .filter_map(|f| f.parent())
-            .filter(|p| *p != root.as_path())
-            .collect();
-        let unwalked: Vec<&&std::path::Path> =
-            scanned_dirs.iter().filter(|d| !reached.iter().any(|r| r == **d)).collect();
-        assert!(
-            scanned_dirs.len() > 5,
-            "control: the scan's own listing named {} director(ies), so the check below is a \
-             check over nothing",
-            scanned_dirs.len()
-        );
-        assert!(
-            unwalked.is_empty(),
-            "{} director(ies) hold a file the probe scan is about to READ and were never \
-             reached by the directory enumeration above, the first of them {:?}. The two walks \
-             in this test are both written here and can be taught the same blindness in \
-             lockstep -- a widened `.git` name filter in both of them removes the same subtree \
-             from both sides of the set equality and is invisible there. `files` comes from a \
-             different enumerator, in both configurations, and this is where that lockstep \
-             stops being free. (`.gitignore` names every excluded directory: {}. That value is \
-             read HERE, and only here, so that the block far above which computes it -- the \
-             second of the two independent statements that `BUILD_OUTPUT_DIRS` may exclude only \
-             what `.gitignore` names -- cannot be removed in one stroke: delete it, or delete \
-             any region spanning both statements, and this name does not resolve.)",
-            unwalked.len(),
-            unwalked.first(),
-            gitignore_names_every_excluded_dir
-        );
 
         // **Three needles over the same bytes, and no encoding DECISION.**
         // The byte search catches a probe in any encoding whose bytes for
@@ -8287,7 +7186,7 @@ pub(crate) mod password_lifetime_tests {
             // is gone, a UTF-16LE `.ps1` regenerated by PowerShell 5.1 is
             // scanned rather than reported, and appending three `\xff` bytes
             // to a file no longer takes it out of scope. See
-            // `build_output_dir` for the measurements behind all three.
+            // the git-only listing for the measurements behind all three.
             //
             // A read that FAILS is skipped rather than panicked on: a tracked
             // file can be momentarily locked by an editor, an antivirus, or a
@@ -8311,10 +7210,10 @@ pub(crate) mod password_lifetime_tests {
                  with `concat!`. If this named a BUILD ARTIFACT, it is not a finding about the \
                  source: a compiled artifact of this crate carries the assembled probe because \
                  that is what compiling a `concat!` produces. Point `CARGO_TARGET_DIR` outside \
-                 the repository, or at `target/`, which `.gitignore` already names -- this scan \
-                 reports such a file loudly rather than sniffing at its bytes to guess whose \
-                 they are, because every sniff tried so far was also an evasion; see \
-                 `build_output_dir`",
+                 the repository, or at `target/`, which `.gitignore` already names -- git \
+                 therefore never offers such a file to this scan, and this scan does not sniff \
+                 at any file's bytes to guess whose they are, because every sniff tried so far \
+                 was also an evasion",
                 file.display(),
                 found.map_or("", |(label, _)| label)
             );
