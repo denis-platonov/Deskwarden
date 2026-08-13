@@ -6161,10 +6161,16 @@ pub(crate) mod password_lifetime_tests {
     /// the fallback configuration with nothing planted: pointing element `[1]`
     /// at `deskwarden/examples`, growing this test's local literals to match
     /// and neutering the `.gitignore` check's assertion -- three edits -- came
-    /// back 2,221 passed / 2 failed, those two. **A green suite therefore
-    /// costs at least five coordinated edits in this file**, and any single
-    /// test's "SURVIVED" recorded elsewhere in this module is a statement
-    /// about that test, not about the suite.
+    /// back 2,221 passed / 2 failed, those two.
+    ///
+    /// The `.gitignore` check is now stated TWICE, in two independent
+    /// expressions bound to no name (see the reader in that test), so
+    /// neutering it is two edits rather than one and the per-test cost of the
+    /// retarget is four. **A green suite therefore costs at least six
+    /// coordinated edits in this file**, and any single test's "SURVIVED"
+    /// recorded elsewhere in this module is a statement about that test, not
+    /// about the suite. Both figures are lower bounds: neither has been shown
+    /// to SUFFICE, only that fewer cannot.
     const BUILD_OUTPUT_DIRS: [&[&str]; 2] = [&["target"], &["deskwarden", "target"]];
 
     /// True for exactly the directories named by [`BUILD_OUTPUT_DIRS`],
@@ -7614,10 +7620,19 @@ pub(crate) mod password_lifetime_tests {
         // two-edit retarget, the three-edit variants that silence this test's
         // `.gitignore` check, and the push- and shadow-shaped step-arounds
         // recorded at the reader itself -- is RED at suite level at three
-        // edits. Silencing those two further tests is at least two more
-        // edits, so **a green suite costs at least five coordinated edits**,
-        // all of them in this file. That is a lower bound: five has not been
-        // demonstrated to suffice, only that fewer than five cannot. Quoting
+        // edits.
+        //
+        // Since `484b628` the `.gitignore` statement is made TWICE, in two
+        // independent expressions bound to no name, so the per-test cost of
+        // the retarget is FOUR edits rather than three: measured in the
+        // fallback configuration with a real probe in a tracked
+        // `deskwarden/examples`, the retarget plus a fold of EITHER statement
+        // alone is red here, and only the retarget plus a fold of BOTH is
+        // green -- and that four-edit form is still red at suite level, at the
+        // same two tests. Silencing those two is at least two more edits, so
+        // **a green suite costs at least six coordinated edits**,
+        // all of them in this file. That is a lower bound: six has not been
+        // demonstrated to suffice, only that fewer than six cannot. Quoting
         // a per-test verdict as though the suite had passed understates this
         // module, and every count in this ledger should be read as "what one
         // test said", with the suite floor above as the number that matters.
@@ -7791,21 +7806,33 @@ pub(crate) mod password_lifetime_tests {
         // fail with both of Cargo's build directories in its message, and a
         // reader that excludes everything makes the ancestors check fail with
         // this crate's own source directory in its message.
-        let excluded_by_gitignore = |d: &std::path::Path| -> bool {
-            let by_name = d.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/"));
-            let by_path = d.strip_prefix(&root).ok().map(|rel| {
-                let mut pat = String::new();
-                for c in rel.components() {
-                    pat.push('/');
-                    pat.push_str(&c.as_os_str().to_string_lossy());
-                }
-                pat.push('/');
-                pat
-            });
-            ignore_text.lines().map(str::trim).any(|l| {
-                !l.is_empty() && (by_name.as_deref() == Some(l) || by_path.as_deref() == Some(l))
-            })
-        };
+        //
+        // **And the reader is not NAMED.** The shape this replaces bound the
+        // rendering to `let excluded_by_gitignore = |d| ..` and called that
+        // name at both sites below, which is the round-`17459e7` defect
+        // wearing new clothes: a name consulted twice can be REBOUND once
+        // between the two consultations. Measured on exactly that shape, at
+        // `484b628`, with a real probe in a tracked `deskwarden/examples`:
+        // retargeting `BUILD_OUTPUT_DIRS[1]` and `literals` at
+        // `deskwarden/examples` and inserting
+        // `let excluded_by_gitignore = |_d: &std::path::Path| -> bool { true };`
+        // immediately after the ancestors assert's closing `);` -- three
+        // edits, NO assert touched and the rendering itself untouched --
+        // passed in the fallback configuration in debug and in release, with
+        // the ancestors assert executing against the honest reader on the way
+        // and the probe unseen. The shadow does not have to beat the check; it
+        // only has to arrive after it.
+        //
+        // So the rendering below is written out at each place it is needed and
+        // bound nowhere. There is no name to rebind, and the two statements of
+        // the property are DELIBERATELY DUPLICATED rather than factored: the
+        // duplication is the point, because one shadow cannot stand in for two
+        // independent expressions. The second statement lives far below, after
+        // the `git ls-files` oracle, is written in a different shape (it
+        // records WHICH line of `.gitignore` names each directory, so its
+        // failure names the line), and its value is consumed by an assert
+        // further down still -- so a single contiguous deletion spanning both
+        // statements does not compile.
 
         // **The reader is asked about the directory it must never be able to
         // name: the one this very file lives in.** Derived -- the path comes
@@ -7825,7 +7852,26 @@ pub(crate) mod password_lifetime_tests {
             .ancestors()
             .skip(1)
             .take_while(|a| *a != root.as_path() && a.starts_with(&root))
-            .filter(|a| excluded_by_gitignore(a))
+            .filter(|a| {
+                ignore_text.lines().map(str::trim).any(|l| {
+                    !l.is_empty()
+                        && (a.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/")).as_deref()
+                            == Some(l)
+                            || a.strip_prefix(&root)
+                                .ok()
+                                .map(|rel| {
+                                    let mut pat = String::new();
+                                    for c in rel.components() {
+                                        pat.push('/');
+                                        pat.push_str(&c.as_os_str().to_string_lossy());
+                                    }
+                                    pat.push('/');
+                                    pat
+                                })
+                                .as_deref()
+                                == Some(l))
+                })
+            })
             .collect();
         assert!(
             ignored_ancestors.is_empty(),
@@ -7839,7 +7885,26 @@ pub(crate) mod password_lifetime_tests {
         );
         let unignored: Vec<&std::path::PathBuf> = const_dirs
             .iter()
-            .filter(|d| !excluded_by_gitignore(d))
+            .filter(|d| {
+                !ignore_text.lines().map(str::trim).any(|l| {
+                    !l.is_empty()
+                        && (d.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}/")).as_deref()
+                            == Some(l)
+                            || d.strip_prefix(&root)
+                                .ok()
+                                .map(|rel| {
+                                    let mut pat = String::new();
+                                    for c in rel.components() {
+                                        pat.push('/');
+                                        pat.push_str(&c.as_os_str().to_string_lossy());
+                                    }
+                                    pat.push('/');
+                                    pat
+                                })
+                                .as_deref()
+                                == Some(l))
+                })
+            })
             .collect();
         assert!(
             unignored.is_empty(),
@@ -8052,6 +8117,55 @@ pub(crate) mod password_lifetime_tests {
             );
         }
 
+        // **The same statement, a second time, on purpose.** Every directory
+        // `BUILD_OUTPUT_DIRS` excludes must be named by `.gitignore` -- said
+        // once far above at the `unignored` filter and again here, both times
+        // as an expression written out in full and bound to no name. The two
+        // are not factored into a helper and must never be: a helper is a
+        // name, and a name consulted twice can be rebound once between the two
+        // consultations, which is precisely how the three-edit shadow quoted
+        // at the rendering above walked a probe-bearing tracked directory out
+        // of the scan while every assert in this test passed. One shadow
+        // cannot stand in for two expressions, so silencing this check costs
+        // an edit of its own.
+        //
+        // The shape is deliberately different from the one above -- it records
+        // the INDEX of the `.gitignore` line that names each directory, so a
+        // failure says which line was expected to be there and was not -- and
+        // the boolean it produces is read again by the `unwalked` assert far
+        // below, so deleting this block in one stroke, or deleting any region
+        // that spans both statements, leaves an unresolved name behind rather
+        // than a green test.
+        let gitignore_lines_naming: Vec<(&std::path::PathBuf, Option<usize>)> = const_dirs
+            .iter()
+            .map(|d| {
+                let named = d.file_name().and_then(|n| n.to_str()).map(|n| n.to_owned() + "/");
+                let anchored = d.strip_prefix(&root).ok().map(|rel| {
+                    rel.components().fold(String::new(), |mut p, c| {
+                        p.push('/');
+                        p.push_str(&c.as_os_str().to_string_lossy());
+                        p
+                    }) + "/"
+                });
+                let at = ignore_text.lines().position(|l| {
+                    Some(l.trim()) == named.as_deref() || Some(l.trim()) == anchored.as_deref()
+                });
+                (d, at)
+            })
+            .collect();
+        let gitignore_names_every_excluded_dir =
+            gitignore_lines_naming.iter().all(|(_, at)| at.is_some());
+        assert!(
+            gitignore_names_every_excluded_dir,
+            "`.gitignore` names no line for at least one directory `BUILD_OUTPUT_DIRS` excludes: \
+             {:?} (the second element of each pair is the index of the `.gitignore` line that \
+             names that directory). This is the same statement the `unignored` assert far above \
+             makes, written a second time and on purpose: a single rebinding cannot stand in for \
+             two independent expressions, so a directory this repository TRACKS files in cannot \
+             be walked out of the probe scan by shadowing one reader",
+            gitignore_lines_naming
+        );
+
         assert!(
             refused_dirs.iter().all(|r| !files.iter().any(|f| f.starts_with(r))),
             "control: a directory refused as SOMEONE ELSE's repository holds a file this \
@@ -8101,9 +8215,14 @@ pub(crate) mod password_lifetime_tests {
              lockstep -- a widened `.git` name filter in both of them removes the same subtree \
              from both sides of the set equality and is invisible there. `files` comes from a \
              different enumerator, in both configurations, and this is where that lockstep \
-             stops being free",
+             stops being free. (`.gitignore` names every excluded directory: {}. That value is \
+             read HERE, and only here, so that the block far above which computes it -- the \
+             second of the two independent statements that `BUILD_OUTPUT_DIRS` may exclude only \
+             what `.gitignore` names -- cannot be removed in one stroke: delete it, or delete \
+             any region spanning both statements, and this name does not resolve.)",
             unwalked.len(),
-            unwalked.first()
+            unwalked.first(),
+            gitignore_names_every_excluded_dir
         );
 
         // **Three needles over the same bytes, and no encoding DECISION.**
