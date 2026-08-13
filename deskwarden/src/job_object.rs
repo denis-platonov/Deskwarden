@@ -1664,12 +1664,45 @@ mod tests {
             //
             // With no real file shaped that way, the refusal branch is
             // unreachable from the tree, so what holds it live is a synthetic
-            // fixture. Both are pinned: deleting the branch's own words, or
-            // deleting the test that drives them, costs an edit in this file
-            // too. Neither is a number, so neither has a trailing comment that
-            // satisfies it while moving it.
-            "INTERLEAVES",
-            "fn an_interleaving_file_is_refused_rather_than_tolerated(",
+            // fixture. Both are pinned below.
+            //
+            // **BUT THIS PIN IS NOT WHAT HOLDS THE RULE, AND THE CLAIM THAT
+            // IT IS COST THE NINTH TEXT-PIN LOSS IN THIS REPOSITORY.** Both
+            // needles here were, at first, satisfiable by text that was
+            // already in the file with no attacker edit at all:
+            //
+            // * the bare token `"INTERLEAVES"` occurs FOUR times in
+            //   `below_cut.rs` -- a doc comment, the fixture's own assert
+            //   argument, the refusal string, and a section comment. Deleting
+            //   the refusal branch outright leaves three, so the needle stayed
+            //   GREEN over a deleted rule. Measured (M8).
+            // * the second needle pinned only the fixture's FUNCTION NAME,
+            //   which a hollowed body still carries. Measured (M8b): with the
+            //   `TOP_LEVEL` arm rewritten to tolerate interleaving AND the
+            //   fixture's body emptied, this whole test PASSED.
+            //
+            // So both are replaced by phrases that live INSIDE the construct
+            // they are meant to hold and nowhere else: a clause of the refusal
+            // `format!` itself, up to and including its closing quote, and a
+            // clause of the fixture's own panic message, likewise up to its
+            // closing quote. Neither survives deleting the thing it names, and
+            // neither is a token that prose about the rule naturally repeats
+            // -- which is exactly how the previous pair failed.
+            //
+            // HONEST COST, corrected. The claim that weakening the refusal
+            // costs "an edit in `verdict`, plus the fixture, plus both
+            // needles here" was wrong twice over: the needles were free, and
+            // the holder that actually killed both mutants was never named.
+            // `verdict` is driven over every file's REAL bytes by the sweep's
+            // shipping-payload loop, which requires a refusal per payload, so
+            // a `verdict` that tolerates interleaving reds there whatever this
+            // file says. That loop is the load-bearing holder; the fixture is
+            // what keeps the branch's own words reachable and its message
+            // legible; these two needles are what make deleting either one
+            // cost an edit in a second file. Three holders, and only the
+            // first of them is not text.
+            "set of tolerated files to join, and adding one is not the fix\"",
+            "back and a `pub fn` between two gated modules ships again\"",
         ] {
             assert!(
                 source.contains(needle),

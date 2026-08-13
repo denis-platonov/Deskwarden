@@ -1258,7 +1258,12 @@ pub(crate) mod every_file_in_the_crate {
     ///
     /// The refusal carries [`CLOSING_LINE`] and not [`TOP_LEVEL`] on purpose.
     /// A [`TOP_LEVEL`] refusal is how an interleaving file is recognised, and
-    /// is therefore tolerated in three files; this shape is tolerated nowhere.
+    /// is turned by [`verdict`] into a refusal that says so and names the
+    /// item that ships. The two are distinct because the remedy is distinct:
+    /// an interleaving file is fixed by MOVING a test module, this shape by
+    /// deleting what shares the brace's line. Neither is tolerated anywhere
+    /// -- there was once a three-file tolerance for the interleaving shape,
+    /// and it is gone.
     ///
     /// **This check here is the second reader of that line, not the only one.**
     /// It runs only for the modules this walk REACHES, and the walk from a cut
@@ -1728,10 +1733,43 @@ pub(crate) mod every_file_in_the_crate {
         // decoy gated module, plus both numbers -- has nothing to pay for: a
         // decoy gated module no longer makes a file exempt, it makes it RED.
         //
-        // Held non-vacuously by
-        // `an_interleaving_file_is_refused_rather_than_tolerated`, which
-        // drives this same `verdict` over a synthetic file that interleaves
-        // and over the same file with its test module moved.
+        // **WHO HOLDS THIS, AND WHAT DEFEATING IT COSTS.** The commit that
+        // deleted the tolerance said the rule lived in two places and that
+        // both of `job_object.rs`'s needles had to be edited to weaken it.
+        // Measured, that accounting was wrong: the needles as written were
+        // satisfied by text already in this file, and the holder that
+        // actually killed the weakening mutants was not claimed at all. The
+        // real list, in order of how much weight each carries:
+        //
+        // 1. **THE LOOP ABOVE -- the load-bearing holder, and it is not
+        //    text.** `shipping_payloads` drives this same `verdict` over
+        //    EVERY file's real bytes and requires a refusal for every
+        //    payload. A `verdict` whose `TOP_LEVEL` arm returns `Ok` stops
+        //    refusing the appended-`pub fn` payload as well, so it reds here
+        //    naming a real file -- with the fixture below deleted, with both
+        //    needles green, with no help from either. Measured: neutering
+        //    that arm reds at this loop in `src/accounts.rs` whether or not
+        //    the fixture still exists.
+        // 2. `an_interleaving_file_is_refused_rather_than_tolerated`, which
+        //    drives this same `verdict` over a synthetic file that
+        //    interleaves and over the same file with its test module moved.
+        //    It is what keeps the refusal BRANCH reachable and its wording
+        //    honest -- no real file is shaped that way -- and what makes the
+        //    accept path a control rather than an assumption. It is not what
+        //    makes the rule survive: hollow it and the loop above still reds.
+        // 3. Two needles in `job_object.rs`, which cost a would-be weakener
+        //    an edit in a SECOND file. They now quote a clause of this file's
+        //    refusal `format!` and a clause of the fixture's panic message,
+        //    each up to its closing quote, rather than the bare token
+        //    `INTERLEAVES` -- which occurs four times here, three of them in
+        //    prose, so it stayed green over a deleted branch.
+        //
+        // So the honest price of bringing the tolerance back is: rewrite this
+        // `verdict` arm AND defeat the payload loop above (whose floors,
+        // `shapes == 4 * live + gates_seen` and `closes_read == gates_seen`
+        // all bind), delete or hollow the fixture, and edit both needles in
+        // `job_object.rs`. Only the first of those is a rule; the rest are
+        // what make it expensive to remove quietly.
 
         // ---- Liveness, over the DERIVED set, on every file's real bytes.
         //
