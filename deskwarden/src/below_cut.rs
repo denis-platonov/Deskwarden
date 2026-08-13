@@ -945,33 +945,58 @@ mod every_file_in_the_crate {
     const CLOSING_LINE: &str = "source on the line that closes a test module below the cut";
 
     /// How many files carry production code BELOW their first gated test
-    /// module, and how many gated test modules those files carry between them.
+    /// module.
     ///
-    /// **These are pins, not a list.** The set itself is derived from the tree
+    /// **This is a pin, not a list.** The set itself is derived from the tree
     /// and its members are named in the failure message, but nothing here
     /// names a file, because every previous round in this area was lost by an
     /// enumeration that could be widened by spelling one more name. What a pin
-    /// buys is cost, and cost is all it buys:
+    /// buys is cost, and cost is all it buys: a file that starts interleaving
+    /// -- which is what a payload plus a decoy gated module does to any file
+    /// in the crate -- moves this number, so such a payload needs an edit here
+    /// too.
     ///
-    /// * A file that starts interleaving moves `INTERLEAVED_FILES` and moves
-    ///   `INTERLEAVED_GATES` by that file's whole gate count, so the two-edit
-    ///   route measured against the old name list -- payload plus one string
-    ///   -- now needs THREE edits.
-    /// * A decoy gated module appended to a file that already interleaves
-    ///   moves `INTERLEAVED_GATES` on its own, so the one-edit route measured
-    ///   inside `app.rs` now needs TWO.
+    /// # Why this number is pinned from ANOTHER FILE, and why the gate count
+    /// is gone
     ///
-    /// `INTERLEAVED_GATES` counts gates only in the interleaving files, not
-    /// crate-wide, so ordinary test-writing in the other fifty-eight files
-    /// never touches it.
+    /// The previous round pinned two integers, `INTERLEAVED_FILES` and
+    /// `INTERLEAVED_GATES`, and claimed that between them they made the escape
+    /// cost three edits. They did not. They were declared on two lines but
+    /// CONSUMED ON ONE -- `(INTERLEAVED_FILES, INTERLEAVED_GATES)` -- and a
+    /// single edit to that one line moved both. Measured: a `pub fn` plus a
+    /// decoy gated module appended to `vault_cache.rs`, and that one line
+    /// changed to `(INTERLEAVED_FILES + 1, INTERLEAVED_GATES + 2)`, SURVIVED
+    /// the whole suite at 2248 lib / 0 failed / 0 warnings and shipped three
+    /// times over in the lib's DEBUG LLVM IR. Two edits, both inside this
+    /// file. Only a pin OUTSIDE the file being edited costs a real second
+    /// edit, so the literal below is pinned by
+    /// `job_object::the_crate_wide_below_the_cut_guard_has_not_been_deleted`,
+    /// which reads this file as text and requires this exact declaration. That
+    /// route now costs three edits in two files.
+    ///
+    /// The gate count is DELETED rather than pinned from outside, because it
+    /// was red on ORDINARY WORK: appending a plain new test module to `app.rs`
+    /// -- no production code, no payload -- failed the suite with `carrying 13
+    /// gated modules; pinned at 3 files and 12 gates`, and the only way to make
+    /// the suite green again was to bump the number, which is byte-for-byte
+    /// the mutant edit. A guard that teaches the attacker's edit to everyone
+    /// who adds a test is a guard that gets weakened by whoever is in a hurry;
+    /// several holes in this crate were made exactly that way. Little is lost
+    /// by deleting it: what it defended against -- a decoy gated module
+    /// appended to a file so that a payload below it reads as ordinary
+    /// interleaving -- still moves `INTERLEAVED_FILES` on its own for the
+    /// fifty-eight files that do not interleave, and for the three that do it
+    /// never helped, because a payload planted in those files needs no decoy
+    /// at all (see this module's report).
     ///
     /// What membership still costs is stated in this module's report: in an
-    /// interleaving file the strict rule is not available, only the tail rule,
-    /// so a `pub fn` planted BETWEEN two of its test modules is not caught.
-    /// That region is ordinary mid-file production and is read as such; the
-    /// tail, which is the half nobody reads, is held in every file.
+    /// interleaving file the strict rule is not available, only the tail rule
+    /// and the closing-line rule, so a `pub fn` planted BETWEEN two of its
+    /// test modules is not caught. That region is ordinary mid-file production
+    /// and is read as such; the tail, which is the half nobody reads, is held
+    /// in every file -- and so, now, is the closing LINE of every gated module
+    /// in every file.
     const INTERLEAVED_FILES: usize = 3;
-    const INTERLEAVED_GATES: usize = 12;
 
     /// Every line of `source` as `(byte offset, line without its terminator)`.
     ///
@@ -1016,12 +1041,20 @@ mod every_file_in_the_crate {
     /// files did that when this rule was first measured. The cut is where the
     /// file's test HALF begins, so it is the gate of the first gated module.
     fn cut_index(source: &str) -> Option<usize> {
-        gate_offsets_opening_a_module(source).first().copied()
+        module_blocks(source).first().map(|b| b.gate_at)
     }
 
-    /// The offsets of every gate line in `source` that opens a column-0
-    /// module block, in order.
-    fn gate_offsets_opening_a_module(source: &str) -> Vec<usize> {
+    /// One gated, column-0 module block: where its gate line starts, and where
+    /// its `mod NAME {` line starts, with that line's text.
+    struct Block<'a> {
+        gate_at: usize,
+        opener_at: usize,
+        opener: &'a str,
+    }
+
+    /// Every gate line in `source` that opens a column-0 module block, in
+    /// order, with the opener it gates.
+    fn module_blocks(source: &str) -> Vec<Block<'_>> {
         let lines = numbered(source);
         let mut out = Vec::new();
         for (i, &(offset, line)) in lines.iter().enumerate() {
@@ -1034,13 +1067,93 @@ mod every_file_in_the_crate {
                 let t = l.trim();
                 !(t.is_empty() || t.starts_with("//") || is_lone_attribute(t))
             });
-            if let Some(&(_, l)) = opener {
+            if let Some(&(opener_at, l)) = opener {
                 if !l.starts_with(char::is_whitespace) && is_module_opener(l.trim()) {
-                    out.push(offset);
+                    out.push(Block { gate_at: offset, opener_at, opener: l });
                 }
             }
         }
         out
+    }
+
+    /// `true` when what follows a test module's closing brace ON ITS OWN LINE
+    /// cannot be source: nothing, a `//` comment, or one complete `/* .. */`
+    /// block comment.
+    ///
+    /// The block-comment arm is not a widening. A payload written inside a
+    /// block comment does not compile into anything, so it is not a payload;
+    /// what the arm buys is that `} /* inert */` -- legal, inert code -- no
+    /// longer reds. The check is deliberately not `starts_with("/*") &&
+    /// ends_with("*/")`, which would tolerate
+    /// `/* */ pub fn shipped() {} /* */`: the FIRST `*/` must be the end of
+    /// the line, so nothing outside a comment can follow.
+    fn after_close_is_inert(after: &str) -> bool {
+        after.is_empty()
+            || after.starts_with("//")
+            || (after.starts_with("/*")
+                && after.match_indices("*/").next().is_some_and(|(i, _)| i + 2 == after.len()))
+    }
+
+    /// **The closing LINE of every gated module in the file, read.**
+    ///
+    /// Returns how many closes were checked, or the reason one of them carries
+    /// source.
+    ///
+    /// # The hole this exists for
+    ///
+    /// [`walk`] reads the remainder of a module's closing brace line, and that
+    /// rule is sound -- where it runs. It did not run. In an INTERLEAVED file
+    /// (`app.rs`, `theme.rs`, `injector/sequence.rs`) the walk from the cut
+    /// aborts at the first [`TOP_LEVEL`] production line, so it never reaches
+    /// the closing-brace line of any module after that one, and [`verdict`]
+    /// then re-walks only from the LAST gate. Every non-last module close in
+    /// those three files -- nine of the crate's one hundred and sixty-one --
+    /// was read by nothing. Measured: `src/app.rs:1980`, the close of the
+    /// second of that file's five gated modules,
+    ///
+    /// ```text
+    /// }    ->    } pub fn shipped_eol_mid(x: u64) -> u64 { x.wrapping_mul(97) }
+    /// ```
+    ///
+    /// one line changed, no line added, brace balance unchanged, no edit to
+    /// this file at all: SURVIVED the whole suite in debug and release at 2247
+    /// lib / 217 bin / 6 ignored / 0 failed / 0 warnings, and appeared three
+    /// times in the lib's DEBUG LLVM IR. The byte-identical payload on the
+    /// LAST module's close was refused by [`CLOSING_LINE`], which is what a
+    /// rule that is right and unreached looks like.
+    ///
+    /// So this walk does not depend on where any other walk stops. It goes
+    /// straight to every gated module block in the file, brace-matches it, and
+    /// reads the tail of the line its real close sits on -- in EVERY file,
+    /// interleaved or not, for EVERY module rather than the last one.
+    fn closing_brace_lines_carry_no_source(
+        source: &str,
+        blocks: &[Block<'_>],
+    ) -> Result<usize, String> {
+        for block in blocks {
+            let Some(rel) = block.opener.rfind('{') else {
+                return Err(format!(
+                    "the module opener {:?} does not end in an opening brace",
+                    block.opener
+                ));
+            };
+            let after_at = match_brace(source, block.opener_at + rel) + 1;
+            let line_end = source[after_at..].find('\n').map_or(source.len(), |n| after_at + n);
+            let after = source[after_at..line_end].trim();
+            if !after_close_is_inert(after) {
+                return Err(format!(
+                    "{CLOSING_LINE}: {after:?} at byte {after_at}, sharing a line with the \
+                     `}}` that really closes the module opened at {:?}. Everything to the \
+                     right of a test module's closing brace is compiled into the shipped \
+                     binary and is the one place below a cut that no line walk looks at: \
+                     measured SURVIVING the whole suite in both profiles, on the close of a \
+                     MID-FILE module of an interleaved file, with three occurrences in the \
+                     lib's DEBUG LLVM IR. Move it above the test modules.",
+                    block.opener
+                ));
+            }
+        }
+        Ok(blocks.len())
     }
 
     /// Walk `region` -- a file from one of its cuts to EOF -- and require it
@@ -1087,6 +1200,14 @@ mod every_file_in_the_crate {
     /// The refusal carries [`CLOSING_LINE`] and not [`TOP_LEVEL`] on purpose.
     /// A [`TOP_LEVEL`] refusal is how an interleaving file is recognised, and
     /// is therefore tolerated in three files; this shape is tolerated nowhere.
+    ///
+    /// **This check here is the second reader of that line, not the only one.**
+    /// It runs only for the modules this walk REACHES, and the walk from a cut
+    /// stops at the first [`TOP_LEVEL`] line, so in an interleaved file it
+    /// reaches almost none of them -- which is how a payload on a mid-file
+    /// module's close shipped. Every module's closing line, in every file, is
+    /// read by [`closing_brace_lines_carry_no_source`] before this walk is
+    /// entered at all.
     fn walk(region: &str) -> Result<usize, String> {
         let mut gated = false;
         let mut modules = 0usize;
@@ -1125,7 +1246,7 @@ mod every_file_in_the_crate {
                 let line_end =
                     region[resume..].find('\n').map_or(region.len(), |n| resume + n);
                 let after = region[resume..line_end].trim();
-                if !(after.is_empty() || after.starts_with("//")) {
+                if !after_close_is_inert(after) {
                     return Err(format!(
                         "{CLOSING_LINE}: {after:?} at byte {resume} of the region, sharing a \
                          line with the `}}` that really closes the module opened at {line:?}. \
@@ -1222,6 +1343,11 @@ mod every_file_in_the_crate {
     struct Verdict {
         interleaved: bool,
         gates: usize,
+        /// How many module closing LINES were read in this file. Carried out
+        /// so the sweep can require it to equal `gates`: a closing-line check
+        /// that quietly read fewer closes than the file has modules is
+        /// exactly the defect this round was lost to.
+        closes_read: usize,
     }
 
     /// **The whole property, applied to one file's text.**
@@ -1238,7 +1364,11 @@ mod every_file_in_the_crate {
     /// entire purpose is that enumerations lose. There is no victim name here;
     /// the controls run over the derived set.
     fn verdict(source: &str) -> Result<Option<Verdict>, String> {
-        let Some(cut) = cut_index(source) else {
+        // The blocks are computed ONCE and handed to everything below. They
+        // used to be recomputed by `cut_index` and again per walk, per payload,
+        // per file.
+        let blocks = module_blocks(source);
+        let Some(cut) = blocks.first().map(|b| b.gate_at) else {
             return Ok(None);
         };
         if !(cut == 0 || source.as_bytes()[cut - 1] == b'\n') {
@@ -1246,11 +1376,16 @@ mod every_file_in_the_crate {
                         inside a comment or a string literal rather than at a real attribute"
                 .to_string());
         }
-        let offsets = gate_offsets_opening_a_module(source);
-        let gates = offsets.len();
+        let gates = blocks.len();
+        // FIRST, and for every module in the file rather than for whichever
+        // ones a walk happens to reach: nothing shares a line with a gated
+        // module's real closing brace. This refusal is never tolerated -- the
+        // interleaving branch below returns it unchanged, because no file in
+        // this crate legitimately writes source there.
+        let closes_read = closing_brace_lines_carry_no_source(source, &blocks)?;
         match walk(&source[cut..]) {
             Ok(0) => Err("the walk below the cut opened no module".to_string()),
-            Ok(_) => Ok(Some(Verdict { interleaved: false, gates })),
+            Ok(_) => Ok(Some(Verdict { interleaved: false, gates, closes_read })),
             Err(why) => {
                 // The file carries production below its FIRST test module.
                 // That is legal Rust and three files here do it deliberately;
@@ -1265,9 +1400,10 @@ mod every_file_in_the_crate {
                 // The tail -- the region below the LAST gated module, which is
                 // the half nobody reads and the half every measured payload
                 // landed in -- is walked under exactly the same rule.
-                let tail = *offsets
+                let tail = blocks
                     .last()
-                    .expect("the cut exists, so at least one gate opens a module");
+                    .expect("the cut exists, so at least one gate opens a module")
+                    .gate_at;
                 let modules = walk(&source[tail..]).map_err(|why| {
                     format!(
                         "below the LAST gated test module in this file -- the tail no guard \
@@ -1280,7 +1416,7 @@ mod every_file_in_the_crate {
                          than one, so the tail is not the last gate"
                     ));
                 }
-                Ok(Some(Verdict { interleaved: true, gates }))
+                Ok(Some(Verdict { interleaved: true, gates, closes_read }))
             }
         }
     }
@@ -1344,6 +1480,39 @@ mod every_file_in_the_crate {
                  about the indented close"
             );
             out.push(("a file-scope `pub fn` behind an indented module close", balanced));
+        }
+        // 5. The end-of-line payload on EVERY gated module's closing line, one
+        //    mutant per module, rather than only on the last one shape 3
+        //    reaches.
+        //
+        //    WHICH module the payload sits on decides whether anything reads
+        //    it, and neither the first nor the last is the dangerous site: the
+        //    walk from the cut reaches the FIRST module's close and the tail
+        //    walk reaches the LAST one, while a module in the MIDDLE of an
+        //    interleaved file is reached by neither -- the walk from the cut
+        //    aborts at the first production line above it and the tail walk
+        //    starts below it. Measured at `src/app.rs:1980`, the close of the
+        //    second of that file's five gated modules: SURVIVED the whole
+        //    suite in both profiles and shipped three times over in the debug
+        //    LLVM IR.
+        //
+        //    Planting on every module rather than on a computed "middle" one
+        //    is the point, and is measured: the first version of this shape
+        //    picked the FIRST module, and with it in place the check this
+        //    control exists to protect could be deleted in one edit and the
+        //    mid-file payload still SURVIVED at 2247 passed. A control that
+        //    picks a site is an enumeration of one site.
+        for block in module_blocks(source) {
+            let Some(rel) = block.opener.rfind('{') else {
+                continue;
+            };
+            let close = match_brace(source, block.opener_at + rel);
+            let mut mid = source.to_string();
+            mid.insert_str(
+                close + 1,
+                " pub fn shipped_eol_mid(x: u64) -> u64 { x.wrapping_mul(97) }",
+            );
+            out.push(("a `pub fn` sharing a line with a module's closing brace", mid));
         }
         out
     }
@@ -1428,8 +1597,8 @@ mod every_file_in_the_crate {
         // the three buckets and NONE of them is a skip.
         let mut with_cut = 0usize;
         let mut interleaved: Vec<String> = Vec::new();
-        let mut interleaved_gates = 0usize;
         let mut gates_seen = 0usize;
+        let mut closes_read = 0usize;
         for path in &files {
             let rel = relative(crate_dir, path);
             let source = std::fs::read_to_string(path)
@@ -1457,9 +1626,9 @@ mod every_file_in_the_crate {
             };
             with_cut += 1;
             gates_seen += found.gates;
+            closes_read += found.closes_read;
             if found.interleaved {
                 interleaved.push(rel.clone());
-                interleaved_gates += found.gates;
             }
         }
 
@@ -1475,6 +1644,17 @@ mod every_file_in_the_crate {
             "control: only {gates_seen} gated test modules were walked across the crate, \
              so the cut-finding rule has stopped finding cuts"
         );
+        // EVERY module's closing line was read, not the ones some walk
+        // happened to reach. The round this rule was added to lost nine of the
+        // crate's one hundred and sixty-one closing lines to a walk that
+        // aborted before them, so the count is compared rather than assumed.
+        assert_eq!(
+            closes_read, gates_seen,
+            "control: {gates_seen} gated test modules were found across the crate but only \
+             {closes_read} of their closing LINES were read. The remainder are the one place \
+             below a cut that nothing looks at, and a `pub fn` written there was measured \
+             surviving the whole suite and shipping in the lib's DEBUG LLVM IR"
+        );
 
         // ---- The interleaving set is PINNED, not enumerated.
         //
@@ -1487,16 +1667,18 @@ mod every_file_in_the_crate {
         // edit of a measured two-edit escape.
         interleaved.sort();
         assert_eq!(
-            (interleaved.len(), interleaved_gates),
-            (INTERLEAVED_FILES, INTERLEAVED_GATES),
-            "the files carrying production BELOW their first test module, or the number of \
-             gated test modules in them, have changed. Derived now: {interleaved:?} carrying \
-             {interleaved_gates} gated modules between them; pinned at {INTERLEAVED_FILES} \
-             files and {INTERLEAVED_GATES} gates. A file in this set gets the TAIL rule only, \
-             so a `pub fn` planted between two of its test modules is not caught -- which is \
-             why joining it, and why adding a gated module to a file already in it, both cost \
-             an edit here. If a file has newly joined, move its production above its test \
-             modules rather than moving this number."
+            interleaved.len(),
+            INTERLEAVED_FILES,
+            "the number of files carrying production BELOW their first test module has \
+             changed. Derived now: {interleaved:?}; pinned at {INTERLEAVED_FILES}. A file in \
+             this set gets the tail rule and the closing-line rule but not the strict one, so \
+             a `pub fn` planted between two of its test modules is not caught -- which is why \
+             joining the set costs an edit here, and a second one in `job_object.rs`, which \
+             pins this file's declaration of that number as text. If a file has newly joined, \
+             move its production above its test modules rather than moving this number. \
+             Adding a TEST to a file in this set moves nothing and must stay that way: the \
+             count of gated modules used to be pinned alongside this, it went red on ordinary \
+             test-writing, and its remedy was byte-for-byte the mutant's edit."
         );
 
         // ---- Liveness, over the DERIVED set, on every file's real bytes.
@@ -1550,10 +1732,23 @@ mod every_file_in_the_crate {
              the crate has no measured proof that this guard refuses anything in it"
         );
         assert!(
-            shapes >= 4 * 44,
+            shapes >= 4 * 44 + 130,
             "control: only {shapes} payload-shape pairs were measured across {live} files, so \
              some file silently offered fewer shapes than the four this crate has measured \
-             shipping"
+             shipping, or the closing-line payload was not planted on every module"
+        );
+        // EXACTLY four payloads per file with a cut, plus one per gated module
+        // in the crate -- the closing-line payload is planted on EVERY module,
+        // not on a chosen one. A shape that quietly stopped being generated
+        // for some file would otherwise leave that file's refusal unmeasured
+        // while the floor above stayed satisfied.
+        assert_eq!(
+            shapes,
+            4 * live + gates_seen,
+            "control: {shapes} payload-shape pairs were measured over {live} files carrying \
+             {gates_seen} gated modules between them, and the four whole-file shapes plus one \
+             closing-line payload per module come to {}. Some file offered fewer",
+            4 * live + gates_seen
         );
     }
 }

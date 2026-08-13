@@ -1635,6 +1635,27 @@ mod tests {
             // And the no-cut files must stay asserted about rather than
             // skipped: a silent skip is how thirty-five files were missed.
             "has no gated test module",
+            // Every gated module's CLOSING LINE must stay read, in every file
+            // and for every module rather than for the ones some walk reaches.
+            // That rule existed before and was simply never reached in the
+            // three interleaved files: a payload on the close of the second of
+            // `app.rs`'s five gated modules SURVIVED the whole suite in both
+            // profiles and shipped three times over in the debug LLVM IR.
+            "fn closing_brace_lines_carry_no_source(",
+            // THE PIN THAT COSTS THE SECOND EDIT. The set of files carrying
+            // production below their first test module is derived, and its
+            // SIZE is compared against this literal. It is pinned from HERE
+            // because a pin inside `below_cut.rs` costs nothing: the previous
+            // round's two integers were declared on two lines but consumed on
+            // one, and a payload plus that ONE line -- rewritten
+            // `(INTERLEAVED_FILES + 1, INTERLEAVED_GATES + 2)` -- was measured
+            // surviving the whole suite at 2248 lib / 0 failed / 0 warnings and
+            // shipping. Widening that set now means editing this file too. If
+            // a file legitimately starts interleaving, move its production
+            // above its test modules; if that is truly impossible, the number
+            // moves in two files and the second edit is this one, in a test
+            // that says out loud what is being widened.
+            "const INTERLEAVED_FILES: usize = 3;",
         ] {
             assert!(
                 source.contains(needle),
