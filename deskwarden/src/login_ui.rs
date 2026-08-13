@@ -6212,8 +6212,17 @@ pub(crate) mod password_lifetime_tests {
                         .filter(|s| !s.is_empty())
                         .map(<[u8]>::to_vec)
                         .collect::<Vec<Vec<u8>>>()
-                })
-                .unwrap_or_default()
+                })?
+            // **Not `unwrap_or_default()`.** That read a FAILED `ls-files
+            // --others` as "there is nothing untracked here", which is the
+            // third instance of the same smell as the `ls-tree` degradation
+            // below and the unchecked `check-ignore` in the scan: a producer
+            // that could not answer, silently reported as one that answered
+            // "none". It was covered -- `git status --porcelain -uall` is the
+            // untracked half's second producer and its subset assert would
+            // have fired -- but coverage by a sibling is not a reason to
+            // accept a silent failure, and the tracked half beside it has
+            // always failed loudly on the identical condition.
         };
         // **The INDEX MODE, asked directly -- because the on-disk marker the
         // shape predicate needs can be DELETED, and deleting it costs zero
@@ -6297,8 +6306,24 @@ pub(crate) mod password_lifetime_tests {
                 .args(["ls-tree", "-r", "-z", "HEAD"])
                 .output()
                 .ok()?;
-            let committed_records: &[u8] =
-                if committed.status.success() { &committed.stdout } else { &[] };
+            // **A nonzero exit is not an answer of "no gitlinks".** This used
+            // to degrade to `&[]`, which is the same shape as the
+            // `check-ignore` hole below: a producer that fails is read as a
+            // producer that found nothing, and the second opinion silently
+            // becomes one opinion. `ls-files -s` above covers this case, so
+            // this was never a hole on its own -- but a second opinion is not
+            // a reason to accept a silent failure, and the two producers are
+            // supposed to fail independently, not to cover for each other in
+            // silence. `None` is what the sibling `staged` producer already
+            // returns and it is loud at BOTH call sites: the probe scan
+            // panics on it (`the_probe_scan_requires_git`) and the fixture
+            // test `expect`s it. It cannot false-red an empty repository with
+            // no `HEAD` that the scan would otherwise accept, because that
+            // scan already panics on its own `ls-tree -r HEAD` producer.
+            if !committed.status.success() {
+                return None;
+            }
+            let committed_records: &[u8] = &committed.stdout;
             for record in staged
                 .stdout
                 .split(|b| *b == 0)
@@ -7870,13 +7895,66 @@ pub(crate) mod password_lifetime_tests {
                      git; see the panics above."
                 )
             });
-        let ignored_paths: Vec<&str> = ignored_raw
+        // **The excluded set has TWO producers too, and the block below is no
+        // longer conditional on either of them being non-empty.**
+        //
+        // The audit was wrapped in `if !ignored_paths.is_empty()`, so ANY
+        // edit that emptied this one list -- dropping `--ignored` from the
+        // arguments, mistyping the `"!! "` prefix -- skipped the whole
+        // attribution audit rather than failing it, and skipping it is
+        // exactly what an exclusion source wants. So a second, independently
+        // spelled question is asked (`ls-files --others --ignored`, plumbing
+        // rather than porcelain, with its own arguments at its own call site)
+        // and the two are UNIONED. They do not collapse ignored directories
+        // by the same rule -- measured on this tree, `status --ignored`
+        // reports `.superpowers/sdd/*` file by file where `ls-files
+        // --directory` collapses it to `.superpowers/` -- so this is not a
+        // set-equality check, it is two overlapping views both of which must
+        // attribute to a tracked `.gitignore`. Emptying one no longer empties
+        // the audit.
+        //
+        // **Bytes, not `&str`.** These were `filter_map(from_utf8().ok())`,
+        // which silently DROPPED any non-UTF-8 path -- a silent skip in a
+        // test whose whole design is that nothing is skipped in silence, and
+        // one that a deliberately non-UTF-8 filename could aim. `check-ignore
+        // -z --stdin` takes bytes and gives them back, so nothing here needs
+        // to decode a path at all.
+        let ignored_second_raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the_probe_scan_requires_git: `git ls-files --others --ignored` could not \
+                     enumerate {root:?}, so the excluded set has no second opinion and one \
+                     edit emptying `git status --ignored` would skip the attribution audit \
+                     entirely. This test does not run without git; see the panics above."
+                )
+            });
+        let mut ignored_paths: Vec<&[u8]> = Vec::new();
+        for path in ignored_raw
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
             .filter_map(|record| record.strip_prefix(b"!! ".as_slice()))
-            .filter_map(|rest| std::str::from_utf8(rest).ok())
-            .collect();
-        if !ignored_paths.is_empty() {
+            .chain(ignored_second_raw.split(|b| *b == 0).filter(|s| !s.is_empty()))
+        {
+            if !ignored_paths.contains(&path) {
+                ignored_paths.push(path);
+            }
+        }
+        {
             use std::io::Write as _;
 
             // **The path list goes through a FILE, not through a pipe, and
@@ -7894,7 +7972,7 @@ pub(crate) mod password_lifetime_tests {
                 .join(format!("deskwarden-probe-scan-excluded-{}.lst", std::process::id()));
             let feed: Vec<u8> = ignored_paths
                 .iter()
-                .flat_map(|rel| rel.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+                .flat_map(|rel| rel.iter().copied().chain(std::iter::once(0u8)))
                 .collect();
             std::fs::File::create(&feed_path)
                 .and_then(|mut file| file.write_all(&feed))
@@ -7926,6 +8004,53 @@ pub(crate) mod password_lifetime_tests {
             // Best-effort: a leftover list in the temp directory is litter,
             // not a hole, and failing the scan over it would be a false red.
             let _ = std::fs::remove_file(&feed_path);
+            // **THE EXIT STATUS, CHECKED -- and this was the hole.**
+            //
+            // Nothing here looked at `out.status`, on the reasoning written
+            // above that "`check-ignore` exits 1 when nothing it was given is
+            // ignored, which is a normal answer and not a failure". That
+            // sentence is true and the conclusion drawn from it was not: it
+            // licensed ignoring EVERY nonzero exit, not just the one that
+            // means "none". A `check-ignore` that FAILS prints nothing, and
+            // empty stdout satisfied both guards below vacuously -- zero
+            // records is a whole number of four-field records, and no records
+            // means no foreign source. Measured at ONE edit: appending
+            // `"--no-such-flag"` to the arguments above makes git exit 129
+            // with empty stdout, and with a real probe in a file hidden by a
+            // `.git/info/exclude` line the test came back `ok. 1 passed` with
+            // the probe unseen, in debug AND in release, while the same
+            // binary with the exclusion emptied was KILLED. On a clean tree
+            // the mutant is green, so it needs no accompanying diff to look
+            // innocent.
+            //
+            // Every other child in this test already panics on a nonzero
+            // exit; this one had `unwrap_or_else` on the SPAWN error only.
+            // And unlike the gitlink producers it has no second opinion about
+            // its own answer: the entire `info/exclude` + `core.excludesFile`
+            // + untracked-`.gitignore` defence hangs off this one child. It
+            // also made the disclosed `git.exe`-wrapper boundary strictly
+            // cheaper, because a wrapper only had to make this call FAIL, not
+            // lie.
+            //
+            // Two asserts, because a total failure and a PARTIAL one are
+            // different shapes and git produces both: confirmed at the git
+            // level that `check-ignore` truncates its stdout mid-stream and
+            // exits 128 on a bad path, so a half-written answer is real.
+            // First the status: 0 means at least one given path is ignored, 1
+            // means none of them is, and those two are the only answers this
+            // parser is entitled to read.
+            assert!(
+                matches!(out.status.code(), Some(0 | 1)),
+                "the_probe_scan_requires_git: `git check-ignore -v -z --stdin` exited {:?} for \
+                 the {} excluded path(s) in {root:?}, which is neither 0 (some given path is \
+                 ignored) nor 1 (none is). A failing `check-ignore` prints NOTHING, and an \
+                 empty answer satisfies both of the checks below vacuously -- so this is the \
+                 whole `.git/info/exclude` / `core.excludesFile` / untracked-`.gitignore` \
+                 defence going inert while the test reports green. It is a failure, not an \
+                 answer.",
+                out.status.code(),
+                ignored_paths.len()
+            );
             // Four NUL-separated fields per record: source, line, pattern,
             // pathname. Anything that does not come in fours is a format this
             // parser does not understand, and an unparsed answer is not a
@@ -7946,6 +8071,45 @@ pub(crate) mod password_lifetime_tests {
                 fields.len(),
                 ignored_paths.len()
             );
+            // **And then the COUNT, because a partial answer is the shape
+            // this command actually produces.** Every path fed in came from a
+            // producer that already called it excluded, so `check-ignore`
+            // owes exactly one record for each -- and a truncated answer,
+            // which git writes when it dies mid-stream, would otherwise leave
+            // the unreported tail unaudited while every remaining record
+            // looked perfectly legitimate. This is the assert that catches a
+            // 128-with-partial-stdout; the status assert above catches a
+            // 129-with-nothing.
+            assert!(
+                fields.len() == ignored_paths.len() * 4,
+                "the_probe_scan_requires_git: `git check-ignore -v -z` returned {} record(s) \
+                 for the {} excluded path(s) it was given in {root:?}. Every path fed to it \
+                 came from a producer that had already called it excluded, so a short answer \
+                 is a TRUNCATED answer -- git writes exactly that, stdout cut mid-stream, when \
+                 it dies part-way through -- and the paths it never got to are then excluded \
+                 by a source nothing has checked. A partial answer is not an answer that the \
+                 exclusion sources were legitimate.",
+                fields.len() / 4,
+                ignored_paths.len()
+            );
+            // The legitimate sources, by RELATIVE path and unfiltered by
+            // `is_file`. Both of those used to be wrong in the same
+            // direction, as false reds rather than as holes: the comparison
+            // was `PathBuf` equality against `cached`, which is (a) filtered
+            // by `.is_file()`, so deleting a tracked `.gitignore` from disk
+            // while git still honours the committed copy made it "not
+            // legitimate", and (b) lexically exact, so a tracked
+            // `Docs/.gitignore` reported by `check-ignore` as `docs/.gitignore`
+            // -- the same file on this platform -- red-lined the suite.
+            // Comparing the relative spellings case-insensitively is right on
+            // Windows, where this ships, and on a case-sensitive filesystem
+            // it widens the accepted set only to sibling paths that git would
+            // itself have to be tracking.
+            let cached_rel: Vec<String> = cached_raw
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|raw| String::from_utf8_lossy(raw).replace('\\', "/").to_ascii_lowercase())
+                .collect();
             let mut foreign: Vec<String> = Vec::new();
             for record in fields.chunks(4) {
                 let source = String::from_utf8_lossy(record[0]).into_owned();
@@ -7960,10 +8124,11 @@ pub(crate) mod password_lifetime_tests {
                 // that would otherwise be a one-file, no-diff bypass wearing a
                 // legitimate name.
                 let as_path = root.join(&source);
+                let source_rel = source.replace('\\', "/").to_ascii_lowercase();
                 let legitimate = std::path::Path::new(&source).file_name()
                     == Some(std::ffi::OsStr::new(".gitignore"))
                     && as_path.starts_with(&root)
-                    && cached.iter().any(|tracked| *tracked == as_path);
+                    && cached_rel.iter().any(|tracked| *tracked == source_rel);
                 if !legitimate {
                     foreign.push(format!("{source} (excluding {pathname})"));
                 }
