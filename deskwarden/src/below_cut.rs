@@ -934,134 +934,17 @@ pub(crate) mod every_file_in_the_crate {
     const GATE: &str = concat!("#[cfg", "(test)]");
 
     /// The opening words of the refusal that says an item sits at file scope
-    /// below a cut. Interleaved files are recognised by it, so it is spelled
-    /// once rather than at every comparison.
+    /// below a cut. [`verdict`] re-words that one refusal into the "this file
+    /// interleaves" message, so it is spelled once rather than at every
+    /// comparison.
     const TOP_LEVEL: &str = "top-level source below the cut";
 
     /// The opening words of the refusal that says something shares a line with
-    /// a test module's closing brace. Deliberately a DIFFERENT prefix from
-    /// [`TOP_LEVEL`]: interleaving tolerates the latter and must never
-    /// tolerate this one. See [`walk`].
+    /// a test module's closing brace. A DIFFERENT prefix from [`TOP_LEVEL`]
+    /// because the two are re-worded differently -- not because either is
+    /// tolerated. Neither is, and there is no longer any tolerance to grant.
+    /// See [`walk`].
     const CLOSING_LINE: &str = "source on the line that closes a test module below the cut";
-
-    /// How many files carry production code BELOW their first gated test
-    /// module.
-    ///
-    /// **This is a pin, not a list.** The set itself is derived from the tree
-    /// and its members are named in the failure message, but nothing here
-    /// names a file, because every previous round in this area was lost by an
-    /// enumeration that could be widened by spelling one more name. What a pin
-    /// buys is cost, and cost is all it buys: a file that starts interleaving
-    /// -- which is what a payload plus a decoy gated module does to any file
-    /// in the crate -- moves this number, so such a payload needs an edit here
-    /// too.
-    ///
-    /// # Why this number is DECLARED in another file rather than pinned as
-    /// text, and why the gate count is gone
-    ///
-    /// The previous round pinned two integers, `INTERLEAVED_FILES` and
-    /// `INTERLEAVED_GATES`, and claimed that between them they made the escape
-    /// cost three edits. They did not. They were declared on two lines but
-    /// CONSUMED ON ONE -- `(INTERLEAVED_FILES, INTERLEAVED_GATES)` -- and a
-    /// single edit to that one line moved both. Measured: a `pub fn` plus a
-    /// decoy gated module appended to `vault_cache.rs`, and that one line
-    /// changed to `(INTERLEAVED_FILES + 1, INTERLEAVED_GATES + 2)`, SURVIVED
-    /// the whole suite at 2248 lib / 0 failed / 0 warnings and shipped three
-    /// times over in the lib's DEBUG LLVM IR.
-    ///
-    /// The round after that kept the literal HERE and had `job_object.rs` look
-    /// for its text with
-    /// `source.contains("const INTERLEAVED_FILES: usize = 3;")`, claiming
-    /// "three edits in two files". `contains` is satisfied by the text
-    /// appearing anywhere, so one line --
-    /// `const INTERLEAVED_FILES: usize = 4; // was: const INTERLEAVED_FILES: usize = 3;`
-    /// -- satisfied the pin and moved the number at the same time. Measured
-    /// with the same `vault_cache.rs` payload: SURVIVED in debug AND release at
-    /// 2249 lib / 217 bin / 6 ignored / 0 failed / 0 warnings, three
-    /// occurrences in the lib's DEBUG LLVM IR. Liveness at the identical site,
-    /// payload alone with this file pristine: KILLED, naming the newly derived
-    /// fourth file. The outside pin had added ZERO edits. That was the eighth
-    /// text-pin loss in this repository.
-    ///
-    /// A pin an attacker can satisfy with a comment is decoration, and no
-    /// amount of `contains` fixes that -- eight rounds here have now been lost
-    /// to exactly one weakness in exactly one direction. So there is no text
-    /// pin at all any more.
-    ///
-    /// What costs a second edit is a second HOLDER, and what makes a holder
-    /// real is that it derives the same quantity for itself and compares it
-    /// against a number of its own. `job_object.rs` declares its own
-    /// `INTERLEAVED_FILES`, calls [`interleaved_files`] -- the same derivation
-    /// the sweep below uses, reached across the module boundary so the compiler
-    /// enforces that it still exists -- and asserts the size against its own
-    /// literal. The two numbers are INDEPENDENT: nothing imports anything, so
-    /// moving the set means editing this line AND that one. Three edits in two
-    /// files, and neither of the two is a string another file greps for.
-    ///
-    /// This does not red on ordinary work. The number moves only when a file
-    /// starts carrying production below its first test module, which adding a
-    /// test never does and adding a new source file never does -- unlike the
-    /// deleted gate count, whose remedy for ordinary test-writing was
-    /// byte-for-byte the mutant's edit.
-    ///
-    /// Read the honest boundary at the foot of this module for what remains.
-    ///
-    /// The gate count is DELETED rather than pinned from outside, because it
-    /// was red on ORDINARY WORK: appending a plain new test module to `app.rs`
-    /// -- no production code, no payload -- failed the suite with `carrying 13
-    /// gated modules; pinned at 3 files and 12 gates`, and the only way to make
-    /// the suite green again was to bump the number, which is byte-for-byte
-    /// the mutant edit. A guard that teaches the attacker's edit to everyone
-    /// who adds a test is a guard that gets weakened by whoever is in a hurry;
-    /// several holes in this crate were made exactly that way. Little is lost
-    /// by deleting it: what it defended against -- a decoy gated module
-    /// appended to a file so that a payload below it reads as ordinary
-    /// interleaving -- still moves `INTERLEAVED_FILES` on its own for the
-    /// fifty-eight files that do not interleave, and for the three that do it
-    /// never helped, because a payload planted in those files needs no decoy
-    /// at all (see this module's report).
-    ///
-    /// What membership still costs is stated in this module's report: in an
-    /// interleaving file the strict rule is not available, only the tail rule
-    /// and the closing-line rule, so a `pub fn` planted BETWEEN two of its
-    /// test modules is not caught. That region is ordinary mid-file production
-    /// and is read as such; the tail, which is the half nobody reads, is held
-    /// in every file -- and so, now, is the closing LINE of every gated module
-    /// in every file.
-    const INTERLEAVED_FILES: usize = 3;
-
-    /// **The interleaving set, derived, for the second holder to check.**
-    ///
-    /// `job_object::the_interleaving_set_is_still_three_files` calls this and
-    /// compares its size against `job_object`'s OWN copy of the number. That is
-    /// what makes the count cost a real second edit: two files each derive the
-    /// set and each compare it against a literal they own, so widening it means
-    /// changing a number in both. The previous round tried to buy the same
-    /// thing with `source.contains("const INTERLEAVED_FILES: usize = 3;")` from
-    /// `job_object.rs` and bought nothing at all -- see [`INTERLEAVED_FILES`].
-    ///
-    /// It is the SAME derivation the sweep uses, not a second implementation of
-    /// it: the sweep asserts its own list equals this one, so a divergence
-    /// between the two reds rather than quietly leaving the second holder
-    /// checking something else.
-    pub(crate) fn interleaved_files() -> Vec<String> {
-        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        rust_sources(crate_dir, &mut files);
-        files.sort();
-        let mut out = Vec::new();
-        for path in &files {
-            let rel = relative(crate_dir, path);
-            let source = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("{rel} is readable to be walked: {e}"));
-            let found = verdict(&source).unwrap_or_else(|why| panic!("{rel}: {why}"));
-            if found.is_some_and(|v| v.interleaved) {
-                out.push(rel);
-            }
-        }
-        out.sort();
-        out
-    }
 
     /// Every line of `source` as `(byte offset, line without its terminator)`.
     ///
@@ -1272,6 +1155,66 @@ pub(crate) mod every_file_in_the_crate {
         assert_eq!(closing_brace_lines_carry_no_source(source, &[]), Ok(0));
     }
 
+    /// **A file that interleaves is REFUSED, not counted.**
+    ///
+    /// This is the property that replaced the interleaving tolerance, and it
+    /// is measured here rather than only at the end of the crate-wide sweep,
+    /// because the sweep can only see it if some real file is shaped that way
+    /// -- and after this round none is. A guard whose refusal branch no
+    /// tree ever reaches is a guard that can be deleted in one edit with the
+    /// suite still green, which is exactly how the previous rule in this area
+    /// was lost.
+    ///
+    /// Synthetic, local and cheap, and driven through the SAME [`verdict`]
+    /// the sweep drives, so weakening the rule to bring back a tolerance --
+    /// swallowing the [`TOP_LEVEL`] refusal, walking only the tail, returning
+    /// `Ok` for the interleaving shape -- reds here immediately.
+    #[test]
+    fn an_interleaving_file_is_refused_rather_than_tolerated() {
+        // Production BETWEEN two gated modules: the exact shape the three
+        // exempted files had, and the region a measured `pub fn` shipped out
+        // of this crate from.
+        let interleaving = concat!(
+            "fn above() {}\n",
+            "#[cfg", "(test)]\nmod a {\n    #[test]\n    fn t() {}\n}\n",
+            "pub fn shipped_between(x: u64) -> u64 { x.wrapping_mul(97) }\n",
+            "#[cfg", "(test)]\nmod b {\n    #[test]\n    fn t() {}\n}\n",
+        );
+        let Err(why) = verdict(interleaving) else {
+            panic!(
+                "an interleaving file was ACCEPTED, so the tolerance this round deleted is \
+                 back and a `pub fn` between two gated modules ships again"
+            );
+        };
+        assert!(
+            why.contains("shipped_between"),
+            "the refusal does not name the item that ships, so it is refusing something \
+             else: {why}"
+        );
+        assert!(
+            why.contains("INTERLEAVES"),
+            "the refusal does not tell the reader what is wrong with the file's SHAPE, which \
+             is the whole remedy: {why}"
+        );
+
+        // Positive control at the identical site: the same bytes with the
+        // first module moved below the production line -- the pure relocation
+        // this round applied to `app.rs`, `theme.rs` and
+        // `injector/sequence.rs` -- is ACCEPTED. Without this, a `verdict`
+        // that refused every file would pass the assertion above.
+        let reordered = concat!(
+            "fn above() {}\n",
+            "pub fn shipped_between(x: u64) -> u64 { x.wrapping_mul(97) }\n",
+            "#[cfg", "(test)]\nmod a {\n    #[test]\n    fn t() {}\n}\n",
+            "#[cfg", "(test)]\nmod b {\n    #[test]\n    fn t() {}\n}\n",
+        );
+        let found = verdict(reordered)
+            .expect("the reordered file is the shape every file in this crate now has")
+            .expect("the reordered fixture has a cut");
+        assert_eq!(found.gates, 2, "control: the fixture does not carry two gated modules");
+        assert_eq!(found.closes_read, 2, "control: both closing lines must still be read");
+    }
+
     /// Walk `region` -- a file from one of its cuts to EOF -- and require it
     /// to be a sequence of gated, column-0 module blocks and nothing else.
     ///
@@ -1454,10 +1397,13 @@ pub(crate) mod every_file_in_the_crate {
             .replace('\\', "/")
     }
 
-    /// What the property says about one file's TEXT: whether it interleaves,
-    /// and how many gated module blocks it carries.
+    /// What the property says about one file's TEXT: how many gated module
+    /// blocks it carries, and how many of their closing lines were read.
+    ///
+    /// **There is no `interleaved` flag any more.** A file that carries
+    /// production between two of its gated test modules is now a REFUSAL, not
+    /// a second kind of verdict -- see [`verdict`].
     struct Verdict {
-        interleaved: bool,
         gates: usize,
         /// How many module closing LINES were read in this file. Carried out
         /// so the sweep can require it to equal `gates`: a closing-line check
@@ -1495,45 +1441,26 @@ pub(crate) mod every_file_in_the_crate {
         let gates = blocks.len();
         // FIRST, and for every module in the file rather than for whichever
         // ones a walk happens to reach: nothing shares a line with a gated
-        // module's real closing brace. This refusal is never tolerated -- the
-        // interleaving branch below returns it unchanged, because no file in
-        // this crate legitimately writes source there.
+        // module's real closing brace.
         let closes_read = closing_brace_lines_carry_no_source(source, &blocks)?;
         match walk(&source[cut..]) {
             Ok(0) => Err("the walk below the cut opened no module".to_string()),
-            Ok(_) => Ok(Some(Verdict { interleaved: false, gates, closes_read })),
-            Err(why) => {
-                // The file carries production below its FIRST test module.
-                // That is legal Rust and three files here do it deliberately;
-                // it is not licence to stop reading the file, and it is not
-                // licence for every other refusal either. Only the file-scope
-                // item refusal means "interleaved" -- an item sharing a line
-                // with a module's closing brace is refused in every file,
-                // interleaving or not, because no file legitimately does that.
-                if !why.starts_with(TOP_LEVEL) {
-                    return Err(why);
-                }
-                // The tail -- the region below the LAST gated module, which is
-                // the half nobody reads and the half every measured payload
-                // landed in -- is walked under exactly the same rule.
-                let tail = blocks
-                    .last()
-                    .expect("the cut exists, so at least one gate opens a module")
-                    .gate_at;
-                let modules = walk(&source[tail..]).map_err(|why| {
-                    format!(
-                        "below the LAST gated test module in this file -- the tail no guard \
-                         in this crate reads -- {why}"
-                    )
-                })?;
-                if modules != 1 {
-                    return Err(format!(
-                        "control: the walk from the LAST gate opened {modules} modules rather \
-                         than one, so the tail is not the last gate"
-                    ));
-                }
-                Ok(Some(Verdict { interleaved: true, gates, closes_read }))
-            }
+            Ok(_) => Ok(Some(Verdict { gates, closes_read })),
+            // **The strict walk is the whole rule now.** There is no
+            // interleaving tolerance: every file's production lives above its
+            // first gated test module and everything from that module to EOF
+            // is gated test modules and nothing else. A file that violates
+            // that reds here, naming itself, rather than being counted into a
+            // set that merely priced the exemption.
+            Err(why) if why.starts_with(TOP_LEVEL) => Err(format!(
+                "{why} -- so this file INTERLEAVES: it carries production code BETWEEN two of \
+                 its gated test modules. That region is read by nothing, and a `pub fn` \
+                 written in it was measured shipping in this crate's debug LLVM IR. Move ALL \
+                 of this file's production ABOVE its first `#[cfg(test)]` module; relocating \
+                 a test module is a pure move and changes no behaviour. There is no longer a \
+                 set of tolerated files to join, and adding one is not the fix"
+            )),
+            Err(why) => Err(why),
         }
     }
 
@@ -1710,9 +1637,12 @@ pub(crate) mod every_file_in_the_crate {
         }
 
         // ---- The property, file by file. Every file lands in exactly one of
-        // the three buckets and NONE of them is a skip.
+        // the two buckets -- a cut, or no cut -- and NEITHER of them is a
+        // skip. There is no third bucket any more: the interleaving one was
+        // deleted along with the three files that were in it. A file that
+        // carries production between two of its gated modules is refused by
+        // `verdict` and panics here, naming itself.
         let mut with_cut = 0usize;
-        let mut interleaved: Vec<String> = Vec::new();
         let mut gates_seen = 0usize;
         let mut closes_read = 0usize;
         for path in &files {
@@ -1743,9 +1673,6 @@ pub(crate) mod every_file_in_the_crate {
             with_cut += 1;
             gates_seen += found.gates;
             closes_read += found.closes_read;
-            if found.interleaved {
-                interleaved.push(rel.clone());
-            }
         }
 
         // ---- Non-vacuity of the WALK.
@@ -1781,43 +1708,30 @@ pub(crate) mod every_file_in_the_crate {
              surviving the whole suite and shipping in the lib's DEBUG LLVM IR"
         );
 
-        // ---- The interleaving set is PINNED, not enumerated.
+        // ---- **AND NO FILE INTERLEAVES.**
         //
-        // Nothing here names a file. The set is derived from the tree and its
-        // members are printed so a reader of a red run learns which file
-        // moved, but what is COMPARED is two integers -- see
-        // `INTERLEAVED_FILES` for why, and for what each of them costs an
-        // attacker. The old form of this assertion compared a written array of
-        // three paths, and a fourth string added to it was the entire second
-        // edit of a measured two-edit escape.
-        interleaved.sort();
-        // The exported derivation the SECOND holder in `job_object.rs` reads is
-        // this same set. If the two ever diverge, that holder is checking
-        // something other than what this test found, and its literal stops
-        // being a second edit for anybody.
-        assert_eq!(
-            interleaved,
-            interleaved_files(),
-            "the interleaving set this sweep derived and the one `interleaved_files` exports \
-             for `job_object.rs` to check are different sets, so the second holder of this \
-             number is guarding something else"
-        );
-        assert_eq!(
-            interleaved.len(),
-            INTERLEAVED_FILES,
-            "the number of files carrying production BELOW their first test module has \
-             changed. Derived now: {interleaved:?}; pinned at {INTERLEAVED_FILES}. A file in \
-             this set gets the tail rule and the closing-line rule but not the strict one, so \
-             a `pub fn` planted between two of its test modules is not caught -- which is why \
-             joining the set costs an edit here, and a SECOND one in `job_object.rs`, which \
-             derives the same set through `interleaved_files` and compares it against a \
-             literal of its own. Neither number is text the other file greps for; the round \
-             that tried that was beaten by a trailing comment. If a file has newly joined, \
-             move its production above its test modules rather than moving this number. \
-             Adding a TEST to a file in this set moves nothing and must stay that way: the \
-             count of gated modules used to be pinned alongside this, it went red on ordinary \
-             test-writing, and its remedy was byte-for-byte the mutant's edit."
-        );
+        // There is no number to compare here, and that is the point. A file
+        // that carries production BETWEEN two of its gated test modules is
+        // refused by `verdict`, so the loop above has already panicked naming
+        // that file. The rule is now the same one for every file in the
+        // crate: production above the first `#[cfg(test)]` module, gated test
+        // modules from there to EOF, nothing else.
+        //
+        // What this replaced: a derived `INTERLEAVED_FILES` set of three, a
+        // second holder of that number in `job_object.rs`, and a special case
+        // in this walk -- machinery whose entire product was a PRICE for an
+        // exemption. `app.rs`, `theme.rs` and `injector/sequence.rs` were the
+        // set; each had its offending test modules relocated below its
+        // production (a pure move -- no production line changed), so the set
+        // is empty and the exemption is gone. With no tolerance left to buy,
+        // the three-edit escape that machinery funded -- payload, plus a
+        // decoy gated module, plus both numbers -- has nothing to pay for: a
+        // decoy gated module no longer makes a file exempt, it makes it RED.
+        //
+        // Held non-vacuously by
+        // `an_interleaving_file_is_refused_rather_than_tolerated`, which
+        // drives this same `verdict` over a synthetic file that interleaves
+        // and over the same file with its test module moved.
 
         // ---- Liveness, over the DERIVED set, on every file's real bytes.
         //
@@ -1895,31 +1809,27 @@ pub(crate) mod every_file_in_the_crate {
     /// Written down rather than implied, because every round in this area has
     /// been lost to a cost that was claimed and not measured.
     ///
-    /// * **Three edits, any of the fifty-eight non-interleaving files.** Append
-    ///   `pub fn shipped(..) {..}` and a decoy `#[cfg(test)] mod d {}` to a file
-    ///   (edit one); move [`INTERLEAVED_FILES`] here from 3 to 4 (edit two);
-    ///   move `job_object`'s own copy from 3 to 4 (edit three, second file).
-    ///   The decoy makes the file interleave, so only the tail rule and the
-    ///   closing-line rule apply and the `pub fn` above the decoy is read by
-    ///   nothing. Two edits bought this before -- the outside "pin" was a
-    ///   `contains` a trailing comment satisfied, so the second file was free.
+    /// * **The decoy-module escape is GONE, at any price.** It used to cost
+    ///   three edits: `pub fn shipped(..) {..}` plus a decoy
+    ///   `#[cfg(test)] mod d {}` appended to a file (edit one), then
+    ///   `INTERLEAVED_FILES` here from 3 to 4 (edit two) and `job_object`'s own
+    ///   copy from 3 to 4 (edit three, second file). The decoy worked because
+    ///   it made the file INTERLEAVE, and interleaving was tolerated at a
+    ///   price. It is no longer tolerated at any price: the tolerance, both
+    ///   holders of the number, and the special case in the walk are deleted,
+    ///   so the decoy now just makes the file red. There is nothing left to
+    ///   pay, and so nothing left to buy.
     ///
-    ///   The count is still ONLY a cost, not a refusal: an attacker willing to
-    ///   spend three edits gets through. Closing it properly needs the
-    ///   interleaving set to be self-declaring -- each interleaving file
-    ///   carrying a marker in its own header, so a file cannot join the set at
-    ///   all without an edit in the file being attacked. That costs an edit in
-    ///   three files outside this module and was out of scope for this round.
-    ///
-    /// * **One edit, `app.rs`, `theme.rs`, `injector/sequence.rs`.** These
-    ///   three interleave legitimately, so the strict rule is not available for
-    ///   them: a `pub fn` written at file scope BETWEEN two of their gated
-    ///   modules is ordinary mid-file production as far as this walk is
-    ///   concerned. The region is roughly 4,343 lines -- `app.rs` 664..2557,
-    ///   `theme.rs` 1707..3005, `injector/sequence.rs` 839..1991. (An earlier
-    ///   note put this at "~5,300"; that was overstated.) The tail of those
-    ///   files, and the closing LINE of every one of their modules, are held.
-    ///   The byte-identical shape in a non-interleaved file is KILLED.
+    /// * **No file is exempt.** `app.rs`, `theme.rs` and
+    ///   `injector/sequence.rs` were the three that interleaved, and a
+    ///   one-edit column-0 `pub fn` planted in their mid-file regions --
+    ///   roughly 4,343 lines between them, `app.rs` 664..2557, `theme.rs`
+    ///   1707..3005, `injector/sequence.rs` 839..1991 -- was measured
+    ///   SURVIVING the whole suite in both profiles and shipping three times
+    ///   over in the lib's debug LLVM IR. Each file's offending test modules
+    ///   were relocated below its production, verbatim and with no production
+    ///   line changed; those same plants are now KILLED. Every file in the
+    ///   crate is held from its first gate to EOF by the strict rule.
     ///
     /// * **Nothing below one edit.** Every whole-file shape measured shipping
     ///   out of this crate -- column-0 append, attribute-shared line,

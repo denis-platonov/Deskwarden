@@ -1697,223 +1697,6 @@ pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
     response
 }
 
-/// Finds the icons above in a frame's shape list, for tests that can no
-/// longer look them up by a painted string because they paint none.
-///
-/// Deliberately in this module: the identifying features are the vertex
-/// counts and the dot radius declared right above, and a test in another
-/// file that spelled them out again would keep passing against a retuned
-/// shape it had stopped finding.
-#[cfg(test)]
-pub mod icon_probe {
-    use super::*;
-
-    fn walk(shape: &egui::Shape, out: &mut Vec<Rect>, keep: &dyn Fn(&egui::Shape) -> bool) {
-        if keep(shape) {
-            out.push(shape.visual_bounding_rect());
-        }
-        if let egui::Shape::Vec(shapes) = shape {
-            for shape in shapes {
-                walk(shape, out, keep);
-            }
-        }
-    }
-
-    fn closed_paths(shape: &egui::Shape, vertices: usize) -> Vec<Rect> {
-        let mut out = Vec::new();
-        walk(shape, &mut out, &|s| {
-            matches!(s, egui::Shape::Path(p) if p.closed && p.points.len() == vertices)
-        });
-        out
-    }
-
-    /// One favourite star: where it is, what colour it was stroked in, and
-    /// whether it is FILLED -- which is the whole visible difference between
-    /// a favourited item and one that is not.
-    #[derive(Debug, Clone, Copy)]
-    pub struct Star {
-        pub rect: Rect,
-        pub stroke: Color32,
-        pub filled: bool,
-    }
-
-    /// The favourite stars this shape tree paints, in both states -- the
-    /// filled star carries the same outline the outlined one does, plus the
-    /// triangle fan that fills it (see `paint_star`).
-    pub fn stars(shape: &egui::Shape) -> Vec<Star> {
-        let mut triangles = Vec::new();
-        walk(shape, &mut triangles, &|s| {
-            matches!(s, egui::Shape::Path(p) if p.points.len() == 3 && p.fill != Color32::TRANSPARENT)
-        });
-        let mut strokes = Vec::new();
-        walk_paths(shape, STAR_VERTICES, &mut strokes);
-        strokes
-            .into_iter()
-            .map(|(rect, stroke)| Star {
-                rect,
-                stroke,
-                filled: triangles.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
-            })
-            .collect()
-    }
-
-    fn walk_paths(shape: &egui::Shape, vertices: usize, out: &mut Vec<(Rect, Color32)>) {
-        match shape {
-            egui::Shape::Path(p) if p.closed && p.points.len() == vertices => {
-                let color = match p.stroke.color {
-                    egui::epaint::ColorMode::Solid(color) => color,
-                    // Nothing here paints a gradient stroke; if something
-                    // starts to, this should be looked at rather than
-                    // silently reported as transparent.
-                    egui::epaint::ColorMode::UV(_) => Color32::TRANSPARENT,
-                };
-                out.push((shape.visual_bounding_rect(), color));
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    walk_paths(shape, vertices, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The reveal eyes this shape tree paints, in both states -- the strike
-    /// is a separate segment, so the almond is found either way.
-    pub fn eyes(shape: &egui::Shape) -> Vec<Rect> {
-        closed_paths(shape, EYE_VERTICES)
-    }
-
-    /// The Preferences tune icons this shape tree paints, each as the union
-    /// of its knobs, with the colour it was stroked in --
-    /// which is the only way `tune_button`'s hover state is visible to a
-    /// test, since it paints no fill and no string.
-    ///
-    /// **Found by its knobs**, matched on [`TUNE_KNOB_RADIUS`], the way
-    /// [`kebab_dots`] finds its dots -- the gear this replaced was found by
-    /// its outline's vertex count, and a tune mark has no closed path to
-    /// count. [`TUNE_ROWS`] consecutive knobs are one icon; the lines are
-    /// deliberately NOT part of the identification (they are plain
-    /// horizontal segments, which the titlebar's own — close glyph also
-    /// draws), so retuning a line cannot make the icon invisible here.
-    ///
-    /// An odd remainder means half an icon was found, which is a probe that
-    /// has stopped matching rather than a shape worth reporting -- so it
-    /// panics, exactly as [`chevrons`] does.
-    pub fn tune_icons(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
-        let mut knobs = Vec::new();
-        walk_rings(shape, TUNE_KNOB_RADIUS, &mut knobs);
-        assert!(
-            knobs.len() % TUNE_ROWS == 0,
-            "found {} tune knobs, which is not a whole number of {TUNE_ROWS}-row tune \
-             icons -- this probe has stopped matching what `tune_button` draws",
-            knobs.len()
-        );
-        knobs
-            .chunks(TUNE_ROWS)
-            .map(|rows| {
-                let rect = rows.iter().fold(Rect::NOTHING, |a, (r, _)| a.union(*r));
-                (rect, rows[0].1)
-            })
-            .collect()
-    }
-
-    fn walk_rings(shape: &egui::Shape, radius: f32, out: &mut Vec<(Rect, Color32)>) {
-        match shape {
-            egui::Shape::Circle(c)
-                if (c.radius - radius).abs() < 0.01 && c.stroke.width > 0.0 =>
-            {
-                out.push((shape.visual_bounding_rect(), c.stroke.color));
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    walk_rings(shape, radius, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The strikes through the eyes above -- the ONLY thing that tells the
-    /// revealed state from the masked one on screen, so without a way to see
-    /// it `eye_toggle` could ignore its argument entirely and look correct.
-    ///
-    /// Every line segment, left to the caller to intersect with [`eyes`]:
-    /// keeping the geometry test at the call site is what stops this from
-    /// silently answering "yes" about some unrelated line drawn nearby.
-    pub fn line_segments(shape: &egui::Shape) -> Vec<Rect> {
-        let mut out = Vec::new();
-        walk(shape, &mut out, &|s| {
-            matches!(s, egui::Shape::LineSegment { .. })
-        });
-        out
-    }
-
-    /// Every account-switcher chevron in a frame, each as the union of its
-    /// two strokes.
-    ///
-    /// In this module, and matched on [`SWITCHER_CHEVRON_ARM`] and
-    /// [`SWITCHER_CHEVRON_DROP`] rather than on numbers written out again,
-    /// for the reason this module exists at all: the vault titlebar this
-    /// chevron lives in also strokes ✕ (two 9x9 arms) and — (one 9x0 bar) as
-    /// line segments, so a test over there that used
-    /// [`line_segments`] directly would find three marks and could not say
-    /// which was the switcher -- and one that spelled out 4.0 x 2.6 itself
-    /// would go on finding the close glyph after this shape was retuned.
-    ///
-    /// The pairing is positional: `account_switcher_button` emits its two
-    /// segments back to back, so consecutive matching pairs are one chevron
-    /// each. An odd count means half a chevron was found, which is a probe
-    /// that has stopped matching rather than a shape worth reporting -- so it
-    /// panics rather than silently dropping it.
-    pub fn chevrons(shape: &egui::Shape) -> Vec<Rect> {
-        let arms: Vec<Rect> = line_segments(shape)
-            .into_iter()
-            .filter(|r| {
-                // `visual_bounding_rect` expands a segment by half the stroke
-                // at each end, so the arm's box is one whole stroke wider and
-                // taller than the arm.
-                (r.width() - (SWITCHER_CHEVRON_ARM + SWITCHER_CHEVRON_STROKE)).abs() < 0.01
-                    && (r.height() - (SWITCHER_CHEVRON_DROP + SWITCHER_CHEVRON_STROKE)).abs()
-                        < 0.01
-            })
-            .collect();
-        assert!(
-            arms.len() % 2 == 0,
-            "found {} chevron arms, which is not a whole number of chevrons -- this probe \
-             has stopped matching what `account_switcher_button` draws",
-            arms.len()
-        );
-        arms.chunks(2).map(|pair| pair[0].union(pair[1])).collect()
-    }
-
-    /// The kebab's individual dots, each with the colour it was filled in --
-    /// which is how `armed` is visible to a test at all.
-    ///
-    /// Three of them is one kebab; the count is left to the caller so "the
-    /// header paints exactly three" is an assertion a test can make rather
-    /// than one this helper hides.
-    pub fn kebab_dots(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
-        let mut out = Vec::new();
-        collect_dots(shape, &mut out);
-        out
-    }
-
-    fn collect_dots(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
-        match shape {
-            egui::Shape::Circle(c) if (c.radius - KEBAB_DOT_RADIUS).abs() < 0.01 => {
-                out.push((shape.visual_bounding_rect(), c.fill));
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_dots(shape, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// A small edit-pencil glyph (sidebar folder rows' edit affordance): a
 /// diagonal body with a filled triangular tip, plus a flat tail. Drawn
 /// rather than typed for the same reason [`close_glyph`] is -- neither the
@@ -3503,5 +3286,222 @@ mod drawn_icon_family_tests {
             "a label painted into the control's own rect produced no text shape either, so \
              the assertion above proves nothing about the control"
         );
+    }
+}
+
+/// Finds the icons above in a frame's shape list, for tests that can no
+/// longer look them up by a painted string because they paint none.
+///
+/// Deliberately in this module: the identifying features are the vertex
+/// counts and the dot radius declared right above, and a test in another
+/// file that spelled them out again would keep passing against a retuned
+/// shape it had stopped finding.
+#[cfg(test)]
+pub mod icon_probe {
+    use super::*;
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<Rect>, keep: &dyn Fn(&egui::Shape) -> bool) {
+        if keep(shape) {
+            out.push(shape.visual_bounding_rect());
+        }
+        if let egui::Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                walk(shape, out, keep);
+            }
+        }
+    }
+
+    fn closed_paths(shape: &egui::Shape, vertices: usize) -> Vec<Rect> {
+        let mut out = Vec::new();
+        walk(shape, &mut out, &|s| {
+            matches!(s, egui::Shape::Path(p) if p.closed && p.points.len() == vertices)
+        });
+        out
+    }
+
+    /// One favourite star: where it is, what colour it was stroked in, and
+    /// whether it is FILLED -- which is the whole visible difference between
+    /// a favourited item and one that is not.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Star {
+        pub rect: Rect,
+        pub stroke: Color32,
+        pub filled: bool,
+    }
+
+    /// The favourite stars this shape tree paints, in both states -- the
+    /// filled star carries the same outline the outlined one does, plus the
+    /// triangle fan that fills it (see `paint_star`).
+    pub fn stars(shape: &egui::Shape) -> Vec<Star> {
+        let mut triangles = Vec::new();
+        walk(shape, &mut triangles, &|s| {
+            matches!(s, egui::Shape::Path(p) if p.points.len() == 3 && p.fill != Color32::TRANSPARENT)
+        });
+        let mut strokes = Vec::new();
+        walk_paths(shape, STAR_VERTICES, &mut strokes);
+        strokes
+            .into_iter()
+            .map(|(rect, stroke)| Star {
+                rect,
+                stroke,
+                filled: triangles.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
+            })
+            .collect()
+    }
+
+    fn walk_paths(shape: &egui::Shape, vertices: usize, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Path(p) if p.closed && p.points.len() == vertices => {
+                let color = match p.stroke.color {
+                    egui::epaint::ColorMode::Solid(color) => color,
+                    // Nothing here paints a gradient stroke; if something
+                    // starts to, this should be looked at rather than
+                    // silently reported as transparent.
+                    egui::epaint::ColorMode::UV(_) => Color32::TRANSPARENT,
+                };
+                out.push((shape.visual_bounding_rect(), color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_paths(shape, vertices, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The reveal eyes this shape tree paints, in both states -- the strike
+    /// is a separate segment, so the almond is found either way.
+    pub fn eyes(shape: &egui::Shape) -> Vec<Rect> {
+        closed_paths(shape, EYE_VERTICES)
+    }
+
+    /// The Preferences tune icons this shape tree paints, each as the union
+    /// of its knobs, with the colour it was stroked in --
+    /// which is the only way `tune_button`'s hover state is visible to a
+    /// test, since it paints no fill and no string.
+    ///
+    /// **Found by its knobs**, matched on [`TUNE_KNOB_RADIUS`], the way
+    /// [`kebab_dots`] finds its dots -- the gear this replaced was found by
+    /// its outline's vertex count, and a tune mark has no closed path to
+    /// count. [`TUNE_ROWS`] consecutive knobs are one icon; the lines are
+    /// deliberately NOT part of the identification (they are plain
+    /// horizontal segments, which the titlebar's own — close glyph also
+    /// draws), so retuning a line cannot make the icon invisible here.
+    ///
+    /// An odd remainder means half an icon was found, which is a probe that
+    /// has stopped matching rather than a shape worth reporting -- so it
+    /// panics, exactly as [`chevrons`] does.
+    pub fn tune_icons(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut knobs = Vec::new();
+        walk_rings(shape, TUNE_KNOB_RADIUS, &mut knobs);
+        assert!(
+            knobs.len() % TUNE_ROWS == 0,
+            "found {} tune knobs, which is not a whole number of {TUNE_ROWS}-row tune \
+             icons -- this probe has stopped matching what `tune_button` draws",
+            knobs.len()
+        );
+        knobs
+            .chunks(TUNE_ROWS)
+            .map(|rows| {
+                let rect = rows.iter().fold(Rect::NOTHING, |a, (r, _)| a.union(*r));
+                (rect, rows[0].1)
+            })
+            .collect()
+    }
+
+    fn walk_rings(shape: &egui::Shape, radius: f32, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Circle(c)
+                if (c.radius - radius).abs() < 0.01 && c.stroke.width > 0.0 =>
+            {
+                out.push((shape.visual_bounding_rect(), c.stroke.color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_rings(shape, radius, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The strikes through the eyes above -- the ONLY thing that tells the
+    /// revealed state from the masked one on screen, so without a way to see
+    /// it `eye_toggle` could ignore its argument entirely and look correct.
+    ///
+    /// Every line segment, left to the caller to intersect with [`eyes`]:
+    /// keeping the geometry test at the call site is what stops this from
+    /// silently answering "yes" about some unrelated line drawn nearby.
+    pub fn line_segments(shape: &egui::Shape) -> Vec<Rect> {
+        let mut out = Vec::new();
+        walk(shape, &mut out, &|s| {
+            matches!(s, egui::Shape::LineSegment { .. })
+        });
+        out
+    }
+
+    /// Every account-switcher chevron in a frame, each as the union of its
+    /// two strokes.
+    ///
+    /// In this module, and matched on [`SWITCHER_CHEVRON_ARM`] and
+    /// [`SWITCHER_CHEVRON_DROP`] rather than on numbers written out again,
+    /// for the reason this module exists at all: the vault titlebar this
+    /// chevron lives in also strokes ✕ (two 9x9 arms) and — (one 9x0 bar) as
+    /// line segments, so a test over there that used
+    /// [`line_segments`] directly would find three marks and could not say
+    /// which was the switcher -- and one that spelled out 4.0 x 2.6 itself
+    /// would go on finding the close glyph after this shape was retuned.
+    ///
+    /// The pairing is positional: `account_switcher_button` emits its two
+    /// segments back to back, so consecutive matching pairs are one chevron
+    /// each. An odd count means half a chevron was found, which is a probe
+    /// that has stopped matching rather than a shape worth reporting -- so it
+    /// panics rather than silently dropping it.
+    pub fn chevrons(shape: &egui::Shape) -> Vec<Rect> {
+        let arms: Vec<Rect> = line_segments(shape)
+            .into_iter()
+            .filter(|r| {
+                // `visual_bounding_rect` expands a segment by half the stroke
+                // at each end, so the arm's box is one whole stroke wider and
+                // taller than the arm.
+                (r.width() - (SWITCHER_CHEVRON_ARM + SWITCHER_CHEVRON_STROKE)).abs() < 0.01
+                    && (r.height() - (SWITCHER_CHEVRON_DROP + SWITCHER_CHEVRON_STROKE)).abs()
+                        < 0.01
+            })
+            .collect();
+        assert!(
+            arms.len() % 2 == 0,
+            "found {} chevron arms, which is not a whole number of chevrons -- this probe \
+             has stopped matching what `account_switcher_button` draws",
+            arms.len()
+        );
+        arms.chunks(2).map(|pair| pair[0].union(pair[1])).collect()
+    }
+
+    /// The kebab's individual dots, each with the colour it was filled in --
+    /// which is how `armed` is visible to a test at all.
+    ///
+    /// Three of them is one kebab; the count is left to the caller so "the
+    /// header paints exactly three" is an assertion a test can make rather
+    /// than one this helper hides.
+    pub fn kebab_dots(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        collect_dots(shape, &mut out);
+        out
+    }
+
+    fn collect_dots(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Circle(c) if (c.radius - KEBAB_DOT_RADIUS).abs() < 0.01 => {
+                out.push((shape.visual_bounding_rect(), c.fill));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_dots(shape, out);
+                }
+            }
+            _ => {}
+        }
     }
 }

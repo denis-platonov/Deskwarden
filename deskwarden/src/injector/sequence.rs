@@ -836,6 +836,300 @@ pub fn run<K: Keyboard>(kb: &K, hwnd: isize, plan: &Plan) -> Result<(), String> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Telling the user
+// ---------------------------------------------------------------------------
+
+/// How a refused or abandoned sequence reaches the **user**, not just the log.
+///
+/// A fill that silently does nothing is indistinguishable from a fill that was
+/// never triggered, and the two want completely different next moves from the
+/// user ("fix the `{S:PIN}` in your sequence" versus "press the hotkey
+/// again"). A refusal that only reaches `log::error!` is a refusal nobody
+/// reads.
+///
+/// A trait so the decision to notify is pinned by a test with a recorder,
+/// rather than by a `MessageBoxW` nothing can call.
+///
+/// **Passed in, never reached for.** There used to be a `RealNotifier` whose
+/// `refused` recorded under `#[cfg(test)]` and opened a window otherwise, and
+/// production named it through a `const REAL_NOTIFIER` inside `fill_from_vault`.
+/// A `cfg(test)` gate is a property of a *compilation unit*, and `main.rs`
+/// links this library compiled **without** it -- so every binary test that
+/// reached that const got the real task-modal dialog, on the desktop of
+/// whoever ran `cargo test`. The gate is gone; the only way to a dialog is to
+/// hold a [`FnNotifier`] whose function is `show_refusal`, which is
+/// `pub(crate)` and so cannot be named from the binary at all; the only such
+/// value is [`REAL_NOTIFIER`], named exclusively on lines no test executes.
+pub trait Notifier {
+    fn refused(&self, detail: &str);
+}
+
+/// Shows the user a refusal: a plain task-modal message box, on its own thread.
+///
+/// On its own thread because `MessageBoxW` blocks until dismissed, and the
+/// caller is either the app's message loop (a plan-time refusal) or the typing
+/// thread (a mid-sequence abort). Neither may sit in a modal loop -- the first
+/// would freeze the tray and every window, and the second would hold the
+/// plan's memory alive for as long as the box was on screen. Fire and forget:
+/// there is no answer to read back, because there is nothing to ask.
+///
+/// A free `fn` and not a method body, for exactly the reason [`crate::app::FnPresenter`]
+/// gives: it lets the production notifier be a struct literal naming this
+/// function, with no argument and no expression in it for a mutation to hide
+/// in. It compiles in every configuration, including under `cfg(test)` -- what
+/// keeps it out of the suite is that nothing in a test can name it, not a gate
+/// that only one of the two crates agrees with.
+pub(crate) fn show_refusal(detail: &str) {
+    log::warn!("autofill refused: {detail}");
+    let detail = detail.to_string();
+    std::thread::spawn(move || {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let text = HSTRING::from(detail);
+        let caption = HSTRING::from("Deskwarden autofill");
+        unsafe {
+            MessageBoxW(None, &text, &caption, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        }
+    });
+}
+
+/// A [`Notifier`] that is nothing but the function it forwards to.
+///
+/// The same shape, and for the same reason, as [`crate::app::FnPresenter`]:
+/// a function *reference* rather than a hand-written `impl` per notifier, so
+/// the production value can be a struct literal with nothing computed in it.
+pub struct FnNotifier {
+    /// Asked to tell the user that a fill was refused, and why.
+    pub refused: fn(&str),
+}
+
+impl Notifier for FnNotifier {
+    fn refused(&self, detail: &str) {
+        (self.refused)(detail);
+    }
+}
+
+/// The production notifier: the real dialog, named and not called.
+///
+/// This is the whole of the refusal path no test can execute, and it is data.
+/// It is named on three lines in `main.rs` and one in [`crate::injector`], all
+/// of them production-only; `notifier_wiring_tests` below holds this literal
+/// by source position, and `main`'s own guard holds the four call sites.
+pub const REAL_NOTIFIER: FnNotifier = FnNotifier { refused: show_refusal };
+
+/// A [`Notifier`] that remembers what it was asked to show and opens nothing.
+///
+/// **Deliberately not `#[cfg(test)]`.** The binary's tests link this library
+/// compiled without `cfg(test)`, so a recorder that only exists under the gate
+/// is a recorder the binary's tests cannot have -- and "cannot have a recorder"
+/// was precisely how they ended up with the dialog. Existing in every
+/// configuration is what lets `main.rs`'s dispatch tests pass one, and so what
+/// makes the hazard unrepresentable rather than merely avoided by discipline.
+///
+/// A `Mutex` and not a `RefCell`, because [`crate::injector::perform`] runs on
+/// the typing thread and a notifier handed to it must be `Sync`.
+#[derive(Default)]
+pub struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+
+impl RecordingNotifier {
+    /// Everything this has been asked to show, cleared.
+    pub fn take(&self) -> Vec<String> {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut held)
+    }
+}
+
+impl Notifier for RecordingNotifier {
+    fn refused(&self, detail: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(detail.to_string());
+    }
+}
+
+#[cfg(test)]
+mod notifier_tests {
+    use super::*;
+
+    #[test]
+    fn a_recorder_keeps_every_refusal_verbatim_and_taking_clears() {
+        let rec = RecordingNotifier::default();
+        rec.refused("the auto-type sequence uses {PICKCHARS}");
+        assert_eq!(rec.take(), vec!["the auto-type sequence uses {PICKCHARS}".to_string()]);
+        // ...and taking clears, so one assertion cannot see another's notice.
+        assert!(rec.take().is_empty());
+    }
+
+    /// An [`FnNotifier`] forwards to the function it was built from -- the one
+    /// line of code between [`REAL_NOTIFIER`]'s field and the real dialog.
+    #[test]
+    fn an_fn_notifier_forwards_to_the_function_it_was_built_from() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(detail: &str) {
+            SEEN.lock().unwrap().push(detail.to_string());
+        }
+        let n = FnNotifier { refused: record };
+        n.refused("something is already typing");
+        assert_eq!(&*SEEN.lock().unwrap(), &["something is already typing".to_string()]);
+    }
+
+    /// **The one line that reaches a real window, held by source position.**
+    ///
+    /// Nothing can execute [`REAL_NOTIFIER`]'s initialiser under test, so
+    /// nothing else can tell that it still names `show_refusal` rather than
+    /// something quieter -- and a production build that silently stopped
+    /// telling the user anything would leave the whole suite green. This is
+    /// the same device, for the same reason, as `app::prompt_wiring_tests`.
+    #[test]
+    fn the_production_notifier_is_the_real_dialog_and_nothing_computed() {
+        // `concat!`-split so this test cannot match its own text.
+        let needle =
+            concat!("const REAL_NOTIFIER: FnNotifier = FnNotifier { ", "refused: show_refusal };");
+        let source = include_str!("sequence.rs");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "expected {needle:?} exactly once in sequence.rs. The production notifier is the \
+             one value in this crate that opens a real window, and it is a struct literal of \
+             one function reference precisely so that there is no expression in it for a \
+             mutation to hide in -- wrapping `show_refusal` in a closure here would re-open \
+             the hole that shape exists to close"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_lifetime_tests {
+    use super::*;
+    use crate::key_sequence::parse;
+    use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+    /// **A refusal that happens after a flush must not release the password.**
+    ///
+    /// `plan` accumulated into a bare `Vec<Step>` and only wrapped it in a
+    /// [`Plan`] at the very end, so the wipe existed only for sequences that
+    /// *succeeded*. `run.flush` moves the accumulated text into a
+    /// [`Step::Text`] at every `{KEY}`, `{DELAY}` and `{DELAY=n}`, so a
+    /// sequence with any of those after `{PASSWORD}` had the plaintext sitting
+    /// in that `Vec` -- and five separate `return Err` paths dropped it there,
+    /// unwiped, straight to the allocator.
+    ///
+    /// The existing lifetime tests all assert on plans that **succeed**, which
+    /// is why nothing saw it: the one route they never took was the failing
+    /// one. Each sequence below refuses at a *different* `return Err`, because
+    /// they are five sites and not one.
+    #[test]
+    fn a_refusal_after_a_flush_does_not_release_the_password() {
+        // The probe is awake on this thread and in this direction. Without
+        // this, a probe that had gone deaf would make every assertion below
+        // pass by saying nothing.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe cannot see an unwiped password, so this test proves nothing"
+        );
+
+        // Leaked, so that building `Resolved` inside the watch allocates
+        // nothing that carries the probe on its own.
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+        let values = || Resolved { username: "u", password, totp: None, custom: vec![] };
+
+        // The fixture check: the prefix these all share really does flush the
+        // password **mid-parse**, before the refusing token is reached.
+        //
+        // Asserting merely that *some* step holds the password is not enough
+        // and this test said so wrongly at first: `plan` flushes once more at
+        // the end, so `{PASSWORD}` alone also puts the password in a step, and
+        // weakening the prefix to that left this passing. What distinguishes a
+        // mid-parse flush is that the password is in a step which is **not the
+        // last** -- there is a `{TAB}` after it, which is exactly what forced
+        // the flush that the refusing token then abandons.
+        let prefix = plan(&parse("{PASSWORD}{TAB}"), &values()).expect("the prefix plans");
+        let before_the_last = &prefix.steps()[..prefix.len() - 1];
+        assert!(
+            before_the_last
+                .iter()
+                .any(|s| matches!(s, Step::Text { text, .. } if text.contains(PROBE))),
+            "the fixture never flushed the password mid-parse, so the refusals below \
+             would prove nothing"
+        );
+        drop(prefix);
+
+        for sequence in [
+            // Unresolved -- a custom field the item has not got.
+            "{PASSWORD}{TAB}{S:NOPE}",
+            // Unsupported -- a construct this build cannot type.
+            "{PASSWORD}{TAB}{PICKCHARS}",
+            // DanglingModifier, from the end-of-token-list check.
+            "{PASSWORD}{TAB}+",
+            // Unsupported -- a grouping.
+            "{PASSWORD}{TAB}(x)",
+            // DanglingModifier, from the in-loop check: a different `return`.
+            "{PASSWORD}{TAB}+hello",
+        ] {
+            let tokens = parse(sequence);
+            let mut refused = false;
+            let leaked = plaintext_reached_the_allocator(|| {
+                refused = plan(&tokens, &values()).is_err();
+            });
+            assert!(refused, "{sequence} was expected to refuse, and planned");
+            assert!(
+                !leaked,
+                "{sequence} handed the password to the allocator in the clear"
+            );
+        }
+    }
+
+    /// The control the reviewer used to isolate the leak to the flushed step:
+    /// a refusal reached **before** any flush has nothing in the accumulator's
+    /// `Vec` to release, and was already clean. It is here so that a future
+    /// change which makes the flushing case leak again cannot be mistaken for
+    /// the probe having gone quiet across the board.
+    ///
+    /// **Which is precisely what it could not tell you, for as long as it had
+    /// no control of its own.** Its whole claim is a `!leaked`, so a probe that
+    /// had gone deaf passed it vacuously -- the one failure mode this test was
+    /// written to rule out, in the test written to rule it out.
+    ///
+    /// The positive control is first for two reasons. It is what makes the
+    /// `!leaked` below mean something; and arming it takes `PROBE_LOCK` for the
+    /// rest of this thread, which the probe plaintext allocated afterwards then
+    /// sits inside. Building probe-bearing fixtures before the first arm is the
+    /// crate's house rule and it is the one shape that hold does not cover: it
+    /// is safe here only because `Box::leak` never frees, and that is a fact
+    /// about this fixture rather than a licence.
+    #[test]
+    fn a_refusal_before_any_flush_was_never_the_leaking_case() {
+        use crate::login_ui::password_lifetime_tests::plaintext_reached_the_allocator;
+
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: the probe cannot see an ordinary String's plaintext go past the \
+             allocator, so the `!leaked` below is satisfied by a deaf instrument and this \
+             test -- whose entire job is to tell a real fix from a deaf probe -- proves nothing"
+        );
+
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+        let tokens = parse("{PASSWORD}{S:NOPE}");
+        let mut refused = false;
+        let leaked = plaintext_reached_the_allocator(|| {
+            refused = plan(
+                &tokens,
+                &Resolved { username: "u", password, totp: None, custom: vec![] },
+            )
+            .is_err();
+        });
+        assert!(refused, "the fixture was expected to refuse");
+        assert!(!leaked, "the refusal reached before any flush released the password");
+    }
+}
+
 #[cfg(test)]
 mod plan_tests {
     use super::*;
@@ -1818,299 +2112,5 @@ pub(crate) mod run_tests {
                 Emitted::Key("TAB", ModSet::default()),
             ]
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Telling the user
-// ---------------------------------------------------------------------------
-
-/// How a refused or abandoned sequence reaches the **user**, not just the log.
-///
-/// A fill that silently does nothing is indistinguishable from a fill that was
-/// never triggered, and the two want completely different next moves from the
-/// user ("fix the `{S:PIN}` in your sequence" versus "press the hotkey
-/// again"). A refusal that only reaches `log::error!` is a refusal nobody
-/// reads.
-///
-/// A trait so the decision to notify is pinned by a test with a recorder,
-/// rather than by a `MessageBoxW` nothing can call.
-///
-/// **Passed in, never reached for.** There used to be a `RealNotifier` whose
-/// `refused` recorded under `#[cfg(test)]` and opened a window otherwise, and
-/// production named it through a `const REAL_NOTIFIER` inside `fill_from_vault`.
-/// A `cfg(test)` gate is a property of a *compilation unit*, and `main.rs`
-/// links this library compiled **without** it -- so every binary test that
-/// reached that const got the real task-modal dialog, on the desktop of
-/// whoever ran `cargo test`. The gate is gone; the only way to a dialog is to
-/// hold a [`FnNotifier`] whose function is `show_refusal`, which is
-/// `pub(crate)` and so cannot be named from the binary at all; the only such
-/// value is [`REAL_NOTIFIER`], named exclusively on lines no test executes.
-pub trait Notifier {
-    fn refused(&self, detail: &str);
-}
-
-/// Shows the user a refusal: a plain task-modal message box, on its own thread.
-///
-/// On its own thread because `MessageBoxW` blocks until dismissed, and the
-/// caller is either the app's message loop (a plan-time refusal) or the typing
-/// thread (a mid-sequence abort). Neither may sit in a modal loop -- the first
-/// would freeze the tray and every window, and the second would hold the
-/// plan's memory alive for as long as the box was on screen. Fire and forget:
-/// there is no answer to read back, because there is nothing to ask.
-///
-/// A free `fn` and not a method body, for exactly the reason [`crate::app::FnPresenter`]
-/// gives: it lets the production notifier be a struct literal naming this
-/// function, with no argument and no expression in it for a mutation to hide
-/// in. It compiles in every configuration, including under `cfg(test)` -- what
-/// keeps it out of the suite is that nothing in a test can name it, not a gate
-/// that only one of the two crates agrees with.
-pub(crate) fn show_refusal(detail: &str) {
-    log::warn!("autofill refused: {detail}");
-    let detail = detail.to_string();
-    std::thread::spawn(move || {
-        use windows::core::HSTRING;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-        };
-        let text = HSTRING::from(detail);
-        let caption = HSTRING::from("Deskwarden autofill");
-        unsafe {
-            MessageBoxW(None, &text, &caption, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-        }
-    });
-}
-
-/// A [`Notifier`] that is nothing but the function it forwards to.
-///
-/// The same shape, and for the same reason, as [`crate::app::FnPresenter`]:
-/// a function *reference* rather than a hand-written `impl` per notifier, so
-/// the production value can be a struct literal with nothing computed in it.
-pub struct FnNotifier {
-    /// Asked to tell the user that a fill was refused, and why.
-    pub refused: fn(&str),
-}
-
-impl Notifier for FnNotifier {
-    fn refused(&self, detail: &str) {
-        (self.refused)(detail);
-    }
-}
-
-/// The production notifier: the real dialog, named and not called.
-///
-/// This is the whole of the refusal path no test can execute, and it is data.
-/// It is named on three lines in `main.rs` and one in [`crate::injector`], all
-/// of them production-only; `notifier_wiring_tests` below holds this literal
-/// by source position, and `main`'s own guard holds the four call sites.
-pub const REAL_NOTIFIER: FnNotifier = FnNotifier { refused: show_refusal };
-
-/// A [`Notifier`] that remembers what it was asked to show and opens nothing.
-///
-/// **Deliberately not `#[cfg(test)]`.** The binary's tests link this library
-/// compiled without `cfg(test)`, so a recorder that only exists under the gate
-/// is a recorder the binary's tests cannot have -- and "cannot have a recorder"
-/// was precisely how they ended up with the dialog. Existing in every
-/// configuration is what lets `main.rs`'s dispatch tests pass one, and so what
-/// makes the hazard unrepresentable rather than merely avoided by discipline.
-///
-/// A `Mutex` and not a `RefCell`, because [`crate::injector::perform`] runs on
-/// the typing thread and a notifier handed to it must be `Sync`.
-#[derive(Default)]
-pub struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
-
-impl RecordingNotifier {
-    /// Everything this has been asked to show, cleared.
-    pub fn take(&self) -> Vec<String> {
-        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut held)
-    }
-}
-
-impl Notifier for RecordingNotifier {
-    fn refused(&self, detail: &str) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(detail.to_string());
-    }
-}
-
-#[cfg(test)]
-mod notifier_tests {
-    use super::*;
-
-    #[test]
-    fn a_recorder_keeps_every_refusal_verbatim_and_taking_clears() {
-        let rec = RecordingNotifier::default();
-        rec.refused("the auto-type sequence uses {PICKCHARS}");
-        assert_eq!(rec.take(), vec!["the auto-type sequence uses {PICKCHARS}".to_string()]);
-        // ...and taking clears, so one assertion cannot see another's notice.
-        assert!(rec.take().is_empty());
-    }
-
-    /// An [`FnNotifier`] forwards to the function it was built from -- the one
-    /// line of code between [`REAL_NOTIFIER`]'s field and the real dialog.
-    #[test]
-    fn an_fn_notifier_forwards_to_the_function_it_was_built_from() {
-        use std::sync::Mutex;
-        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        fn record(detail: &str) {
-            SEEN.lock().unwrap().push(detail.to_string());
-        }
-        let n = FnNotifier { refused: record };
-        n.refused("something is already typing");
-        assert_eq!(&*SEEN.lock().unwrap(), &["something is already typing".to_string()]);
-    }
-
-    /// **The one line that reaches a real window, held by source position.**
-    ///
-    /// Nothing can execute [`REAL_NOTIFIER`]'s initialiser under test, so
-    /// nothing else can tell that it still names `show_refusal` rather than
-    /// something quieter -- and a production build that silently stopped
-    /// telling the user anything would leave the whole suite green. This is
-    /// the same device, for the same reason, as `app::prompt_wiring_tests`.
-    #[test]
-    fn the_production_notifier_is_the_real_dialog_and_nothing_computed() {
-        // `concat!`-split so this test cannot match its own text.
-        let needle =
-            concat!("const REAL_NOTIFIER: FnNotifier = FnNotifier { ", "refused: show_refusal };");
-        let source = include_str!("sequence.rs");
-        assert_eq!(
-            source.matches(needle).count(),
-            1,
-            "expected {needle:?} exactly once in sequence.rs. The production notifier is the \
-             one value in this crate that opens a real window, and it is a struct literal of \
-             one function reference precisely so that there is no expression in it for a \
-             mutation to hide in -- wrapping `show_refusal` in a closure here would re-open \
-             the hole that shape exists to close"
-        );
-    }
-}
-
-#[cfg(test)]
-mod refusal_lifetime_tests {
-    use super::*;
-    use crate::key_sequence::parse;
-    use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
-
-    /// **A refusal that happens after a flush must not release the password.**
-    ///
-    /// `plan` accumulated into a bare `Vec<Step>` and only wrapped it in a
-    /// [`Plan`] at the very end, so the wipe existed only for sequences that
-    /// *succeeded*. `run.flush` moves the accumulated text into a
-    /// [`Step::Text`] at every `{KEY}`, `{DELAY}` and `{DELAY=n}`, so a
-    /// sequence with any of those after `{PASSWORD}` had the plaintext sitting
-    /// in that `Vec` -- and five separate `return Err` paths dropped it there,
-    /// unwiped, straight to the allocator.
-    ///
-    /// The existing lifetime tests all assert on plans that **succeed**, which
-    /// is why nothing saw it: the one route they never took was the failing
-    /// one. Each sequence below refuses at a *different* `return Err`, because
-    /// they are five sites and not one.
-    #[test]
-    fn a_refusal_after_a_flush_does_not_release_the_password() {
-        // The probe is awake on this thread and in this direction. Without
-        // this, a probe that had gone deaf would make every assertion below
-        // pass by saying nothing.
-        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
-        assert!(
-            plaintext_reached_the_allocator(move || drop(bare)),
-            "the probe cannot see an unwiped password, so this test proves nothing"
-        );
-
-        // Leaked, so that building `Resolved` inside the watch allocates
-        // nothing that carries the probe on its own.
-        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
-        let values = || Resolved { username: "u", password, totp: None, custom: vec![] };
-
-        // The fixture check: the prefix these all share really does flush the
-        // password **mid-parse**, before the refusing token is reached.
-        //
-        // Asserting merely that *some* step holds the password is not enough
-        // and this test said so wrongly at first: `plan` flushes once more at
-        // the end, so `{PASSWORD}` alone also puts the password in a step, and
-        // weakening the prefix to that left this passing. What distinguishes a
-        // mid-parse flush is that the password is in a step which is **not the
-        // last** -- there is a `{TAB}` after it, which is exactly what forced
-        // the flush that the refusing token then abandons.
-        let prefix = plan(&parse("{PASSWORD}{TAB}"), &values()).expect("the prefix plans");
-        let before_the_last = &prefix.steps()[..prefix.len() - 1];
-        assert!(
-            before_the_last
-                .iter()
-                .any(|s| matches!(s, Step::Text { text, .. } if text.contains(PROBE))),
-            "the fixture never flushed the password mid-parse, so the refusals below \
-             would prove nothing"
-        );
-        drop(prefix);
-
-        for sequence in [
-            // Unresolved -- a custom field the item has not got.
-            "{PASSWORD}{TAB}{S:NOPE}",
-            // Unsupported -- a construct this build cannot type.
-            "{PASSWORD}{TAB}{PICKCHARS}",
-            // DanglingModifier, from the end-of-token-list check.
-            "{PASSWORD}{TAB}+",
-            // Unsupported -- a grouping.
-            "{PASSWORD}{TAB}(x)",
-            // DanglingModifier, from the in-loop check: a different `return`.
-            "{PASSWORD}{TAB}+hello",
-        ] {
-            let tokens = parse(sequence);
-            let mut refused = false;
-            let leaked = plaintext_reached_the_allocator(|| {
-                refused = plan(&tokens, &values()).is_err();
-            });
-            assert!(refused, "{sequence} was expected to refuse, and planned");
-            assert!(
-                !leaked,
-                "{sequence} handed the password to the allocator in the clear"
-            );
-        }
-    }
-
-    /// The control the reviewer used to isolate the leak to the flushed step:
-    /// a refusal reached **before** any flush has nothing in the accumulator's
-    /// `Vec` to release, and was already clean. It is here so that a future
-    /// change which makes the flushing case leak again cannot be mistaken for
-    /// the probe having gone quiet across the board.
-    ///
-    /// **Which is precisely what it could not tell you, for as long as it had
-    /// no control of its own.** Its whole claim is a `!leaked`, so a probe that
-    /// had gone deaf passed it vacuously -- the one failure mode this test was
-    /// written to rule out, in the test written to rule it out.
-    ///
-    /// The positive control is first for two reasons. It is what makes the
-    /// `!leaked` below mean something; and arming it takes `PROBE_LOCK` for the
-    /// rest of this thread, which the probe plaintext allocated afterwards then
-    /// sits inside. Building probe-bearing fixtures before the first arm is the
-    /// crate's house rule and it is the one shape that hold does not cover: it
-    /// is safe here only because `Box::leak` never frees, and that is a fact
-    /// about this fixture rather than a licence.
-    #[test]
-    fn a_refusal_before_any_flush_was_never_the_leaking_case() {
-        use crate::login_ui::password_lifetime_tests::plaintext_reached_the_allocator;
-
-        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
-        assert!(
-            plaintext_reached_the_allocator(move || drop(bare)),
-            "control: the probe cannot see an ordinary String's plaintext go past the \
-             allocator, so the `!leaked` below is satisfied by a deaf instrument and this \
-             test -- whose entire job is to tell a real fix from a deaf probe -- proves nothing"
-        );
-
-        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
-        let tokens = parse("{PASSWORD}{S:NOPE}");
-        let mut refused = false;
-        let leaked = plaintext_reached_the_allocator(|| {
-            refused = plan(
-                &tokens,
-                &Resolved { username: "u", password, totp: None, custom: vec![] },
-            )
-            .is_err();
-        });
-        assert!(refused, "the fixture was expected to refuse");
-        assert!(!leaked, "the refusal reached before any flush released the password");
     }
 }

@@ -657,64 +657,6 @@ pub fn match_arms_hotkey(_prompt_on_match: bool) -> bool {
     true
 }
 
-/// **The decision, directly.** Both inputs are driven, and the two answers are
-/// asserted to *differ* -- a pair of fixtures that agreed would pass against a
-/// `match_disposition` that ignored its argument entirely, which is precisely
-/// the mutation that matters here.
-#[cfg(test)]
-mod match_disposition_tests {
-    use super::*;
-
-    #[test]
-    fn the_setting_on_prompts_and_the_setting_off_does_nothing() {
-        assert_eq!(match_disposition(true), MatchDisposition::Prompt);
-        assert_eq!(match_disposition(false), MatchDisposition::Nothing);
-        assert_ne!(
-            match_disposition(true),
-            match_disposition(false),
-            "the premise: the preference actually decides something. Equal answers mean \
-             `match_disposition` is ignoring its argument, and the switch in preferences does \
-             nothing at all"
-        );
-    }
-
-    /// **The one that would silently switch autofill off.** `false` means
-    /// "no prompt", never "no autofill": the hotkey is the fallback the user
-    /// is relying on, so it arms for a match in *either* setting. A
-    /// `match_arms_hotkey` that returned `prompt_on_match` would leave the
-    /// first assertion green and this one red.
-    #[test]
-    fn every_match_arms_the_hotkey_whatever_the_setting_says() {
-        assert!(match_arms_hotkey(true), "a prompted match still arms the hotkey");
-        assert!(
-            match_arms_hotkey(false),
-            "with the prompt off the hotkey is the ONLY way anything is typed. If a match \
-             stops arming here, Ctrl+Alt+B fills nothing and turning the prompt off has \
-             turned autofill off entirely"
-        );
-        assert_eq!(
-            match_arms_hotkey(true),
-            match_arms_hotkey(false),
-            "arming is deliberately NOT a function of the preference"
-        );
-    }
-
-    /// Neither disposition is a fill. Stated as a test because the retired
-    /// `Auto` mode was exactly a third variant here, and a future one added
-    /// without thinking is how it would come back.
-    #[test]
-    fn no_disposition_fills_by_itself() {
-        for on in [true, false] {
-            match match_disposition(on) {
-                // Raises the overlay; `handle_match` fills only if
-                // `prompt_arm` answers `true`, which is the user's click.
-                MatchDisposition::Prompt => {}
-                MatchDisposition::Nothing => {}
-            }
-        }
-    }
-}
-
 /// Dispatches a freshly foregrounded, matched window.
 ///
 /// **Always arms `(item_id, hwnd)`** and returns it, so the main loop's
@@ -3980,5 +3922,63 @@ mod fill_dispatch_tests {
         // happened".
         assert_eq!(rec.default_fills.lock().unwrap().len(), 1);
         assert!(!leaked, "the default fill freed the password in the clear");
+    }
+}
+
+/// **The decision, directly.** Both inputs are driven, and the two answers are
+/// asserted to *differ* -- a pair of fixtures that agreed would pass against a
+/// `match_disposition` that ignored its argument entirely, which is precisely
+/// the mutation that matters here.
+#[cfg(test)]
+mod match_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn the_setting_on_prompts_and_the_setting_off_does_nothing() {
+        assert_eq!(match_disposition(true), MatchDisposition::Prompt);
+        assert_eq!(match_disposition(false), MatchDisposition::Nothing);
+        assert_ne!(
+            match_disposition(true),
+            match_disposition(false),
+            "the premise: the preference actually decides something. Equal answers mean \
+             `match_disposition` is ignoring its argument, and the switch in preferences does \
+             nothing at all"
+        );
+    }
+
+    /// **The one that would silently switch autofill off.** `false` means
+    /// "no prompt", never "no autofill": the hotkey is the fallback the user
+    /// is relying on, so it arms for a match in *either* setting. A
+    /// `match_arms_hotkey` that returned `prompt_on_match` would leave the
+    /// first assertion green and this one red.
+    #[test]
+    fn every_match_arms_the_hotkey_whatever_the_setting_says() {
+        assert!(match_arms_hotkey(true), "a prompted match still arms the hotkey");
+        assert!(
+            match_arms_hotkey(false),
+            "with the prompt off the hotkey is the ONLY way anything is typed. If a match \
+             stops arming here, Ctrl+Alt+B fills nothing and turning the prompt off has \
+             turned autofill off entirely"
+        );
+        assert_eq!(
+            match_arms_hotkey(true),
+            match_arms_hotkey(false),
+            "arming is deliberately NOT a function of the preference"
+        );
+    }
+
+    /// Neither disposition is a fill. Stated as a test because the retired
+    /// `Auto` mode was exactly a third variant here, and a future one added
+    /// without thinking is how it would come back.
+    #[test]
+    fn no_disposition_fills_by_itself() {
+        for on in [true, false] {
+            match match_disposition(on) {
+                // Raises the overlay; `handle_match` fills only if
+                // `prompt_arm` answers `true`, which is the user's click.
+                MatchDisposition::Prompt => {}
+                MatchDisposition::Nothing => {}
+            }
+        }
     }
 }
