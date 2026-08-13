@@ -1360,6 +1360,60 @@ pub fn cli_send_delete(
     delete_send(&CliSendRunner::with_session(job, data_dir, session), id)
 }
 
+/// **The one `pub` route out of this module into a real `bw send create`
+/// child**, and the third and last of the trio [`cli_send_list`] and
+/// [`cli_send_delete`] belong to.
+///
+/// Everything [`cli_send_list`]'s doc says about the privacy wall applies here
+/// unchanged and is not repeated: `CliSendRunner` and both of its constructors
+/// are private to `crate::send`, and the two guards that hold the wall -- the
+/// public surface EQUALITY and the crate-wide needle counts, both in
+/// `vault_window::send_ui::source_pins` -- were updated by the same commit
+/// that added this function, deliberately, rather than widened to admit it
+/// silently.
+///
+/// **Adding this door was not optional**, for [`cli_send_delete`]'s reason
+/// exactly: [`create_send`] is generic over [`SendRunner`] and there is no
+/// `pub` implementation of that trait in this crate, so a create wired from
+/// `vault_window` had a choice between this one function and making the runner
+/// nameable from outside, and the second is the wall itself.
+///
+/// **The session is passed twice and that is not a mistake.** The runner is
+/// configured with it so that every child it starts inherits `BW_SESSION`;
+/// [`create_send`] is handed it as well because a create's invocation is built
+/// from a plan, by [`plan_to_invocation`], which stamps the token into the
+/// invocation's own session slot rather than reading it off the runner. The
+/// two are the same string and neither reaches argv --
+/// `CliSendRunner::build_command` is the one place that decides that, and it
+/// decides it for every invocation this module has.
+///
+/// **The plan's secrets reach the child on stdin and nowhere else.** The
+/// argument vector [`plan_to_invocation`] builds is the two literal words
+/// `send create`; the name, the body, the share password, the lifetime and the
+/// view limit all travel in the base64 JSON that
+/// [`SendInvocation::stdin_json_b64`] carries, which the runner writes to the
+/// child's stdin.
+///
+/// **It blocks for up to [`SEND_TIMEOUT`], and it must never be called from
+/// the eframe frame closure.** The seal that holds that is
+/// `vault_window::send_create_wiring::every_mention_of_the_blocking_create_is_sealed_inside_its_own_module`,
+/// which counts this name over every `.rs` file under `src` and requires every
+/// mention outside `send.rs` to be inside `mod send_create_thread`.
+pub fn cli_send_create(
+    job: Option<&crate::job_object::KillOnCloseJob>,
+    data_dir: Option<&Path>,
+    session: &str,
+    plan: &SendPlan,
+    now: &dyn SendClock,
+) -> Result<CreatedSend, SendError> {
+    create_send(
+        &CliSendRunner::with_session(job, data_dir, session),
+        plan,
+        session,
+        now,
+    )
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

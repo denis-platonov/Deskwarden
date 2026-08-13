@@ -1,12 +1,16 @@
-//! The vault window's **Sends** screen: a read-only list of the Sends this
-//! account has published.
+//! The vault window's **Sends** screen: the Sends this account has published,
+//! with a composer for making a new one.
 //!
-//! This is step 3 of five, and it is deliberately the *third* thing built and
-//! the *first* thing visible. A Send is a public URL: the only outbound
-//! publishing action in this app. The design's order is list, then delete,
-//! then create -- revocation before publication -- so this screen can show a
-//! Send and copy its link, and there is no way in the app to make one or to
-//! revoke one yet. Steps 4 and 5 add those.
+//! Steps 3, 4 and 5 of five, in that order, and the order was the point. A
+//! Send is a public URL: the only outbound publishing action in this app. The
+//! design built list, then delete, then create -- **revocation before
+//! publication**, so that at no commit could this app make a link it could not
+//! then show and take down.
+//!
+//! As of step 5 the screen lists every Send, copies any row's link, revokes a
+//! row in two steps, and creates a TEXT Send from the composer in
+//! [`draw_composer`]. File Sends are still made in the web vault only; see
+//! below, and [`SCOPE_SUBTEXT`], which says so on screen.
 //!
 //! ## The one rule this file exists to keep
 //!
@@ -21,8 +25,9 @@
 //! ## File Sends are SHOWN, never hidden
 //!
 //! This app cannot create a file Send (`bw send create` takes a file path,
-//! and this window has no upload path). It can list and -- from step 4 -- it
-//! can revoke one. So a file Send made in the web vault appears here with a
+//! and this window has no upload path -- which is why step 5's composer makes
+//! text Sends and offers no type switch at all, rather than offering one that
+//! refuses). It can list and revoke one. So a file Send made in the web vault appears here with a
 //! tag saying what it is. Filtering them out would make "your Sends" a lie in
 //! exactly the direction that matters: an unlisted public link is one the
 //! user cannot revoke from here and does not know is there.
@@ -31,7 +36,9 @@
 //!
 //! Every row carries a Copy link button. A link shown once, at creation, and
 //! never again is a support ticket; the whole point of the list is that the
-//! user can get back to a link they published.
+//! user can get back to a link they published. The create's own banner shows
+//! the new link too, but the list is what makes it durable -- which is why a
+//! successful create invalidates the list rather than only reporting.
 
 use crate::send::{SendClock, SendError, SendSummary};
 use crate::theme;
@@ -470,6 +477,26 @@ pub enum SendUiAction {
     /// The confirmation was declined. Its button occupies the pixels the
     /// Delete button was drawn in -- see [`draw_row`].
     CancelDelete,
+    /// The header's New Send button was pressed: put the composer on screen.
+    OpenComposer,
+    /// The composer's Discard button was pressed: take it off screen and wipe
+    /// the draft.
+    CancelComposer,
+    /// The composer's Create button was pressed.
+    ///
+    /// **It carries nothing, and that is deliberate.** Every other variant
+    /// here carries the value it was read off, because the alternative is a
+    /// second lookup on the far side that can resolve to a different row.
+    /// The draft is different: it is a secret, and this enum derives `Debug`,
+    /// `Clone`, `PartialEq` and `Eq`. A `SubmitSend(SendPlan)` would put the
+    /// text of the Send and its share password into every `{:?}` any future
+    /// call site writes of an action -- which is exactly the leak `SendPlan`'s
+    /// hand-written `Debug` and `SendInvocation`'s exist to refuse. There is
+    /// no second-lookup hazard to trade against, either: the draft lives in
+    /// exactly one place, the window's own `SendComposer`, and
+    /// `vault_window::apply_send_action` is handed that same `&mut` -- so
+    /// there is only ever one plan and no way to name another.
+    SubmitSend,
 }
 
 /// **A [`SendUiAction`] that this pane produced, which cannot be thrown away
@@ -682,6 +709,19 @@ pub fn draw_send_pane(
     state: &SendPaneState,
     notice: Option<&str>,
     delete: SendDeleteView<'_>,
+    // **`&mut`, and the one place the draft lives.** The pane owns no state
+    // of its own -- every other pane in this window is the same -- so the
+    // half-typed name, body and share password are the window's, survive a
+    // trip to another screen, and are wiped by exactly one thing: dropping
+    // this value. See [`SendComposer`].
+    composer: &mut SendComposer,
+    // Whether a `bw send create` started from that draft is still running.
+    creating: bool,
+    // The clock the composer's expiry line is worded against. A parameter for
+    // `crate::send`'s reason: nothing that decides what a date SAYS may read
+    // the wall clock for itself, or the paint tests could only assert the
+    // shape of the sentence and never its content.
+    now: &dyn SendClock,
 ) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
@@ -704,6 +744,25 @@ pub fn draw_send_pane(
                 .clicked()
             {
                 action = SendUiAction::Refresh;
+            }
+            // **Hidden while the composer is open**, because the form is
+            // already the thing on screen and a second way to "open" it would
+            // either do nothing or throw the draft away. It is drawn after
+            // Refresh in a right-to-left layout, so it sits to Refresh's
+            // left.
+            if !composer.open {
+                ui.add_space(BUTTON_GAP);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(NEW_SEND_LABEL).size(12.0).color(theme::INK),
+                        )
+                        .min_size(egui::vec2(88.0, COPY_BUTTON_HEIGHT)),
+                    )
+                    .clicked()
+                {
+                    action = SendUiAction::OpenComposer;
+                }
             }
         });
     });
@@ -734,6 +793,20 @@ pub fn draw_send_pane(
     if let Some(message) = notice {
         if draw_notice_band(ui, message) {
             action = SendUiAction::DismissNotice;
+        }
+        ui.add_space(12.0);
+    }
+
+    // **Above the list and not instead of it.** The composer is a card on
+    // this screen rather than a screen of its own, so every control the Sends
+    // pane has -- Refresh, Copy link, Delete, the confirmation -- keeps
+    // working while a draft is open. A form that took the pane whole would
+    // make "there is a draft open" a state in which the rest of the feature
+    // silently does not exist, which is the shape this window keeps having to
+    // un-write.
+    if composer.open {
+        if let Some(reported) = draw_composer(ui, composer, creating, now) {
+            action = reported;
         }
         ui.add_space(12.0);
     }
@@ -1004,6 +1077,288 @@ fn draw_row(
     // on the URL: the guard is on the *returned action* as well as on the
     // widget, so no future re-layout of the button can reopen the path.
     destructive.or_else(|| (copied && has_url).then(|| SendUiAction::CopyLink(row.access_url.clone())))
+}
+
+/// The header button that opens the composer. Hidden while the composer is
+/// already open: two ways to reach one open form is one way too many, and the
+/// form itself is the thing on screen at that point.
+pub const NEW_SEND_LABEL: &str = "New Send";
+
+/// The composer's own heading. **The one label that appears nowhere else on
+/// this screen**, which is what makes it the witness
+/// `send_delete_wiring::ReachableState::ComposerOpen` is checked by.
+pub const COMPOSER_HEADING: &str = "New text Send";
+
+/// The name field's placeholder.
+pub const NAME_HINT: &str = "Name this Send";
+/// The body field's placeholder. **Says "text"**, because that is the only
+/// kind this app makes and a blank box invites a file drag that will do
+/// nothing.
+pub const TEXT_HINT: &str = "The text to share";
+/// The share-password switch.
+pub const PASSWORD_TOGGLE_LABEL: &str = "Require a password to open the link";
+/// The share-password field's placeholder.
+pub const PASSWORD_HINT: &str = "Password for the link";
+/// The line above the three lifetime buttons.
+pub const LIFETIME_PROMPT: &str = "The link stops working after";
+/// The composer's own submit. **Not "Create Send"**: what the user gets back
+/// is a link, and the noun on the button is the thing that is about to exist
+/// in the world.
+pub const CREATE_LABEL: &str = "Create link";
+/// The composer's way out. **"Discard" and not "Cancel"**, deliberately: the
+/// row's confirmation already owns [`CANCEL_LABEL`] on this same screen, and
+/// pressing this one throws typed secret text away.
+pub const DISCARD_LABEL: &str = "Discard";
+/// What the composer says while its `bw send create` is running. Every control
+/// in the form is disabled in that state, so a second press cannot start a
+/// second child.
+pub const CREATING_LABEL: &str = "Publishing\u{2026}";
+
+/// **The draft, and the whole of what the window holds for it between
+/// frames.**
+///
+/// It is a [`crate::send::SendPlan`] and not a parallel set of fields, which
+/// is the decision worth writing down. A composer holding its own `name`,
+/// `text`, `password` and `days` would need a conversion to a plan, and a
+/// conversion is a place where the validated value and the published value
+/// can differ -- the form says "7 days" and the JSON says thirty, and no test
+/// that checks the form or the JSON alone sees it. There is nothing to
+/// convert here: [`crate::send::validate_plan`] reads the same bytes
+/// `crate::send::plan_to_invocation` will encode.
+///
+/// It also means the draft costs no per-frame clone of the plaintext.
+/// Validation runs every frame the form is up, and a shape that had to build
+/// a `SendPlan` to validate would hand the secret body to the allocator sixty
+/// times a second.
+///
+/// **`Debug` is derived and that is safe here**, unlike everywhere else in
+/// this feature: the only field that carries a secret is the plan, whose own
+/// `Debug` is hand-written to print lengths rather than contents.
+///
+/// **There is no separate "wants a password" flag.** `plan.password` is
+/// `Option<Zeroizing<String>>` and the switch drives that `Option` directly,
+/// so turning the password off wipes the buffer it was typed into rather than
+/// leaving a live secret behind a `false`.
+#[derive(Debug, Default)]
+pub struct SendComposer {
+    /// Whether the form is on screen. **Window state, not pane state**: it
+    /// survives leaving the Sends screen and coming back, because a half-typed
+    /// secret thrown away by a stray navigation is a worse surprise than a
+    /// form that is still open.
+    pub open: bool,
+    /// The draft itself.
+    pub plan: crate::send::SendPlan,
+}
+
+impl SendComposer {
+    /// Whether the share-password switch is on.
+    pub fn wants_password(&self) -> bool {
+        self.plan.password.is_some()
+    }
+
+    /// Turns the share-password switch on or off.
+    ///
+    /// Turning it **off drops the buffer**, which zeroizes it. Turning it on
+    /// starts from empty rather than from whatever was typed before, for the
+    /// same reason: there is no hidden copy to come back.
+    pub fn set_wants_password(&mut self, wanted: bool) {
+        if wanted != self.wants_password() {
+            self.plan.password = wanted.then(|| zeroize::Zeroizing::new(String::new()));
+        }
+    }
+}
+
+/// What is wrong with the draft, phrased for the user, or `None`.
+///
+/// A one-line delegation to [`crate::send::validate_plan`] **and that is the
+/// point**: the sentence under the Create button and the refusal inside
+/// `plan_to_invocation` are the same function, so there is no draft this form
+/// calls acceptable that the encoder then rejects, and none it greys out that
+/// would in fact have published.
+pub fn composer_problem(composer: &SendComposer) -> Option<&'static str> {
+    crate::send::validate_plan(&composer.plan)
+}
+
+/// Whether the Create button may be pressed at all.
+///
+/// **Pulled out as a function of two facts rather than written into the
+/// widget**, because it is the rule that stops a second `bw send create`
+/// starting while the first is still running -- and a rule written inside an
+/// eframe closure is a rule no test in this crate can run.
+pub fn composer_can_submit(problem: Option<&str>, in_flight: bool) -> bool {
+    problem.is_none() && !in_flight
+}
+
+/// The label on one lifetime button.
+pub fn lifetime_label(days: u8) -> String {
+    if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
+/// The composer card. Returns the action **this form** reported, if any.
+///
+/// `in_flight` is whether a `bw send create` started from this form is still
+/// running. Every control is disabled while it is, which is the first of the
+/// two locks against a second child; the second is in
+/// `vault_window::apply_send_action`, which refuses a submit with one in
+/// flight whatever the pane reported.
+fn draw_composer(
+    ui: &mut egui::Ui,
+    composer: &mut SendComposer,
+    in_flight: bool,
+    now: &dyn SendClock,
+) -> Option<SendUiAction> {
+    let mut action = None;
+    let enabled = !in_flight;
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(COMPOSER_HEADING)
+                    .size(14.0)
+                    .color(theme::INK)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut composer.plan.name)
+                    .hint_text(NAME_HINT)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::multiline(&mut *composer.plan.text)
+                    .hint_text(TEXT_HINT)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(LIFETIME_PROMPT)
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // **The choices come from `send.rs` and are not spelled
+                // here.** `validate_plan` refuses any other value, so a
+                // button offering one would be a control that cannot work.
+                for days in crate::send::DELETE_IN_DAYS_CHOICES {
+                    let chosen = composer.plan.delete_in_days == days;
+                    let colour = if chosen { theme::INK } else { theme::TEXT_MUTED };
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(
+                                egui::RichText::new(lifetime_label(days)).size(12.0).color(colour),
+                            )
+                            .selected(chosen)
+                            .min_size(egui::vec2(72.0, COPY_BUTTON_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        composer.plan.delete_in_days = days;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            // **The DATE, not only the number of days.** A publishing action
+            // where being wrong about the lifetime is the harm gets the thing
+            // the user can check against a calendar. `expiry_wording` is
+            // `send.rs`'s own, so this line and the `deletionDate` in the JSON
+            // cannot disagree about what the choice means.
+            ui.label(
+                egui::RichText::new(crate::send::expiry_wording(
+                    composer.plan.delete_in_days,
+                    now,
+                ))
+                .size(11.0)
+                .color(theme::TEXT_FAINT),
+            );
+
+            ui.add_space(10.0);
+            let mut wants_password = composer.wants_password();
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::Checkbox::new(
+                        &mut wants_password,
+                        egui::RichText::new(PASSWORD_TOGGLE_LABEL)
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    ),
+                )
+                .changed()
+            {
+                composer.set_wants_password(wants_password);
+            }
+            if let Some(password) = composer.plan.password.as_mut() {
+                ui.add_space(4.0);
+                ui.add_enabled(
+                    enabled,
+                    egui::TextEdit::singleline(&mut **password)
+                        .hint_text(PASSWORD_HINT)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+            }
+
+            ui.add_space(12.0);
+            let problem = composer_problem(composer);
+            let can_submit = composer_can_submit(problem, in_flight);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        can_submit,
+                        egui::Button::new(
+                            egui::RichText::new(CREATE_LABEL).size(12.0).color(theme::INK),
+                        )
+                        .min_size(egui::vec2(104.0, COPY_BUTTON_HEIGHT)),
+                    )
+                    .clicked()
+                {
+                    action = Some(SendUiAction::SubmitSend);
+                }
+                ui.add_space(BUTTON_GAP);
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(
+                            egui::RichText::new(DISCARD_LABEL)
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .min_size(egui::vec2(DELETE_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
+                    )
+                    .clicked()
+                {
+                    action = Some(SendUiAction::CancelComposer);
+                }
+                ui.add_space(BUTTON_GAP);
+                if in_flight {
+                    ui.label(
+                        egui::RichText::new(CREATING_LABEL)
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                } else if let Some(problem) = problem {
+                    // **The reason the button is grey, beside the button.** A
+                    // disabled control with no explanation is a control the
+                    // user reads as broken.
+                    ui.label(egui::RichText::new(problem).size(11.0).color(theme::TEXT_FAINT));
+                }
+            });
+        });
+    action
 }
 
 /// The inline band. Same shape the item list's band has -- one line, clicking
@@ -1836,7 +2191,7 @@ mod verdict_linearity {
                 let _ = ctx.run_ui(Default::default(), |ui| {
                     // Deliberately dropped rather than applied: this is the
                     // shape every measured shadow reduces to.
-                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default());
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0));
                 });
             }),
             1,
@@ -1940,7 +2295,7 @@ mod paint_tests {
 
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete).into_action();
+            action = draw_send_pane(ui, state, notice, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
 
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
@@ -2112,7 +2467,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -2146,7 +2501,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2158,7 +2513,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete).into_action();
+            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         action
     }
@@ -2286,7 +2641,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -2306,7 +2661,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2319,7 +2674,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default()).into_action();
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -2348,7 +2703,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -2363,7 +2718,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2376,7 +2731,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete).into_action();
+            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
         });
         action
     }
@@ -4889,8 +5244,17 @@ mod source_pins {
             // `impl SendRunner for CliSendRunner<'_>` and the two entry
             // points -- the definitions and the two pinned constructions, and
             // no third.
-            (concat!("CliSendRunner", "::with_session"), 2, false),
-            (concat!("CliSendRunner", ""), 5, false),
+            // **Both of these moved by one AGAIN when `cli_send_create`
+            // landed**, on step 4's terms: its body hands a
+            // `CliSendRunner::with_session(job, data_dir, session)` to the
+            // generic create, which is one more `CliSendRunner` and one more
+            // `CliSendRunner::with_session` than the file had. Six is now
+            // `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`,
+            // `impl SendRunner for CliSendRunner<'_>` and the THREE entry
+            // points -- the definitions and the three pinned constructions,
+            // and no fourth.
+            (concat!("CliSendRunner", "::with_session"), 3, false),
+            (concat!("CliSendRunner", ""), 6, false),
             (concat!("CliSendRunner", "::new"), 0, false),
             // The revoke's two, on the same terms as `list_sends` and
             // `list_invocation` above. `delete_send` is its definition plus
@@ -4909,6 +5273,18 @@ mod source_pins {
             // `crate::send`, so this row and the closure above are together
             // the whole of what refuses a second use of it.
             (concat!("list_", "invocation"), 2, false),
+            // **The create's two, on the same terms as the revoke's pair
+            // above.** `create_send` is its definition plus the one call in
+            // `cli_send_create`; `plan_to_invocation` is its definition plus
+            // the one use in `create_send`. A third mention of either is a
+            // second blocking `bw send create` written inside the privacy
+            // boundary, where the private runner is still in scope -- and
+            // `plan_to_invocation` is the create's exact counterpart of
+            // `list_invocation`: `runner.run(&plan_to_invocation(..))` is a
+            // whole blocking publish that spells neither `create_send` nor
+            // `cli_send_create`.
+            (concat!("create_", "send"), 2, false),
+            (concat!("plan_to_", "invocation"), 2, false),
         ] {
             assert_eq!(
                 send_rs.matches(needle).count(),
@@ -5201,6 +5577,13 @@ mod source_pins {
         // counterpart of the line above it and carries the same three
         // parameters plus the id.
         "send.rs: pub fn cli_send_delete(",
+        // **Added by Sends step 5, deliberately**, and for the line above's
+        // reason word for word: `create_send` is generic over `SendRunner`,
+        // this crate has no `pub` implementation of that trait, and the only
+        // alternative to one new door here was making the runner nameable
+        // from outside -- which is the wall itself. It carries the same three
+        // parameters the other two do, plus the plan and the clock.
+        "send.rs: pub fn cli_send_create(",
     ];
 
     /// **Nothing waits on the Sends channel from the frame's own thread.**
@@ -5674,7 +6057,8 @@ mod source_pins {
         // handed a delete state that is not the window's own, fails here.
         let pane = squashed(concat!(
             "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
-             send_delete.view(), )"
+             send_delete.view(), &mut send_create.composer, send_create.in_flight, \
+             &crate::send::SystemClock, )"
         ));
         assert_eq!(
             squashed(&production).matches(pane.as_str()).count(),

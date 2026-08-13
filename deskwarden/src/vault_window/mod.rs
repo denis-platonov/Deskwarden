@@ -534,6 +534,11 @@ pub fn build_frame(
     // without a `bw send delete` -- which is the only kind of pin that has
     // survived over this wiring. See `VaultFrameEnv::send_delete`.
     let spawn_send_delete = env.send_delete;
+    // The sixth, and the PUBLISHING one. Named here for `spawn_send_delete`'s
+    // reason, plus its own: behind this pointer is a `bw send create`, and a
+    // test that reached the production one would put a real public link on
+    // the internet. See `VaultFrameEnv::send_create`.
+    let spawn_send_create = env.send_create;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -835,6 +840,15 @@ pub fn build_frame(
     // revoke ended as. The rules relating those three are `apply_send_action`
     // and `drain_send_delete`, which are plain functions the tests run.
     let mut send_delete = SendDeleteState::default();
+    // One create reporting back. The whole of it -- the `bw send create`
+    // child included -- happens on the worker thread
+    // `send_create_thread::spawn_send_create` starts, so nothing here waits.
+    let (send_create_tx, send_create_rx): (SendCreateSender, Receiver<SendCreateReport>) =
+        mpsc::channel();
+    // The draft, whether a create is running, and what the last one ended as.
+    // The rules relating those three are `apply_send_action` and
+    // `drain_send_create`, which are plain functions the tests run.
+    let mut send_create = SendCreateState::default();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -1373,6 +1387,9 @@ pub fn build_frame(
         // the whole of the decision -- clear the flag, decide whether the
         // list on screen is now a lie -- is `drain_send_delete`.
         drain_send_delete(&send_delete_rx, &mut send_delete, &mut send_fetch);
+        // The create's answer, on the same terms and for the same reason: a
+        // published Send is a row the list on screen does not have.
+        drain_send_create(&send_create_rx, &mut send_create, &mut send_fetch);
 
         // Non-blocking, like the favicon drain above: the sync thread
         // (spawned from the Sync button below) reports its outcome here, and
@@ -2636,6 +2653,9 @@ pub fn build_frame(
                         state,
                         notice_message.as_deref(),
                         send_delete.view(),
+                        &mut send_create.composer,
+                        send_create.in_flight,
+                        &crate::send::SystemClock,
                     );
                 }
                 // Resolved from the list the selection was made in, for the
@@ -3395,6 +3415,11 @@ pub fn build_frame(
             &send_delete_tx,
             &session_token,
             spawn_send_delete,
+            SendCreateWiring {
+                state: &mut send_create,
+                tx: &send_create_tx,
+                spawn: spawn_send_create,
+            },
         );
 
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
@@ -3509,6 +3534,19 @@ pub fn build_frame(
         if let Some(report) = &send_delete.report {
             if draw_send_delete_report(ui.ctx(), report) {
                 send_delete.report = None;
+            }
+        }
+        // The create's banner, on the same terms. The two are separate cards
+        // in the same corner rather than one shared card, for
+        // `send_create_message`'s reason: the wordings and the tones are
+        // different features and a shared widget is a shared thing to get
+        // wrong. Each arm of `apply_send_action` drops its OWN previous
+        // report when a new operation starts, so neither card ever stacks on
+        // itself; the two can be up together, which is honest -- "that link
+        // is down" and "this one is live" are two facts and both are true.
+        if let Some(report) = &send_create.report {
+            if draw_send_create_report(ui.ctx(), report) {
+                send_create.report = None;
             }
         }
 
@@ -3690,6 +3728,18 @@ pub struct VaultFrameEnv {
     /// revoke observed at the point of effect, with no `bw` child: see
     /// `send_delete_wiring::clicking_delete_on_a_send_row_really_revokes_it`.
     send_delete: SendDeleteSpawn,
+    /// `send_create_thread::spawn_send_create` in production -- the Sends
+    /// composer's Create button, the only thing in this program that starts a
+    /// `bw send create`.
+    ///
+    /// Here for the `send_delete` field's reason exactly, and for one more
+    /// that is specific to this feature: a create PUBLISHES A PUBLIC LINK,
+    /// so a harness that reached the production spawner by accident would not
+    /// merely spawn a process, it would put whatever the test typed on the
+    /// internet under the developer's own account. `frame_env_seam::stubbed`
+    /// therefore refuses to create at all rather than defaulting to
+    /// production.
+    send_create: SendCreateSpawn,
     /// `spawn_aux_load` in production -- the Trash and Archive lists.
     ///
     /// Here so that "the user has opened Trash, and its list arrived" is a
@@ -3715,6 +3765,7 @@ impl VaultFrameEnv {
             send_list: send_fetch_thread::spawn_send_list,
             export: export_thread::spawn_export,
             send_delete: send_delete_thread::spawn_send_delete,
+            send_create: send_create_thread::spawn_send_create,
             aux_load: spawn_aux_load,
             settings_path: crate::settings::default_path(),
         }
@@ -5812,7 +5863,13 @@ fn apply_send_action(
     tx: &SendDeleteSender,
     session: &zeroize::Zeroizing<String>,
     spawn: SendDeleteSpawn,
+    create: SendCreateWiring<'_>,
 ) {
+    let SendCreateWiring {
+        state: create,
+        tx: create_tx,
+        spawn: spawn_create,
+    } = create;
     match action {
         // The URL comes out of the row that was clicked and is carried in the
         // action itself -- there is no second lookup here that could resolve
@@ -5860,6 +5917,64 @@ fn apply_send_action(
                     session.clone(),
                     id,
                     name,
+                );
+            }
+        }
+        // **Opening the form destroys nothing and publishes nothing.** The
+        // previous report goes, because a banner about the last Send is not
+        // about the one being typed.
+        send_ui::SendUiAction::OpenComposer => {
+            create.composer.open = true;
+            create.report = None;
+        }
+        // **Discard is a whole-value reset, not `open = false`.** The draft
+        // holds a secret; leaving it behind a closed flag would keep the text
+        // of a Send the user decided not to publish alive in this process
+        // until the window closed. Replacing the value drops the
+        // `Zeroizing` buffers, which wipes them.
+        //
+        // It is refused while a create is in flight: the worker thread has
+        // its own clone of the plan, so wiping the draft would not recall it,
+        // and a form that vanished mid-publish would leave the user with no
+        // idea what was being published.
+        send_ui::SendUiAction::CancelComposer => {
+            if !create.in_flight {
+                create.composer = send_ui::SendComposer::default();
+            }
+        }
+        // **The only place in this program that starts a `bw send create`.**
+        send_ui::SendUiAction::SubmitSend => {
+            // Two locks, and this is the second: the composer disables every
+            // control while a create is in flight, so there is no button to
+            // press, and this refuses anyway. A second child would publish
+            // the same secret twice under two links, only one of which the
+            // user would ever see to revoke.
+            //
+            // **And the draft is validated HERE as well as beside the
+            // button.** `send_ui::composer_can_submit` greys the control out;
+            // this is what makes greying it out a rule rather than a
+            // rendering. Both call `crate::send::validate_plan`, which is
+            // also what `plan_to_invocation` refuses on, so the three cannot
+            // disagree about what a publishable draft is.
+            if !create.in_flight && send_ui::composer_problem(&create.composer).is_none() {
+                create.in_flight = true;
+                create.report = None;
+                spawn_create(
+                    ctx.clone(),
+                    create_tx.clone(),
+                    // The window's own session, cloned per create into a
+                    // `Zeroizing` the worker drops. It reaches the child in
+                    // `BW_SESSION` and never in argv.
+                    session.clone(),
+                    // **The plan is CLONED and the draft stays put.** A
+                    // `mem::take` here would empty the form on the frame the
+                    // user pressed Create, and a create that then failed
+                    // would have thrown away the text they would have to
+                    // retype. The draft is wiped by `drain_send_create`, on a
+                    // confirmed success and on nothing else. The clone is one
+                    // per press, not one per frame, and every buffer in it is
+                    // `Zeroizing`.
+                    create.composer.plan.clone(),
                 );
             }
         }
@@ -6007,14 +6122,442 @@ mod send_delete_thread {
     ) where
         F: FnOnce() -> SendDeleteReport + Send + 'static,
     {
-        std::thread::spawn(move || {
-            let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                .unwrap_or_else(|_| SendDeleteReport::Failed {
-                    name: String::new(),
-                    error: crate::send::SendError::TimedOut,
+        // **The `std::thread::spawn` moved out of this body and into
+        // `super::spawn_reporting`, which the create's spawner shares.** The
+        // crate's thread census (`job_object::THREAD_SPAWN_SITES`) is exact
+        // in both directions, so a fifth worker in this file had a choice
+        // between spending a site and sharing one; the three lines these
+        // workers all have to get right -- catch the panic, always send
+        // something, always repaint -- are better written once anyway. What
+        // is still decided HERE is the fallback, because only this feature
+        // knows which of its outcomes is honest for "this app does not
+        // know".
+        super::spawn_reporting(ctx_for_delete, tx, work, || SendDeleteReport::Failed {
+            name: String::new(),
+            error: crate::send::SendError::TimedOut,
+        });
+    }
+}
+
+// ===========================================================================
+// Sends, step 5: create
+// ===========================================================================
+
+/// **One background worker, its answer, and the repaint that makes the answer
+/// visible** -- factored out of the revoke's spawner and shared with the
+/// create's.
+///
+/// It exists because the crate's thread census is exact:
+/// `job_object::THREAD_SPAWN_SITES` grants this file a fixed number of
+/// `std::thread::spawn` sites and holds it in both directions, so a fifth
+/// feature that wanted a worker had a choice between spending a site and
+/// sharing one. Sharing is also the better shape: the three lines every one
+/// of these workers has to get right -- catch the panic, always send
+/// something, always repaint -- are now written once.
+///
+/// **`catch_unwind` and a caller-supplied fallback.** The in-flight flag of
+/// each feature is cleared by its drain and by nothing else, so a worker that
+/// panics before sending latches that flag for the life of the window: the
+/// row stuck on "Revoking...", the composer stuck on "Publishing...", neither
+/// with a control on it. The fallback is a value the CALLER chooses because
+/// only the caller knows which of its outcomes is the honest one for "this
+/// app does not know" -- and for both of the callers here that is the
+/// AMBIGUOUS one, since a panicked worker may well have started a child that
+/// really did the thing.
+///
+/// `request_repaint` is what makes the answer visible: every drain is a
+/// `try_recv` in the frame closure, so without a frame to run in a finished
+/// worker sits in its channel until some unrelated input provokes one.
+fn spawn_reporting<T, F, P>(ctx: egui::Context, tx: mpsc::Sender<T>, work: F, on_panic: P)
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    P: FnOnce() -> T + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let report =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
+                on_panic()
+            });
+        let _ = tx.send(report);
+        ctx.request_repaint();
+    });
+}
+
+/// What one confirmed create ended as, carried back from the worker thread it
+/// runs on.
+///
+/// [`SendDeleteReport`]'s shape and its reason: the `SendError` travels whole
+/// rather than pre-rendered, because the message, the tone and the refetch
+/// decision are three different questions about one failure and two of them
+/// turn on `is_ambiguous`.
+///
+/// **The success carries the link.** `CreatedSend::access_url` is the whole
+/// point of the operation, and `send.rs` already refuses to call a run a
+/// success without one -- `SendError::CreatedButUnreadable` exists for exactly
+/// the case where `bw` exited zero and the URL could not be read back.
+///
+/// **`Debug` is derived and safe.** Nothing in here is a secret: a name the
+/// user typed to label the Send, a public URL, and an error. The plaintext
+/// body and the share password never leave the composer's `SendPlan` and its
+/// clone on the worker thread, both of which redact themselves.
+#[derive(Debug, Clone)]
+enum SendCreateReport {
+    /// `bw send create` exited zero and its answer parsed. The link is live.
+    Created { name: String, access_url: String },
+    /// It did not, and this is why.
+    Failed {
+        name: String,
+        error: crate::send::SendError,
+    },
+}
+
+impl SendCreateReport {
+    /// Whether the account's list of Sends is now different from the one on
+    /// screen.
+    ///
+    /// **True for an AMBIGUOUS failure as well as for a success**, for
+    /// [`SendDeleteReport::list_is_now_stale`]'s reason read the other way
+    /// round: `SendError::TimedOut` means this app stopped waiting, not that
+    /// the server did nothing, so a Send may have been published that this
+    /// window does not know about. Not refetching in that case leaves a live
+    /// public link off the only screen that could revoke it, which is strictly
+    /// the worse half of the trade.
+    fn list_is_now_stale(&self) -> bool {
+        match self {
+            SendCreateReport::Created { .. } => true,
+            SendCreateReport::Failed { error, .. } => error.is_ambiguous(),
+        }
+    }
+
+    /// Whether the draft that produced this report may be thrown away.
+    ///
+    /// **Only on a confirmed success.** A failed create leaves the composer
+    /// open with every character still in it: the user typed a secret, this
+    /// app could not publish it, and clearing the form would make them type
+    /// it again to find out whether the failure was transient. An AMBIGUOUS
+    /// failure keeps the draft too -- the Send may exist, but this app cannot
+    /// say so, and the list it is about to refetch is where the answer will
+    /// be.
+    fn draft_is_spent(&self) -> bool {
+        matches!(self, SendCreateReport::Created { .. })
+    }
+}
+
+/// How loudly a create report is painted. [`DeleteTone`]'s shape and its
+/// reason; a separate type because these are separate features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateTone {
+    /// The link exists.
+    Good,
+    /// It does not, or it is not known to.
+    Bad,
+}
+
+/// **The whole of the create's outcome-to-user mapping**, as a pure function
+/// of the report.
+///
+/// Never answers "say nothing", for [`send_delete_message`]'s reason turned
+/// around: a Send is a PUBLIC LINK, and silence about one that may exist is
+/// the user believing nothing was published when something was.
+///
+/// **Ambiguity gets its own words and its own tone.** `SendError::TimedOut`
+/// is the arm this exists for: `bw` was still running when the deadline
+/// passed, so the link may be live and may not be. Rendering that as a
+/// failure is this app telling the user nothing was published when a secret
+/// may already be reachable by anyone holding the URL -- which is the create
+/// side of the one lie the revoke mapping must not tell either. Every arm is
+/// compared pairwise by
+/// `send_create_wiring::every_create_outcome_says_something_different`, and
+/// exactly one of them is [`CreateTone::Good`].
+fn send_create_message(report: &SendCreateReport) -> (CreateTone, String) {
+    match report {
+        SendCreateReport::Created { name, access_url } => (
+            CreateTone::Good,
+            format!(
+                "\u{201c}{name}\u{201d} is published. Its link is {access_url} \u{2014} anyone \
+                 who has it can open the Send.",
+            ),
+        ),
+        SendCreateReport::Failed { name, error } if error.is_ambiguous() => (
+            CreateTone::Bad,
+            format!(
+                "Deskwarden could not confirm whether \u{201c}{name}\u{201d} was published, so \
+                 a link to it may already be live. {} Check the list below before trying \
+                 again.",
+                error.user_message()
+            ),
+        ),
+        SendCreateReport::Failed { name, error } => (
+            CreateTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} was not published and nothing was shared. {}",
+                error.user_message()
+            ),
+        ),
+    }
+}
+
+/// The create banner: [`draw_send_delete_report`]'s card, for one report.
+///
+/// **It is handed the REPORT and not a tone and a string**, for that
+/// function's reason exactly -- a card taking `(tone, text)` is a card whose
+/// caller decides the colour, and the caller is the frame closure, so "every
+/// report painted in the success colour" would be a one-word change no test in
+/// this crate can run.
+///
+/// Answers `true` when the user dismissed it.
+fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bool {
+    let (tone, text) = send_create_message(report);
+    let accent = match tone {
+        CreateTone::Good => theme::BORDER,
+        CreateTone::Bad => theme::ERROR,
+    };
+    let ink = match tone {
+        CreateTone::Good => theme::INK,
+        CreateTone::Bad => theme::ERROR,
+    };
+    let mut dismissed = false;
+    egui::Area::new(egui::Id::new("vault-send-create-report"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, accent))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(text).size(12.0).color(ink));
+                        ui.add_space(10.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Dismiss")
+                                        .size(12.0)
+                                        .color(theme::TEXT_MUTED),
+                                )
+                                .min_size(egui::vec2(72.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            dismissed = true;
+                        }
+                    });
                 });
-            let _ = tx.send(report);
-            ctx_for_delete.request_repaint();
+        });
+    dismissed
+}
+
+type SendCreateSender = mpsc::Sender<SendCreateReport>;
+
+/// A parameter of [`apply_send_action`] rather than a call written inside it,
+/// and a `fn` pointer rather than a closure, for [`SendDeleteSpawn`]'s reason:
+/// it carries no captured state by construction, so the value the tests drive
+/// with and the value the frame closure passes are the same KIND of thing.
+///
+/// The plan travels **by value** and the session in a `Zeroizing<String>`, so
+/// the worker owns both and drops both.
+type SendCreateSpawn = fn(egui::Context, SendCreateSender, zeroize::Zeroizing<String>, crate::send::SendPlan);
+
+/// Everything the window holds between frames for the create.
+///
+/// [`SendDeleteState`]'s shape and its reason: the three are a state machine
+/// and the rules relating them -- a submit is refused while one is in flight,
+/// the draft outlives a failure and dies with a success, a report replaces the
+/// previous report -- are rules no test in this crate could run if they were
+/// written as `if`s between panels. They live in [`apply_send_action`] and
+/// [`drain_send_create`], which are plain functions.
+///
+/// **The draft is `send_ui::SendComposer` and lives HERE**, not in the pane:
+/// panes in this window own no state, and a draft that died with the frame
+/// would lose a half-typed secret to every navigation.
+#[derive(Debug, Default)]
+struct SendCreateState {
+    /// The form, open or closed, with whatever is typed into it.
+    composer: send_ui::SendComposer,
+    /// Whether a `bw send create` is running. **At most one at a time**: the
+    /// composer disables every control while it is, so there is no button to
+    /// start a second from, and [`apply_send_action`] refuses anyway.
+    in_flight: bool,
+    /// The last report, until the user dismisses it.
+    report: Option<SendCreateReport>,
+}
+
+/// The create's three arguments to [`apply_send_action`], as one value.
+///
+/// A struct and not three more parameters, because [`apply_send_action`]
+/// already carries seven and its call in the frame closure is pinned by brace
+/// depth -- an argument list that grows without bound is an argument list that
+/// gets reordered, and two `&mut` state values of different types next to two
+/// senders of different types is exactly the shape where a swap compiles.
+struct SendCreateWiring<'a> {
+    state: &'a mut SendCreateState,
+    tx: &'a SendCreateSender,
+    spawn: SendCreateSpawn,
+}
+
+/// The create reporting back, as a plain function for [`drain_send_delete`]'s
+/// reason.
+///
+/// `in_flight` is cleared FIRST and unconditionally: the thread that set it
+/// has finished, whatever became of its answer, and a conditional clear is how
+/// a flag like this latches forever -- leaving the composer painted
+/// "Publishing..." with every control disabled for the life of the window.
+///
+/// **The draft is wiped only on a confirmed success** -- see
+/// [`SendCreateReport::draft_is_spent`] -- and wiping it is a whole-value
+/// reset, so the name, the body and the share password all go back to the
+/// allocator zeroized rather than being cleared field by field and one of them
+/// forgotten.
+fn drain_send_create(
+    rx: &Receiver<SendCreateReport>,
+    create: &mut SendCreateState,
+    fetch: &mut send_ui::SendFetch,
+) {
+    if let Ok(report) = rx.try_recv() {
+        create.in_flight = false;
+        if report.list_is_now_stale() {
+            fetch.invalidate();
+        }
+        if report.draft_is_spent() {
+            create.composer = send_ui::SendComposer::default();
+        }
+        create.report = Some(report);
+    }
+}
+
+/// The create's off-thread half, and its job.
+mod send_create_thread {
+    //! **Everything about a create that blocks lives in here, and the frame
+    //! closure's only entry point is [`spawn_send_create`]** -- `mod
+    //! send_delete_thread`'s shape, for `mod send_fetch_thread`'s reason.
+    //! `crate::send::cli_send_create` waits on a `bw` child for up to
+    //! `send::SEND_TIMEOUT`, sixty seconds, and a synchronous call from a
+    //! frame would freeze the whole window, titlebar included, for a minute
+    //! on the frame the user presses Create.
+    //!
+    //! The seal is
+    //! `super::send_create_wiring::every_mention_of_the_blocking_create_is_sealed_inside_its_own_module`:
+    //! every occurrence of `cli_send_create` and `real_send_create` in the
+    //! crate's production, outside `send.rs` where the first is defined, must
+    //! be inside this block. A call written in the frame closure spells the
+    //! first of those and fails.
+    //!
+    //! **The plan's secrets reach the child on stdin and nowhere else**, and
+    //! the session in `BW_SESSION` and never in argv. Neither decision is
+    //! taken here: `crate::send::plan_to_invocation` builds an argument vector
+    //! that is the two literal words `send create` and puts everything else in
+    //! the base64 JSON body, and `CliSendRunner::build_command` is the one
+    //! place that decides where the session goes.
+
+    use eframe::egui;
+
+    use super::{SendCreateReport, SendCreateSender};
+
+    /// The job every `bw send create` child this window starts is placed in.
+    ///
+    /// **`super::send_fetch_thread::sends_job` itself, reused rather than
+    /// mirrored**, for the reason `mod send_delete_thread`'s `delete_job`
+    /// gives and not a new one: `crate::send::cli_send_create` takes exactly
+    /// `Option<&crate::job_object::KillOnCloseJob>`, which is what `sends_job`
+    /// already answers, and the child is the same `bw send` against the same
+    /// account started by the same window. Two jobs would be two handles held
+    /// for one purpose.
+    ///
+    /// `None` is never passed deliberately: `sends_job` degrades to `None`
+    /// only when the kernel refuses to make a job at all, and refusing to
+    /// publish because a job object could not be created would be the worse
+    /// trade.
+    ///
+    /// One cell, so every call answers the SAME job -- which is what lets
+    /// `super::send_create_wiring::the_create_child_is_spawned_into_the_job_this_window_holds`
+    /// compare the job that arrived at the spawn with this function's answer
+    /// by pointer identity.
+    fn create_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+        super::send_fetch_thread::sends_job()
+    }
+
+    /// **One whole create, blocking, from the plan to the verdict** -- and the
+    /// wiring's own entry point, in the sense that everything above it is a
+    /// thread and everything below it is `send.rs`.
+    ///
+    /// Nothing is injected. The job, the profile directory, the clock, the
+    /// runner and the spawn are all the production ones, which is what makes
+    /// `super::send_create_wiring::the_create_child_is_spawned_into_the_job_this_window_holds`
+    /// a statement about what ships: that test calls THIS function with
+    /// `job_object`'s spawn probe armed, and the probe is thread-local, so it
+    /// must be a call the test makes on its own thread -- which is why the
+    /// blocking half is a plain function and not something only reachable
+    /// through `std::thread::spawn`.
+    ///
+    /// **The name is read off the plan before anything is published**, and it
+    /// is the only field of the plan that reaches the report: it is a label
+    /// the user typed and is already on screen, while the body and the share
+    /// password are the secret and never leave this function.
+    pub(super) fn real_send_create(
+        plan: &crate::send::SendPlan,
+        session: &str,
+    ) -> SendCreateReport {
+        // Read on the creating thread, not captured from the frame:
+        // `bw_path` keeps the active account's profile directory as process
+        // state precisely so that every spawn in this crate reaches the same
+        // account, and a copy taken a frame earlier is a copy that can be
+        // stale.
+        let data_dir = crate::bw_path::active_data_dir();
+        let name = plan.name.trim().to_string();
+        match crate::send::cli_send_create(
+            create_job(),
+            data_dir.as_deref(),
+            session,
+            plan,
+            // The real clock, read here and nowhere in `send.rs`. The
+            // deletion date the CLI is given is the one the composer's own
+            // expiry line was worded from, to the second the user pressed
+            // Create rather than to the second the form was drawn.
+            &crate::send::SystemClock,
+        ) {
+            Ok(created) => SendCreateReport::Created {
+                name,
+                access_url: created.access_url,
+            },
+            Err(error) => SendCreateReport::Failed { name, error },
+        }
+    }
+
+    /// Publishes one Send on a background thread. The frame closure's one
+    /// entry point, and *nothing but* the delegation.
+    pub(super) fn spawn_send_create(
+        ctx_for_create: egui::Context,
+        tx: SendCreateSender,
+        session: zeroize::Zeroizing<String>,
+        plan: crate::send::SendPlan,
+    ) {
+        spawn_send_create_with(ctx_for_create, tx, move || {
+            real_send_create(&plan, &session)
+        });
+    }
+
+    /// The off-thread half, **generic over the work so that it can be
+    /// tested** -- `spawn_send_delete_with`'s shape and its reason, and its
+    /// `catch_unwind` too: `in_flight` is cleared by the drain and by nothing
+    /// else, so a worker that panics before sending leaves the composer
+    /// painted "Publishing..." with every control disabled for the life of the
+    /// window. The panic is turned into the AMBIGUOUS report, because a
+    /// panicked worker may have started a child that really did publish a
+    /// public link.
+    pub(super) fn spawn_send_create_with<F>(
+        ctx_for_create: egui::Context,
+        tx: SendCreateSender,
+        work: F,
+    ) where
+        F: FnOnce() -> SendCreateReport + Send + 'static,
+    {
+        super::spawn_reporting(ctx_for_create, tx, work, || SendCreateReport::Failed {
+            name: String::new(),
+            error: crate::send::SendError::TimedOut,
         });
     }
 }
@@ -16676,8 +17219,8 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            // 54 as of Sends step 4, which added `mod send_delete_wiring`.
-            modules, 54,
+            // 55 as of Sends step 5, which added `mod send_create_wiring`.
+            modules, 55,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -19480,10 +20023,23 @@ mod send_delete_wiring {
         /// green without this, and it makes the whole Sends screen inert for
         /// the seconds a real revoke takes.
         RevokeInFlight,
+        /// The create composer open, with the Sends screen left and returned
+        /// to since. **The draft is WINDOW state, not pane state**, and this
+        /// is the state that says so: the form is opened with the real New
+        /// Send button, the window is navigated away from it, and the matrix's
+        /// own press of the Sends row below finds the composer still there.
+        ///
+        /// It is a reachable state in its own right and not a decoration: the
+        /// composer sits ABOVE the rows, so a gate written on
+        /// `send_create.composer.open` -- the newest frame-local this window
+        /// has -- would leave every control on the Sends screen inert for as
+        /// long as a user is typing a Send, which is the whole of the time the
+        /// feature is being used.
+        ComposerOpen,
     }
 
     impl ReachableState {
-        const ALL: [Self; 10] = [
+        const ALL: [Self; 11] = [
             Self::Fresh,
             Self::EmptyVault,
             Self::FolderSelected,
@@ -19494,6 +20050,7 @@ mod send_delete_wiring {
             Self::NoticeUp,
             Self::FetchInFlight,
             Self::RevokeInFlight,
+            Self::ComposerOpen,
         ];
     }
 
@@ -19683,6 +20240,12 @@ mod send_delete_wiring {
                 Witness::BadgeResolvedOnRow { row: "Archive", other: "Trash" }
             }
             ReachableState::SearchTyped => Witness::Appeared("zq"),
+            // The composer's own heading, which nothing else on this screen
+            // paints -- and which `Fresh`'s Sends screen therefore does not,
+            // so the baseline check below is a real one.
+            ReachableState::ComposerOpen => {
+                Witness::OnTheSendsScreen(send_ui::COMPOSER_HEADING)
+            }
         }
     }
 
@@ -20363,7 +20926,7 @@ mod send_delete_wiring {
         /// values, not identifiers: renaming the constant behind
         /// `FRAME_ITEM_NAME` changes nothing here, but pointing it at a
         /// different string does.
-        const MEASURED: [(ReachableState, &str); 10] = [
+        const MEASURED: [(ReachableState, &str); 11] = [
             (ReachableState::Fresh, "Baseline"),
             (ReachableState::EmptyVault, "NeverPaints|Frame Harness Item"),
             (
@@ -20383,6 +20946,7 @@ mod send_delete_wiring {
                 "OnTheSendsScreen|Asking Bitwarden for your Sends\u{2026}",
             ),
             (ReachableState::RevokeInFlight, "OwnBlock"),
+            (ReachableState::ComposerOpen, "OnTheSendsScreen|New text Send"),
         ];
 
         // The table is over EVERY state and no others. Without this an
@@ -20467,6 +21031,214 @@ mod send_delete_wiring {
                  exactly one baseline and exactly one variant with a block of its own."
             );
         }
+    }
+
+    /// Every create the frame started, as (name, text, share password,
+    /// session). A `Mutex` rather than a thread-local for [`FRAME_REVOKES`]'s
+    /// reason: the spawner is a `fn` item, so there is nowhere to capture a
+    /// recorder, and [`FRAME_LOCK`] keeps two tests out of each other's
+    /// records.
+    static FRAME_CREATES: std::sync::Mutex<Vec<(String, String, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// The name typed into the real composer by
+    /// [`typing_a_send_and_pressing_create_really_publishes_what_was_typed`].
+    const FRAME_DRAFT_NAME: &str = "Draft From The Frame";
+    /// The body typed into it. Distinctive, so "this is what was typed and
+    /// not something the harness supplied" is a search a stray substring
+    /// cannot satisfy.
+    const FRAME_DRAFT_TEXT: &str = "obsidian-lamplight-4417";
+
+    /// A [`SendCreateSpawn`] that records instead of publishing. Production's
+    /// signature exactly, so the only difference between this run and the
+    /// shipping one is which of two `fn` pointers the env carries.
+    fn frame_create(
+        _ctx: egui::Context,
+        _tx: SendCreateSender,
+        session: zeroize::Zeroizing<String>,
+        plan: crate::send::SendPlan,
+    ) {
+        FRAME_CREATES.lock().expect("not poisoned").push((
+            plan.name.clone(),
+            plan.text.to_string(),
+            plan.password.as_deref().cloned().unwrap_or_default(),
+            session.to_string(),
+        ));
+    }
+
+    /// **THE WHOLE CREATE, ON A REAL WINDOW, DRIVEN THE WAY A USER DRIVES
+    /// IT.**
+    ///
+    /// Every other hold on this feature is about a piece of it: the state
+    /// machine (`send_create_wiring`), the child and its job, the composer's
+    /// own widgets. This is the one that says the pieces are connected --
+    /// the real sidebar row is pressed, the real New Send button is pressed,
+    /// the real text fields are focused by clicking them and filled with
+    /// real key events, the real Create button is pressed, and the publish
+    /// is observed where it leaves the frame carrying what was typed.
+    ///
+    /// It is also the only thing that can see the two shapes a source pin
+    /// cannot: a Create button that is drawn but reports nothing, and an
+    /// `apply_send_action` reached with an action that was neutralised on the
+    /// way. See [`VaultFrameEnv::send_delete`] for the measured history of
+    /// both on the revoke side.
+    ///
+    /// **The greyed-out button is checked first, and that is not decoration.**
+    /// An empty draft must publish nothing; a Create that fires on an empty
+    /// form would publish an empty Send under a public link. So the button is
+    /// pressed BEFORE anything is typed and the ledger is required to be
+    /// empty, and only then is the form filled.
+    ///
+    /// **No `bw`, no dialog, no network.** The create spawner is substituted
+    /// through the env seam; that the production pointer behind that seam is
+    /// the real `send_create_thread::spawn_send_create` is held by
+    /// `send_ui`'s `production_is_the_only_env_a_shipping_build_has` and by
+    /// `export_wiring::production_hands_the_window_the_real_functions`.
+    #[test]
+    fn typing_a_send_and_pressing_create_really_publishes_what_was_typed() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_CREATES.lock().expect("not poisoned").clear();
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-send-create-frame-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::with_send_create(
+                super::frame_env_seam::stubbed(
+                    frame_sync,
+                    frame_load,
+                    frame_send_list,
+                    Some(scratch.join("settings.json")),
+                ),
+                frame_create,
+            ),
+        );
+
+        let state = ReachableState::Fresh;
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        let _ = matrix_frame(&ctx, &mut frame_fn);
+        let output = matrix_frame(&ctx, &mut frame_fn);
+
+        let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
+        let on_sends = matrix_click(&ctx, &mut frame_fn, sends_at);
+        let new_at = matrix_locate(state, &on_sends, send_ui::NEW_SEND_LABEL);
+        let mut opened = matrix_click(&ctx, &mut frame_fn, new_at);
+        assert!(
+            matrix_find(&opened, send_ui::COMPOSER_HEADING).is_some(),
+            "the New Send button was pressed and no composer appeared, so the header's one \
+             way into this feature is inert. What was painted: {:?}",
+            matrix_texts(&opened)
+        );
+
+        // **The empty form publishes nothing.** Pressed for real, before a
+        // character is typed.
+        let create_at = matrix_locate(state, &opened, send_ui::CREATE_LABEL);
+        opened = matrix_click(&ctx, &mut frame_fn, create_at);
+        assert!(
+            FRAME_CREATES.lock().expect("not poisoned").is_empty(),
+            "pressing Create on an EMPTY draft published something -- a Send with no name \
+             and no body, under a public link"
+        );
+
+        // Fill it, by focusing each field the way a user does: a click on the
+        // box, then real text events.
+        let name_at = matrix_locate(state, &opened, send_ui::NAME_HINT);
+        let focused = matrix_click(&ctx, &mut frame_fn, name_at);
+        let _ = focused;
+        let typed_name = matrix_key_text(&ctx, &mut frame_fn, FRAME_DRAFT_NAME);
+        assert!(
+            matrix_find(&typed_name, FRAME_DRAFT_NAME).is_some(),
+            "the name field did not take what was typed into it, so the rest of this test \
+             would be about an empty form. What was painted: {:?}",
+            matrix_texts(&typed_name)
+        );
+        let text_at = matrix_locate(state, &typed_name, send_ui::TEXT_HINT);
+        let _ = matrix_click(&ctx, &mut frame_fn, text_at);
+        let filled = matrix_key_text(&ctx, &mut frame_fn, FRAME_DRAFT_TEXT);
+        assert!(
+            matrix_find(&filled, FRAME_DRAFT_TEXT).is_some(),
+            "the body field did not take what was typed into it. What was painted: {:?}",
+            matrix_texts(&filled)
+        );
+
+        let create_at = matrix_locate(state, &filled, send_ui::CREATE_LABEL);
+        let published = matrix_click(&ctx, &mut frame_fn, create_at);
+
+        assert_eq!(
+            FRAME_CREATES.lock().expect("not poisoned").clone(),
+            vec![(
+                FRAME_DRAFT_NAME.to_string(),
+                FRAME_DRAFT_TEXT.to_string(),
+                String::new(),
+                FRAME_SESSION.to_string(),
+            )],
+            "pressing Create on a filled composer did not start exactly one publish carrying \
+             exactly what was typed and this window's own session. A press that reaches \
+             nothing looks identical on screen, and the whole feature is that press. What \
+             was painted: {:?}",
+            matrix_texts(&published)
+        );
+
+        // And the window knows one is running: the composer says so, which is
+        // what stops a second press.
+        assert!(
+            matrix_find(&published, send_ui::CREATING_LABEL).is_some(),
+            "the publish started and the composer does not say so, so a second press would \
+             publish the same secret again under a second link. What was painted: {:?}",
+            matrix_texts(&published)
+        );
+
+        assert_eq!(
+            send_ui::abandoned_in_this_thread(),
+            0,
+            "a Sends verdict was dropped instead of applied during this test"
+        );
+    }
+
+    /// Real text events, with no Ctrl+K first -- [`matrix_type`] is the search
+    /// box's route and focuses it on the way in, which is exactly wrong for a
+    /// field that has just been focused by a click.
+    fn matrix_key_text(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+        text: &str,
+    ) -> egui::FullOutput {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Text(text.to_string())],
+                ..matrix_input()
+            },
+            |ui| frame_fn(ui),
+        );
+        matrix_frame(ctx, frame_fn)
     }
 
     fn drive_the_sends_screen_in(state: ReachableState) {
@@ -20589,6 +21361,30 @@ mod send_delete_wiring {
             }
             ReachableState::SearchTyped => {
                 output = matrix_type(&ctx, &mut frame_fn, "zq");
+            }
+            ReachableState::ComposerOpen => {
+                // **Opened on the Sends screen, then navigated away from.**
+                // The matrix presses the Sends row itself a few lines below,
+                // and the witness is checked on THAT screen -- so this arm
+                // proves the draft survives a trip to another screen, which
+                // is the property that makes losing a half-typed secret to a
+                // stray click impossible.
+                let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
+                let on_sends = matrix_click(&ctx, &mut frame_fn, sends_at);
+                let new_at = matrix_locate(state, &on_sends, send_ui::NEW_SEND_LABEL);
+                let opened = matrix_click(&ctx, &mut frame_fn, new_at);
+                assert!(
+                    matrix_find(&opened, send_ui::COMPOSER_HEADING).is_some(),
+                    "control: the New Send button was pressed and no composer appeared, so                      this state cannot be reached at all. What was painted: {:?}",
+                    matrix_texts(&opened)
+                );
+                let away = matrix_locate(state, &opened, "Frame Harness Folder");
+                output = matrix_click(&ctx, &mut frame_fn, away);
+                assert!(
+                    matrix_find(&output, send_ui::COMPOSER_HEADING).is_none(),
+                    "control: the composer is painted on a screen that is not the Sends                      screen, so \"it is still open when we come back\" says nothing about                      coming back. What was painted: {:?}",
+                    matrix_texts(&output)
+                );
             }
         }
         let reached = Reached::proved(state, &before, &output);
@@ -20921,11 +21717,30 @@ mod send_delete_wiring {
             &tx,
             &zeroize::Zeroizing::new(SESSION.to_string()),
             recording_spawn,
+            // The create side, present and inert: none of the actions these
+            // tests drive is a create one, and a spawner that panics is what
+            // says so if that ever stops being true.
+            SendCreateWiring {
+                state: &mut SendCreateState::default(),
+                tx: &mpsc::channel().0,
+                spawn: refuses_to_create_here,
+            },
         );
         // Held so the sender cannot report "disconnected" for a reason that
         // has nothing to do with what is being asserted.
         drop(rx);
         SPAWNS.with(|s| s.borrow().clone())
+    }
+
+    /// The create spawner these revoke tests hand over. None of them produce
+    /// a create action, so reaching it at all is the failure.
+    fn refuses_to_create_here(
+        _: egui::Context,
+        _: SendCreateSender,
+        _: zeroize::Zeroizing<String>,
+        plan: crate::send::SendPlan,
+    ) {
+        panic!("a revoke-side action started a create: {plan:?}");
     }
 
     fn confirm() -> send_ui::SendUiAction {
@@ -22079,7 +22894,9 @@ mod send_delete_wiring {
         );
         let tail = squashed(concat!(
             "}) .inner .into_", "action(), &mut send_delete, &mut send_fetch, \
-             ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, );"
+             ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, \
+             SendCreateWiring { state: &mut send_create, tx: &send_create_tx, \
+             spawn: spawn_send_create, }, );"
         ));
         assert_eq!(
             flat.matches(&tail).count(),
@@ -22456,6 +23273,13 @@ mod frame_env_seam {
             send_list,
             export: refuses_to_export,
             send_delete: refuses_to_revoke,
+            // **The third refusal, and the loudest one.** A create does not
+            // merely start a process: it PUBLISHES, and a harness that
+            // pressed Create without naming a spawner would put whatever the
+            // test typed on the internet under whatever account the
+            // developer is logged into, with a link this app would then have
+            // to be told to revoke.
+            send_create: refuses_to_create,
             // **Answers with an EMPTY list rather than dialling the vault.**
             // Not a refusal, unlike the two above: opening Trash is not a
             // destructive act and a harness reaches it by pressing an
@@ -22514,6 +23338,28 @@ mod frame_env_seam {
         VaultFrameEnv { export, ..env }
     }
 
+    /// The default [`VaultFrameEnv::send_create`] of a [`stubbed`] env.
+    fn refuses_to_create(
+        _: egui::Context,
+        _: SendCreateSender,
+        _: zeroize::Zeroizing<String>,
+        plan: crate::send::SendPlan,
+    ) {
+        panic!(
+            "a test pressed Create on a `frame_env_seam::stubbed` window ({plan:?}). That              would have run a real `bw send create` against whatever account the developer              is logged into and PUBLISHED A PUBLIC LINK to whatever the test typed; build              the env with `with_send_create` and observe the spawn there instead"
+        );
+    }
+
+    /// [`stubbed`] with the create spawner named too, for [`with_send_delete`]'s
+    /// reason and more so: the harness that presses Create is one test, and
+    /// every other caller should stay unable to publish anything by accident.
+    pub(super) fn with_send_create(
+        env: VaultFrameEnv,
+        send_create: SendCreateSpawn,
+    ) -> VaultFrameEnv {
+        VaultFrameEnv { send_create, ..env }
+    }
+
     /// [`stubbed`] with the revoke spawner named too, for [`with_export`]'s
     /// reason: the harness that presses Delete is one test, and every other
     /// caller should stay unable to start a `bw send delete` by accident.
@@ -22522,5 +23368,1129 @@ mod frame_env_seam {
         send_delete: SendDeleteSpawn,
     ) -> VaultFrameEnv {
         VaultFrameEnv { send_delete, ..env }
+    }
+}
+
+/// **The Sends create, from the composer to the `bw send create` child.**
+///
+/// The chain has the same four links the revoke's does and each is held
+/// separately, because no single test can span them: the frame closure is not
+/// runnable in this crate, and `job_object::spawn_probe` is thread-local by
+/// design.
+///
+///  1. The composer paints its controls and reports what was pressed --
+///     `send_ui::paint_tests`, real clicks on real widgets.
+///  2. **What the pane reports becomes state and a spawn** --
+///     [`pressing_create_on_a_valid_draft_starts_exactly_one_publish`] and its
+///     siblings, which drive the production [`apply_send_action`] and watch
+///     what it does.
+///  3. [`send_create_thread::spawn_send_create`] is the delegation and nothing
+///     but, and `spawn_send_create_with` really runs its work off the caller's
+///     thread -- [`the_create_runs_on_a_thread_that_is_not_the_frames`].
+///  4. **And the work it delegates, driven for real, spawns the child into the
+///     very job this window holds, with nothing secret in its argument vector
+///     or its environment** --
+///     [`the_create_child_is_spawned_into_the_job_this_window_holds`] and
+///     [`the_drafts_secrets_reach_the_child_in_neither_argv_nor_the_environment`].
+///
+/// And the click itself is held on a real window by
+/// `send_delete_wiring::the_sends_screen_works_in_every_state_the_user_can_reach`,
+/// whose `ComposerOpen` state opens the real form with the real button and
+/// finds it still open after a trip to another screen and back.
+///
+/// Nothing here starts a process, touches the network, reads the real vault,
+/// publishes a real Send or opens a dialog: the probe refuses before
+/// `CreateProcess`, and the one spawner the state tests use is a recorder.
+#[cfg(test)]
+mod send_create_wiring {
+    use super::*;
+
+    /// Invented. No real session token appears in this file.
+    const SESSION: &str = "an-invented-session-token-for-the-create-wiring";
+    /// The body of the draft in every test below. **A single distinctive
+    /// string**, so "the secret is not in argv" is a search a stray substring
+    /// cannot satisfy by accident.
+    const SECRET: &str = "sarcophagus-thunderclap-9f2b-the-body-of-the-send";
+    /// The share password, on the same terms.
+    const SHARE_PASSWORD: &str = "quarantine-mandolin-7c41-the-share-password";
+    const DRAFT_NAME: &str = "Wiring harness draft";
+
+    fn a_draft() -> crate::send::SendPlan {
+        crate::send::SendPlan {
+            name: DRAFT_NAME.to_string(),
+            text: zeroize::Zeroizing::new(SECRET.to_string()),
+            password: Some(zeroize::Zeroizing::new(SHARE_PASSWORD.to_string())),
+            ..crate::send::SendPlan::default()
+        }
+    }
+
+    /// A composer holding [`a_draft`], open.
+    fn an_open_composer() -> send_ui::SendComposer {
+        send_ui::SendComposer {
+            open: true,
+            plan: a_draft(),
+        }
+    }
+
+    // ==================================================================
+    // 4. The child: the job, and what it does and does not carry
+    // ==================================================================
+
+    /// The address of the job this window puts every `bw send` child into, or
+    /// `None` if this machine would not give the process one.
+    fn window_job_address() -> Option<usize> {
+        send_fetch_thread::sends_job().map(|job| std::ptr::from_ref(job) as usize)
+    }
+
+    /// Drives the wiring's blocking entry point for real and reports every
+    /// spawn it attempted.
+    ///
+    /// **Nothing is substituted.** The job, the profile directory, the clock,
+    /// the runner, the invocation and `job_object::spawn_in_job` are all the
+    /// ones that ship, which is what makes the recorded values facts about
+    /// production.
+    fn spawns_of_one_create(
+        plan: &crate::send::SendPlan,
+    ) -> (SendCreateReport, Vec<crate::job_object::spawn_probe::Attempt>) {
+        // `bw_job_command_in` refuses outright unless startup recorded a
+        // signature-verified CLI. First-wins and idempotent, so this is safe
+        // however the test order falls out, and the path is a fiction nothing
+        // ever executes.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = send_create_thread::real_send_create(plan, SESSION);
+        let attempts = probe.attempts();
+        drop(probe);
+        (report, attempts)
+    }
+
+    /// **THE CRITICAL ASSERTION, at the wiring's own entry point.**
+    ///
+    /// The create child inherits the vault-unlocking session in its
+    /// environment block, which on Windows any same-user process can read
+    /// given a handle, and it is about to publish a secret. Kill-on-close
+    /// membership is what guarantees it dies with this process however this
+    /// process dies -- a panic, a `process::exit` that runs no destructor, a
+    /// Task Manager kill. The property is established below `real_runner` for
+    /// every invocation; this wiring is the code above it, where it can go
+    /// missing unseen, so it is asserted again here against what actually
+    /// arrived at the spawn.
+    ///
+    /// Nothing here reads a line of source: a text pin near `spawn_in_job(..)`
+    /// cannot see which value flows into it.
+    #[test]
+    fn the_create_child_is_spawned_into_the_job_this_window_holds() {
+        let held = window_job_address().expect(
+            "this process could not create a job object at all, so every assertion below \
+             collapses onto the `None` control and asserts nothing",
+        );
+
+        let (_report, attempts) = spawns_of_one_create(&a_draft());
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the wiring did not reach `spawn_in_job` exactly once, so anything asserted about \
+             what it carried is about nothing: {attempts:?}"
+        );
+
+        // THE JOB, BY POINTER IDENTITY.
+        assert_eq!(
+            attempts[0].job,
+            Some(held),
+            "the `bw send create` child was spawned with a job that is not the one this \
+             window holds, so it would not die with this process after a panic, a \
+             `process::exit` or a Task Manager kill -- leaving a child running with the \
+             vault-unlocking session in its environment and a secret on its stdin"
+        );
+
+        // Control: "some job at all" is not what was asserted.
+        let other = crate::job_object::KillOnCloseJob::new()
+            .expect("a job object is a handle, not a process");
+        assert_ne!(
+            attempts[0].job,
+            Some(std::ptr::from_ref(&other) as usize),
+            "control: the recorded job is indistinguishable from an unrelated one"
+        );
+
+        // Control: `None` is EXPRESSIBLE and DISTINGUISHABLE end to end --
+        // which is the whole difference a dropped job erases. Driven through
+        // the same `cli_send_create`/`CliSendRunner`/`spawn_in_job` chain,
+        // jobless.
+        let jobless_probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let _ = crate::send::cli_send_create(
+            None,
+            None,
+            SESSION,
+            &a_draft(),
+            &crate::send::FixedClock(0),
+        );
+        let jobless = jobless_probe.attempts();
+        drop(jobless_probe);
+        assert_eq!(
+            jobless.iter().map(|a| a.job).collect::<Vec<_>>(),
+            vec![None],
+            "control: a jobless call did not reach the spawn jobless, so the probe cannot \
+             tell a child inside a job from one outside it"
+        );
+        assert_ne!(
+            attempts[0].job, None,
+            "control: the wiring's own spawn is indistinguishable from the jobless one"
+        );
+
+        // AND IT IS THE SENDS JOB, not a second one minted for the create.
+        assert_eq!(
+            attempts[0].job,
+            window_job_address(),
+            "the create does not use the job the Sends fetch uses"
+        );
+
+        // THE RECORDED SPAWN IS THE CREATE, and not merely *a* spawn that
+        // happened.
+        let program = attempts[0].program.to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the create: {program}"
+        );
+        assert_eq!(
+            attempts[0]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["send".to_string(), "create".to_string()],
+            "the recorded spawn does not carry this create's arguments, so it is not the \
+             create -- and an argument vector longer than these two words is a user choice \
+             that has left the JSON body for the world-readable command line"
+        );
+    }
+
+    /// **NOTHING SECRET REACHES `argv` OR THE ENVIRONMENT.**
+    ///
+    /// A process's argument vector is readable by every process on the machine
+    /// -- Task Manager's "Command line" column, `Get-CimInstance
+    /// Win32_Process` -- and the whole point of a Send is that its body is a
+    /// secret. `send.rs` proves this of the built `Command`; this proves it of
+    /// what really arrived at `spawn_in_job` from the window's own entry
+    /// point, which is the layer where a well-meaning `--name` or a debug
+    /// `--text` would be added.
+    ///
+    /// The environment is asserted in BOTH directions: the session is there
+    /// (so the child is authenticated at all) and neither secret is, anywhere.
+    #[test]
+    fn the_drafts_secrets_reach_the_child_in_neither_argv_nor_the_environment() {
+        let (_report, attempts) = spawns_of_one_create(&a_draft());
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the wiring did not reach `spawn_in_job` exactly once: {attempts:?}"
+        );
+
+        let argv: String = attempts[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        for (what, needle) in [
+            ("the body of the Send", SECRET),
+            ("the share password", SHARE_PASSWORD),
+            ("the session token", SESSION),
+        ] {
+            assert!(
+                !argv.contains(needle),
+                "{what} is in the argument vector of the `bw send create` child, where every \
+                 process on this machine can read it: {argv:?}"
+            );
+        }
+
+        let envs: Vec<(String, Option<String>)> = attempts[0]
+            .envs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.as_ref().map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        // Control, and the reason this test is not vacuous: the session
+        // really is handed over, in the environment, so "no secret in the
+        // overlay" below is a statement about an overlay that carries
+        // something.
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "BW_SESSION" && v.as_deref() == Some(SESSION)),
+            "control: the create child inherits no session at all, so it would answer \
+             \"locked\" and the assertions here are about a spawn that could never work: \
+             {envs:?}"
+        );
+        for (key, value) in &envs {
+            let value = value.as_deref().unwrap_or_default();
+            for (what, needle) in [
+                ("the body of the Send", SECRET),
+                ("the share password", SHARE_PASSWORD),
+            ] {
+                assert!(
+                    !key.contains(needle) && !value.contains(needle),
+                    "{what} is in the environment overlay of the `bw send create` child \
+                     ({key}), which is inherited by anything that child starts and readable \
+                     by any same-user process. It belongs on stdin and nowhere else"
+                );
+            }
+        }
+    }
+
+    /// **AND THE BODY REALLY IS ON STDIN.**
+    ///
+    /// The two assertions above are absences, and an absence is also what an
+    /// invocation that carried the secret NOWHERE would satisfy -- a create
+    /// that published an empty Send would pass both. This is the positive
+    /// half: the invocation the very same plan produces carries the body, the
+    /// share password and the chosen lifetime in the base64 JSON that
+    /// `CliSendRunner::run` writes to the child's stdin.
+    ///
+    /// It reads `plan_to_invocation` rather than the spawn because a
+    /// `Command`'s stdin is a pipe, not a value: the only way to observe the
+    /// bytes on it is to start a child, which nothing in this crate may do.
+    /// What connects the two is that the runner is handed this invocation and
+    /// writes exactly `stdin_json_b64()` to the pipe -- one function, in
+    /// `send.rs`, and the only writer there is.
+    #[test]
+    fn the_whole_draft_travels_in_the_json_body_that_goes_to_stdin() {
+        let invocation =
+            crate::send::plan_to_invocation(&a_draft(), SESSION, &crate::send::FixedClock(0))
+                .expect("a valid draft builds an invocation");
+        assert_eq!(
+            invocation.args(),
+            ["send".to_string(), "create".to_string()],
+            "control: the argument vector is not the two literal words, so `argv` is \
+             carrying something and the split this test is about does not exist"
+        );
+
+        let body = invocation.stdin_json_b64();
+        let json = String::from_utf8(
+            body.bytes()
+                .filter(|b| *b != b'=')
+                .collect::<Vec<u8>>()
+                .chunks(4)
+                .flat_map(|chunk| {
+                    let mut bits = 0u32;
+                    for (i, byte) in chunk.iter().enumerate() {
+                        let value = match byte {
+                            b'A'..=b'Z' => byte - b'A',
+                            b'a'..=b'z' => byte - b'a' + 26,
+                            b'0'..=b'9' => byte - b'0' + 52,
+                            b'+' => 62,
+                            b'/' => 63,
+                            other => panic!("not base64: {other:?}"),
+                        };
+                        bits |= u32::from(value) << (18 - 6 * i);
+                    }
+                    (0..chunk.len() - 1).map(move |i| ((bits >> (16 - 8 * i)) & 0xff) as u8)
+                })
+                .collect::<Vec<u8>>(),
+        )
+        .expect("the body is UTF-8 JSON");
+
+        for (what, needle) in [
+            ("the body of the Send", SECRET),
+            ("the share password", SHARE_PASSWORD),
+            ("the name", DRAFT_NAME),
+        ] {
+            assert!(
+                json.contains(needle),
+                "{what} is not in the JSON that goes to the child's stdin, so this create \
+                 would publish something other than what the user typed: {json}"
+            );
+        }
+    }
+
+    // ==================================================================
+    // 3. The thread
+    // ==================================================================
+
+    /// The create does not run on the caller's thread.
+    ///
+    /// A frame that waited for `cli_send_create` would freeze the window,
+    /// titlebar included, for up to sixty seconds on the frame the user
+    /// presses Create.
+    #[test]
+    fn the_create_runs_on_a_thread_that_is_not_the_frames() {
+        let ctx = egui::Context::default();
+        let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+        let here = std::thread::current().id();
+        send_create_thread::spawn_send_create_with(ctx, tx, move || SendCreateReport::Created {
+            name: format!("{:?}", std::thread::current().id()),
+            access_url: "https://send.example.invalid/x".to_string(),
+        });
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reported");
+        let SendCreateReport::Created { name, .. } = report else {
+            panic!("the worker's own report did not come back: {report:?}")
+        };
+        assert_ne!(
+            name,
+            format!("{here:?}"),
+            "the create ran on the calling thread, so a real one would freeze the frame that \
+             started it for up to sixty seconds"
+        );
+    }
+
+    /// A worker that panics still reports, and reports the AMBIGUOUS outcome.
+    ///
+    /// `in_flight` is cleared by the drain and by nothing else, so a worker
+    /// that dies silently leaves the composer painted "Publishing..." with
+    /// every control disabled for the life of the window. And the outcome is
+    /// ambiguous rather than a clean failure because a panicked worker may
+    /// have started a child that really did publish a public link.
+    #[test]
+    fn a_create_worker_that_panics_still_reports_and_reports_it_as_ambiguous() {
+        let ctx = egui::Context::default();
+        let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+        send_create_thread::spawn_send_create_with(ctx, tx, || {
+            panic!("the publishing thread fell over")
+        });
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a panicked worker still reported");
+        assert!(
+            report.list_is_now_stale(),
+            "a panicked create did not invalidate the list, so a Send it may have published \
+             would never appear on the only screen that can revoke it: {report:?}"
+        );
+        assert!(
+            !report.draft_is_spent(),
+            "a panicked create threw the user's draft away: {report:?}"
+        );
+        let (tone, _) = send_create_message(&report);
+        assert_eq!(
+            tone,
+            CreateTone::Bad,
+            "a panicked create is painted as a success: {report:?}"
+        );
+    }
+
+    // ==================================================================
+    // 2. The state machine: `apply_send_action` and `drain_send_create`
+    // ==================================================================
+
+    thread_local! {
+        /// Every create [`recording_create_spawn`] was asked to start, on this
+        /// thread. Thread-local because `cargo test` runs tests in parallel.
+        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, u8, String)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// A [`SendCreateSpawn`] that records instead of publishing.
+    ///
+    /// A `fn` item with the production signature, so the only difference
+    /// between the tested run and the shipping one is which of two `fn`
+    /// pointers the caller names.
+    ///
+    /// It records the plan's contents in the clear **because this is a test
+    /// and the plan is invented**; production never formats a plan, which is
+    /// what `SendPlan`'s hand-written `Debug` is for.
+    fn recording_create_spawn(
+        _ctx: egui::Context,
+        _tx: SendCreateSender,
+        session: zeroize::Zeroizing<String>,
+        plan: crate::send::SendPlan,
+    ) {
+        CREATE_SPAWNS.with(|s| {
+            s.borrow_mut().push((
+                plan.name.clone(),
+                plan.text.to_string(),
+                plan.password.as_deref().cloned().unwrap_or_default(),
+                plan.delete_in_days,
+                session.to_string(),
+            ));
+        });
+    }
+
+    /// Runs the production [`apply_send_action`] and answers every create it
+    /// started.
+    fn apply(
+        action: send_ui::SendUiAction,
+        create: &mut SendCreateState,
+    ) -> Vec<(String, String, String, u8, String)> {
+        CREATE_SPAWNS.with(|s| s.borrow_mut().clear());
+        let ctx = egui::Context::default();
+        let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+        let (delete_tx, delete_rx): (SendDeleteSender, Receiver<SendDeleteReport>) =
+            mpsc::channel();
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        apply_send_action(
+            action,
+            &mut delete,
+            &mut fetch,
+            &ctx,
+            &delete_tx,
+            &zeroize::Zeroizing::new(SESSION.to_string()),
+            refuses_to_revoke_here,
+            SendCreateWiring {
+                state: create,
+                tx: &tx,
+                spawn: recording_create_spawn,
+            },
+        );
+        // Held so neither sender can report "disconnected" for a reason that
+        // has nothing to do with what is being asserted.
+        drop(rx);
+        drop(delete_rx);
+        CREATE_SPAWNS.with(|s| s.borrow().clone())
+    }
+
+    /// The revoke spawner these tests hand over. None of them produce a
+    /// revoke action, so reaching it at all is the failure.
+    fn refuses_to_revoke_here(
+        _: egui::Context,
+        _: SendDeleteSender,
+        _: zeroize::Zeroizing<String>,
+        id: String,
+        _: String,
+    ) {
+        panic!("a create-side action started a revoke of {id:?}");
+    }
+
+    /// **THE PUBLISH HAPPENS, ONCE, WITH WHAT THE USER TYPED.**
+    ///
+    /// The whole of the create's effect is this spawn, so a test that only
+    /// checked the composer closed or the flag latched would pass against an
+    /// `apply` that published nothing at all.
+    #[test]
+    fn pressing_create_on_a_valid_draft_starts_exactly_one_publish() {
+        let mut create = SendCreateState {
+            composer: an_open_composer(),
+            ..SendCreateState::default()
+        };
+        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
+        assert_eq!(
+            started,
+            vec![(
+                DRAFT_NAME.to_string(),
+                SECRET.to_string(),
+                SHARE_PASSWORD.to_string(),
+                crate::send::DEFAULT_DELETE_IN_DAYS,
+                SESSION.to_string(),
+            )],
+            "pressing Create did not start exactly one publish carrying exactly the draft \
+             and this window's own session"
+        );
+        assert!(
+            create.in_flight,
+            "the publish started and the window does not know one is running, so the \
+             composer would still offer a Create button and a second press would publish \
+             the same secret twice under two links"
+        );
+        // **The draft survives the press.** A create that failed would
+        // otherwise have thrown away text the user has to retype -- and text
+        // the user cannot retype if it was pasted from somewhere now closed.
+        assert_eq!(
+            create.composer.plan.text.as_str(),
+            SECRET,
+            "the draft was emptied by the press, so a failed publish loses what was typed"
+        );
+        assert!(
+            create.composer.open,
+            "the composer closed on the press, so a failed publish leaves the user with no \
+             form and no draft"
+        );
+    }
+
+    /// A second press while one is in flight publishes nothing.
+    ///
+    /// The composer disables its controls while a create runs, so this is the
+    /// second lock rather than the first -- and the first is a rendering,
+    /// which is the layer a mis-laid-out button walks straight past.
+    #[test]
+    fn a_second_press_while_a_publish_is_in_flight_starts_nothing() {
+        let mut create = SendCreateState {
+            composer: an_open_composer(),
+            in_flight: true,
+            report: None,
+        };
+        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
+        assert!(
+            started.is_empty(),
+            "a second press started another `bw send create`: the same secret would be \
+             published twice under two links, only one of which the user is ever shown to \
+             revoke -- {started:?}"
+        );
+    }
+
+    /// An invalid draft publishes nothing, whatever the pane reported.
+    ///
+    /// The button is greyed out by `send_ui::composer_can_submit`; this is
+    /// what makes greying it out a RULE. Every field of the draft here is the
+    /// default, so the problem is the one `validate_plan` names first.
+    #[test]
+    fn a_press_on_an_invalid_draft_starts_nothing() {
+        let mut create = SendCreateState {
+            composer: send_ui::SendComposer {
+                open: true,
+                ..send_ui::SendComposer::default()
+            },
+            ..SendCreateState::default()
+        };
+        assert!(
+            send_ui::composer_problem(&create.composer).is_some(),
+            "control: the empty draft is considered publishable, so this test is about \
+             nothing"
+        );
+        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
+        assert!(
+            started.is_empty(),
+            "an unpublishable draft was handed to `bw send create` anyway: {started:?}"
+        );
+        assert!(
+            !create.in_flight,
+            "nothing was published and the window thinks something is running, so the \
+             composer is disabled for the life of the window"
+        );
+    }
+
+    /// Opening the form opens it and publishes nothing.
+    #[test]
+    fn opening_the_composer_publishes_nothing_and_clears_the_last_report() {
+        let mut create = SendCreateState {
+            report: Some(SendCreateReport::Created {
+                name: "an earlier Send".to_string(),
+                access_url: "https://send.example.invalid/earlier".to_string(),
+            }),
+            ..SendCreateState::default()
+        };
+        let started = apply(send_ui::SendUiAction::OpenComposer, &mut create);
+        assert!(started.is_empty(), "opening the form published something");
+        assert!(create.composer.open, "the form did not open");
+        assert!(
+            create.report.is_none(),
+            "the banner about the LAST Send is still up over the form for the next one"
+        );
+    }
+
+    /// **DISCARD WIPES THE DRAFT RATHER THAN HIDING IT.**
+    ///
+    /// A draft left behind a closed flag is the text of a Send the user
+    /// decided not to publish, alive in this process until the window closes.
+    #[test]
+    fn discarding_the_composer_wipes_what_was_typed() {
+        let mut create = SendCreateState {
+            composer: an_open_composer(),
+            ..SendCreateState::default()
+        };
+        let started = apply(send_ui::SendUiAction::CancelComposer, &mut create);
+        assert!(started.is_empty(), "discarding the form published something");
+        assert!(!create.composer.open, "the form did not close");
+        assert_eq!(
+            create.composer.plan.text.as_str(),
+            "",
+            "the body of the discarded Send is still held by this window"
+        );
+        assert_eq!(
+            create.composer.plan.name, "",
+            "the name of the discarded Send is still held by this window"
+        );
+        assert!(
+            create.composer.plan.password.is_none(),
+            "the share password of the discarded Send is still held by this window"
+        );
+    }
+
+    /// Discard is refused while a publish is running.
+    ///
+    /// The worker holds its own clone of the plan, so wiping the draft would
+    /// not recall it -- and a form that vanished mid-publish would leave the
+    /// user with no idea what is being published.
+    #[test]
+    fn discarding_is_refused_while_a_publish_is_in_flight() {
+        let mut create = SendCreateState {
+            composer: an_open_composer(),
+            in_flight: true,
+            report: None,
+        };
+        let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
+        assert!(
+            create.composer.open && create.composer.plan.text.as_str() == SECRET,
+            "the form was discarded out from under a publish that is still running"
+        );
+    }
+
+    /// The drain, for every outcome.
+    #[test]
+    fn the_drain_clears_the_flag_and_decides_the_draft_and_the_list() {
+        for (report, stale, spent) in [
+            (
+                SendCreateReport::Created {
+                    name: DRAFT_NAME.to_string(),
+                    access_url: "https://send.example.invalid/new".to_string(),
+                },
+                true,
+                true,
+            ),
+            (
+                SendCreateReport::Failed {
+                    name: DRAFT_NAME.to_string(),
+                    error: crate::send::SendError::TimedOut,
+                },
+                true,
+                false,
+            ),
+            (
+                SendCreateReport::Failed {
+                    name: DRAFT_NAME.to_string(),
+                    error: crate::send::SendError::Rejected("no".to_string()),
+                },
+                false,
+                false,
+            ),
+        ] {
+            let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+            let mut create = SendCreateState {
+                composer: an_open_composer(),
+                in_flight: true,
+                report: None,
+            };
+            let mut fetch = send_ui::SendFetch::default();
+            fetch.result = Some(Ok(Vec::new()));
+            let generation = fetch.generation();
+            tx.send(report.clone()).expect("the receiver is held");
+            drain_send_create(&rx, &mut create, &mut fetch);
+
+            assert!(
+                !create.in_flight,
+                "{report:?}: the in-flight flag was not cleared, so the composer is disabled \
+                 for the life of the window"
+            );
+            assert_eq!(
+                fetch.generation() != generation,
+                stale,
+                "{report:?}: the list was refetched when it should not have been, or was \
+                 left standing when a Send that may exist is missing from it"
+            );
+            assert_eq!(
+                create.composer.plan.text.as_str() == SECRET,
+                !spent,
+                "{report:?}: the draft was kept when it should have been wiped, or thrown \
+                 away when the user still needs it"
+            );
+            assert!(
+                create.report.is_some(),
+                "{report:?}: nothing is shown to the user at all -- silence about a public \
+                 link that may exist"
+            );
+        }
+    }
+
+    // ==================================================================
+    // What the user is told
+    // ==================================================================
+
+    /// Every outcome says something different, and exactly one is the good
+    /// tone.
+    #[test]
+    fn every_create_outcome_says_something_different() {
+        let reports = [
+            SendCreateReport::Created {
+                name: DRAFT_NAME.to_string(),
+                access_url: "https://send.example.invalid/new".to_string(),
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::TimedOut,
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::Rejected("the server said no".to_string()),
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::CreatedButUnreadable,
+            },
+        ];
+        let said: Vec<(CreateTone, String)> = reports.iter().map(send_create_message).collect();
+        for (i, (_, a)) in said.iter().enumerate() {
+            assert!(
+                !a.is_empty(),
+                "an outcome says nothing at all: {:?}",
+                reports[i]
+            );
+            for (j, (_, b)) in said.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "{:?} and {:?} tell the user the same thing, so one of them is a \
+                         wrong answer wearing the other's words",
+                        reports[i], reports[j]
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            said.iter().filter(|(t, _)| *t == CreateTone::Good).count(),
+            1,
+            "exactly one create outcome is a success. More than one means a failure -- or \
+             an ambiguous outcome, where a public link may already be live -- is painted as \
+             though the app knows it worked"
+        );
+        // The ambiguous failure is the arm this mapping exists for: it must
+        // not say "nothing was shared".
+        let (_, ambiguous) = &said[1];
+        assert!(
+            ambiguous.contains("may already be live"),
+            "the ambiguous failure does not warn that a link may exist, so the user is told \
+             a secret was not published when it may have been: {ambiguous}"
+        );
+        // And the success carries the link, because a Send whose URL the user
+        // is never shown is not a success they can use.
+        let (_, created) = &said[0];
+        assert!(
+            created.contains("https://send.example.invalid/new"),
+            "the success does not tell the user the link: {created}"
+        );
+    }
+
+    /// **A FAILED CREATE IS NEVER PAINTED IN THE SUCCESS COLOUR.**
+    ///
+    /// Read off the glyphs the card really paints, not off the mapping: the
+    /// card is handed the REPORT precisely so that the colour is not the
+    /// caller's to choose, and this is what checks that it is not.
+    #[test]
+    fn a_failed_create_is_never_painted_in_the_success_colour() {
+        fn painted(report: &SendCreateReport) -> send_delete_wiring::Card {
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            // Drawn on EVERY frame and not only the last, for the revoke
+            // card's reason: an `egui::Area` is laid out from the size it had
+            // on the previous frame, so a card first drawn on the frame being
+            // read is measured at zero and paints nothing at all.
+            let _ = ctx.run_ui(input(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input(), |ui| {
+                let _ = draw_send_create_report(ui.ctx(), report);
+            });
+            let output = ctx.run_ui(input(), |ui| {
+                let _ = draw_send_create_report(ui.ctx(), report);
+            });
+            let mut card = send_delete_wiring::Card::default();
+            for clipped in &output.shapes {
+                send_delete_wiring::collect_card(&clipped.shape, &mut card);
+            }
+            assert!(
+                !card.text.is_empty(),
+                "the card painted no text at all, so every assertion over it would pass                  against nothing"
+            );
+            card
+        }
+
+        for report in [
+            SendCreateReport::Created {
+                name: DRAFT_NAME.to_string(),
+                access_url: "https://send.example.invalid/new".to_string(),
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::TimedOut,
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::Rejected("no".to_string()),
+            },
+            SendCreateReport::Failed {
+                name: DRAFT_NAME.to_string(),
+                error: crate::send::SendError::CreatedButUnreadable,
+            },
+        ] {
+            let card = painted(&report);
+            let (tone, text) = send_create_message(&report);
+            assert!(
+                card.text.iter().any(|t| t.contains(DRAFT_NAME)),
+                "{report:?} painted no message naming the Send: {:?}",
+                card.text
+            );
+            assert!(
+                card.text.iter().any(|t| t == &text),
+                "the card painted something other than {text:?}: {:?}",
+                card.text
+            );
+            // The INK is what is read and not the card's outline, for the
+            // revoke card's reason: the outline is `egui::Frame`'s stroke,
+            // which reaches the tessellator rather than the shape list at
+            // this layer, so reading it would be reading a value that is the
+            // same for every report.
+            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            match tone {
+                CreateTone::Bad => assert!(
+                    error_ink,
+                    "{report:?} is a failure -- or an outcome this app cannot confirm -- but                      no glyph on its card is painted in the error colour, so a Send that was                      not published reads exactly like one that was. Painted colours were {:?}",
+                    card.text_colours
+                ),
+                CreateTone::Good => assert!(
+                    !error_ink,
+                    "a successful publish is painted as an error: {:?}",
+                    card.text_colours
+                ),
+            }
+        }
+    }
+
+    // ==================================================================
+    // The seal: the blocking create has one call site in the whole crate
+    // ==================================================================
+
+    /// This file's production half.
+    fn own_production() -> &'static str {
+        production_half(include_str!("mod.rs"))
+    }
+
+    /// A file's production half: everything above its first **gated test
+    /// MODULE**. `send_delete_wiring::production_of`'s rule and its reason --
+    /// `send.rs` opens with a `#[cfg(test)] const`, so a naive first-gate cut
+    /// puts the whole file below the line and every count comes back zero.
+    fn production_half(text: &str) -> &str {
+        let marker = concat!("#[cfg", "(test)]\r\nmod ");
+        match text.find(marker) {
+            Some(end) => &text[..end],
+            None => text,
+        }
+    }
+
+    /// Every `.rs` file under `src`, as (path, text).
+    fn every_source_file() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("the source tree is readable") {
+                let entry = entry.expect("a readable directory entry");
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    walk(&path, &format!("{prefix}{name}/"), out);
+                } else if name.ends_with(".rs") {
+                    out.push((
+                        format!("{prefix}{name}"),
+                        std::fs::read_to_string(&path).expect("a readable source file"),
+                    ));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, "", &mut out);
+        out
+    }
+
+    /// `mod send_create_thread`'s text, by brace matching from its opener.
+    fn sealed_create_module() -> String {
+        let source = own_production();
+        let head = concat!("mod send_create_", "thread {");
+        let at = source
+            .rfind(head)
+            .expect("`mod send_create_thread` is not in this file's production");
+        let after = &source[at..];
+        let code = send_delete_wiring::code_braces_only(after);
+        let mut depth = 0i32;
+        for (offset, ch) in code.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after[..offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`mod send_create_thread` is never closed");
+    }
+
+    /// **The blocking create is sealed inside its own module.**
+    ///
+    /// `crate::send::cli_send_create` waits on a `bw` child for up to sixty
+    /// seconds. The fetch and the revoke carry the same seal, and for the same
+    /// measured reason: the failure mode is not a missing guard but a call
+    /// written in a third position nobody counted -- the frame closure itself,
+    /// or a forwarder in a sibling file.
+    ///
+    /// Counted over EVERY `.rs` file under `src`, walked rather than listed,
+    /// less the one definition in `send.rs`.
+    #[test]
+    fn every_mention_of_the_blocking_create_is_sealed_inside_its_own_module() {
+        let files = every_source_file();
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+        for required in ["vault_window/mod.rs", "send.rs"] {
+            assert!(
+                files.iter().any(|(p, _)| p == required),
+                "control: the crate walk never reached {required:?}, so a blocking create \
+                 written there would be counted by nothing at all"
+            );
+        }
+
+        let block = send_delete_wiring::code_braces_only(&sealed_create_module());
+        assert!(
+            block.len() > 200,
+            "control: the sealed-module slice is only {} bytes, which is not a module's worth",
+            block.len()
+        );
+        assert!(
+            !block.contains(concat!("send_fetch.note_", "screen(on_sends);")),
+            "control: the sealed-module slice contains the frame closure, so every \
+             containment assertion here is vacuous"
+        );
+
+        for (needle, defined_in_send_rs) in [
+            (concat!("cli_send_", "create"), 1usize),
+            (concat!("real_send_", "create"), 0),
+            (concat!("spawn_send_create_", "with"), 0),
+        ] {
+            let total: usize = files
+                .iter()
+                .map(|(path, text)| {
+                    let region = send_delete_wiring::code_braces_only(production_half(text));
+                    let seen = region.matches(needle).count();
+                    if path == "send.rs" {
+                        assert_eq!(
+                            seen, defined_in_send_rs,
+                            "`send.rs` spells {needle:?} {seen} times, not the \
+                             {defined_in_send_rs} its definitions account for -- the extra \
+                             mention is a second blocking `bw send create` written inside \
+                             the privacy boundary"
+                        );
+                        0
+                    } else {
+                        seen
+                    }
+                })
+                .sum();
+            let inside = block.matches(needle).count();
+            assert!(
+                total > 0,
+                "control: {needle:?} is not in production outside `send.rs` at all, so \
+                 requiring it to be inside the sealed module asserts nothing"
+            );
+            assert_eq!(
+                inside, total,
+                "{needle:?} occurs {total} times in the crate's production outside \
+                 `send.rs` but only {inside} of them are inside `mod send_create_thread`. A \
+                 mention outside that block -- in the frame closure or in a sibling file -- \
+                 is a blocking `bw send create` reachable from the eframe thread, where it \
+                 freezes the window, titlebar included, for up to sixty seconds"
+            );
+        }
+    }
+
+    /// The create is placed in the SAME job the Sends fetch is, and this file
+    /// says so once: `mod send_create_thread` names `sends_job` and mints no
+    /// `OnceLock` of its own.
+    ///
+    /// Behaviourally this is already held by
+    /// [`the_create_child_is_spawned_into_the_job_this_window_holds`], which
+    /// compares by pointer identity. This is the cheap statement of intent
+    /// beside it: a second cell would be a second handle held for one purpose,
+    /// and it would still pass the pointer test on its own terms.
+    #[test]
+    fn the_create_module_mints_no_job_of_its_own() {
+        let block = send_delete_wiring::code_braces_only(&sealed_create_module());
+        assert!(
+            block.contains(concat!("send_fetch_thread::sends_", "job()")),
+            "`mod send_create_thread` no longer names the Sends job"
+        );
+        assert!(
+            !block.contains(concat!("Once", "Lock")),
+            "`mod send_create_thread` mints a cell of its own, which is a second handle held \
+             for one purpose"
+        );
+    }
+
+    /// **THE DRAFT'S PLAINTEXT IS WIPED WHEN THE COMPOSER LETS GO OF IT.**
+    ///
+    /// The buffers are `Zeroizing` because `SendPlan`'s are, and this reads the
+    /// bytes back through a raw pointer to prove that the wipe really happens
+    /// at the two moments the feature depends on it: Discard, and the
+    /// successful publish that clears the form.
+    ///
+    /// Reading freed memory is undefined behaviour in general; this is the
+    /// same technique `send.rs`'s own
+    /// `the_plans_secret_fields_and_the_built_json_all_wipe` uses and it is
+    /// confined to the same purpose. The buffer is not freed while it is read
+    /// -- the capacity is still owned by the `String` inside the value being
+    /// inspected -- only overwritten.
+    #[test]
+    fn discarding_a_draft_zeroizes_the_text_and_the_share_password() {
+        for wipe_by_publishing in [false, true] {
+            let mut create = SendCreateState {
+                composer: an_open_composer(),
+                in_flight: wipe_by_publishing,
+                report: None,
+            };
+            let text_at = create.composer.plan.text.as_ptr();
+            let text_len = create.composer.plan.text.len();
+            let password_at = create
+                .composer
+                .plan
+                .password
+                .as_ref()
+                .expect("the draft has one")
+                .as_ptr();
+            let password_len = create
+                .composer
+                .plan
+                .password
+                .as_ref()
+                .expect("the draft has one")
+                .len();
+
+            // Control: the plaintext really is there to begin with.
+            let before = unsafe { std::slice::from_raw_parts(text_at, text_len) };
+            assert_eq!(
+                before,
+                SECRET.as_bytes(),
+                "control: the draft's buffer does not hold the plaintext, so the wipe below \
+                 asserts nothing"
+            );
+
+            if wipe_by_publishing {
+                let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+                let mut fetch = send_ui::SendFetch::default();
+                tx.send(SendCreateReport::Created {
+                    name: DRAFT_NAME.to_string(),
+                    access_url: "https://send.example.invalid/new".to_string(),
+                })
+                .expect("the receiver is held");
+                drain_send_create(&rx, &mut create, &mut fetch);
+            } else {
+                create.in_flight = false;
+                let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
+            }
+
+            let text_after = unsafe { std::slice::from_raw_parts(text_at, text_len) };
+            assert!(
+                text_after.iter().all(|b| *b == 0),
+                "the body of the Send is still in memory after the draft was let go \
+                 (publishing: {wipe_by_publishing}): {:?}",
+                String::from_utf8_lossy(text_after)
+            );
+            let password_after =
+                unsafe { std::slice::from_raw_parts(password_at, password_len) };
+            assert!(
+                password_after.iter().all(|b| *b == 0),
+                "the share password is still in memory after the draft was let go \
+                 (publishing: {wipe_by_publishing}): {:?}",
+                String::from_utf8_lossy(password_after)
+            );
+        }
     }
 }
