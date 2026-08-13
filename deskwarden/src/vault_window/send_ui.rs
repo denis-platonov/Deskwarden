@@ -1989,6 +1989,90 @@ mod tests {
         assert_eq!(fetch.generation(), before);
         assert!(fetch.result.is_none());
     }
+
+    /// **The in-flight half of [`composer_can_submit`], which nothing ran.**
+    ///
+    /// The function's own doc calls `!in_flight` "the rule that stops a
+    /// second `bw send create` starting", and it was the reason the rule was
+    /// lifted out of the eframe closure at all -- but every caller in the
+    /// crate is that closure, so deleting `&& !in_flight` outright left 2243
+    /// lib / 217 bin tests green with no warning. Measured.
+    ///
+    /// **What that mutant did and did not cost, stated exactly, because the
+    /// two-lock design is easy to mistake for redundancy.** It does NOT
+    /// double-publish: the second lock, in `vault_window::apply_send_action`,
+    /// holds and is covered. What it costs is the whole point of the FIRST
+    /// lock -- during a publish the Create button goes live and clickable, so
+    /// the user is invited to press a control that has been quietly disarmed
+    /// one layer down. The misleading live button is the defect; the two
+    /// locks exist because refusing the work and refusing the INVITATION are
+    /// different jobs.
+    ///
+    /// All four combinations, so neither argument can be ignored: a truth
+    /// table is the only thing that pins a two-input `&&`, and either input
+    /// dropped makes one of these four rows fail.
+    #[test]
+    fn the_create_button_is_dead_while_a_create_is_in_flight() {
+        let problem: Option<&str> = None;
+        let broken: Option<&str> = Some("Give the Send a name.");
+
+        assert!(
+            composer_can_submit(problem, false),
+            "a valid draft with nothing in flight could not be submitted, so the rest of \
+             this test is about a button that never goes live at all"
+        );
+        assert!(
+            !composer_can_submit(problem, true),
+            "THE MISSING CASE: a VALID draft offered a live Create button while a \
+             `bw send create` was already running. `apply_send_action`'s own lock stops \
+             the second child, so this does not double-publish -- what it does is invite \
+             the user to press a control that has been disarmed one layer down, which is \
+             the misleading state this first lock exists to prevent"
+        );
+        assert!(
+            !composer_can_submit(broken, false),
+            "a draft the form itself calls invalid offered a live Create button"
+        );
+        assert!(
+            !composer_can_submit(broken, true),
+            "control: both reasons to refuse at once still refuses"
+        );
+    }
+
+    /// Control for the test above: the `problem` it calls valid really is the
+    /// verdict the FORM reaches on a real draft, and the one it calls invalid
+    /// really is a refusal -- so neither row above is asserting about a
+    /// hand-made `Option` that no composer could ever produce.
+    #[test]
+    fn the_submit_rule_is_fed_the_forms_own_verdict() {
+        let mut composer = SendComposer::default();
+        assert!(
+            composer_problem(&composer).is_some(),
+            "control: a freshly opened composer is empty, so the form must refuse it"
+        );
+        assert!(
+            !composer_can_submit(composer_problem(&composer), false),
+            "an empty draft could be submitted, which would publish an empty Send under a \
+             public link"
+        );
+
+        composer.plan.name.push_str("a name");
+        composer.plan.text.push_str("a body");
+        assert_eq!(
+            composer_problem(&composer),
+            None,
+            "control: a filled draft is still refused, so the `None` row above is not a \
+             verdict this form ever reaches"
+        );
+        assert!(
+            composer_can_submit(composer_problem(&composer), false),
+            "a draft the form accepts could not be submitted"
+        );
+        assert!(
+            !composer_can_submit(composer_problem(&composer), true),
+            "a draft the form accepts could be submitted DURING a publish"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6664,11 +6748,13 @@ mod source_pins {
     /// guards. It is not, and the reason is in the source rather than in this
     /// paragraph: the substitute constructor lives in a module gated to the
     /// test configuration, so it is not compiled into the binary the user
-    /// runs, and **all six fields are private**, so nothing outside
+    /// runs, and **every field is private**, so nothing outside
     /// `mod vault_window` can build one any other way. What is left is one
-    /// constructor whose body names the same **five** spawn functions the
-    /// call sites used to name directly, plus the settings path they used to
-    /// compute inline.
+    /// constructor whose body names the same spawn functions the call sites
+    /// used to name directly, plus the settings path they used to compute
+    /// inline -- and, since a needle list is only ever as long as somebody
+    /// remembered to make it, a count of the assignments it really makes
+    /// against `vault_window::export_wiring::VAULT_FRAME_ENV_FIELDS`.
     ///
     /// **What this holds is SPELLING, and that is not the whole seam.** Every
     /// needle below is a name. A wrapper written at module level --
@@ -6718,6 +6804,12 @@ mod source_pins {
             concat!("send_fetch_thread::spawn_send_", "list"),
             concat!("export_thread::spawn_", "export"),
             concat!("send_delete_thread::spawn_send_", "delete"),
+            // The spawner that PUBLISHES. It was absent from this list from
+            // the day the field landed, and absent from the address pin too,
+            // so a forwarder in its slot -- `if plan.password.is_none() {
+            // real(..) }` -- was green across the whole suite with no warning
+            // while every password-protected Send silently failed to start.
+            concat!("send_create_thread::spawn_send_", "create"),
             concat!("spawn_aux_", "load"),
         ] {
             assert_eq!(
@@ -6726,6 +6818,35 @@ mod source_pins {
                 "`VaultFrameEnv::production` does not name {named:?} exactly once: {body}"
             );
         }
+        // **DERIVED, not enumerated.** The list above is a list of names, and
+        // a list of names cannot notice a name nobody added to it -- which is
+        // precisely how `aux_load` and then `send_create` each shipped with
+        // nothing pinning them. This counts the field assignments the
+        // constructor actually makes and requires the number `VaultFrameEnv`
+        // really has, so a ninth field is red HERE even if its author never
+        // touches this list. The other half of the pair is
+        // `vault_window::export_wiring::production_hands_the_window_the_real_functions`,
+        // whose exhaustive destructuring makes a ninth field fail to COMPILE.
+        let assigned = body
+            .lines()
+            .filter(|line| {
+                let line = line.trim_end();
+                line.starts_with("            ")
+                    && line.ends_with(',')
+                    && line.trim_start().starts_with(|c: char| c.is_ascii_lowercase())
+                    && line.contains(": ")
+            })
+            .count();
+        assert_eq!(
+            assigned,
+            super::super::export_wiring::VAULT_FRAME_ENV_FIELDS,
+            "`VaultFrameEnv::production` assigns {assigned} fields but `VaultFrameEnv` has \
+             {} of them. Every field of that struct is a way for the frame closure to reach \
+             outside this process, so one that appears in the constructor without appearing \
+             in the needle list above -- or in the address pin -- is a field a wrapper can \
+             occupy with the whole suite green: {body}",
+            super::super::export_wiring::VAULT_FRAME_ENV_FIELDS
+        );
         assert_eq!(
             inside.matches("fn ").count(),
             0,

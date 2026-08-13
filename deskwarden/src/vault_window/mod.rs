@@ -3661,14 +3661,29 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// **Two pins, and they cover different things.**
 /// `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`
 /// reads the SOURCE: it holds that there is one constructor, that the test
-/// gate on the other is intact, that this one names each of the five spawn
-/// functions exactly once, and that it defines nothing of its own. That is a
-/// pin on SPELLING: a wrapper `fn spawn_export` in some other module would
-/// satisfy the needle while doing nothing. What pins the VALUE is
+/// gate on the other is intact, that this one names each of the spawn
+/// functions exactly once, that it assigns exactly
+/// `export_wiring::VAULT_FRAME_ENV_FIELDS` fields, and that it defines
+/// nothing of its own. That is a pin on SPELLING:
+/// a wrapper `fn spawn_export` in some other module would satisfy the needle
+/// while doing nothing. What pins the VALUE is
 /// [`export_wiring::production_hands_the_window_the_real_functions`], which
 /// compares every field of `production()` against the real function BY
 /// ADDRESS -- so a rename, a wrapper, a feature-flagged forwarder or a no-op
 /// fails it whatever it is called and wherever it is written.
+///
+/// **A new field is now a COMPILE ERROR until it is pinned**, which is the
+/// one thing neither guard used to be. Both of them held written lists, and
+/// both lists were short: `aux_load` shipped missing from each, and
+/// `send_create` -- the field that puts a public link on the internet --
+/// shipped missing from each behind it. See
+/// `export_wiring::VAULT_FRAME_ENV_FIELDS`, which is declared BELOW THE CUT
+/// for the reason in the paragraph above: a test-gated constant written
+/// beside this struct truncates every source guard's production slice, and
+/// putting it here cost 18 red tests in none of which this seam appears. The
+/// gate attribute is deliberately not SPELLED anywhere above the cut in this
+/// file -- writing it even inside a doc comment truncates the slice just the
+/// same, which cost the same 18 tests a second time.
 ///
 /// **Why the substitute is not an inherent method beside**
 /// **[`VaultFrameEnv::production`].** Every source guard in this file cuts
@@ -17879,7 +17894,28 @@ mod export_wiring {
     /// (`.github/workflows/release.yml`), never `cargo test --release`.
     #[test]
     fn production_hands_the_window_the_real_functions() {
-        let env = VaultFrameEnv::production();
+        // THE STRUCTURAL PART, and the reason this is a destructuring and not
+        // `env.sync`, `env.load`, ... : the pattern is EXHAUSTIVE and has no
+        // `..`. Adding a ninth field to `VaultFrameEnv` makes this line fail
+        // to COMPILE -- E0027, "pattern does not mention field" -- so the new
+        // field cannot reach a shipping build while this test stays green and
+        // silent, which is exactly what `aux_load` and then `send_create`
+        // both did. A field-by-field read would have accepted them; a written
+        // list of names in the array below did accept them.
+        //
+        // Every binding is then USED below, so a field that is destructured
+        // and quietly not compared is an `unused_variables` warning, and this
+        // crate builds and tests with zero warnings.
+        let VaultFrameEnv {
+            sync,
+            load,
+            send_list,
+            export,
+            send_delete,
+            send_create,
+            aux_load,
+            settings_path,
+        } = VaultFrameEnv::production();
 
         // Typed `let`s rather than casts off the `fn` items, so each one is a
         // `fn` POINTER of exactly the field's type before any address is
@@ -17895,20 +17931,49 @@ mod export_wiring {
             send_fetch_thread::spawn_send_list;
         let real_export: ExportSpawn = export_thread::spawn_export;
         let real_delete: SendDeleteSpawn = send_delete_thread::spawn_send_delete;
+        let real_create: SendCreateSpawn = send_create_thread::spawn_send_create;
+        let real_aux_load: AuxLoadSpawn = spawn_aux_load;
 
-        let checked: [(&str, bool); 5] = [
-            ("sync", std::ptr::fn_addr_eq(env.sync, real_sync)),
-            ("load", std::ptr::fn_addr_eq(env.load, real_load)),
-            ("send_list", std::ptr::fn_addr_eq(env.send_list, real_send_list)),
-            ("export", std::ptr::fn_addr_eq(env.export, real_export)),
-            ("send_delete", std::ptr::fn_addr_eq(env.send_delete, real_delete)),
+        let checked: [(&str, bool); 7] = [
+            ("sync", std::ptr::fn_addr_eq(sync, real_sync)),
+            ("load", std::ptr::fn_addr_eq(load, real_load)),
+            ("send_list", std::ptr::fn_addr_eq(send_list, real_send_list)),
+            ("export", std::ptr::fn_addr_eq(export, real_export)),
+            ("send_delete", std::ptr::fn_addr_eq(send_delete, real_delete)),
+            // The field that PUBLISHES. A forwarder here does not merely make
+            // a button inert: `if plan.password.is_none() { real(..) }` in
+            // this slot leaves every password-protected create silently
+            // unstarted, `in_flight` latched `true` for the life of the
+            // window, the composer frozen on "Publishing..." and the typed
+            // secret still resident. That mutant was measured green across
+            // 2243 lib / 217 bin tests with zero warnings before this line
+            // existed.
+            ("send_create", std::ptr::fn_addr_eq(send_create, real_create)),
+            ("aux_load", std::ptr::fn_addr_eq(aux_load, real_aux_load)),
         ];
-        // THE SIXTH FIELD, by value. `default_path` is where the real
+        // The tie to `VAULT_FRAME_ENV_FIELDS`, and the reason it is an
+        // assertion and not a comment: the destructuring above stops a ninth
+        // field COMPILING, and this stops the repair for that compile error
+        // being "add the name to the pattern and move on". The count has to
+        // come out right, which means the new field is either compared here
+        // or deliberately excluded by someone who then had to change this
+        // number and say why.
+        assert_eq!(
+            checked.len() + 1,
+            VAULT_FRAME_ENV_FIELDS,
+            "`VaultFrameEnv` has {VAULT_FRAME_ENV_FIELDS} fields but this test compares \
+             {} of them plus `settings_path`. A field of this struct is a way for the frame \
+             closure to reach outside the process, and one that nothing here compares is a \
+             field a wrapper, a forwarder or a flag-gated no-op can occupy with the whole \
+             suite green -- which is what happened to `aux_load` and then to `send_create`",
+            checked.len()
+        );
+        // THE ONE NON-`fn` FIELD, by value. `default_path` is where the real
         // `%APPDATA%\\Deskwarden` is decided, and a window handed anything
         // else keeps the user's preferences somewhere they will never be
         // read again.
         assert_eq!(
-            env.settings_path,
+            settings_path,
             crate::settings::default_path(),
             "`VaultFrameEnv::production` hands the window a settings path that is not \
              `settings::default_path()`. Nothing here is executed, so no click test and \
@@ -17919,7 +17984,7 @@ mod export_wiring {
         // CONTROL: the comparison discriminates, and the value is a real
         // path rather than the `None` that would make the assertion above
         // pass by both sides being empty.
-        let real_path = env.settings_path.clone().expect(
+        let real_path = settings_path.clone().expect(
             "control: production hands the window no settings path at all, so the \
              equality above is `None == None` and holds nothing",
         );
@@ -17929,7 +17994,7 @@ mod export_wiring {
              name, so whatever it points at is not this app's settings file"
         );
         assert_ne!(
-            env.settings_path,
+            settings_path,
             Some(std::env::temp_dir().join(crate::settings::SETTINGS_FILE_NAME)),
             "control: production's settings path compares EQUAL to a path it plainly is \
              not, so the equality above is vacuous"
@@ -17951,9 +18016,24 @@ mod export_wiring {
         // "same" above is not something every pair of `fn` pointers has.
         let decoy: ExportSpawn = not_the_export_spawner;
         assert!(
-            !std::ptr::fn_addr_eq(env.export, decoy),
+            !std::ptr::fn_addr_eq(export, decoy),
             "control: a different function of the same signature compares EQUAL to the \
              production export spawner, so every assertion above is vacuous"
+        );
+        // The same control for the two fields this test did not used to
+        // compare at all, so neither new assertion is trusted on the
+        // export field's evidence.
+        let create_decoy: SendCreateSpawn = not_the_create_spawner;
+        assert!(
+            !std::ptr::fn_addr_eq(send_create, create_decoy),
+            "control: a different function of the same signature compares EQUAL to the \
+             production create spawner, so the `send_create` assertion is vacuous"
+        );
+        let aux_decoy: AuxLoadSpawn = not_the_aux_load_spawner;
+        assert!(
+            !std::ptr::fn_addr_eq(aux_load, aux_decoy),
+            "control: a different function of the same signature compares EQUAL to the \
+             production aux-load spawner, so the `aux_load` assertion is vacuous"
         );
         // And the real one really does compare equal to itself, so the
         // control above is not passing because comparison always says `false`.
@@ -17963,9 +18043,78 @@ mod export_wiring {
         );
     }
 
+    /// How many fields `VaultFrameEnv` has.
+    ///
+    /// **A number written once and checked from two directions, because a
+    /// WRITTEN LIST OF FIELD NAMES has lost this race twice.** `aux_load`
+    /// shipped with nothing pinning it and nobody noticed; `send_create` --
+    /// the one field in that struct that publishes to the public internet --
+    /// then shipped unpinned behind it, and a forwarder in its place that
+    /// silently dropped every password-protected Send was measured GREEN
+    /// across the whole suite. Both slipped through for one reason: each of
+    /// the two guards over that struct held an ENUMERATION, and an
+    /// enumeration cannot notice a name nobody added to it. This codebase has
+    /// lost a spelling race to a written list every time it has run one.
+    ///
+    /// What makes a ninth field impossible to add quietly is not this
+    /// constant on its own -- it is the pair it ties together:
+    ///
+    /// 1. [`production_hands_the_window_the_real_functions`] destructures
+    ///    `VaultFrameEnv::production()`'s value with an EXHAUSTIVE pattern
+    ///    and no `..`. A ninth field makes that test **fail to compile**
+    ///    (E0027, "pattern does not mention field"), so it cannot be skipped,
+    ///    omitted or left green -- the author has to come here and say what
+    ///    pins the new field.
+    /// 2. `send_ui::source_pins::production_is_the_only_env_a_shipping_build_has`
+    ///    counts the assignments the constructor really makes and requires
+    ///    exactly this many, so a field added to the CONSTRUCTOR alone is red
+    ///    too.
+    ///
+    /// The destructure is the hard stop and this constant is the tie: bumping
+    /// this number by itself buys nothing, because the pattern still will not
+    /// compile.
+    ///
+    /// **Declared HERE, below the cut, and not beside the struct.** A
+    /// `#[cfg(test)] const` written next to `VaultFrameEnv` is a gated item
+    /// in the production region, and every source guard in this crate cuts
+    /// its production slice at the FIRST test gate in the text. Measured:
+    /// **18 tests red**, in none of which this seam appears -- `job_object`'s
+    /// bare-`Command` walk, three `export_wiring` pins, three
+    /// `send_delete_wiring` pins, both below-the-cut guards, and the rest.
+    /// The struct's own doc warned about exactly this and it happened anyway,
+    /// which is why the number is recorded rather than the lesson.
+    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 8;
+
     /// The decoy [`production_hands_the_window_the_real_functions`] compares
     /// against: `ExportSpawn`'s signature exactly, and nothing else.
     fn not_the_export_spawner(_: egui::Context, _: ExportSender, _: zeroize::Zeroizing<String>) {
+        unreachable!("never called -- this exists to have an address");
+    }
+
+    /// The `send_create` decoy. **`unreachable!` rather than an empty body**,
+    /// for the release-profile reason recorded on
+    /// [`production_hands_the_window_the_real_functions`]: MSVC's
+    /// identical-COMDAT-folding makes two functions with identical bodies
+    /// compare EQUAL under `--release`, so a decoy with an empty body could
+    /// fold onto some other empty `fn` and the control would answer about the
+    /// wrong address. A panic message no other function carries cannot fold.
+    fn not_the_create_spawner(
+        _: egui::Context,
+        _: SendCreateSender,
+        _: zeroize::Zeroizing<String>,
+        _: crate::send::SendPlan,
+    ) {
+        unreachable!("never called -- this exists to have an address, and must never publish");
+    }
+
+    /// The `aux_load` decoy. [`not_the_create_spawner`]'s reasoning exactly.
+    fn not_the_aux_load_spawner(
+        _: std::sync::Arc<VaultCache>,
+        _: OutOfVault,
+        _: u64,
+        _: crate::vault_cache::VaultEra,
+        _: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+    ) {
         unreachable!("never called -- this exists to have an address");
     }
 

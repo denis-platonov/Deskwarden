@@ -163,7 +163,13 @@ pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {
     if plan.name.trim().is_empty() {
         return Some("Give the Send a name.");
     }
-    if plan.name.len() > MAX_NAME_LEN {
+    // **Trimmed, like the emptiness check above it and like the name that is
+    // actually published.** `real_send_create` sends `plan.name.trim()`, so
+    // measuring the untrimmed string refused drafts whose PUBLISHED name is
+    // within the limit -- and refused them with "That name is too long."
+    // under a field the user can see is not too long, with no way to find
+    // out that trailing whitespace was the reason.
+    if plan.name.trim().len() > MAX_NAME_LEN {
         return Some("That name is too long.");
     }
     if plan.text.is_empty() {
@@ -465,9 +471,10 @@ pub fn plan_to_invocation(
     json_mut.push_str(if plan.hidden { "true" } else { "false" });
     json_mut.push_str("},\"file\":null,\"maxAccessCount\":");
     match plan.max_access_count {
-        // No `format!`/`to_string`: this one is not secret, but the buffer is
-        // pre-reserved and a temporary would be a second allocation for
-        // nothing.
+        // `itoa_u32` rather than `format!`, and NOT because it saves an
+        // allocation -- it returns an owned `String` like `to_string` would.
+        // See its own doc: the digits are formed in a stack buffer instead of
+        // through the formatting machinery, and that is the whole of it.
         Some(n) => {
             let mut buf = itoa_u32(n);
             json_mut.push_str(buf.as_str());
@@ -494,7 +501,15 @@ pub fn plan_to_invocation(
     })
 }
 
-/// A `u32` rendered without allocating a formatting temporary.
+/// A `u32` rendered to a `String`.
+///
+/// **The comment this used to carry said it avoided an allocation, and it
+/// does not** -- it returns an owned `String`, which is exactly one
+/// allocation, the same as `n.to_string()`. What it actually buys is that the
+/// digits are formed in a fixed stack buffer rather than through the
+/// formatting machinery, which is a smaller and duller claim than the one
+/// that was written here. Corrected rather than deleted so the next reader
+/// does not re-derive the wrong reason from the shape of the code.
 fn itoa_u32(mut n: u32) -> String {
     if n == 0 {
         return "0".to_string();
@@ -1016,14 +1031,32 @@ struct CliSendRunner<'a> {
     /// ARRIVED at [`crate::job_object::spawn_in_job`], plus `job_object`'s
     /// tree walk proving this file has no second route to a child process.
     ///
-    /// **And it is unreachable in production today.** The one production
-    /// construction of this type, in `vault_window`, passes `None` outright:
-    /// the vault window holds no [`crate::job_object::KillOnCloseJob`], so
-    /// every real `bw send` child already spawns outside any job. That is
-    /// deliberate and documented, not an oversight -- but it means the
-    /// guarantee above is currently proven only of code no production caller
-    /// exercises with a job. When the window is given one, the property must
-    /// be re-proven at the call that hands it over.
+    /// **And it is live in production. Every production caller passes a real
+    /// job.** This paragraph used to say the opposite -- that `vault_window`
+    /// passed `None` outright and that every real `bw send` child therefore
+    /// spawned outside any job -- and that has been false since
+    /// `vault_window::send_fetch_thread::sends_job` landed. It is now false
+    /// of all three entry points: [`cli_send_list`] is called with
+    /// `sends_job()`, [`cli_send_delete`] with `delete_job()` and
+    /// [`cli_send_create`] with `create_job()`, each a process-lifetime
+    /// `OnceLock<KillOnCloseJob>`.
+    ///
+    /// It is recorded here rather than quietly deleted because a stale
+    /// "unreachable in production" on the most security-sensitive field in
+    /// this file is worse than no comment at all: it invites the next reader
+    /// to treat the job as dead weight and drop it, and it invites a reviewer
+    /// to skip the one guarantee that now protects every `bw send` child this
+    /// app spawns -- including the create, which holds `BW_SESSION` while it
+    /// publishes.
+    ///
+    /// **`None` is still a real value and still correct.** `KillOnCloseJob::
+    /// new` is a kernel call that can fail, and both job accessors degrade to
+    /// `None` rather than refusing the work; `spawn_in_job` accepts `None`.
+    /// So the property proven by
+    /// [`the_send_reaches_the_spawn_carrying_the_job_the_runner_was_built_with`]
+    /// -- that whatever job this runner was BUILT with is the job that
+    /// arrives at the spawn -- is the property production depends on, not a
+    /// property of code no caller exercises.
     job: Option<&'a crate::job_object::KillOnCloseJob>,
     /// The active account's CLI profile directory, passed straight through to
     /// [`crate::bw_path::bw_command_in`] so a Send is created, listed and
@@ -3366,6 +3399,55 @@ mod tests {
         for days in DELETE_IN_DAYS_CHOICES {
             assert_eq!(validate_plan(&SendPlan { delete_in_days: days, ..plan() }), None);
         }
+    }
+
+    /// **The length limit measures the name that gets PUBLISHED.**
+    ///
+    /// `plan_to_invocation` writes `plan.name.trim()` into the JSON, and the
+    /// emptiness check above it trims too, but the length check used to
+    /// measure `plan.name` whole. A name at exactly the limit with a trailing
+    /// space was therefore refused with "That name is too long." under a
+    /// field the user can count and see is not -- a refusal with no visible
+    /// cause and no way to discover the cause.
+    #[test]
+    fn the_name_limit_is_measured_on_the_name_that_is_published() {
+        let at_limit = "n".repeat(MAX_NAME_LEN);
+        assert_eq!(
+            validate_plan(&SendPlan { name: at_limit.clone(), ..plan() }),
+            None,
+            "control: a name of exactly {MAX_NAME_LEN} bytes is refused, so the limit is \
+             off by one and the case below proves nothing"
+        );
+        assert_eq!(
+            validate_plan(&SendPlan { name: format!("  {at_limit}\t\r\n "), ..plan() }),
+            None,
+            "a name that is exactly at the limit once trimmed -- which is the name that \
+             reaches the CLI -- was refused for its whitespace"
+        );
+        // And the limit still bites on the trimmed length, so the fix did not
+        // simply remove the check.
+        assert_eq!(
+            validate_plan(&SendPlan { name: format!("  {at_limit}n  "), ..plan() }),
+            Some("That name is too long."),
+            "control: a name one byte over the limit once trimmed was accepted, so the \
+             length check no longer refuses anything"
+        );
+        // The published name really is the trimmed one, so "the name that
+        // gets published" above is a fact about this crate and not a guess.
+        let padded = SendPlan { name: "  spaced  ".to_string(), ..plan() };
+        let invocation = plan_to_invocation(&padded, "sess", &NOW)
+            .expect("a padded but valid name must still be encodable");
+        // `as_str` rather than `serde_json::json!`: `job_object`'s
+        // bare-name-macro walk refuses that macro in this file, and it is
+        // right to -- a `macro_rules!` in textual scope can expand into a
+        // call to anything in this crate, a `bw` spawned outside the
+        // kill-on-close job among them.
+        assert_eq!(
+            body_of(&invocation)["name"].as_str(),
+            Some("spaced"),
+            "the published name is not the trimmed one, so measuring the trimmed length is \
+             measuring the wrong string"
+        );
     }
 
     #[test]
