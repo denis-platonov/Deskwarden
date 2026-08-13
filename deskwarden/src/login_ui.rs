@@ -7972,6 +7972,19 @@ pub(crate) mod password_lifetime_tests {
         // So: two bindings, two names, and the yardsticks below are taken from
         // the bindings rather than from the fed list. See the two asserts
         // immediately after the union, and the coverage assert at the audit.
+        //
+        // **What that `!` does now is TREE-DEPENDENT, and the attribution
+        // above should be read as a measurement on THIS tree rather than as a
+        // property of the control.** The de-duplication is now
+        // `if seen_ignored.insert(path)`, so the mutant is an ADDED `!`, and
+        // `!insert` pushes exactly the paths the two producers BOTH named --
+        // the duplicates -- rather than nothing. On this tree that is 2 of
+        // 29 776, so the union collapses and the two coverage asserts fire.
+        // On a tree where the two producers agree completely, every path is a
+        // duplicate, `ignored_paths` is COMPLETE, the coverage asserts pass
+        // and it is `foreign.is_empty()` that kills instead. Both trees kill;
+        // which control does it is not fixed, so do not read a green coverage
+        // assert as evidence that the union is intact.
         let status_ignored: std::collections::HashSet<&[u8]> = ignored_raw
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
@@ -7988,10 +8001,29 @@ pub(crate) mod password_lifetime_tests {
         // the real tree: 2.63 s unoptimized and 468 ms optimized, against
         // 47.9 ms and 5.0 ms hashed -- so it was material in both profiles,
         // and dominated the ~1.2 s the two `git` calls themselves cost. This
-        // is a data-structure change only, and it is not a behaviour change to
-        // chase it: verified over that same list that both loops produce
-        // byte-identical `ignored_paths` -- the same paths, in the same
-        // first-seen order.
+        // is a MEMBERSHIP-preserving change, and only that. `HashSet<&[u8]>`
+        // hashes the slice CONTENTS, which is exactly what `Vec::contains`
+        // compared, so no path is added and none is dropped -- the set
+        // `ignored_paths` denotes is identical.
+        //
+        // **The ORDER is not, and an earlier revision of this comment claimed
+        // a verification that cannot have happened.** It said "the same
+        // paths, in the same first-seen order". `RandomState` reseeds per
+        // PROCESS, so iterating `status_ignored` and `listed_ignored` yields a
+        // different order in every run: measured over 12 paths, three runs,
+        // three different orders. That order propagates to `ignored_paths`, to
+        // the bytes fed to `check-ignore`, to the order of the child's records
+        // and therefore to the order of the paths printed in the `foreign`
+        // failure message below.
+        //
+        // It is behaviourally harmless -- every consumer here is
+        // order-insensitive: the feed is a set of questions, the audit is a
+        // set membership, and all four asserts compare lengths or emptiness.
+        // But the practical consequence is worth stating for whoever reads a
+        // red next: **the failure messages of the `foreign` and `unaudited`
+        // asserts list their paths in an unstable order, so do not diff two
+        // runs' output and conclude that the set changed.** Sort before
+        // comparing, as `unaudited` already does for its own output.
         let mut seen_ignored: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
         let mut ignored_paths: Vec<&[u8]> = Vec::new();
         for path in status_ignored.iter().chain(listed_ignored.iter()).copied() {
@@ -8184,6 +8216,102 @@ pub(crate) mod password_lifetime_tests {
                 .filter(|s| !s.is_empty())
                 .map(|raw| String::from_utf8_lossy(raw).replace('\\', "/").to_ascii_lowercase())
                 .collect();
+            // **The legitimacy rule is a NAMED PREDICATE, and it is exercised
+            // on a fixture before it is trusted on the tree.**
+            //
+            // Everything else added to this test watches the audited set
+            // SHRINK: `unaudited`, both coverage asserts, the record-count
+            // assert and the status assert all fire when something reaches
+            // `check-ignore` that should have and did not. Not one of them
+            // watches the other direction -- an edit that WIDENS what counts
+            // as a legitimate exclusion source. Measured: deleting the single
+            // conjunct `&& tracked.iter().any(..)` below, with a real probe in
+            // an untracked `docs/scratch_note.md` hidden by an UNTRACKED
+            // `docs/.gitignore`, SURVIVED the filtered run in debug AND in
+            // `--release` with the probe unseen, while the identical site on
+            // pristine code KILLED at `foreign.is_empty()` in both profiles.
+            // Every control above stayed green, because nothing shrank: the
+            // same 29 776 paths were fed, answered and attributed. Only the
+            // VERDICT moved.
+            //
+            // So the verdict gets its own second opinion, at the point of
+            // decision rather than as another whole-scan invariant. The four
+            // asserts below call this predicate on a hand-built fixture whose
+            // answers are known independently of any repository state, and
+            // each one is chosen so that exactly ONE conjunct can produce it.
+            // Deleting any conjunct turns one of them red immediately, on a
+            // pristine tree, with no probe planted and nothing to notice.
+            let fold = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
+            let legitimate = |source: &str, tracked: &[String]| -> bool {
+                let as_path = root.join(source);
+                let source_rel = fold(source);
+                let named_gitignore = std::path::Path::new(source)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| fold(name) == fold(".gitignore"));
+                named_gitignore
+                    && as_path.starts_with(&root)
+                    && tracked.iter().any(|entry| *entry == source_rel)
+            };
+            // The fixture's "tracked" set is built HERE, not read from the
+            // repository, and it deliberately contains all four spellings the
+            // asserts ask about -- so membership cannot be what distinguishes
+            // three of them, and the conjunct under test is the only thing
+            // that can.
+            let outside_root = root
+                .parent()
+                .expect("the repository root has a parent directory")
+                .join("not-this-repository")
+                .join(".gitignore");
+            let outside_root = outside_root.to_string_lossy().into_owned();
+            let fixture_tracked: Vec<String> = vec![
+                fold("deskwarden/.gitignore"),
+                fold(".git/info/exclude"),
+                fold(&outside_root),
+            ];
+            // Liveness. Without this the predicate could be `false` and the
+            // three rejections below would all pass vacuously.
+            assert!(
+                legitimate("deskwarden/.gitignore", &fixture_tracked),
+                "control: the legitimacy predicate rejected a source that is named \
+                 `.gitignore`, lies under {root:?} and is present in the tracked set it was \
+                 given. It now rejects everything, so the three rejections below prove nothing \
+                 and the whole audit is a formality."
+            );
+            // THE FINDING. `docs/.gitignore` is named correctly and lies under
+            // `root`; the ONLY thing that can reject it is the requirement
+            // that the source be a TRACKED file, and the fixture set does not
+            // contain it. This is the assert that a deletion of that conjunct
+            // turns red.
+            assert!(
+                !legitimate("docs/.gitignore", &fixture_tracked),
+                "control: the legitimacy predicate ACCEPTED an untracked `.gitignore`. An \
+                 untracked `.gitignore` is a file that exists on disk, appears in no commit \
+                 and shows up in no diff, so accepting one as an exclusion source means any \
+                 untracked probe-bearing file can be removed from every listing this test has \
+                 for the cost of one two-line file that review never sees. The requirement \
+                 that an exclusion source be tracked is the whole reason this audit exists."
+            );
+            // `.git/info/exclude` is IN the fixture set and under `root`, so
+            // only the file-name test can reject it.
+            assert!(
+                !legitimate(".git/info/exclude", &fixture_tracked),
+                "control: the legitimacy predicate ACCEPTED `.git/info/exclude`. It was handed \
+                 to the predicate as a tracked path under the root precisely so that the file \
+                 name is the only thing left to reject it -- and `.git/info/exclude` is the \
+                 one-line, zero-diff, never-committed exclusion source this audit was written \
+                 for."
+            );
+            // The absolute path is in the fixture set and is named
+            // `.gitignore`, so only the containment test can reject it. This
+            // is the shape `check-ignore` prints for a `core.excludesFile`.
+            assert!(
+                !legitimate(&outside_root, &fixture_tracked),
+                "control: the legitimacy predicate ACCEPTED an absolute path outside {root:?}. \
+                 `check-ignore` prints a `core.excludesFile` as the absolute path it was \
+                 configured as, so containment is what distinguishes this repository's own \
+                 ignore rules from a machine-wide setting nothing in this tree records."
+            );
             let mut foreign: Vec<String> = Vec::new();
             let mut audited: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
             for record in fields.chunks(4) {
@@ -8228,17 +8356,7 @@ pub(crate) mod password_lifetime_tests {
                 // them, one of the two committed. This tree has exactly one
                 // tracked `.gitignore`, so the set of spellings available to
                 // borrow is empty.
-                let as_path = root.join(&source);
-                let fold = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
-                let source_rel = fold(&source);
-                let named_gitignore = std::path::Path::new(&source)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| fold(name) == fold(".gitignore"));
-                let legitimate = named_gitignore
-                    && as_path.starts_with(&root)
-                    && cached_rel.iter().any(|tracked| *tracked == source_rel);
-                if !legitimate {
+                if !legitimate(&source, &cached_rel) {
                     foreign.push(format!("{source} (excluding {pathname})"));
                 }
             }
