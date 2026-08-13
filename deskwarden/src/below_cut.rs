@@ -1757,19 +1757,28 @@ pub(crate) mod every_file_in_the_crate {
         //    honest -- no real file is shaped that way -- and what makes the
         //    accept path a control rather than an assumption. It is not what
         //    makes the rule survive: hollow it and the loop above still reds.
-        // 3. Two needles in `job_object.rs`, which cost a would-be weakener
-        //    an edit in a SECOND file. They now quote a clause of this file's
-        //    refusal `format!` and a clause of the fixture's panic message,
-        //    each up to its closing quote, rather than the bare token
-        //    `INTERLEAVES` -- which occurs four times here, three of them in
-        //    prose, so it stayed green over a deleted branch.
+        // 3. Two needles in `job_object.rs`, which quote a clause of this
+        //    file's refusal `format!` and a clause of the fixture's panic
+        //    message rather than the bare token `INTERLEAVES` -- which occurs
+        //    four times here, three of them in prose, so it stayed green over
+        //    a deleted branch. What they buy is VISIBILITY, not a second
+        //    file's worth of work. The claim that they "cost an edit in a
+        //    SECOND file" was measured false: that test reads this file with
+        //    a raw `read_to_string`, so with the `TOP_LEVEL` arm neutered and
+        //    the fixture hollowed, TWO `//` COMMENT LINES added here carrying
+        //    the clauses verbatim turn it green with no edit to
+        //    `job_object.rs` at all. They are a tripwire -- the cheapest
+        //    defeat now has to write the refusal's own words back as dead
+        //    comment text beside the branch it deleted, which no diff reads
+        //    as innocent -- not a barrier. Holder 1 is the barrier.
         //
         // So the honest price of bringing the tolerance back is: rewrite this
         // `verdict` arm AND defeat the payload loop above (whose floors,
         // `shapes == 4 * live + gates_seen` and `closes_read == gates_seen`
-        // all bind), delete or hollow the fixture, and edit both needles in
-        // `job_object.rs`. Only the first of those is a rule; the rest are
-        // what make it expensive to remove quietly.
+        // all bind), and delete or hollow the fixture. Satisfying the two
+        // needles is a formality by comparison -- but a conspicuous one.
+        // Only the first of those is a rule; the rest are what make it
+        // awkward to remove quietly.
 
         // ---- Liveness, over the DERIVED set, on every file's real bytes.
         //

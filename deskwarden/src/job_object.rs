@@ -1689,27 +1689,57 @@ mod tests {
             // neither is a token that prose about the rule naturally repeats
             // -- which is exactly how the previous pair failed.
             //
-            // HONEST COST, corrected. The claim that weakening the refusal
-            // costs "an edit in `verdict`, plus the fixture, plus both
-            // needles here" was wrong twice over: the needles were free, and
-            // the holder that actually killed both mutants was never named.
-            // `verdict` is driven over every file's REAL bytes by the sweep's
-            // shipping-payload loop, which requires a refusal per payload, so
-            // a `verdict` that tolerates interleaving reds there whatever this
-            // file says. That loop is the load-bearing holder; the fixture is
-            // what keeps the branch's own words reachable and its message
-            // legible; these two needles are what make deleting either one
-            // cost an edit in a second file. Three holders, and only the
-            // first of them is not text.
-            "set of tolerated files to join, and adding one is not the fix\"",
-            "back and a `pub fn` between two gated modules ships again\"",
+            // HONEST COST, corrected TWICE. The claim that weakening the
+            // refusal costs "an edit in `verdict`, plus the fixture, plus both
+            // needles here" was wrong: the needles as first written were free,
+            // and the holder that actually killed both mutants was never
+            // named. `verdict` is driven over every file's REAL bytes by the
+            // sweep's shipping-payload loop, which requires a refusal per
+            // payload, so a `verdict` that tolerates interleaving reds there
+            // whatever this file says. That loop is the load-bearing holder;
+            // the fixture is what keeps the branch's own words reachable and
+            // its message legible.
+            //
+            // The replacement claim -- that these two needles "make deleting
+            // either one cost an edit in a SECOND file" -- was wrong in the
+            // same direction. Measured: with the `TOP_LEVEL` arm neutered and
+            // the fixture hollowed, adding TWO `//` COMMENT LINES inside
+            // `below_cut.rs` carrying these clauses verbatim turns this test
+            // GREEN, with no edit to this file at all. The read below is a
+            // raw `read_to_string` -- no `sanitized()`, no comment stripping
+            // -- so a comment satisfies it exactly as the code does. (Comment
+            // stripping was considered and NOT done: this file has lost text
+            // pins nine times, and a stripper that mis-parses a raw string or
+            // a `//` inside a literal would red the suite over nothing. An
+            // honest statement of what the needles buy is worth more than a
+            // fragile barrier.)
+            //
+            // So what these needles ACTUALLY buy is not a second file's worth
+            // of work. It is VISIBILITY: the cheapest defeat is no longer a
+            // silent one-line change to a match arm, but a diff that has to
+            // add the refusal's own words back as dead comment text next to
+            // the branch it just deleted -- an edit no reviewer reads as
+            // innocent. They are a TRIPWIRE, not a barrier. The barrier is
+            // holder 1, the sweep, which reds on all of the above regardless.
+            //
+            // The clauses stop one word short of their closing quote ON
+            // PURPOSE. Each is the tail line of a `\`-continued literal, so
+            // including the `"` meant that APPENDING A SENTENCE to the
+            // refusal -- an unambiguous improvement -- moved the quote and
+            // red-lined the suite while blaming a deletion that had not
+            // happened. Each clause is unique in `below_cut.rs` without it.
+            "set of tolerated files to join, and adding one is not the fix",
+            "back and a `pub fn` between two gated modules ships again",
         ] {
             assert!(
                 source.contains(needle),
-                "`below_cut.rs` no longer contains {needle:?}. The crate-wide walk over every \
-                 source file's tail has been deleted or rewritten into something that no \
-                 longer derives what it reads. Thirty-five of this crate's files have no \
-                 guard of their own; that test is the only thing reading their tails."
+                "`below_cut.rs` no longer contains {needle:?}. Either the crate-wide walk over \
+                 every source file's tail has been deleted or rewritten into something that no \
+                 longer derives what it reads -- thirty-five of this crate's files have no \
+                 guard of their own, and that test is the only thing reading their tails -- OR \
+                 the refusal message or the fixture's panic message was legitimately reworded \
+                 or re-wrapped. If it was reworded, that is fine: update this needle to a \
+                 clause of the new wording that lives inside the construct and nowhere else."
             );
         }
     }
