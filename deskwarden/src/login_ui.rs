@@ -6095,16 +6095,76 @@ pub(crate) mod password_lifetime_tests {
     /// the scan fails naming it, the same as in the fallback. The other half
     /// of that fix is in [`nested_repository_shape`], which no longer counts
     /// an empty `.git` as a repository at all.
+    /// Searches `path` for any of `needles` **without ever holding the whole
+    /// file in memory**, returning the label of the first needle found.
+    ///
+    /// The read loop used to be `std::fs::read(file)`, which is a whole-file
+    /// allocation. That was harmless while the listing was a directory walk
+    /// that excluded build output, and it stopped being harmless when the
+    /// listing became git's: a file FORCE-ADDED under `target/` is tracked,
+    /// and tracked files pass through no filter at all, so a multi-gigabyte
+    /// artifact is read whole and then window-scanned three times. That is an
+    /// undisclosed cost of making the listing git-only, and it is paid here
+    /// rather than bought back with a size-based skip -- a skip would be a new
+    /// exclusion predicate, which is the exact shape six rounds were spent
+    /// deleting from this test.
+    ///
+    /// The chunk carries `max_needle_len - 1` bytes of the previous chunk
+    /// forward, so a needle straddling a chunk boundary is still found; the
+    /// only splitting that hides the probe is the one `concat!` performs in
+    /// the source, which is the remedy this test recommends.
+    ///
+    /// I/O errors are RETURNED, not swallowed. See the caller.
+    fn scan_for_needles(
+        path: &std::path::Path,
+        needles: &[(&'static str, &[u8])],
+    ) -> std::io::Result<Option<&'static str>> {
+        use std::io::Read as _;
+
+        const CHUNK: usize = 1 << 20;
+        let overlap = needles
+            .iter()
+            .map(|(_, n)| n.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let mut handle = std::fs::File::open(path)?;
+        let mut window: Vec<u8> = Vec::with_capacity(overlap + CHUNK);
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let read = handle.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            window.extend_from_slice(&chunk[..read]);
+            if let Some((label, _)) = needles
+                .iter()
+                .find(|(_, n)| !n.is_empty() && window.windows(n.len()).any(|w| w == *n))
+            {
+                return Ok(Some(label));
+            }
+            let keep = window.len().min(overlap);
+            let drop_to = window.len() - keep;
+            window.drain(..drop_to);
+        }
+    }
+
     fn tracked_files(
         root: &std::path::Path,
         refused: &mut Vec<std::path::PathBuf>,
     ) -> Option<Vec<std::path::PathBuf>> {
-        fn list(root: &std::path::Path, extra: &[&str]) -> Option<Vec<Vec<u8>>> {
+        // **Two producers, two `Command`s, not one builder called twice.**
+        // `fn list(root, extra)` was a single `Command` builder shared by both
+        // questions, so a PATHSPEC appended inside it reached the tracked list
+        // AND the untracked list in ONE edit -- the two "independent"
+        // enumerations here were one. They are written out separately so that
+        // corrupting both costs two edits at two call sites, which is what the
+        // doc above claims they cost.
+        let tracked = {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(root)
                 .args(["ls-files", "-z"])
-                .args(extra)
                 .output()
                 .ok()?;
             out.status.success().then(|| {
@@ -6112,12 +6172,26 @@ pub(crate) mod password_lifetime_tests {
                     .split(|b| *b == 0)
                     .filter(|s| !s.is_empty())
                     .map(<[u8]>::to_vec)
-                    .collect()
-            })
-        }
-
-        let tracked = list(root, &[])?;
-        let untracked = list(root, &["--others", "--exclude-standard"]).unwrap_or_default();
+                    .collect::<Vec<Vec<u8>>>()
+            })?
+        };
+        let untracked = {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["ls-files", "-z", "--others", "--exclude-standard"])
+                .output();
+            out.ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    o.stdout
+                        .split(|b| *b == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(<[u8]>::to_vec)
+                        .collect::<Vec<Vec<u8>>>()
+                })
+                .unwrap_or_default()
+        };
 
         let mut undecodable: Vec<String> = Vec::new();
         let mut listed: Vec<std::path::PathBuf> = Vec::new();
@@ -7154,7 +7228,7 @@ pub(crate) mod password_lifetime_tests {
         // `concat!` is FOR and is the remedy this test recommends.
         let probe_utf16le: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let probe_utf16be: Vec<u8> = PROBE.encode_utf16().flat_map(u16::to_be_bytes).collect();
-        let needles: [(&str, &[u8]); 3] = [
+        let needles: [(&'static str, &[u8]); 3] = [
             ("as bytes", PROBE.as_bytes()),
             ("encoded UTF-16LE", &probe_utf16le),
             ("encoded UTF-16BE", &probe_utf16be),
@@ -7175,7 +7249,7 @@ pub(crate) mod password_lifetime_tests {
         );
 
         let mut scanned = 0usize;
-        let mut unreadable = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
         let mut scanned_this_file = false;
         for file in &files {
             // **Bytes, no extension list, and no encoding rule.** This is a
@@ -7188,19 +7262,37 @@ pub(crate) mod password_lifetime_tests {
             // to a file no longer takes it out of scope. See
             // the git-only listing for the measurements behind all three.
             //
-            // A read that FAILS is skipped rather than panicked on: a tracked
-            // file can be momentarily locked by an editor, an antivirus, or a
-            // concurrent build. The counters below are what stops that
-            // tolerance from turning the whole check into a silent pass.
-            let Ok(bytes) = std::fs::read(file) else {
-                unreadable += 1;
-                continue;
+            // **A read that FAILS is a FAILURE, named.** It used to be
+            // skipped, on the reasoning that a tracked file can be momentarily
+            // locked by an editor, an antivirus or a concurrent build, with
+            // "the counters below" said to stop that tolerance from becoming a
+            // silent pass. They did not, and the hole needed ZERO edits to the
+            // source: plant the real probe in the tracked
+            // `deskwarden/examples/ui_preview.rs`, then deny read on that ONE
+            // file (`icacls ... /deny *S-1-1-0:(R)`), and the run is
+            // `1 passed; 0 failed` with the probe unseen -- because the floor
+            // was `scanned + 5 >= files.len()` and a floor cannot see a
+            // subtraction of five. On Windows an editor lock, an AV hold or an
+            // ACL is enough, and up to five files could take that exit
+            // unremarked. The same hole cost ONE edit from the source side --
+            // an `.and_then` on this very statement returning `Err` for one
+            // file name -- and that mutation SURVIVED the whole suite in debug
+            // and in release with a committed probe in the tree.
+            //
+            // So this is now exactly as loud as `the_probe_scan_requires_git`:
+            // a file this test was asked to police and could not read is a
+            // property it could not check, and a test that cannot check its
+            // property says so instead of quietly checking a weaker one. The
+            // remedy for a real lock is to re-run, not to tolerate it.
+            let found = match scan_for_needles(file, &needles) {
+                Ok(found) => found,
+                Err(error) => {
+                    unreadable.push(format!("{} ({error})", file.display()));
+                    continue;
+                }
             };
             scanned += 1;
             scanned_this_file |= file.ends_with("login_ui.rs");
-            let found = needles
-                .iter()
-                .find(|(_, n)| bytes.windows(n.len()).any(|w| w == *n));
             assert!(
                 found.is_none(),
                 "{} contains the assembled probe ({}). Any test that reads this tree back now \
@@ -7215,7 +7307,7 @@ pub(crate) mod password_lifetime_tests {
                  at any file's bytes to guess whose they are, because every sniff tried so far \
                  was also an evasion",
                 file.display(),
-                found.map_or("", |(label, _)| label)
+                found.unwrap_or("")
             );
         }
 
@@ -7225,12 +7317,26 @@ pub(crate) mod password_lifetime_tests {
         // green run. There is no longer any second, quieter category: a
         // listed file is either scanned or it failed to open, and the
         // not-source bucket that the `.bak` evasion hid in does not exist.
-        // Every listed file must be scanned but for at most five that will
-        // not OPEN.
+        // Every listed file must be scanned. NOT "all but five": that
+        // tolerance was a zero-edit hole (see the read loop above), and both
+        // controls here are now equalities rather than floors, because a floor
+        // cannot see a subtraction.
         assert!(
-            scanned + 5 >= files.len() && scanned > 30,
-            "control: only {scanned} of the {} listed files were scanned ({unreadable} could \
-             not be opened), so the check above is a check over a fraction of the tree",
+            unreadable.is_empty(),
+            "{} listed file(s) could not be OPENED, so the probe could be sitting in one of \
+             them unread and this scan cannot say otherwise. This is not tolerated for the \
+             same reason `the_probe_scan_requires_git` is not: a check that could not run over \
+             part of the tree is not a check that passed over it. Measured: with the probe \
+             planted in a tracked file and read denied on that one file, the old \
+             five-file tolerance returned a full green. If a lock is genuinely transient -- an \
+             editor, an antivirus, a concurrent build -- close it and re-run. The files: {:?}",
+            unreadable.len(),
+            unreadable
+        );
+        assert!(
+            scanned == files.len() && scanned > 30,
+            "control: {scanned} of the {} listed files were scanned, so the check above is a \
+             check over a fraction of the tree",
             files.len()
         );
         assert!(
