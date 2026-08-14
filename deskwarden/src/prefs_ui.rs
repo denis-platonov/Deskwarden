@@ -432,13 +432,46 @@ fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String, enabled: bool) 
 
     // Frameless: the box around it is painted above, so `TextEdit`'s own frame
     // would draw a second, differently-rounded rectangle inside it.
+    // The number is placed by hand rather than by `horizontal_align(Center)`,
+    // and that is a measurement, not a preference. On egui 0.35 a singleline
+    // `TextEdit` centres its galley over a region 12pt WIDER than the rect it
+    // is handed: given `field.shrink(4.0)` (48pt) it centred over 60pt, which
+    // put the number 6pt right of the cell while the greyed branch above --
+    // which centres an explicit galley -- sat dead centre. So the live control
+    // and the disabled one disagreed by 6pt horizontally and 3.5pt vertically,
+    // which is what the bug report was.
+    //
+    // `desired_width` does NOT move it (measured: 48 and 36 give the same
+    // result), so there is no width to tune. What IS exact is `Align::Min`,
+    // which lands the text at precisely `rect.min.x`. The origin is therefore
+    // computed here from the same `layout_no_wrap` measurement the greyed
+    // branch uses, so the two branches now agree BY CONSTRUCTION rather than
+    // by coincidence -- and neither depends on the 12pt discrepancy being
+    // understood, which it is not.
+    //
+    // The rect still runs to the cell's right edge so most of the cell stays
+    // clickable; only the text's left edge moves with the digit count.
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(
+            buffer.clone(),
+            FontId::new(12.0, FontFamily::Proportional),
+            theme::INK,
+        )
+        .size()
+        .x;
+    let inner = field.shrink(4.0);
     let entry = ui.put(
-        field.shrink(4.0),
+        Rect::from_min_max(
+            Pos2::new(field.center().x - text_width / 2.0, inner.min.y),
+            inner.max,
+        ),
         egui::TextEdit::singleline(buffer)
             .id(egui::Id::new(STEPPER_FIELD_ID))
             .frame(egui::Frame::new())
             .font(FontId::new(12.0, FontFamily::Proportional))
-            .horizontal_align(egui::Align::Center)
+            .horizontal_align(egui::Align::Min)
+            .vertical_align(egui::Align::Center)
             .margin(Margin::ZERO),
     );
     if entry.lost_focus() && !stepped {
@@ -1972,6 +2005,62 @@ mod tests {
             "with auto-lock off the stepper must read as disabled"
         );
         assert_ne!(theme::BORDER_STRONG, theme::HAIRLINE, "the two greys have to differ at all");
+    }
+
+    /// The number sits in the middle of its cell in BOTH states.
+    ///
+    /// Both halves are load-bearing and neither is redundant. The greyed
+    /// branch paints an explicit galley and was always centred; the live one
+    /// hands the placement to a `TextEdit` and was measured 6.0pt right and
+    /// 3.5pt high of the cell centre -- visible as the number jumping when
+    /// the toggle is flipped. Asserting only the live branch would let a
+    /// future edit break the greyed one silently, and asserting only that the
+    /// two AGREE would be satisfied by both being wrong together, so each is
+    /// checked against the cell it is drawn in.
+    #[test]
+    fn the_minutes_number_is_centred_in_its_cell_in_both_states() {
+        let minutes = clamp_auto_lock_minutes(Settings::default().auto_lock_minutes).to_string();
+        for (state, painted) in [
+            ("live", paint_settings(Section::General, Settings::default())),
+            (
+                "greyed",
+                paint_settings(
+                    Section::General,
+                    Settings { auto_lock_enabled: false, ..Settings::default() },
+                ),
+            ),
+        ] {
+            let outer = painted.only_rect_of_size(Vec2::new(
+                STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH,
+                STEPPER_HEIGHT,
+            ));
+            // The value cell is the middle segment, between the two end
+            // buttons -- derived from the same constants `minutes_stepper`
+            // lays the control out with, so this cannot drift from it.
+            let cell = Rect::from_min_size(
+                Pos2::new(outer.min.x + STEPPER_STEP_WIDTH, outer.min.y),
+                Vec2::new(STEPPER_VALUE_WIDTH, STEPPER_HEIGHT),
+            );
+            let number = painted.rect_of(&minutes);
+            // Half a point: the two branches lay the glyphs out by different
+            // routes and their widths differ by ~0.1pt, so an exact equality
+            // would be measuring rounding rather than centring. The defect
+            // this catches was 6.0 and 3.5.
+            assert!(
+                (number.center().x - cell.center().x).abs() < 0.5,
+                "{state}: the minutes number is not horizontally centred in its cell -- \
+                 number centre {:?}, cell centre {:?}",
+                number.center(),
+                cell.center()
+            );
+            assert!(
+                (number.center().y - cell.center().y).abs() < 0.5,
+                "{state}: the minutes number is not vertically centred in its cell -- \
+                 number centre {:?}, cell centre {:?}",
+                number.center(),
+                cell.center()
+            );
+        }
     }
 
     #[test]
