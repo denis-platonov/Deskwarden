@@ -445,7 +445,32 @@ fn ticking_totp_without_a_passphrase_cannot_produce_a_bare_seed() {
 
 ---
 
-## Task 7: Fetching a Send
+## Task 7: Fetching a Send — **DONE (`96ec238`)**
+
+> **This task's original instruction was wrong and is corrected here**, because
+> a later reader would otherwise follow it.
+>
+> It said the password must go on **stdin, never argv**. `bw send receive`
+> has **no stdin route for a password at all** — verified against the CLI. It
+> offers exactly three: the inline flag (secret in argv), `--passwordfile`
+> (secret written to disk, outliving the run), and `--passwordenv`, which
+> names an **environment variable**, so argv carries the variable's name and
+> never its value. The third is what shipped — the same channel `BW_SESSION`
+> already travels on. `create` can pipe because all its secrets ride in one
+> JSON body; `receive` has no such body.
+>
+> Two things fell out of it that were not in the plan:
+> - **`SendInvocation`'s `Debug` was leaking.** It printed `args` in full,
+>   justified on the premise that arguments never carry a secret. That premise
+>   died when a command took an access URL **positionally**, so `5eab0ff`'s
+>   redaction work was incomplete. Now elided whole.
+> - The file's ban on the string `--password` also refused `--passwordenv`,
+>   since one is a prefix of the other. It was replaced with a **sharper**
+>   rule — every occurrence must be part of `--passwordenv` — which still
+>   refuses the inline flag and now also refuses `--passwordfile`.
+>
+> A receive carries **no session token**: fetching a Send is anonymous, so the
+> vault key is not handed to a child with no use for it.
 
 **Files:**
 - Modify: `deskwarden/src/send.rs`
