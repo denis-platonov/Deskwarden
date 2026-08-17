@@ -373,10 +373,83 @@ fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
     )
 }
 
+/// **The last four digits of a card's number, and the ONE place they are
+/// worked out.**
+///
+/// Both the row's `(*4545)` suffix ([`card_number_suffix`]) and the search
+/// arm in [`matches_filter`] read this. They are deliberately not two
+/// extractions: a card findable by digits it does not display, or displaying
+/// digits that do not find it, is a disagreement no user could diagnose and
+/// nothing but a third test comparing the two could catch. One function, and
+/// the two behaviours are the same fact by construction.
+///
+/// **Keyed on [`ItemKind`], not on the presence of a number.** A login whose
+/// name is `4545` is not a card and grows neither a suffix nor a digit match.
+///
+/// **Fewer than four digits stored gives `None`, not a partial.** The rule is
+/// `docs/superpowers/specs/2026-08-17-card-art-design.md` §4's, quoted
+/// straight: revealing "the last four" of a six-digit fragment discloses a
+/// larger fraction of it than the last four of a real number does, and a
+/// partial number is a data-entry state rather than a card.
+///
+/// **Non-digits are skipped** -- a number the user typed as `4242 4242 4242
+/// 4242` or with dashes has the same last four as one typed bare.
+///
+/// The full number is never materialised into a plain `String`. It lives in a
+/// `Zeroizing` on the item, and this walks its `chars` twice rather than
+/// collecting them, so the only copy this function makes is of the four
+/// digits it answers with -- which are the digits already painted on the row.
+pub fn card_last_four(item: &VaultItem) -> Option<String> {
+    if ItemKind::of(item) != ItemKind::Card {
+        return None;
+    }
+    let number = item.card.as_ref()?.number.as_ref()?;
+    let digits = || number.chars().filter(char::is_ascii_digit);
+    let count = digits().count();
+    if count < 4 {
+        return None;
+    }
+    Some(digits().skip(count - 4).collect())
+}
+
+/// The row's title suffix for `item`, exactly as painted: `(*4545)`.
+///
+/// A pure function of the item so the rendering rule -- one asterisk, four
+/// digits, parentheses, and nothing at all when there are not four digits --
+/// can be asserted without a frame, and so [`item_row`] has no formatting
+/// decision of its own to get wrong.
+pub fn card_number_suffix(item: &VaultItem) -> Option<String> {
+    card_last_four(item).map(|four| format!("(*{four})"))
+}
+
+/// The part of `search_lower` that could be a card's digits, with the
+/// punctuation the row paints AROUND them trimmed off.
+///
+/// The user reads `(*4545)` off the row, so a query typed as `*4545` or
+/// `(*4545)` should find the same card `4545` does. This trims those three
+/// characters from the ENDS and stops -- it is deliberately not a parser for
+/// the suffix's shape, which is why a query that is nothing but punctuation
+/// trims to empty and matches no card rather than every one of them.
+fn card_digit_query(search_lower: &str) -> Option<&str> {
+    let trimmed = search_lower.trim_matches(|c| c == '(' || c == '*' || c == ')');
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// True when `item` is both in `filter`'s scope (delegates to
 /// `SidebarFilter::scope_contains` -- the one place that logic lives, so
 /// this and `sidebar::count_for` can't drift apart) and matches
-/// `search_lower` against its name or username.
+/// `search_lower` against its name, its username, or -- for a card -- the
+/// last four digits of its number.
+///
+/// **The card arm matches the last four ONLY, never the whole number.** The
+/// principle is "you can search for what you can see": the row paints
+/// `(*4545)` and nothing else of the number, so a query matching a middle
+/// fragment would pull up a card on evidence the user cannot read anywhere on
+/// screen. [`card_last_four`] is the single source for both, so the digits
+/// that find a card are the digits it shows, by construction.
+///
+/// Substring and case-insensitive like the two arms beside it: `45` matches,
+/// exactly as a two-letter name fragment already does.
 pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &str) -> bool {
     if !filter.scope_contains(item) {
         return false;
@@ -389,7 +462,11 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
         .as_ref()
         .and_then(|l| l.username.as_deref())
         .unwrap_or("");
-    item.name.to_lowercase().contains(search_lower) || username.to_lowercase().contains(search_lower)
+    item.name.to_lowercase().contains(search_lower)
+        || username.to_lowercase().contains(search_lower)
+        || card_digit_query(search_lower).is_some_and(|digits| {
+            card_last_four(item).is_some_and(|four| four.contains(digits))
+        })
 }
 
 /// Design 2b's search placeholder: "Search 180 logins" -- a count of what is
@@ -978,6 +1055,12 @@ const TITLE_SIZE: f32 = 13.0;
 const SUBTITLE_SIZE: f32 = 11.0;
 const TITLE_GAP_Y: f32 = 2.0;
 
+/// The space between a card row's name and its `(*4545)` suffix. A word gap,
+/// not a column gap: the suffix qualifies the name it follows, and the row's
+/// own `ROW_GAP_X` (which separates the avatar, the text column and the
+/// chips) would read as a third element on the line.
+const TITLE_SUFFIX_GAP_X: f32 = 4.0;
+
 /// The exact height the row's one- or two-line text column will lay out to,
 /// measured from the fonts it is about to be drawn with.
 ///
@@ -1001,6 +1084,82 @@ fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
         height += TITLE_GAP_Y + ui.ctx().fonts_mut(|f| f.row_height(&subtitle));
     }
     height
+}
+
+/// The y offset that puts `suffix`'s first baseline on `name`'s, measured
+/// from the two galleys rather than written down as a constant.
+///
+/// `detail.rs`'s `digits_baseline_drop` argument, for the one case here: the
+/// name is Archivo (SemiBold or Bold) and the suffix is the subtitle's plain
+/// proportional face, so the two have different ascents at the same 13pt.
+/// Painted at a shared top the suffix would sit visibly high against the name
+/// it qualifies.
+fn suffix_baseline_drop(name: &egui::Galley, suffix: &egui::Galley) -> f32 {
+    fn first_baseline(galley: &egui::Galley) -> f32 {
+        galley
+            .rows
+            .first()
+            .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+            .unwrap_or(0.0)
+    }
+    first_baseline(name) - first_baseline(suffix)
+}
+
+/// The title line of a CARD row: the item's name, then `(*4545)`.
+///
+/// **Laid and painted by hand rather than as two `Label`s in a
+/// `ui.horizontal`, and both halves of that are load-bearing.**
+///
+/// *The box is exactly the NAME galley's height.* The text column above was
+/// allocated at [`text_column_height`], which measures the title's own font
+/// and nothing else; a line that allocated the taller of two faces would grow
+/// that column for card rows only, un-centre them against the avatar, and red
+/// `the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top`
+/// -- or worse, pass it, since that guard's items are logins. Painting into
+/// the name's own box means a suffix can never change a row's height, which
+/// is also what keeps every row exactly one `ROW_TILE_HEIGHT` tall for
+/// `show_rows` to virtualize against.
+///
+/// *The NAME is truncated and the suffix is not.* The suffix's width is taken
+/// off the available room FIRST and the name is laid into what is left, so a
+/// long name loses its tail and the digits survive. That is the whole point
+/// of the suffix: two cards from the same bank have the same name and are
+/// told apart only by the four digits, so truncating those instead would
+/// leave two identical rows. A single `Label` over one `LayoutJob` of both
+/// runs would have done exactly that -- egui truncates at the END of the
+/// line.
+fn paint_title_with_suffix(ui: &mut egui::Ui, title: RichText, suffix: &str) {
+    // The subtitle's typography, on the title's line: the plain proportional
+    // face at no named weight, in `TEXT_FAINT`. Deliberately NOT
+    // `theme::semibold`/`theme::bold` -- the user asked for the suffix "not
+    // in bold", and secondary text on this row already has an answer, which
+    // is the username line directly below it. Kept at `TITLE_SIZE` rather
+    // than `SUBTITLE_SIZE` because it shares the name's line and its
+    // baseline; the lighter weight and the faint ink are what separate it
+    // from the name, not a second type size on one line.
+    let suffix_galley = egui::WidgetText::from(
+        RichText::new(suffix).size(TITLE_SIZE).color(theme::TEXT_FAINT),
+    )
+    .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+    // `max(1.0)`, not `max(0.0)`: egui reads a zero wrap width as "do not
+    // wrap", which is the behaviour this is withdrawing.
+    let room = (ui.available_width() - suffix_galley.size().x - TITLE_SUFFIX_GAP_X).max(1.0);
+    let name_galley = egui::WidgetText::from(title)
+        .into_galley(ui, Some(egui::TextWrapMode::Truncate), room, egui::TextStyle::Body);
+    let drop = suffix_baseline_drop(&name_galley, &suffix_galley);
+    let width = name_galley.size().x + TITLE_SUFFIX_GAP_X + suffix_galley.size().x;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, name_galley.size().y), Sense::hover());
+    let suffix_x = rect.left() + name_galley.size().x + TITLE_SUFFIX_GAP_X;
+    // The fallback colours are never reached -- both galleys carry their own
+    // section colour -- but they are the right ones if a future `RichText`
+    // here ever drops its `.color()`.
+    ui.painter().galley(rect.left_top(), name_galley, theme::INK);
+    ui.painter().galley(
+        egui::pos2(suffix_x, rect.top() + drop),
+        suffix_galley,
+        theme::TEXT_FAINT,
+    );
 }
 
 /// What one drawn row reports back to [`draw_item_list`].
@@ -1160,7 +1319,19 @@ fn item_row(
                         // make one row taller than every other and slide the
                         // whole virtualized list out of register with the
                         // fixed pitch `show_rows` scrolls by.
-                        ui.add(egui::Label::new(title).truncate());
+                        //
+                        // A CARD with four or more digits stored takes the
+                        // other branch, which draws the same name followed by
+                        // `(*4545)`. Every other row -- including a card with
+                        // no number, an empty one, or a fragment shorter than
+                        // four digits -- takes this one and is byte for byte
+                        // the row it was before.
+                        match card_number_suffix(item) {
+                            Some(suffix) => paint_title_with_suffix(ui, title, &suffix),
+                            None => {
+                                ui.add(egui::Label::new(title).truncate());
+                            }
+                        }
                         if !username.is_empty() {
                             ui.add(
                                 egui::Label::new(
@@ -1424,6 +1595,172 @@ mod tests {
     fn search_matches_username_too() {
         let it = item("Ledgerline", Some("a.novak@ledgerline.com"), Some(1));
         assert!(matches_filter(&it, &SidebarFilter::All, "novak"));
+    }
+
+    /// A card (`type: 3`) with `number` stored exactly as the vault stores
+    /// it -- a `Zeroizing<String>` on `CardData` -- so nothing here is
+    /// asserting against a shape the bridge does not produce.
+    fn card_numbered(name: &str, number: &str) -> VaultItem {
+        let mut it = item(name, None, Some(3));
+        it.card = Some(crate::vault_bridge::CardData {
+            number: Some(zeroize::Zeroizing::new(number.to_string())),
+            ..Default::default()
+        });
+        it
+    }
+
+    /// The names of everything a query leaves standing, in list order --
+    /// which is what the user sees, and what "assert the list, not that it is
+    /// non-empty" means.
+    fn found(items: &[VaultItem], query: &str) -> Vec<String> {
+        items
+            .iter()
+            .filter(|it| matches_filter(it, &SidebarFilter::All, query))
+            .map(|it| it.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_last_four_are_the_last_four_digits_of_a_cards_number() {
+        assert_eq!(
+            card_last_four(&card_numbered("BoA Credit", "4242424242424545")).as_deref(),
+            Some("4545")
+        );
+    }
+
+    #[test]
+    fn separators_in_a_stored_number_do_not_change_its_last_four() {
+        // The same card typed two ways. Were the digits not filtered, the
+        // spaced form would answer "4545" only by luck of where the space
+        // fell -- a dash immediately before the last four would answer
+        // "-454".
+        assert_eq!(
+            card_last_four(&card_numbered("Spaced", "4242 4242 4242 4545")).as_deref(),
+            Some("4545")
+        );
+        assert_eq!(
+            card_last_four(&card_numbered("Dashed", "4242-4242-4242-4545")).as_deref(),
+            Some("4545")
+        );
+    }
+
+    #[test]
+    fn fewer_than_four_digits_stored_reveals_nothing_at_all() {
+        // The card-art spec's rule: a partial number is a data-entry state,
+        // and "the last four" of a three-digit fragment is all of it.
+        assert_eq!(card_last_four(&card_numbered("Partial", "454")), None);
+        assert_eq!(card_number_suffix(&card_numbered("Partial", "454")), None);
+        // And exactly four IS a card, so the floor is `< 4` and not `<= 4`.
+        assert_eq!(card_last_four(&card_numbered("Four", "4545")).as_deref(), Some("4545"));
+    }
+
+    #[test]
+    fn a_card_with_no_number_or_an_empty_one_has_no_last_four() {
+        assert_eq!(card_last_four(&item("Bare card", None, Some(3))), None);
+        assert_eq!(card_last_four(&card_numbered("Empty", "")), None);
+    }
+
+    #[test]
+    fn the_rule_is_keyed_on_kind_not_on_text() {
+        // A login whose NAME is a card-shaped number. Nothing about it is a
+        // card, so it grows neither a suffix nor a digit match.
+        let login = item("4242424242424545", None, Some(1));
+        assert_eq!(card_last_four(&login), None);
+        assert_eq!(card_number_suffix(&login), None);
+
+        // **And the case that actually exercises the kind check.** `type` and
+        // the `card` payload are two independent fields on `VaultItem`, so an
+        // item can carry card DATA while being a login -- a stale payload
+        // left behind by a kind change, or anything a server chose to send.
+        // The check on `ItemKind` is the only thing standing between that and
+        // a login row painting a card's digits; with the check deleted the
+        // assertions above still pass, because the login above has no `card`
+        // at all.
+        let mut disguised = card_numbered("Looks like a login", "4242424242424545");
+        disguised.item_type = Some(1);
+        assert_eq!(card_last_four(&disguised), None);
+        assert_eq!(card_number_suffix(&disguised), None);
+        assert!(found(&[disguised], "4545").is_empty());
+    }
+
+    #[test]
+    fn the_suffix_is_one_asterisk_and_the_four_digits_in_parentheses() {
+        assert_eq!(
+            card_number_suffix(&card_numbered("BoA Credit", "4242424242424545")).as_deref(),
+            Some("(*4545)")
+        );
+    }
+
+    #[test]
+    fn searching_the_last_four_finds_the_card_and_only_the_card() {
+        let items = [
+            card_numbered("BoA Credit", "4242424242424545"),
+            item("Ledgerline", None, Some(1)),
+        ];
+        assert_eq!(found(&items, "4545"), ["BoA Credit"]);
+    }
+
+    #[test]
+    fn a_login_is_not_found_by_a_cards_digits() {
+        // The live control on the arm above: the query returns nothing at
+        // all when the only item is a login, so "finds the card" above is a
+        // statement about the card and not about the query matching
+        // everything.
+        let items = [item("Ledgerline", None, Some(1))];
+        assert!(found(&items, "4545").is_empty());
+    }
+
+    #[test]
+    fn the_name_and_username_arms_still_match_after_the_card_arm_was_added() {
+        // The control that the new arm was ADDED and did not replace the two
+        // beside it -- the failure a card-only test could not see.
+        let items = [
+            card_numbered("BoA Credit", "4242424242424545"),
+            item("Ledgerline", Some("a.novak@ledgerline.com"), Some(1)),
+        ];
+        assert_eq!(found(&items, "boa"), ["BoA Credit"]);
+        assert_eq!(found(&items, "ledger"), ["Ledgerline"]);
+        assert_eq!(found(&items, "novak"), ["Ledgerline"]);
+    }
+
+    #[test]
+    fn a_card_too_short_to_show_its_digits_is_not_findable_by_them_either() {
+        // The two rules are the same fact: the row shows nothing, so nothing
+        // can be searched for. A disagreement here is a card findable by
+        // digits it does not display.
+        let items = [card_numbered("Partial", "454")];
+        assert_eq!(card_number_suffix(&items[0]), None);
+        assert!(found(&items, "454").is_empty());
+        // Still findable by its name, so it has not fallen out of the list.
+        assert_eq!(found(&items, "partial"), ["Partial"]);
+    }
+
+    #[test]
+    fn a_middle_fragment_of_the_number_does_not_find_the_card() {
+        // "You can search for what you can see." `4242` is stored and is not
+        // painted anywhere, so it must not pull the card up.
+        let items = [card_numbered("BoA Credit", "4242424242424545")];
+        assert!(found(&items, "4242").is_empty());
+        assert_eq!(found(&items, "4545"), ["BoA Credit"]);
+    }
+
+    #[test]
+    fn a_partial_query_of_the_last_four_matches_like_any_other_fragment() {
+        let items = [card_numbered("BoA Credit", "4242424242424545")];
+        assert_eq!(found(&items, "45"), ["BoA Credit"]);
+        assert_eq!(found(&items, "545"), ["BoA Credit"]);
+    }
+
+    #[test]
+    fn the_suffixs_own_punctuation_is_tolerated_but_is_not_a_query_by_itself() {
+        let items = [card_numbered("BoA Credit", "4242424242424545")];
+        // Typed straight off the row.
+        assert_eq!(found(&items, "*4545"), ["BoA Credit"]);
+        assert_eq!(found(&items, "(*4545)"), ["BoA Credit"]);
+        // Punctuation alone trims to nothing and matches no card, rather
+        // than matching every card there is.
+        assert!(found(&items, "*").is_empty());
+        assert!(found(&items, "()").is_empty());
     }
 
     #[test]
@@ -3768,6 +4105,246 @@ mod row_tile_tests {
 
     fn card(name: &str) -> VaultItem {
         VaultItem { item_type: Some(3), login: None, ..login(name, "") }
+    }
+
+    /// A card with a number stored in the shape the vault bridge produces --
+    /// a `Zeroizing<String>` on `CardData`.
+    fn card_numbered(name: &str, number: &str) -> VaultItem {
+        let mut it = card(name);
+        it.card = Some(crate::vault_bridge::CardData {
+            number: Some(zeroize::Zeroizing::new(number.to_string())),
+            ..Default::default()
+        });
+        it
+    }
+
+    /// The rect and colour of one painted run, by its exact text.
+    fn painted(p: &Painted, text: &str) -> (egui::Rect, egui::Color32) {
+        let run = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{text:?} was never painted; the row painted: {:?}",
+                    p.texts.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>()
+                )
+            });
+        (run.1, run.2)
+    }
+
+    /// The font one painted run was laid out in.
+    fn painted_font(p: &Painted, text: &str) -> egui::FontId {
+        p.fonts
+            .iter()
+            .find(|(t, _)| t == text)
+            .unwrap_or_else(|| panic!("{text:?} was never painted"))
+            .1
+            .clone()
+    }
+
+    /// Every painted run that looks like the card suffix. Used to assert its
+    /// ABSENCE without pinning the exact digits a wrong implementation might
+    /// have chosen.
+    fn suffix_runs(p: &Painted) -> Vec<String> {
+        p.texts
+            .iter()
+            .map(|(t, _, _)| t.clone())
+            .filter(|t| t.starts_with("(*"))
+            .collect()
+    }
+
+    #[test]
+    fn a_cards_row_shows_its_last_four_after_the_name() {
+        // The user's request, verbatim: "add *4545 after the name in search
+        // results not in bold like: `BoA Credit (*4545)`".
+        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], None);
+        let (name, _) = painted(&p, "BoA Credit");
+        let (suffix, _) = painted(&p, "(*4242)");
+        assert!(
+            suffix.left() >= name.right() - 0.01,
+            "the suffix runs {}..{} and the name {}..{} -- the suffix is not AFTER the name",
+            suffix.left(),
+            suffix.right(),
+            name.left(),
+            name.right()
+        );
+        // On the name's own line, not below it: the two boxes overlap in y.
+        assert!(
+            suffix.top() < name.bottom() && name.top() < suffix.bottom(),
+            "the suffix sits at y {}..{} and the name at {}..{} -- they are not on one line",
+            suffix.top(),
+            suffix.bottom(),
+            name.top(),
+            name.bottom()
+        );
+    }
+
+    #[test]
+    fn the_suffix_is_lighter_than_the_name_it_follows() {
+        // "not in bold". The name is Archivo SemiBold in `INK`; the suffix
+        // takes the row's OWN secondary typography -- the plain proportional
+        // face in `TEXT_FAINT`, which is what the username line below it
+        // uses. Asserted against the name in the same frame so this cannot
+        // stay green by both moving together.
+        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], None);
+        let (_, name_colour) = painted(&p, "BoA Credit");
+        let (_, suffix_colour) = painted(&p, "(*4242)");
+        assert_eq!(name_colour, theme::INK);
+        assert_eq!(suffix_colour, theme::TEXT_FAINT);
+        assert_ne!(suffix_colour, name_colour);
+
+        let name_font = painted_font(&p, "BoA Credit");
+        let suffix_font = painted_font(&p, "(*4242)");
+        assert_eq!(
+            name_font.family,
+            egui::FontFamily::Name(theme::SEMIBOLD.into()),
+            "the name stopped being the design's 600 weight"
+        );
+        assert_eq!(
+            suffix_font.family,
+            egui::FontFamily::Proportional,
+            "the suffix is in a named (bold) Archivo face; it must be the plain proportional one"
+        );
+        // Same size, so the difference the eye reads is weight and ink and
+        // not a second type size on one line.
+        assert!((suffix_font.size - name_font.size).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_selected_cards_suffix_stays_light_while_its_name_goes_bold() {
+        // The branch the test above cannot reach: selected rows draw the name
+        // in Archivo Bold in `BLUE_DEEP`. The suffix must not follow it.
+        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], Some("BoA Credit"));
+        let (_, name_colour) = painted(&p, "BoA Credit");
+        let (_, suffix_colour) = painted(&p, "(*4242)");
+        assert_eq!(name_colour, theme::BLUE_DEEP);
+        assert_eq!(suffix_colour, theme::TEXT_FAINT);
+        assert_eq!(
+            painted_font(&p, "BoA Credit").family,
+            egui::FontFamily::Name(theme::BOLD.into())
+        );
+        assert_eq!(painted_font(&p, "(*4242)").family, egui::FontFamily::Proportional);
+    }
+
+    #[test]
+    fn a_card_with_three_digits_shows_no_suffix_and_the_row_is_otherwise_itself() {
+        // The card-art spec's floor. The POSITIVE half matters as much as the
+        // negative one: an implementation that painted nothing at all would
+        // satisfy "no suffix" vacuously.
+        let p = paint(&[card_numbered("Partial", "454")], None);
+        painted(&p, "Partial");
+        assert_eq!(one_tile(&p).rect.height(), ROW_TILE_HEIGHT);
+        assert!(
+            suffix_runs(&p).is_empty(),
+            "a three-digit card grew a suffix: {:?}",
+            suffix_runs(&p)
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_number_at_all_looks_exactly_as_it_did() {
+        let p = paint(&[card("Bare")], None);
+        painted(&p, "Bare");
+        assert!(suffix_runs(&p).is_empty(), "a numberless card grew a suffix");
+    }
+
+    #[test]
+    fn a_login_named_like_a_card_number_grows_no_suffix() {
+        // The control that the rule is keyed on KIND and not on text: this
+        // row's whole name is sixteen digits and it is a login.
+        let p = paint(&[login("4242424242424242", "a.novak@ledgerline.com")], None);
+        painted(&p, "4242424242424242");
+        painted(&p, "a.novak@ledgerline.com");
+        assert!(suffix_runs(&p).is_empty(), "a login grew a card suffix");
+    }
+
+    #[test]
+    fn a_long_card_name_truncates_and_the_four_digits_survive() {
+        // The suffix is what tells two cards from the same bank apart, so it
+        // is the NAME that loses its tail. Squeezed at a pane far narrower
+        // than the real one, which is fixed at `LIST_WIDTH`.
+        //
+        // **Measured as painted WIDTH and not as painted text.** A truncated
+        // egui galley still reports the whole string from `Galley::text` --
+        // only its box shrinks -- so a test reading the text back would be
+        // green whatever the row drew.
+        let long = "Bank of America Cash Rewards Signature Visa";
+        let item = card_numbered(long, "4242424242424242");
+        let roomy = paint(std::slice::from_ref(&item), None);
+        let tight = paint_at_width(std::slice::from_ref(&item), None, 240.0);
+
+        let (roomy_name, _) = painted(&roomy, long);
+        let (roomy_suffix, _) = painted(&roomy, "(*4242)");
+        let (tight_name, _) = painted(&tight, long);
+        let (tight_suffix, _) = painted(&tight, "(*4242)");
+
+        assert!(
+            tight_name.width() < roomy_name.width() - 1.0,
+            "the name was not squeezed at all: {} wide on a 240pt pane against {} on a \
+             {PANE_WIDTH}pt one",
+            tight_name.width(),
+            roomy_name.width()
+        );
+        // The suffix is UNTOUCHED: same width on both panes, and still whole.
+        assert!(
+            (tight_suffix.width() - roomy_suffix.width()).abs() < 0.01,
+            "the suffix was squeezed too: {} against {}",
+            tight_suffix.width(),
+            roomy_suffix.width()
+        );
+        // And it is still inside the row it belongs to.
+        let tile = one_tile_of_width(&tight, 240.0 - 2.0 * LIST_PADDING).rect;
+        assert!(
+            tight_suffix.right() <= tile.right() + 0.01,
+            "the suffix runs to x={} but the tile ends at x={}",
+            tight_suffix.right(),
+            tile.right()
+        );
+    }
+
+    #[test]
+    fn a_suffix_never_makes_a_row_taller_than_every_other_row() {
+        // The virtualized list scrolls by a fixed `ROW_TILE_HEIGHT` pitch, so
+        // one taller row slides the whole list out of register. The suffix is
+        // painted into the NAME's own box for exactly this reason.
+        let items = [
+            login("Ledgerline", "a.novak@ledgerline.com"),
+            card_numbered("BoA Credit", "4242424242424242"),
+        ];
+        let p = paint(&items, None);
+        let tiles = row_tiles(&p);
+        assert_eq!(tiles.len(), 2, "expected one tile per row");
+        for tile in &tiles {
+            assert!(
+                (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.01,
+                "a row is {} tall, not {ROW_TILE_HEIGHT}",
+                tile.rect.height()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cards_suffix_does_not_move_the_rows_trailing_chips() {
+        // The chips are allocated before the title column, so a longer title
+        // line must be absorbed by the title and never by them.
+        let mut with_2fa = card_numbered("BoA Credit", "4242424242424242");
+        with_2fa.login = Some(crate::vault_bridge::LoginData {
+            username: None,
+            password: None,
+            totp: Some(zeroize::Zeroizing::new("JBSWY3DPEHPK3PXP".into())),
+            uris: vec![],
+            other: serde_json::Map::new(),
+        });
+        let mut without = with_2fa.clone();
+        without.card = None;
+        let with_chip = chip_rect(&paint(&[with_2fa], None), "2FA");
+        let bare = chip_rect(&paint(&[without], None), "2FA");
+        assert!(
+            (with_chip.left() - bare.left()).abs() < 0.01
+                && (with_chip.top() - bare.top()).abs() < 0.01,
+            "the 2FA chip moved from {bare:?} to {with_chip:?} when the card grew a suffix"
+        );
     }
 
     /// The kind whose Edit entry is still greyed -- see
