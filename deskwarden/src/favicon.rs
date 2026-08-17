@@ -94,6 +94,59 @@ pub fn domain_from_uri(uri: &str) -> Option<String> {
     }
 }
 
+/// The custom field a card's bank domain is stored on.
+///
+/// Namespaced the way `app_match::APP_MATCH_FIELD_NAME` is, and declared
+/// **once**: the reader below and the picker that writes it are in different
+/// modules, and two spellings of a field name that must match is a defect
+/// that shows up only as a silently blank tile.
+pub const BANK_DOMAIN_FIELD: &str = "deskwarden:bank-domain";
+
+/// The domain whose icon represents `item`, or `None` for an item that has no
+/// icon of its own and should fall back to the colored-initials monogram.
+///
+/// **This is the seam between two differently-keyed things.** The UI's icon
+/// cache is keyed by *item id*; everything in this module is keyed by
+/// *domain*. The only thing standing between them is the question this
+/// function answers, which used to be answered inline in the loader for
+/// logins and therefore could only ever be answered for logins.
+///
+/// With the question lifted out, the loader and the item list need no
+/// knowledge of cards at all: they keep asking the same question and start
+/// getting an answer for a kind of item that previously had none. Fetching,
+/// the on-disk cache, the on-screen prefetch window and the monogram fallback
+/// all come along for free, because those are properties of the machinery
+/// rather than of logins.
+///
+/// A login answers with [`domain_from_uri`] of its first URI -- exactly what
+/// the loader did itself. A card answers with its [`BANK_DOMAIN_FIELD`], if
+/// set. Everything else answers `None`.
+pub fn icon_domain_for(item: &crate::vault_bridge::VaultItem) -> Option<String> {
+    match crate::vault_bridge::ItemKind::of(item) {
+        crate::vault_bridge::ItemKind::Login => item
+            .login
+            .as_ref()
+            .and_then(|l| l.uris.first())
+            .and_then(|u| u.uri.as_deref())
+            .and_then(domain_from_uri),
+        crate::vault_bridge::ItemKind::Card => item
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some(BANK_DOMAIN_FIELD))
+            .and_then(|f| f.value.as_deref())
+            .map(|v| v.trim())
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
+        // Listed rather than caught by a `_`, as `ItemKind`'s own doc
+        // requires: a type Bitwarden ships later must arrive here as
+        // "no icon", not as whatever the arm above it happens to do.
+        crate::vault_bridge::ItemKind::SecureNote
+        | crate::vault_bridge::ItemKind::Identity
+        | crate::vault_bridge::ItemKind::SshKey
+        | crate::vault_bridge::ItemKind::Unknown(_) => None,
+    }
+}
+
 /// How long to wait for the icon host's TCP handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -407,6 +460,113 @@ mod tests {
     fn domain_rejects_uris_with_no_dotted_host() {
         assert_eq!(domain_from_uri("localhost"), None);
         assert_eq!(domain_from_uri(""), None);
+    }
+
+    /// Builds a `VaultItem` from wire JSON, so these fixtures exercise the
+    /// same deserialization the real vault snapshot goes through rather than
+    /// a hand-assembled struct that could drift from it.
+    fn item_from_json(json: &str) -> crate::vault_bridge::VaultItem {
+        serde_json::from_str(json).expect("fixture item parses")
+    }
+
+    fn login_with_uri(uri: &str) -> crate::vault_bridge::VaultItem {
+        item_from_json(&format!(
+            r#"{{"id":"i1","name":"Login","type":1,"login":{{"uris":[{{"uri":"{uri}"}}]}}}}"#
+        ))
+    }
+
+    /// A `type: 3` card carrying a real number and one custom field.
+    fn card_with_field(name: &str, value: &str) -> crate::vault_bridge::VaultItem {
+        item_from_json(&format!(
+            r#"{{"id":"c1","name":"Card","type":3,"card":{{"number":"4111111111111111"}},
+                 "fields":[{{"name":"{name}","value":"{value}"}}]}}"#
+        ))
+    }
+
+    fn plain_card() -> crate::vault_bridge::VaultItem {
+        item_from_json(
+            r#"{"id":"c2","name":"Card","type":3,"card":{"number":"4111111111111111"}}"#,
+        )
+    }
+
+    fn secure_note() -> crate::vault_bridge::VaultItem {
+        item_from_json(r#"{"id":"n1","name":"Note","type":2}"#)
+    }
+
+    #[test]
+    fn a_login_answers_with_its_uris_domain_exactly_as_before() {
+        let item = login_with_uri("https://github.com/login");
+        assert_eq!(icon_domain_for(&item).as_deref(), Some("github.com"));
+        // The loader used to call `domain_from_uri` on this URI itself; the
+        // lifted function must be the same answer, not merely *an* answer.
+        assert_eq!(
+            icon_domain_for(&item),
+            domain_from_uri("https://github.com/login")
+        );
+    }
+
+    #[test]
+    fn a_login_with_no_usable_uri_still_answers_nothing() {
+        // Both of the loader's old bail-outs: no URI at all, and a URI with
+        // no dotted host. Neither may start producing a domain.
+        assert_eq!(icon_domain_for(&item_from_json(r#"{"id":"l","name":"L","type":1}"#)), None);
+        assert_eq!(icon_domain_for(&login_with_uri("localhost")), None);
+    }
+
+    #[test]
+    fn a_card_answers_with_its_bank_domain_field() {
+        let item = card_with_field(BANK_DOMAIN_FIELD, "chase.com");
+        assert_eq!(icon_domain_for(&item).as_deref(), Some("chase.com"));
+    }
+
+    #[test]
+    fn a_card_without_the_field_has_no_icon_of_its_own() {
+        let item = plain_card();
+        assert_eq!(icon_domain_for(&item), None);
+        // Control: the fixture is a real card with a number, so `None` is
+        // about the missing field and not about an empty item.
+        assert!(item.card.as_ref().expect("fixture is a card").number.is_some());
+    }
+
+    #[test]
+    fn a_card_whose_bank_domain_is_blank_is_the_same_as_not_having_one() {
+        // The picker writing an empty string, or `bw` round-tripping one, is
+        // a card with no bank -- not a fetch of `https://.../ /icon.png`.
+        let item = card_with_field(BANK_DOMAIN_FIELD, "   ");
+        assert_eq!(icon_domain_for(&item), None);
+        // Control: the same fixture shape with a real value does answer, so
+        // this is about the blank and not about the fixture.
+        assert_eq!(
+            icon_domain_for(&card_with_field(BANK_DOMAIN_FIELD, "chase.com")).as_deref(),
+            Some("chase.com")
+        );
+    }
+
+    #[test]
+    fn a_card_reads_only_its_own_field_name() {
+        // A card carrying some *other* custom field must not have that value
+        // treated as a domain -- a hidden field's value would then be fetched
+        // as a URL path segment.
+        let item = card_with_field("Security question", "chase.com");
+        assert_eq!(icon_domain_for(&item), None);
+        assert_eq!(BANK_DOMAIN_FIELD, "deskwarden:bank-domain");
+    }
+
+    #[test]
+    fn a_secure_note_has_no_icon() {
+        assert_eq!(icon_domain_for(&secure_note()), None);
+    }
+
+    #[test]
+    fn the_kinds_that_have_no_icon_of_their_own_all_answer_none() {
+        // Identity, SSH key and a type Bitwarden has not shipped yet. Driven
+        // as a list so a new kind cannot quietly inherit the login arm.
+        for ty in [2, 4, 5, 6] {
+            let item = item_from_json(&format!(r#"{{"id":"x","name":"X","type":{ty}}}"#));
+            assert_eq!(icon_domain_for(&item), None, "type {ty}");
+        }
+        // Control: the loop is not passing because every item answers None.
+        assert!(icon_domain_for(&login_with_uri("https://chase.com")).is_some());
     }
 
     /// Encodes straight (non-premultiplied) RGBA8 pixels as a PNG, so the

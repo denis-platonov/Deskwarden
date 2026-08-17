@@ -7902,11 +7902,13 @@ fn ensure_icon_loaded(
     if icons.textures.contains_key(&item.id) || favicon_requested.contains(&item.id) {
         return;
     }
-    let Some(uri) = item.login.as_ref().and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()) else {
-        favicon_requested.insert(item.id.clone());
-        return;
-    };
-    let Some(domain) = crate::favicon::domain_from_uri(uri) else {
+    // **One question, asked once.** This used to read a login's first URI and
+    // call `domain_from_uri` on it inline, which meant only a login could
+    // ever have an icon. `icon_domain_for` is that same question lifted out,
+    // so an item kind that answers it -- a card with a bank domain -- reaches
+    // everything below (the disk cache, the fetch, the monogram fallback)
+    // without this function knowing such a kind exists.
+    let Some(domain) = crate::favicon::icon_domain_for(item) else {
         favicon_requested.insert(item.id.clone());
         return;
     };
@@ -16024,6 +16026,117 @@ mod account_details_tests {
                  window reads"
             );
         }
+    }
+
+    /// A directory this test process owns, named for `label`.
+    fn icon_routing_cache_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-test-icon-routing-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("test cache dir");
+        dir
+    }
+
+    /// A tiny opaque PNG -- enough for `decode_rgba` to succeed, which is the
+    /// only property this test needs from the bytes.
+    fn tiny_png() -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, 4, 4);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&[255u8; 4 * 4 * 4]).expect("png data");
+        }
+        out
+    }
+
+    /// Runs one `ensure_icon_loaded` call against a disk cache that already
+    /// holds an icon for `cached_domain`, and reports whether the item ended
+    /// up with a texture.
+    ///
+    /// **The disk-cache hit is the observable end of the domain-keyed path**,
+    /// and it is the right one to assert on: it is reached only by an item
+    /// that produced a domain, it is keyed by that domain and not by the item
+    /// id, and it spawns no thread and touches no network -- so this drives
+    /// the real loader rather than a copy of its shape.
+    fn loads_icon_from_cache(item: &VaultItem, cached_domain: &str, label: &str) -> bool {
+        let dir = icon_routing_cache_dir(label);
+        crate::favicon::write_cached_icon(&dir, cached_domain, &tiny_png());
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let mut requested = std::collections::HashSet::new();
+        let mut icons = IconCache::default();
+        ensure_icon_loaded(&ctx, item, &dir, &None, &tx, &mut requested, &mut icons);
+
+        let loaded = icons.textures.contains_key(&item.id);
+        std::fs::remove_dir_all(&dir).ok();
+        // Every path through the loader marks the item resolved; asserting it
+        // here keeps `loaded == false` meaning "no domain", not "not run".
+        assert!(requested.contains(&item.id), "the loader did not run at all");
+        loaded
+    }
+
+    fn routing_item(json: &str) -> VaultItem {
+        serde_json::from_str(json).expect("fixture item parses")
+    }
+
+    /// **The point of the whole seam.** The loader asks
+    /// `favicon::icon_domain_for` rather than reading a login's URI itself,
+    /// so a card carrying `deskwarden:bank-domain` reaches the same
+    /// domain-keyed machinery -- with nothing in this function, or in
+    /// `item_list`, knowing that cards exist.
+    ///
+    /// Mutation that proves this is not vacuous: put the old
+    /// `item.login...uris.first()` read back in place of the
+    /// `icon_domain_for` call and this test fails while the login one below
+    /// still passes.
+    #[test]
+    fn a_card_with_a_bank_domain_reaches_the_domain_keyed_icon_path() {
+        let card = routing_item(&format!(
+            r#"{{"id":"c1","name":"Card","type":3,"card":{{"number":"4111111111111111"}},
+                 "fields":[{{"name":"{}","value":"chase.com"}}]}}"#,
+            crate::favicon::BANK_DOMAIN_FIELD
+        ));
+        assert!(
+            loads_icon_from_cache(&card, "chase.com", "card-hit"),
+            "a card with a bank domain did not reach the domain-keyed icon path"
+        );
+    }
+
+    /// The negative half, with the cache deliberately holding the same icon:
+    /// a card with no bank domain gets nothing, so the test above is about
+    /// the field and not about cards being handed whatever is on disk.
+    #[test]
+    fn a_card_without_a_bank_domain_reaches_no_icon_at_all() {
+        let card = routing_item(
+            r#"{"id":"c2","name":"Card","type":3,"card":{"number":"4111111111111111"}}"#,
+        );
+        assert!(
+            !loads_icon_from_cache(&card, "chase.com", "card-miss"),
+            "a card with no bank domain picked up an icon anyway"
+        );
+    }
+
+    /// Logins go through the new question and come out where they always did.
+    #[test]
+    fn a_login_still_reaches_the_icon_path_through_its_uri() {
+        let login = routing_item(
+            r#"{"id":"l1","name":"Login","type":1,"login":{"uris":[{"uri":"https://chase.com/login"}]}}"#,
+        );
+        assert!(
+            loads_icon_from_cache(&login, "chase.com", "login-hit"),
+            "a login stopped reaching its own icon"
+        );
+        // ...and a login whose URI has no dotted host still gets nothing,
+        // which is the loader's other pre-existing bail-out.
+        let bare = routing_item(
+            r#"{"id":"l2","name":"Login","type":1,"login":{"uris":[{"uri":"localhost"}]}}"#,
+        );
+        assert!(!loads_icon_from_cache(&bare, "localhost", "login-bare"));
     }
 
     /// **The account menu is handed the same fact, not a fresh reading of it.**
