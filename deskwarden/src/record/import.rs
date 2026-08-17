@@ -1,4 +1,6 @@
-//! Turning a validated [`Record`] into the item that will be created.
+//! Turning a validated [`Record`] into the item that will be created, and
+//! deciding whether creating it would collide with something already in the
+//! vault.
 //!
 //! Pure. Nothing here talks to `bw serve`; [`item_from`] hands back a
 //! [`NewItem`] and the caller POSTs it through
@@ -34,7 +36,7 @@
 
 use crate::record::payload::Record;
 use crate::record::seal::{unseal, SealFailed};
-use crate::vault_bridge::NewItem;
+use crate::vault_bridge::{NewItem, VaultItem};
 use zeroize::Zeroizing;
 
 /// Why a record could not become an item.
@@ -102,6 +104,33 @@ pub fn item_from(record: &Record, passphrase: Option<&str>) -> Result<NewItem, I
         notes: record.notes.clone().map(Zeroizing::new),
     })
 }
+
+/// Whether importing `record` would land on top of something already there.
+///
+/// A **value**, not an action: the surface asks the user what to do with it.
+/// Nothing in this module overwrites anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collision {
+    Fresh,
+    SameName { existing_id: String },
+}
+
+/// Matches on **name only**.
+///
+/// Deliberately not on username or URI, and this is the load-bearing choice in
+/// the whole policy: two genuinely different accounts on one service share both
+/// — a personal and an admin login on the same host, with the same email — so
+/// matching on either would report a collision between records that are not the
+/// same record. The worst outcome of a missed collision is a duplicate item the
+/// user can delete. The worst outcome of a *false* collision is a credential
+/// silently replaced by someone else's. Those are not symmetric.
+pub fn collides(record: &Record, existing: &[VaultItem]) -> Collision {
+    match existing.iter().find(|item| item.name == record.name) {
+        Some(item) => Collision::SameName { existing_id: item.id.clone() },
+        None => Collision::Fresh,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +159,23 @@ mod tests {
             notes: None,
             totp_sealed: None,
             not_after: None,
+        }
+    }
+
+    fn an_existing_item(id: &str, name: &str) -> VaultItem {
+        VaultItem {
+            id: id.to_string(),
+            name: name.to_string(),
+            fields: Vec::new(),
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
         }
     }
 
@@ -235,5 +281,76 @@ mod tests {
                 .expect("no seal to open")
                 .to_payload();
         assert_eq!(payload["login"]["uris"][0]["uri"].as_str(), Some("https://sap.example"));
+    }
+
+    #[test]
+    fn a_name_already_in_the_vault_is_a_collision_and_names_the_item_it_hit() {
+        let vault = [
+            an_existing_item("aaa", "Some Other Thing"),
+            an_existing_item("bbb", "SAP Production"),
+        ];
+        assert_eq!(
+            collides(&bare("SAP Production"), &vault),
+            Collision::SameName { existing_id: "bbb".to_string() }
+        );
+    }
+
+    #[test]
+    fn a_name_not_in_the_vault_is_fresh_and_the_vault_was_not_empty() {
+        let vault = [
+            an_existing_item("aaa", "Some Other Thing"),
+            an_existing_item("bbb", "SAP Production"),
+        ];
+        assert_eq!(collides(&bare("A Brand New Thing"), &vault), Collision::Fresh);
+        // The live control the plan asks for: `Fresh` above is a verdict about
+        // a vault that HAS items in it, not the trivially correct answer to an
+        // empty list. Asserted through `collides` itself rather than by
+        // eyeballing the fixture, so a fixture that quietly emptied would red.
+        assert!(!vault.is_empty());
+        assert_eq!(
+            collides(&bare("SAP Production"), &vault),
+            Collision::SameName { existing_id: "bbb".to_string() },
+            "control: this fixture vault cannot produce a collision at all, so `Fresh` above \
+             means nothing"
+        );
+    }
+
+    #[test]
+    fn a_matching_username_and_uri_under_a_different_name_is_not_a_collision() {
+        // The trap this policy exists to avoid. Two genuinely different
+        // accounts on one service share a username and a URI -- and a false
+        // collision that silently overwrites a credential is far worse than a
+        // duplicate item.
+        let mut existing = an_existing_item("bbb", "SAP Production (admin)");
+        existing.login = Some(crate::vault_bridge::LoginData {
+            username: Some("dplatonov".to_string()),
+            uris: vec![crate::vault_bridge::UriEntry {
+                uri: Some("https://sap.example".to_string()),
+                other: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        });
+        let vault = [existing];
+        let incoming = Record {
+            username: Some("dplatonov".to_string()),
+            uri: Some("https://sap.example".to_string()),
+            ..bare("SAP Production (personal)")
+        };
+        assert_eq!(
+            collides(&incoming, &vault),
+            Collision::Fresh,
+            "a shared username and URI was read as the same record"
+        );
+        // Control: the two really do share both, so `Fresh` above is a
+        // decision not to match on them rather than a fixture with nothing in
+        // common.
+        assert_eq!(
+            vault[0].login.as_ref().and_then(|l| l.username.as_deref()),
+            incoming.username.as_deref()
+        );
+        assert_eq!(
+            vault[0].login.as_ref().and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()),
+            incoming.uri.as_deref()
+        );
     }
 }
