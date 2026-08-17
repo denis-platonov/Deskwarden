@@ -74,16 +74,16 @@ pub struct IdentityDraft {
 ///
 /// The three field names are the wire keys captured from a real type-5 item on
 /// 2026-08-01 (`.superpowers/sdd/item-shapes-capture.md`): `privateKey`,
-/// `publicKey`, `keyFingerprint`. There is no `SshKeyData` to mirror yet --
-/// the struct lands with the `ssh-key-type` branch and
-/// [`NewItem::ssh_key`] takes the three strings directly in the meantime --
-/// so this draft is written against that constructor.
+/// `publicKey`, `keyFingerprint`. [`NewItem::ssh_key`] takes the three strings
+/// directly, so this draft is written against that constructor.
 ///
-/// **Create only.** [`EditDraft::apply_to`] never writes these back, because
-/// [`VaultItem`] has no `sshKey` field in this build: an existing key's object
-/// rides the `other` catch-all and is preserved precisely *because* nothing
-/// touches it. [`form_body`] is where that asymmetry is decided, so the edit
-/// form cannot offer boxes whose contents would be silently dropped.
+/// **Create only.** [`EditDraft::apply_to`] never writes these back, and
+/// [`EditDraft::from_item`] never reads them: `form_body` gives an existing
+/// SSH key `FormBody::UneditableNotice`, so there is no form to fill this
+/// draft from or to save it out of. An existing key's data is preserved
+/// precisely *because* nothing here touches it. That is also why an SSH key
+/// is creatable but not editable -- see
+/// [`detail::kind_offers_edit`](super::detail::kind_offers_edit).
 #[derive(Debug, Clone, Default)]
 pub struct SshKeyDraft {
     pub private_key: String,
@@ -1425,12 +1425,15 @@ impl EditDraft {
             }
             // Edits nothing but the name and folder already applied above.
             //
-            // SSH keys: this build has no `SshKeyData` (`type: 5`'s wire
-            // shape is being modelled separately), so the whole `sshKey`
-            // object rides `VaultItem::other` and the clone preserves it
-            // untouched. When the field lands, the clone preserves it for
-            // exactly the same reason -- *because nothing here touches it*.
-            // Do not add an arm that writes it without a form to fill it.
+            // SSH keys: there is no form that fills an `SshKeyDraft` on an
+            // edit -- `form_body` gives an existing key
+            // `FormBody::UneditableNotice` and `from_item` leaves the draft
+            // blank -- so anything written here would be written from three
+            // empty strings, wiping a real private key. The clone preserves
+            // the key's data for exactly the reason it always did: *because
+            // nothing here touches it*. Do not add an arm that writes it
+            // without a form to fill it. This is why `kind_offers_edit` is
+            // false for `SshKey` while `is_creatable` is true.
             //
             // Unknown: an item type this build does not understand. There is
             // by definition nothing safe to write into it.
@@ -1612,8 +1615,10 @@ impl EditDraft {
 }
 
 /// The form's heading. Pure so the wording is asserted directly rather than
-/// inferred from a screenshot; the old hardcoded "Edit login" was the read
-/// pane's `kind_offers_edit` stopgap made visible.
+/// inferred from a screenshot; the old hardcoded "Edit login" was the
+/// login-only era made visible, from when `kind_offers_edit` drew the read
+/// pane's button for no other kind. It now draws it for every kind
+/// [`EditDraft::apply_to`] writes, so the heading has to name them.
 fn form_title(kind: ItemKind, creating: bool) -> String {
     let noun = match kind {
         ItemKind::Login => "login",
@@ -4846,6 +4851,163 @@ mod tests {
 
     fn parse(raw: &str) -> VaultItem {
         serde_json::from_str(raw).expect("fixture is not a VaultItem")
+    }
+
+    /// Types a recognisable new value into every box the form would offer for
+    /// `kind` -- and, for the kinds the form offers nothing for, into *every*
+    /// box there is, so "nothing was written" is a claim about `apply_to`'s
+    /// gate rather than about a draft that was never edited.
+    fn edit_every_box(draft: &mut EditDraft, kind: ItemKind) {
+        let offered = detail::kind_offers_edit(kind);
+        if !offered || kind == ItemKind::Login {
+            draft.username = "edited-user".into();
+            draft.password = "edited-pass".into();
+            draft.totp = "EDITEDSEED".into();
+        }
+        if !offered || kind == ItemKind::Card {
+            draft.card.cardholder_name = "Edited Holder".into();
+            draft.card.number = "4111111111111111".into();
+        }
+        if !offered || kind == ItemKind::Identity {
+            draft.identity.first_name = "Grace".into();
+            draft.identity.city = "Edited City".into();
+        }
+        if !offered || kind == ItemKind::SecureNote {
+            draft.note_body = "edited body".into();
+        }
+        if !offered {
+            draft.ssh_key.private_key = "EDITED-PRIV".into();
+            draft.ssh_key.public_key = "EDITED-PUB".into();
+            draft.ssh_key.key_fingerprint = "SHA256:EDITED".into();
+        }
+    }
+
+    /// **The guard that stops the two facts drifting.** `kind_offers_edit`
+    /// draws the Edit button; `apply_to` is what a Save through that button
+    /// does. This asserts they agree *behaviourally*, for every kind: a real
+    /// `EditDraft` built from a real `VaultItem`, every box the form has
+    /// filled with a new value, saved -- and then the item itself is asked
+    /// whether anything changed.
+    ///
+    /// A button offered for a kind `apply_to` does not write is a form that
+    /// silently discards what the user typed (widen the predicate to include
+    /// `SshKey` and this reds); an unoffered kind that `apply_to` does write
+    /// is a feature nobody can reach.
+    #[test]
+    fn edit_is_offered_for_exactly_the_kinds_apply_to_writes() {
+        let mut offered_count = 0;
+        for raw in EVERY_KIND {
+            let item = parse(raw);
+            let kind = ItemKind::of(&item);
+            let mut draft = EditDraft::from_item(&item);
+            edit_every_box(&mut draft, kind);
+            let saved = draft.apply_to(&item);
+
+            // Whole-item comparison, not a per-kind field lookup: the name and
+            // folder are untouched above, so any difference at all is the
+            // kind's own object (or `notes`) having been written.
+            let before = serde_json::to_value(&item).unwrap();
+            let after = serde_json::to_value(&saved).unwrap();
+            let wrote_something = before != after;
+
+            assert_eq!(
+                wrote_something,
+                detail::kind_offers_edit(kind),
+                "{kind:?}: kind_offers_edit says {} but a save through the form {} \
+                 the item.\nbefore: {before}\nafter:  {after}",
+                detail::kind_offers_edit(kind),
+                if wrote_something { "changed" } else { "did not change" }
+            );
+            if detail::kind_offers_edit(kind) {
+                offered_count += 1;
+            }
+        }
+        assert_eq!(offered_count, 4, "the fixture set no longer covers four editable kinds");
+    }
+
+    /// The user's reported bug, end to end: a card can be edited, the change
+    /// lands, and the item does **not** gain a `login` object on the way.
+    ///
+    /// That second half is the assertion that proves enabling the button was
+    /// safe -- an empty `login` grafted onto a card is exactly what the
+    /// login-only gate existed to prevent.
+    #[test]
+    fn a_card_round_trips_through_the_form_without_growing_a_login() {
+        let item = parse(CARD_WITH_EXTRAS);
+        assert!(detail::kind_offers_edit(ItemKind::of(&item)), "a card must offer Edit");
+
+        let mut draft = EditDraft::from_item(&item);
+        // `from_item` populated the card draft -- the user sees their card,
+        // not an empty form.
+        assert_eq!(draft.card.cardholder_name, "John Doe");
+        assert_eq!(draft.card.number, "4242424242424242");
+        assert_eq!(draft.card.exp_year, "2028");
+
+        draft.card.number = "4111111111111111".into();
+        let saved = draft.apply_to(&item);
+
+        let card = saved.card.as_ref().expect("the save dropped the card object");
+        assert_eq!(card.number.as_deref().map(|n| n.as_str()), Some("4111111111111111"));
+        assert_eq!(card.cardholder_name.as_deref(), Some("John Doe"));
+        assert_eq!(card.exp_year.as_deref(), Some("2028"));
+
+        assert!(saved.login.is_none(), "editing a card grew a login object");
+        let json = serde_json::to_value(&saved).unwrap();
+        assert!(
+            json.as_object().unwrap().get("login").is_none(),
+            "editing a card put a `login` key on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn an_identity_round_trips_through_the_form_without_growing_a_login() {
+        let item = parse(IDENTITY_WITH_EXTRAS);
+        assert!(detail::kind_offers_edit(ItemKind::of(&item)), "an identity must offer Edit");
+
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(draft.identity.first_name, "Ada");
+        assert_eq!(draft.identity.last_name, "Lovelace");
+
+        draft.identity.first_name = "Grace".into();
+        let saved = draft.apply_to(&item);
+
+        let identity = saved.identity.as_ref().expect("the save dropped the identity object");
+        assert_eq!(identity.first_name.as_deref(), Some("Grace"));
+        assert_eq!(identity.last_name.as_deref(), Some("Lovelace"));
+
+        assert!(saved.login.is_none(), "editing an identity grew a login object");
+        let json = serde_json::to_value(&saved).unwrap();
+        assert!(
+            json.as_object().unwrap().get("login").is_none(),
+            "editing an identity put a `login` key on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn a_secure_note_round_trips_through_the_form_without_growing_a_login() {
+        let item = parse(NOTE_WITH_EXTRAS);
+        assert!(detail::kind_offers_edit(ItemKind::of(&item)), "a secure note must offer Edit");
+
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(draft.note_body, "the passphrase");
+
+        draft.note_body = "the new passphrase".into();
+        let saved = draft.apply_to(&item);
+
+        assert_eq!(
+            saved.notes.as_deref().map(|n| n.as_str()),
+            Some("the new passphrase"),
+            "the note body did not round-trip"
+        );
+        // Its `{"type": 0}` discriminator rides `other` and must survive.
+        assert_eq!(saved.other.get("secureNote"), Some(&serde_json::json!({"type": 0})));
+
+        assert!(saved.login.is_none(), "editing a secure note grew a login object");
+        let json = serde_json::to_value(&saved).unwrap();
+        assert!(
+            json.as_object().unwrap().get("login").is_none(),
+            "editing a secure note put a `login` key on the wire: {json}"
+        );
     }
 
     #[test]

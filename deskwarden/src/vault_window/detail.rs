@@ -499,30 +499,37 @@ pub fn kind_offers_fill(kind: ItemKind) -> bool {
 
 /// Whether this kind may be opened in the edit form.
 ///
-/// **Login-only, and this is a stopgap with a date on it.** The read pane
-/// became kind-aware before the edit form did, and `EditDraft` is still
-/// login-shaped in both directions: `from_item` reads only `item.login`, and
-/// `apply_to` does `updated.login.unwrap_or_default()` unconditionally, so
-/// saving a card from that form gives it an empty `login` object it never had
-/// -- an item carrying two type objects, the exact risk the spec names. The
-/// form's own heading says "Edit login".
+/// **True exactly for the kinds `EditDraft::apply_to` actually writes back.**
+/// That is the whole rule, and it is not a list to be maintained by hand: the
+/// test `edit_is_offered_for_exactly_the_kinds_apply_to_writes` in
+/// `detail_edit.rs` drives a real draft of every kind through `apply_to` and
+/// fails if this predicate and that behaviour ever disagree.
 ///
-/// Offering the button anyway would mean offering to corrupt the item, so
-/// until the plan's kind-aware `EditDraft` lands (Task 6) the button is not
-/// drawn for kinds the form cannot honestly edit. **Delete is deliberately
-/// not gated** -- deleting a card means exactly what deleting a login means.
+/// This was login-only until 2026-08-17, and the reason is worth keeping: the
+/// read pane became kind-aware before the edit form did, and `apply_to` used
+/// to write `updated.login.unwrap_or_default()` unconditionally, so saving a
+/// card from that form gave it an empty `login` object it never had -- an item
+/// carrying two type objects. `apply_to` is now a `match self.kind` with real
+/// arms, guarded by an early return when the draft's kind disagrees with the
+/// item's, so that corruption is structurally impossible and the button is
+/// honest for Login, SecureNote, Card and Identity.
 ///
-/// When `EditDraft` becomes kind-aware, this becomes `true` for the kinds it
-/// handles; it is a separate predicate from [`kind_offers_fill`] precisely so
-/// that change cannot accidentally re-enable filling too.
+/// **`SshKey` stays false, and it is not an oversight.** It is *creatable*
+/// (see [`is_creatable`](super::detail_edit::is_creatable)) because the create
+/// path builds a whole new item through `NewItem::ssh_key`, which POSTs the
+/// three key fields; the edit path has no arm in `apply_to` that writes them
+/// and `form_body` gives an SSH key `FormBody::UneditableNotice` on an edit,
+/// so an Edit button here would open a form that changes nothing but the name
+/// and folder. Creatable and editable are genuinely different sets. `Unknown`
+/// is neither.
+///
+/// **Delete is deliberately not gated** -- deleting a card means exactly what
+/// deleting a login means. This is a separate predicate from
+/// [`kind_offers_fill`] precisely so that widening one cannot widen the other.
 pub fn kind_offers_edit(kind: ItemKind) -> bool {
     match kind {
-        ItemKind::Login => true,
-        ItemKind::SecureNote
-        | ItemKind::Card
-        | ItemKind::Identity
-        | ItemKind::SshKey
-        | ItemKind::Unknown(_) => false,
+        ItemKind::Login | ItemKind::SecureNote | ItemKind::Card | ItemKind::Identity => true,
+        ItemKind::SshKey | ItemKind::Unknown(_) => false,
     }
 }
 
@@ -6777,21 +6784,36 @@ mod tests {
         assert!(!kind_offers_fill(ItemKind::Unknown(6)));
     }
 
-    /// The edit form is login-shaped, and `EditDraft::apply_to` writes a
-    /// `login` object onto whatever it is given. Until that is kind-aware,
-    /// offering Edit on a card is offering to corrupt it.
+    /// Edit is offered for the four kinds `EditDraft::apply_to` writes back,
+    /// and withheld for the two it deliberately does not.
+    ///
+    /// Exhaustive over `EVERY_KIND` so a new variant cannot slip in
+    /// unclassified, and the `SshKey`/`Unknown` half is a **live control**,
+    /// not a leftover: an SSH key is creatable but not editable (`apply_to`
+    /// has no arm writing its keys, and `form_body` gives it
+    /// `UneditableNotice`), so an Edit button there would change nothing but
+    /// the name. The behavioural version of this rule -- which is the one
+    /// that cannot drift -- is
+    /// `edit_is_offered_for_exactly_the_kinds_apply_to_writes`.
     #[test]
-    fn only_logins_offer_to_edit_for_now() {
-        assert!(kind_offers_edit(ItemKind::Login));
+    fn edit_is_offered_for_the_kinds_the_form_writes_back() {
         for kind in [
+            ItemKind::Login,
             ItemKind::SecureNote,
             ItemKind::Card,
             ItemKind::Identity,
-            ItemKind::SshKey,
-            ItemKind::Unknown(6),
         ] {
-            assert!(!kind_offers_edit(kind), "{kind:?} must not offer Edit yet");
+            assert!(kind_offers_edit(kind), "{kind:?} must offer Edit");
         }
+        for kind in [ItemKind::SshKey, ItemKind::Unknown(6)] {
+            assert!(!kind_offers_edit(kind), "{kind:?} must not offer Edit");
+        }
+        // No kind went unclassified above.
+        assert_eq!(
+            EVERY_KIND.iter().filter(|k| kind_offers_edit(**k)).count(),
+            4,
+            "a kind was added without being classified for Edit"
+        );
     }
 
     #[test]

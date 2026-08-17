@@ -143,15 +143,17 @@ pub const MOVE_TO_FOLDER_LABEL: &str = "Move to folder";
 
 /// Why "Edit" is greyed for a non-login.
 ///
-/// The reason, not just the fact: `detail::kind_offers_edit` is still
-/// login-only (its own doc calls itself a stopgap), because `EditDraft`
-/// became kind-aware before that gate was relaxed. This string has to be
-/// deleted the day that predicate starts returning `true` for other kinds --
-/// nothing else here would need to change, since the enabled flag is read
-/// straight off it.
+/// Why "Edit" is greyed for the kinds the form cannot write back.
+///
+/// The reason, not just the fact. Since 2026-08-17 that is only an SSH key
+/// (creatable, but `EditDraft::apply_to` has no arm that writes its keys, so
+/// a form would silently discard them) and an item type this build does not
+/// recognise. Logins, secure notes, cards and identities are editable -- see
+/// `detail::kind_offers_edit`, which is the one predicate the enabled flag is
+/// read straight off.
 const EDIT_DISABLED_REASON: &str =
-    "Deskwarden's edit form only handles logins yet. Open this item in the Bitwarden \
-     web vault or app to edit it.";
+    "Deskwarden cannot edit this item type yet. Open it in the Bitwarden web vault \
+     or app to edit it.";
 
 /// Shown instead of a destination list when the vault has no folder that can
 /// be assigned to.
@@ -1623,28 +1625,36 @@ mod menu_entry_tests {
     }
 
     #[test]
-    fn a_card_offers_no_open_website_and_cannot_be_edited() {
-        // "Open website" is login-only (`detail::kind_offers_fill`), and the
-        // edit form is still login-shaped (`detail::kind_offers_edit`) --
-        // but those two are expressed differently on purpose: the website
-        // entry is ABSENT, editing is PRESENT AND GREYED.
+    fn a_card_offers_no_open_website_but_can_be_edited() {
+        // "Open website" is login-only (`detail::kind_offers_fill`) and is
+        // ABSENT. Editing a card is offered and enabled -- `apply_to` writes
+        // the card object -- which is the user-visible half of the 2026-08-17
+        // fix.
         let entries = menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault);
         assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
-        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(
+            enabled_labels(&entries),
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+        );
     }
 
     #[test]
-    fn a_secure_note_offers_the_same_three_as_a_card() {
+    fn a_secure_note_offers_the_same_four_as_a_card() {
         let entries = menu_entries(&of_kind(Some(2)), &[], false, FilterSource::LiveVault);
         assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
-        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(
+            enabled_labels(&entries),
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+        );
     }
 
+    /// An SSH key is the live case for the greyed entry now: it is creatable
+    /// but not editable, because `apply_to` has no arm that writes its keys.
     #[test]
     fn the_greyed_edit_entry_says_why() {
         // Greying without a reason is the failure this is guarding: the user
         // sees the action they came for, unavailable, and no explanation.
-        let entries = menu_entries(&of_kind(Some(4)), &[], false, FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(5)), &[], false, FilterSource::LiveVault);
         let edit = entries
             .iter()
             .find_map(|e| match e {
@@ -1705,8 +1715,9 @@ mod menu_entry_tests {
     #[test]
     fn edit_follows_kind_offers_edit_for_every_kind() {
         // Drives the predicate the menu itself consumes, so relaxing
-        // `kind_offers_edit` (its doc calls itself a stopgap) enables the
-        // entry here without anyone having to remember this file exists.
+        // `kind_offers_edit` enables the entry here without anyone having to
+        // remember this file exists -- which is exactly what happened when
+        // it was widened to cards, notes and identities.
         for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
             let item = of_kind(item_type);
             let entries = menu_entries(&item, &[], false, FilterSource::LiveVault);
@@ -3759,6 +3770,12 @@ mod row_tile_tests {
         VaultItem { item_type: Some(3), login: None, ..login(name, "") }
     }
 
+    /// The kind whose Edit entry is still greyed -- see
+    /// `EDIT_DISABLED_REASON`. A card's no longer is.
+    fn ssh_key(name: &str) -> VaultItem {
+        VaultItem { item_type: Some(5), login: None, ..login(name, "") }
+    }
+
     #[test]
     fn a_right_click_selects_the_row_it_lands_on() {
         // The whole reason right-click is not just "open a menu": the menu
@@ -3891,10 +3908,19 @@ mod row_tile_tests {
     #[test]
     fn the_greyed_edit_entry_reports_nothing_when_it_is_clicked() {
         // Greyed has to mean inert. A disabled entry that still fired would
-        // hand a card to an edit form that cannot honestly edit one.
-        let items = [card("Visa (personal)")];
+        // hand an SSH key to a form with no boxes for its keys, whose Save
+        // would change nothing but the name.
+        let items = [ssh_key("deploy key")];
         let p = choose_entry(&items, vec![], 0, "Edit");
         assert_eq!(p.action, ItemListAction::None);
+        // The positive control, in the same harness: a card's Edit is NOT
+        // greyed now, so the assertion above is the greying and not the
+        // menu failing to deliver clicks.
+        let cards = [card("Visa (personal)")];
+        assert_eq!(
+            choose_entry(&cards, vec![], 0, "Edit").action,
+            ItemListAction::Row { id: "Visa (personal)".to_string(), command: RowCommand::Edit },
+        );
     }
 
     #[test]

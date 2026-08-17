@@ -2882,10 +2882,10 @@ pub fn build_frame(
                             //
                             // What that guard was protecting is still
                             // protected, one layer down and more precisely:
-                            // the *edit* form is still login-shaped, so
                             // `detail::kind_offers_edit` draws no Edit button
-                            // for a kind `EditDraft` would corrupt (see its
-                            // doc). Read and Delete are safe for every kind.
+                            // for a kind the form cannot write back -- an SSH
+                            // key or an unrecognised type (see its doc). Read
+                            // and Delete are safe for every kind.
                             //
                             // That removal is now pinned by a test rather
                             // than by this comment:
