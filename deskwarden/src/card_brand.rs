@@ -144,6 +144,90 @@ pub fn brand_for_number(digits: &str) -> Option<CardBrand> {
         .map(|rule| rule.brand)
 }
 
+/// The dot a masked digit is drawn as.
+const BULLET: char = '\u{2022}';
+
+/// How many trailing digits a mask may reveal, and the floor below which it
+/// reveals none.
+///
+/// The last four are printed on every receipt and asked for by every support
+/// line: they are what identifies the card to its owner and they are not
+/// enough to use it. Below four stored digits that trade stops paying -- "the
+/// last four" of a three-digit fragment is most of it -- so a partial number,
+/// which is a data-entry state and not a card, reveals nothing.
+const REVEALED: usize = 4;
+
+/// The masked number: `•••• •••• •••• 4242`, or `•••• •••••• •0005` for an
+/// Amex.
+///
+/// **The dot count follows the digits actually stored.** The brand table is
+/// the authority for GROUPING and nothing else, so a card whose prefix nobody
+/// recognises still masks to its true length rather than to a guess -- a mask
+/// that draws sixteen over a fifteen-digit card tells the user the card on
+/// screen is a different card from the one in their hand.
+pub fn mask_for(number: &str, brand: Option<CardBrand>) -> String {
+    let digits = digits_of(number);
+    let shown_from = digits.len().saturating_sub(REVEALED);
+    let body: Vec<char> = digits
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if digits.len() >= REVEALED && i >= shown_from {
+                c
+            } else {
+                BULLET
+            }
+        })
+        .collect();
+
+    let mut out = String::with_capacity(body.len() + body.len() / 4);
+    for (i, c) in body.iter().enumerate() {
+        if group_starts_at(i, body.len(), brand) && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push(*c);
+    }
+    out
+}
+
+/// Whether a space falls before position `i` of a `len`-digit number.
+///
+/// The brand's own grouping is used when it accounts for exactly the digits
+/// stored; otherwise -- a half-typed number, or a length no table entry
+/// claims -- the fallback groups in fours **from the right**, which keeps the
+/// revealed last four together in one group instead of splitting them across
+/// a boundary that the left-hand grouping would put in the middle of them.
+fn group_starts_at(i: usize, len: usize, brand: Option<CardBrand>) -> bool {
+    let own = brand
+        .map(CardBrand::grouping)
+        .filter(|groups| groups.iter().sum::<usize>() == len);
+    match own {
+        Some(groups) => {
+            let mut at = 0;
+            groups.iter().any(|g| {
+                at += g;
+                at - g == i
+            })
+        }
+        None => len.saturating_sub(i).is_multiple_of(4),
+    }
+}
+
+/// The masked security code: `•••`, or `••••` for an Amex.
+///
+/// **Never revealed, unlike the last four.** A security code has no
+/// identification use to trade against its risk, so seeing it stays a
+/// deliberate act behind the reveal affordance. With no brand to consult the
+/// stored code's own length is the truth, bounded by the only two lengths a
+/// code has.
+pub fn code_mask_for(code: &str, brand: Option<CardBrand>) -> String {
+    let len = match brand {
+        Some(b) => b.security_code_len(),
+        None => digits_of(code).len().clamp(3, 4),
+    };
+    BULLET.to_string().repeat(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,4 +342,80 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn a_visa_masks_in_fours_with_the_last_four_shown() {
+        assert_eq!(
+            mask_for("4111111111111111", Some(CardBrand::Visa)),
+            "•••• •••• •••• 1111"
+        );
+    }
+
+    #[test]
+    fn an_amex_masks_in_its_own_grouping() {
+        // The whole reason this is not a fixed sixteen-in-fours: an Amex is
+        // fifteen digits in 4-6-5. A mask that draws sixteen tells the user
+        // their card is a different card from the one in their hand.
+        assert_eq!(
+            mask_for("378282246310005", Some(CardBrand::AmericanExpress)),
+            "•••• •••••• •0005"
+        );
+    }
+
+    #[test]
+    fn fewer_than_four_digits_reveals_nothing() {
+        // A partial number is a data-entry state, not a card, and "the last
+        // four" of a three-digit fragment is most of it.
+        let masked = mask_for("123", Some(CardBrand::Visa));
+        assert!(
+            !masked.contains('1') && !masked.contains('2') && !masked.contains('3'),
+            "a digit survived masking: {masked}"
+        );
+        assert_eq!(masked.chars().filter(|c| *c == BULLET).count(), 3);
+        // Control: four digits DOES reveal, so the rule is the floor and not
+        // "never reveals".
+        assert!(mask_for("1234", Some(CardBrand::Visa)).ends_with("1234"));
+    }
+
+    #[test]
+    fn an_unknown_brand_masks_to_the_length_actually_stored() {
+        // The table is the authority for GROUPING; the dot count follows the
+        // digits there really are, so an unrecognised card still masks true.
+        let masked = mask_for("1234567890123", None);
+        assert!(masked.ends_with("0123"), "{masked}");
+        assert_eq!(masked.chars().filter(|c| *c == BULLET).count(), 9);
+    }
+
+    #[test]
+    fn a_number_stored_with_spaces_masks_to_its_digits_and_not_its_characters() {
+        // What `bw` round-trips is whatever was typed, and a card typed in
+        // groups is normal. Masking the characters would draw a longer card.
+        let masked = mask_for("4111 1111 1111 1111", Some(CardBrand::Visa));
+        assert_eq!(masked, "•••• •••• •••• 1111");
+        assert_eq!(masked.chars().filter(|c| *c == BULLET).count(), 12);
+    }
+
+    #[test]
+    fn the_security_code_mask_is_four_for_amex_and_three_otherwise() {
+        assert_eq!(
+            code_mask_for("1234", Some(CardBrand::AmericanExpress)),
+            "••••"
+        );
+        assert_eq!(code_mask_for("123", Some(CardBrand::Visa)), "•••");
+        // Never revealed by the mask, unlike the last four: a code has no
+        // identification use to trade against its risk.
+        assert!(!code_mask_for("123", Some(CardBrand::Visa)).contains('1'));
+    }
+
+    #[test]
+    fn an_unknown_brands_code_mask_follows_the_code_that_is_stored() {
+        // Same principle as the number: with no table to consult, the truth
+        // is the stored value's own length rather than a guess at three.
+        assert_eq!(code_mask_for("1234", None), "••••");
+        assert_eq!(code_mask_for("123", None), "•••");
+        // An empty code still draws a field rather than nothing, and never
+        // more dots than a code can have.
+        assert_eq!(code_mask_for("", None), "•••");
+        assert_eq!(code_mask_for("1234567", None), "••••");
+    }
 }
