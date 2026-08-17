@@ -20,6 +20,10 @@ pub mod backend_policy;
 #[cfg(test)]
 pub mod below_cut;
 pub mod breach;
+/// `#[cfg(test)]` for [`below_cut`]'s reason: it reads this crate's own
+/// source text to guard it, and nothing in it can ship.
+#[cfg(test)]
+pub mod debug_leak_guard;
 pub mod bw_path;
 pub mod bw_serve;
 pub mod dispatch;

@@ -42,7 +42,39 @@ use zeroize::Zeroizing;
 /// two keys into the typed fields, and nothing in the crate writes to `other`),
 /// and [`UriEntry`]/[`LoginData`] share the shape; it is why `other` should
 /// stay a map only serde fills.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// A stand-in printed in place of a value that must never reach a formatter.
+///
+/// **Whole-value elision, not a length and not a prefix.** `send.rs`'s
+/// [`crate::send::Redacted`]-style marker prints a byte count because the one
+/// question its `Debug` had to answer was "is the body empty"; nothing here
+/// turns on that distinction, so these print nothing about the value at all.
+/// Where presence still matters -- an absent password is different from a
+/// blank one on this wire -- the field is `Option`, and the impls below map
+/// the `Option` rather than the value, so `None` and `Some(<elided>)` stay
+/// distinguishable without the bytes.
+struct Elided;
+
+impl std::fmt::Debug for Elided {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<elided>")
+    }
+}
+
+/// `other` is a `serde_json::Map` of whatever keys `bw` sent that this crate
+/// does not model -- and Bitwarden is free to add a secret-bearing one at any
+/// time without this crate changing a line. Printing its VALUES would make
+/// every future wire field a leak by default, so only the key names are
+/// shown: they are what a reader debugging a round-trip actually needs, and a
+/// key name is a schema fact rather than a user's data.
+struct KeysOnly<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl std::fmt::Debug for KeysOnly<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct VaultField {
     pub name: Option<String>,
     /// `Zeroizing<String>` for the same reason [`LoginData::password`] is,
@@ -70,6 +102,19 @@ pub struct VaultField {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Hand-written so a hidden custom field's value never reaches a formatter.
+/// `name` is kept: it is the label the user typed, it is already on screen,
+/// and without it a `Debug` cannot tell two fields apart.
+impl std::fmt::Debug for VaultField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultField")
+            .field("name", &self.name)
+            .field("value", &self.value.as_ref().map(|_| Elided))
+            .field("other", &KeysOnly(&self.other))
+            .finish()
+    }
+}
+
 /// The `login` object `bw serve` returns for login-type items.
 ///
 /// Only the two fields we type are modelled; everything else `bw` sends inside
@@ -82,7 +127,7 @@ pub struct VaultField {
 /// must not be written back as `{"username":null,"password":"p"}` -- that
 /// injects a key the source never had. Unmodelled keys already round-trip
 /// exactly through `other`; these two now do too.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct LoginData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -110,6 +155,21 @@ pub struct LoginData {
     pub uris: Vec<UriEntry>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Hand-written so the password and the TOTP seed never reach a formatter.
+/// `username` and `uris` are kept: neither is a secret, both are already on
+/// screen, and they are what identify the login to a reader.
+impl std::fmt::Debug for LoginData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginData")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| Elided))
+            .field("totp", &self.totp.as_ref().map(|_| Elided))
+            .field("uris", &self.uris)
+            .field("other", &KeysOnly(&self.other))
+            .finish()
+    }
 }
 
 /// One entry of `login.uris`. `bw`'s match-strategy field (`match`) on each
@@ -142,7 +202,7 @@ pub struct UriEntry {
 /// one: [`VaultItem`]'s catch-all cannot reach inside a nested object, so
 /// without this any key Bitwarden adds here would be silently dropped on the
 /// next full-state PUT.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct CardData {
     #[serde(rename = "cardholderName", default, skip_serializing_if = "Option::is_none")]
     pub cardholder_name: Option<String>,
@@ -162,6 +222,29 @@ pub struct CardData {
     pub code: Option<Zeroizing<String>>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Hand-written so the card number and the security code never reach a
+/// formatter. The cardholder name, brand and expiry are kept: none is a
+/// secret on its own, and they are what identify the card to a reader.
+///
+/// **The expiry stays in full rather than being elided as "part of the card
+/// number".** It is printed on the front of the card, it is useless without
+/// the number, and eliding it would leave a `Debug` that cannot tell two
+/// cards apart -- the exact failure `SendPlan`'s `name` field exists to
+/// avoid.
+impl std::fmt::Debug for CardData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CardData")
+            .field("cardholder_name", &self.cardholder_name)
+            .field("brand", &self.brand)
+            .field("number", &self.number.as_ref().map(|_| Elided))
+            .field("exp_month", &self.exp_month)
+            .field("exp_year", &self.exp_year)
+            .field("code", &self.code.as_ref().map(|_| Elided))
+            .field("other", &KeysOnly(&self.other))
+            .finish()
+    }
 }
 
 /// An identity (`type: 4`). Eighteen fields, of which a real item populates a
@@ -237,7 +320,7 @@ pub struct IdentityData {
 /// [`CardData`] have one: [`VaultItem`]'s catch-all cannot reach inside a
 /// nested object, so without this any key Bitwarden adds here would be
 /// silently dropped on the next full-state PUT.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct SshKeyData {
     /// `Zeroizing`: this is the secret the whole item exists to hold, so it
     /// gets exactly the treatment [`CardData::number`], [`CardData::code`],
@@ -258,7 +341,22 @@ pub struct SshKeyData {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Hand-written so the private key never reaches a formatter. The public half
+/// and the fingerprint are kept for the reason their own doc comments give:
+/// both are public by construction, and the fingerprint is the thing that
+/// names the key to a reader.
+impl std::fmt::Debug for SshKeyData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshKeyData")
+            .field("private_key", &self.private_key.as_ref().map(|_| Elided))
+            .field("public_key", &self.public_key)
+            .field("key_fingerprint", &self.key_fingerprint)
+            .field("other", &KeysOnly(&self.other))
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct VaultItem {
     pub id: String,
     pub name: String,
@@ -304,6 +402,36 @@ pub struct VaultItem {
     pub favorite: bool,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Hand-written so a secure note's body never reaches a formatter, and so
+/// `other`'s values do not.
+///
+/// **The four type objects are printed in full, and that is safe by
+/// delegation rather than by luck**: [`LoginData`], [`CardData`] and
+/// [`SshKeyData`] each hand-write their own `Debug` above and elide their own
+/// secrets, and [`IdentityData`] holds none. This is the whole point of
+/// putting the refusal on the type that owns the secret: a container does not
+/// have to know what its parts hold, and the crate-wide guard in
+/// `debug_leak_guard` will not let one of those parts quietly go back to a
+/// derive.
+impl std::fmt::Debug for VaultItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultItem")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("fields", &self.fields)
+            .field("login", &self.login)
+            .field("card", &self.card)
+            .field("identity", &self.identity)
+            .field("ssh_key", &self.ssh_key)
+            .field("notes", &self.notes.as_ref().map(|_| Elided))
+            .field("item_type", &self.item_type)
+            .field("folder_id", &self.folder_id)
+            .field("favorite", &self.favorite)
+            .field("other", &KeysOnly(&self.other))
+            .finish()
+    }
 }
 
 /// What kind of thing an item is, derived from `bw`'s numeric `type`.
@@ -891,7 +1019,7 @@ struct FolderList {
 /// structs the read path deserializes into ([`CardData`], [`IdentityData`]),
 /// so the wire key names have exactly one definition and the create and edit
 /// paths cannot drift apart.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum NewItem {
     Login {
         name: String,
@@ -946,10 +1074,10 @@ pub enum NewItem {
     /// in plain text where nothing will ever wipe it.
     ///
     /// The three secret-bearing fields are [`Zeroizing`] for the same reason
-    /// [`LoginData::password`] is. `NewItem`'s `Debug` is derived and would
-    /// print them; that is pre-existing here ([`NewItem::SshKey`] already
-    /// carries a `Zeroizing` private key through the same derive) and nothing
-    /// in this crate logs a `NewItem`.
+    /// [`LoginData::password`] is. `NewItem`'s `Debug` is hand-written below
+    /// and elides all three; it used to be derived, on the argument that
+    /// "nothing in this crate logs a `NewItem`", which is a fact about
+    /// today's call sites rather than a property of the type.
     ImportedRecord {
         name: String,
         folder_id: Option<String>,
@@ -963,6 +1091,92 @@ pub enum NewItem {
         uri: Option<String>,
         notes: Option<Zeroizing<String>>,
     },
+}
+
+/// Hand-written so no secret this enum carries reaches a formatter.
+///
+/// **Every variant prints its own name and its `name`/`folder_id`, and
+/// nothing else that could be a secret.** The variant name is the live part:
+/// a `Debug` that could not say whether it was looking at a `Card` or an
+/// `SshKey` would be worth nothing to a reader, and the paired test below
+/// asserts it survives rather than only asserting the secrets are gone -- a
+/// redaction assertion that would also pass against an empty string proves
+/// nothing.
+///
+/// `name` and `folder_id` are kept for [`SendPlan`](crate::send::SendPlan)'s
+/// reason: the user typed the name to identify the item to themselves and it
+/// is already on screen, and a folder id is a container's identifier, not
+/// content.
+///
+/// **`Card` and `Identity` delegate to their payload's own `Debug`** rather
+/// than eliding the whole object: [`CardData`] hand-writes its own above and
+/// already refuses the number and the code, and [`IdentityData`] holds no
+/// secret. Eliding them here would hide the non-secret half for no gain and
+/// would put the decision in two places.
+///
+/// `SecureNote`'s body is elided whole: a secure note IS the secret.
+impl std::fmt::Debug for NewItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NewItem::Login { name, folder_id, username, password: _ } => f
+                .debug_struct("NewItem::Login")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("username", username)
+                .field("password", &Elided)
+                .finish(),
+            NewItem::SecureNote { name, folder_id, body: _ } => f
+                .debug_struct("NewItem::SecureNote")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("body", &Elided)
+                .finish(),
+            NewItem::Card { name, folder_id, card } => f
+                .debug_struct("NewItem::Card")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("card", card)
+                .finish(),
+            NewItem::Identity { name, folder_id, identity } => f
+                .debug_struct("NewItem::Identity")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("identity", identity)
+                .finish(),
+            NewItem::SshKey {
+                name,
+                folder_id,
+                private_key: _,
+                public_key,
+                key_fingerprint,
+            } => f
+                .debug_struct("NewItem::SshKey")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("private_key", &Elided)
+                .field("public_key", public_key)
+                .field("key_fingerprint", key_fingerprint)
+                .finish(),
+            NewItem::ImportedRecord {
+                name,
+                folder_id,
+                username,
+                password,
+                totp,
+                uri,
+                notes,
+            } => f
+                .debug_struct("NewItem::ImportedRecord")
+                .field("name", name)
+                .field("folder_id", folder_id)
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| Elided))
+                .field("totp", &totp.as_ref().map(|_| Elided))
+                .field("uri", uri)
+                .field("notes", &notes.as_ref().map(|_| Elided))
+                .finish(),
+        }
+    }
 }
 
 impl NewItem {
@@ -3215,6 +3429,139 @@ mod tests {
             email: Some("ada@example.com".into()),
             ..IdentityData::default()
         }
+    }
+
+    /// Every secret a [`NewItem`] can carry, one distinguishable needle each,
+    /// paired with the variant that carries it.
+    ///
+    /// Needles rather than realistic values so a hit is unambiguous: a
+    /// `Debug` that printed `"p"` might have printed a field name, but
+    /// nothing prints `NEEDLE_LOGIN_PASSWORD` by accident.
+    fn every_new_item_secret() -> Vec<(&'static str, NewItem)> {
+        vec![
+            (
+                "NEEDLE_LOGIN_PASSWORD",
+                NewItem::login("Acme", "ada", "NEEDLE_LOGIN_PASSWORD", None),
+            ),
+            (
+                "NEEDLE_NOTE_BODY",
+                NewItem::secure_note("Wifi", "NEEDLE_NOTE_BODY", None),
+            ),
+            (
+                "NEEDLE_CARD_NUMBER",
+                NewItem::card(
+                    "Card",
+                    CardData {
+                        number: Some(Zeroizing::new("NEEDLE_CARD_NUMBER".into())),
+                        code: Some(Zeroizing::new("NEEDLE_CARD_CODE".into())),
+                        ..CardData::default()
+                    },
+                    None,
+                ),
+            ),
+            (
+                "NEEDLE_SSH_PRIVATE_KEY",
+                NewItem::ssh_key("Key", "NEEDLE_SSH_PRIVATE_KEY", "pub", "fp", None),
+            ),
+            (
+                "NEEDLE_IMPORTED_PASSWORD",
+                NewItem::ImportedRecord {
+                    name: "Imported".into(),
+                    folder_id: None,
+                    username: Some("ada".into()),
+                    password: Some(Zeroizing::new("NEEDLE_IMPORTED_PASSWORD".into())),
+                    totp: Some(Zeroizing::new("NEEDLE_IMPORTED_TOTP".into())),
+                    uri: Some("https://example.com".into()),
+                    notes: Some(Zeroizing::new("NEEDLE_IMPORTED_NOTES".into())),
+                },
+            ),
+        ]
+    }
+
+    /// `{:?}` on a [`NewItem`] prints none of the secrets it carries.
+    ///
+    /// This is the assertion that reds if the hand-written `Debug` is deleted
+    /// and the `#[derive(Debug)]` comes back. It is paired with
+    /// `a_new_items_debug_still_says_which_variant_it_is` below, which is its
+    /// live control: an impl that printed the empty string would satisfy this
+    /// test and be useless, and this crate has shipped exactly that vacuous
+    /// pairing at least twice.
+    #[test]
+    fn a_new_items_debug_prints_none_of_its_secrets() {
+        for (needle, item) in every_new_item_secret() {
+            let printed = format!("{item:?}");
+            assert!(
+                !printed.contains(needle),
+                "`{needle}` reached a formatter through `NewItem`'s `Debug`: {printed}"
+            );
+        }
+        // The secondary secrets on the two variants that carry more than one,
+        // so a `Debug` that elided only the first field of each still fails.
+        let all: String = every_new_item_secret()
+            .iter()
+            .map(|(_, item)| format!("{item:?}"))
+            .collect();
+        for needle in [
+            "NEEDLE_CARD_CODE",
+            "NEEDLE_IMPORTED_TOTP",
+            "NEEDLE_IMPORTED_NOTES",
+        ] {
+            assert!(
+                !all.contains(needle),
+                "`{needle}` reached a formatter through `NewItem`'s `Debug`: {all}"
+            );
+        }
+    }
+
+    /// **The live control for the redaction test above.**
+    ///
+    /// A `Debug` that wrote nothing at all would pass
+    /// `a_new_items_debug_prints_none_of_its_secrets` and would be worthless
+    /// to the reader it exists for. So: every variant must still be
+    /// identifiable by name, and must still print the item's `name`, which is
+    /// the non-secret identifier the user typed.
+    #[test]
+    fn a_new_items_debug_still_says_which_variant_it_is() {
+        let cases = [
+            ("Login", NewItem::login("Acme", "ada", "p", None)),
+            ("SecureNote", NewItem::secure_note("Wifi", "b", None)),
+            ("Card", NewItem::card("Card", a_filled_card(), None)),
+            ("Identity", NewItem::identity("Me", a_filled_identity(), None)),
+            ("SshKey", NewItem::ssh_key("Key", "priv", "pub", "fp", None)),
+            (
+                "ImportedRecord",
+                NewItem::ImportedRecord {
+                    name: "Imported".into(),
+                    folder_id: None,
+                    username: None,
+                    password: None,
+                    totp: None,
+                    uri: None,
+                    notes: None,
+                },
+            ),
+        ];
+        for (variant, item) in &cases {
+            let printed = format!("{item:?}");
+            assert!(
+                printed.contains(variant),
+                "`NewItem`'s `Debug` no longer says it is a `{variant}`: {printed}"
+            );
+            assert!(
+                printed.contains(item.name()),
+                "`NewItem`'s `Debug` no longer prints the item's name, so two items \
+                 cannot be told apart: {printed}"
+            );
+        }
+        // And the six renderings really are distinguishable from one another,
+        // which is the property "identifies the variant" is shorthand for.
+        let rendered: std::collections::BTreeSet<String> =
+            cases.iter().map(|(_, i)| format!("{i:?}")).collect();
+        assert_eq!(
+            rendered.len(),
+            cases.len(),
+            "two variants render identically under `Debug`: {rendered:?}"
+        );
     }
 
     /// Every kind, each built with real values, for the shared structural
