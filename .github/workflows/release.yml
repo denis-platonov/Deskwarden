@@ -84,6 +84,27 @@ jobs:
             exit 1
           }
 
+      # Until 2026-08-13 this workflow built a release without running a single
+      # test. That was not a small gap: `spawn_send_create` -- the seam that
+      # publishes a Send to the internet -- was found able to have its body
+      # emptied with every static guard still green, and it fell only to a
+      # behavioural test. A pipeline that compiles but never runs anything
+      # cannot see that class of defect at all.
+      #
+      # Debug rather than `--release` on purpose. The one argument for testing
+      # the shipping profile was that identical-COMDAT-folding might make a
+      # fake seam compare equal to the real one by address under
+      # `lto = true, codegen-units = 1`; that was measured on this crate and
+      # does NOT happen -- a byte-identical twin is still KILLED in release. So
+      # debug buys the same coverage in ~30s instead of adding another LTO
+      # build to every release.
+      #
+      # This step runs BEFORE the binary is built, so a red test costs a minute
+      # rather than a full package-and-publish cycle.
+      - name: Run the test suite
+        working-directory: deskwarden
+        run: cargo test -j 8
+
       - name: Build release binary
         working-directory: deskwarden
         run: cargo build --release
