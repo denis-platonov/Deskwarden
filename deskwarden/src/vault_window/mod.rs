@@ -1437,7 +1437,22 @@ pub fn build_frame(
                 // declaration for the account-A/account-B scenario that
                 // distinguishes them.
                 load_generation += 1;
-                spawn_vault_load(
+                // **Through the `load` SEAM, exactly like the initial load
+                // above -- not `spawn_vault_load` by name.** This call named
+                // the production function directly, and was the one route out
+                // of this window that no `VaultFrameEnv` pin could see: the
+                // width pin, the derived whole-body pins and the `seam!`
+                // address comparison are all statements about the pointers
+                // that struct CARRIES, and none of them says anything about a
+                // call that never reads the struct. So the single path that
+                // re-reads the whole vault after `bw sync` was neither
+                // substitutable nor observable, and every pin over
+                // `production` stayed green while it was.
+                // `a_successful_syncs_forced_reload_goes_through_the_load_seam`
+                // now runs real frames with a sync that succeeds and reads
+                // what arrives here; it fails if this becomes a direct call
+                // again.
+                (spawn_load)(
                     cache.clone(),
                     vault_tx.clone(),
                     VaultLoadRequest {
@@ -19662,6 +19677,225 @@ mod export_wiring {
         _generation: u64,
         _session: zeroize::Zeroizing<String>,
     ) {
+    }
+
+    // -----------------------------------------------------------------
+    // THE SEAM PRODUCTION USED TO WALK AROUND
+    // -----------------------------------------------------------------
+
+    /// Every vault load the FRAME started, as `(force_refresh, generation)`.
+    ///
+    /// A `static` for [`FRAME_STARTED`]'s reason: the seam is a bare `fn`
+    /// pointer by design, so there is nowhere to capture a recorder.
+    /// Serialised by [`FRAME_LOCK`], which every frame test in this module
+    /// takes.
+    static FRAME_LOADS: std::sync::Mutex<Vec<(bool, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    /// A [`VaultFrameEnv::load`] that RECORDS what it was asked for, and then
+    /// answers at once like [`loads_an_empty_vault`] so the window leaves the
+    /// spinner.
+    fn records_the_load(
+        _cache: Arc<VaultCache>,
+        tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        request: VaultLoadRequest,
+    ) {
+        FRAME_LOADS
+            .lock()
+            .expect("not poisoned")
+            .push((request.force_refresh, request.generation));
+        let _ = tx.send((
+            request.generation,
+            Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+        ));
+    }
+
+    /// A [`VaultFrameEnv::sync`] that reports SUCCESS at once, with no `bw`
+    /// and no network -- the auto-sync on the window's first real frame calls
+    /// this, and the next frame's `sync_rx` drain then takes the success arm.
+    fn sync_succeeds(tx: mpsc::Sender<Result<(), String>>, _session: String) {
+        let _ = tx.send(Ok(()));
+    }
+
+    /// **A successful sync's forced reload goes through the `load` SEAM, not
+    /// around it.**
+    ///
+    /// `VaultFrameEnv` exists so that every route this window takes outside
+    /// the process is substitutable, and the whole-body pins, the width pin
+    /// and the `seam!` address comparison are all statements about the
+    /// pointers that struct carries. None of them says anything at all about
+    /// a call that never reads the struct. The post-sync reload was exactly
+    /// such a call: it named `spawn_vault_load` directly, so the one path in
+    /// this window that re-reads the entire vault after `bw sync` was neither
+    /// substitutable nor observable, and a harness could not reach it without
+    /// dialling the real backend.
+    ///
+    /// **That is not a hypothetical gap.** It is the same defect class the
+    /// seam work was built to answer, and it survived precisely because
+    /// nothing was watching *that* seam -- every pin in this module reads
+    /// `VaultFrameEnv::production`, and production was telling the truth. A
+    /// seam production walks around proves nothing about production.
+    ///
+    /// This test asserts the EFFECT and not the spelling, for
+    /// [`clicking_the_export_row_really_starts_an_export`]'s reason: it runs
+    /// real frames with a sync that succeeds, and asks what arrived at the
+    /// seam. `force_refresh` is the part that matters and is asserted
+    /// separately -- `bw sync` has just changed the vault under a snapshot
+    /// still marked populated, so a reload without it short-circuits on
+    /// `is_populated` and serves pre-sync data, which is Sync appearing to do
+    /// nothing at all.
+    ///
+    /// **No `bw`, no dialog, no network:** both spawners are substituted
+    /// through the env seam, which is the point being made.
+    /// A real window whose sync SUCCEEDS and whose load answers, driven for
+    /// `frames` frames, returning what was painted on the last one.
+    ///
+    /// Shared by the two tests below because the expensive and delicate part
+    /// -- a real `build_frame` with both outward spawns substituted -- is
+    /// identical for both, and the thing that must not drift between them is
+    /// exactly that the sync really succeeded.
+    fn frames_of_a_window_whose_sync_succeeds(
+        dir: &TempDir,
+        frames: usize,
+    ) -> egui::FullOutput {
+        let (_options, mut frame_fn, _handles) = build_frame(
+            // A base URL nothing listens on, and never dialled: the only
+            // things that would dial it are the load and sync spawns, and
+            // both are stubbed.
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                // `None`, so no favicon is fetched for any host.
+                server_url: None,
+            }),
+            HARNESS_SESSION.to_string(),
+            dir.0.join("icons"),
+            // So the auto-lock countdown cannot end the session underneath
+            // the frames below.
+            AutoLock::Never,
+            true,
+            Some(harness_accounts()),
+            true,
+            super::frame_env_seam::stubbed(
+                sync_succeeds,
+                records_the_load,
+                no_send_list,
+                // Under the scratch directory, so no frame reads or writes
+                // the real per-user application data directory.
+                Some(dir.0.join("settings.json")),
+            ),
+        );
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        // Frame 1 fires the auto-sync, which reports success at once. Frame 2
+        // drains that result -- it is where the forced reload is asked for and
+        // where `sync_status` becomes `Some(Ok(()))`. The rest are slack, so
+        // that a failure reads "it never happened" rather than "not yet".
+        let mut output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        for _ in 1..frames {
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        output
+    }
+
+    #[test]
+    fn a_successful_syncs_forced_reload_goes_through_the_load_seam() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("frame-sync-reload");
+        FRAME_LOADS.lock().expect("not poisoned").clear();
+
+        let _output = frames_of_a_window_whose_sync_succeeds(&dir, 4);
+
+        let loads = FRAME_LOADS.lock().expect("not poisoned").clone();
+        assert!(
+            loads.iter().any(|(force_refresh, _)| *force_refresh),
+            "no FORCED reload reached `VaultFrameEnv::load` after a successful sync. What \
+             did reach the seam: {loads:?}. Either the post-sync reload names \
+             `spawn_vault_load` directly again -- walking around the one struct that makes \
+             this window substitutable, so that every address pin over it stays green while \
+             this path is unobservable -- or it no longer forces a refresh, which is a \
+             reload that short-circuits on `is_populated` and re-serves the pre-sync vault"
+        );
+        // Control: the initial load really is a DIFFERENT, unforced one, so
+        // the assertion above is not satisfied by the load every window does
+        // at startup regardless of any sync.
+        assert!(
+            loads.iter().any(|(force_refresh, _)| !*force_refresh),
+            "the window's initial load never reached the seam either, so the assertion \
+             above is not about the sync at all: {loads:?}"
+        );
+    }
+
+    /// **A sync that SUCCEEDS paints the success pill.**
+    ///
+    /// The gap this closes was recorded in the `frame_promptness` fix's own
+    /// commit message: that fix made its scenario exercise the sync FAILURE
+    /// path, which left the success arm of [`sync_pill`] -- the one every
+    /// ordinary run of this app takes -- rendered by no test at all. The
+    /// wording itself has unit coverage; what had none was that a real window
+    /// whose sync succeeded actually puts it on screen.
+    ///
+    /// **It became testable with the seam bypass fixed, and that is not a
+    /// coincidence.** Driving a window to sync success means the post-sync
+    /// forced reload runs. While that reload named `spawn_vault_load`
+    /// directly, reaching this state meant dialling the real vault backend
+    /// from a test, so the success path could not be driven without going
+    /// outside the process. Routed through [`VaultFrameEnv::load`] it is
+    /// answered by [`records_the_load`], and the whole success path is
+    /// reachable with no `bw` and no network.
+    ///
+    /// Asserted as a PREFIX, not an equality: the rest of the label is
+    /// `synced_ago_text`, which is a function of elapsed time and would make
+    /// this a clock race. What is held here is that the success arm was the
+    /// one taken and that it reached the screen.
+    #[test]
+    fn a_successful_sync_paints_the_success_pill() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("frame-sync-pill");
+        FRAME_LOADS.lock().expect("not poisoned").clear();
+
+        let output = frames_of_a_window_whose_sync_succeeds(&dir, 4);
+
+        let mut painted = Vec::new();
+        for clipped in &output.shapes {
+            labelled_rects(&clipped.shape, &mut painted);
+        }
+        let texts: Vec<&String> = painted.iter().map(|(text, _)| text).collect();
+
+        assert!(
+            texts.iter().any(|text| text.starts_with("Synced")),
+            "a window whose sync succeeded painted no \"Synced ...\" pill. That is the arm \
+             of `sync_pill` every ordinary run of this app takes, and the user's only \
+             feedback that the Sync they asked for worked. What was painted: {texts:?}"
+        );
+        // Controls: the two arms that must NOT be on screen. Without these,
+        // the assertion above would be satisfied by a pill that says
+        // "Synced" while the window is in fact reporting a failure, and the
+        // test would be about the word rather than the state.
+        assert!(
+            !texts.iter().any(|text| *text == "Sync failed"),
+            "the window reported a sync FAILURE on a run whose sync returned `Ok(())`: \
+             {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| *text == "Sync"),
+            "the window still shows the never-synced pill after a sync reported success, so \
+             the result was never drained into `sync_status`: {texts:?}"
+        );
     }
 
     /// Every label painted on `output`, with the rectangle it occupies.
