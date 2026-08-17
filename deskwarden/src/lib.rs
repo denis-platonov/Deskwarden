@@ -26,6 +26,7 @@ pub mod breach;
 pub mod debug_leak_guard;
 pub mod bw_path;
 pub mod bw_serve;
+pub mod card_brand;
 pub mod dispatch;
 pub mod favicon;
 pub mod file_picker;
