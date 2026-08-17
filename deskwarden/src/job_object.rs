@@ -2004,7 +2004,12 @@ mod tests {
         let manifest = manifest_raw.replace("\r\n", "\n");
         assert_eq!(
             (manifest.len(), fnv1a64(&manifest)),
-            (4895, 0x4fb2_d692_a07c_167c_u64),
+            // Re-pinned deliberately: `argon2 = "0.5"` was added, from
+            // crates.io, for the passphrase seal over a record's TOTP seed
+            // (`record/seal.rs`). No section was re-pointed and no path or
+            // fork was introduced; `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            (5525, 0xc437_c18a_eda2_ff85_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

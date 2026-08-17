@@ -956,7 +956,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 36] = [
+        const OPENS_NO_WINDOW: [&str; 37] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -996,6 +996,11 @@ mod tests {
             "logging",
             "match_engine",
             "password_strength",
+            // The record payload written into a Send and read back out of
+            // one, plus the passphrase seal over the TOTP seed. Pure data
+            // with no I/O at all; the surfaces that will draw it are a later
+            // step and are not this module.
+            "record",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.

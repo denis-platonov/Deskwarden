@@ -92,6 +92,15 @@ aes-gcm = "0.10"
 # `sha2` is already here, so `digest`/`block-buffer`/`cpufeatures` are
 # already in the tree: this adds one crate and no new transitive surface.
 sha1 = "0.10"
+# Argon2id, for the passphrase that seals a TOTP seed inside a record Send
+# (src/record/seal.rs). NOT interchangeable with the `sha2` already here:
+# `hello.rs` derives its key from a Windows Hello signature, which has full
+# entropy, so one SHA-256 is right there. A record's seal is derived from a
+# passphrase a human chose, over ciphertext that may sit on a Bitwarden server
+# for days -- a single hash is a few hundred million guesses per second on one
+# GPU, and no parameter of SHA-256 can be turned up to change that. RustCrypto,
+# same family as `sha2`/`aes-gcm`; pulls in `base64ct` and `password-hash`.
+argon2 = "0.5"
 sha2 = "0.10"
 getrandom = "0.2"
 # Decodes fetched favicons to RGBA (src/favicon.rs); also used by the
