@@ -10,16 +10,45 @@ the way a physical card is: bank large, network small in the lower right.
 
 ---
 
-## The three pieces
+## The pieces
 
 They are one design because they share the card detail view and the item list
-tile. Split into separate specs, each would touch the same two files.
+tile, and because **four of them are consequences of the same function.**
 
 1. **Network badge** — from `CardData.brand`, which the vault already stores.
 2. **Bank icon** — from a namespaced custom field naming the bank's domain,
    fetched through the existing favicon machinery.
 3. **Brand detection** — suggest the network from the card number while the
    user has not chosen one.
+4. **Masked number** — the right number of dots, grouped the way that brand
+   groups, with the last four shown.
+5. **Masked security code** — three dots or four, depending on the brand.
+6. **Billing ZIP**, and later a link to a full address.
+
+### Why 3, 4 and 5 are one thing
+
+A card's digit count, its grouping, and its security-code length are all
+properties of the network:
+
+| | Visa / Mastercard | American Express | Diners Club |
+|---|---|---|---|
+| Digits | 16 | **15** | 14 |
+| Grouping | 4-4-4-4 | **4-6-5** | 4-6-4 |
+| Security code | 3 | **4** | 3 |
+
+So `•••• •••• •••• 4242` is correct for a Visa and **wrong for an Amex**, which
+must read `•••• •••••• •4321`. A mask that always draws sixteen dots in fours
+is not a cosmetic approximation — it tells the user their card is a different
+card from the one they hold.
+
+This makes `brand_for_number` load-bearing for the badge, the mask, the
+grouping and the code length at once, which is the argument for putting all of
+it in one spec rather than four.
+
+**The mask is derived from the stored number's own length where there is one.**
+The brand table is the authority for *grouping* and for the code length; the
+dot count follows the digits actually stored, so a card the table does not
+recognise still masks to its true length rather than to a guess.
 
 ## What already exists
 
@@ -140,7 +169,58 @@ well-formed — and a card the user is midway through typing is always invalid.
 Refusing to suggest until the number is complete would make the feature appear
 only after it has stopped being useful.
 
-## 4. Layout
+## 4. The masked fields and the expiry label
+
+**The number.** Masked to its true length, grouped by the brand's own
+convention, with the **last four digits shown**: `•••• •••• •••• 4242` for a
+Visa, `•••• •••••• •4321` for an American Express. The last four are the
+digits printed on every receipt and asked for by every support line; they are
+what identifies the card to its owner, and they are not enough to use it.
+
+Fewer than four digits stored → mask everything and reveal nothing. A partial
+number is a data-entry state, not a card, and revealing "the last four" of a
+six-digit fragment discloses a larger fraction of it.
+
+**The security code.** Three dots or four, per the table above. This one is
+never revealed by the mask — unlike the last four, a CVV has no
+identification use to trade against its risk. Revealing it stays an explicit,
+deliberate act behind the existing reveal affordance.
+
+**The expiry label is `MM/YY`.** A card expires in a month and a year; there
+is no day. `CardData` stores `exp_month` and `exp_year`, and
+`detail.rs::card_expiry_text` already composes them — this is a label, not a
+new field.
+
+## 5. Billing ZIP, and the address link
+
+An online card form usually wants three things: the number, the security code,
+and the **billing postcode**. The postcode is the one the vault has nowhere to
+put today.
+
+**Do the ZIP first, on the card itself.** A `deskwarden:billing-zip` custom
+field, in the same namespaced convention as `deskwarden:app-match` and
+`deskwarden:bank-domain`. No lookup, no second item, no linkage — and it
+covers the common case on its own.
+
+**The full address already exists and is not a new record type.**
+`ItemKind::Identity` models `address1`/`address2`/`address3`, `city`, `state`,
+`postal_code`, `country`, plus name, company, email and phone
+(`vault_bridge.rs:182`). Identities are creatable, and editable as of the
+2026-08-17 fix that turned on Card and Identity together. **Do not add an
+Address kind**; Bitwarden has no such type, and inventing one would produce
+items no other client can read.
+
+**What is genuinely missing is a link**, and Bitwarden has no native
+card-to-identity relation. When it is wanted, use the same convention again:
+`deskwarden:billing-identity` holding the identity's item id, resolved at
+render time, degrading to the ZIP and then to nothing.
+
+**Ordering matters here.** The ZIP field is a few lines and covers most real
+forms; the identity link needs a picker, a resolution path, and a decision
+about what to show when the linked item is deleted. Shipping the ZIP first
+means the second half is optional rather than load-bearing.
+
+## 6. Layout
 
 **Detail view:** bank icon large, network badge in the lower-right corner,
 overlapping the icon's edge — the arrangement of a physical card, which is why
@@ -156,7 +236,7 @@ push a control out of the row.
 
 ---
 
-## Testing
+## 7. Testing
 
 The pure parts carry the weight, as usual here:
 
@@ -170,10 +250,15 @@ The pure parts carry the weight, as usual here:
 - **The touched rule** — a test that edits the number after a manual pick and
   asserts the pick survives. This is the test that matters most; write it
   first.
+- `mask_for` — a Visa masks to sixteen dots in fours with the last four
+  shown, an Amex to fifteen in 4-6-5, and a stored number of fewer than four
+  digits reveals **nothing**. Assert the rendered string, not a length.
+- The security-code mask is four dots for Amex and three otherwise, and is
+  never revealed by the mask itself.
 - Badge and tile composition through the existing headless `Context::run_ui`
   harness, measuring painted ink the way the overlay row tests do.
 
-## Deliberately not in scope
+## 8. Deliberately not in scope
 
 - **Reading the bank from the number.** BIN-to-issuer requires a lookup
   service, and sending even a prefix discloses the issuer of a card in the
