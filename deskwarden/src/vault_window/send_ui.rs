@@ -7101,6 +7101,25 @@ mod frame_promptness {
     /// satisfied by some other value that happens to travel the same path.
     const HARNESS_SESSION: &str = "harness-session-token";
 
+    /// The failure [`counted_sync`] answers with, and so the reason the sync pill
+    /// carries when [`SYNC_PILL_LABEL`] is on screen.
+    ///
+    /// A FAILED sync, deliberately, and this is the whole of the flake fix -- see
+    /// [`SYNC_ANSWERS`] for the defect it closes. Nothing this scenario asserts is
+    /// about the sync's OUTCOME: it is about the session token that reached both
+    /// `(spawn_sync)` call sites, which is recorded by the stub before it answers
+    /// anything at all.
+    const HARNESS_SYNC_FAILURE: &str = "the harness failed this sync on purpose";
+
+    /// What the toolbar pill reads once [`counted_sync`]'s answer has been drained:
+    /// `sync_pill`'s `(Some(Err(_)), _)` arm, whose label is a CONSTANT.
+    ///
+    /// Not `sync_pill`'s success arm, whose label is `format!("Synced {}", synced_ago_text(..))`
+    /// -- a string built out of `last_sync_at.elapsed()`. Nothing about this
+    /// harness's `press_sync` scenario has any wall clock in it now, which is the
+    /// point.
+    const SYNC_PILL_LABEL: &str = "Sync failed";
+
     // Counted per THREAD, not per process. Each scenario runs on its own
     // freshly spawned worker and every stub below is called synchronously on
     // that worker (the "spawns" are stubs; they spawn nothing), so a
@@ -7124,11 +7143,43 @@ mod frame_promptness {
         ///
         /// Off for every scenario but the one that presses the Sync pill,
         /// and off by default deliberately: an answered sync clears
-        /// `sync_in_progress`, relabels the pill and starts a forced
-        /// reload, so switching it on for everybody would change what
-        /// every other scenario in this module measures. The pill refuses
-        /// its own click while `sync_in_progress`, so the one scenario
-        /// that presses it cannot reach that call site without this.
+        /// `sync_in_progress` and relabels the pill, so switching it on for
+        /// everybody would change what every other scenario in this module
+        /// measures. The pill refuses its own click while
+        /// `sync_in_progress`, so the one scenario that presses it cannot
+        /// reach that call site without this.
+        ///
+        /// **The answer is a FAILURE, and that is what un-flaked this** (it was
+        /// `Ok(())`, and `the_windows_own_session_is_what_reaches_the_bw_sync_child`
+        /// redded intermittently under a parallel suite for about a day). A
+        /// SUCCESSFUL sync makes `run`'s sync drain start a forced vault reload --
+        /// and it starts it through `spawn_vault_load` DIRECTLY, not through the
+        /// `spawn_load` seam this harness stubs, so that one load is real. It dials
+        /// the deliberately dead `http://127.0.0.1:1` bridge this harness builds the
+        /// cache on, spends `vault_bridge::CONNECT_TIMEOUT` (3s) getting nowhere, and
+        /// reports `VaultLoadFailure::Refresh`; `apply_vault_load_result` then
+        /// OVERRIDES `sync_status` from `Some(Ok(()))` to `Some(Err(..))`, because a
+        /// "Synced just now" pill over a vault that was never refreshed is a lie it
+        /// exists to correct. So the pill turned from "Synced just now" into
+        /// "Sync failed" partway through the scenario, and whether that happened
+        /// before or after the frame the pill is located on was a pure race between
+        /// this module's frame loop and a three-second network timeout on a detached
+        /// thread. Idle, the frames cost ~0.8s and won; under `cargo test -j 8` they
+        /// cost seconds and lost. Measured on `0fec1e9`: 11 reds in 40 runs of this
+        /// module under CPU contention, every one of them
+        /// `the toolbar's sync pill painted no "Synced just now" to press ... ["Sync
+        /// failed", ..]`; and with a 5s settle forced in before the locate, 5 reds
+        /// in 5, which is the same race decided the other way.
+        ///
+        /// A failed sync takes the `else` of that `if result.is_ok()`, so **no load
+        /// is spawned at all** and no thread outlives the frame that made it. The
+        /// pill's label is then a constant ([`SYNC_PILL_LABEL`]) rather than one
+        /// built out of `last_sync_at.elapsed()`. Neither the count nor the sessions
+        /// this scenario asserts is about the sync's outcome -- `counted_sync`
+        /// records the token it was handed BEFORE it answers anything -- and the
+        /// pill's click gate is `!sync_in_progress`, which a failure clears exactly
+        /// as a success does. So the second `(spawn_sync)` call site is still
+        /// reached, by the one control that reaches it, and is still asserted on.
         static SYNC_ANSWERS: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -7156,10 +7207,11 @@ mod frame_promptness {
         // Synchronous, not spawned, so the answer is on the channel before
         // the drain three hundred lines further down the same frame reads
         // it -- which is what makes the pill clickable on a fixed frame
-        // rather than on a race. Off unless the scenario asks; see
-        // [`SYNC_ANSWERS`].
+        // rather than on a race. Off unless the scenario asks, and a
+        // FAILURE when it is asked -- see [`SYNC_ANSWERS`] for the race a
+        // successful answer started, on a thread that outlived the frame.
         if SYNC_ANSWERS.with(Cell::get) {
-            let _ = tx.send(Ok(()));
+            let _ = tx.send(Err(HARNESS_SYNC_FAILURE.to_string()));
         }
     }
 
@@ -7342,7 +7394,8 @@ mod frame_promptness {
         /// frame. Turning this on also turns [`SYNC_ANSWERS`] on, because
         /// `theme::status_pill_button(..).clicked() && !sync_in_progress`
         /// is the production gate and an unanswered auto-sync never lets
-        /// go of `sync_in_progress`.
+        /// go of `sync_in_progress`. What that answer SAYS, and why it is a
+        /// failure rather than a success, is [`SYNC_ANSWERS`]'s own doc.
         press_sync: bool,
         /// Whether to RIGHT-click the fixture login's row, which is the only
         /// way into `item_list.rs`'s `response.context_menu` closure --
@@ -7622,11 +7675,12 @@ mod frame_promptness {
             // The pill is the only control that reaches the SECOND
             // `(spawn_sync)` call site. It is found by the words it paints
             // once the auto-sync has been answered and drained --
-            // `sync_pill`'s `(Some(Ok(())), None)` arm, whose
-            // `synced_ago_text` is "just now" for any elapsed under a
-            // minute, which no clock this test runs under can exceed
-            // between the drain and this line.
-            let pos = locate_label(&output, "Synced just now", "the toolbar's sync pill");
+            // `sync_pill`'s `(Some(Err(_)), _)` arm, which is the arm
+            // [`SYNC_ANSWERS`] puts the window in and whose label is a
+            // constant. This line USED to look for the success arm's
+            // "Synced just now", and that arm's label is not stable for the
+            // life of the scenario: see [`SYNC_ANSWERS`].
+            let pos = locate_label(&output, SYNC_PILL_LABEL, "the toolbar's sync pill");
             click(&ctx, &mut *frame_fn, pos);
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
@@ -8238,6 +8292,13 @@ mod frame_promptness {
     /// happens to the token BELOW the pointer -- that `bw_serve::run_bw_sync`
     /// puts it in the child's environment rather than argv -- is not
     /// asserted here, and is recorded as open in this round's notes.
+    ///
+    /// **The stub answers a FAILED sync**, and that is not incidental: a
+    /// successful one made this test a known flake for about a day. The
+    /// mechanism, the measurements and why answering a failure takes nothing
+    /// away from what is asserted below are all on [`SYNC_ANSWERS`]. Nothing
+    /// in this scenario reads a clock now; the two assertions below are a
+    /// count and an equality on recorded tokens.
     #[test]
     fn the_windows_own_session_is_what_reaches_the_bw_sync_child() {
         let outcome = measured("sync-session", Scenario { press_sync: true, ..Scenario::new() });
