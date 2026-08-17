@@ -1,10 +1,9 @@
 # Sending a Record for Local Import — Design Note and Open Decision
 
-**Status: NOT A PLAN.** One decision is unresolved, and a plan with an open
-decision in it is a plan that cannot be executed. This records the analysis so
-the decision can be made once and cheaply, after which this becomes a plan.
+**Status: DECIDED 2026-08-17.** Both open decisions are resolved (see "The
+decisions", below). This is now ready to become a plan.
 
-**Date:** 2026-08-13
+**Date:** 2026-08-13, decided 2026-08-17
 **Related:** `docs/superpowers/plans/2026-08-13-send-a-record.md` (the native
 Send work, which does not depend on this)
 
@@ -29,8 +28,10 @@ structured data and importing it into something that can run the TOTP clock.
   crypto of our own for the envelope. `bw` already encrypts client-side, the key
   travels in the URL fragment, and the server enforces expiry, view count and
   password.
-- Revoke: **natively**, and see the hardening plan's Task 1 — revoke should set
-  `disabled` rather than delete, so the Revoked state is renderable.
+- Revoke: **natively, by deleting** (decided 2026-08-17). A revoked Send is gone
+  from `bw send list`, so there is no Revoked row and none is drawn — the row
+  simply leaves the list. See "The decisions" below for why that is the safer
+  reading here rather than merely the simpler one.
 - Carrier: **a file Send, not a text Send.** We do not create file Sends today,
   but this is the case that wants one: a `.json` attachment makes the browser
   offer a download instead of rendering a seed on screen in a page that can be
@@ -50,8 +51,11 @@ password that is survivable, because you rotate it. For a seed it is not:
 "rotating" means re-enrolling the second factor with the service, which
 Deskwarden cannot do or offer.
 
-So for any Send carrying a seed, the state word **"Revoked" must not read as
-"pulled back"**. It means "no new recipients".
+So for any Send carrying a seed, revoking **must not read as "pulled back"**. It
+means "no new recipients". Since revoke deletes (decided 2026-08-17) there is no
+Revoked row to mislabel — but the confirmation shown *before* revoking must
+still say plainly that a seed already fetched stays valid forever, because that
+is the moment the user believes they are undoing something.
 
 ## Two layers of encryption — when it is real, when it is theatre
 
@@ -91,9 +95,49 @@ path's password step already refuses to touch.
 
 ---
 
-## THE OPEN DECISION
+## The decisions
 
-**Where does the imported record live?**
+### Decided 2026-08-17: revoke deletes
+
+Revoke runs `bw send delete`, which is what it does today. The consequence,
+accepted knowingly: a revoked Send does not come back from `bw send list`, so
+the Shared screen cannot show a **Revoked** state — the row leaves the list
+instead of changing colour.
+
+The argument for `disabled` was renderability, and that argument is real but
+narrow. Against it: a disabled Send is still ciphertext sitting on a server,
+and for the payload this spec is about — a TOTP seed — "still there but
+switched off" is a worse resting state than "gone". Deleting also cannot be
+un-done by a mis-click at the Bitwarden end, which is the failure that would
+actually matter.
+
+**What this obliges:** the confirmation before revoking must say the record is
+being removed permanently, not paused, and must not offer "Send again" from a
+row that no longer exists. Any design element depending on a Revoked row — see
+`2026-08-13-send-a-record.md` Task 4 — is cut rather than reinterpreted.
+
+### Decided 2026-08-17: the imported record goes into the vault
+
+**Option A below.** Deskwarden continues to store no vault of its own.
+
+The cost, accepted knowingly: the embedded `not_after` becomes advisory only.
+A vault item does not expire, so honouring it would mean Deskwarden remembering
+the item and deleting it later — best-effort, and only while Deskwarden is
+installed and running. The UI must therefore present `not_after` as *staleness
+information about the record*, never as an expiry that will be enforced. Copy
+that implies the record will disappear on its own is wrong and must not ship.
+
+**What this obliges:**
+- Import writes through `bw` and so requires an unlocked vault; the import
+  entry point needs the same locked-state handling every other vault write has.
+- A collision policy is now mandatory, because a real item is being created:
+  importing the same record twice must not silently produce two items.
+- The TOTP seed lands in the item's own `totp` field, so the vault computes the
+  code and Deskwarden does not become a TOTP implementation.
+
+---
+
+### The original analysis: where does the imported record live?
 
 ### Option A — the recipient's Bitwarden vault, via `bw create item`
 
@@ -113,12 +157,12 @@ path's password step already refuses to touch.
   stores no vault at all — `bw serve` does. This is a substantial new
   responsibility for a companion app.
 
-### Recommendation
+### Outcome
 
-**Option A**, with the UI telling the truth about permanence, rather than
-building a second vault to support a promise the mechanism cannot keep. But the
-argument for B gets stronger the more weight the embedded expiry is meant to
-carry, so this is genuinely the user's call and not a detail.
+**Option A was chosen** (2026-08-17), matching the recommendation: tell the
+truth about permanence rather than build a second vault to support a promise
+the mechanism cannot keep.
 
-**Until it is decided, do not start this work.** The native Send plan
-(`2026-08-13-send-a-record.md`) is independent and can proceed.
+This work is now unblocked and needs a plan written from this spec. The native
+Send plan (`2026-08-13-send-a-record.md`) remains independent, and its Task 4
+must be revised for the revoke decision above before it is executed.

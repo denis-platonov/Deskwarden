@@ -89,8 +89,16 @@ mod tests {
 
     #[test]
     fn revoked_wins_over_every_other_reason() {
-        // The user's own act is the most informative answer, so it is reported
+        // A deliberate act is the most informative answer, so it is reported
         // even when the Send would also have expired or been used up.
+        //
+        // Reachability note (2026-08-17): Deskwarden's own revoke DELETES, so
+        // it never produces this state -- a Send we revoked leaves the list
+        // entirely. `disabled` arrives set only when the user disabled the
+        // Send somewhere else, e.g. the Bitwarden web vault or another client.
+        // That is exactly why this arm must exist: those Sends DO come back
+        // from `bw send list`, and rendering one as "Waiting" would tell the
+        // user a dead link is live.
         assert_eq!(state_of(1, Some(1), Some(at(1)), true, at(9)), SendState::Revoked);
     }
 
@@ -117,7 +125,9 @@ pub enum SendState {
     Used,
     /// Ran out of time, never opened.
     Expired,
-    /// The user pulled it back.
+    /// Disabled server-side. Not reachable from our own revoke, which
+    /// deletes; this is a Send switched off from the web vault or another
+    /// client, which still appears in `bw send list`.
     Revoked,
 }
 
@@ -236,6 +246,9 @@ fn a_body_with_no_fields_chosen_cannot_be_built() {
 
 ## Notes for the implementer
 
-- **Revoke currently deletes.** `send.rs:542` runs `["send", "delete", id]`. A deleted Send does not come back from `bw send list`, so **the Revoked state cannot render at all** while revoke means delete. See the companion plan `2026-08-13-send-hardening-followups.md`, Task 1 — do that first or this task's Revoked row will be dead code.
+- **Revoke deletes, and that was decided deliberately** (2026-08-17 — see `docs/superpowers/specs/2026-08-13-send-record-import-decision.md`). `send.rs:542` runs `["send", "delete", id]` and stays that way; the companion plan's Task 1, which proposed switching to `disabled`, is **CANCELLED — do not do it.**
+  - Consequence: **our own revoke never produces the Revoked state.** The row leaves the list instead of changing colour. Do not build a Revoked row as the destination of the revoke button, and do not offer "Send again" from a row that no longer exists.
+  - **The Revoked arm is still live and still required**, for a different reason: a Send disabled from the Bitwarden web vault or another client comes back from `bw send list` with `disabled: true`. Rendering one of those as Waiting would show a dead link as live. Test it as an externally-disabled Send, not as the result of pressing our button.
+  - The pre-revoke confirmation must say **permanently removed**, not paused. For any Send carrying a TOTP seed it must also say that whoever already fetched it keeps working codes forever — revoking controls future retrievals only.
 - The `emails` field in the create JSON is Bitwarden's recipient restriction. It is already in the JSON we build, hardcoded to `null`.
 - `expirationDate` and `deletionDate` are different: expiry stops access, deletion removes the record. The design's "Expires 1h/24h/7d/30d" is `expirationDate`.

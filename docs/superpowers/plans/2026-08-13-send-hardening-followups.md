@@ -20,7 +20,22 @@
 
 ---
 
-## Task 1: Revoke should disable, not delete
+## Task 1: Revoke should disable, not delete — **CANCELLED 2026-08-17. DO NOT DO THIS.**
+
+**Decision: revoke keeps deleting.** The reasoning is recorded in
+`docs/superpowers/specs/2026-08-13-send-record-import-decision.md` under "The
+decisions": a disabled Send is still ciphertext on a server, and for a payload
+carrying a TOTP seed "switched off but still there" is a worse resting state
+than "gone". The renderability argument below is correct and was outweighed.
+
+**What follows from that, and is still to be done elsewhere:** the Revoked row
+is cut from `2026-08-13-send-a-record.md` Task 4 rather than reinterpreted, and
+the pre-revoke confirmation must say *permanently removed*, not *paused*.
+
+The original analysis is kept below because it is the record of why the
+alternative was considered — **it is not an instruction.**
+
+---
 
 **Why:** `send.rs:542` runs `["send", "delete", id]`. A deleted Send is gone from `bw send list`, so a **Revoked** row can never be displayed — the state exists in the design and is unrenderable in the product. Bitwarden supports `disabled`, and we already write `"disabled":false` in the create JSON at `send.rs:492` without ever using it. Disabling kills the link just as hard, keeps the record so its dates and "Send again" remain visible, and is reversible after a mis-click.
 
@@ -182,5 +197,6 @@ its first task rather than an afterthought.
 ## Notes for the implementer
 
 - Tasks 1 and 2 are both small `send.rs` edits in the same area and can share a commit if you prefer, though separate is cleaner for review.
-- Task 1 is a **prerequisite** for the Revoked row in `2026-08-13-send-a-record.md` Task 4.
+- Task 1 is **CANCELLED** (2026-08-17) and is no longer a prerequisite for anything. `2026-08-13-send-a-record.md` Task 4 keeps its Revoked arm, but reaches it only via a Send disabled elsewhere — see that plan's implementer notes.
+- **Tasks 2, 3 and 4 are unaffected and remain the ready work here.** Task 2 (the redacting `Debug`) is the most valuable: `access_url` carries the decryption key after `#`, and nothing today stops a stray log line from writing a working key to a plaintext file.
 - Task 3 touches `vault_window/mod.rs`, which is frequently held by other work. Coordinate before starting.
