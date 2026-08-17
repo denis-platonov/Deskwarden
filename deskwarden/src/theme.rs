@@ -885,7 +885,32 @@ pub const BUTTON_HEIGHT: f32 = 32.0;
 /// neither Archivo nor egui's fallback fonts carry U+21B5, so as text it
 /// renders as a tofu box.
 pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
-    primary_button_with_metrics(ui, label, kbd, BUTTON_HEIGHT, 7)
+    primary_button_with_metrics(ui, label, kbd, BUTTON_HEIGHT, 7, true)
+}
+
+/// [`primary_button`], but able to say "not yet".
+///
+/// [`primary_button`] is `ui.add`, which has no way to express an unavailable
+/// action, and that gap is why the item form's Save was a bare
+/// `egui::Button` for so long: it needed `add_enabled`, so it skipped the
+/// design system entirely and picked up egui's default fill and egui's
+/// default font instead. The user's report was that the two footer buttons
+/// looked like they came from different families -- they did, and this is the
+/// missing half that lets Save come from this one.
+///
+/// `enabled == false` runs the button inside a disabled `Ui`, so egui fades
+/// the whole control -- the explicit [`BLUE`] fill included -- toward the
+/// window colour. That fade is the only signal that the action is off, which
+/// is why `detail_edit`'s
+/// `the_disabled_save_button_does_not_look_enabled` asserts on the painted
+/// fill and not on anything structural.
+pub fn primary_button_enabled(
+    ui: &mut Ui,
+    label: &str,
+    kbd: Option<&str>,
+    enabled: bool,
+) -> Response {
+    primary_button_with_metrics(ui, label, kbd, BUTTON_HEIGHT, 7, enabled)
 }
 
 /// Design 2b's item-pane `+ New`, which is the only primary button in the app
@@ -898,7 +923,7 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
 /// pane's Save and "Fill in app"), and moving them all to match one button in
 /// one pane would be a redesign of five screens to fix one.
 pub fn primary_button_matching_field(ui: &mut Ui, label: &str) -> Response {
-    primary_button_with_metrics(ui, label, None, SEARCH_FIELD_HEIGHT, 8)
+    primary_button_with_metrics(ui, label, None, SEARCH_FIELD_HEIGHT, 8, true)
 }
 
 fn primary_button_with_metrics(
@@ -907,6 +932,7 @@ fn primary_button_with_metrics(
     kbd: Option<&str>,
     height: f32,
     radius: u8,
+    enabled: bool,
 ) -> Response {
     let paint_return = kbd == Some("↵");
     let text = match kbd {
@@ -916,24 +942,31 @@ fn primary_button_with_metrics(
         Some(k) => format!("{label}  {k}"),
         None => label.to_string(),
     };
-    let response = ui.add(
-        egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
-            .fill(BLUE)
-            .stroke(Stroke::NONE)
-            .corner_radius(CornerRadius::same(radius))
-            // The design's action buttons are 32px tall (3h Continue, 2b/3f
-            // toolbar); text + padding alone comes up short.
-            .min_size(Vec2::new(0.0, height)),
-    );
-    if paint_return {
-        paint_return_arrow(
-            ui.painter(),
-            Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
-            RETURN_GLYPH_SIZE,
-            Color32::from_white_alpha(204),
+    // `add_enabled_ui` and not `add_enabled`, so the arrow below is drawn by
+    // the SAME faded painter as the button it sits inside. `add_enabled`
+    // returns to the parent `Ui` before this function paints the glyph, which
+    // would leave a full-opacity ↵ on a greyed-out button.
+    ui.add_enabled_ui(enabled, |ui| {
+        let response = ui.add(
+            egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
+                .fill(BLUE)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(radius))
+                // The design's action buttons are 32px tall (3h Continue, 2b/3f
+                // toolbar); text + padding alone comes up short.
+                .min_size(Vec2::new(0.0, height)),
         );
-    }
-    response
+        if paint_return {
+            paint_return_arrow(
+                ui.painter(),
+                Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
+                RETURN_GLYPH_SIZE,
+                Color32::from_white_alpha(204),
+            );
+        }
+        response
+    })
+    .inner
 }
 
 /// Extent of the drawn ↵ glyph. The design sets it in 10px monospace beside

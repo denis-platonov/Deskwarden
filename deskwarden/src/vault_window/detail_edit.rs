@@ -3621,24 +3621,48 @@ pub fn draw_detail_edit(
                 // height for the same reason as Cancel's; a literal here is
                 // one the next design change moves only half of.
                 //
-                // Only the height. Save is NOT run through
-                // `theme::secondary_button`: that helper is `ui.add`, and
-                // this button is `add_enabled` (it is disabled while the name
-                // is empty, or the kind is not creatable). Its filled default
-                // look is also what distinguishes the primary action from the
-                // outlined Cancel, and egui's `add_enabled` is what greys it
-                // -- see `the_disabled_save_button_does_not_look_enabled`.
-                // The zero x floor leaves the width to the label, which
-                // changes with the validity ("Save" / "Save (needs a name)").
-                let save = egui::Button::new(if !draft.is_valid() {
+                // **Both buttons come from the theme, and that is the point.**
+                //
+                // Save used to be a bare `egui::Button` here, with only its
+                // height copied from `theme::BUTTON_HEIGHT`, because it needs
+                // a disabled state (the name is empty, or the kind is not
+                // creatable) and `theme::primary_button` was `ui.add` with no
+                // way to say so. The cost of that shortcut was the user's
+                // report: a bare `Button` takes egui's default fill AND
+                // egui's default font, so the footer showed one blue-ish
+                // themed control beside one that was neither the design's
+                // blue nor the design's semibold face -- "one bold and not
+                // bold now for some reason". It was two font stacks, not
+                // emphasis.
+                //
+                // `theme::primary_button_enabled` is the missing half, added
+                // rather than worked around: it runs the same body as every
+                // other primary button in the app inside an `add_enabled_ui`,
+                // so the disabled fade `the_disabled_save_button_does_not_
+                // look_enabled` measures is still there and the weight now
+                // matches Cancel's BY CONSTRUCTION -- both are
+                // `theme::semibold(_, 13.0)`. See
+                // `the_two_footer_buttons_are_set_in_one_face`.
+                //
+                // The label still changes with the validity ("Save" / "Save
+                // (needs a name)" / `SAVE_TEMPLATE_BLOCKED`), which is how
+                // the strip says what is wrong beside the control it is wrong
+                // about; the width follows the label as it always did.
+                let save_label = if !draft.is_valid() {
                     "Save (needs a name)"
                 } else if draft.sequence_fault().is_some() {
                     SAVE_TEMPLATE_BLOCKED
                 } else {
                     "Save"
-                })
-                .min_size(egui::Vec2::new(0.0, theme::BUTTON_HEIGHT));
-                if ui.add_enabled(draft.is_saveable() && creatable, save).clicked() {
+                };
+                if theme::primary_button_enabled(
+                    ui,
+                    save_label,
+                    None,
+                    draft.is_saveable() && creatable,
+                )
+                .clicked()
+                {
                     action = EditAction::Save;
                 }
                 if theme::secondary_button(ui, "Cancel").clicked() {
@@ -9218,6 +9242,17 @@ mod edit_pane_layout_tests {
         /// overlap assertion is asked of the glyph positions egui really
         /// placed -- the same source `Painted::rendered` reads.
         glyphs: Vec<(String, Rect)>,
+        /// The FACE each run was laid out in, by run text.
+        ///
+        /// Neither `texts` nor `glyphs` can see a font: both answer in
+        /// pixels, and two labels in two different families at the same size
+        /// occupy boxes that look perfectly reasonable side by side. That
+        /// blindness is exactly what shipped the footer the user reported --
+        /// a bare `egui::Button` Save in egui's default proportional face
+        /// beside a `theme::secondary_button` Cancel in Archivo SemiBold,
+        /// with every geometry assertion in this module green. See
+        /// [`the_two_footer_buttons_are_set_in_one_face`].
+        fonts: Vec<(String, egui::FontId)>,
         /// Every OTHER shape the frame drew ink with, named and boxed:
         /// carets, icons, circles, lines, curves, meshes.
         ///
@@ -9274,6 +9309,24 @@ mod edit_pane_layout_tests {
                 self.strings()
             );
             found[0]
+        }
+
+        /// The face `label` was laid out in. See [`Painted::fonts`].
+        ///
+        /// Asserts uniqueness for the same reason [`Painted::rect_of`] does:
+        /// a label drawn twice would let a caller read whichever copy
+        /// happened to be first and call it the answer.
+        fn font_of(&self, label: &str) -> egui::FontId {
+            let found: Vec<&egui::FontId> =
+                self.fonts.iter().filter(|(t, _)| t == label).map(|(_, f)| f).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} run in the edit form, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0].clone()
         }
 
         /// The smallest painted rectangle enclosing `inner`: the FRAME a
@@ -9342,6 +9395,13 @@ mod edit_pane_layout_tests {
                     .collect();
                 painted.texts.push((text.galley.text().to_string(), rect));
                 painted.rendered.push((text.galley.text().to_string(), rendered, rect));
+                // The face the layout job asked for. First section: every run
+                // this form paints is single-format. See `Painted::fonts`.
+                if let Some(section) = text.galley.job.sections.first() {
+                    painted
+                        .fonts
+                        .push((text.galley.text().to_string(), section.format.font_id.clone()));
+                }
                 // ... and the box the ink really covers. See `Painted::glyphs`.
                 if let Some(ink) = glyph_ink(text) {
                     painted.glyphs.push((text.galley.text().to_string(), ink));
@@ -9732,11 +9792,23 @@ mod edit_pane_layout_tests {
     /// **Save and Cancel are one strip of one height.**
     ///
     /// The second report on this screen: "Also save button is off". Measured
-    /// on the pre-fix layout -- Save `top=1368 h=26 bot=1394`, Cancel
-    /// `top=1368 h=32 bot=1400`. Save was a bare `egui::Button` and Cancel
-    /// goes through `theme::secondary_button`, so Save's bottom edge stopped
-    /// 6pt above its neighbour's. Both label widths are checked, because the
-    /// caption changes with the draft's validity.
+    /// on the layout that provoked it -- Save `top=1368 h=26 bot=1394`,
+    /// Cancel `top=1368 h=32 bot=1400`. Save was then a bare `egui::Button`
+    /// carrying only a copied `min_size`, while Cancel went through
+    /// `theme::secondary_button`, so Save's bottom edge stopped 6pt above its
+    /// neighbour's.
+    ///
+    /// **Save is no longer a bare button.** It is
+    /// `theme::primary_button_enabled`, so the shared height is now a
+    /// property of both buttons coming from the same theme rather than of one
+    /// literal being kept in sync with another -- and this test is what says
+    /// the new helper really lands on `theme::BUTTON_HEIGHT` too. The
+    /// mismatch it was written for cannot come back the way it came, but it
+    /// can come back through a redesign that moves one helper and not the
+    /// other, which is the case this still covers.
+    ///
+    /// Both label widths are checked, because the caption changes with the
+    /// draft's validity.
     #[test]
     fn the_button_strips_controls_share_one_baseline() {
         for (what, name) in [(true, "Save"), (false, SAVE)] {
@@ -9762,6 +9834,76 @@ mod edit_pane_layout_tests {
                 "the strip is {}pt tall, not theme::BUTTON_HEIGHT ({})",
                 save.height(),
                 theme::BUTTON_HEIGHT
+            );
+        }
+    }
+
+    /// **Save and Cancel are set in ONE face, at one size.**
+    ///
+    /// The other half of the same report: "even one bold and not bold now for
+    /// some reason". There was no reason -- nothing on this screen means to
+    /// emphasise one footer button over the other typographically. Save was a
+    /// bare `egui::Button`, which takes egui's default `FontId` (the
+    /// `Proportional` family at the style's body size); Cancel goes through
+    /// `theme::secondary_button`, which is `theme::semibold(_, 13.0)` and so
+    /// asks for the `FontFamily::Name("Archivo-SemiBold")` face. Two
+    /// families, read as two weights.
+    ///
+    /// Asserted on the `FontId` the layout job carried and not on ink width,
+    /// because ink width is what was already green while this was wrong.
+    /// Both halves: they must MATCH each other, and -- so this cannot be
+    /// satisfied by regressing Cancel to a bare button too -- the face they
+    /// share must be the theme's semibold, positively named.
+    ///
+    /// Run over all three Save captions, since each is a different layout job
+    /// and only one of them is exercised by any given draft.
+    #[test]
+    fn the_two_footer_buttons_are_set_in_one_face() {
+        // What `theme::semibold(_, 13.0)` -- the face both button helpers ask
+        // for -- resolves to. Spelled out rather than read back off a
+        // `RichText`, whose font id is private.
+        let expected =
+            egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        for name in [SAVE, SAVE_TEMPLATE_BLOCKED, "Save"] {
+            let ctx = styled_context(ROOMY_PANE);
+            let mut draft = tallest_draft();
+            if name != SAVE {
+                draft.name = "Ledgerline".to_string();
+            }
+            if name == SAVE_TEMPLATE_BLOCKED {
+                let app = draft.app.as_mut().expect("the tallest draft carries an app block");
+                // `template_touched`, because `AppMatchDraft::template_fault`
+                // withholds the verdict on a template the user has not
+                // edited -- an untouched one is the item's own and is not
+                // this form's to refuse.
+                app.template_touched = true;
+                // An unclosed brace, which is what the parser cannot render
+                // back -- an unknown-but-closed `{NOPE}` round-trips as a
+                // literal and is saveable.
+                app.sequence = "{USERNAME}{TAB".to_string();
+                assert!(
+                    draft.sequence_fault().is_some(),
+                    "the blocked case wants a template this build cannot read back"
+                );
+            } else if name == "Save" {
+                assert!(draft.is_saveable(), "the plain case wants a saveable draft");
+            }
+            let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+            let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+            let save = painted.font_of(name);
+            let cancel = painted.font_of("Cancel");
+            assert_eq!(
+                save, cancel,
+                "{name} is laid out in {save:?} beside Cancel's {cancel:?} -- the footer's two \
+                 buttons come from different font stacks, which is what the user saw as one \
+                 bold and one not"
+            );
+            assert_eq!(
+                save, expected,
+                "{name} is laid out in {save:?}, which is not the theme's semibold ({expected:?}) \
+                 -- the two buttons agreeing on egui's default face would satisfy the check \
+                 above while taking BOTH of them out of the design system"
             );
         }
     }
