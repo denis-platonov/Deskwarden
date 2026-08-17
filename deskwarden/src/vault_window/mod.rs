@@ -3307,6 +3307,25 @@ pub fn build_frame(
                                     draft.set_app_path(&path);
                                 }
                             }
+                            // **4d.** Opened HERE, exactly as the file dialog
+                            // above is, and for a stronger version of the same
+                            // reason: the scratch window pumps its OWN message
+                            // loop for as long as the sequence is typing, so it
+                            // cannot be opened from inside the form's closure.
+                            // It is a plain Win32 window rather than an
+                            // `eframe` one precisely because this line is
+                            // inside a running event loop -- see
+                            // `scratch_window`'s header.
+                            //
+                            // Nothing from the item is passed: `sample_plan`
+                            // builds the whole plan from the SEQUENCE, with
+                            // every field resolved to a fixed sample, so there
+                            // is no argument here that could carry a secret.
+                            EditAction::Rehearse => {
+                                let sequence =
+                                    draft.app.as_ref().map(|a| a.sequence.clone()).unwrap_or_default();
+                                generate_error = crate::scratch_window::rehearsal_notice(&sequence);
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -3397,6 +3416,16 @@ pub fn build_frame(
                             // by the other.
                             EditAction::PickAppFile => log::warn!(
                                 "the create form asked for a file picker it does not draw"
+                            ),
+                            // Unreachable for the same reason the arm above is
+                            // -- the create form draws no app block, so there
+                            // is no sequence and no Rehearse button -- and
+                            // spelled out rather than caught by a `_ =>` for
+                            // the same reason: `EditAction` is matched
+                            // exhaustively so that a control added to one form
+                            // cannot be silently ignored by the other.
+                            EditAction::Rehearse => log::warn!(
+                                "the create form asked to rehearse a sequence it does not draw"
                             ),
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
@@ -10387,6 +10416,42 @@ mod app_block_wiring_tests {
              through `set_app_path`, which is what derives `process` from it and so keeps \
              `AppMatch::launchable_path`'s file-name tie-back satisfiable. An arm that \
              assigned `draft.app.path` directly would store a path the launcher refuses"
+        );
+    }
+
+    /// **4d's other half**, held the same way Browse's is and for the same
+    /// reason: the arm lives in `run`'s update closure, which needs a real
+    /// event loop, and it ends in a window that pumps its own message pump for
+    /// as long as a sequence is typing. `sequence_builder_tests::
+    /// clicking_rehearse_asks_the_caller_to_run_one` asserts the form REPORTS
+    /// the action; nothing that runs can assert anybody acts on it.
+    ///
+    /// What this cannot see: that the rehearsal is any good. What it catches is
+    /// the arm being deleted or gutted -- a Rehearse button that reports an
+    /// action nobody acts on, i.e. a button that does nothing, with the whole
+    /// suite green.
+    #[test]
+    fn rehearse_opens_the_scratch_window_and_its_refusal_reaches_the_user() {
+        const REHEARSE_ARM: &str = concat!("EditAction::Rehearse", " => {");
+        const RUNS_IT: &str = concat!("scratch_window::rehearsal_", "notice(&sequence)");
+        // Positive control on both needles, through the same counting.
+        let planted = concat!(
+            "match x { EditAction::Rehearse",
+            " => { generate_error = crate::scratch_window::rehearsal_",
+            "notice(&sequence); } }"
+        );
+        assert_eq!(occurrences(planted, REHEARSE_ARM), 1);
+        assert_eq!(occurrences(planted, RUNS_IT), 1);
+
+        assert_eq!(
+            occurrences(source(), REHEARSE_ARM),
+            1,
+            "expected {REHEARSE_ARM:?} exactly once -- the edit form's Rehearse arm. Zero means              the form still reports the action and nobody acts on it, and every test of the              button keeps passing because the button really does report"
+        );
+        assert_eq!(
+            occurrences(source(), RUNS_IT),
+            1,
+            "expected {RUNS_IT:?} exactly once. The answer has to be ASSIGNED somewhere the              user sees it: a rehearsal that could not open its window, or a sequence the              compiler refuses, is otherwise a click that does nothing at all"
         );
     }
 

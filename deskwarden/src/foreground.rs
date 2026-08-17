@@ -696,7 +696,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 8] = [
+    const OPENS_WINDOWS: [&str; 9] = [
         "app_window",
         "loading_ui",
         "login_ui",
@@ -707,6 +707,11 @@ mod tests {
         // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
         "preflight_host",
         "prefs_ui",
+        // The 4d rehearsal scratch window. The one window in this crate that
+        // is NOT an `eframe` one -- see
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise.
+        "scratch_window",
         "vault_window",
     ];
 
@@ -730,6 +735,24 @@ mod tests {
         // loop rather than in it.
         ("picker_ui", include_str!("picker_ui.rs"), "PICK_ITEM_TITLE", 1),
     ];
+
+    /// **Opens a window that is not an `eframe` one, and raises it anyway.**
+    ///
+    /// The third category, and it exists because [`RAISING_SITES`] holds its
+    /// windows by grepping for `run_ui_native(TITLE,` -- a needle that names
+    /// `eframe`'s entry point and nothing else. `scratch_window` opens a plain
+    /// Win32 window with `CreateWindowExW`, for a reason recorded at length in
+    /// that module's header (a rehearsal is started from *inside* the vault
+    /// window's event loop, and `winit` will not build a second one), so it
+    /// would count zero there.
+    ///
+    /// Zero is exactly the wrong answer. Left in [`RAISING_SITES`] the guard
+    /// would fail on a window that does everything right; moved to the
+    /// exemption list it would be excused from raising when it is the one
+    /// window in this crate the user is meant to sit and watch. So it is held
+    /// here instead, by the needle that names how it really opens.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 1] =
+        [("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE")];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
@@ -866,6 +889,45 @@ mod tests {
         );
     }
 
+    /// The same claim [`every_window_this_crate_opens_asks_to_be_brought_to_the_front`]
+    /// makes, for the windows that are not `eframe`'s.
+    ///
+    /// What it can see: the module really opens a window (`CreateWindowExW`),
+    /// really raises the title it opened under, and has not quietly become an
+    /// `eframe` window -- which would move it into the other table's remit and
+    /// out of this one's, with both guards then reading zero.
+    #[test]
+    fn every_win32_window_this_crate_opens_asks_to_be_brought_to_the_front() {
+        for (name, source, title) in OPENS_A_WIN32_WINDOW_AND_RAISES_IT {
+            // The production half and then `code()`, for both reasons the
+            // exemption loop below gives: an exact count over another module's
+            // file false-fires on a fixture that spells the needle, and a
+            // comment can hold a needle as well as a call can.
+            let (production, cut) = production_half(source);
+            assert!(cut > 0, "no test module was cut out of `{name}`");
+            let source = code(&production);
+            assert!(
+                source.contains("CreateWindowExW("),
+                "`{name}` is listed as opening a Win32 window and opens none"
+            );
+            assert_eq!(
+                source.matches(&format!("raise_window({title})")).count(),
+                1,
+                "`{name}` opens a window titled `{title}` and must raise that same window"
+            );
+            assert_eq!(
+                source.matches("run_ui_native(").count(),
+                0,
+                "`{name}` has become an `eframe` window. Move it to `RAISING_SITES`, which \
+                 counts `run_ui_native(TITLE,` -- otherwise neither table holds its raise."
+            );
+        }
+        // Positive control on the two zero-counts' needles, through the same
+        // `code()` the loop uses: they can be found where they really are, so a
+        // zero above is an absence and not a typo.
+        assert!(RAISING_SITES.iter().all(|(_, s, ..)| code(s).contains("run_ui_native(")));
+    }
+
     /// **The list above is hand-enumerated, and that is its one weakness.** A
     /// module added to this crate that opens a window is simply absent from it:
     /// every assertion still passes, and the new window is unguarded -- which
@@ -986,7 +1048,11 @@ mod tests {
         }
 
         // ---- and the raise lists reconcile with OPENS_WINDOWS --------------
-        let raises: Vec<&str> = RAISING_SITES.iter().map(|(module, ..)| *module).collect();
+        let raises: Vec<&str> = RAISING_SITES
+            .iter()
+            .map(|(module, ..)| *module)
+            .chain(OPENS_A_WIN32_WINDOW_AND_RAISES_IT.iter().map(|(module, ..)| *module))
+            .collect();
         let excused: Vec<&str> = OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
             .iter()
             .map(|(module, ..)| *module)
@@ -994,7 +1060,15 @@ mod tests {
 
         // Positive controls on the two projections, so every check below is
         // reading real names rather than iterating an empty vector.
-        assert_eq!(raises.len(), RAISING_SITES.len(), "control: a name per raising site");
+        assert_eq!(
+            raises.len(),
+            RAISING_SITES.len() + OPENS_A_WIN32_WINDOW_AND_RAISES_IT.len(),
+            "control: a name per raising site, `eframe`'s and Win32's alike"
+        );
+        assert!(
+            raises.contains(&"scratch_window"),
+            "control: the Win32 raise table is being read at all: {raises:?}"
+        );
         assert!(
             raises.contains(&"vault_window"),
             "control: the raise table is being read, and by module name rather than file name \
@@ -1119,14 +1193,25 @@ mod tests {
     /// **The invariant that makes matching a window BY TITLE safe at all.**
     ///
     /// [`RAISING_SITES`] compares title *identifiers*; it never looks at their
-    /// values. Four modules open a window titled literally `"Deskwarden"` --
-    /// `vault_window`, `app_window` and `loading_ui`, which all raise, and
-    /// `overlay_ui`, which is excused. [`pick`] is a `find`, so if two of them
-    /// were ever on screen together a raise would take whichever `EnumWindows`
-    /// happened to hand back first, silently and non-deterministically.
+    /// values. **Five** modules open a window titled literally `"Deskwarden"`
+    /// -- `vault_window`, `app_window` and `loading_ui`, which all raise, and
+    /// `overlay_ui` and `preflight_host`, which are excused. (This said "four"
+    /// while there were four, and went stale the day the preflight host
+    /// landed; a count in prose goes stale silently, which is why the one
+    /// below is asserted.) [`pick`] is a `find`, so if two of them were ever on
+    /// screen together a raise would take whichever `EnumWindows` happened to
+    /// hand back first, silently and non-deterministically.
     ///
-    /// It is not reachable today, and the reason is worth naming because it is
-    /// the thing being pinned rather than the collision itself:
+    /// **`scratch_window` is the sixth window and is deliberately not the sixth
+    /// of those**, because it is the one window here that provably IS alive
+    /// alongside another: it is opened from inside the vault window's frame
+    /// closure and pumps its own message loop while that window is still up.
+    /// Serialisation is therefore not what makes it safe -- a unique title is,
+    /// and that is asserted below rather than left in prose.
+    ///
+    /// For the five that do share a title, the collision is not reachable
+    /// today, and the reason is worth naming because it is the thing being
+    /// pinned rather than the collision itself:
     ///
     /// * **No `with_any_thread`.** On Windows, `winit` refuses to build an
     ///   event loop off the main thread -- it panics -- unless the builder was
@@ -1156,9 +1241,38 @@ mod tests {
     /// relies on, so it is the one written down here.
     #[test]
     fn only_one_window_of_this_process_can_exist_at_a_time() {
+        // **The one window that is not serialised with the rest**, and the one
+        // property that makes that safe. `scratch_window` is open while the
+        // vault window is, so a title it shared with anything would make
+        // `pick`'s `find` non-deterministic for exactly as long as a rehearsal
+        // is on screen -- which is when a `SendInput` burst is in flight.
+        //
+        // Two comparisons and not one: these are the two title constants this
+        // module can name, and both spell the literal the other three windows
+        // also open under, so a `SCRATCH_TITLE` changed to `"Deskwarden"` fails
+        // here rather than in production.
+        assert_ne!(
+            crate::vault_window::rehearsal::SCRATCH_TITLE,
+            crate::vault_window::WINDOW_TITLE,
+            "the rehearsal scratch window shares a title with a window it is open alongside"
+        );
+        assert_ne!(
+            crate::vault_window::rehearsal::SCRATCH_TITLE,
+            crate::preflight_host::PREFLIGHT_TITLE
+        );
+        // Control on the pair above: those two constants really are the same
+        // string, so an `assert_ne!` against either is an assertion about the
+        // shared literal and not about two unrelated names.
+        assert_eq!(crate::vault_window::WINDOW_TITLE, crate::preflight_host::PREFLIGHT_TITLE);
+
         let sources = RAISING_SITES
             .iter()
             .map(|(module, source, ..)| (*module, *source))
+            .chain(
+                OPENS_A_WIN32_WINDOW_AND_RAISES_IT
+                    .iter()
+                    .map(|(module, source, _)| (*module, *source)),
+            )
             .chain(
                 OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
                     .iter()
@@ -1208,11 +1322,11 @@ mod tests {
             // `with_any_thread` by name inside a window module fails this test
             // -- which is a build failure that says exactly what it means.)
             assert!(
-                source.contains("ViewportBuilder"),
-                "control: `{module}`'s source does not build a viewport, so it is either not 
-                 the file this thinks it is or not a window-opening module -- and the two 
-                 counts below are then zero for a reason that has nothing to do with the 
-                 invariant"
+                source.contains("ViewportBuilder") || source.contains("CreateWindowExW"),
+                "control: `{module}`'s source neither builds a viewport nor creates a Win32
+                 window, so it is either not the file this thinks it is or not a
+                 window-opening module -- and the two counts below are then zero for a reason
+                 that has nothing to do with the invariant"
             );
             assert_eq!(
                 source.matches("with_any_thread").count(),

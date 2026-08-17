@@ -1727,6 +1727,18 @@ pub enum EditAction {
     /// A cancelled dialog is `None` and nothing changes -- there is no failure
     /// to report, unlike a failed generate.
     PickAppFile,
+    /// **4d.** "Rehearse with fake data" was clicked in the sequence block.
+    ///
+    /// Carries nothing, for the same reason [`Self::PickAppFile`] does and one
+    /// more. The form cannot run it: the scratch window pumps its own message
+    /// loop, so it must be opened between frames rather than inside one. And
+    /// there is nothing for it to carry -- a rehearsal is built from the
+    /// sequence alone by
+    /// [`crate::vault_window::rehearsal::sample_plan`], which resolves every
+    /// field to a fixed sample, so an item, a password or a one-time code
+    /// passed through here would be a value the rehearsal has no use for and
+    /// must not have.
+    Rehearse,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -2976,7 +2988,7 @@ fn app_sequence_block(
     app: &mut AppMatchDraft,
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
-) {
+) -> Option<EditAction> {
     theme::field_label(ui, APP_SEQUENCE_LABEL);
     let view = sequence_view(&app.sequence);
 
@@ -3004,7 +3016,7 @@ fn app_sequence_block(
             app.sequence_open = true;
         }
         ui.add_space(10.0);
-        return;
+        return None;
     }
 
     ui.label(RichText::new(APP_SEQUENCE_HINT).size(11.0).color(theme::TEXT_FAINT));
@@ -3062,15 +3074,19 @@ fn app_sequence_block(
     // insert chips are the palette, and a second set of Add buttons writing to
     // a string the user is editing by hand would fight the cursor.
     if app.template_view {
+        let mut action = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            if rehearse_button(ui).clicked() {
+                action = Some(EditAction::Rehearse);
+            }
             if theme::secondary_button(ui, APP_SEQUENCE_CLOSE).clicked() {
                 app.sequence_open = false;
                 app.previewing = false;
             }
         });
         ui.add_space(10.0);
-        return;
+        return action;
     }
 
     // -- the palette: nothing here is typed from memory --------------------
@@ -3138,9 +3154,18 @@ fn app_sequence_block(
     });
     ui.add_space(8.0);
 
-    // -- the eye ------------------------------------------------------------
+    // -- the rehearsal, and the eye -----------------------------------------
+    //
+    // 4d's own control, in the one column this pane has rather than in the
+    // design's right-hand rail, and FIRST in the row deliberately: rehearsing
+    // is the safe way to find out what a sequence does, and the eye beside it
+    // is the one that puts a real password on screen.
+    let mut action = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        if rehearse_button(ui).clicked() {
+            action = Some(EditAction::Rehearse);
+        }
         let caption = if app.previewing { APP_SEQUENCE_HIDE } else { APP_SEQUENCE_REVEAL };
         if theme::secondary_button(ui, caption).clicked() {
             app.previewing = !app.previewing;
@@ -3164,6 +3189,27 @@ fn app_sequence_block(
         ui.label(RichText::new(APP_SEQUENCE_HIDDEN_NOTE).size(11.0).color(theme::TEXT_FAINT));
     }
     ui.add_space(10.0);
+    action
+}
+
+/// 4d's own caption, and the sentence under it.
+///
+/// The caption names the fake data because that is the whole promise: this
+/// button types, and what it types is not the user's password. A caption that
+/// said only "Rehearse" would be a button nobody dares press on an item that
+/// matters.
+/// **The caption is the whole promise**, and it is on the button rather than in
+/// a sentence beside it. 4d puts an explanatory line under the control ("types
+/// sample-user and not-a-real-password into a scratch window..."); this pane is
+/// one narrow column and the form is already at the height
+/// `no_two_runs_on_the_tallest_edit_form_overlap` measures, so a second row of
+/// prose pushed the eye and Close below the fold. What could not be dropped is
+/// the word that makes the button safe to press on an item that matters, so
+/// that is what the caption says.
+pub const APP_SEQUENCE_REHEARSE: &str = "Rehearse with fake data";
+
+fn rehearse_button(ui: &mut egui::Ui) -> egui::Response {
+    theme::secondary_button(ui, APP_SEQUENCE_REHEARSE)
 }
 
 /// **4c -- the template view.** The same sequence as one editable line, with
@@ -3397,7 +3443,9 @@ fn app_block(
     // The sequence block answers what the pills used to sit above: not *when*
     // this item fills, which is no longer a per-item question, but what it
     // types once it does.
-    app_sequence_block(ui, app, palette, source);
+    if let Some(asked) = app_sequence_block(ui, app, palette, source) {
+        action = Some(asked);
+    }
 
     // Staged, not immediate: unlike the read pane's card -- which writes
     // straight through because there is no Save to wait for -- this is one
@@ -7593,6 +7641,31 @@ mod sequence_builder_tests {
         painted
     }
 
+    /// [`frame`], keeping the action the form reported.
+    ///
+    /// A second helper rather than a wider `frame`, because every other test in
+    /// this module is about what is painted and would have to thread an answer
+    /// it does not read.
+    fn frame_action(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        item: &VaultItem,
+        totp: &detail::TotpState,
+        events: &[egui::Event],
+    ) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
+        let output = ctx.run_ui(raw_input(pane, events), |ui| {
+            action = draw_detail_edit(ui, draft, &[], false, &mut apps, Some(item), totp);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        (action, painted)
+    }
+
     fn click(pos: Pos2) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(pos),
@@ -7624,6 +7697,53 @@ mod sequence_builder_tests {
         let _ = frame(ctx, pane, draft, item, totp, &click(at));
         assert!(draft.app.as_ref().unwrap().sequence_open, "the builder did not open");
         frame(ctx, pane, draft, item, totp, &[])
+    }
+
+    /// **4d's way in.** Mutation this catches: delete the button, or drop the
+    /// `action = Some(EditAction::Rehearse)`. `EditAction::Rehearse` is `pub`,
+    /// so having no producers left is not even a warning -- which is exactly
+    /// how a control that reports nothing ships.
+    #[test]
+    fn clicking_rehearse_asks_the_caller_to_run_one() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "");
+        let totp = detail::TotpState::NoSecret;
+        // The button lives in the keystroke builder, which is shut by default.
+        draft.app.as_mut().unwrap().sequence_open = true;
+
+        let (idle, painted) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &[]);
+        assert_eq!(idle, EditAction::None, "the form reported an action with no input");
+        let button = painted.rect_of(APP_SEQUENCE_REHEARSE);
+
+        let (action, _) =
+            frame_action(&ctx, PANE, &mut draft, &item, &totp, &click(button.center()));
+        assert_eq!(action, EditAction::Rehearse);
+
+        // The positive control: were any click in the form reporting
+        // `Rehearse`, the assertion above would pass with the button deleted.
+        let miss = Pos2::new(button.center().x, button.top() - 60.0);
+        let (missed, _) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &click(miss));
+        assert_ne!(missed, EditAction::Rehearse, "a click that hit nothing started a rehearsal");
+    }
+
+    /// The same control in the template view, which draws its own row and so is
+    /// a second place for it to go missing.
+    #[test]
+    fn the_template_view_can_rehearse_too() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "");
+        let totp = detail::TotpState::NoSecret;
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.sequence_open = true;
+            app.template_view = true;
+        }
+        let (_, painted) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &[]);
+        let at = painted.rect_of(APP_SEQUENCE_REHEARSE).center();
+        let (action, _) = frame_action(&ctx, PANE, &mut draft, &item, &totp, &click(at));
+        assert_eq!(action, EditAction::Rehearse);
     }
 
     /// **The wiring pin for the drawing.** Deleting the

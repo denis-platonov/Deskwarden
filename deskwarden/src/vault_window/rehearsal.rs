@@ -20,15 +20,19 @@
 //! `foreground::own_window_titled`, and does not run at all if that window
 //! cannot be found. There is no fallback to the foreground, deliberately.
 //!
-//! # What is not here yet
+//! # Where the window is
 //!
-//! The scratch window itself -- the eframe host that opens under
-//! [`SCRATCH_TITLE`], receives the keystrokes and shows the transcript -- is
-//! **not built**. Everything it would need is: [`rehearsal_plan`] for what to
-//! send, [`scratch_target`] for where, `Injector::fill_sequence` for the send,
-//! and [`transcript`]/[`acts`]/[`elapsed_label`] for the readout. Until that
-//! host exists there is no way to start a rehearsal from the UI, so nothing in
-//! this module is reachable from a running app.
+//! [`crate::scratch_window`], at crate root rather than here. It opens under
+//! [`SCRATCH_TITLE`], raises itself, and drives this module's
+//! [`rehearsal_plan`] through `Injector::fill_sequence` -- the ordinary sender
+//! -- while pumping its own message loop, which is what lets a user watch the
+//! timing rather than receive the whole burst at the end. It is a plain Win32
+//! window and not an `eframe` one because a rehearsal is started from inside
+//! the vault window's event loop; see that module's header.
+//!
+//! What is drawn there comes from here: [`transcript`] and [`acts`] for the
+//! plan that was sent, [`arrived_panel`] and [`report_text`] for what really
+//! landed, and [`elapsed_label`] for the total.
 //!
 //! # Why the assertions in this file are positive
 //!
@@ -40,6 +44,7 @@
 //! that the plan really ran.
 
 use crate::injector::sequence::{self, Plan, Step};
+use crate::key_sequence::{FieldRef, Token};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -101,6 +106,54 @@ pub fn substitute(steps: &[Step]) -> Vec<Step> {
 /// list it assembled itself and skip the substitution.
 pub fn rehearsal_plan(real: &Plan) -> Result<Plan, sequence::Refusal> {
     sequence::replan(substitute(real.steps()))
+}
+
+/// The sample a `{TOTP}` resolves to for a rehearsal. Six zeros: a shape a
+/// user recognises as a code, and a value no authenticator will ever emit.
+pub const SAMPLE_TOTP: &str = "000000";
+
+/// **The plan a rehearsal starts from, built without the vault.**
+///
+/// [`substitute`] would replace every payload anyway, so the obvious thing --
+/// plan the user's sequence against the real item and then substitute -- makes
+/// one more copy of the password than the feature needs, on the UI thread, for
+/// no gain: the *shape* a rehearsal reproduces is its keys, its waits and its
+/// rates, and none of those depend on what a field resolves to. `MAX_BURST`
+/// chunking does depend on payload length, and that is precisely what
+/// [`sequence::replan`] redoes on the substituted text, so planning against the
+/// real values would have its answer thrown away.
+///
+/// So the sequence is resolved against the samples from the start, and
+/// [`substitute`] then runs over the result anyway. The two are not redundant:
+/// this is the reason no vault value is ever *near* a rehearsal, and that is
+/// the reason no vault value can *survive* one.
+///
+/// An empty sequence is the item's default, exactly as a real fill treats it --
+/// rehearsing "nothing" for an item that fills perfectly well would be a
+/// rehearsal of the wrong thing.
+pub fn sample_plan(sequence: &str) -> Result<Plan, sequence::Refusal> {
+    let sequence =
+        if sequence.is_empty() { crate::key_sequence::DEFAULT_SEQUENCE } else { sequence };
+    let tokens = crate::key_sequence::parse(sequence);
+    // Every custom field the sequence names, given a sample. Collected from the
+    // tokens rather than from the item, because there is no item here: a
+    // `{S:PIN}` must rehearse whether or not this vault has a `PIN`.
+    let custom: Vec<(&str, &str)> = tokens
+        .iter()
+        .filter_map(|token| match token {
+            Token::Field(FieldRef::Custom(name)) => Some((name.as_str(), SAMPLE_PASSWORD)),
+            _ => None,
+        })
+        .collect();
+    sequence::plan(
+        &tokens,
+        &sequence::Resolved {
+            username: SAMPLE_USER,
+            password: SAMPLE_PASSWORD,
+            totp: Some(SAMPLE_TOTP),
+            custom,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +238,73 @@ pub const SCRATCH_TITLE: &str = "Deskwarden \u{2014} rehearsal scratch";
 /// rather than dangerous, which is precisely why it would be easy to ship.
 pub fn scratch_target() -> Option<isize> {
     crate::foreground::own_window_titled(SCRATCH_TITLE)
+}
+
+// ---------------------------------------------------------------------------
+// The readout
+// ---------------------------------------------------------------------------
+
+/// What the readout says while the sequence is still being typed.
+pub const WAITING_NOTE: &str = "Rehearsing\u{2026} watch the box above.";
+
+/// The design's heading for the panel showing what really landed.
+pub const ARRIVED_HEADING: &str = "WHAT ARRIVED";
+
+/// The design's glyph for a Tab that arrived.
+pub const ARRIVED_TAB: char = '\u{21e5}';
+
+/// The design's glyph for an Enter that arrived.
+pub const ARRIVED_ENTER: char = '\u{23ce}';
+
+/// The characters that really landed, with the two invisible keys drawn.
+///
+/// **Read off the edit control, not off the plan.** [`transcript`] says what
+/// was *sent*; this says what *arrived*, and the whole value of a rehearsal is
+/// that those two can differ -- a control that eats a Tab, or a dialog that was
+/// not ready for the first character, shows up here and nowhere else.
+///
+/// A Tab and an Enter are otherwise invisible in a transcript, and a rehearsal
+/// whose readout cannot tell "the Tab arrived" from "the Tab did not" is a
+/// readout that answers the one question it was opened to answer with a blank.
+/// The carriage return of a Windows line ending is dropped rather than drawn:
+/// it is how the edit control stores a line break, not a key anybody sent.
+pub fn arrived_panel(arrived: &str) -> String {
+    let mut out = String::with_capacity(arrived.len());
+    for ch in arrived.chars() {
+        match ch {
+            '\t' => out.push(ARRIVED_TAB),
+            '\r' => {}
+            '\n' => {
+                out.push(ARRIVED_ENTER);
+                out.push('\n');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The line above the transcript: the design's `Rehearsal finished · 2.1 s`,
+/// with the act count beside it.
+///
+/// **Acts, not `Plan::len()`.** See [`acts`]: `plan` chops text at
+/// [`crate::injector::sequence::MAX_BURST`], so a six-act sequence plans as
+/// nine steps and a user told "9" is being told an implementation detail.
+pub fn finished_line(elapsed: Duration, acts: usize) -> String {
+    let unit = if acts == 1 { "act" } else { "acts" };
+    format!("Rehearsal finished \u{b7} {} \u{b7} {acts} {unit}", elapsed_label(elapsed))
+}
+
+/// The whole readout, as the one string the scratch window's panel shows.
+///
+/// Windows line endings because its one consumer is a Win32 edit control,
+/// which draws a bare `\n` as a box rather than as a line break.
+pub fn report_text(arrived: &str, elapsed: Duration, acts: usize) -> String {
+    format!(
+        "{}\r\n\r\n{ARRIVED_HEADING}\r\n{}",
+        finished_line(elapsed, acts),
+        arrived_panel(arrived).replace('\n', "\r\n")
+    )
 }
 
 #[cfg(test)]
@@ -337,6 +457,119 @@ mod tests {
             "the chunk boundaries leaked into the transcript"
         );
         assert_eq!(acts(&sent), 1);
+    }
+
+    /// **The plan a rehearsal starts from never asks the vault for anything.**
+    ///
+    /// Positive on both halves: every text step that comes out holds a sample,
+    /// and the fields a real fill would refuse to resolve -- a `{TOTP}` on an
+    /// item with no seed, a `{S:PIN}` on an item with no `PIN` -- plan here
+    /// rather than refusing, because a rehearsal is about the shape and the
+    /// timing and not about what this particular item happens to hold.
+    #[test]
+    fn the_starting_plan_is_built_from_samples_and_not_from_an_item() {
+        let planned = sample_plan("{USERNAME}{TAB}{PASSWORD}{TAB}{TOTP}{TAB}{S:PIN}{ENTER}")
+            .expect("a sequence naming every kind of field must still rehearse");
+        let typed: Vec<&str> = planned
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            typed,
+            [SAMPLE_USER, SAMPLE_PASSWORD, SAMPLE_TOTP, SAMPLE_PASSWORD],
+            "the starting plan resolved something other than a sample"
+        );
+        // The control that stops the assertion above being vacuous: the very
+        // same sequence, planned the way a real fill plans it, REFUSES on an
+        // item with no one-time code -- so the values above came from here.
+        assert!(
+            sequence::plan(
+                &crate::key_sequence::parse("{TOTP}"),
+                &sequence::Resolved {
+                    username: "u",
+                    password: "p",
+                    totp: None,
+                    custom: Vec::new(),
+                },
+            )
+            .is_err(),
+            "control: the real planner resolves a `{{TOTP}}` this item has not got"
+        );
+    }
+
+    /// An empty sequence is the item's default, because that is what a real
+    /// fill types for it. Rehearsing nothing would rehearse the wrong thing.
+    #[test]
+    fn an_empty_sequence_rehearses_the_default_fill() {
+        let planned = sample_plan("").expect("the default must plan");
+        assert_eq!(
+            transcript(&planned),
+            transcript(
+                &sample_plan(crate::key_sequence::DEFAULT_SEQUENCE).expect("the default plans")
+            ),
+            "an unset sequence rehearsed something other than the default fill"
+        );
+        assert!(
+            transcript(&planned).contains(&Arrival::Pressed("TAB".to_string())),
+            "control: the default fill really does press Tab, so the comparison above is \
+             between two non-trivial transcripts"
+        );
+    }
+
+    /// **The two invisible keys are visible in the readout.**
+    ///
+    /// Asserted positively, on the glyphs, at the positions they arrived at --
+    /// and with a control that the sample text itself came through unaltered,
+    /// so a renderer that dropped everything would fail here rather than pass
+    /// by saying nothing.
+    #[test]
+    fn a_tab_and_an_enter_that_arrived_are_drawn_rather_than_left_blank() {
+        // Exactly what a Win32 edit control holds after the design's sequence:
+        // Tab is stored as a tab, Enter as a Windows line ending.
+        let arrived = format!("{SAMPLE_USER}\t\r\n{SAMPLE_PASSWORD}\r\n");
+        let panel = arrived_panel(&arrived);
+        assert_eq!(
+            panel,
+            format!("{SAMPLE_USER}{ARRIVED_TAB}{ARRIVED_ENTER}\n{SAMPLE_PASSWORD}{ARRIVED_ENTER}\n")
+        );
+        // The control: a Tab that did NOT arrive reads differently. Without
+        // this, a renderer that drew the glyph unconditionally would pass.
+        assert!(
+            !arrived_panel(&format!("{SAMPLE_USER}\r\n")).contains(ARRIVED_TAB),
+            "a Tab that never arrived was drawn anyway, so the readout cannot answer the one \
+             question a rehearsal is opened to answer"
+        );
+        assert!(panel.contains(SAMPLE_USER) && panel.contains(SAMPLE_PASSWORD));
+    }
+
+    /// The heading counts **acts**, and the whole readout carries the design's
+    /// words plus the arrival panel.
+    #[test]
+    fn the_report_says_how_long_it_took_and_what_landed() {
+        let real = real_plan();
+        let sent = rehearsal_plan(&real).expect("plans");
+        assert_eq!(
+            finished_line(Duration::from_millis(2100), acts(&sent)),
+            "Rehearsal finished \u{b7} 2.1 s \u{b7} 5 acts",
+            "the count must be acts and not `Plan::len()`, which chunks"
+        );
+        assert_eq!(finished_line(Duration::from_millis(250), 1), "Rehearsal finished \u{b7} 250 ms \u{b7} 1 act");
+
+        let report = report_text(&format!("{SAMPLE_USER}\t"), Duration::from_millis(2100), 5);
+        assert!(report.starts_with("Rehearsal finished \u{b7} 2.1 s"), "{report:?}");
+        assert!(report.contains(ARRIVED_HEADING), "{report:?}");
+        assert!(report.contains(&format!("{SAMPLE_USER}{ARRIVED_TAB}")), "{report:?}");
+        // Every line break in the readout is a Windows one: a bare `\n` is
+        // drawn as a box by the edit control this is written for. Controlled by
+        // the assertion just above that the report has line breaks at all.
+        assert!(report.contains("\r\n"), "control: the readout has no line breaks to check");
+        for line in report.split("\r\n") {
+            assert!(!line.contains('\n'), "a bare newline survived into {line:?}");
+        }
     }
 
     #[test]
