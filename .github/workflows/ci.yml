@@ -1,0 +1,161 @@
+# .github/workflows/ci.yml
+#
+# Runs on every push and pull request, so a red tree is found in minutes
+# rather than at the next release tag.
+#
+# Until 2026-08-17 the ONLY workflow in this repository was release.yml,
+# which triggers on "v*.*.*" tags. Between tags nothing was checked at all.
+#
+# WHY EACH COMMIT AND NOT JUST THE TIP. `f67bf42` does not compile: it imports
+# `crate::app::FillChoice`, which the NEXT commit introduces. A conventional
+# tip-only CI would have passed that push without complaint, because the tip
+# was green -- the breakage lives in the middle of the range and is invisible
+# from either end. That is the defect class this file exists for, so the
+# "compiles" job walks the pushed commits individually.
+#
+# It cannot repair f67bf42. That commit is an ancestor of v0.5.0, v0.6.0 and
+# v0.7.0, all of which have published binaries, so rewriting it would
+# invalidate the whole release history to correct a commit nobody will check
+# out. It is recorded rather than rewritten; this guard stops the next one.
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# A superseded run is wasted money and a misleading red. Keep the newest per
+# ref and cancel the rest -- except on main, where each push's history is
+# checked on its own and cancelling would leave a range unverified.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # The full bar the project actually holds: tests green, zero warnings,
+  # measured on the tree as it will be built.
+  test:
+    name: Tests and warnings
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: deskwarden
+
+      # Debug, not --release, for the reason release.yml gives at length:
+      # identical-COMDAT-folding was measured on this crate and does NOT make
+      # a fake seam compare equal to the real one, so the shipping profile
+      # buys no coverage the debug profile lacks -- at several minutes of LTO
+      # per run.
+      - name: Run the test suite
+        working-directory: deskwarden
+        run: cargo test -j 8
+
+      # "Zero warnings, including a shipping build" is a standing rule in
+      # every plan in docs/superpowers/plans. A rule nothing enforces is a
+      # rule that decays, so it is enforced here.
+      #
+      # RUSTC warnings, not clippy. Clippy was measured on this crate on
+      # 2026-08-17 and reports roughly a hundred findings -- mostly
+      # `type_complexity`, `doc_list_item_without_indentation` and
+      # `manual_contains` -- so `clippy -D warnings` would have redded on its
+      # first run. A gate that is red the day it lands does not get fixed, it
+      # gets deleted or `continue-on-error`'d, and then it guards nothing.
+      # Clippy is worth a pass of its own; it is not worth making this gate
+      # untrustworthy on day one.
+      - name: Deny warnings
+        working-directory: deskwarden
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --all-targets -j 8
+
+  # Every commit introduced by this push must compile on its own. `cargo
+  # check` rather than a full build or the test suite: the property being
+  # defended is "this commit is a coherent tree", and the tip's full run above
+  # covers everything else. Checking is fast enough to afford per commit.
+  compiles:
+    name: Every new commit compiles
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The whole history, because the range below needs the commit before
+          # the push and a shallow clone does not have it.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: deskwarden
+
+      - name: Check each commit in the range
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # A pull request is checked against its base; a push against what
+          # the ref pointed at before. A branch's first push reports an
+          # all-zero "before" and has no range to speak of, so fall back to
+          # the tip alone rather than walking the project's whole history.
+          if [ -n "${BASE:-}" ]; then
+            range="$BASE..HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD~0..HEAD"
+          fi
+
+          commits=$(git rev-list --reverse "$range")
+          if [ -z "$commits" ]; then
+            echo "No new commits in $range -- nothing to check."
+            exit 0
+          fi
+
+          count=$(printf '%s\n' "$commits" | wc -l | tr -d ' ')
+          echo "Checking $count commit(s) in $range."
+
+          # A backstop, not a policy: a push of hundreds of commits is a merge
+          # of old work, and paying for each is not worth it. Say so out loud
+          # rather than silently checking a subset -- an unannounced cap reads
+          # as "all of them were fine".
+          limit=25
+          if [ "$count" -gt "$limit" ]; then
+            echo "::warning::$count commits pushed, which is more than the $limit this job \
+          walks. Only the last $limit are checked individually; the tip is fully tested by the \
+          other job either way."
+            commits=$(printf '%s\n' "$commits" | tail -n "$limit")
+          fi
+
+          failed=""
+          for sha in $commits; do
+            subject=$(git log -1 --format='%s' "$sha")
+            echo "::group::$sha  $subject"
+            git checkout --quiet --detach "$sha"
+            if (cd deskwarden && cargo check --all-targets -j 8); then
+              echo "ok"
+            else
+              echo "::error::$sha does not compile on its own: $subject"
+              failed="$failed $sha"
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "These commits do not compile in isolation:$failed"
+            echo "Squash or reorder them so each commit is a coherent tree. See the note at the \
+          top of this file for why the tip being green is not enough."
+            exit 1
+          fi
+          echo "Every checked commit compiles."
