@@ -792,6 +792,48 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
     Ok(plan)
 }
 
+/// **Re-wraps an already-planned step list into a [`Plan`], re-chunking and
+/// re-bounding it.**
+///
+/// The rehearsal ([`crate::vault_window::rehearsal`]) takes a real plan's
+/// steps, swaps every [`Step::Text`] payload for a sample, and needs the
+/// result back as a `Plan` so it can go through the *same* sender a real fill
+/// does. There is no other constructor, and there deliberately is not one that
+/// simply wraps: substituted text is a different length, so it must be chunked
+/// against [`MAX_BURST`] again and checked against [`MAX_SEQUENCE`] again, or
+/// the rehearsal would be the one run in this crate that can open a gap
+/// between two foreground checks.
+///
+/// It re-chunks through the very same [`TextRun`] [`plan`] uses, so the two
+/// cannot disagree about what a burst is -- and so the accumulator is wiped on
+/// the way out here too.
+pub fn replan(steps: Vec<Step>) -> Result<Plan, Refusal> {
+    let mut acc = Plan { steps: Vec::new() };
+    for step in steps {
+        match step {
+            Step::Text { text, rate } => {
+                let mut run = TextRun::new(rate);
+                run.push(&text);
+                run.flush(&mut acc.steps);
+                // The step was moved out of the caller's `Vec`, so nothing
+                // else will wipe it. Cheap, and it means `replan` cannot
+                // become the one door a plaintext payload leaves by.
+                let mut text = text;
+                text.zeroize();
+            }
+            other => acc.steps.push(other),
+        }
+    }
+    if acc.is_empty() {
+        return Err(Refusal::Nothing);
+    }
+    let projected = acc.projected();
+    if projected > MAX_SEQUENCE {
+        return Err(Refusal::TooLong(projected));
+    }
+    Ok(acc)
+}
+
 // ---------------------------------------------------------------------------
 // The runner
 // ---------------------------------------------------------------------------
