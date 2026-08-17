@@ -23,6 +23,46 @@
 //! Note: Options specified in JSON take precedence over command options
 //! ```
 //!
+//! **`bw send receive` was captured the same way, and it does not follow the
+//! same rule.** The plan this module's fetch path came from assumed a bare
+//! `bw send receive <url>`; the installed CLI says:
+//!
+//! ```text
+//! bw send receive [options] <url>
+//!   Access a Bitwarden Send from a url
+//!   --passwordenv <passwordenv>    Environment variable storing the Send's password
+//!   --obj                          Return the Send's json object rather than the content
+//!   --output <location>            Specify a file path to save a File-type Send to
+//! If a password is required, the provided password is used or the user is prompted.
+//! ```
+//!
+//! **The URL is positional -- so far the plan was right -- but the password is
+//! not on stdin, and there is no stdin route for it at all.** Unlike `create`,
+//! whose every secret travels in a JSON body that can be piped, `receive`
+//! offers exactly three password channels and this module had to pick one.
+//!
+//! **Two lines of that help text are deliberately not reproduced above**, and
+//! they are the two rejected channels: the flag that takes the password
+//! *inline* as its own argument, and the flag that takes the path of a *file*
+//! containing it. Neither is spelled anywhere in this file -- see
+//! [`the_only_password_flag_this_file_spells_is_the_environment_one`], which
+//! is the successor to the two-flag ban and holds the same rule. The reason
+//! applies to a captured help text as much as to code, because a reader copies
+//! what is in front of them: the first puts the secret in `argv`, readable by
+//! every other process on the machine, and the second writes it to disk, where
+//! it outlives the run. That leaves `--passwordenv`, which names an
+//! *environment variable*, so argv carries only the variable's NAME -- the
+//! channel `BW_SESSION` already travels on, for the same measured reason. That
+//! is what [`receive_invocation`] builds and [`SEND_PASSWORD_ENV`] is the
+//! variable. Prompting is not an option: nothing this app spawns is attached
+//! to a console.
+//!
+//! One consequence follows for [`SendInvocation::args`]: a receive's
+//! **positional argument is itself a secret**, because a Send's access URL
+//! carries the decryption key in its fragment. It is the only command in this
+//! module of which that is true, and it is why the invocation's `Debug` elides
+//! the whole argument vector of a receive.
+//!
 //! **The consequence is the good one.** The share password, the access cap,
 //! the deletion date and the hidden flag are all *JSON* fields, and the JSON
 //! can be piped through **stdin**. So no secret ever needs to touch `argv`,
@@ -31,7 +71,7 @@
 //! password entirely; it does not. The command-line flags that would have
 //! carried the share password or the recipient e-mail addresses therefore
 //! appear **nowhere** in this file, and
-//! [`the_two_secret_bearing_flags_appear_nowhere_in_this_file`] pins that
+//! [`the_only_password_flag_this_file_spells_is_the_environment_one`] pins that
 //! over the source text -- because an assertion over invocations only ever
 //! covers the plans a test happened to build.
 //!
@@ -327,6 +367,25 @@ pub struct SendInvocation {
     /// is handed one explicitly, because only it is built from a plan the
     /// caller already holds a session for.
     session_token: Option<Zeroizing<String>>,
+    /// The Send's share password, to be placed in [`SEND_PASSWORD_ENV`], or
+    /// `None` for an invocation that needs none.
+    ///
+    /// **A second environment channel, and it exists because `bw send
+    /// receive` has no stdin one** -- see the module docs. Every other secret
+    /// in this module travels in `stdin_json_b64`; this one cannot, and the
+    /// remaining choices were argv and a file on disk.
+    ///
+    /// `Zeroizing` for `SendPlan::password`'s reason exactly: it is a secret,
+    /// and a plain `String` goes back to the allocator still holding it.
+    send_password: Option<Zeroizing<String>>,
+    /// Whether [`Self::args`] carries a Send **access URL**.
+    ///
+    /// A `bool` recorded at construction rather than a rule that inspects the
+    /// arguments, because a rule would be a parsing decision that has to be
+    /// right every time -- the same reason [`ElidedAccessUrl`] elides a whole
+    /// URL instead of splitting it on `#`. Set by [`receive_invocation`] and
+    /// by nothing else; read only by this type's `Debug`.
+    args_carry_access_url: bool,
 }
 
 impl SendInvocation {
@@ -346,16 +405,33 @@ impl SendInvocation {
 
 /// Hand-written for the reason on the type: the session token unlocks the
 /// vault and the body is the secret being published, so neither may reach a
-/// formatter. The arguments are printed in full -- they are pinned never to
-/// carry a secret, and a `Debug` that hid them would say nothing at all.
+/// formatter.
+///
+/// **The arguments used to be printed unconditionally**, on the stated grounds
+/// that they are pinned never to carry a secret and that a `Debug` hiding them
+/// would say nothing at all. That premise held for exactly as long as this
+/// module had only `create`, `list` and `delete`: `receive` takes a Send's
+/// **access URL** positionally, and an access URL carries the decryption key
+/// in its fragment -- the same material [`CreatedSend`] and [`SendSummary`]
+/// already elide. So a receive's argument vector is elided **whole**, for the
+/// reason [`ElidedAccessUrl`] gives about splitting on `#`, and every other
+/// invocation still prints its arguments in full.
 impl std::fmt::Debug for SendInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SendInvocation")
-            .field("args", &self.args)
-            .field("stdin_json_b64", &Redacted(self.stdin_json_b64.len()))
+        let mut out = f.debug_struct("SendInvocation");
+        if self.args_carry_access_url {
+            out.field("args", &ElidedAccessUrl);
+        } else {
+            out.field("args", &self.args);
+        }
+        out.field("stdin_json_b64", &Redacted(self.stdin_json_b64.len()))
             .field(
                 "session_token",
                 &self.session_token.as_ref().map(|t| Redacted(t.len())),
+            )
+            .field(
+                "send_password",
+                &self.send_password.as_ref().map(|p| Redacted(p.len())),
             )
             .finish()
     }
@@ -372,6 +448,9 @@ impl PartialEq for SendInvocation {
             && *self.stdin_json_b64 == *other.stdin_json_b64
             && self.session_token.as_deref().map(|s| s.as_str())
                 == other.session_token.as_deref().map(|s| s.as_str())
+            && self.send_password.as_deref().map(|s| s.as_str())
+                == other.send_password.as_deref().map(|s| s.as_str())
+            && self.args_carry_access_url == other.args_carry_access_url
     }
 }
 
@@ -498,6 +577,8 @@ pub fn plan_to_invocation(
         args: vec!["send".to_string(), "create".to_string()],
         stdin_json_b64: b64,
         session_token: Some(Zeroizing::new(session.to_string())),
+        send_password: None,
+        args_carry_access_url: false,
     })
 }
 
@@ -533,6 +614,8 @@ fn list_invocation(session: Option<&str>) -> SendInvocation {
         args: vec!["send".to_string(), "list".to_string()],
         stdin_json_b64: Zeroizing::new(String::new()),
         session_token: session.map(|s| Zeroizing::new(s.to_string())),
+        send_password: None,
+        args_carry_access_url: false,
     }
 }
 
@@ -542,6 +625,64 @@ fn delete_invocation(id: &str, session: Option<&str>) -> SendInvocation {
         args: vec!["send".to_string(), "delete".to_string(), id.to_string()],
         stdin_json_b64: Zeroizing::new(String::new()),
         session_token: session.map(|s| Zeroizing::new(s.to_string())),
+        send_password: None,
+        args_carry_access_url: false,
+    }
+}
+
+/// The environment variable a `bw send receive` child reads a Send's share
+/// password from, named by `--passwordenv` in the argument vector.
+///
+/// **The variable's NAME is what reaches argv; its VALUE never does.** This is
+/// `SESSION_ENV`'s rule applied to the one other secret this module has to
+/// hand a child, and it is applied here because `bw send receive` offers no
+/// stdin route at all -- see the module docs, where the measured help text and
+/// the three channels it offers are written down.
+///
+/// Prefixed with this app's name rather than reusing anything of `bw`'s, so
+/// that it cannot collide with a variable the CLI reads for some other reason.
+const SEND_PASSWORD_ENV: &str = "DESKWARDEN_SEND_PASSWORD";
+
+/// The invocation that fetches one Send's contents from its link.
+///
+/// **`pub`, unlike its three neighbours above, and that is the deliberate
+/// decision.** `list_invocation` and `delete_invocation` are private because
+/// each has a `pub` entry point beside it that runs it; this one has no runner
+/// yet, so the import path being built on top of it needs the builder itself.
+/// It publishes nothing on its own: building a `SendInvocation` spawns no
+/// process, and there is still no `pub` implementation of [`SendRunner`] in
+/// this crate for a caller outside the module to hand it to.
+///
+/// **The password does not go in argv.** `bw send receive` has no stdin route
+/// for it -- that is the measured difference from `send create`, written down
+/// in the module docs -- so it travels in [`SEND_PASSWORD_ENV`] and argv
+/// carries only that variable's name. When there is no password the flag is
+/// absent entirely rather than pointing at an unset variable.
+///
+/// **The URL does go in argv, and it is a secret.** There is nowhere else `bw`
+/// will read it from. A Send's access URL carries the decryption key in its
+/// fragment, which is why this is the one invocation whose whole argument
+/// vector its `Debug` elides.
+///
+/// **No session token.** Fetching a Send is anonymous -- the link is the
+/// credential -- so `BW_SESSION`, which unlocks the entire vault, is not
+/// handed to a child that has no use for it. It is `None` in the sense the
+/// field documents: a runner configured with a session would still supply one,
+/// but nothing here puts it there.
+pub fn receive_invocation(url: &str, password: Option<&str>) -> SendInvocation {
+    let mut args = vec!["send".to_string(), "receive".to_string()];
+    if password.is_some() {
+        args.push("--passwordenv".to_string());
+        args.push(SEND_PASSWORD_ENV.to_string());
+    }
+    args.push(url.to_string());
+
+    SendInvocation {
+        args,
+        stdin_json_b64: Zeroizing::new(String::new()),
+        session_token: None,
+        send_password: password.map(|p| Zeroizing::new(p.to_string())),
+        args_carry_access_url: true,
     }
 }
 
@@ -1235,6 +1376,14 @@ impl<'a> CliSendRunner<'a> {
         command.args(inv.args());
         if let Some(token) = inv.session_token() {
             command.env(SESSION_ENV, token);
+        }
+        // The second environment channel, and the one place it is set. `bw
+        // send receive` reads the Send's share password from the variable
+        // `--passwordenv` names; the value reaches the child here and never in
+        // argv, which is `SESSION_ENV`'s rule applied to the other secret this
+        // module has to hand a child.
+        if let Some(password) = &inv.send_password {
+            command.env(SEND_PASSWORD_ENV, password.as_str());
         }
         // Both pipes captured, and stdin piped because the request body goes
         // in that way. No stream is inherited: a console handed to the child
@@ -2012,6 +2161,109 @@ mod runner_tests {
     }
 
     #[test]
+    fn a_receives_share_password_reaches_the_child_in_the_environment_and_never_its_argv() {
+        // The receive path held at the spawn itself, on exactly the terms
+        // `the_session_the_list_runner_holds_reaches_the_child_and_never_its_argv`
+        // holds the read path: what is read back is the environment overlay
+        // and the argument vector that ARRIVED at `spawn_in_job`, not the
+        // invocation the test built.
+        //
+        // `bw send receive --help` offers three ways to supply the password
+        // and no stdin route at all: a flag taking the value inline, a flag
+        // taking the path of a file holding it, and `--passwordenv <var>`.
+        // The first puts the secret in argv, where every process on this
+        // machine can read it; the second writes it to disk, where it
+        // outlives the run. The third is the one this module uses, and it is
+        // the same channel `BW_SESSION` already travels on.
+        const URL: &str = "https://vault.bitwarden.com/#/send/invented-id/invented-key";
+        const PASSWORD: &str = "receive-share-pw-4471";
+
+        let runner = CliSendRunner::with_session(None, None, SESSION);
+        let (args, envs) =
+            the_one_spawn(|| runner.run(&receive_invocation(URL, Some(PASSWORD))).map(|_| ()));
+
+        // POSITIVE: the whole of what the child was given, by equality. An
+        // "is not in argv" loop alone passes over an empty argument vector.
+        assert_eq!(
+            args,
+            vec![
+                "send".to_string(),
+                "receive".to_string(),
+                concat!("--", "passwordenv").to_string(),
+                SEND_PASSWORD_ENV.to_string(),
+                URL.to_string(),
+            ],
+            "the recorded spawn does not carry this receive's arguments, so every check below \
+             is about some other command"
+        );
+
+        // The secret arrived, once, in the environment.
+        assert_eq!(
+            envs.iter()
+                .filter(|(k, _)| k == SEND_PASSWORD_ENV)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(PASSWORD.to_string())],
+            "`{SEND_PASSWORD_ENV}` did not arrive at the child set exactly once to the share \
+             password, so a real `bw send receive` would sit at an interactive prompt: {envs:?}"
+        );
+
+        // NEGATIVE: and nowhere in argv.
+        for arg in &args {
+            assert!(
+                !arg.contains(PASSWORD),
+                "the share password is in argv, where any process on the machine can read it: \
+                 {arg}"
+            );
+            assert!(
+                !arg.contains(SESSION),
+                "the session token is in argv, where any process on the machine can read it: \
+                 {arg}"
+            );
+        }
+        assert!(
+            PASSWORD.len() > 8,
+            "control: the needle searched for in argv is a real string, so the loop above is \
+             not vacuous"
+        );
+
+        // **`BW_SESSION` does NOT reach a receive**, and that is deliberate:
+        // fetching a Send is anonymous, so the key to the whole vault is not
+        // handed to a child that has no use for it.
+        assert!(
+            envs.iter().all(|(k, _)| k != SESSION_ENV),
+            "a receive handed the child the vault session it does not need: {envs:?}"
+        );
+        // Control on that, and it is the load-bearing one: the SAME runner
+        // does set `BW_SESSION` exactly once on the read path, so the absence
+        // above is a property of the receive invocation rather than of a
+        // runner that had lost its session or of a `build_command` that had
+        // stopped setting the variable at all.
+        let (_, list_envs) = the_one_spawn(|| list_sends(&runner).map(|_| ()));
+        assert_eq!(
+            list_envs
+                .iter()
+                .filter(|(k, _)| k == SESSION_ENV)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(SESSION.to_string())],
+            "control: the same runner no longer sets `{SESSION_ENV}` on the path that needs \
+             it, so the receive's absence above proves nothing: {list_envs:?}"
+        );
+
+        // Control the other way: a receive with no password sets no variable,
+        // so the overlay assertion above distinguishes a carried password
+        // from one `build_command` invented.
+        let (_, none_envs) =
+            the_one_spawn(|| runner.run(&receive_invocation(URL, None)).map(|_| ()));
+        assert!(
+            none_envs.iter().all(|(k, _)| k != SEND_PASSWORD_ENV),
+            "control: a receive built with no password still set {SEND_PASSWORD_ENV}: \
+             {none_envs:?}"
+        );
+    }
+
+    #[test]
     fn the_send_reaches_the_spawn_carrying_the_job_the_runner_was_built_with() {
         // THE CRITICAL FINDING, held at the spawn itself.
         //
@@ -2444,22 +2696,41 @@ mod runner_tests {
     }
 
     #[test]
-    fn the_two_secret_bearing_flags_still_appear_nowhere_in_this_file() {
+    fn the_only_password_flag_this_file_spells_is_still_the_environment_one() {
         // The pure half pins this too; it is repeated here because this is the
         // step that builds a real command line, and a flag added to the runner
-        // rather than to `plan_to_invocation` would slip past a pin that only
+        // rather than to an invocation builder would slip past a pin that only
         // ever looked at the invocation builders.
+        //
+        // Sharpened alongside its counterpart in the pure half when the fetch
+        // path landed, and for the reason written out there: a flat ban on the
+        // string refuses the ONE safe password channel `bw send receive`
+        // offers along with the two dangerous ones, and a control that refuses
+        // the safe option is a control the next author routes around.
         let source = include_str!("send.rs");
-        for forbidden in [concat!("--", "password"), concat!("--", "emails")] {
-            assert!(
-                !source.contains(forbidden),
-                "`{forbidden}` is spelled in this file: every field that carries a secret or a \
-                 recipient list goes in as JSON on stdin, never as a flag"
-            );
-        }
+        let any_password_flag = source.matches(concat!("--", "password")).count();
+        let environment_flag = source.matches(concat!("--", "passwordenv")).count();
         assert!(
-            source.contains(concat!("--", "password").trim_start_matches('-')),
-            "control: the needles above are not vacuous -- the bare word is present, so the \
+            environment_flag > 0,
+            "control: the environment password flag is spelled nowhere in this file, so the \
+             subtraction below compares nothing with nothing"
+        );
+        assert_eq!(
+            any_password_flag - environment_flag,
+            0,
+            "a password flag other than the environment one is spelled in this file: the \
+             inline flag puts the secret in argv and the file flag writes it to disk. The \
+             share password belongs in the variable the environment flag names, and nothing \
+             else."
+        );
+        assert!(
+            !source.contains(concat!("--", "emails")),
+            "the recipient-list flag is spelled in this file: a recipient list goes in as JSON \
+             on stdin, never as a flag"
+        );
+        assert!(
+            source.contains(concat!("--", "emails").trim_start_matches('-')),
+            "control: the needle above is not vacuous -- the bare word is present, so the \
              absence asserted is the absence of the flag spelling"
         );
     }
@@ -2974,11 +3245,32 @@ mod tests {
     }
 
     /// The source pin. The test above only covers the plans it happens to
-    /// build; this covers every plan there could ever be, by saying the two
-    /// flags are not written anywhere in this file at all -- not in
-    /// production, not in a doc comment a future reader could copy.
+    /// build; this covers every plan there could ever be, by saying the
+    /// secret-bearing flags are not written anywhere in this file at all --
+    /// not in production, not in a doc comment a future reader could copy.
+    ///
+    /// **This is the successor to `the_two_secret_bearing_flags_appear_nowhere_in_this_file`,
+    /// and the change was deliberate rather than a widening.** That test
+    /// banned every occurrence of the bare flag spelling outright, which was
+    /// exactly right while this module had only `create`: everything a create
+    /// carries travels in the JSON body over stdin, so no password flag of any
+    /// kind had a reason to exist here.
+    ///
+    /// `bw send receive` has no stdin route for its password -- measured, and
+    /// written down in the module docs -- so the fetch path had to pick one of
+    /// three flags, and the safest of them, `--passwordenv`, *contains* the
+    /// banned string as a prefix. A ban that refuses the safe flag along with
+    /// the two dangerous ones is not a safety control; it is a control that
+    /// pushes the next author into `concat!` and out of sight.
+    ///
+    /// So the rule is now sharper, not looser: **every occurrence of the flag
+    /// prefix in this file must be part of `--passwordenv`.** That still
+    /// refuses the inline flag, and it additionally refuses the file-path one,
+    /// which the old ban would have let through -- a path on disk outlives the
+    /// run, so it is worse than argv in one respect the old rule never
+    /// considered.
     #[test]
-    fn the_two_secret_bearing_flags_appear_nowhere_in_this_file() {
+    fn the_only_password_flag_this_file_spells_is_the_environment_one() {
         let source = include_str!("send.rs");
         // Positive controls: the file was really read, and `contains` really
         // finds things in it. Without these the assertions below would pass
@@ -2989,16 +3281,148 @@ mod tests {
             "the control marker is missing, so this test is not reading this file"
         );
 
-        for flag in [concat!("--", "password"), concat!("--", "emails")] {
-            assert_eq!(
-                source.matches(flag).count(),
-                0,
-                "{flag:?} is spelled in send.rs. Both of those flags carry a secret or a \
-                 recipient list on the command line, where every process on the machine can \
-                 read it. Everything they would carry belongs in the JSON body, which goes \
-                 over stdin."
+        // Spelled with `concat!` so that this test's own source is not an
+        // occurrence of what it counts -- the whole file, tests included, is
+        // the haystack.
+        let any_password_flag = source.matches(concat!("--", "password")).count();
+        let environment_flag = source.matches(concat!("--", "passwordenv")).count();
+
+        // Control, and it is the load-bearing one: the safe flag really is in
+        // this file. Without it the subtraction below would read 0 - 0 == 0
+        // over a file that had lost the fetch path entirely, and over a file
+        // that had moved the flag into a `concat!` where nothing can see it.
+        assert!(
+            environment_flag > 0,
+            "the environment password flag is spelled nowhere in send.rs, so the subtraction \
+             below compares nothing with nothing -- either the fetch path is gone or its flag \
+             has been assembled out of pieces where no source pin can read it"
+        );
+        assert_eq!(
+            any_password_flag - environment_flag,
+            0,
+            "send.rs spells a password flag that is not the environment one. There are two, \
+             and this module refuses both: the flag that takes the password inline puts it in \
+             argv, where every process on the machine can read it, and the flag that takes a \
+             file path writes it to disk, where it outlives the run. The share password \
+             belongs in the variable `--passwordenv` names, and nothing else."
+        );
+
+        assert_eq!(
+            source.matches(concat!("--", "emails")).count(),
+            0,
+            "the recipient-list flag is spelled in send.rs. It carries a recipient list on the \
+             command line, where every process on the machine can read it; everything it would \
+             carry belongs in the JSON body, which goes over stdin."
+        );
+    }
+
+    // -- 2b. fetching a Send -----------------------------------------------
+    //
+    // `bw send receive` is the one command in this module whose POSITIONAL
+    // argument is itself a secret: the access URL carries the Send's
+    // decryption key in its fragment. So the two rules pull in opposite
+    // directions here -- the URL must be in argv (there is nowhere else `bw`
+    // will read it from) and the share password must not be.
+
+    /// Invented, and shaped like a real one: the fragment after `#` is where
+    /// a Send's decryption key lives, which is why `SendInvocation`'s `Debug`
+    /// elides the whole argument vector of a receive.
+    const RECEIVE_URL: &str = "https://vault.bitwarden.com/#/send/an-invented-id/an-invented-key";
+    /// Invented. Long enough that a `contains` for it is not vacuous.
+    const RECEIVE_PASSWORD: &str = "receive-share-pw-4471";
+
+    #[test]
+    fn a_receive_puts_the_link_in_argv_and_the_share_password_nowhere_in_it() {
+        let inv = receive_invocation(RECEIVE_URL, Some(RECEIVE_PASSWORD));
+
+        // POSITIVE first. "The password is not in argv" is true of an empty
+        // argument vector, and an empty argument vector fetches nothing, so
+        // the whole of what `bw` is handed is asserted by equality.
+        assert_eq!(
+            inv.args(),
+            [
+                "send",
+                "receive",
+                concat!("--", "passwordenv"),
+                SEND_PASSWORD_ENV,
+                RECEIVE_URL,
+            ],
+            "the receive's argument vector is not the one `bw send receive [options] <url>` \
+             documents"
+        );
+
+        // NEGATIVE. The share password travels in the environment, which is
+        // what `--passwordenv` names: a process's argument vector is readable
+        // by every other process on this machine, and the flag that takes the
+        // password inline would put the secret straight into it.
+        for arg in inv.args() {
+            assert!(
+                !arg.contains(RECEIVE_PASSWORD),
+                "the share password reached the command line, where every process on this \
+                 machine can read it: {arg:?}"
             );
         }
+        // Control on the loop above: the password is a real string, and it
+        // really did reach the invocation -- so "not in argv" is a statement
+        // about WHERE it went and not about a password that vanished.
+        assert!(RECEIVE_PASSWORD.len() > 8, "control: the needle is a real string");
+        assert_eq!(
+            inv.send_password.as_deref().map(String::as_str),
+            Some(RECEIVE_PASSWORD),
+            "the password did not reach the invocation at all, so the argv check above is \
+             about nothing"
+        );
+
+        // And a receive carries no session: fetching a Send is anonymous, and
+        // the token that unlocks the whole vault has no business in a child
+        // that does not need it.
+        assert_eq!(inv.session_token(), None);
+        assert_eq!(inv.stdin_json_b64(), "");
+    }
+
+    #[test]
+    fn a_receive_without_a_password_names_no_password_source_at_all() {
+        // The differential half: an absent password must change the argument
+        // vector, or the flag above is unconditional decoration and the
+        // environment variable is read by `bw` when nothing set it.
+        let inv = receive_invocation(RECEIVE_URL, None);
+        assert_eq!(
+            inv.args(),
+            ["send", "receive", RECEIVE_URL],
+            "a receive built with no password still names a password source"
+        );
+        assert!(inv.send_password.is_none());
+    }
+
+    #[test]
+    fn a_receives_debug_elides_the_link_that_carries_the_decryption_key() {
+        // `SendInvocation`'s hand-written `Debug` printed `args` in full, on
+        // the stated grounds that the arguments are pinned never to carry a
+        // secret. A receive's URL breaks that premise: it is the same
+        // material `CreatedSend` and `SendSummary` already elide, for the
+        // reason `ElidedAccessUrl` gives.
+        let rendered = format!("{:?}", receive_invocation(RECEIVE_URL, Some(RECEIVE_PASSWORD)));
+        assert!(
+            !rendered.contains(RECEIVE_URL) && !rendered.contains("an-invented-key"),
+            "one `log::debug!(\"{{inv:?}}\")` writes a working decryption key to a plaintext \
+             log file: {rendered}"
+        );
+        assert!(
+            !rendered.contains(RECEIVE_PASSWORD),
+            "the share password reached a formatter: {rendered}"
+        );
+
+        // Controls, both directions. The render is a real one and still names
+        // the type; and a CREATE's `Debug` still prints its argument vector in
+        // full, so the elision above is a property of the receive rather than
+        // of a `Debug` that has stopped saying anything.
+        assert!(rendered.contains("SendInvocation"), "the render is not one: {rendered}");
+        let created = format!("{:?}", plan_to_invocation(&plan(), "sess", &NOW).expect("valid"));
+        assert!(
+            created.contains("\"create\""),
+            "a create's Debug no longer prints its arguments, so the receive's elision is \
+             indistinguishable from a Debug that prints nothing: {created}"
+        );
     }
 
     // -- 3. classify_failure, every arm ------------------------------------

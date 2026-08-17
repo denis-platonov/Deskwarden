@@ -5623,6 +5623,16 @@ mod source_pins {
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",
         "send.rs: pub fn session_token(&self) -> Option<&str> {",
         "send.rs: pub fn plan_to_invocation(",
+        // **Added by the record-import plan's task 7, deliberately.** It is a
+        // `pub fn` where `list_invocation` and `delete_invocation` beside it
+        // are private, and that difference is the whole of the decision: those
+        // two each have a `pub` entry point that RUNS them, so the builder
+        // itself never had to be reachable. The fetch path has no runner yet,
+        // so the import surface being built on top of it needs the builder.
+        // Nothing behind this door spawns anything -- building a
+        // `SendInvocation` starts no process, and there is still no `pub`
+        // implementation of `SendRunner` in this crate to hand one to.
+        "send.rs: pub fn receive_invocation(url: &str, password: Option<&str>) -> SendInvocation {",
         "send.rs: pub struct CreatedSend {",
         "send.rs: pub id: String,",
         "send.rs: pub name: String,",
