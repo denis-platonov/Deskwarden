@@ -2,6 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **STATUS: COMPLETE 2026-08-17.** Task 1 **cancelled** by decision (revoke
+> keeps deleting). Tasks 2, 3 and 4 are **done** — `5eab0ff`, `c76e3fe`,
+> `a7c98da`. Three findings worth carrying forward:
+>
+> - **Task 2 named two carriers of the decryption key; there were three.**
+>   `RawOutput` also derived `Debug`, and for `bw send create` its `stdout`
+>   *is* the response body — `accessUrl` plus the secret itself in
+>   `text.text`. It is the one a person actually reaches for when a Send
+>   fails. Any future type that holds `bw` output verbatim needs the same
+>   treatment.
+> - **Task 4 said six squashers; there are seven**, and the three not yet
+>   converted were measured and did **not** red — they squash
+>   `code_braces_only(...)` output, which already blanks comments. They were
+>   correctly left alone, and the verdict is recorded beside each.
+> - **Task 3's bypass was the only one.** The census found every other
+>   outward `spawn_*` in `run` already goes through its seam binding. The
+>   standing "do not copy `mod.rs:1438`" warning is retired. Closing it also
+>   made the sync-success pill test feasible, which had been uncovered since
+>   the `frame_promptness` fix.
+
 **Goal:** Four small, independent corrections found during the 2026-08-13 review and flake work, each cheap and each closing a real hole rather than a hypothetical one.
 
 **Architecture:** No new subsystems. Each task is a contained change to an existing file with a test that fails before it and passes after.
