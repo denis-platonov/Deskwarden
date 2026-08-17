@@ -39,7 +39,7 @@ pub const SEAL_KDF: &str = "argon2id";
 /// Argon2id cost. The memory parameter is the one that matters against custom
 /// hardware; 19 MiB with `t=2, p=1` is the OWASP-recommended pairing.
 ///
-/// **Measured, not assumed**, on the machine this was written on: about 0.5 s
+/// **Measured, not assumed**, on the machine this was written on: about 0.7 s
 /// per derivation in a `debug` build and about 75 ms in `release`. The debug
 /// figure is the one the test suite pays, and it is why these numbers were
 /// checked rather than turned up further: the whole of this crate's record
