@@ -144,6 +144,41 @@ fn a_debug_render_never_carries_the_decryption_key() {
 
 ---
 
+---
+
+## Deferred: modifier-plus-letter chords (`^A`) — NOT scheduled
+
+**Decided 2026-08-13: not doing this now.** Recorded so the reasoning survives.
+
+`app_match.rs:116` describes the stored sequence as "in KeePass's notation", and
+KeePass supports modifier-plus-**letter** chords: `^A` is Ctrl+A, `^C`, `^V`.
+`^A{PASSWORD}` — replace whatever is prefilled, then type — is one of the
+commonest real auto-type sequences, and it is the design's own headline example
+in section 4a.
+
+**We support the modifiers but not letters.** `key_sequence.rs:193-195` maps
+`+`/`^`/`%` to Shift/Ctrl/Alt, so `^{TAB}` parses and compiles. `KEYS`
+(`key_sequence.rs:100`) contains only *named* keys — Enter, Tab, Esc, arrows,
+F-keys. There is no `A` in it, or any other letter.
+
+**Why deferring is safe:** the failure is loud. A modifier with nothing bindable
+after it becomes `Refusal::DanglingModifier` at plan time
+(`injector/sequence.rs:706` and `:780`), so a pasted KeePass sequence containing
+`^A` is refused with a named reason rather than silently typing the wrong keys.
+There is no data-corruption risk in leaving it unsupported — only a gap.
+
+**Why it is not a small job.** A letter's virtual-key code is **keyboard-layout
+dependent**: `^A` on AZERTY is a different physical key than on QWERTY. Doing it
+properly means `VkKeyScanEx` or scan codes, not a naive VK table — and a naive
+table would silently send the wrong chord for international users, which is a
+worse failure than the current refusal.
+
+**Revisit when** a real target application needs it — a prefilling login dialog
+is the likely trigger. At that point it is its own plan, with layout handling as
+its first task rather than an afterthought.
+
+---
+
 ## Notes for the implementer
 
 - Tasks 1 and 2 are both small `send.rs` edits in the same area and can share a commit if you prefer, though separate is cleaner for review.
