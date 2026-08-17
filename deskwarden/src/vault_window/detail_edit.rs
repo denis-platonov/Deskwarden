@@ -15,6 +15,7 @@ use crate::vault_bridge::{
 use crate::vault_bridge::{LoginData, UriEntry};
 use crate::vault_window::{detail, sidebar};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// The card-specific half of a draft (`type: 3`).
@@ -483,6 +484,32 @@ pub struct AppMatchDraft {
     /// one-line summary of what would be typed, and the button that opens it
     /// -- so the sequence is still *visible* without being in the way.
     pub sequence_open: bool,
+    /// Whether the sequence is being shown as the template STRING rather than
+    /// as the step list.
+    ///
+    /// A view flag and nothing more. Both views read and write
+    /// [`Self::sequence`], so switching between them is not a mode change with
+    /// its own state to reconcile -- it is the same string, drawn twice.
+    pub template_view: bool,
+    /// The text box behind the template view, seeded from [`Self::sequence`]
+    /// **verbatim** every time the view is entered.
+    ///
+    /// Separate from `sequence` only because egui's `TextEdit` needs a
+    /// `&mut String` it owns across a frame; the moment it changes, its bytes
+    /// are copied into `sequence` unaltered. Nothing here is ever rendered
+    /// through [`key_sequence::render`], so a template the user did not touch
+    /// leaves `sequence` byte for byte as it arrived -- the promise
+    /// [`AppMatch::sequence`] makes.
+    pub template_draft: String,
+    /// Whether the user has actually edited the template box.
+    ///
+    /// **The gate on the save refusal, and it has to be here.** A vault may
+    /// already hold a sequence this build cannot read back (an unterminated
+    /// brace another tool wrote); blocking Save on it would make renaming such
+    /// an item impossible, which is a worse outcome than carrying the string.
+    /// So the refusal applies to what the user WROTE, in the field that says
+    /// it will not parse, and never retroactively to what they inherited.
+    pub template_touched: bool,
 }
 
 /// The `trigger` a binding created in this form is born with.
@@ -536,6 +563,9 @@ impl AppMatchDraft {
             literal_draft: String::new(),
             wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
             sequence_open: false,
+            template_view: false,
+            template_draft: String::new(),
+            template_touched: false,
         }
     }
 
@@ -580,7 +610,22 @@ impl AppMatchDraft {
             literal_draft: String::new(),
             wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
             sequence_open: false,
+            template_view: false,
+            template_draft: String::new(),
+            template_touched: false,
         }
+    }
+
+    /// The template fault that must stop a save, or `None`.
+    ///
+    /// See [`template_fault`] for what "will not parse" means against a parser
+    /// that cannot fail, and [`Self::template_touched`] for why an inherited
+    /// string is not judged by it.
+    pub fn template_fault(&self) -> Option<&'static str> {
+        if !self.template_touched {
+            return None;
+        }
+        template_fault(&self.sequence)
     }
 
     /// The binding this draft would save.
@@ -1264,6 +1309,28 @@ impl EditDraft {
     /// legitimate for e.g. a placeholder entry.
     pub fn is_valid(&self) -> bool {
         !self.name.trim().is_empty()
+    }
+
+    /// The keystroke template's refusal, or `None`.
+    ///
+    /// Separate from [`Self::is_valid`] rather than folded into it, because the
+    /// two say different things and the strip says both: "Name is required." is
+    /// about a box the user has not filled in, and this is about a string the
+    /// user wrote that this build cannot read back. A single bool would have
+    /// one caption for two faults.
+    pub fn sequence_fault(&self) -> Option<&'static str> {
+        self.app.as_ref().and_then(AppMatchDraft::template_fault)
+    }
+
+    /// **The save gate.** A name, a creatable kind (the caller's own check),
+    /// and a template that parses.
+    ///
+    /// This is where the design's "a template that won't parse can't be saved"
+    /// lives, and it is on the DRAFT rather than in the button, so it is a
+    /// decision a test can call. See [`template_fault`] for what "won't parse"
+    /// means against a parser that is total by design.
+    pub fn is_saveable(&self) -> bool {
+        self.is_valid() && self.sequence_fault().is_none()
     }
 
     /// Whether the form may offer "No folder".
@@ -2116,6 +2183,406 @@ pub fn sequence_with_wait(sequence: &str, seconds: &str) -> Option<String> {
     Some(sequence_with(sequence, key_sequence::Token::Delay(ms)))
 }
 
+// ---------------------------------------------------------------------------
+// 4a -- the step list
+//
+// The design's premise: the steps are the editor, and the template string is a
+// second view of the same steps. What follows is the step MODEL -- the rows,
+// their badges, their payloads and the running tally -- derived purely from the
+// stored string so every one of it is callable from a test rather than only
+// reachable through a frame.
+//
+// ROWS ARE ONE PER TOKEN, and that is load-bearing: the up, down and delete
+// controls hand their row's index straight to `sequence_moved` and
+// `sequence_without`, which index the TOKEN list. A row model that folded two
+// tokens into one row (which is what the design's picture does with
+// `{DELAY=40}`) would make every index below the fold wrong. So a `{DELAY=n}`
+// gets its own row AND is folded into the note of the text rows it governs --
+// the design's reading is preserved without the indices lying.
+// ---------------------------------------------------------------------------
+
+/// The badge at the head of a step row: what kind of act the step is.
+///
+/// [`Self::Rate`] and [`Self::Raw`] are the two the design does not draw.
+/// They exist because the token list can contain things that are not acts --
+/// a typing-rate change, a grouping character, a construct from another
+/// password manager -- and a row model with nowhere to put them would have to
+/// either drop them (losing the user's string) or mislabel them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    Key,
+    Text,
+    Wait,
+    /// `{DELAY=n}` -- not an act, a change to the rate the rows below type at.
+    Rate,
+    /// Carried, not acted on. See [`SEQUENCE_UNKNOWN_TIP`].
+    Raw,
+}
+
+impl StepKind {
+    /// The badge caption. Short and upper-case so the column reads as a
+    /// column, which is the whole of what the design asks of it.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Key => "KEY",
+            Self::Text => "TEXT",
+            Self::Wait => "WAIT",
+            Self::Rate => "RATE",
+            Self::Raw => "RAW",
+        }
+    }
+}
+
+/// What a secret step's payload column shows instead of the secret.
+///
+/// **A FIXED number of dots, not the value's length.** The design draws
+/// "•••••••••••• 20 chars", and this build deliberately does not: see
+/// [`APP_SEQUENCE_HIDDEN_NOTE`], which settled the same question for the eye.
+/// A dotted run whose length is the password's length tells anyone looking at
+/// the screen how long the password is, which is the one fact about it that is
+/// useful to an attacker and useless to the user.
+pub const SECRET_MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+/// The note on a step whose payload is a secret. Says why the column is empty
+/// of information rather than leaving the mask to be read as the value.
+pub const SECRET_NOTE: &str = "hidden \u{2014} never shown here";
+
+/// The note on a step that carries no note of its own. An em dash, which is
+/// what the design draws in the same cell.
+pub const NO_NOTE: &str = "\u{2014}";
+
+/// One row of the step list.
+///
+/// **`payload` never holds a password.** The only branch that can put a
+/// resolved value in it is gated on the field NOT being
+/// [`FieldRef::Password`], and the password branch writes [`SECRET_MASK`]
+/// unconditionally -- not "when hidden", unconditionally. There is no argument
+/// to this function that turns that off, which is the difference between a
+/// masked field and a field that happens to be masked right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRow {
+    /// 1-based, as drawn. `number - 1` is the token index the row's controls
+    /// act on -- see the module comment above on why that identity holds.
+    pub number: usize,
+    pub kind: StepKind,
+    /// What the step is, in the same words the chip used to say
+    /// ([`Token::chip_label`]), so the two views of a step cannot drift.
+    pub label: String,
+    /// The value column: the mask for a secret, the resolved value for a
+    /// revealed non-secret, and empty otherwise.
+    pub payload: String,
+    /// Whether `payload` is a mask standing in for something that is never
+    /// drawn.
+    pub secret: bool,
+    pub note: String,
+    /// Whether this build knows what the step is. `false` draws it faintly and
+    /// says [`SEQUENCE_UNKNOWN_TIP`] on hover.
+    pub understood: bool,
+}
+
+/// The typing-rate note carried by a text row, in the design's words.
+fn rate_note(rate: Option<u32>) -> String {
+    let ms = rate.unwrap_or_else(|| {
+        u32::try_from(crate::injector::sequence::DEFAULT_RATE.as_millis()).unwrap_or(u32::MAX)
+    });
+    format!("{ms} ms/char")
+}
+
+/// The step list for `sequence`, as drawn.
+///
+/// `reveal` is the eye (`AppMatchDraft::previewing`): with it shut, a field row
+/// names its field and shows no value at all. With it open, a non-secret field
+/// shows what it would resolve to -- the same thing the preview line already
+/// showed, in the row that will type it. **A password shows [`SECRET_MASK`] in
+/// both states**, and a one-time code is treated as a secret too: it is a
+/// credential, and the design's own rule is that secrets are masked.
+pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Vec<StepRow> {
+    let tokens = sequence_view(sequence).tokens;
+    let mut rate: Option<u32> = None;
+    let mut rows = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        let (kind, payload, secret, note) = match token {
+            Token::Literal(_) => (StepKind::Text, String::new(), false, rate_note(rate)),
+            Token::Field(field) => {
+                let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
+                let payload = if secret {
+                    SECRET_MASK.to_string()
+                } else if reveal {
+                    resolved_value(field, source)
+                } else {
+                    String::new()
+                };
+                let note =
+                    if secret { format!("{} \u{b7} {}", rate_note(rate), SECRET_NOTE) } else { rate_note(rate) };
+                (StepKind::Text, payload, secret, note)
+            }
+            Token::Key(_) => (StepKind::Key, String::new(), false, NO_NOTE.to_string()),
+            Token::Delay(_) => (StepKind::Wait, String::new(), false, NO_NOTE.to_string()),
+            Token::DelayRate(ms) => {
+                rate = Some(*ms);
+                (StepKind::Rate, String::new(), false, RATE_NOTE.to_string())
+            }
+            Token::Modifier(_) => (StepKind::Key, String::new(), false, MODIFIER_NOTE.to_string()),
+            Token::Grouping(_) | Token::Unknown(_) => {
+                (StepKind::Raw, String::new(), false, NO_NOTE.to_string())
+            }
+        };
+        rows.push(StepRow {
+            number: index + 1,
+            kind,
+            label: token.chip_label(),
+            payload,
+            secret,
+            note,
+            understood: token.is_understood(),
+        });
+    }
+    rows
+}
+
+/// The note on a `{DELAY=n}` row.
+pub const RATE_NOTE: &str = "sets the typing speed from here on";
+
+/// The note on a bare modifier, which is held for the key that follows it.
+pub const MODIFIER_NOTE: &str = "held for the next key";
+
+/// A non-secret field's value, for the revealed payload column.
+///
+/// **Never reached for a password**: [`step_rows`]'s only call site is inside
+/// the `else` of a `matches!(field, FieldRef::Password | FieldRef::Totp)`. It
+/// is written to answer honestly for the fields it does see, and the
+/// unresolved cases come back as the same sentence
+/// [`key_sequence::resolve_preview`] already uses, so the row and the preview
+/// say one thing.
+fn resolved_value(field: &FieldRef, source: &ResolveSource<'_>) -> String {
+    let parts = key_sequence::resolve_preview(
+        std::slice::from_ref(&Token::Field(field.clone())),
+        source,
+    );
+    match parts.first() {
+        Some(PreviewPart::Value(v)) => v.clone(),
+        Some(PreviewPart::Unresolved(why)) => why.clone(),
+        Some(PreviewPart::Pending) => "fetching\u{2026}".to_string(),
+        _ => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "N steps . T total" -- the running summary, and the budget
+// ---------------------------------------------------------------------------
+
+/// What the sequence adds up to, **asked of the runner's own plan**.
+///
+/// Not a second projection: [`injector::sequence::Step::projected`] is the one
+/// answer to "how long does this take", and it is the same answer
+/// [`injector::sequence::MAX_SEQUENCE`] and [`injector::sequence::MAX_BURST`]
+/// are checked against at fill time. A count computed here would drift from the
+/// thing that actually refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceTally {
+    /// The ACTS the sequence performs, which is neither the number of rows nor
+    /// [`injector::sequence::Plan::len`].
+    ///
+    /// Not the rows, because a `{DELAY=n}` is a row and no act, and a run of
+    /// literal text either side of a `{USERNAME}` is three rows and one.
+    ///
+    /// **And deliberately not `Plan::len` either**, which was the first
+    /// implementation and was wrong on screen: `plan` splits a text run into
+    /// [`injector::sequence::MAX_BURST`]-sized chunks so it can re-check the
+    /// foreground between them, so a 21-character password typed at 40 ms/char
+    /// is four `Step::Text`s. Those four are one thing the user did and one
+    /// row in the list; reporting "9 steps" for the six-row sequence in the
+    /// design would be counting an implementation detail of the runner's
+    /// safety check. The DURATION still comes from the plan, because there the
+    /// chunking makes no difference to the sum.
+    pub steps: usize,
+    pub total: Duration,
+    /// The longest single step, against [`injector::sequence::MAX_BURST`].
+    pub burst: Duration,
+}
+
+/// [`SequenceTally`] for `sequence`, or `None` when the runner would refuse it
+/// outright (in which case [`sequence_warning`] is already saying why).
+///
+/// The [`Plan`](crate::injector::sequence::Plan) is read and dropped inside
+/// this function, and its `Drop` wipes the plaintext it copied -- the same care
+/// [`sequence_refusal`] takes, for the same reason.
+pub fn sequence_tally(sequence: &str, source: &ResolveSource<'_>) -> Option<SequenceTally> {
+    let tokens = sequence_view(sequence).tokens;
+    let values = crate::injector::sequence::Resolved {
+        username: source.username,
+        password: source.password,
+        totp: edit_time_totp(source.totp),
+        custom: source.custom.clone(),
+    };
+    let plan = crate::injector::sequence::plan(&tokens, &values).ok()?;
+    let tally = SequenceTally {
+        steps: acts(&tokens),
+        total: plan.projected(),
+        burst: plan
+            .steps()
+            .iter()
+            .map(crate::injector::sequence::Step::projected)
+            .max()
+            .unwrap_or(Duration::ZERO),
+    };
+    Some(tally)
+}
+
+/// How many ACTS `tokens` describe. See [`SequenceTally::steps`].
+///
+/// A run of adjacent text-producing tokens is one act, a key (with whatever
+/// modifiers precede it) is one, a pause is one, and a rate change is none.
+/// The same grouping [`injector::sequence::Step`] makes, taken BEFORE the
+/// burst chunking rather than after it.
+fn acts(tokens: &[Token]) -> usize {
+    let mut count = 0;
+    let mut typing = false;
+    for token in tokens {
+        match token {
+            Token::Literal(_) | Token::Field(_) => {
+                if !typing {
+                    count += 1;
+                    typing = true;
+                }
+            }
+            Token::Key(_) | Token::Delay(_) => {
+                count += 1;
+                typing = false;
+            }
+            // Held for the key that follows, which is the act.
+            Token::Modifier(_) => typing = false,
+            // Not an act at all -- it changes how the acts below type.
+            Token::DelayRate(_) => {}
+            Token::Grouping(_) | Token::Unknown(_) => typing = false,
+        }
+    }
+    count
+}
+
+/// A duration in the words the design uses: milliseconds under a second, one
+/// decimal of a second above it. Never "0 s" for a real pause -- see
+/// [`key_sequence::wait_label`], which made the same call for the same reason.
+pub fn duration_label(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
+    }
+}
+
+/// The design's "6 steps \u{b7} 2.1 s" line.
+pub fn tally_label(tally: &SequenceTally) -> String {
+    let unit = if tally.steps == 1 { "step" } else { "steps" };
+    format!("{} {unit} \u{b7} {} total", tally.steps, duration_label(tally.total))
+}
+
+/// The design's budget pair, **against the crate's real limits** rather than
+/// the illustrative 512/64 in the picture.
+pub fn budget_label(tally: &SequenceTally) -> String {
+    format!(
+        "{} of {} total \u{b7} {} of {} in one burst",
+        duration_label(tally.total),
+        duration_label(crate::injector::sequence::MAX_SEQUENCE),
+        duration_label(tally.burst),
+        duration_label(crate::injector::sequence::MAX_BURST),
+    )
+}
+
+/// What the summary says when the runner refuses the sequence outright, so the
+/// line is never blank. The reason itself is already above, in
+/// [`sequence_warning`]'s words.
+pub const TALLY_REFUSED: &str = "won't run \u{2014} see above";
+
+// ---------------------------------------------------------------------------
+// 4c -- the template view, and the bridge
+// ---------------------------------------------------------------------------
+
+/// The two captions of the Steps/Template toggle.
+pub const VIEW_STEPS: &str = "Steps";
+pub const VIEW_TEMPLATE: &str = "Template";
+
+/// The insert chips, **in the grammar `key_sequence` really parses**.
+///
+/// The design's picture writes a pause as `{WAIT=250}`. There is no such
+/// construct: [`key_sequence::parse`] reads a pause as `{DELAY 250}` (a space)
+/// and a typing rate as `{DELAY=50}` (an equals sign), and a `{WAIT=250}` would
+/// come back as [`Token::Unknown`] and be refused at fill time. The template
+/// view's entire premise is that the string in the box IS the stored string, so
+/// a second spelling here would be a chip that writes a sequence this build
+/// cannot run.
+///
+/// The design's `{SHIFT+TAB}` is wrong the same way and for a different
+/// reason: a chord in this grammar is a MODIFIER CHARACTER before a key, so
+/// Shift+Tab is `+{TAB}`. (`{CTRL+A}`, which the design's own example opens
+/// with, has no spelling at all here -- `^` before a literal letter is
+/// [`injector::sequence::Refusal::DanglingModifier`], and there is no `A` in
+/// [`key_sequence::KEYS`] -- so it is not offered rather than offered broken.)
+pub const TEMPLATE_CHIPS: &[&str] = &[
+    "{USERNAME}",
+    "{PASSWORD}",
+    "{TOTP}",
+    "{TAB}",
+    "+{TAB}",
+    "{ENTER}",
+    "{DELAY 250}",
+    "{DELAY=50}",
+];
+
+/// `template` with `chip` added on the end.
+///
+/// Inserting into an EMPTY template **materialises the default first**, for
+/// exactly the reason [`sequence_with`] does: an empty stored value means
+/// [`key_sequence::DEFAULT_SEQUENCE`], and a chip click that silently replaced
+/// that whole fill with one token would be a delete wearing an add's caption.
+pub fn template_with(template: &str, chip: &str) -> String {
+    if template.is_empty() {
+        format!("{}{chip}", key_sequence::DEFAULT_SEQUENCE)
+    } else {
+        format!("{template}{chip}")
+    }
+}
+
+/// The refusal shown under an unparseable template, and the reason Save is off.
+pub const TEMPLATE_UNPARSED: &str =
+    "This template has a `{` that is never closed, so the steps below are not what it says. \
+     Close the brace, or write `{{}` to type a brace.";
+
+/// Whether `template` is a string this build can hold without changing it.
+///
+/// **What "will not parse" means against a parser that cannot fail.**
+/// [`key_sequence::parse`] is total by design -- an unknown `{WHATEVER}` rides
+/// through as [`Token::Unknown`] so a sequence from another password manager is
+/// never destroyed by being looked at. That deliberate totality means "parse
+/// returned an error" is not available as the test, and inventing one would
+/// mean refusing to save exactly the foreign sequences `AppMatch::sequence`
+/// exists to carry.
+///
+/// The honest test is the ROUND TRIP: a template is well formed when
+/// `render(parse(t)) == t`, i.e. when the step list under the field really is
+/// the string in the field. The one shape that fails it is an unterminated `{`
+/// -- which parses as literal text and renders back with the brace escaped, so
+/// the string the user is looking at and the string that would be typed differ.
+/// That is precisely the case the design says cannot be saved, and it is the
+/// only one, so nothing well-formed is caught by it.
+pub fn template_fault(template: &str) -> Option<&'static str> {
+    if template.is_empty() {
+        return None;
+    }
+    let tokens = key_sequence::parse(template);
+    (key_sequence::render(&tokens) != template).then_some(TEMPLATE_UNPARSED)
+}
+
+/// The note under an empty template box. Names the default rather than leaving
+/// a blank field reading as "types nothing" -- the same correction
+/// [`APP_SEQUENCE_DEFAULT_NOTICE`] makes on the steps side.
+pub const TEMPLATE_EMPTY_NOTE: &str =
+    "Empty means the default: {USERNAME}{TAB}{PASSWORD}. Type a template to change it.";
+
+/// The line above the parsed step list in the template view.
+pub const TEMPLATE_READS_AS: &str = "Reads as";
+
 /// The field buttons this form offers, for the item **as it is being edited**.
 ///
 /// The user name and the password come from the DRAFT rather than the item,
@@ -2343,40 +2810,125 @@ enum ChipEdit {
     Remove(usize),
 }
 
-/// The wrapped chip row. Returns the one edit clicked, if any.
-fn sequence_chips(ui: &mut egui::Ui, tokens: &[Token]) -> Option<ChipEdit> {
+/// The badge's ink. One accent hue: the understood kinds wear the blue, and
+/// the two that are carried rather than acted on wear the faint ink -- the
+/// same distinction the chips drew, said in colour rather than in fill.
+fn badge_ink(row: &StepRow) -> egui::Color32 {
+    match row.kind {
+        _ if !row.understood => theme::TEXT_FAINT,
+        StepKind::Rate | StepKind::Raw => theme::TEXT_MUTED,
+        _ => theme::BLUE,
+    }
+}
+
+/// The step list: one card-shaped row per token, with the controls that move
+/// and remove it.
+///
+/// **A row per token and a control set per row**, which is what makes the
+/// index a row hands to [`sequence_moved`] the index that function means. The
+/// captions are still `<`, `>` and `x` and still sit to the RIGHT of the row's
+/// label, because that is the geometry `control_beside` in the tests reads --
+/// and because an arrow glyph the app's Latin text face has no coverage for
+/// draws as a box (see [`small_chip_button`]).
+///
+/// `editable` is false in the template view, where the list is the read-out of
+/// what the string became rather than the thing being edited.
+///
+/// Returns the one edit clicked, applied by the caller after the loop so the
+/// borrow of the row list is over first.
+fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<ChipEdit> {
     let mut edit = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(3.0, 4.0);
-        for (index, token) in tokens.iter().enumerate() {
-            // An unknown step is drawn in the faint ink and says so on hover:
-            // it is carried, not acted on, and a user looking at an imported
-            // sequence should be able to see which is which.
-            let understood = token.is_understood();
-            let chip = egui::Button::new(
-                theme::semibold(token.chip_label(), 12.0)
-                    .color(if understood { theme::INK } else { theme::TEXT_FAINT }),
-            )
-            .fill(if understood { theme::BLUE_WASH } else { theme::CARD_TINT })
-            .stroke(Stroke::new(1.0, if understood { theme::BLUE_EDGE } else { theme::BORDER }))
-            .corner_radius(CornerRadius::same(7))
-            .wrap();
-            let response = ui.add(chip);
-            if !understood {
-                response.on_hover_text(SEQUENCE_UNKNOWN_TIP);
-            }
-            if ui.add_enabled(index > 0, small_chip_button("<")).clicked() {
-                edit = Some(ChipEdit::Back(index));
-            }
-            if ui.add_enabled(index + 1 < tokens.len(), small_chip_button(">")).clicked() {
-                edit = Some(ChipEdit::Forward(index));
-            }
-            if ui.add(small_chip_button("x")).clicked() {
-                edit = Some(ChipEdit::Remove(index));
+    for row in rows {
+        egui::Frame::new()
+            .fill(if row.secret { theme::CARD_TINT } else { theme::CARD })
+            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // **The note gets its own line, and that is a layout fact
+                // rather than a taste.** The pane is 298pt at the app's
+                // minimum size; a note like "40 ms/char . hidden -- never
+                // shown here" is wider than that on its own, so put on the
+                // same wrapped row as the index and the badge it wraps to a
+                // multi-line galley that egui lays out ACROSS the row's other
+                // runs -- `no_two_runs_on_the_tallest_edit_form_overlap`
+                // caught exactly that, with the note painted over the index.
+                // Line one is the step; line two is what to know about it.
+                ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
+                    ui.label(
+                        RichText::new(row.number.to_string()).size(11.0).color(theme::TEXT_GHOST),
+                    );
+                    ui.label(theme::semibold(row.kind.badge(), 10.0).color(badge_ink(row)));
+                    let label = ui.label(
+                        theme::semibold(row.label.clone(), 12.0).color(if row.understood {
+                            theme::INK
+                        } else {
+                            theme::TEXT_FAINT
+                        }),
+                    );
+                    if !row.understood {
+                        label.on_hover_text(SEQUENCE_UNKNOWN_TIP);
+                    }
+                    if !row.payload.is_empty() {
+                        // A mask is not a value and must not be drawn like
+                        // one: the accent ink is reserved for something the
+                        // user can actually read.
+                        ui.label(RichText::new(row.payload.clone()).size(12.0).color(
+                            if row.secret { theme::TEXT_MUTED } else { theme::BLUE },
+                        ));
+                    }
+                    if editable {
+                        let index = row.number - 1;
+                        if ui.add_enabled(index > 0, small_chip_button("<")).clicked() {
+                            edit = Some(ChipEdit::Back(index));
+                        }
+                        if ui
+                            .add_enabled(row.number < rows.len(), small_chip_button(">"))
+                            .clicked()
+                        {
+                            edit = Some(ChipEdit::Forward(index));
+                        }
+                        if ui.add(small_chip_button("x")).clicked() {
+                            edit = Some(ChipEdit::Remove(index));
+                        }
+                    }
+                });
+                ui.label(RichText::new(row.note.clone()).size(11.0).color(theme::TEXT_FAINT));
+                });
+            });
+        ui.add_space(4.0);
+    }
+    edit
+}
+
+/// The Steps / Template toggle. Returns the view asked for, or `None`.
+///
+/// Two buttons rather than a segmented control, because egui has no segmented
+/// control and a painted one would be hit-testing built by hand for no gain --
+/// the state is already visible in which of the two is drawn as the current
+/// one.
+fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
+    let mut asked = None;
+    ui.horizontal(|ui| {
+        for (caption, is_template) in [(VIEW_STEPS, false), (VIEW_TEMPLATE, true)] {
+            let current = template_view == is_template;
+            let button = egui::Button::new(theme::semibold(caption, 11.0).color(if current {
+                theme::INK
+            } else {
+                theme::TEXT_MUTED
+            }))
+            .fill(if current { theme::BLUE_WASH } else { theme::CARD })
+            .stroke(Stroke::new(1.0, if current { theme::BLUE_EDGE } else { theme::BORDER }))
+            .corner_radius(CornerRadius::same(7));
+            if ui.add(button).clicked() && !current {
+                asked = Some(is_template);
             }
         }
     });
-    edit
+    asked
 }
 
 /// The tip on a step this build carries but does not understand.
@@ -2465,7 +3017,34 @@ fn app_sequence_block(
         ui.add_space(4.0);
     }
 
-    if let Some(edit) = sequence_chips(ui, &view.tokens) {
+    // -- the tally, and the view toggle ------------------------------------
+    //
+    // Both above the list, because both are statements ABOUT the list: how
+    // much of it there is, and which of its two spellings is on screen.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+        let summary = match sequence_tally(&app.sequence, source) {
+            Some(tally) => tally_label(&tally),
+            None => TALLY_REFUSED.to_string(),
+        };
+        ui.label(theme::semibold(summary, 11.0).color(theme::TEXT_SECONDARY));
+        if let Some(wants_template) = view_toggle(ui, app.template_view) {
+            // **Seeded verbatim, every time the view is entered.** Not
+            // `render`ed, not normalised: the box holds the bytes the item
+            // holds, so a user who opens the template view and closes it again
+            // has changed nothing at all. See `AppMatchDraft::template_draft`.
+            if wants_template {
+                app.template_draft = app.sequence.clone();
+            }
+            app.template_view = wants_template;
+        }
+    });
+    ui.add_space(6.0);
+
+    if app.template_view {
+        app_template_view(ui, app, source);
+    } else if let Some(edit) = sequence_steps(ui, &step_rows(&app.sequence, source, app.previewing), true)
+    {
         app.sequence = match edit {
             ChipEdit::Back(i) => sequence_moved(&app.sequence, i, true),
             ChipEdit::Forward(i) => sequence_moved(&app.sequence, i, false),
@@ -2473,6 +3052,26 @@ fn app_sequence_block(
         };
     }
     ui.add_space(8.0);
+
+    if let Some(tally) = sequence_tally(&app.sequence, source) {
+        ui.label(RichText::new(budget_label(&tally)).size(11.0).color(theme::TEXT_GHOST));
+        ui.add_space(6.0);
+    }
+
+    // The palette below belongs to the step list. In the template view the
+    // insert chips are the palette, and a second set of Add buttons writing to
+    // a string the user is editing by hand would fight the cursor.
+    if app.template_view {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            if theme::secondary_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+                app.sequence_open = false;
+                app.previewing = false;
+            }
+        });
+        ui.add_space(10.0);
+        return;
+    }
 
     // -- the palette: nothing here is typed from memory --------------------
     ui.label(RichText::new("Add a value").size(11.0).color(theme::TEXT_FAINT));
@@ -2566,6 +3165,68 @@ fn app_sequence_block(
     }
     ui.add_space(10.0);
 }
+
+/// **4c -- the template view.** The same sequence as one editable line, with
+/// the step list it parses to underneath it.
+///
+/// The bridge is one assignment: what the user types IS the stored string.
+/// There is no render step between the box and `app.sequence`, which is what
+/// makes the round trip byte-exact in both directions -- a template that is
+/// merely looked at leaves the item untouched, and a template that is edited
+/// stores the user's own bytes rather than this build's spelling of them.
+fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &ResolveSource<'_>) {
+    // Multiline, because a sequence with a wait and a rate in it is longer
+    // than the pane is wide and the pane refuses horizontal scrolling
+    // (`assert_inside`). Wrapped text is readable; a line running off the
+    // right edge is a template whose end the user cannot see.
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut app.template_draft)
+            .desired_rows(2)
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    if response.changed() {
+        app.template_touched = true;
+        app.sequence = app.template_draft.clone();
+    }
+    ui.add_space(4.0);
+
+    if app.template_draft.is_empty() {
+        ui.label(RichText::new(TEMPLATE_EMPTY_NOTE).size(11.0).color(theme::TEXT_FAINT));
+        ui.add_space(4.0);
+    }
+
+    // **The refusal, in the field that caused it.** Save is off while this is
+    // on screen -- see `EditDraft::sequence_fault`.
+    if let Some(fault) = app.template_fault() {
+        ui.label(RichText::new(fault).size(11.0).color(theme::ERROR));
+        ui.add_space(4.0);
+    }
+
+    ui.label(RichText::new("Insert").size(11.0).color(theme::TEXT_FAINT));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for chip in TEMPLATE_CHIPS {
+            if ui.add(palette_button(chip)).clicked() {
+                app.template_draft = template_with(&app.template_draft, chip);
+                app.template_touched = true;
+                app.sequence = app.template_draft.clone();
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    // The parsed steps, under the field, read-only. The design's whole point:
+    // the string is never the only thing on screen, so the user always sees
+    // what it became.
+    ui.label(RichText::new(TEMPLATE_READS_AS).size(11.0).color(theme::TEXT_FAINT));
+    ui.add_space(4.0);
+    let _ = sequence_steps(ui, &step_rows(&app.sequence, source, false), false);
+}
+
+/// Save's caption while the keystroke template will not parse. Names the thing
+/// to go and fix, the same way "Save (needs a name)" does.
+pub const SAVE_TEMPLATE_BLOCKED: &str = "Save (fix the template)";
 
 /// The refusal under the wait box, said as the rule rather than as "invalid".
 const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
@@ -2887,6 +3548,15 @@ pub fn draw_detail_edit(
                 ui.label(RichText::new("Name is required.").size(12.0).color(theme::ERROR));
                 ui.add_space(6.0);
             }
+            // Repeated here, beside the button it disables. The same sentence
+            // is also drawn under the template box that caused it (see
+            // `app_template_view`), because the box can be scrolled off the
+            // top of a long form and a Save that is off for no visible reason
+            // is the silent no-op this file keeps refusing to ship.
+            if let Some(fault) = draft.sequence_fault() {
+                ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
+                ui.add_space(6.0);
+            }
 
             ui.horizontal(|ui| {
                 // `min_size`, and the SAME height Cancel beside it gets from
@@ -2907,13 +3577,15 @@ pub fn draw_detail_edit(
                 // -- see `the_disabled_save_button_does_not_look_enabled`.
                 // The zero x floor leaves the width to the label, which
                 // changes with the validity ("Save" / "Save (needs a name)").
-                let save = egui::Button::new(if draft.is_valid() {
-                    "Save"
-                } else {
+                let save = egui::Button::new(if !draft.is_valid() {
                     "Save (needs a name)"
+                } else if draft.sequence_fault().is_some() {
+                    SAVE_TEMPLATE_BLOCKED
+                } else {
+                    "Save"
                 })
                 .min_size(egui::Vec2::new(0.0, theme::BUTTON_HEIGHT));
-                if ui.add_enabled(draft.is_valid() && creatable, save).clicked() {
+                if ui.add_enabled(draft.is_saveable() && creatable, save).clicked() {
                     action = EditAction::Save;
                 }
                 if theme::secondary_button(ui, "Cancel").clicked() {
@@ -7673,6 +8345,521 @@ mod sequence_builder_tests {
              is not reading the TOTP state it was handed: {:?}",
             no_secret.strings()
         );
+    }
+
+    // -- 4a: the step list -------------------------------------------------
+    //
+    // The rows are a pure function of the stored string, so every claim the
+    // list makes is asked of `step_rows` directly. The three frame tests below
+    // are the wiring pins.
+
+    /// A `ResolveSource` over [`item`], for the row tests.
+    fn rows_source<'a>(item: &'a VaultItem, totp: &'a detail::TotpState) -> ResolveSource<'a> {
+        let login = item.login.as_ref().unwrap();
+        sequence_source(
+            login.username.as_deref().unwrap_or(""),
+            login.password.as_deref().map_or("", |v| v.as_str()),
+            Some(item),
+            totp,
+        )
+    }
+
+    /// **The row index IS the token index, and the whole edit path depends on
+    /// it.** `<`, `>` and `x` hand `number - 1` to `sequence_moved` and
+    /// `sequence_without`, which index the token list -- so a row model that
+    /// dropped, merged or reordered a token would silently make every control
+    /// below the fold act on a different step.
+    #[test]
+    fn every_token_gets_exactly_one_row_at_its_own_index() {
+        const SEQUENCE: &str = "{ESC}{USERNAME}{TAB}{DELAY 250}{DELAY=40}{PASSWORD}{ENTER}";
+        let item = item();
+        let totp = live_code();
+        let tokens = sequence_view(SEQUENCE).tokens;
+        let rows = step_rows(SEQUENCE, &rows_source(&item, &totp), false);
+
+        assert_eq!(rows.len(), tokens.len(), "rows: {rows:?}");
+        for (index, (row, token)) in rows.iter().zip(&tokens).enumerate() {
+            assert_eq!(row.number, index + 1, "row {index} is numbered {}", row.number);
+            // The label is the chip's, so the two views of one step cannot
+            // drift into two vocabularies.
+            assert_eq!(row.label, token.chip_label(), "row {index}");
+        }
+    }
+
+    /// The badges the design asks for, on the tokens that earn them -- and the
+    /// two it does not draw, on the tokens that are not acts.
+    #[test]
+    fn each_kind_of_token_wears_the_badge_that_names_what_it_does() {
+        const SEQUENCE: &str = "{ESC}{USERNAME}{TAB}{DELAY 250}{DELAY=40}{PASSWORD}{PICKCHARS}";
+        let item = item();
+        let totp = live_code();
+        let badges: Vec<&str> = step_rows(SEQUENCE, &rows_source(&item, &totp), false)
+            .iter()
+            .map(|r| r.kind.badge())
+            .collect();
+        assert_eq!(
+            badges,
+            vec!["KEY", "TEXT", "KEY", "WAIT", "RATE", "TEXT", "RAW"],
+            "the badges do not say what each step actually does"
+        );
+    }
+
+    /// **A password is never in the row, in either state of the eye.**
+    ///
+    /// Both states, because "masked" must be a property of the FIELD and not
+    /// of a flag that is off right now: the reveal argument is passed both
+    /// ways and the assertion is the same both times. The one-time code is
+    /// held to the same rule -- it is a credential too.
+    #[test]
+    fn a_secret_step_shows_a_mask_and_never_its_value() {
+        const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{TOTP}";
+        let item = item();
+        let totp = live_code();
+        let source = rows_source(&item, &totp);
+
+        for reveal in [false, true] {
+            let rows = step_rows(SEQUENCE, &source, reveal);
+            let secrets: Vec<&StepRow> = rows.iter().filter(|r| r.secret).collect();
+            assert_eq!(secrets.len(), 2, "reveal={reveal}: {rows:?}");
+            for row in &secrets {
+                assert_eq!(row.payload, SECRET_MASK, "reveal={reveal}");
+            }
+            for row in &rows {
+                for cell in [&row.label, &row.payload, &row.note] {
+                    assert!(
+                        !cell.contains(PASSWORD),
+                        "reveal={reveal}: a row cell {cell:?} carries the password"
+                    );
+                    assert!(
+                        !cell.contains(TOTP_CODE),
+                        "reveal={reveal}: a row cell {cell:?} carries the one-time code"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The positive control on the test above: the eye really does reach the
+    /// row, for the values it is allowed to reach. Without this, an
+    /// implementation that put NOTHING in any payload would satisfy the
+    /// masking test while showing the user nothing at all.
+    #[test]
+    fn the_eye_fills_a_non_secret_rows_payload_and_leaves_it_empty_when_shut() {
+        const SEQUENCE: &str = "{USERNAME}";
+        let item = item();
+        let totp = live_code();
+        let source = rows_source(&item, &totp);
+        assert_eq!(step_rows(SEQUENCE, &source, true)[0].payload, USERNAME);
+        assert_eq!(step_rows(SEQUENCE, &source, false)[0].payload, "");
+    }
+
+    /// The rate a `{DELAY=n}` sets is carried into the notes of the rows BELOW
+    /// it and not the ones above -- which is the design's picture, drawn
+    /// without folding two tokens into one row.
+    #[test]
+    fn a_rate_change_notes_itself_on_the_steps_it_governs_and_not_the_earlier_ones() {
+        const SEQUENCE: &str = "{USERNAME}{DELAY=40}{PASSWORD}";
+        let item = item();
+        let totp = live_code();
+        let rows = step_rows(SEQUENCE, &rows_source(&item, &totp), false);
+        assert!(!rows[0].note.contains("40 ms/char"), "the earlier row took a later rate: {:?}", rows[0].note);
+        assert!(rows[2].note.contains("40 ms/char"), "the later row missed the rate: {:?}", rows[2].note);
+    }
+
+    // -- 4a: the tally -----------------------------------------------------
+
+    /// **The count and the time come from the runner's own plan.** Steps are
+    /// not rows: a `{DELAY=n}` is a row and no step, and the whole point of
+    /// asking `plan` is that the figure on screen is the figure
+    /// `MAX_SEQUENCE` is checked against.
+    #[test]
+    fn the_tally_counts_the_runners_steps_rather_than_the_rows() {
+        const SEQUENCE: &str = "{ESC}{USERNAME}{TAB}{DELAY 250}{DELAY=40}{PASSWORD}{ENTER}";
+        let item = item();
+        let totp = live_code();
+        let source = rows_source(&item, &totp);
+
+        let rows = step_rows(SEQUENCE, &source, false);
+        let tally = sequence_tally(SEQUENCE, &source).expect("a runnable sequence has a tally");
+        assert_eq!(rows.len(), 7, "the fixture changed shape");
+        assert_eq!(
+            tally.steps, 6,
+            "the tally is not counting the acts the user can see -- either the {{DELAY=40}} row              was counted, or the runner's burst chunking was"
+        );
+        // **The control on that assertion**, and the reason the fixture types
+        // at 40 ms/char: the runner really does split this password into more
+        // `Step`s than there are acts, so `tally.steps == 6` cannot be
+        // satisfied by handing back `Plan::len()`.
+        let chunks = crate::injector::sequence::plan(
+            &sequence_view(SEQUENCE).tokens,
+            &crate::injector::sequence::Resolved {
+                username: source.username,
+                password: source.password,
+                totp: edit_time_totp(source.totp),
+                custom: source.custom.clone(),
+            },
+        )
+        .expect("the fixture must plan")
+        .len();
+        assert!(
+            chunks > tally.steps,
+            "the fixture no longer distinguishes the acts ({}) from the runner's chunks ({chunks})",
+            tally.steps
+        );
+        assert!(
+            tally.total >= Duration::from_millis(250),
+            "the 250 ms wait is not in the total: {:?}",
+            tally.total
+        );
+        assert!(
+            tally.burst <= tally.total && tally.burst > Duration::ZERO,
+            "the burst figure is not a step of this plan: {tally:?}"
+        );
+        assert_eq!(tally_label(&tally), format!("6 steps \u{b7} {} total", duration_label(tally.total)));
+    }
+
+    /// A sequence the runner refuses has no tally, and the block says so
+    /// rather than showing a zero -- "0 steps" would read as a sequence that
+    /// is merely empty.
+    #[test]
+    fn a_refused_sequence_has_no_tally() {
+        let item = item();
+        let totp = live_code();
+        let source = rows_source(&item, &totp);
+        assert!(sequence_refusal(&sequence_view("{PICKCHARS}").tokens, &source).is_some());
+        assert_eq!(sequence_tally("{PICKCHARS}", &source), None);
+    }
+
+    /// The budget line quotes the CRATE's limits, not the design's
+    /// illustrative ones.
+    #[test]
+    fn the_budget_line_is_measured_against_the_runners_own_limits() {
+        let item = item();
+        let totp = live_code();
+        let tally = sequence_tally("{USERNAME}", &rows_source(&item, &totp)).unwrap();
+        let line = budget_label(&tally);
+        assert!(
+            line.contains(&duration_label(crate::injector::sequence::MAX_SEQUENCE)),
+            "the budget does not quote MAX_SEQUENCE: {line:?}"
+        );
+        assert!(
+            line.contains(&duration_label(crate::injector::sequence::MAX_BURST)),
+            "the budget does not quote MAX_BURST: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_duration_reads_in_milliseconds_below_a_second_and_in_tenths_above_it() {
+        assert_eq!(duration_label(Duration::from_millis(250)), "250 ms");
+        assert_eq!(duration_label(Duration::from_millis(2100)), "2.1 s");
+        assert_eq!(duration_label(Duration::from_secs(60)), "60.0 s");
+    }
+
+    // -- 4c: the template view ---------------------------------------------
+
+    /// **The chips write the grammar `key_sequence` really parses.**
+    ///
+    /// The design's picture spells a pause `{WAIT=250}`, which does not exist:
+    /// it would come back as `Token::Unknown` and be refused at fill time. A
+    /// chip that inserted one would be a button that breaks the sequence it
+    /// was clicked to build, so every chip is parsed here and required to be
+    /// something this build understands.
+    #[test]
+    fn every_insert_chip_parses_into_a_step_this_build_understands() {
+        for chip in TEMPLATE_CHIPS {
+            let tokens = key_sequence::parse(chip);
+            assert!(!tokens.is_empty(), "the chip {chip:?} inserts nothing");
+            for token in &tokens {
+                assert!(
+                    token.is_understood(),
+                    "the chip {chip:?} inserts a step this build cannot type: {token:?}"
+                );
+            }
+            assert_eq!(
+                key_sequence::render(&tokens),
+                *chip,
+                "the chip {chip:?} is not spelled the way this build spells it"
+            );
+            assert_eq!(template_fault(chip), None, "the chip {chip:?} is not a saveable template");
+        }
+        // The design's own spelling, held here so the departure is a test
+        // rather than a comment: it does NOT parse to anything typable.
+        for spelling in ["{WAIT=250}", "{SHIFT+TAB}", "{CTRL+A}"] {
+            let tokens = key_sequence::parse(spelling);
+            assert!(
+                tokens.iter().any(|t| !t.is_understood()),
+                "the design's {spelling:?} became typable; the chips can be revisited"
+            );
+        }
+    }
+
+    /// Inserting into an empty template materialises the default first -- the
+    /// same correction `sequence_with` makes, for the same reason.
+    #[test]
+    fn inserting_into_an_empty_template_keeps_the_default_it_stood_for() {
+        assert_eq!(
+            template_with("", "{ENTER}"),
+            format!("{}{{ENTER}}", key_sequence::DEFAULT_SEQUENCE)
+        );
+        assert_eq!(template_with("{TAB}", "{ENTER}"), "{TAB}{ENTER}");
+    }
+
+    /// **What "will not parse" means, and what it must NOT catch.**
+    ///
+    /// Everything well formed passes, including the foreign constructs
+    /// `AppMatch::sequence` exists to carry -- refusing those would make this
+    /// build unable to save an item another password manager wrote. The one
+    /// shape refused is the one where the field and the step list under it
+    /// disagree: an unterminated brace.
+    #[test]
+    fn a_template_is_faulted_exactly_when_it_will_not_read_back_as_itself() {
+        for good in [
+            "",
+            "{USERNAME}{TAB}{PASSWORD}",
+            "{ESC}{USERNAME}{TAB}{DELAY 250}{DELAY=40}{PASSWORD}{ENTER}",
+            // Carried, not understood -- and still saveable.
+            "{PICKCHARS}{USERNAME}",
+            "{APPACTIVATE Foo}",
+            "{WAIT=250}",
+            // An escaped brace is well formed and means a typed brace.
+            "a{{}b",
+            "{S:PIN}",
+        ] {
+            assert_eq!(template_fault(good), None, "the well-formed {good:?} was refused");
+        }
+        for bad in ["{", "{USERNAME}{TAB", "a{FOO", "{{"] {
+            assert_eq!(
+                template_fault(bad),
+                Some(TEMPLATE_UNPARSED),
+                "the malformed {bad:?} was accepted"
+            );
+        }
+    }
+
+    /// The fault is a property of what the USER wrote, never of what they
+    /// inherited: a vault already holding an unreadable sequence must still be
+    /// renameable.
+    #[test]
+    fn an_inherited_bad_sequence_does_not_block_a_save_but_an_edited_one_does() {
+        let item = item();
+        let mut draft = draft_for(&item, "{USERNAME}{TAB");
+        assert_eq!(template_fault(&draft.app.as_ref().unwrap().sequence), Some(TEMPLATE_UNPARSED));
+        assert!(draft.is_saveable(), "an inherited unreadable sequence blocked the save");
+        assert_eq!(draft.sequence_fault(), None);
+
+        draft.app.as_mut().unwrap().template_touched = true;
+        assert_eq!(draft.sequence_fault(), Some(TEMPLATE_UNPARSED));
+        assert!(!draft.is_saveable(), "an edited unparseable template was still saveable");
+        // ...and it is the TEMPLATE and not the name that is wrong, so the two
+        // refusals stay distinguishable.
+        assert!(draft.is_valid(), "the fixture lost its name");
+    }
+
+    // -- 4c: the bridge ----------------------------------------------------
+
+    /// **The round trip, byte for byte.** Opening the template view, looking
+    /// at it and closing it again must leave the stored string exactly as it
+    /// arrived -- including a spelling this build would never produce. The
+    /// fixture is deliberately one `render` would rewrite (a lower-case
+    /// `{S:pin}` sitting beside a construct this build does not model), so a
+    /// seed that went through the renderer fails here.
+    #[test]
+    fn opening_and_closing_the_template_view_does_not_re_spell_the_stored_string() {
+        const STORED: &str = "{PICKCHARS}{USERNAME}{DELAY 250}{S:pin}{APPACTIVATE Foo}";
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, STORED);
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+
+        let to_template = open.rect_of(VIEW_TEMPLATE).center();
+        let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_template));
+        assert!(draft.app.as_ref().unwrap().template_view, "the Template toggle did not switch");
+        assert_eq!(
+            draft.app.as_ref().unwrap().template_draft,
+            STORED,
+            "the template box was seeded with something other than the stored bytes"
+        );
+
+        let to_steps = after.rect_of(VIEW_STEPS).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_steps));
+        assert!(!draft.app.as_ref().unwrap().template_view, "the Steps toggle did not switch back");
+        assert_eq!(
+            draft.app.as_ref().unwrap().sequence,
+            STORED,
+            "a round trip through the template view re-spelled the user's string"
+        );
+        assert!(
+            !draft.app.as_ref().unwrap().template_touched,
+            "merely looking at the template counted as an edit"
+        );
+        assert!(draft.is_saveable(), "an untouched round trip made the item unsaveable");
+    }
+
+    /// **The wiring pin for 4c.** Typing into the template box writes the
+    /// user's own bytes onto the draft, and the step list under it re-reads
+    /// them -- which is the whole of the bridge. Deleting the
+    /// `app.sequence = app.template_draft.clone();` assignment fails here.
+    #[test]
+    fn typing_a_template_stores_those_bytes_and_re_parses_them_underneath() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}");
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let at = open.rect_of(VIEW_TEMPLATE).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+
+        // **Really typed, not assigned.** Click into the box -- it is the one
+        // widget between the toggle and the Insert row -- and send the
+        // characters as input events, so the assignment that copies the box
+        // onto the draft is on the path under test.
+        let template = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let top = template.rect_of(VIEW_TEMPLATE).bottom();
+        let bottom = template.rect_of("Insert").top();
+        let field = template
+            .texts
+            .iter()
+            .find(|(text, rect)| text == "{USERNAME}" && rect.top() > top && rect.top() < bottom)
+            .map(|(_, rect)| *rect)
+            .expect("the template box is not drawn between the toggle and the Insert row");
+
+        // Two frames: egui grants focus at the END of the frame the click
+        // arrives in, so text sent in that same frame goes nowhere.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(field.center()));
+        let mut events: Vec<egui::Event> = Vec::new();
+        events.push(egui::Event::Key {
+            key: egui::Key::End,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        events.push(egui::Event::Text("{TAB}{PASSWORD}".to_string()));
+        let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &events);
+        assert_eq!(draft.app.as_ref().unwrap().sequence, "{USERNAME}{TAB}{PASSWORD}");
+        // The parsed list is on screen under the field, so the string is never
+        // the only thing the user can see.
+        for step in ["Username", "Tab", "Password"] {
+            assert!(
+                after.strings().contains(&step),
+                "the parsed step {step:?} is not drawn under the template field: {:?}",
+                after.strings()
+            );
+        }
+        assert!(after.strings().contains(&TEMPLATE_READS_AS), "the read-out lost its heading");
+    }
+
+    /// **The refusal reaches the button.** An unparseable template turns Save
+    /// off and re-captions it, and the reason is on screen in the strip as
+    /// well as under the field.
+    #[test]
+    fn an_unparseable_template_turns_save_off_and_says_why() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}");
+        let _ = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.template_view = true;
+            app.template_draft = "{USERNAME}{TAB".to_string();
+            app.template_touched = true;
+            app.sequence = app.template_draft.clone();
+        }
+        assert!(!draft.is_saveable(), "the pure gate let an unparseable template through");
+
+        // Two frames: `egui::Panel::bottom` lays its content out against the
+        // height it measured LAST frame, and the refusal line above the
+        // buttons is new this one, so the strip is a frame behind.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        assert!(
+            painted.strings().contains(&SAVE_TEMPLATE_BLOCKED),
+            "Save does not say the template is what is wrong: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.strings().contains(&TEMPLATE_UNPARSED),
+            "the refusal itself is not on screen: {:?}",
+            painted.strings()
+        );
+
+        // The control: fix it, and both go away.
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.template_draft = "{USERNAME}{TAB}".to_string();
+            app.sequence = app.template_draft.clone();
+        }
+        assert!(draft.is_saveable(), "a fixed template did not re-enable the save");
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let fixed = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        assert!(!fixed.strings().contains(&TEMPLATE_UNPARSED));
+        assert!(!fixed.strings().contains(&SAVE_TEMPLATE_BLOCKED));
+    }
+
+    /// **The wiring pin for 4a's summary.** The tally is drawn, and it moves
+    /// when the sequence does. A constant would pass "is it on screen".
+    #[test]
+    fn the_step_count_on_screen_follows_the_sequence() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}");
+        let one = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let totp = live_code();
+        let source = rows_source(&item, &totp);
+        let expected_one = tally_label(&sequence_tally("{USERNAME}", &source).unwrap());
+        assert!(
+            one.strings().contains(&expected_one.as_str()),
+            "the tally {expected_one:?} is not on screen: {:?}",
+            one.strings()
+        );
+
+        draft.app.as_mut().unwrap().sequence = "{USERNAME}{TAB}{PASSWORD}{ENTER}".to_string();
+        let more = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let expected_more =
+            tally_label(&sequence_tally("{USERNAME}{TAB}{PASSWORD}{ENTER}", &source).unwrap());
+        assert_ne!(expected_one, expected_more, "the fixture cannot tell the two apart");
+        assert!(
+            more.strings().contains(&expected_more.as_str()),
+            "the tally did not follow the sequence: {:?}",
+            more.strings()
+        );
+    }
+
+    /// **The password is not painted in the step list**, with the eye shut and
+    /// with it open. Asked of the band the rows occupy rather than of the
+    /// whole form, because the form's own password box is above it and the
+    /// eye's preview -- which is a reveal the user asked for by name -- is
+    /// below.
+    #[test]
+    fn no_row_in_the_step_list_paints_the_password() {
+        const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{ENTER}";
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, SEQUENCE);
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+
+        for previewing in [false, true] {
+            draft.app.as_mut().unwrap().previewing = previewing;
+            let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+            let floor = painted.rect_of(APP_SEQUENCE_HINT).bottom();
+            let ceiling = painted.rect_of("Add a value").top();
+            for (source, drawn, rect) in &painted.rendered {
+                if rect.top() <= floor || rect.top() >= ceiling {
+                    continue;
+                }
+                assert!(
+                    !source.contains(PASSWORD) && !drawn.contains(PASSWORD),
+                    "previewing={previewing}: the step list painted the password ({source:?} / \
+                     {drawn:?})"
+                );
+            }
+            // The positive control: the masked row IS there, so the loop above
+            // is not passing over an empty band.
+            assert!(
+                painted.strings().contains(&SECRET_MASK),
+                "previewing={previewing}: the masked password row is not drawn at all"
+            );
+        }
+        let _ = open;
     }
 }
 
