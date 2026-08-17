@@ -837,6 +837,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::signature::SignatureInfo;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Mutex, MutexGuard};
 
     /// What the substitute seam saw, for the whole PROCESS.
@@ -1080,14 +1081,57 @@ mod tests {
     /// 120ms was also not enough. Under concurrent compilation a detached
     /// thread routinely does not get scheduled inside it, which is what made
     /// the witness miss and the stray contaminate the next window.
-    /// [`the_settle_window_waits_out_a_launch_it_did_not_start`] pins this
-    /// behaviourally against a launch delayed well past the old budget, and
-    /// [`the_settle_budget_is_not_a_token_one`] pins the number itself so a
-    /// shrink is caught even on a lucky machine.
+    /// [`the_settle_window_waits_out_a_launch_it_did_not_start`] pins the
+    /// WAITING behaviourally, against a launch placed inside the window by
+    /// construction rather than by the clock, and
+    /// [`the_settle_budget_is_not_a_token_one`] pins the NUMBER, so a shrink
+    /// is caught without anything being timed at all.
     const SETTLE_QUIET: Duration = Duration::from_millis(500);
 
     /// Poll interval for [`Session::settle`].
     const SETTLE_POLL: Duration = Duration::from_millis(10);
+
+    /// How many times a [`Session::settle`] loop has SAMPLED the recorder,
+    /// counted for the whole process.
+    ///
+    /// # Why the settle window is instrumented rather than out-waited
+    ///
+    /// [`the_settle_window_waits_out_a_launch_it_did_not_start`] has to put a
+    /// launch INSIDE a settle window that is already running. It used to do
+    /// that by sleeping 200ms on a detached thread and trusting 200ms of
+    /// sleep to fit inside [`SETTLE_QUIET`]. It does not always fit: thread
+    /// start-up plus the sleep's own overshoot ran past the whole 500ms
+    /// window under `-j 8` on a loaded machine, `settle` returned having seen
+    /// nothing, and the assertion printed `left: []` -- which reads as "no
+    /// launch happened", the same false alarm the generation tag was
+    /// introduced to stop this module telling. Reproduced at `0fec1e9` on run
+    /// 3 of 6 full `-j 8` suites (that run took 82s against a 53s median).
+    ///
+    /// Widening `SETTLE_QUIET` would only have moved the bet, and the number
+    /// is pinned by [`the_settle_budget_is_not_a_token_one`] anyway. This
+    /// counter removes the bet instead: the delaying thread waits for the
+    /// window to SAMPLE, which is a condition rather than a duration, so its
+    /// launch is a change `settle` has still to notice on any machine at any
+    /// load.
+    static SETTLE_POLLS: AtomicU64 = AtomicU64::new(0);
+
+    fn settle_polls() -> u64 {
+        SETTLE_POLLS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Blocks until [`Session::settle`] has sampled the recorder at least `n`
+    /// times since `from`.
+    ///
+    /// The ceiling is not a margin to be tuned: it exists so that a `settle`
+    /// which never polls -- exactly the mutant this instrument is here to
+    /// catch -- leaves its caller free to make the launch LATE, and so red
+    /// about a missed launch, rather than hanging the suite.
+    fn await_settle_polls(from: u64, n: u64, ceiling: Duration) {
+        let started = std::time::Instant::now();
+        while settle_polls() < from + n && started.elapsed() < ceiling {
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
 
     /// Total bound on [`Session::settle_witnessing`]. Generous on purpose: it
     /// is not a budget anything is expected to approach, it is the point at
@@ -1169,6 +1213,11 @@ mod tests {
             // a thread still running, and a window that stopped waiting while
             // one was in flight closes on top of it.
             let sizes = || {
+                // Counted so a test can place a launch inside this window by
+                // construction instead of guessing at the clock; see
+                // [`SETTLE_POLLS`]. The count is the only thing this adds --
+                // the reading below is unchanged.
+                SETTLE_POLLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let r = recorder();
                 (r.launched.len(), r.verified.len())
             };
@@ -1495,33 +1544,58 @@ mod tests {
         );
     }
 
-    /// **The settle window is wide enough to be a witness.**
+    /// **The plain settle window keeps waiting for a launch that arrives
+    /// after it has already started looking.**
     ///
     /// [`a_launch_on_a_detached_thread_is_witnessed_by_the_settle_window`]
-    /// waits for its launch, so it says nothing about the budget. This one
-    /// does not wait: it calls the PLAIN [`Session::settle`] -- the one
-    /// `route_recording` uses, and therefore the one that has to catch a
-    /// mutant which slips a detached spawn into `apply_update_with` -- against
-    /// a launch delayed past the 120ms the old shape actually allowed.
+    /// waits for its launch by count, so it says nothing about what the
+    /// unassisted window does. This one calls the PLAIN [`Session::settle`]
+    /// -- the one `route_recording` uses, and therefore the one that has to
+    /// catch a mutant which slips a detached spawn into `apply_update_with`.
     ///
-    /// With `SETTLE_QUIET` shrunk to anything under the delay below, this
-    /// fails.
+    /// # The launch is placed inside the window, not timed to fall in it
+    ///
+    /// The delay used to be `sleep(200ms)` against a 500ms `SETTLE_QUIET`,
+    /// i.e. a bet that thread start-up plus sleep overshoot stayed under
+    /// 300ms. That bet lost under `-j 8`; see [`SETTLE_POLLS`] for the
+    /// measurement. There is no sleep here now. The thread reports itself on
+    /// CPU BEFORE the window opens, so start-up is not part of what has to
+    /// fit; then it waits for the window to have SAMPLED twice -- its
+    /// pre-loop reading plus at least one poll -- so the launch is provably
+    /// a change `settle` has still to notice and wait out.
+    ///
+    /// What that leaves pinned is what was pinned before: a `settle` that
+    /// reads the recorder once and returns never sees this launch, and this
+    /// goes red with an empty vector. Measured: `while false && ..` on the
+    /// quiet loop is KILLED here. The SIZE of the quiet period is pinned
+    /// separately, and without a clock, by
+    /// [`the_settle_budget_is_not_a_token_one`]; neither test pins the
+    /// restart-on-change inside the loop, which was true of the shape this
+    /// replaced as well.
     #[test]
     fn the_settle_window_waits_out_a_launch_it_did_not_start() {
         let session = Session::open(None);
         let path = routed_path(session.generation);
+        let polls_before = settle_polls();
+        let (on_cpu, started) = std::sync::mpsc::channel();
         let _ = std::thread::Builder::new().spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            on_cpu.send(()).expect("nobody is waiting for the delaying thread");
+            // Deliberately unconditional: if the window never samples, the
+            // ceiling lapses and this launch lands LATE, which is the red
+            // this test is for. Refusing to launch would hide it.
+            await_settle_polls(polls_before, 2, SETTLE_DEADLINE);
             let _ = substitute_launch(&path);
         });
+        started.recv().expect("the delaying thread never reached the CPU");
         session.settle();
 
         assert_eq!(
             session.launched(),
             vec![routed_path(session.generation)],
-            "a launch delayed 200ms was not witnessed by the plain settle window, so a mutant \
-             that puts the real launch on a detached thread would be recorded by nobody in \
-             `route_recording` -- which is the exact survivor this harness exists to kill"
+            "a launch made while the plain settle window was already polling was not \
+             witnessed by it, so a mutant that puts the real launch on a detached thread \
+             would be recorded by nobody in `route_recording` -- which is the exact \
+             survivor this harness exists to kill"
         );
     }
 
