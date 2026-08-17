@@ -730,7 +730,13 @@ pub struct SendSummary {
 /// carried elsewhere -- would fall through the split and print the key in
 /// full. There is also nothing the left half buys: the record's own `id` is
 /// already a field beside it, so the `Debug` still names the Send without it.
-struct ElidedAccessUrl;
+///
+/// `pub(crate)` rather than private to this module because an access URL is
+/// copied out of [`CreatedSend`] and carried around the app: the vault
+/// window's own `SendCreateReport` holds one, and the alternative to sharing
+/// this type was a second stand-in beside a second copy of the reasoning
+/// above, which is how one of the two ends up split on `#`.
+pub(crate) struct ElidedAccessUrl;
 
 impl std::fmt::Debug for ElidedAccessUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

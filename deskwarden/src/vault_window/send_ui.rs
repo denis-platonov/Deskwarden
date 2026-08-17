@@ -5644,6 +5644,16 @@ mod source_pins {
         "send.rs: pub access_url: String,",
         "send.rs: pub deletion_date: String,",
         "send.rs: pub is_file: bool,",
+        // Re-pinned deliberately. `ElidedAccessUrl` is a zero-sized `Debug`
+        // stand-in and NOT a door out of the module in the sense this wall
+        // guards: it carries no data, reaches no `bw` child, and its whole
+        // behaviour is to write one sentence saying a URL was withheld. It
+        // was widened from private to `pub(crate)` so the vault window's
+        // `SendCreateReport` -- which holds a copy of an access URL and used
+        // to derive `Debug` over it -- elides that URL through the same type,
+        // rather than growing a second stand-in beside a second copy of the
+        // "do not split on `#`" reasoning.
+        "send.rs: pub(crate) struct ElidedAccessUrl;",
         "send.rs: pub struct RawOutput {",
         "send.rs: pub exit_code: Option<i32>,",
         "send.rs: pub stdout: String,",

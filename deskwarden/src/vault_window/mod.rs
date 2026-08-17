@@ -6276,11 +6276,22 @@ where
 /// success without one -- `SendError::CreatedButUnreadable` exists for exactly
 /// the case where `bw` exited zero and the URL could not be read back.
 ///
-/// **`Debug` is derived and safe.** Nothing in here is a secret: a name the
-/// user typed to label the Send, a public URL, and an error. The plaintext
-/// body and the share password never leave the composer's `SendPlan` and its
-/// clone on the worker thread, both of which redact themselves.
-#[derive(Debug, Clone)]
+/// **`Debug` is hand-written below and deliberately NOT derived.** It used to
+/// be derived, on the stated grounds that "nothing in here is a secret: a
+/// name, a public URL, and an error". That premise is false, and `send.rs`
+/// says so on the type this URL is copied out of: **an access URL carries the
+/// Send's decryption key in its fragment**, after the `#`. Deriving `Debug`
+/// here therefore printed the key in full to any log line or panic message
+/// that formatted a report, which is the same leak
+/// [`crate::send::CreatedSend`] and [`crate::send::SendSummary`] already
+/// elide. The plaintext body and the share password genuinely do stay in the
+/// composer's `SendPlan` and its clone on the worker thread, both of which
+/// redact themselves; the URL never did.
+///
+/// The URL is elided **whole**, for the reason
+/// [`crate::send::ElidedAccessUrl`] gives about splitting on `#`, and `name`
+/// is kept in full so the `Debug` still says which report this is.
+#[derive(Clone)]
 enum SendCreateReport {
     /// `bw send create` exited zero and its answer parsed. The link is live.
     Created { name: String, access_url: String },
@@ -6289,6 +6300,27 @@ enum SendCreateReport {
         name: String,
         error: crate::send::SendError,
     },
+}
+
+/// Hand-written for the reason on the type. `Created` keeps its `name` -- it
+/// is what the user typed to label the Send and it is already on screen -- and
+/// stands [`crate::send::ElidedAccessUrl`] in for the link. `Failed` carries
+/// no URL at all, so it prints exactly as the derive would have.
+impl std::fmt::Debug for SendCreateReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendCreateReport::Created { name, access_url: _ } => f
+                .debug_struct("Created")
+                .field("name", name)
+                .field("access_url", &crate::send::ElidedAccessUrl)
+                .finish(),
+            SendCreateReport::Failed { name, error } => f
+                .debug_struct("Failed")
+                .field("name", name)
+                .field("error", error)
+                .finish(),
+        }
+    }
 }
 
 impl SendCreateReport {
@@ -25370,6 +25402,81 @@ mod send_create_wiring {
             open: true,
             plan: a_draft(),
         }
+    }
+
+    // ==================================================================
+    // 3b. The report's own `Debug`
+    // ==================================================================
+
+    /// A Send URL in the real shape `bw` returns: the decryption key rides in
+    /// the fragment, after the `#`. Invented; nothing here is a live link.
+    const CREATED_URL: &str = "https://send.bitwarden.com/#dOnTpRiNtMeAnYwHeRe";
+    /// The half of that URL a `#`-splitting elision would leave printed.
+    const CREATED_URL_KEY: &str = "dOnTpRiNtMeAnYwHeRe";
+
+    /// **The report's `Debug` must not print the access URL.**
+    ///
+    /// The URL is not public: its fragment IS the Send's decryption key, so a
+    /// derived `Debug` -- which is what this type had -- put the key into
+    /// every log line and panic message that formatted a report. `send.rs`
+    /// elides the same material on `CreatedSend` and `SendSummary`; this is
+    /// the third copy of it and was the one that got away.
+    #[test]
+    fn a_created_reports_debug_does_not_print_the_access_url() {
+        let report = SendCreateReport::Created {
+            name: DRAFT_NAME.to_string(),
+            access_url: CREATED_URL.to_string(),
+        };
+        let printed = format!("{report:?}");
+        assert!(
+            !printed.contains(CREATED_URL_KEY),
+            "the Send's decryption key reached a formatter: {printed}"
+        );
+        assert!(
+            !printed.contains("send.bitwarden.com"),
+            "the URL was elided by SPLITTING on '#' rather than whole, which is a parsing rule \
+             that has to be right every time: {printed}"
+        );
+    }
+
+    /// **The live control on the test above.** A `Debug` that printed nothing
+    /// -- or an empty string -- would satisfy "the key is absent" and be
+    /// useless, which is a shape this crate has shipped twice. So the same
+    /// output is asserted to still SAY WHICH REPORT THIS IS: the outcome, the
+    /// name the user typed, and a stand-in that admits a URL was withheld.
+    #[test]
+    fn a_created_reports_debug_still_identifies_the_report_it_redacted() {
+        let report = SendCreateReport::Created {
+            name: DRAFT_NAME.to_string(),
+            access_url: CREATED_URL.to_string(),
+        };
+        let printed = format!("{report:?}");
+        assert!(printed.contains("Created"), "the outcome is gone: {printed}");
+        assert!(printed.contains(DRAFT_NAME), "the Send's name is gone: {printed}");
+        assert!(
+            printed.contains("access_url"),
+            "the field is not even named, so a reader cannot tell a withheld URL from a type \
+             that never had one: {printed}"
+        );
+        assert!(
+            printed.contains("elided"),
+            "nothing says the URL was withheld on purpose: {printed}"
+        );
+    }
+
+    /// A failure carries no URL, so its `Debug` prints in full -- and the
+    /// `name` and the error are exactly what a reader needs. Asserted so the
+    /// hand-written `Debug` cannot quietly redact the half that is safe.
+    #[test]
+    fn a_failed_reports_debug_still_prints_its_name_and_its_error() {
+        let report = SendCreateReport::Failed {
+            name: DRAFT_NAME.to_string(),
+            error: crate::send::SendError::TimedOut,
+        };
+        let printed = format!("{report:?}");
+        assert!(printed.contains("Failed"), "{printed}");
+        assert!(printed.contains(DRAFT_NAME), "{printed}");
+        assert!(printed.contains("TimedOut"), "{printed}");
     }
 
     // ==================================================================
