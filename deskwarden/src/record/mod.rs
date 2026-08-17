@@ -25,6 +25,7 @@
 //! `payload::tests::a_notes_field_that_looks_like_a_key_sequence_is_stored_as_text`
 //! is that rule made checkable rather than merely stated.
 
+pub mod import;
 pub mod payload;
 pub mod seal;
 

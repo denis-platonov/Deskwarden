@@ -930,6 +930,39 @@ pub enum NewItem {
         public_key: String,
         key_fingerprint: String,
     },
+    /// A credential record imported from a Send (`record::import::item_from`).
+    ///
+    /// **A variant of its own rather than a widened [`NewItem::Login`]**, for
+    /// two reasons that are not stylistic. `Login` takes `username` and
+    /// `password` as plain `String`s and always writes both keys, so "the
+    /// sender did not tick a password" could only be expressed as `""` — and
+    /// absence is meaningful on this wire (see `record::payload`). And `Login`
+    /// has no `totp` at all (`vault_window::detail_edit` records that gap),
+    /// which is the one field this variant exists to carry.
+    ///
+    /// **The seed goes in `login.totp` and nowhere else**, so the *vault*
+    /// computes the code. A seed pushed into `notes` instead is a seed no
+    /// client can use, and a seed written into both is a second copy sitting
+    /// in plain text where nothing will ever wipe it.
+    ///
+    /// The three secret-bearing fields are [`Zeroizing`] for the same reason
+    /// [`LoginData::password`] is. `NewItem`'s `Debug` is derived and would
+    /// print them; that is pre-existing here ([`NewItem::SshKey`] already
+    /// carries a `Zeroizing` private key through the same derive) and nothing
+    /// in this crate logs a `NewItem`.
+    ImportedRecord {
+        name: String,
+        folder_id: Option<String>,
+        username: Option<String>,
+        password: Option<Zeroizing<String>>,
+        /// The **bare** seed, already opened from its seal by
+        /// `record::import::item_from`. Nothing else in the crate may put a
+        /// still-sealed seed here: a sealed blob in `totp` would be a TOTP
+        /// secret the vault would silently compute wrong codes from.
+        totp: Option<Zeroizing<String>>,
+        uri: Option<String>,
+        notes: Option<Zeroizing<String>>,
+    },
 }
 
 impl NewItem {
@@ -992,7 +1025,8 @@ impl NewItem {
             | NewItem::SecureNote { name, .. }
             | NewItem::Card { name, .. }
             | NewItem::Identity { name, .. }
-            | NewItem::SshKey { name, .. } => name,
+            | NewItem::SshKey { name, .. }
+            | NewItem::ImportedRecord { name, .. } => name,
         }
     }
 
@@ -1002,7 +1036,8 @@ impl NewItem {
             | NewItem::SecureNote { folder_id, .. }
             | NewItem::Card { folder_id, .. }
             | NewItem::Identity { folder_id, .. }
-            | NewItem::SshKey { folder_id, .. } => folder_id.as_deref(),
+            | NewItem::SshKey { folder_id, .. }
+            | NewItem::ImportedRecord { folder_id, .. } => folder_id.as_deref(),
         }
     }
 
@@ -1051,6 +1086,30 @@ impl NewItem {
                 ssh.insert("publicKey".to_string(), serde_json::json!(public_key));
                 ssh.insert("keyFingerprint".to_string(), serde_json::json!(key_fingerprint));
                 (5, "sshKey", ssh, None)
+            }
+            NewItem::ImportedRecord { username, password, totp, uri, notes, .. } => {
+                // Every key is written ONLY when the record carried it. That
+                // is the wire meaning of "absence is meaningful" arriving
+                // intact at the vault: an untick that became `""` here would
+                // create an item with a blank username the sender never chose.
+                let mut login = serde_json::Map::new();
+                if let Some(username) = username {
+                    login.insert("username".to_string(), serde_json::json!(username));
+                }
+                if let Some(password) = password {
+                    login.insert("password".to_string(), serde_json::json!(password.as_str()));
+                }
+                // The one place the seed is written, and it is `login.totp`.
+                if let Some(totp) = totp {
+                    login.insert("totp".to_string(), serde_json::json!(totp.as_str()));
+                }
+                if let Some(uri) = uri {
+                    login.insert(
+                        "uris".to_string(),
+                        serde_json::json!([{ "uri": uri }]),
+                    );
+                }
+                (1, "login", login, notes.as_ref().map(|n| n.as_str()))
             }
         };
 
@@ -3321,6 +3380,75 @@ mod tests {
         let created = bridge.create_item(&NewItem::login("New", "u", "p", None)).unwrap();
         assert_eq!(created.id, "9");
         assert_eq!(created.login.unwrap().username.as_deref(), Some("u"));
+    }
+
+    /// An imported record reaches `bw serve` through the SAME
+    /// `POST /object/item` every other create uses -- no second write path --
+    /// and its seed reaches the item's own `totp`.
+    ///
+    /// The mock matches the exact body, so a seed that also got copied into
+    /// `notes` or into a custom field would not match and this would red.
+    #[test]
+    fn create_item_posts_an_imported_record_with_the_seed_in_the_logins_totp() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "SAP Production",
+                "type": 1,
+                "folderId": null,
+                "notes": "line one",
+                "login": {
+                    "username": "dplatonov",
+                    "password": "hunter2",
+                    "totp": "JBSWY3DPEHPK3PXP",
+                    "uris": [{ "uri": "https://sap.example" }],
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(CREATED_BODY)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let created = bridge
+            .create_item(&NewItem::ImportedRecord {
+                name: "SAP Production".to_string(),
+                folder_id: None,
+                username: Some("dplatonov".to_string()),
+                password: Some(Zeroizing::new("hunter2".to_string())),
+                totp: Some(Zeroizing::new("JBSWY3DPEHPK3PXP".to_string())),
+                uri: Some("https://sap.example".to_string()),
+                notes: Some(Zeroizing::new("line one".to_string())),
+            })
+            .unwrap();
+        assert_eq!(created.id, "9");
+    }
+
+    /// The absence half, kept separate because a body matcher proves a key is
+    /// absent only when the rest of the body is exactly right.
+    #[test]
+    fn an_imported_record_that_carried_nothing_optional_posts_no_optional_keys() {
+        let payload = NewItem::ImportedRecord {
+            name: "SAP Production".to_string(),
+            folder_id: None,
+            username: None,
+            password: None,
+            totp: None,
+            uri: None,
+            notes: None,
+        }
+        .to_payload();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "name": "SAP Production",
+                "type": 1,
+                "folderId": null,
+                "login": {},
+            }),
+            "an unsent field became a present-and-empty key in the create payload"
+        );
     }
 
     #[test]
