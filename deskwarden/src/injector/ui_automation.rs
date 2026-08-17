@@ -175,6 +175,32 @@ pub fn fill_via_ui_automation(hwnd: isize, username: &str, password: &str) -> Re
     }
 }
 
+/// Whether the control that holds keyboard focus **right now** is a masked
+/// field, as UI Automation reports it.
+///
+/// The same `CurrentIsPassword` property [`fill_via_ui_automation`] uses to
+/// pick the password box out of a window's Edit controls, asked of the focused
+/// element instead of a found one -- so `injector::target` can say what is
+/// under the caret without duplicating the property lookup or the apartment
+/// dance.
+///
+/// `Err` means the question could not be asked (no apartment, no focused
+/// element, a provider that does not expose the property). The caller is
+/// expected to treat that as *unknown* and not as `false`; see
+/// [`crate::injector::target::describe_foreground`], which returns `None` on
+/// it.
+pub fn focused_is_masked() -> Result<bool> {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+            log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
+        }
+        let automation: IUIAutomation =
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+        Ok(automation.GetFocusedElement()?.CurrentIsPassword()?.as_bool())
+    }
+}
+
 /// A screen-space rect to anchor the autofill overlay near: the currently
 /// focused element inside `hwnd` if there is one and it reports a real
 /// (non-empty) bounding box, otherwise the first Edit control found in the
