@@ -26001,79 +26001,117 @@ mod send_create_wiring {
 
     /// **THE DRAFT'S PLAINTEXT IS WIPED WHEN THE COMPOSER LETS GO OF IT.**
     ///
-    /// The buffers are `Zeroizing` because `SendPlan`'s are, and this reads the
-    /// bytes back through a raw pointer to prove that the wipe really happens
-    /// at the two moments the feature depends on it: Discard, and the
-    /// successful publish that clears the form.
+    /// Two readings, and it is the pair that is the claim, because either one
+    /// alone has a hole the other closes:
     ///
-    /// Reading freed memory is undefined behaviour in general; this is the
-    /// same technique `send.rs`'s own
-    /// `the_plans_secret_fields_and_the_built_json_all_wipe` uses and it is
-    /// confined to the same purpose. The buffer is not freed while it is read
-    /// -- the capacity is still owned by the `String` inside the value being
-    /// inspected -- only overwritten.
+    ///  1. **The draft really was let go.** After the release the composer is
+    ///     back to `default()` -- closed, with an empty body and no share
+    ///     password. Without this, a release path that merely set `open =
+    ///     false` and left the plan in place would free nothing and reading 2
+    ///     would answer "clean" about a buffer still full of the secret.
+    ///  2. **And what it let go of went back to the allocator wiped**, on the
+    ///     crate's `#[global_allocator]` probe -- the same instrument
+    ///     `send.rs`'s `the_plans_secret_fields_and_the_built_json_all_wipe`
+    ///     holds the same two fields against, and with its control asserted
+    ///     first for its reason.
+    ///
+    /// Both at the two moments the feature depends on the wipe: Discard, and
+    /// the successful publish that clears the form.
+    ///
+    /// **This used to read the buffer back through a raw pointer after the
+    /// release, and that was wrong twice.**
+    ///
+    /// It was *racy*: `apply` replaces the whole composer, so the `String`'s
+    /// allocation is not merely overwritten but FREED, and the read happened
+    /// after the free. Under a full suite at `-j 8` another thread can be
+    /// handed that block between the free and the read, and the bytes read are
+    /// then neither the plaintext nor zeros. That is the whole of the
+    /// intermittent failure this test was known for; the wipe it was
+    /// complaining about was correct every time.
+    ///
+    /// And it was *vacuous*: [`crate::login_ui::password_lifetime_tests`]'s
+    /// `Watcher::dealloc` zeroes EVERY block it frees, unconditionally and by
+    /// design. So a post-free read finds zeros whether the draft wiped itself
+    /// or not -- deleting `Zeroizing` from `SendPlan` left the old assertion
+    /// green. The probe is read INSIDE `dealloc`, before that wipe and while
+    /// the block is still unambiguously the allocator's, which is both the
+    /// deterministic observation point and the only one that can tell the two
+    /// apart.
     #[test]
     fn discarding_a_draft_zeroizes_the_text_and_the_share_password() {
+        use crate::login_ui::password_lifetime_tests::{
+            plaintext_reached_the_allocator, PROBE,
+        };
+
+        // **The control, first**, as every probe test in this crate does: an
+        // instrument that answered `false` to everything would make both
+        // verdicts below vacuous with nothing in the output to say so. Arming
+        // it first is also what puts the fixtures built inside the loop under
+        // this thread's hold of the probe lock.
+        let bare = PROBE.to_string();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: the allocator probe did not see a plain `String` carrying the probe go \
+             back to the allocator, so every verdict below is meaningless"
+        );
+
         for wipe_by_publishing in [false, true] {
+            // Built before the watch arms, so the temporaries of building the
+            // draft are not what is measured.
             let mut create = SendCreateState {
-                composer: an_open_composer(),
+                composer: send_ui::SendComposer {
+                    open: true,
+                    plan: crate::send::SendPlan {
+                        name: DRAFT_NAME.to_string(),
+                        text: zeroize::Zeroizing::new(PROBE.to_string()),
+                        password: Some(zeroize::Zeroizing::new(PROBE.to_string())),
+                        ..crate::send::SendPlan::default()
+                    },
+                },
                 in_flight: wipe_by_publishing,
                 report: None,
             };
-            let text_at = create.composer.plan.text.as_ptr();
-            let text_len = create.composer.plan.text.len();
-            let password_at = create
-                .composer
-                .plan
-                .password
-                .as_ref()
-                .expect("the draft has one")
-                .as_ptr();
-            let password_len = create
-                .composer
-                .plan
-                .password
-                .as_ref()
-                .expect("the draft has one")
-                .len();
-
-            // Control: the plaintext really is there to begin with.
-            let before = unsafe { std::slice::from_raw_parts(text_at, text_len) };
-            assert_eq!(
-                before,
-                SECRET.as_bytes(),
-                "control: the draft's buffer does not hold the plaintext, so the wipe below \
-                 asserts nothing"
-            );
-
+            let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
+            let mut fetch = send_ui::SendFetch::default();
             if wipe_by_publishing {
-                let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
-                let mut fetch = send_ui::SendFetch::default();
                 tx.send(SendCreateReport::Created {
                     name: DRAFT_NAME.to_string(),
                     access_url: "https://send.example.invalid/new".to_string(),
                 })
                 .expect("the receiver is held");
-                drain_send_create(&rx, &mut create, &mut fetch);
-            } else {
-                create.in_flight = false;
-                let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
             }
 
-            let text_after = unsafe { std::slice::from_raw_parts(text_at, text_len) };
+            let leaked = plaintext_reached_the_allocator(|| {
+                if wipe_by_publishing {
+                    drain_send_create(&rx, &mut create, &mut fetch);
+                } else {
+                    create.in_flight = false;
+                    let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
+                }
+            });
+
+            // 1. The draft was let go of at all.
             assert!(
-                text_after.iter().all(|b| *b == 0),
-                "the body of the Send is still in memory after the draft was let go \
-                 (publishing: {wipe_by_publishing}): {:?}",
-                String::from_utf8_lossy(text_after)
+                !create.composer.open,
+                "the composer is still open after the draft was released \
+                 (publishing: {wipe_by_publishing})"
             );
-            let password_after =
-                unsafe { std::slice::from_raw_parts(password_at, password_len) };
             assert!(
-                password_after.iter().all(|b| *b == 0),
-                "the share password is still in memory after the draft was let go \
-                 (publishing: {wipe_by_publishing}): {:?}",
-                String::from_utf8_lossy(password_after)
+                create.composer.plan.text.is_empty(),
+                "the body of the Send is still in the composer after the draft was let go \
+                 (publishing: {wipe_by_publishing})"
+            );
+            assert!(
+                create.composer.plan.password.is_none(),
+                "the share password is still in the composer after the draft was let go \
+                 (publishing: {wipe_by_publishing})"
+            );
+
+            // 2. And its buffers reached the allocator wiped.
+            assert!(
+                !leaked,
+                "the draft handed the body of the Send or the share password back to the \
+                 allocator in the clear when it was let go (publishing: {wipe_by_publishing})"
             );
         }
     }
