@@ -18077,14 +18077,13 @@ mod export_wiring {
     /// onto the one function the frame closure names.
     #[test]
     fn spawn_export_only_hands_the_real_work_to_the_tested_spawner() {
-        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let body = concat!(
             "pub(super) fn spawn_", "export( ctx_for_export: egui::Context, tx: ExportSender, \
              session: zeroize::Zeroizing<String>, ) { spawn_export_with(ctx_for_export, tx, \
              move || { pick_and_export(real_destination, &session) }); }"
         );
         assert_eq!(
-            squashed(production()).matches(body).count(),
+            code_squashed(production()).matches(body).count(),
             1,
             "`spawn_export` is no longer exactly the delegation to `spawn_export_with` with \
              the real picker -- anything added to it is a line that runs on the frame's own \
