@@ -220,7 +220,85 @@ forms; the identity link needs a picker, a resolution path, and a decision
 about what to show when the linked item is deleted. Shipping the ZIP first
 means the second half is optional rather than load-bearing.
 
-## 6. Layout
+## 6. The card pane's layout
+
+The detail pane currently lists a card's fields as five stacked label/value
+rows, in the order the struct happens to have them. **Lay it out like the
+object it describes instead**, so the eye finds things where the physical card
+puts them.
+
+```
+[brand]  ••••  ••••  ••••  4242
+Expires  08/29        Code  •••
+──────────────────────────────────
+A. Novak                    (or the linked identity)
+```
+
+**One line: brand then number.** The brand becomes the icon from §1 rather
+than the word "Visa", sitting immediately before the digits — which is where
+it sits on the card, and which removes a whole row.
+
+**One line: expiry and security code.** They are short, they are always read
+together when filling a form, and stacking them wastes two rows on eight
+characters.
+
+**The cardholder goes to the bottom**, below a divider, because it is the
+least-consulted field and because that slot is where the **linked identity**
+(§5) will render when one is set. Name or identity, never both — the identity
+supersedes the bare name, since it contains it.
+
+### Consequences to check rather than assume
+
+- **The rows above are being rebuilt anyway** for masking (§4) and for the
+  typography fix that made the expiry match the digits around it. Do this
+  after that lands, not concurrently — they are the same three rows.
+- **Two values on one line changes the copy affordance.** Every value in this
+  pane is click-to-copy with its own hit area; two on a line means two hit
+  areas in one row, and the existing row-level click must not become
+  ambiguous. `copy_row` is built around one value per row — check whether it
+  generalises or needs a sibling.
+- The pane's layout guards measure painted ink and row heights. Removing two
+  rows will move them **legitimately**; re-pin deliberately rather than
+  loosening a tolerance.
+
+## 7. Shortcuts for card fields
+
+Every value in this pane should be reachable from the keyboard, as a login's
+already are.
+
+**The existing table is keyed by field ROLE, not by item kind**
+(`detail.rs:1104`): `Password → CTRL+B`, `Username → CTRL+U`,
+`Totp → CTRL+T`, `Website → CTRL+SHIFT+U`. There is also a **drift guard that
+refuses the same chord appearing twice**, so card chords must be added to that
+table rather than beside it — a parallel mechanism would be the "two
+enumerations that must agree" defect this project keeps losing to.
+
+**Two ways to fit cards into it, and the choice is real:**
+
+**A — reuse the roles.** A card's number is its sensitive value and its
+cardholder is its identifying one, so `CTRL+B` copies the number and `CTRL+U`
+the cardholder, exactly as they do on a login. Only the security code and
+expiry need new chords. Muscle memory transfers; two new chords instead of
+four.
+
+**B — give cards their own chords.** Unambiguous, self-documenting, and every
+chord means exactly one thing everywhere. Costs four new bindings in an
+already-crowded space, and asks the user to learn a second set.
+
+**Recommendation: A.** The table is already role-keyed rather than
+kind-keyed, which is the design saying roles are the unit. "Copy the secret"
+and "copy who it belongs to" are the same intent on both kinds.
+
+**Whichever is chosen, the chord-uniqueness guard decides whether it is even
+expressible.** Check that guard before writing code: if it forbids one chord
+resolving differently per item kind, option A is not available and the
+question is settled by the constraint rather than by taste.
+
+Expiry and security code need chords in either case. **Do not pick them from
+this document** — pick them by reading which chords the crate already spends,
+including the global hotkeys in `hotkey.rs`, and say what you found.
+
+## 9. Tile composition
 
 **Detail view:** bank icon large, network badge in the lower-right corner,
 overlapping the icon's edge — the arrangement of a physical card, which is why
@@ -236,7 +314,7 @@ push a control out of the row.
 
 ---
 
-## 7. Testing
+## 10. Testing
 
 The pure parts carry the weight, as usual here:
 
@@ -258,7 +336,7 @@ The pure parts carry the weight, as usual here:
 - Badge and tile composition through the existing headless `Context::run_ui`
   harness, measuring painted ink the way the overlay row tests do.
 
-## 8. Deliberately not in scope
+## 11. Deliberately not in scope
 
 - **Reading the bank from the number.** BIN-to-issuer requires a lookup
   service, and sending even a prefix discloses the issuer of a card in the
