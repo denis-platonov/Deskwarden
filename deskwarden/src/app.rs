@@ -199,6 +199,40 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     choice: FillChoice,
     notifier: &dyn sequence::Notifier,
 ) {
+    fill_from_vault_with(
+        cache,
+        injector,
+        fill_stats,
+        item_id,
+        hwnd,
+        choice,
+        notifier,
+        &crate::vault_window::preflight::SendGate::production(),
+    )
+}
+
+/// [`fill_from_vault`] with the preflight's foreground lookup **injected**.
+///
+/// The lookup is a live Win32 + COM round trip, so a test that reached the
+/// production gate would either be asking the machine it runs on where the
+/// mouse is, or -- worse -- would pass because that machine happened to answer
+/// the way the test wanted. Handing the gate in is what lets the fill be
+/// driven end to end with a foreground that is a value.
+///
+/// The split is `updater::apply_update`/`apply_update_with`'s, for the reason
+/// recorded there: the routing question -- does the sender still get asked? --
+/// is the one a pin on a pure decision cannot answer.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
+    cache: &VaultCache,
+    injector: &Injector<A, B>,
+    fill_stats: &crate::fill_stats::FillStats,
+    item_id: &str,
+    hwnd: isize,
+    choice: FillChoice,
+    notifier: &dyn sequence::Notifier,
+    gate: &crate::vault_window::preflight::SendGate,
+) {
     let item = cache
         .items()
         .into_iter()
@@ -296,6 +330,10 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                     fill_outcome_sink(fill_stats, item_id)(outcome);
                 }
                 Ok(FillAction::Sequence(plan)) => {
+                    // **The preflight gate, in the position that gates.** See
+                    // [`preflight_guard_for`] for which fills it speaks for and
+                    // `vault_window::preflight::dispatch_with` for why the gate
+                    // is a function behind a seam rather than an `if` here.
                     // **No `record_fill` on the `Ok` arm.** `fill_sequence`
                     // returns as soon as the typing thread has been *started*,
                     // so `Ok(())` cannot tell a sequence that typed a password
@@ -305,7 +343,29 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                     // of the picker. The sink is what records, from the thread
                     // that knows.
                     let sink = fill_outcome_sink(fill_stats, item_id);
-                    if let Err(e) = injector.fill_sequence(hwnd, plan, sink) {
+                    let rule_image = crate::vault_bridge::extract_app_match(&item).map(|m| m.process);
+                    let gated = crate::vault_window::preflight::dispatch_with(
+                        gate,
+                        preflight_guard_for(&choice, rule_image.as_deref()),
+                        || injector.fill_sequence(hwnd, plan, sink),
+                    );
+                    let sent = match gated {
+                        crate::vault_window::preflight::Gated::Sent(result) => result,
+                        crate::vault_window::preflight::Gated::Refused(why) => {
+                            let message =
+                                crate::vault_window::preflight::refusal_notice(Some(why));
+                            log::warn!("preflight refused a fill of item {item_id}: {message}");
+                            notifier.refused(&message);
+                            return;
+                        }
+                        crate::vault_window::preflight::Gated::NoTarget => {
+                            let message = crate::vault_window::preflight::refusal_notice(None);
+                            log::warn!("preflight could not describe the foreground; not filling");
+                            notifier.refused(&message);
+                            return;
+                        }
+                    };
+                    if let Err(e) = sent {
                         log::error!(
                             "auto-type sequence failed for item {item_id} into hwnd {hwnd}: {e}"
                         );
@@ -387,6 +447,39 @@ pub fn fill_outcome_sink(
             fill_stats.record_fill(&item_id);
         }
     })
+}
+
+/// **Which fills the preflight speaks for**, as a pure function so the scope
+/// of the gate is a thing with its own tests rather than a condition buried in
+/// [`fill_from_vault`].
+///
+/// It speaks for a fill that types **a bare secret into whatever holds
+/// focus**: [`FillChoice::Just`] of a password or a one-time code. That is
+/// precisely the case section 4b is written about, and it is the case where
+/// "the focused control is masked" is the right question -- the user put their
+/// caret in the password box and asked for the password.
+///
+/// It deliberately does **not** speak for [`FillChoice::UserTabPass`] or
+/// [`FillChoice::Saved`], and the reason is not caution, it is arithmetic:
+/// both of those start by typing a username into a field that is not masked,
+/// so `preflight::verdict`'s `NotMasked` arm would refuse every one of them.
+/// The design's own 4b illustration is such a sequence (Ctrl+A, the address,
+/// Tab, the password, Enter) shown in the ALLOWED state, so applying the
+/// masking rule to a multi-step sequence would contradict the picture it comes
+/// from. That conflict is recorded rather than papered over.
+pub fn preflight_guard_for<'a>(
+    choice: &FillChoice,
+    rule_image: Option<&'a str>,
+) -> crate::vault_window::preflight::Guard<'a> {
+    match choice {
+        FillChoice::Just(key_sequence::FieldRef::Password)
+        | FillChoice::Just(key_sequence::FieldRef::Totp) => {
+            crate::vault_window::preflight::Guard::Preflight { rule_image }
+        }
+        FillChoice::Just(_) | FillChoice::UserTabPass | FillChoice::Saved => {
+            crate::vault_window::preflight::Guard::NotRequired
+        }
+    }
 }
 
 /// The stored auto-type sequence for `item`, or `""` if it has no app match
@@ -2509,6 +2602,38 @@ mod fill_dispatch_tests {
     const USER: &str = "work.account@contoso.com";
     const PASS: &str = "Zq7-tremulous-BADGER";
 
+    /// The foreground the gated fills below are told they are typing into:
+    /// the process `item_with`'s rule names, with a masked control focused.
+    /// A value, so no test asks the machine it runs on where the mouse is.
+    fn a_masked_box_in_the_rules_process() -> Option<crate::injector::target::SendTarget> {
+        Some(crate::injector::target::SendTarget {
+            title: "Work Microsoft 365 - Sign in".into(),
+            image_name: "msedge.exe".into(),
+            pid: 7412,
+            class_name: "Chrome_WidgetWin_1".into(),
+            focused_is_masked: true,
+        })
+    }
+
+    /// The same window, with the caret in a box that echoes what is typed.
+    fn an_unmasked_box_in_the_rules_process() -> Option<crate::injector::target::SendTarget> {
+        Some(crate::injector::target::SendTarget {
+            focused_is_masked: false,
+            ..a_masked_box_in_the_rules_process().unwrap()
+        })
+    }
+
+    /// A chat window: the design's own example of where a password must not go.
+    fn a_chat_box() -> Option<crate::injector::target::SendTarget> {
+        Some(crate::injector::target::SendTarget {
+            title: "Slack - #payments-oncall".into(),
+            image_name: "slack.exe".into(),
+            pid: 9001,
+            class_name: "Chrome_WidgetWin_1".into(),
+            focused_is_masked: false,
+        })
+    }
+
     fn item_with(sequence: &str) -> VaultItem {
         let m = AppMatch {
             sequence: sequence.to_string(),
@@ -3512,7 +3637,7 @@ mod fill_dispatch_tests {
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = scratch_stats("choice-totp");
-        fill_from_vault(
+        fill_from_vault_with(
             &cache,
             &injector,
             &stats,
@@ -3520,6 +3645,9 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Just(key_sequence::FieldRef::Totp),
             &sequence::RecordingNotifier::default(),
+            &crate::vault_window::preflight::SendGate::describing(
+                a_masked_box_in_the_rules_process,
+            ),
         );
 
         totp.assert();
@@ -3555,7 +3683,7 @@ mod fill_dispatch_tests {
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = scratch_stats("choice-nototp");
-        fill_from_vault(
+        fill_from_vault_with(
             &cache,
             &injector,
             &stats,
@@ -3563,6 +3691,9 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Just(key_sequence::FieldRef::Password),
             &sequence::RecordingNotifier::default(),
+            &crate::vault_window::preflight::SendGate::describing(
+                a_masked_box_in_the_rules_process,
+            ),
         );
 
         // Positive control: the fill really ran and really typed, so
@@ -3574,6 +3705,78 @@ mod fill_dispatch_tests {
             [Step::Text { text: PASS.to_string(), rate: sequence::DEFAULT_RATE }]
         );
         totp.expect(0).assert();
+    }
+
+    /// **The gate, driven from the entry point it gates.**
+    ///
+    /// The routing tests in `vault_window::preflight` prove `dispatch_with`
+    /// refuses; this proves the FILL goes through it. A real `fill_from_vault_with`
+    /// runs end to end with a foreground that is a value, and the question is
+    /// whether the recording filler saw a single keystroke.
+    ///
+    /// Delete the gate from `fill_from_vault_with`'s sequence arm -- or
+    /// neutralise it to a `let _gated = dispatch_with(..);` -- and the two
+    /// refusal cases below type the password, which is exactly the survivor
+    /// `updater::installer_is_launchable` records for the shape of test that
+    /// only pins the decision.
+    fn gated_password_fill(
+        describe: fn() -> Option<crate::injector::target::SendTarget>,
+    ) -> (usize, Vec<String>) {
+        let _serialised = crate::injector::sequence_test_lock();
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("preflight-routing");
+        let notifier = sequence::RecordingNotifier::default();
+        fill_from_vault_with(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            &notifier,
+            &crate::vault_window::preflight::SendGate::describing(describe),
+        );
+        let typed = rec.sequences.lock().unwrap().len();
+        (typed, notifier.take())
+    }
+
+    #[test]
+    fn a_password_fill_types_only_when_the_preflight_allows_it() {
+        // Positive control on the instrument: with the right window and a
+        // masked control the fill really does type, so a count of zero below
+        // is a refusal and not a harness that never fills anything.
+        let (typed, said) = gated_password_fill(a_masked_box_in_the_rules_process);
+        assert_eq!(typed, 1, "the allowed case never typed; said: {said:?}");
+        assert!(said.is_empty(), "an allowed fill told the user it was refused: {said:?}");
+    }
+
+    #[test]
+    fn a_password_fill_types_nothing_when_the_preflight_refuses() {
+        // The design's own example: the wrong process in front.
+        let (typed, said) = gated_password_fill(a_chat_box);
+        assert_eq!(typed, 0, "the password was typed into a chat box");
+        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
+
+        // The right process, with the caret in a box that echoes.
+        let (typed, said) = gated_password_fill(an_unmasked_box_in_the_rules_process);
+        assert_eq!(typed, 0, "the password was typed into an unmasked control");
+        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
+
+        // Nowhere describable at all -- an unknown target is not a safe one.
+        let (typed, said) = gated_password_fill(|| None);
+        assert_eq!(typed, 0, "the password was typed with no idea where it was going");
+        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
     }
 
     /// **`UserTabPass` reaches the UI-Automation-first path, not the runner.**
@@ -3979,6 +4182,142 @@ mod match_disposition_tests {
                 MatchDisposition::Prompt => {}
                 MatchDisposition::Nothing => {}
             }
+        }
+    }
+}
+
+/// **The preflight gate, and the fact that it is in a gating POSITION.**
+///
+/// Two claims, and neither covers the other.
+///
+/// The routing claim -- that nothing reaches the sender without
+/// `Verdict::Allowed` -- is `vault_window::preflight`'s, made by driving
+/// `dispatch_with` end to end behind its seam and asking whether the sender
+/// RAN. That is what kills a deleted or neutralised refusal branch, which a
+/// pin on `verdict` alone cannot see; `updater::installer_is_launchable`
+/// records the measured survivor that taught this crate the difference.
+///
+/// The claim HERE is the other half: that `fill_from_vault`'s sequence arm
+/// reaches the sender only *through* that function. `fill_from_vault` needs a
+/// `VaultCache`, an `Injector` and a `FillStats` and nothing in this crate can
+/// call it, so this is a source pin, said plainly, with positive controls on
+/// every needle. Move the `injector.fill_sequence` call out of the closure and
+/// this fails.
+#[cfg(test)]
+mod preflight_call_site_tests {
+
+    /// This file with every top-level gated module removed -- including this
+    /// one, which spells every needle below. Same line-based cut, and the same
+    /// reasons, as `fill_call_site_tests::production_only`.
+    fn production() -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in include_str!("app.rs").lines() {
+            let flat = line.trim_end();
+            if !skipping && flat == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if flat == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            out.push_str(flat);
+            out.push('\n');
+        }
+        assert!(!skipping, "a gated module never closed at column zero; the cut is unreliable");
+        out
+    }
+
+    const SENDER: &str = concat!("injector.fill_", "sequence(");
+    const GATED: &str = concat!("|| injector.fill_", "sequence(hwnd, plan, sink)");
+    const GATE: &str = concat!("preflight::dispatch_", "with(");
+
+    #[test]
+    fn the_sequence_sender_is_reached_only_from_inside_the_gate() {
+        let production = production();
+        assert!(
+            production.len() < include_str!("app.rs").len(),
+            "control: the cut removed nothing, so this pin is reading its own fixtures"
+        );
+        assert_eq!(
+            production.matches(GATE).count(),
+            1,
+            "there must be exactly one gated dispatch in this file"
+        );
+        assert_eq!(
+            production.matches(SENDER).count(),
+            1,
+            "the sequence sender is called more than once, so one of the calls is ungated"
+        );
+        assert_eq!(
+            production.matches(GATED).count(),
+            1,
+            "the one call to the sequence sender is not the closure handed to the gate"
+        );
+        // The gate is what the call is INSIDE, not merely a line above it: the
+        // closure is the sender's whole text, so the sender cannot run unless
+        // the closure is called, and only the allowed arm calls it.
+        let at_gate = production.find(GATE).expect("the gate is in this file");
+        let at_send = production.find(SENDER).expect("the sender is in this file");
+        assert!(at_gate < at_send, "the sender is called before the gate is even consulted");
+
+        // Positive control on all three needles: they match the spellings they
+        // are meant to match, so a count of 1 is a real call site rather than
+        // a typo that matches nothing.
+        let fixture = concat!(
+            "let gated = crate::vault_window::preflight::dispatch_",
+            "with(\n",
+            "    &gate, guard, || injector.fill_",
+            "sequence(hwnd, plan, sink),\n);\n"
+        );
+        assert_eq!(fixture.matches(GATE).count(), 1);
+        assert_eq!(fixture.matches(SENDER).count(), 1);
+        assert_eq!(fixture.matches(GATED).count(), 1);
+    }
+}
+
+/// Which fills the preflight speaks for. See [`preflight_guard_for`] for why
+/// the multi-step sequences are deliberately outside it.
+#[cfg(test)]
+mod preflight_guard_tests {
+    use super::*;
+    use crate::vault_window::preflight::Guard;
+
+    #[test]
+    fn a_bare_secret_typed_at_the_caret_is_gated_and_carries_the_items_rule() {
+        for field in [key_sequence::FieldRef::Password, key_sequence::FieldRef::Totp] {
+            assert_eq!(
+                preflight_guard_for(&FillChoice::Just(field.clone()), Some("saplogon.exe")),
+                Guard::Preflight { rule_image: Some("saplogon.exe") },
+                "{field:?} types a credential into whatever holds focus and must be gated"
+            );
+            assert_eq!(
+                preflight_guard_for(&FillChoice::Just(field), None),
+                Guard::Preflight { rule_image: None },
+                "an item with no rule is still gated, on the masking half"
+            );
+        }
+    }
+
+    /// The other choices are NOT gated, and this states the reason as a test
+    /// rather than only in prose: both begin by typing a username into a field
+    /// that is not masked, so `verdict`'s `NotMasked` arm would refuse every
+    /// one of them -- including the design's own 4b illustration.
+    #[test]
+    fn a_sequence_that_starts_by_typing_a_username_is_not_gated_on_masking() {
+        for choice in [
+            FillChoice::UserTabPass,
+            FillChoice::Saved,
+            FillChoice::Just(key_sequence::FieldRef::Username),
+        ] {
+            assert_eq!(
+                preflight_guard_for(&choice, Some("saplogon.exe")),
+                Guard::NotRequired,
+                "{choice:?} would be refused on every legitimate fill"
+            );
         }
     }
 }

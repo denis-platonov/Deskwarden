@@ -9,6 +9,7 @@ pub mod detail;
 pub mod detail_edit;
 pub mod folder_modal;
 pub mod item_list;
+pub mod preflight;
 pub mod send_ui;
 pub mod sidebar;
 
