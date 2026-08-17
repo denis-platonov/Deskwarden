@@ -956,7 +956,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 39] = [
+        const OPENS_NO_WINDOW: [&str; 40] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -976,6 +976,10 @@ mod tests {
             // pure data with no I/O. The panes that draw what it returns are
             // `detail` and `item_list`, and neither is this module.
             "card_brand",
+            // The network marks: a lookup returning `include_bytes!`-ed PNG
+            // bytes. It hands a picture to whoever is painting; the tile and
+            // the detail pane draw it, and neither is this module.
+            "card_mark",
             // Reads this crate's own source to check that no type carrying a
             // secret derives `Debug`. Like `below_cut` it is `#[cfg(test)]`
             // at its declaration and draws nothing.
