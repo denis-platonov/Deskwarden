@@ -105,11 +105,53 @@ pub enum Gated<T> {
 pub struct SendGate {
     /// [`crate::injector::target::describe_foreground`] in production.
     describe: fn() -> Option<SendTarget>,
+    /// [`crate::preflight_host::show_preflight`] in production: the modal that
+    /// hosts [`draw`]. See [`Self::confirm`] for why it is here and not inside
+    /// [`dispatch_with`].
+    confirm: fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction>,
 }
 
 impl SendGate {
     pub fn production() -> Self {
-        Self { describe: crate::injector::target::describe_foreground }
+        Self {
+            describe: crate::injector::target::describe_foreground,
+            confirm: crate::preflight_host::show_preflight,
+        }
+    }
+
+    /// The foreground, through the gate's own seam.
+    ///
+    /// Public so that the caller can build a [`PreflightState`] out of the
+    /// **same** observation [`dispatch_with`] will make, rather than a second
+    /// one taken from somewhere else -- a preflight that named one window and
+    /// a gate that checked another would be worse than no preflight.
+    pub fn describe(&self) -> Option<SendTarget> {
+        (self.describe)()
+    }
+
+    /// Puts the 4b confirmation on screen and answers what the user did.
+    ///
+    /// # This is *ahead of* the gate and never *instead of* it
+    ///
+    /// The confirmation cannot decide anything. Its only affirmative answer is
+    /// [`PreflightAction::Send`], and all that answer does is let the caller
+    /// go on to call [`dispatch_with`], which describes the foreground again
+    /// and refuses on its own terms. So there is no ordering of clicks, holds
+    /// or window switches that reaches a sender without the refusal arms in
+    /// `dispatch_with` having allowed it, and the mutation measurement those
+    /// arms carry (neutralise: 3 red, delete: 2 red) is unchanged by hosting
+    /// the surface -- the tests drive this seam with a stub that always
+    /// answers `Send`, so what they measure is still the gate alone.
+    ///
+    /// The other direction is a real gain: [`draw`]'s refusal state paints no
+    /// hold affordance at all, so a refused target never even offers the user
+    /// a way to ask.
+    pub fn confirm(
+        &self,
+        state: PreflightState,
+        copy_payload: zeroize::Zeroizing<String>,
+    ) -> Option<PreflightAction> {
+        (self.confirm)(state, copy_payload)
     }
 }
 
@@ -422,8 +464,35 @@ fn draw_refused(ui: &mut Ui, state: &PreflightState, why: Refusal) -> Option<Pre
 /// whole of the production half.
 #[cfg(test)]
 impl SendGate {
+    /// A gate whose foreground is a fixture and whose confirmation **always
+    /// says yes**.
+    ///
+    /// Saying yes is the point: it takes the hosted modal out of the picture
+    /// entirely, so every routing assertion built on this constructor is
+    /// measuring `dispatch_with`'s refusal arms and nothing else. If the
+    /// confirmation could refuse here, a deleted gate would still look green
+    /// and the whole measurement would be worthless.
     pub fn describing(describe: fn() -> Option<SendTarget>) -> Self {
-        Self { describe }
+        Self { describe, confirm: |_, _| Some(PreflightAction::Send) }
+    }
+
+    /// A gate whose confirmation is a fixture too, for the tests that ask
+    /// whether the surface is HOSTED -- i.e. whether a gated fill really opens
+    /// it before anything is typed.
+    /// The confirmation seam, by identity, for the address pin in
+    /// `app::fill_dispatch_tests`. A getter and not a `pub` field so that
+    /// production code still cannot reach past [`Self::confirm`].
+    pub fn confirm_fn(
+        &self,
+    ) -> fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction> {
+        self.confirm
+    }
+
+    pub fn describing_and_confirming(
+        describe: fn() -> Option<SendTarget>,
+        confirm: fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction>,
+    ) -> Self {
+        Self { describe, confirm }
     }
 }
 
@@ -494,7 +563,7 @@ mod tests {
     /// Runs a gated send that records whether it ran, and hands back both.
     fn run(describe: fn() -> Option<SendTarget>, guard: Guard<'_>) -> (Gated<()>, bool) {
         let mut sent = false;
-        let gated = dispatch_with(&SendGate { describe }, guard, || sent = true);
+        let gated = dispatch_with(&SendGate::describing(describe), guard, || sent = true);
         (gated, sent)
     }
 

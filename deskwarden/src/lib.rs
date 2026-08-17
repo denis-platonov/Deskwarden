@@ -41,6 +41,7 @@ pub mod match_engine;
 pub mod overlay_ui;
 pub mod password_strength;
 pub mod picker_ui;
+pub mod preflight_host;
 pub mod prefs_ui;
 pub mod send;
 pub mod session_store;

@@ -344,9 +344,19 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
                     // that knows.
                     let sink = fill_outcome_sink(fill_stats, item_id);
                     let rule_image = crate::vault_bridge::extract_app_match(&item).map(|m| m.process);
+                    let guard = preflight_guard_for(&choice, rule_image.as_deref());
+                    // **The 4b surface, hosted.** It runs BEFORE the gate and
+                    // never instead of it: its only affirmative answer lets
+                    // this arm go on and call `dispatch_with`, which describes
+                    // the foreground again and refuses on its own terms. See
+                    // `preflight::SendGate::confirm` for why that ordering is
+                    // what keeps the gate's mutation measurement intact.
+                    if !confirmed_by_preflight(gate, guard, &item, &choice, totp.as_deref()) {
+                        return;
+                    }
                     let gated = crate::vault_window::preflight::dispatch_with(
                         gate,
-                        preflight_guard_for(&choice, rule_image.as_deref()),
+                        guard,
                         || injector.fill_sequence(hwnd, plan, sink),
                     );
                     let sent = match gated {
@@ -478,6 +488,91 @@ pub fn preflight_guard_for<'a>(
         }
         FillChoice::Just(_) | FillChoice::UserTabPass | FillChoice::Saved => {
             crate::vault_window::preflight::Guard::NotRequired
+        }
+    }
+}
+
+/// **Asks the hosted 4b confirmation, and answers whether the fill may go on
+/// to ask the gate.**
+///
+/// Three ways this answers `true`, and each is deliberate:
+///
+/// 1. [`crate::vault_window::preflight::Guard::NotRequired`] -- the fill is
+///    not one the preflight speaks for (see [`preflight_guard_for`]), so no
+///    window is opened and nothing is asked. Putting a modal in front of every
+///    `UserTabPass` fill would make the app unusable, and it would ask a
+///    question about masking that those fills deliberately do not answer.
+/// 2. The foreground could not be described. **Nothing is confirmed and
+///    nothing is sent**: `dispatch_with` is still called, sees the same
+///    `None`, and answers `Gated::NoTarget`, which is the arm that tells the
+///    user. Returning `true` here rather than short-circuiting keeps the
+///    reporting of an undescribable foreground in exactly one place.
+/// 3. The user completed the hold.
+///
+/// Everything else -- Esc, Cancel, Dismiss, "Copy instead", the window closed
+/// with the X, a second preflight already open -- answers `false`, and a
+/// `false` types nothing.
+///
+/// # It is not the gate
+///
+/// A `true` from here is permission to *ask*, not permission to type.
+/// `dispatch_with` runs immediately after and makes its own observation. That
+/// is what lets this be hosted without weakening the measurement the refusal
+/// arms carry: the routing tests drive
+/// [`crate::vault_window::preflight::SendGate::describing`], whose
+/// confirmation always says `Send`, so what they see is the gate on its own.
+fn confirmed_by_preflight(
+    gate: &crate::vault_window::preflight::SendGate,
+    guard: crate::vault_window::preflight::Guard<'_>,
+    item: &VaultItem,
+    choice: &FillChoice,
+    totp: Option<&str>,
+) -> bool {
+    let crate::vault_window::preflight::Guard::Preflight { rule_image } = guard else {
+        return true;
+    };
+    let Some(target) = gate.describe() else {
+        return true;
+    };
+    // No rule recorded means no process claim to show, so the surface says the
+    // target claims itself -- the same `None` reading `dispatch_with` makes,
+    // spelled the same way so the two cannot disagree about what the user was
+    // shown and what was then checked.
+    let claim = rule_image.unwrap_or(target.image_name.as_str()).to_string();
+
+    let (username, password) = credentials_for(item);
+    let password = zeroize::Zeroizing::new(password);
+    // The step rows are built from this, and `step_rows(.., false)` writes the
+    // mask for a secret in a branch whose `else` is the only one that can
+    // resolve a value -- so nothing borrowed here can reach the screen.
+    let totp_state = crate::vault_window::detail::TotpState::NoSecret;
+    let source = crate::key_sequence::ResolveSource {
+        username: &username,
+        password: password.as_str(),
+        custom: crate::key_sequence::custom_pairs(item),
+        totp: &totp_state,
+    };
+    let sequence = match choice {
+        FillChoice::Just(field) => {
+            crate::key_sequence::render(&[crate::key_sequence::Token::Field(field.clone())])
+        }
+        FillChoice::UserTabPass | FillChoice::Saved => sequence_for(item),
+    };
+    // "Copy instead" is an escape from typing, not from the vault: it is the
+    // very value this fill was going to type, and it is the only secret the
+    // window is handed. `Zeroizing` so the window's exit wipes it.
+    let copy = zeroize::Zeroizing::new(match choice {
+        FillChoice::Just(key_sequence::FieldRef::Totp) => totp.unwrap_or_default().to_string(),
+        _ => password.to_string(),
+    });
+
+    let state =
+        crate::vault_window::preflight::PreflightState::new(target, &claim, &sequence, &source);
+    match gate.confirm(state, copy) {
+        Some(crate::vault_window::preflight::PreflightAction::Send) => true,
+        answered => {
+            log::info!("the preflight was not confirmed ({answered:?}); nothing was typed");
+            false
         }
     }
 }
@@ -3749,6 +3844,145 @@ mod fill_dispatch_tests {
         );
         let typed = rec.sequences.lock().unwrap().len();
         (typed, notifier.take())
+    }
+
+    // ---- the surface is HOSTED, not merely written ------------------------
+    //
+    // `dispatch_with` refuses bad targets whether or not a modal exists, so
+    // every routing test above stays green with the 4b confirmation deleted
+    // from `fill_from_vault_with` entirely -- which is the state this crate
+    // shipped in at `b05c818`: a tested `draw` that nothing put on screen.
+    // These three ask the other question: was the user ASKED, and is the
+    // answer obeyed?
+    //
+    // The recorder is a pair of statics rather than a closure because the seam
+    // is an `fn` pointer, for the reason `SendGate`'s doc gives: a seam taking
+    // an `impl Fn` could be handed a wrapper and the identity pin below could
+    // not see it. The whole module is serialised on `sequence_test_lock`.
+    static CONFIRMS_ASKED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static CONFIRM_SAW_SECRET: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn confirmed(
+        state: crate::vault_window::preflight::PreflightState,
+        copy: zeroize::Zeroizing<String>,
+    ) -> Option<crate::vault_window::preflight::PreflightAction> {
+        CONFIRMS_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // What the surface was handed: a step list that says there is a
+        // secret, and the very value "Copy instead" would put on the clipboard.
+        CONFIRM_SAW_SECRET.store(
+            state.has_secret() && copy.as_str() == PASS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        Some(crate::vault_window::preflight::PreflightAction::Send)
+    }
+
+    fn cancelled(
+        _state: crate::vault_window::preflight::PreflightState,
+        _copy: zeroize::Zeroizing<String>,
+    ) -> Option<crate::vault_window::preflight::PreflightAction> {
+        CONFIRMS_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(crate::vault_window::preflight::PreflightAction::Cancel)
+    }
+
+    fn must_not_be_asked(
+        _state: crate::vault_window::preflight::PreflightState,
+        _copy: zeroize::Zeroizing<String>,
+    ) -> Option<crate::vault_window::preflight::PreflightAction> {
+        panic!("a fill the preflight does not speak for opened a confirmation window");
+    }
+
+    /// Drives a whole fill with both halves of the gate as fixtures, and
+    /// reports how many times the confirmation was asked and how many
+    /// sequences were typed.
+    fn hosted_fill(
+        choice: FillChoice,
+        confirm: fn(
+            crate::vault_window::preflight::PreflightState,
+            zeroize::Zeroizing<String>,
+        ) -> Option<crate::vault_window::preflight::PreflightAction>,
+    ) -> (usize, usize) {
+        let _serialised = crate::injector::sequence_test_lock();
+        CONFIRMS_ASKED.store(0, std::sync::atomic::Ordering::SeqCst);
+        CONFIRM_SAW_SECRET.store(false, std::sync::atomic::Ordering::SeqCst);
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("preflight-hosting");
+        fill_from_vault_with(
+            &cache_with(item_with("{USERNAME}{TAB}{PASSWORD}")),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            choice,
+            &sequence::RecordingNotifier::default(),
+            &crate::vault_window::preflight::SendGate::describing_and_confirming(
+                a_masked_box_in_the_rules_process,
+                confirm,
+            ),
+        );
+        let typed = rec.sequences.lock().unwrap().len();
+        (CONFIRMS_ASKED.load(std::sync::atomic::Ordering::SeqCst), typed)
+    }
+
+    /// **The hosting, driven from the entry point.** Delete the
+    /// `confirmed_by_preflight` call from `fill_from_vault_with` and this is
+    /// red at `asked == 1` while every routing test above stays green.
+    #[test]
+    fn a_bare_secret_fill_asks_the_confirmation_before_it_types() {
+        let (asked, typed) =
+            hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), confirmed);
+        assert_eq!(asked, 1, "the 4b confirmation was never shown");
+        assert_eq!(typed, 1, "the confirmed fill did not type, so `asked` proves nothing");
+        assert!(
+            CONFIRM_SAW_SECRET.load(std::sync::atomic::Ordering::SeqCst),
+            "the surface was handed a step list with no secret in it, or a copy payload that              is not the value this fill was about to type"
+        );
+    }
+
+    /// And the answer is obeyed. Reading the confirmation's answer and
+    /// carrying on regardless -- `let _ = confirmed_by_preflight(..);`, the
+    /// neutralisation this crate has measured surviving elsewhere at zero
+    /// warnings -- is red here.
+    #[test]
+    fn a_cancelled_confirmation_types_nothing() {
+        let (asked, typed) =
+            hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), cancelled);
+        assert_eq!(asked, 1, "control: the confirmation really was shown");
+        assert_eq!(typed, 0, "the fill typed a password the user had just cancelled");
+    }
+
+    /// The scope is `preflight_guard_for`'s and not one of its own: a
+    /// `UserTabPass` fill opens no window at all. Widening the modal to every
+    /// fill would put a hold-to-send in front of the app's ordinary path --
+    /// and would ask a masking question those fills deliberately do not answer.
+    #[test]
+    fn an_ungated_fill_opens_no_confirmation() {
+        let (asked, typed) = hosted_fill(FillChoice::Saved, must_not_be_asked);
+        assert_eq!(asked, 0);
+        assert_eq!(typed, 1, "control: the ungated fill really ran");
+    }
+
+    /// The production seam, pinned by ADDRESS, exactly as the foreground
+    /// lookup beside it is. A `confirm` that was a wrapper -- or a
+    /// flag-gated `|_, _| Some(Send)` -- is a different address and fails
+    /// here whatever it is spelled, and every test above would still pass.
+    #[test]
+    fn the_production_gate_hosts_the_real_confirmation_window() {
+        let production = crate::vault_window::preflight::SendGate::production();
+        assert!(
+            std::ptr::fn_addr_eq(
+                production.confirm_fn(),
+                crate::preflight_host::show_preflight
+                    as fn(
+                        crate::vault_window::preflight::PreflightState,
+                        zeroize::Zeroizing<String>,
+                    )
+                        -> Option<crate::vault_window::preflight::PreflightAction>
+            ),
+            "the production gate does not open the real preflight window"
+        );
     }
 
     #[test]

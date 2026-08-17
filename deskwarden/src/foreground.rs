@@ -696,12 +696,16 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 7] = [
+    const OPENS_WINDOWS: [&str; 8] = [
         "app_window",
         "loading_ui",
         "login_ui",
         "overlay_ui",
         "picker_ui",
+        // The 4b preflight confirmation. Excused from raising for the same
+        // reasons `overlay_ui` is, and for one more that is stronger -- see
+        // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
+        "preflight_host",
         "prefs_ui",
         "vault_window",
     ];
@@ -739,7 +743,13 @@ mod tests {
     /// The reason is carried in the source because it is the whole content of
     /// the exemption; the test below refuses a blank one, and refuses a module
     /// listed here that turns out to raise after all.
-    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 1] = [(
+    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 2] = [
+        (
+        "preflight_host",
+        include_str!("preflight_host.rs"),
+        "The preflight is `with_always_on_top()`, so the OS already keeps it above everything.          It also opens while ANOTHER app is foreground -- it is the confirmation shown BEFORE a          sequence is typed into that app -- and it opens under the same literal `\"Deskwarden\"`          title `vault_window`, `app_window` and `loading_ui` all raise under, so a          `raise_window` here could bring one of those forward instead. And there is a reason          particular to this window: `preflight::verdict` was computed from the foreground          described a moment before it opened, and `dispatch_with` describes the foreground          again after it closes. A raise is a deliberate change to which window is in front,          made by the one surface in the app whose whole job is to tell the truth about which          window is in front.",
+    ),
+    (
         "overlay_ui",
         include_str!("overlay_ui.rs"),
         "The autofill prompt is `with_always_on_top()`, so the OS already keeps it above \
