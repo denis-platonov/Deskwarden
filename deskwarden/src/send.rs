@@ -553,7 +553,12 @@ fn delete_invocation(id: &str, session: Option<&str>) -> SendInvocation {
 /// point: a `CreatedSend` the user cannot be shown the URL for is not a
 /// success, which is why [`SendError::CreatedButUnreadable`] exists rather
 /// than an `access_url: Option<String>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **`Debug` is hand-written below and deliberately not derived**, for the
+/// reason [`SendPlan`] gives: `access_url` carries the Send's decryption key
+/// in its fragment, so a derived `Debug` turns one stray log line into full
+/// disclosure of the Send's contents.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreatedSend {
     pub id: String,
     pub name: String,
@@ -562,7 +567,10 @@ pub struct CreatedSend {
 }
 
 /// One row of the Sends screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **`Debug` is hand-written below and deliberately not derived**, for the
+/// reason [`CreatedSend`] gives.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SendSummary {
     pub id: String,
     pub name: String,
@@ -573,8 +581,80 @@ pub struct SendSummary {
     pub is_file: bool,
 }
 
+/// Stands in for an `access_url` in a `Debug`.
+///
+/// **The WHOLE URL is elided, not just the fragment after `#`.** Splitting on
+/// `#` and printing the left half would be a parsing rule that has to be right
+/// every time: a URL `bw` returned in some other shape -- no `#`, or the key
+/// carried elsewhere -- would fall through the split and print the key in
+/// full. There is also nothing the left half buys: the record's own `id` is
+/// already a field beside it, so the `Debug` still names the Send without it.
+struct ElidedAccessUrl;
+
+impl std::fmt::Debug for ElidedAccessUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<access URL elided: carries the decryption key>")
+    }
+}
+
+/// Hand-written so the decryption key never reaches a formatter. `id` and
+/// `name` are kept: they are what identify the Send to a reader, and both are
+/// already on screen.
+impl std::fmt::Debug for CreatedSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedSend")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("access_url", &ElidedAccessUrl)
+            .field("deletion_date", &self.deletion_date)
+            .finish()
+    }
+}
+
+/// Hand-written so `bw`'s response body never reaches a formatter. The
+/// *shape* of the answer is what a reader debugging a failure actually needs
+/// -- did it exit, was there anything on either stream -- and none of that
+/// requires the bytes. Lengths are given so "empty" and "something arrived"
+/// stay distinguishable, which is the distinction
+/// [`SendError::FailedSilently`] turns on.
+impl std::fmt::Debug for RawOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawOutput")
+            .field("exit_code", &self.exit_code)
+            .field("stdout_len", &self.stdout.len())
+            .field("stderr_len", &self.stderr.len())
+            .finish()
+    }
+}
+
+/// Hand-written for the reason [`CreatedSend`]'s impl gives.
+impl std::fmt::Debug for SendSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendSummary")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("access_url", &ElidedAccessUrl)
+            .field("deletion_date", &self.deletion_date)
+            .field("is_file", &self.is_file)
+            .finish()
+    }
+}
+
 /// What `bw` said, verbatim. The runner's whole output; no interpretation.
-#[derive(Debug, Clone, Default)]
+///
+/// **`Debug` is hand-written below and deliberately not derived.** This type
+/// is the THIRD carrier of a Send's decryption key and the most dangerous of
+/// the three: for `bw send create`, `stdout` is the response JSON, `accessUrl`
+/// and all. [`CreatedSend`] and [`SendSummary`] at least look like records a
+/// reader might think twice about printing; this one is named "raw output",
+/// which is precisely what someone reaches for when a Send fails and they
+/// want to see what happened. A derived `Debug` here makes
+/// `log::debug!("{raw:?}")` -- the most natural debugging line in this module
+/// -- write a working key to a plaintext file.
+///
+/// The fields stay public and unredacted: parsing needs the bytes. Only the
+/// `Debug` refuses, because `Debug` is what ends up in logs.
+#[derive(Clone, Default)]
 pub struct RawOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
@@ -3296,6 +3376,107 @@ mod tests {
                     .to_string(),
                 deletion_date: "2026-08-18T00:43:17.148Z".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_debug_render_never_carries_the_decryption_key() {
+        // The access URL's fragment IS the Send's decryption key: anyone
+        // holding the whole URL can read the payload. A `Debug` that prints it
+        // turns one careless `log::debug!("{summary:?}")` into a working key
+        // written to a plaintext file, and nothing about a `String` field
+        // warns the author of that line.
+        let summary = SendSummary {
+            id: "abc".to_string(),
+            name: "SAP Production".to_string(),
+            access_url: "https://send.bitwarden.com/#abcdefghijklmnop/somekeyhere".to_string(),
+            deletion_date: "2026-08-17T14:20:00.000Z".to_string(),
+            is_file: false,
+        };
+        let created = CreatedSend {
+            id: "abc".to_string(),
+            name: "SAP Production".to_string(),
+            access_url: "https://send.bitwarden.com/#abcdefghijklmnop/somekeyhere".to_string(),
+            deletion_date: "2026-08-17T14:20:00.000Z".to_string(),
+        };
+
+        for (what, rendered) in [
+            ("SendSummary", format!("{summary:?}")),
+            ("CreatedSend", format!("{created:?}")),
+        ] {
+            assert!(
+                !rendered.contains("somekeyhere"),
+                "{what}: the access URL carries the Send's decryption key after `#`; a Debug \
+                 that prints it turns any stray log line into a full disclosure of the Send's \
+                 contents. Rendered: {rendered}"
+            );
+            // The whole URL goes, not just the fragment: a `bw` that returned
+            // the link in another shape would fall through a split on `#`.
+            assert!(
+                !rendered.contains("abcdefghijklmnop") && !rendered.contains("send.bitwarden.com"),
+                "{what}: part of the access URL survived, so the redaction is a parse of the \
+                 URL rather than a refusal to print it. Rendered: {rendered}"
+            );
+            // LIVE CONTROLS: a `Debug` that rendered the empty string would
+            // pass the assertions above and be useless. These two say it
+            // still identifies which Send this is.
+            assert!(
+                rendered.contains("SAP Production"),
+                "control: {what}'s Debug no longer carries the name, so it cannot say which \
+                 Send it is. Rendered: {rendered}"
+            );
+            assert!(
+                rendered.contains("abc") && rendered.contains(what),
+                "control: {what}'s Debug no longer carries its id or its type name. \
+                 Rendered: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_output_debug_never_carries_the_response_body() {
+        // The third carrier, and the one a person actually reaches for. When a
+        // Send fails, the natural debugging line is `log::debug!("{raw:?}")` --
+        // and for `bw send create` this stdout IS the response JSON, key and
+        // all. Redacting the two record types and leaving this derived would
+        // be the whole fix defeated by the most likely way anyone would look.
+        let raw = RawOutput {
+            exit_code: Some(0),
+            stdout: CREATED_JSON.to_string(),
+            stderr: "some diagnostic".to_string(),
+        };
+        let rendered = format!("{raw:?}");
+
+        assert!(
+            !rendered.contains("somekeyhere")
+                && !rendered.contains("accessUrl")
+                && !rendered.contains("hunter2"),
+            "the raw stdout of `bw send create` is the response body: it carries the Send's \
+             decryption key AND, in `text.text`, the secret itself. A Debug that prints it \
+             writes both into any log that catches a failure. Rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("some diagnostic"),
+            "stderr is elided too: `bw` echoes the request on some failures, so it is not \
+             reliably free of the link. Rendered: {rendered}"
+        );
+
+        // LIVE CONTROLS. A Debug rendering the empty string would satisfy every
+        // assertion above and tell a reader nothing. These say it still
+        // answers the questions a failure actually raises: did it exit, and was
+        // there anything on either stream -- the distinction
+        // `SendError::FailedSilently` turns on.
+        assert!(
+            rendered.contains("RawOutput") && rendered.contains('0'),
+            "control: the Debug no longer names the type or reports the exit code. \
+             Rendered: {rendered}"
+        );
+        let empty = format!("{:?}", RawOutput::default());
+        assert_ne!(
+            rendered, empty,
+            "control: a populated RawOutput renders identically to an empty one, so the Debug \
+             cannot distinguish `bw` said nothing from `bw` said something -- which is exactly \
+             the call FailedSilently has to make"
         );
     }
 
