@@ -17535,7 +17535,16 @@ mod export_wiring {
     /// string -- a second literal-aware hand parser, over production bodies
     /// this time -- and every byte it got wrong would be a FALSE RED on honest
     /// code. The rule as it stands is narrow, true, and now written down.
-    fn code_squashed(text: &str) -> String {
+    ///
+    /// `pub(super)` so that [`send_delete_wiring`](super::send_delete_wiring)'s
+    /// two whole-body pins can share it -- the same direction
+    /// `send_delete_wiring::code_braces_only` is already shared in. They each
+    /// carried a private `split_whitespace` squash that kept comment-only
+    /// lines, and both were MEASURED to red on a plain explanatory comment
+    /// added inside the function they pin. Sharing one squasher is what makes
+    /// the boundary above true of every pin that claims it rather than of the
+    /// ones whose author happened to be in this module.
+    pub(super) fn code_squashed(text: &str) -> String {
         text.lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .flat_map(str::split_whitespace)
@@ -18293,6 +18302,14 @@ mod export_wiring {
         );
 
         // The second lock: the call's arguments, as a whole-call equality.
+        // A private `split_whitespace` squash, and it STAYS one. MEASURED
+        // 2026-08-17 against Task 4: a whole-line comment written inside the
+        // frame beside the pinned call left this test GREEN. It squashes
+        // `code_braces_only` output, and that already replaces comments with
+        // spaces -- so the false red `code_squashed` exists to answer cannot
+        // reach here. Swapping it in would be an unmeasured "consistency"
+        // edit to a pin, which is how pins in this file have been weakened
+        // before.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
         let expected = squashed(concat!(
             "apply_export_", "action( account_action.as_ref(), &mut export, ui.ctx(), \
@@ -19474,7 +19491,15 @@ mod export_wiring {
         //
         // Whitespace-collapsed, so `rustfmt` and any reindent of this file
         // are free -- the false-red class this module keeps losing to.
-        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        //
+        // [`code_squashed`] rather than a private `split_whitespace` squash,
+        // and that was MEASURED, not tidied: with the private one, a single
+        // whole-line comment written inside the macro's own body redded this
+        // pin with a message about the macro no longer being the address
+        // comparison. That is the same false red `c067ce1` took off
+        // `spawn_export`, and the same lesson -- a guard that reds on a
+        // comment is a guard the next person loosens.
+        let collapsed: String = code_squashed(body);
         let expected = concat!(
             "{ (",
             "$field:ident, ",
@@ -20353,7 +20378,12 @@ mod export_wiring {
     /// the production runner and the window's own job.
     #[test]
     fn pick_and_export_only_hands_the_real_runner_to_the_tested_entry_point() {
-        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // [`code_squashed`], not a private `split_whitespace` squash. Measured:
+        // one whole-line comment inside `pick_and_export`'s body redded this
+        // pin with a message about a verdict decided above `run_export`. See
+        // that function's doc for why a comment must be free and a TRAILING
+        // comment still is not.
+        let squashed = code_squashed;
         let body = concat!(
             "pub(super) fn pick_and_", "export<P>(pick: P, session: &str) -> ExportReport \
              where P: FnOnce() -> Option<PathBuf>, { pick_and_export_with(pick, session, \
@@ -23779,7 +23809,13 @@ mod send_delete_wiring {
     /// one.
     #[test]
     fn spawn_send_delete_only_hands_the_real_work_to_the_tested_spawner() {
-        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The SHARED squasher, which drops comment-only lines. Measured with
+        // the private `split_whitespace` one this used to carry: a single
+        // whole-line comment inside `spawn_send_delete`'s body redded this
+        // pin with a message accusing its author of adding a line that runs
+        // on the frame's own thread. A trailing comment on a code line still
+        // reds, deliberately -- see `export_wiring::code_squashed`.
+        let squashed = super::export_wiring::code_squashed;
         let body = concat!(
             "pub(super) fn spawn_send_", "delete( ctx_for_delete: egui::Context, tx: \
              SendDeleteSender, session: zeroize::Zeroizing<String>, id: String, name: String, ) \
@@ -23819,7 +23855,10 @@ mod send_delete_wiring {
     /// hollow `spawn_aux_load` -- had nothing to notice.
     #[test]
     fn spawn_send_create_only_hands_the_real_work_to_the_tested_spawner() {
-        let squashed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The shared squasher, for
+        // [`spawn_send_delete_only_hands_the_real_work_to_the_tested_spawner`]'s
+        // measured reason exactly.
+        let squashed = super::export_wiring::code_squashed;
         let body = concat!(
             "pub(super) fn spawn_send_", "create( ctx_for_create: egui::Context, tx: \
              SendCreateSender, session: zeroize::Zeroizing<String>, plan: \
@@ -24527,6 +24566,14 @@ mod send_delete_wiring {
         // the HEAD, which says the applier takes the panel expression
         // directly and therefore that nothing can be bound between them,
         // and the TAIL, which pins the rest of the arguments as before.
+        // A private `split_whitespace` squash, and it STAYS one. MEASURED
+        // 2026-08-17 against Task 4: a whole-line comment written inside the
+        // frame beside the pinned call left this test GREEN. It squashes
+        // `code_braces_only` output, and that already replaces comments with
+        // spaces -- so the false red `code_squashed` exists to answer cannot
+        // reach here. Swapping it in would be an unmeasured "consistency"
+        // edit to a pin, which is how pins in this file have been weakened
+        // before.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
         let flat = squashed(&code_braces_only(production()));
         let head = squashed(concat!(
@@ -24649,6 +24696,14 @@ mod send_delete_wiring {
         // gating what the pane is ASKED FOR is the same defect as gating
         // what it reported -- that is where the `search` shadow moved to
         // once the verdict's own binding was gone.
+        // A private `split_whitespace` squash, and it STAYS one. MEASURED
+        // 2026-08-17 against Task 4: a whole-line comment written inside the
+        // frame beside the pinned call left this test GREEN. It squashes
+        // `code_braces_only` output, and that already replaces comments with
+        // spaces -- so the false red `code_squashed` exists to answer cannot
+        // reach here. Swapping it in would be an unmeasured "consistency"
+        // edit to a pin, which is how pins in this file have been weakened
+        // before.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
         let model = squashed(concat!(
             "if let Some(state) = &show_sends .then(|| send_ui::pane_", "state(\
