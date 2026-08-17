@@ -935,6 +935,35 @@ pub struct EditDraft {
     /// a `deskwarden:app-match` in the middle of the user's fields keeps its
     /// slot because it is still in this list.
     pub fields: Vec<FieldDraft>,
+    /// [`Self::content_digest`] as it was when this form OPENED, which is what
+    /// [`Self::is_dirty`] compares against.
+    ///
+    /// **A digest and not a copy of the draft**, and that is a security
+    /// decision before it is a memory one: a pristine `EditDraft` kept beside
+    /// the live one would be a second plaintext copy of the password, the
+    /// TOTP seed, the card's number and code and every hidden custom field,
+    /// living exactly as long as the form is open and wiped by nothing. A
+    /// `u64` carries no plaintext. The cost is that a hash collision reads as
+    /// "not dirty", i.e. the confirmation is skipped on a draft that has
+    /// changed; that is one 2^-64 event against a permanent duplicate of
+    /// every secret on the screen.
+    ///
+    /// **Private**, and set only by the three constructors. A caller that
+    /// could assign it could declare a modified draft pristine, which is the
+    /// whole guarantee.
+    opened_digest: u64,
+    /// The discard confirmation is on screen.
+    ///
+    /// On the draft rather than in `egui::Memory` for the same reason
+    /// [`Self::reveal_password`] is: this is state that must outlive a frame,
+    /// and putting it here is also what makes "Cancel on a dirty draft asks
+    /// first" a fact a test can assert by reading a value rather than by
+    /// finding a dialog in a paint list.
+    ///
+    /// **Deliberately not part of [`Self::content_digest`]**: opening the
+    /// confirmation is not an edit, and a draft that became dirty by being
+    /// asked about would be a form that could never answer "nothing to lose".
+    pub discard_prompt: bool,
 }
 
 /// The generator's own form state: which kind of secret to make, and how big.
@@ -990,6 +1019,8 @@ impl Default for EditDraft {
     fn default() -> Self {
         Self {
             kind: ItemKind::Login,
+            opened_digest: 0,
+            discard_prompt: false,
             name: String::new(),
             folder_id: None,
             original_folder_id: None,
@@ -1006,6 +1037,10 @@ impl Default for EditDraft {
             app: None,
             fields: Vec::new(),
         }
+        // A blank form has nothing to lose, and `is_dirty` has to say so from
+        // the first frame. Every other constructor routes through this one or
+        // seals for itself.
+        .seal()
     }
 }
 
@@ -1162,7 +1197,12 @@ impl EditDraft {
             // including the ones this form will not draw. See
             // [`Self::fields`].
             fields: item.fields.iter().map(FieldDraft::from_field).collect(),
+            opened_digest: 0,
+            discard_prompt: false,
         }
+        // The item AS READ is this form's opening state, so "dirty" means
+        // "differs from the item on screen" and not "is non-empty".
+        .seal()
     }
 
     /// A blank draft of the default kind (a login -- see [`Self::default`]).
@@ -1180,7 +1220,10 @@ impl EditDraft {
     /// cannot reach would buy nothing and would have to be kept in step with
     /// `ItemKind` forever.
     pub fn empty_of(kind: ItemKind) -> Self {
-        Self { kind, ..Self::default() }
+        // Resealed AFTER the kind is set: `default()`'s seal was taken on a
+        // login, and a blank card that counted as dirty against it would put
+        // the discard confirmation in front of a form nobody had typed into.
+        Self { kind, ..Self::default() }.seal()
     }
 
     /// Which kind this draft is for.
@@ -1331,6 +1374,157 @@ impl EditDraft {
     /// means against a parser that is total by design.
     pub fn is_saveable(&self) -> bool {
         self.is_valid() && self.sequence_fault().is_none()
+    }
+
+    /// Records this draft's current content as its opening state, so
+    /// [`Self::is_dirty`] measures from here.
+    ///
+    /// Called by the three constructors and by nothing else, which is what
+    /// makes "dirty" mean "changed since the form opened" rather than
+    /// "changed since somebody last said so". In particular [`Self::set_kind`]
+    /// does NOT reseal: switching the type on a create form clears every
+    /// kind-specific box, and that is a change the user would lose.
+    fn seal(mut self) -> Self {
+        self.opened_digest = self.content_digest();
+        self
+    }
+
+    /// A digest over everything on this form the user can type or choose,
+    /// and over nothing else.
+    ///
+    /// **The exclusions are the whole design of this function.** Revealing a
+    /// password, opening the window picker, filtering it, previewing a
+    /// sequence and opening the discard confirmation are all things the user
+    /// does to the form rather than to the item; if any of them counted, a
+    /// form nobody had edited would ask "discard your changes?" on the way
+    /// out. A confirmation that fires when there is nothing to lose is worse
+    /// than none, because it teaches the user to click through it -- and they
+    /// will still be clicking through it on the day it matters.
+    ///
+    /// The top-level `let Self { .. }` binds **every** field with no `..`
+    /// rest pattern, so a field added to [`EditDraft`] later does not compile
+    /// until somebody decides which side of that line it is on. Same for
+    /// [`CardDraft`] and [`SshKeyDraft`], the two kind halves that carry
+    /// reveal flags mixed in with their content.
+    ///
+    /// The app block is digested as **the binding it would save**
+    /// ([`AppMatchDraft::to_match`]) plus its `bound` flag, rather than
+    /// field by field, for the same reason: that struct is over half window
+    /// picker and template-editor state.
+    ///
+    /// The intermediate string is [`zeroize::Zeroize`]d before it is dropped.
+    /// It is the one place in this file that deliberately materialises the
+    /// password, the TOTP seed and the card's secrets into a single buffer,
+    /// and leaving that buffer to the allocator would be a new copy of every
+    /// secret on the screen once per frame.
+    fn content_digest(&self) -> u64 {
+        use std::fmt::Write as _;
+        use std::hash::{Hash as _, Hasher as _};
+        use zeroize::Zeroize as _;
+
+        let Self {
+            kind,
+            name,
+            folder_id,
+            // Not editable: what the folder WAS when the form opened. It
+            // moves only when `folder_id` does, and that is already counted.
+            original_folder_id: _,
+            username,
+            password,
+            // View state, not content -- see this function's doc.
+            reveal_password: _,
+            totp,
+            reveal_totp: _,
+            card,
+            identity,
+            ssh_key,
+            note_body,
+            generator,
+            app,
+            fields,
+            // The measurement itself, and the question being asked about it.
+            opened_digest: _,
+            discard_prompt: _,
+        } = self;
+        let CardDraft {
+            cardholder_name,
+            brand,
+            number,
+            exp_month,
+            exp_year,
+            code,
+            reveal_number: _,
+            reveal_code: _,
+        } = card;
+        let SshKeyDraft { private_key, public_key, key_fingerprint, reveal_private_key: _ } =
+            ssh_key;
+
+        // NUL between every part, so "ab" + "" and "a" + "b" are different
+        // drafts rather than the same digest.
+        let mut sketch = String::new();
+        let _ = write!(
+            sketch,
+            "{kind:?}\u{0}{name}\u{0}{folder_id:?}\u{0}{username}\u{0}{password}\u{0}{totp}\u{0}\
+             {cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
+             {code}\u{0}{private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}\
+             {identity:?}\u{0}{note_body}\u{0}{generator:?}\u{0}"
+        );
+        match app {
+            Some(app) => {
+                let _ = write!(sketch, "app\u{0}{}\u{0}{:?}\u{0}", app.bound, app.to_match());
+            }
+            None => sketch.push_str("no-app\u{0}"),
+        }
+        for field in fields {
+            let _ = write!(sketch, "{}\u{0}{}\u{0}{:?}\u{0}", field.name, field.value, field.role);
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sketch.hash(&mut hasher);
+        sketch.zeroize();
+        hasher.finish()
+    }
+
+    /// **Whether this draft has unsaved changes.** A pure function of the
+    /// draft, which is what lets `draft_dirtiness_tests` construct every case
+    /// directly instead of driving the form and reading a dialog back out.
+    ///
+    /// This is the gate on the Cancel confirmation: a draft nobody has
+    /// touched closes immediately.
+    pub fn is_dirty(&self) -> bool {
+        self.content_digest() != self.opened_digest
+    }
+
+    /// Wipes every secret this draft holds, in place.
+    ///
+    /// Called on a **confirmed** discard, and on nothing else. The draft is
+    /// about to be dropped by `vault_window::mod`'s `DetailMode::Read`, and a
+    /// dropped `String` hands its bytes back to the allocator exactly as it
+    /// received them; the item's password, TOTP seed, card number and code,
+    /// private key, note body and hidden custom fields would all sit in freed
+    /// memory afterwards.
+    ///
+    /// Note what this does NOT touch: the name, the folder, the username, the
+    /// identity block, the app binding. None of them is a secret, and wiping
+    /// them would make the "keep editing" pairing below harder to read
+    /// without making anything safer.
+    ///
+    /// `zeroize` and not `String::clear`: `clear` sets the length to zero and
+    /// leaves every byte where it was.
+    pub fn zeroize_secrets(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+        self.totp.zeroize();
+        self.card.number.zeroize();
+        self.card.code.zeroize();
+        self.ssh_key.private_key.zeroize();
+        // A secure note's entire body is the secret.
+        self.note_body.zeroize();
+        for field in &mut self.fields {
+            if field.role == FieldRole::Hidden {
+                field.value.zeroize();
+            }
+        }
     }
 
     /// Whether the form may offer "No folder".
@@ -3666,7 +3860,15 @@ pub fn draw_detail_edit(
                     action = EditAction::Save;
                 }
                 if theme::secondary_button(ui, "Cancel").clicked() {
-                    action = EditAction::Cancel;
+                    // **Not `EditAction::Cancel` outright.** A draft with
+                    // unsaved edits asks first; an untouched one closes now.
+                    // See `EditDraft::is_dirty` for why the gate is on the
+                    // draft's content and not on "was this form ever open".
+                    if draft.is_dirty() {
+                        draft.discard_prompt = true;
+                    } else {
+                        action = EditAction::Cancel;
+                    }
                 }
             });
         });
@@ -4033,8 +4235,145 @@ pub fn draw_detail_edit(
         .inner;
     note_form_overflow(ui.ctx(), scrolled.content_size.y > scrolled.inner_rect.height());
 
+    // **Last, and over everything.** Drawn after the form so the overlay's
+    // scrim sits on top of the boxes it is asking about, and only ever in
+    // response to `discard_prompt`, which only the Cancel button above sets
+    // and only on a dirty draft.
+    if draft.discard_prompt {
+        match draw_discard_confirm(ui.ctx()) {
+            Some(DiscardAnswer::Discard) => {
+                draft.discard_prompt = false;
+                // **Before the form closes, and only on this branch.** The
+                // caller drops the draft in response to `Cancel`, which
+                // returns its `String`s to the allocator with the plaintext
+                // still in them. The `KeepEditing` arm must NOT do this: a
+                // confirmation that wiped the form behind the dialog would
+                // answer "keep editing" by emptying every secret box on it.
+                // Both directions are pinned by `discard_confirm_tests`.
+                draft.zeroize_secrets();
+                action = EditAction::Cancel;
+            }
+            Some(DiscardAnswer::KeepEditing) => draft.discard_prompt = false,
+            None => {}
+        }
+    }
+
     action
 }
+
+/// What the discard confirmation came back with, or nothing if it is still
+/// asking.
+///
+/// A two-variant enum rather than a `bool`, because the two answers are not
+/// symmetric -- one of them destroys the user's typing -- and `Some(true)` at
+/// a call site says nothing about which one that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscardAnswer {
+    KeepEditing,
+    Discard,
+}
+
+/// The confirmation the item form's Cancel puts up when the draft has unsaved
+/// changes.
+///
+/// **An in-window overlay, drawn from inside the vault window's running
+/// frame**, on the same `Area`-over-scrim pattern as
+/// [`folder_modal::draw_folder_edit_modal`](super::folder_modal). It cannot be
+/// a second OS window: `overlay_ui::show_prompt_overlay` and `preflight_host`
+/// each pump their own message loop, and this is called from inside egui's.
+///
+/// Two rules the layout encodes rather than merely permits:
+///
+/// * **Discard is not preselected.** It is the outlined destructive control,
+///   the way the folder modal's Delete is; "Keep editing" is the filled
+///   primary. Nothing here binds `Enter`, so a stray return keypress on the
+///   way out of a text box cannot answer this dialog at all.
+/// * **Escape means keep editing.** Escape is the reflex for "get this off my
+///   screen", and every other transient overlay in this app cancels on it --
+///   which is precisely why it must resolve to the SAFE answer here. The
+///   destructive answer requires the pointer.
+fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
+    let mut answer = None;
+
+    // Full-window click-catcher under the card, so a click aimed at the form
+    // behind cannot reach it. A click on the scrim itself is swallowed and
+    // decides nothing -- neither answer is safe to give by accident, and
+    // "dismiss by clicking away" would give the destructive one to anyone who
+    // read the two buttons as a toolbar.
+    egui::Area::new(egui::Id::new("detail-edit-discard-scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(90),
+            );
+        });
+
+    egui::Area::new(egui::Id::new("detail-edit-discard-modal"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.set_width(320.0);
+                    ui.label(theme::bold(DISCARD_TITLE, 15.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(DISCARD_BODY).size(12.0).color(theme::TEXT_FAINT),
+                    );
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        // The destructive answer, in the design's error
+                        // outline and on the far side of the row from the
+                        // pointer's resting place -- the same treatment the
+                        // folder modal gives Delete.
+                        let discard = ui.add(
+                            egui::Button::new(
+                                theme::semibold(DISCARD_CONFIRM, 13.0).color(theme::ERROR),
+                            )
+                            .fill(theme::CARD)
+                            .stroke(Stroke::new(1.0, theme::ERROR))
+                            .corner_radius(CornerRadius::same(7))
+                            .min_size(egui::Vec2::new(0.0, theme::BUTTON_HEIGHT)),
+                        );
+                        if discard.clicked() {
+                            answer = Some(DiscardAnswer::Discard);
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if theme::primary_button(ui, DISCARD_KEEP, None).clicked() {
+                                    answer = Some(DiscardAnswer::KeepEditing);
+                                }
+                            },
+                        );
+                    });
+                });
+        });
+
+    // Escape resolves to the SAFE answer. See this function's doc.
+    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(DiscardAnswer::KeepEditing);
+    }
+
+    answer
+}
+
+/// The confirmation's four strings, named so the tests assert on the same
+/// bytes the screen shows rather than on a re-typed copy of them.
+const DISCARD_TITLE: &str = "Discard your changes?";
+const DISCARD_BODY: &str =
+    "This form has edits that have not been saved. Closing it now loses them.";
+const DISCARD_KEEP: &str = "Keep editing";
+const DISCARD_CONFIRM: &str = "Discard changes";
 
 #[cfg(test)]
 mod tests {
@@ -10025,6 +10364,257 @@ mod edit_pane_layout_tests {
         );
     }
 
+    /// Runs one frame to find `label`, then a second in which it is clicked.
+    /// Returns what the form asked the caller to do on the click.
+    fn click_labelled(ctx: &egui::Context, draft: &mut EditDraft, label: &str) -> EditAction {
+        let no_input: &[egui::Event] = &[];
+        // Two settling frames before anything is measured, exactly as the
+        // other click tests in this module do: the footer's own height feeds
+        // `note_form_overflow`, so a form measured on its very first frame is
+        // not the one the user is looking at -- on a cold context the strip
+        // is not painted at all.
+        let _ = frame(ctx, ROOMY_PANE, draft, true, no_input);
+        let (_, painted) = acting_frame_for(
+            ctx,
+            ROOMY_PANE,
+            draft,
+            true,
+            no_input,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        let at = painted.rect_of(label).center();
+        acting_frame_for(ctx, ROOMY_PANE, draft, true, &click(at), None, &detail::TotpState::NoSecret)
+            .0
+    }
+
+    /// [`tallest_draft`] as if the form had just OPENED on it.
+    ///
+    /// `tallest_draft` builds its state by assigning onto an
+    /// `EditDraft::empty()`, which is exactly what a user typing counts as --
+    /// so it arrives dirty, and every discard test below would be measuring a
+    /// fixture rather than a form. Resealing is what says "this is the state
+    /// the form opened in"; it is the same thing `EditDraft::from_item` does
+    /// on a real edit.
+    fn opened_tallest_draft() -> EditDraft {
+        let draft = tallest_draft().seal();
+        assert!(!draft.is_dirty(), "a resealed draft is still dirty");
+        draft
+    }
+
+    /// A dirty draft with a secret in every box the discard is supposed to
+    /// wipe, and a non-secret in one it is not.
+    fn edited_draft_full_of_secrets() -> EditDraft {
+        let mut draft = opened_tallest_draft();
+        draft.name = "Ledgerline".to_string();
+        draft.username = "someone@example.invalid".to_string();
+        draft.password = "hunter2-the-password".to_string();
+        draft.totp = "JBSWY3DPEHPK3PXP".to_string();
+        draft.card.number = "4111111111111111".to_string();
+        draft.card.code = "919".to_string();
+        draft.note_body = "the recovery words".to_string();
+        assert!(draft.is_dirty(), "the fixture must be dirty or the confirmation never opens");
+        draft
+    }
+
+    /// **Cancel on an UNTOUCHED form closes it, with no confirmation.**
+    ///
+    /// The half that is easy to leave out and is the more important of the
+    /// two. A dialog that fires when there is nothing to lose is worse than
+    /// no dialog: it trains the user to dismiss it without reading, and they
+    /// will still be dismissing it without reading on the day it is guarding
+    /// real typing. Asserted on both the returned action and the absence of
+    /// the confirmation's own strings.
+    #[test]
+    fn cancelling_an_untouched_form_closes_it_immediately() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = opened_tallest_draft();
+
+        let action = click_labelled(&ctx, &mut draft, "Cancel");
+        assert_eq!(
+            action,
+            EditAction::Cancel,
+            "Cancel on a form nobody edited did not close it"
+        );
+        assert!(
+            !draft.discard_prompt,
+            "an untouched form put the discard confirmation up anyway"
+        );
+
+        let (_, painted) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut draft,
+            true,
+            &[],
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        assert!(
+            !painted.strings().contains(&DISCARD_TITLE),
+            "the discard confirmation is on screen for an untouched form: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **Cancel on an EDITED form asks first**, and asking is not closing.
+    ///
+    /// Both facts, because either alone passes on a broken form: a dialog
+    /// that appears while `EditAction::Cancel` still goes out is a form that
+    /// closes behind its own confirmation.
+    #[test]
+    fn cancelling_an_edited_form_asks_before_closing() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = edited_draft_full_of_secrets();
+
+        let action = click_labelled(&ctx, &mut draft, "Cancel");
+        assert_eq!(
+            action,
+            EditAction::None,
+            "Cancel on an edited form closed it while the confirmation was going up"
+        );
+        assert!(draft.discard_prompt, "Cancel on an edited form asked nothing");
+
+        let (_, painted) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut draft,
+            true,
+            &[],
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        let on_screen = painted.strings();
+        for expected in [DISCARD_TITLE, DISCARD_BODY, DISCARD_KEEP, DISCARD_CONFIRM] {
+            assert!(
+                on_screen.contains(&expected),
+                "the confirmation does not show {expected:?}: {on_screen:?}"
+            );
+        }
+    }
+
+    /// **The pair the whole task turns on: the wipe follows the ANSWER.**
+    ///
+    /// Confirming the discard closes the form and zeroizes its secrets;
+    /// keeping editing closes nothing and zeroizes nothing. Run as one test
+    /// over both answers against one fixture, because they are not two
+    /// properties -- they are one property and its negation, and split across
+    /// two tests it is far too easy to delete the half that is inconvenient.
+    ///
+    /// A confirmation that wiped before asking would empty every secret box
+    /// on the form behind the dialog, and the user who chose "keep editing"
+    /// would come back to a blank one. That is the failure this pairing
+    /// exists to catch, and it is why the keep-editing side asserts on the
+    /// exact bytes the fixture typed and not merely on "not empty".
+    #[test]
+    fn the_discard_confirmation_wipes_on_discard_and_only_on_discard() {
+        for confirm in [false, true] {
+            let ctx = styled_context(ROOMY_PANE);
+            let mut draft = edited_draft_full_of_secrets();
+            let typed = draft.clone();
+
+            assert_eq!(
+                click_labelled(&ctx, &mut draft, "Cancel"),
+                EditAction::None,
+                "the confirmation did not open, so this round measures nothing"
+            );
+            let answered = click_labelled(
+                &ctx,
+                &mut draft,
+                if confirm { DISCARD_CONFIRM } else { DISCARD_KEEP },
+            );
+
+            assert!(!draft.discard_prompt, "the confirmation stayed up after being answered");
+            if confirm {
+                assert_eq!(
+                    answered,
+                    EditAction::Cancel,
+                    "confirming the discard did not close the form"
+                );
+                for (what, got) in [
+                    ("the password", &draft.password),
+                    ("the TOTP seed", &draft.totp),
+                    ("the card number", &draft.card.number),
+                    ("the card's security code", &draft.card.code),
+                    ("the note body", &draft.note_body),
+                ] {
+                    assert!(
+                        got.is_empty(),
+                        "a confirmed discard left {what} in the draft it is about to drop"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    answered,
+                    EditAction::None,
+                    "keeping editing closed the form anyway"
+                );
+                assert_eq!(
+                    (&draft.password, &draft.totp, &draft.card.number, &draft.card.code),
+                    (&typed.password, &typed.totp, &typed.card.number, &typed.card.code),
+                    "choosing KEEP EDITING wiped the form's secrets -- the user is now \
+                     looking at empty boxes they never emptied"
+                );
+                assert_eq!(
+                    draft.note_body, typed.note_body,
+                    "choosing KEEP EDITING wiped the note body"
+                );
+                assert!(
+                    draft.is_dirty(),
+                    "a kept draft stopped counting as dirty, so the next Cancel walks straight \
+                     out with the user's edits"
+                );
+            }
+        }
+    }
+
+    /// **Escape answers the confirmation SAFELY, and cannot answer it any
+    /// other way.**
+    ///
+    /// Escape is the reflex for "make this go away", and every other
+    /// transient overlay in this app cancels on it -- which is exactly why it
+    /// has to resolve to *keep editing* here and not to the destructive
+    /// answer. Paired with the secrets, because "Escape closed the dialog" and
+    /// "Escape discarded the draft" look identical from the outside if the
+    /// only thing checked is that the dialog went away.
+    #[test]
+    fn escape_on_the_discard_confirmation_keeps_editing() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = edited_draft_full_of_secrets();
+        let typed = draft.clone();
+        assert_eq!(click_labelled(&ctx, &mut draft, "Cancel"), EditAction::None);
+        assert!(draft.discard_prompt, "nothing is up for Escape to answer");
+
+        let escape = [
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut draft,
+            true,
+            &escape,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+
+        assert!(!draft.discard_prompt, "Escape did not dismiss the confirmation");
+        assert_eq!(
+            action,
+            EditAction::None,
+            "Escape on the discard confirmation DISCARDED the draft -- the safe reflex was \
+             wired to the destructive answer"
+        );
+        assert_eq!(draft.password, typed.password, "Escape wiped the password");
+        assert_eq!(draft.totp, typed.totp, "Escape wiped the TOTP seed");
+    }
+
     /// The bug, stated as geometry: on a pane the app can really be resized
     /// to, holding the form the user really had, Save and Cancel are on
     /// screen.
@@ -11670,6 +12260,236 @@ mod edit_pane_layout_tests {
         assert!(
             grazed.width() <= 0.5 || grazed.height() <= 0.5,
             "two runs that share an edge ({grazed:?}) are being called an overlap"
+        );
+    }
+}
+
+/// **"Has this draft changed?" as a decision about a value**, tested by
+/// constructing drafts rather than by driving the form and reading a dialog
+/// back off the screen.
+///
+/// The confirmation on Cancel is only as good as this predicate. A false
+/// negative walks out with the user's typing; a false positive nags on a form
+/// with nothing to lose, which is the failure that teaches people to click
+/// through the dialog and so causes the first one later.
+#[cfg(test)]
+mod draft_dirtiness_tests {
+    use super::*;
+    use crate::vault_bridge::{LoginData, VaultItem};
+
+    /// One named thing a user can do to an open form: the sentence a failure
+    /// should name it by, and the mutation that does it.
+    type Touch = (&'static str, fn(&mut EditDraft));
+
+    fn item() -> VaultItem {
+        VaultItem {
+            id: "id-1".to_string(),
+            name: "Ledgerline".to_string(),
+            folder_id: Some("f1".to_string()),
+            fields: Vec::new(),
+            login: Some(LoginData {
+                username: Some("someone@example.invalid".to_string()),
+                password: Some(Zeroizing::new("hunter2".to_string())),
+                totp: None,
+                uris: Vec::new(),
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: Some(Zeroizing::new("a note".to_string())),
+            item_type: Some(1),
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// The three constructors all open CLEAN. Without this the predicate is
+    /// permanently `true` and the confirmation is permanently in the way.
+    #[test]
+    fn a_freshly_opened_draft_is_not_dirty() {
+        assert!(!EditDraft::empty().is_dirty(), "a blank create form opened dirty");
+        assert!(!EditDraft::from_item(&item()).is_dirty(), "an edit form opened dirty");
+        for kind in CREATABLE_KINDS {
+            assert!(
+                !EditDraft::empty_of(kind).is_dirty(),
+                "a blank {kind:?} create form opened dirty -- `empty_of` seals after setting \
+                 the kind precisely so this cannot happen"
+            );
+        }
+    }
+
+    /// **Every box the user can type in makes the draft dirty**, one at a
+    /// time. Named, so a failure says which field the digest is blind to
+    /// rather than only that one of them is.
+    #[test]
+    fn editing_any_content_field_makes_the_draft_dirty() {
+        let edits: Vec<Touch> = vec![
+            ("the name", |d| d.name = "Renamed".to_string()),
+            ("the folder", |d| d.folder_id = Some("f2".to_string())),
+            ("the username", |d| d.username = "other@example.invalid".to_string()),
+            ("the password", |d| d.password = "changed".to_string()),
+            ("the TOTP seed", |d| d.totp = "JBSWY3DPEHPK3PXP".to_string()),
+            ("the note body", |d| d.note_body = "rewritten".to_string()),
+            ("the cardholder name", |d| d.card.cardholder_name = "A. Payer".to_string()),
+            ("the card number", |d| d.card.number = "4111111111111111".to_string()),
+            ("the card's code", |d| d.card.code = "919".to_string()),
+            ("an identity field", |d| d.identity.first_name = "Ada".to_string()),
+            ("the private key", |d| d.ssh_key.private_key = "-----BEGIN".to_string()),
+            ("the generator's size", |d| d.generator.length = 64),
+            ("the generator's kind", |d| d.generator.passphrase = true),
+            ("a new custom field", |d| d.fields.push(FieldDraft::new_of(FieldRole::Text))),
+            ("the item type", |d| d.set_kind(ItemKind::Card)),
+        ];
+        for (what, edit) in edits {
+            let mut draft = EditDraft::from_item(&item());
+            assert!(!draft.is_dirty(), "the fixture was already dirty before {what} changed");
+            edit(&mut draft);
+            assert!(
+                draft.is_dirty(),
+                "changing {what} left the draft looking untouched -- Cancel would walk out \
+                 with it without asking"
+            );
+        }
+    }
+
+    /// **...and the things that are NOT edits do not.**
+    ///
+    /// The other side of the same predicate, and the one that keeps the
+    /// dialog honest. Revealing a secret and opening the confirmation itself
+    /// are things done to the FORM. If either counted, Cancel on a form the
+    /// user had merely looked at would ask them to confirm losing nothing.
+    #[test]
+    fn merely_looking_at_the_form_does_not_make_it_dirty() {
+        let looks: Vec<Touch> = vec![
+            ("revealing the password", |d| d.reveal_password = true),
+            ("revealing the TOTP seed", |d| d.reveal_totp = true),
+            ("revealing the card number", |d| d.card.reveal_number = true),
+            ("revealing the card's code", |d| d.card.reveal_code = true),
+            ("revealing the private key", |d| d.ssh_key.reveal_private_key = true),
+            ("opening the discard confirmation", |d| d.discard_prompt = true),
+            ("setting the kind it already has", |d| d.set_kind(ItemKind::Login)),
+        ];
+        for (what, look) in looks {
+            let mut draft = EditDraft::from_item(&item());
+            look(&mut draft);
+            assert!(
+                !draft.is_dirty(),
+                "{what} counted as an edit -- Cancel would now nag about changes that do not \
+                 exist, which is how a confirmation becomes something people click through"
+            );
+        }
+    }
+
+    /// Two edits that cancel each other out leave the draft clean, which is
+    /// the property a "was this form ever touched" flag could not have. The
+    /// user who types a character and deletes it again has nothing to lose.
+    #[test]
+    fn an_edit_that_is_undone_leaves_the_draft_clean() {
+        let mut draft = EditDraft::from_item(&item());
+        let original = draft.name.clone();
+        draft.name.push('x');
+        assert!(draft.is_dirty(), "the fixture cannot tell the two states apart");
+        draft.name = original;
+        assert!(
+            !draft.is_dirty(),
+            "a typed-then-deleted character left the form permanently dirty"
+        );
+    }
+
+    /// **The wipe is a wipe, at the bytes.**
+    ///
+    /// `is_empty()` is what the UI-level pairing in `edit_pane_layout_tests`
+    /// can see, and `String::clear` satisfies it while leaving every
+    /// plaintext byte exactly where it was -- so on its own that assertion
+    /// would go green on a discard that erased nothing at all. This reads the
+    /// buffer back through the pointer it had BEFORE the wipe, which is still
+    /// the same allocation afterwards (`Zeroize for String` zeroes in place
+    /// and then sets the length to zero; it does not reallocate).
+    ///
+    /// The pointer and capacity are checked to prove that, because if the
+    /// allocation HAD moved this would be reading unrelated memory and its
+    /// verdict would mean nothing.
+    #[test]
+    fn zeroize_secrets_overwrites_the_bytes_rather_than_forgetting_them() {
+        const PROBE: &str = "correct-horse-battery-staple";
+        let mut draft = EditDraft::empty();
+        draft.password = PROBE.to_string();
+        let ptr = draft.password.as_ptr();
+        let len = draft.password.len();
+        let capacity = draft.password.capacity();
+
+        // The control: those bytes really are readable there right now, so a
+        // green verdict below is about the wipe and not about a probe that
+        // never saw anything.
+        //
+        // SAFETY: `ptr`/`len` describe the live, initialised buffer of a
+        // `String` this test owns and has not touched since reading them.
+        let before = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert_eq!(before, PROBE.as_bytes(), "the probe cannot see the plaintext to begin with");
+
+        draft.zeroize_secrets();
+
+        assert!(draft.password.is_empty(), "the wiped password is not empty");
+        assert_eq!(
+            draft.password.as_ptr(),
+            ptr,
+            "the buffer moved, so the read below would be about unrelated memory"
+        );
+        assert_eq!(draft.password.capacity(), capacity, "the buffer was reallocated");
+        // SAFETY: the same allocation, still owned by `draft`, still at least
+        // `len` bytes long -- the capacity is unchanged and was >= len.
+        let after = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert_eq!(
+            after,
+            vec![0u8; len],
+            "the discarded password's bytes are still in the buffer -- `zeroize_secrets` \
+             forgot the string instead of erasing it, and the allocator will hand those \
+             bytes to the next caller"
+        );
+    }
+
+    /// Every secret the form holds is covered, and the non-secrets are
+    /// deliberately left alone. The second half is not decoration: it is what
+    /// says the wipe was written as a list of secrets rather than as a blanket
+    /// clear, which is the version that would also erase the name and the
+    /// username a caller may still want to report on.
+    #[test]
+    fn zeroize_secrets_covers_every_secret_and_only_the_secrets() {
+        let mut draft = EditDraft::from_item(&item());
+        draft.totp = "JBSWY3DPEHPK3PXP".to_string();
+        draft.card.number = "4111111111111111".to_string();
+        draft.card.code = "919".to_string();
+        draft.ssh_key.private_key = "-----BEGIN OPENSSH PRIVATE KEY-----".to_string();
+        draft.fields.push(FieldDraft::new_of(FieldRole::Hidden));
+        draft.fields.push(FieldDraft::new_of(FieldRole::Text));
+        let hidden = draft.fields.len() - 2;
+        let plain = draft.fields.len() - 1;
+        draft.fields[hidden].value = "a hidden secret".to_string();
+        draft.fields[plain].value = "not a secret".to_string();
+
+        draft.zeroize_secrets();
+
+        for (what, got) in [
+            ("the password", &draft.password),
+            ("the TOTP seed", &draft.totp),
+            ("the card number", &draft.card.number),
+            ("the card's code", &draft.card.code),
+            ("the private key", &draft.ssh_key.private_key),
+            ("the note body", &draft.note_body),
+            ("a hidden custom field", &draft.fields[hidden].value),
+        ] {
+            assert!(got.is_empty(), "{what} survived the wipe");
+        }
+        assert_eq!(draft.name, "Ledgerline", "the wipe erased the item's name");
+        assert_eq!(
+            draft.username, "someone@example.invalid",
+            "the wipe erased the username, which is not a secret"
+        );
+        assert_eq!(
+            draft.fields[plain].value, "not a secret",
+            "the wipe erased a PLAIN custom field -- it is a blanket clear wearing a list's \
+             name, and the next secret added to the form will not be on that list"
         );
     }
 }
