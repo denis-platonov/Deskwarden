@@ -628,7 +628,13 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
-/// A card's expiry as `MM/YYYY`, with either half allowed to be missing.
+/// A card's expiry as `MM/YY`, with either half allowed to be missing.
+///
+/// **`MM/YY`, because that is what is embossed on the card.** This used to
+/// render `08/2029` where the plastic in the reader's hand says `08/29`, so
+/// checking the pane against the card was a subtraction. Bitwarden stores
+/// `expYear` as the full year, so the four-digit form is what arrives and the
+/// two-digit form is what is shown.
 ///
 /// Both halves are strings on the wire and either may be absent, so "what does
 /// a card with a month but no year show" is a decision rather than an
@@ -642,12 +648,28 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// both shapes; anything that does not parse as a month (`"xx"`, `"13"`,
 /// `"0"`) is passed through untouched, because showing an unexpected value
 /// beats silently dropping it.
+///
+/// **The year follows the same rule, stated the same way: a four-digit year
+/// shows its last two digits, and ANY other year is shown exactly as it
+/// arrived.** So `"2029"` renders `29`, `"29"` renders `29` (already the
+/// displayed form -- shortening it again would give `9`), and `"20291"`,
+/// `"abcd"`, `"7"` and `"202x"` render themselves. The shortening is gated on
+/// four ASCII digits rather than on `parse`, because `str::parse::<u16>`
+/// accepts a leading sign and would turn `"+123"` into `23` -- a number the
+/// item does not contain. An empty or blank year is absent, as everywhere
+/// else on this pane ([`non_empty`]).
 fn card_expiry_text(month: Option<&str>, year: Option<&str>) -> Option<String> {
     let month = non_empty(month).map(|m| match m.parse::<u8>() {
         Ok(n) if (1..=12).contains(&n) => format!("{n:02}"),
         _ => m.to_string(),
     });
-    let year = non_empty(year).map(str::to_string);
+    let year = non_empty(year).map(|y| {
+        if y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()) {
+            y[2..].to_string()
+        } else {
+            y.to_string()
+        }
+    });
     match (month, year) {
         (Some(m), Some(y)) => Some(format!("{m}/{y}")),
         (Some(m), None) => Some(m),
@@ -4780,6 +4802,203 @@ fn card_text_pair(ui: &mut egui::Ui, first: RichText, second: RichText) {
         });
 }
 
+/// **The typography every DIGITS row shares**, whatever else the row does:
+/// `font-family: ui-monospace; font-size: 15px; letter-spacing: 0.08em`. The
+/// tracking is what stops a bullet run -- or a card number -- reading as one
+/// solid blob.
+///
+/// The seam exists because the card pane's three digit rows had drifted into
+/// two different treatments. The number and the security code are secrets and
+/// go through [`masked_row`]; the expiry is not a secret and goes through
+/// [`digits_row`], so it gains neither bullets nor a Reveal eye. Before this,
+/// that difference in *what the row does* had dragged a difference in *how the
+/// row looks* along with it -- the expiry was 14px proportional and untracked,
+/// sitting between two 15px tracked monospace runs, and the user reported the
+/// three as "different fonts".
+///
+/// **Stated here rather than as an opt-in flag on [`credential_row`].** A
+/// `monospace: bool` parameter would have to be threaded through every one of
+/// that function's callers -- the identity pane's fifteen rows, the SSH pane,
+/// the login pane -- all of which would pass `false`, and the rule "these
+/// three rows are one typography" would then live in the call sites rather
+/// than anywhere a reader could find it. This function IS the rule, and both
+/// row kinds are defined in terms of it.
+fn digits_job(text: &str) -> egui::text::LayoutJob {
+    theme::letterspaced_mono(text, MASKED_SIZE, MASKED_TRACKING, theme::INK)
+}
+
+/// The first text baseline in a galley, measured **down from the top of the
+/// galley's own box** -- which is what egui gives a row of text to sit in, and
+/// not where the ink lands inside it.
+///
+/// `0.0` for a galley that laid out no glyph at all; nothing on this pane can
+/// produce one (a row with an empty value is not drawn at all -- see
+/// [`masked_row_visible`]), and a placement decision that panicked on one
+/// would be worse than one that leaves it where egui put it.
+fn first_baseline(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(0.0)
+}
+
+/// **How far DOWN a digits run must be painted from the top of the box egui
+/// centred for it, so that it sits on the same baseline an ordinary value
+/// does.** The whole of the "the number sits too high" repair, as a pure
+/// function of two galleys a test can lay out for itself.
+///
+/// The defect was reported as the card number sitting higher than the rows
+/// around it. It is NOT the `Galley`-versus-`LayoutJob` hazard [`masked_row`]
+/// records: measured on the card pane, the number's galley BOX is centred
+/// exactly right -- `ui.allocate_exact_size` inside the row's
+/// `Layout::left_to_right(Align::Center)` band centres every value's box on
+/// the same line, and the label's box and the value's box share a centre to
+/// the pixel on all five rows. The ink does not, because the two faces do not
+/// put their baseline in the same place inside that box:
+///
+/// | run | box | baseline from box top | slack below |
+/// |---|---|---|---|
+/// | monospace 15px | 18.0 | 12.0 | 6.0 |
+/// | proportional 14px (a value) | 15.0 | 12.0 | 3.0 |
+/// | proportional 12px (a label) | 13.0 | 10.0 | 3.0 |
+///
+/// The monospace face carries twice the descent, so centring the two boxes on
+/// one line puts the monospace baseline `(18 - 15) / 2 = 1.5`pt ABOVE the
+/// baseline a 14px value would have had. That is the displacement, and it is
+/// the same 1.5pt whether the row is showing digits or bullets, because a
+/// baseline is a property of the face and not of the string.
+///
+/// **The target is the ordinary value's baseline, not the label's and not the
+/// band's centre.** Every non-digit row on this pane already puts its value on
+/// a baseline 1.0pt below its label's, and nobody has ever reported that; it
+/// is what "a 14px value beside a 12px label" looks like. Matching the band's
+/// centre instead would move the digit rows to a line no other row on the pane
+/// uses. So the rule is "a digits row sits where an ordinary value sits", and
+/// the offset is derived from the two galleys rather than written down as
+/// `1.5` -- a constant nobody could later justify, and one that would go
+/// stale the moment either type size moved.
+fn digits_baseline_drop(digits: &egui::Galley, ordinary: &egui::Galley) -> f32 {
+    (digits.size().y - ordinary.size().y) / 2.0
+        + (first_baseline(ordinary) - first_baseline(digits))
+}
+
+/// The reference run [`digits_baseline_drop`] measures against: a value in the
+/// pane's ordinary row typography. Its *string* is irrelevant -- a baseline
+/// and a row height are properties of the face and the size -- so it is a
+/// single digit rather than the caller's text, and no caller has to think
+/// about it.
+fn ordinary_value_galley(ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "0",
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
+            color: theme::INK,
+            ..Default::default()
+        },
+    );
+    ui.painter().layout_job(job)
+}
+
+/// Where a digits value is going, decided BEFORE the row is opened: the shape
+/// its row has to take, and the width the value really has on the line it ends
+/// up on.
+///
+/// Extracted from [`masked_row`], whose doc argues both halves at length --
+/// briefly: on the narrowest pane the value column is 44pt and a ten-bullet
+/// mask is 94.2pt, so a row that insisted on two columns overflowed its card
+/// and pushed its own Reveal eye off the pane; and a `LayoutJob`'s
+/// `wrap.max_width` defaults to infinity, so the width chosen here has to be
+/// put back on the job or the run draws its full length regardless.
+///
+/// [`digits_row`] shares it rather than assuming it does not need it. Its
+/// value is short -- `04/23` is five characters -- but "short" is a fact about
+/// today's data, not a rule, and the row it sits in is exactly as narrow as
+/// the two around it.
+fn digits_fit(ui: &egui::Ui, natural: f32, controls_width: f32) -> (RowShape, f32) {
+    let content = row_content_width(ui);
+    let beside_the_label = content - ROW_LABEL_WIDTH - ROW_GAP - controls_width;
+    let shape = if natural <= beside_the_label {
+        RowShape::Columns
+    } else {
+        RowShape::Stacked
+    };
+    // The width the value really has on the line it ends up on. `max(1.0)`
+    // rather than `max(0.0)`: egui treats a zero wrap width as "no wrapping",
+    // which is the behaviour this exists to withdraw.
+    let room = match shape {
+        RowShape::Columns => beside_the_label,
+        RowShape::Stacked => content - controls_width,
+    }
+    .max(1.0);
+    (shape, room)
+}
+
+/// Paint a digits value into the row's value slot, on the baseline
+/// [`digits_baseline_drop`] chose.
+///
+/// **Laid here and painted by hand, and neither half is style.** Handing a
+/// `LayoutJob` to `Label` gets it re-laid with `wrap.max_width` overwritten by
+/// `f32::INFINITY` (see [`masked_row`]), so the run has to be a `Galley` by
+/// the time it reaches the row. And `Label` given a galley paints it at
+/// `rect.left_top()` of the box it allocates -- the placement this function
+/// exists to correct. So the box is allocated the same way `Label` would
+/// allocate it, which keeps the row's height and the controls' right-alignment
+/// exactly as they were, and only the paint position moves.
+fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
+    let mut job = digits_job(text);
+    job.wrap.max_width = room;
+    // **`break_anywhere`, for the reason the `Program file` path row gives**:
+    // egui breaks at word boundaries, and neither a bullet run nor a card
+    // number has any.
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    let drop = digits_baseline_drop(&galley, &ordinary_value_galley(ui));
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter()
+        .galley(egui::pos2(rect.left(), rect.top() + drop), galley, theme::INK);
+}
+
+/// A row whose value is DIGITS and is **not a secret**: the card's expiry.
+///
+/// [`credential_row`], except that the value is painted in the pane's shared
+/// digit typography ([`digits_job`]) and on the baseline [`paint_digits`]
+/// chooses -- so it lines up with the number above it and the security code
+/// below it by construction rather than by two constants happening to agree.
+///
+/// **Deliberately not [`masked_row`].** An expiry is printed on the front of
+/// the card; bullets over it and a Reveal eye beside it would claim it is a
+/// secret, which is a lie about the data and a control that does nothing
+/// useful. This row therefore has no `revealed` flag and no controls at all --
+/// the two functions share their typography and their placement, and nothing
+/// else.
+fn digits_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    action: &mut DetailAction,
+    on_copy: DetailAction,
+) {
+    // Laid out unwrapped, which is the question being asked: how wide does
+    // this value WANT to be? No controls on this row, so nothing is owed to
+    // them.
+    let natural = ui.painter().layout_job(digits_job(value)).size().x;
+    let (shape, room) = digits_fit(ui, natural, 0.0);
+    copy_row(
+        ui,
+        label,
+        |ui| paint_digits(ui, value, room),
+        |_ui| {},
+        on_copy,
+        None,
+        row_offers_copy(value),
+        action,
+        shape,
+    );
+}
+
 /// A plain value row. The whole tile copies; `hint`, when there is one, is
 /// the keyboard chord that copies the same value without the mouse, named in
 /// the tile's tooltip (see [`copy_row_tooltip`]).
@@ -4904,58 +5123,19 @@ fn masked_row(
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
         });
-    let content = row_content_width(ui);
-    
     // Laid out unwrapped, which is the question being asked: how wide does
     // this value WANT to be?
-    let natural = ui
-        .painter()
-        .layout_job(theme::letterspaced_mono(
-            &shown,
-            MASKED_SIZE,
-            MASKED_TRACKING,
-            theme::INK,
-        ))
-        .size()
-        .x;
-    let beside_the_label = content - ROW_LABEL_WIDTH - ROW_GAP - controls_width;
-    let shape = if natural <= beside_the_label {
-        RowShape::Columns
-    } else {
-        RowShape::Stacked
-    };
-    // The width the value really has on the line it ends up on. `max(1.0)`
-    // rather than `max(0.0)`: egui treats a zero wrap width as "no wrapping",
-    // which is the behaviour this exists to withdraw.
-    let room = match shape {
-        RowShape::Columns => beside_the_label,
-        RowShape::Stacked => content - controls_width,
-    }
-    .max(1.0);
+    let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
+    // The same decision, in the same words, as the expiry beside it makes --
+    // see [`digits_fit`].
+    let (shape, room) = digits_fit(ui, natural, controls_width);
     copy_row(
         ui,
         label,
-        |ui| {
-            // `font-family: ui-monospace; font-size: 15px; letter-spacing:
-            // 0.08em` -- the tracking is what stops a bullet run reading as
-            // one solid blob.
-            let mut job =
-                theme::letterspaced_mono(&shown, MASKED_SIZE, MASKED_TRACKING, theme::INK);
-            job.wrap.max_width = room;
-            // **`break_anywhere`, for the reason the `Program file` path row
-            // gives**: egui breaks at word boundaries, and neither a bullet
-            // run nor a password has any.
-            job.wrap.break_anywhere = true;
-            // **Laid here and handed over as a `Galley`, and that is not
-            // style.** Given a `LayoutJob`, `Label` re-lays it and overwrites
-            // `wrap.max_width` with its own -- `f32::INFINITY` inside a
-            // horizontal layout, whose wrap mode is `Extend`. So the width set
-            // two lines up would be discarded and the run would draw its full
-            // length anyway, which is exactly the defect. Same discovery, and
-            // the same repair, as `app_row_view`'s.
-            let galley = ui.painter().layout_job(job);
-            ui.label(galley);
-        },
+        // The typography, the wrap and the baseline are all
+        // [`paint_digits`]'s -- the same three the expiry row gets, so the
+        // card's three digit rows cannot drift apart again.
+        |ui| paint_digits(ui, &shown, room),
         |ui| {
             // AN EYE, not the words "Reveal"/"Hide". The state it shows is
             // the ACTION, the way every password manager spells it: an open
@@ -5066,7 +5246,10 @@ fn card_rows(
     }
     if let Some(v) = &expiry {
         separate(ui, &mut first);
-        credential_row(ui, "Expiry", v, None, action, DetailAction::CopyValue(v.clone()));
+        // Digits, between two rows of digits -- see [`digits_row`], and see
+        // [`digits_job`] for why the expiry is not merely "the same size as"
+        // its neighbours but literally the same typography.
+        digits_row(ui, "Expiry", v, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &code {
         separate(ui, &mut first);
@@ -7166,7 +7349,8 @@ mod tests {
             "visa",
             "Number",
             "Expiry",
-            "04/2023",
+            // `MM/YY`, the form the plastic itself is embossed with.
+            "04/23",
             "Security code",
         ] {
             assert!(contains(&texts, label), "the card pane painted no {label:?}: {texts:?}");
@@ -9634,7 +9818,7 @@ mod tests {
     #[test]
     fn nothing_but_the_number_and_the_code_is_masked_on_a_card() {
         let texts = painted(&a_full_card(), &TotpState::NoSecret);
-        for visible in ["John Doe", "visa", "04/2023"] {
+        for visible in ["John Doe", "visa", "04/23"] {
             assert!(
                 contains(&texts, visible),
                 "{visible:?} was masked; only the number and the security code may be: {texts:?}"
@@ -10111,26 +10295,41 @@ mod tests {
     /// The plan's test, plus the case the plan got wrong. Bitwarden's own
     /// `item.card` template sends `expMonth: "04"` -- already padded -- so a
     /// formatter that only handles the unpadded case would produce `"004"`.
+    ///
+    /// **`MM/YY`, the form embossed on the card**, and the year's own
+    /// unparseable cases beside the month's -- the two halves obey one rule
+    /// and this test is what says so.
     #[test]
     fn card_expiry_renders_whatever_half_is_present() {
         let t = |m, y| card_expiry_text(m, y);
-        assert_eq!(t(Some("3"), Some("2028")), Some("03/2028".to_string()));
-        assert_eq!(t(Some("11"), Some("2028")), Some("11/2028".to_string()));
+        assert_eq!(t(Some("3"), Some("2028")), Some("03/28".to_string()));
+        assert_eq!(t(Some("11"), Some("2028")), Some("11/28".to_string()));
         // The verified capture's own shape: already zero-padded, and it must
         // not be padded a second time.
-        assert_eq!(t(Some("04"), Some("2023")), Some("04/2023".to_string()));
+        assert_eq!(t(Some("04"), Some("2023")), Some("04/23".to_string()));
         // Either half may be absent, and a half-formed "03/" reads as data
         // loss rather than as a partially-filled item.
         assert_eq!(t(Some("3"), None), Some("03".to_string()));
-        assert_eq!(t(None, Some("2028")), Some("2028".to_string()));
+        assert_eq!(t(None, Some("2028")), Some("28".to_string()));
         assert_eq!(t(None, None), None);
         assert_eq!(t(Some(""), Some("")), None);
         assert_eq!(t(Some("  "), Some(" ")), None);
-        assert_eq!(t(Some(" 4 "), Some(" 2028 ")), Some("04/2028".to_string()));
+        assert_eq!(t(Some(" 4 "), Some(" 2028 ")), Some("04/28".to_string()));
         // Not a month: show it rather than swallowing it.
-        assert_eq!(t(Some("xx"), Some("2028")), Some("xx/2028".to_string()));
-        assert_eq!(t(Some("13"), Some("2028")), Some("13/2028".to_string()));
-        assert_eq!(t(Some("0"), Some("2028")), Some("0/2028".to_string()));
+        assert_eq!(t(Some("xx"), Some("2028")), Some("xx/28".to_string()));
+        assert_eq!(t(Some("13"), Some("2028")), Some("13/28".to_string()));
+        assert_eq!(t(Some("0"), Some("2028")), Some("0/28".to_string()));
+        // **A year that is not four digits is shown as it arrived**, the
+        // same refusal-to-drop the month's `"xx"` gets. A year already in
+        // the displayed form is left alone rather than shortened twice.
+        assert_eq!(t(Some("04"), Some("29")), Some("04/29".to_string()));
+        assert_eq!(t(Some("04"), Some("20291")), Some("04/20291".to_string()));
+        assert_eq!(t(Some("04"), Some("7")), Some("04/7".to_string()));
+        assert_eq!(t(Some("04"), Some("202x")), Some("04/202x".to_string()));
+        // Four characters that are not four DIGITS, and a signed number
+        // `str::parse` would have accepted: neither is shortened.
+        assert_eq!(t(Some("04"), Some("abcd")), Some("04/abcd".to_string()));
+        assert_eq!(t(Some("04"), Some("+123")), Some("04/+123".to_string()));
     }
 
     #[test]
@@ -12443,7 +12642,7 @@ mod tests {
             ("Cardholder name", DetailAction::CopyValue("John Doe".to_string())),
             ("Brand", DetailAction::CopyValue("visa".to_string())),
             ("Number", DetailAction::CopyCardNumber),
-            ("Expiry", DetailAction::CopyValue("04/2023".to_string())),
+            ("Expiry", DetailAction::CopyValue("04/23".to_string())),
             ("Security code", DetailAction::CopyCardCode),
         ];
         for (label, want) in expected {
@@ -12457,6 +12656,269 @@ mod tests {
                 clicked.action
             );
         }
+    }
+
+    // ------------------------------------------- the card's three DIGIT rows
+
+    /// Every reveal flag up, so the number and the security code paint their
+    /// real digits rather than a bullet run. Both digit-row assertions below
+    /// want the digits: bullets are drawn from a different part of the face
+    /// and would let a test pass on a value the reader never sees.
+    const ALL_REVEALED: RevealState = RevealState {
+        password: true,
+        card_number: true,
+        card_code: true,
+        password_history: [true; MAX_HISTORY_ROWS],
+        ssh_private_key: true,
+        totp_secret: true,
+    };
+
+    /// The card [`a_full_card`] would be if its expiry carried **no
+    /// descender**.
+    ///
+    /// `04/23` is what a real card shows and what the pane really renders,
+    /// but the `/` hangs below the baseline in both faces -- so a run's ink
+    /// bottom stops being its baseline, and a vertical assertion over it
+    /// would be measuring the slash rather than the row. Dropping the year
+    /// leaves `card_expiry_text` rendering the month alone (its documented
+    /// "either half may be missing" rule), which is digits and nothing else.
+    /// Every other value here is chosen the same way: `John Doe`, `visa`,
+    /// `4242…` and `123` all sit flat on the baseline.
+    fn a_card_whose_every_value_sits_on_the_baseline() -> VaultItem {
+        let mut item = a_full_card();
+        item.card.as_mut().expect("a_full_card has card data").exp_year = None;
+        item
+    }
+
+    /// Every painted run's text, the font it was laid out in, its tracking,
+    /// and -- as [`shape_ink::drawn_glyph_ink`] -- the box its pixels really
+    /// cover.
+    fn painted_ink(
+        item: &VaultItem,
+        reveal: RevealState,
+    ) -> Vec<(String, egui::FontId, f32, egui::Rect, egui::Rect)> {
+        fn walk(
+            shape: &egui::Shape,
+            out: &mut Vec<(String, egui::FontId, f32, egui::Rect, egui::Rect)>,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let format = text.galley.job.sections.first().map(|s| s.format.clone());
+                    let Some(format) = format else { return };
+                    let Some(ink) = shape_ink::drawn_glyph_ink(text) else {
+                        return;
+                    };
+                    out.push((
+                        text.galley.text().to_string(),
+                        format.font_id,
+                        format.extra_letter_spacing,
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        ink,
+                    ));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &frame_shapes(item, &TotpState::NoSecret, reveal) {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The one painted run with this text: its font, its tracking, its box
+    /// and its ink. Panics for the reasons [`only`] does.
+    fn one_run(
+        painted: &[(String, egui::FontId, f32, egui::Rect, egui::Rect)],
+        text: &str,
+    ) -> (egui::FontId, f32, egui::Rect, egui::Rect) {
+        let mut hits = painted.iter().filter(|(t, ..)| t == text);
+        let hit = hits
+            .next()
+            .unwrap_or_else(|| panic!("nothing painted {text:?}; painted: {painted:?}"));
+        assert!(
+            hits.next().is_none(),
+            "{text:?} was painted more than once, so this assertion is ambiguous"
+        );
+        (hit.1.clone(), hit.2, hit.3, hit.4)
+    }
+
+    /// **The card's three digit rows are ONE typography.**
+    ///
+    /// The user, of a card's detail view: "code, number and expiry feel like
+    /// different fonts". They were: the number and the security code go
+    /// through `masked_row` and were 15px tracked monospace, and the expiry
+    /// went through `credential_row` and was 14px untracked *proportional* --
+    /// a different family, a point smaller and unspaced, sitting between the
+    /// two rows it is meant to line up with.
+    ///
+    /// The assertion is on all three at once and against `digits_job`'s own
+    /// constants, so a row that stops sharing the seam names itself here
+    /// rather than drifting quietly. The expiry is checked to be MASKED
+    /// NOWHERE (it paints its real digits with no bullets and no eye) in
+    /// `nothing_but_the_number_and_the_code_is_masked_on_a_card` and by the
+    /// eye count below: sharing the typography must not have made it a
+    /// secret.
+    #[test]
+    fn the_cards_three_digit_rows_are_one_typography() {
+        let item = a_full_card();
+        let painted = painted_ink(&item, ALL_REVEALED);
+        for value in ["4242424242424242", "04/23", "123"] {
+            let (font, tracking, ..) = one_run(&painted, value);
+            assert_eq!(
+                font,
+                egui::FontId::new(MASKED_SIZE, egui::FontFamily::Monospace),
+                "the card's {value:?} row is not in the shared digit face"
+            );
+            assert_eq!(
+                tracking, MASKED_TRACKING,
+                "the card's {value:?} row is not tracked like the digit rows beside it"
+            );
+        }
+        // The rows that are NOT digits keep the pane's ordinary value type --
+        // this is a rule about three rows, not a monospace card.
+        for value in ["John Doe", "visa"] {
+            let (font, tracking, ..) = one_run(&painted, value);
+            assert_eq!(
+                font,
+                egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
+                "{value:?} was dragged into the digit face"
+            );
+            assert_eq!(tracking, 0.0, "{value:?} was dragged into the digit tracking");
+        }
+        // **And the expiry gained no Reveal control.** Two eyes on this pane,
+        // the number's and the security code's, exactly as before.
+        let mut pane = Pane::new();
+        let shot = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            shot.eyes.len(),
+            2,
+            "the expiry is not a secret and must not have gained a Reveal eye: {:?}",
+            shot.eyes
+        );
+    }
+
+    /// **A digit row's value sits on the line the rest of the pane sits on.**
+    ///
+    /// The user: the card number is "higher than it should [be]". Measured on
+    /// the card pane before the repair, as the offset from each row's label
+    /// box centre down to the BOTTOM OF THE VALUE'S PAINTED INK -- which for
+    /// a run with no descender is its baseline:
+    ///
+    /// ```text
+    /// Cardholder name  John Doe            +4.5
+    /// Brand            visa                +4.5
+    /// Number           4242424242424242    +3.0   1.5pt high
+    /// Expiry           04                  +4.5
+    /// Security code    123                 +3.0   1.5pt high
+    /// ```
+    ///
+    /// and after it every row reads +4.5. The cause is in
+    /// [`digits_baseline_drop`]: the monospace face carries 6.0pt of descent
+    /// against the proportional face's 3.0, so centring the two BOXES on one
+    /// line -- which is what egui does, correctly, and which the existing
+    /// `a_card_row_puts_its_label_and_value_on_the_designs_two_columns`
+    /// already checks -- leaves the ink 1.5pt apart.
+    ///
+    /// **This test is on the ink and it has to be.** Every value's box centre
+    /// agreed with its label's box centre to the pixel both before and after,
+    /// so a test written against rects passes on the defect. So does one
+    /// written against the row's total height: the row band is
+    /// `ROW_CONTENT_HEIGHT` whatever the value does.
+    ///
+    /// The fixture is [`a_card_whose_every_value_sits_on_the_baseline`] so
+    /// that "ink bottom" means "baseline" on all five rows; a descender under
+    /// one value would move that row's ink bottom without moving the row.
+    #[test]
+    fn every_card_value_paints_its_ink_on_one_baseline_with_its_label() {
+        let item = a_card_whose_every_value_sits_on_the_baseline();
+        let painted = painted_ink(&item, ALL_REVEALED);
+        let rows = [
+            ("Cardholder name", "John Doe"),
+            ("Brand", "visa"),
+            ("Number", "4242424242424242"),
+            ("Expiry", "04"),
+            ("Security code", "123"),
+        ];
+        let drops: Vec<(&str, f32)> = rows
+            .iter()
+            .map(|(label, value)| {
+                let (.., label_box, _) = one_run(&painted, label);
+                let (.., ink) = one_run(&painted, value);
+                (*label, ink.bottom() - label_box.center().y)
+            })
+            .collect();
+        // The reference is a row nobody has ever reported: an ordinary
+        // proportional value beside an ordinary label. Naming it rather than
+        // writing +4.5 down keeps this test about the RELATIONSHIP, so a
+        // retuned row height moves every entry together and reds nothing.
+        let (_, ordinary) = drops[1];
+        for (label, drop) in &drops {
+            assert!(
+                (drop - ordinary).abs() <= 0.25,
+                "the {label:?} row's value paints its ink {drop}pt below the label's centre \
+                 where an ordinary row paints its own {ordinary}pt below -- the value is \
+                 {}pt off the pane's line: {drops:?}",
+                ordinary - drop
+            );
+        }
+    }
+
+    /// The pure function the painted-ink test above rests on, exercised on
+    /// the two galleys it is really asked about -- so the arithmetic is
+    /// pinned even if the pane stops calling it.
+    ///
+    /// Both directions: a run in the SAME face as the reference must be left
+    /// exactly where egui put it, and the monospace run must be dropped by
+    /// half the difference in box heights. A `digits_baseline_drop` that
+    /// returned a constant would fail the first; one that returned `0.0`
+    /// would fail the second.
+    #[test]
+    fn the_digit_rows_baseline_drop_is_half_the_faces_disagreement() {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(PANE, PANE),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let _ = ctx.run_ui(input(), |ui| {
+            let ordinary = ordinary_value_galley(ui);
+            assert_eq!(
+                digits_baseline_drop(&ordinary, &ordinary),
+                0.0,
+                "a value already in the pane's own face is being moved"
+            );
+            let digits = ui.painter().layout_job(digits_job("0"));
+            let drop = digits_baseline_drop(&digits, &ordinary);
+            assert!(
+                drop > 0.0,
+                "the monospace run is not being dropped at all, so the defect is unfixed"
+            );
+            assert_eq!(
+                drop,
+                (digits.size().y - ordinary.size().y) / 2.0
+                    + (first_baseline(&ordinary) - first_baseline(&digits)),
+                "the drop is not the two galleys' own disagreement"
+            );
+            // And the two really do disagree -- otherwise the line above is
+            // an identity that would hold for any pair of galleys.
+            assert_ne!(
+                digits.size().y,
+                ordinary.size().y,
+                "the digit face and the ordinary face have the same box height, so this \
+                 test cannot tell a correct drop from a zero one"
+            );
+        });
     }
 
     /// The password row goes through the same `masked_row` the two card
@@ -14984,6 +15446,36 @@ pub(crate) mod shape_ink {
     /// touches. Every one of this crate's earlier geometry blindnesses has
     /// been a galley answering about the layout job rather than about the
     /// pixels.
+    /// The box a galley's glyphs cover **as the tessellator will actually
+    /// draw them**, in absolute coordinates.
+    ///
+    /// [`glyph_ink`] answers with each glyph's LOGICAL box -- its advance
+    /// width by the row's line height, hung off the baseline -- which is the
+    /// right answer for "did this run stray into the scroll lane" and the
+    /// wrong one for any question about where a run sits VERTICALLY: every
+    /// glyph in a row reports the same top and bottom whatever it looks like,
+    /// so a run displaced within its own line height is invisible to it.
+    ///
+    /// This uses `Glyph::uv_rect`, which is the rectangle epaint puts in the
+    /// mesh (`tessellate_glyphs`: `glyph.pos + uv_rect.offset`, sized
+    /// `uv_rect.size`) -- the pixels, and nothing but the pixels. Glyphs that
+    /// rasterise to nothing (a space) contribute nothing, and a run of only
+    /// those is `None`.
+    pub(crate) fn drawn_glyph_ink(text: &egui::epaint::TextShape) -> Option<egui::Rect> {
+        let mut ink: Option<egui::Rect> = None;
+        for row in text.galley.rows.iter() {
+            for glyph in row.glyphs.iter() {
+                if glyph.uv_rect.is_nothing() {
+                    continue;
+                }
+                let at = text.pos + row.pos.to_vec2() + glyph.pos.to_vec2() + glyph.uv_rect.offset;
+                let box_ = egui::Rect::from_min_size(at, glyph.uv_rect.size);
+                ink = Some(ink.map_or(box_, |r: egui::Rect| r.union(box_)));
+            }
+        }
+        ink
+    }
+
     pub(crate) fn glyph_ink(text: &egui::epaint::TextShape) -> Option<egui::Rect> {
         let mut ink: Option<egui::Rect> = None;
         for row in text.galley.rows.iter() {
