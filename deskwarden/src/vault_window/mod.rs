@@ -1029,6 +1029,17 @@ pub fn build_frame(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).reveal_totp_seed)
         .unwrap_or(false);
+    // Whether an item's DOMAIN may be sent to the icon service at all, read
+    // the same way and live-editable for the same reason -- but defaulting
+    // the other way round. `true` is the default for this one (see
+    // `Settings::fetch_icons`), and it is also the answer when there is no
+    // settings path at all: a window opened with nowhere to read preferences
+    // from should behave as a fresh install does, and a fresh install shows
+    // icons.
+    let fetch_icons_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).fetch_icons)
+        .unwrap_or(true);
     // **The window's one breach cache**, alive exactly as long as the window
     // and holding nothing but five-character SHA-1 prefixes and counts.
     //
@@ -1241,6 +1252,23 @@ pub fn build_frame(
         // to every later window that does know the server. Icons wait; the
         // rows they sit on do not.
         let icon_base_known = details_rx.is_none();
+        // Whether icons may be fetched at all, and where from -- the two
+        // halves of the same decision, built once here and handed to both
+        // call sites below so they cannot disagree.
+        //
+        // The `enabled` half is read the way `check_breaches` and
+        // `reveal_totp_seed` are read in the detail arm: prefer the
+        // preferences modal's live copy (nothing is written to disk until
+        // this window closes, so re-reading the file would show the value the
+        // user has already changed away from) and fall back to what the file
+        // said when the window opened.
+        let icon_fetch = IconFetch {
+            enabled: edited_settings_for_closure
+                .borrow()
+                .as_ref()
+                .map_or(fetch_icons_at_open, |s| s.fetch_icons),
+            server_url: &server_url,
+        };
 
         // The initial vault load, arriving from the thread spawned before
         // the window opened. Non-blocking like every other drain here, so
@@ -2256,7 +2284,7 @@ pub fn build_frame(
                     ui.ctx(),
                     item,
                     &icon_cache_dir,
-                    &server_url,
+                    &icon_fetch,
                     &favicon_tx,
                     &mut favicon_requested,
                     &mut icons,
@@ -2712,7 +2740,7 @@ pub fn build_frame(
                         ui.ctx(),
                         item,
                         &icon_cache_dir,
-                        &server_url,
+                        &icon_fetch,
                         &favicon_tx,
                         &mut favicon_requested,
                         &mut icons,
@@ -7887,6 +7915,28 @@ fn vault_body_state(
     }
 }
 
+/// Everything [`ensure_icon_loaded`] needs to know about icon *fetching*:
+/// whether the user permits it at all, and -- when they do -- which server's
+/// icon service to ask.
+///
+/// One parameter rather than two, and not merely to keep the argument list
+/// short (though it does; the function is already at clippy's limit). They
+/// are one decision made in one place: `enabled` is
+/// [`crate::settings::Settings::fetch_icons`] as the window has it THIS
+/// frame, `server_url` is the account URL that decides which host the domain
+/// would go to, and a caller that had one without the other could ask the
+/// wrong host or ask a host the user has told it not to.
+///
+/// Borrowed rather than owned because both fields are read once per item per
+/// frame and neither is mutated -- an owned `Option<String>` here would clone
+/// the server URL for every visible row, every frame.
+struct IconFetch<'a> {
+    /// `false` means no icon request is made and no icon *domain* is even
+    /// computed -- see the guard in [`ensure_icon_loaded`].
+    enabled: bool,
+    server_url: &'a Option<String>,
+}
+
 /// Ensures `item`'s favicon is loading or loaded, doing as little work as
 /// possible: skips entirely if already resolved (loaded or a fetch already
 /// dispatched) this session, serves instantly from the on-disk cache if
@@ -7902,12 +7952,30 @@ fn ensure_icon_loaded(
     ctx: &egui::Context,
     item: &VaultItem,
     icon_cache_dir: &std::path::Path,
-    server_url: &Option<String>,
+    fetch: &IconFetch<'_>,
     favicon_tx: &mpsc::Sender<FaviconResult>,
     favicon_requested: &mut std::collections::HashSet<String>,
     icons: &mut IconCache,
 ) {
     if icons.textures.contains_key(&item.id) || favicon_requested.contains(&item.id) {
+        return;
+    }
+    // **The user's switch, and it stands in front of the QUESTION rather than
+    // in front of the request.** `Settings::fetch_icons` off means this
+    // function does not so much as work out which domain the item would
+    // disclose: no `icon_domain_for`, so no disk-cache lookup keyed on that
+    // domain, no thread, and no request. A gate placed lower -- around the
+    // `thread::spawn` alone -- would be a preference that still computed and
+    // consulted the domain, and the whole point of the setting is the domain.
+    //
+    // **`favicon_requested` is deliberately NOT marked here**, exactly as the
+    // `icon_base_known` guard at the call sites deliberately does not mark
+    // it. That set means "this item has been dealt with for the session", and
+    // a skip is not a decision about the item -- it is a decision about the
+    // setting, which the preferences modal can reverse while this window is
+    // open. Marking it would mean turning the pill back on left every item
+    // already drawn without an icon until the window was closed and reopened.
+    if !fetch.enabled {
         return;
     }
     // **One question, asked once.** This used to read a login's first URI and
@@ -7935,7 +8003,7 @@ fn ensure_icon_loaded(
 
     let tx = favicon_tx.clone();
     let item_id = item.id.clone();
-    let server_url = server_url.clone();
+    let server_url = fetch.server_url.clone();
     let cache_dir = icon_cache_dir.to_path_buf();
     std::thread::spawn(move || {
         let base = crate::favicon::icon_base_url(server_url.as_deref());
@@ -16071,6 +16139,28 @@ mod account_details_tests {
     /// id, and it spawns no thread and touches no network -- so this drives
     /// the real loader rather than a copy of its shape.
     fn loads_icon_from_cache(item: &VaultItem, cached_domain: &str, label: &str) -> bool {
+        let (loaded, requested) = run_icon_loader(item, cached_domain, label, true);
+        // Every path through the loader that the SETTING allows marks the
+        // item resolved; asserting it here keeps `loaded == false` meaning
+        // "no domain", not "not run".
+        assert!(requested, "the loader did not run at all");
+        loaded
+    }
+
+    /// The same one call with `fetch_icons` explicit, reporting both of the
+    /// things the setting changes: whether a texture arrived, and whether the
+    /// item was marked resolved for the session.
+    ///
+    /// Split out of [`loads_icon_from_cache`] rather than folded into it
+    /// because the `requested` assertion that helper makes is exactly what
+    /// the off case must NOT satisfy -- see
+    /// `icon_fetching_off_does_not_mark_the_item_resolved_for_the_session`.
+    fn run_icon_loader(
+        item: &VaultItem,
+        cached_domain: &str,
+        label: &str,
+        fetch_icons: bool,
+    ) -> (bool, bool) {
         let dir = icon_routing_cache_dir(label);
         crate::favicon::write_cached_icon(&dir, cached_domain, &tiny_png());
 
@@ -16078,14 +16168,104 @@ mod account_details_tests {
         let (tx, _rx) = mpsc::channel::<FaviconResult>();
         let mut requested = std::collections::HashSet::new();
         let mut icons = IconCache::default();
-        ensure_icon_loaded(&ctx, item, &dir, &None, &tx, &mut requested, &mut icons);
+        ensure_icon_loaded(
+            &ctx,
+            item,
+            &dir,
+            &IconFetch { enabled: fetch_icons, server_url: &None },
+            &tx,
+            &mut requested,
+            &mut icons,
+        );
 
         let loaded = icons.textures.contains_key(&item.id);
         std::fs::remove_dir_all(&dir).ok();
-        // Every path through the loader marks the item resolved; asserting it
-        // here keeps `loaded == false` meaning "no domain", not "not run".
-        assert!(requested.contains(&item.id), "the loader did not run at all");
-        loaded
+        (loaded, requested.contains(&item.id))
+    }
+
+    /// **The setting gates the LOADER, not merely the struct.**
+    ///
+    /// Driven through the real `ensure_icon_loaded` against a disk cache that
+    /// already holds this item's icon, so the observable end is the same one
+    /// `a_card_with_a_bank_domain_reaches_the_domain_keyed_icon_path` uses --
+    /// a texture that could only have come from the domain-keyed path.
+    ///
+    /// **The live control is the same item, the same cache and the same
+    /// domain with the setting ON**, which is what makes the negative half
+    /// mean something: without it, a fixture that had quietly stopped
+    /// producing a domain, or a cache directory that was never written, would
+    /// pass the off case for reasons that have nothing to do with the pill.
+    #[test]
+    fn an_item_reaches_no_icon_path_when_icon_fetching_is_off() {
+        let login = routing_item(
+            r#"{"id":"l9","name":"Login","type":1,"login":{"uris":[{"uri":"https://chase.com/login"}]}}"#,
+        );
+        let (on, _) = run_icon_loader(&login, "chase.com", "gate-on", true);
+        assert!(
+            on,
+            "the live control failed: this item does not reach the icon path even with \
+             `fetch_icons: true`, so the off case below proves nothing about the setting"
+        );
+        let (off, _) = run_icon_loader(&login, "chase.com", "gate-off", false);
+        assert!(
+            !off,
+            "an item picked up an icon with `fetch_icons: false` -- the setting exists but the \
+             loader ignores it, which is a preference that does nothing"
+        );
+    }
+
+    /// The skip does not consume the item's one chance at an icon.
+    ///
+    /// `favicon_requested` means "dealt with for this session", and the
+    /// preferences modal can turn this pill back on while the window is open
+    /// (`icon_fetch` is rebuilt every frame from `edited_settings`). If the
+    /// off path marked the item, turning icons back on would leave every
+    /// already-drawn row blank until the window was closed and reopened.
+    ///
+    /// Both halves, because "never marks" would be just as wrong as "always
+    /// marks": with the setting ON the mark is what stops the loader
+    /// re-asking on every one of the sixty frames a second it is called on.
+    #[test]
+    fn icon_fetching_off_does_not_mark_the_item_resolved_for_the_session() {
+        let login = routing_item(
+            r#"{"id":"l10","name":"Login","type":1,"login":{"uris":[{"uri":"https://chase.com/login"}]}}"#,
+        );
+        let (_, marked_when_off) = run_icon_loader(&login, "chase.com", "mark-off", false);
+        assert!(
+            !marked_when_off,
+            "the skipped item was marked resolved, so turning icon fetching back on mid-session \
+             leaves every row already drawn without an icon"
+        );
+        let (_, marked_when_on) = run_icon_loader(&login, "chase.com", "mark-on", true);
+        assert!(
+            marked_when_on,
+            "the loader stopped marking items it DID handle, so it re-asks every frame"
+        );
+    }
+
+    /// The gate stands in front of the question, not merely in front of the
+    /// request: with the setting off, `icon_domain_for` is not consulted at
+    /// all, so nothing works out which domain the item would have disclosed.
+    ///
+    /// Source-level because that ordering is not observable from outside --
+    /// both placements produce no network request, and only one of them
+    /// avoids computing the domain. Comments are stripped first, for the
+    /// reason `no_icon_is_fetched_before_the_server_url_is_known` records:
+    /// the guard is explained by name in a comment directly above it.
+    #[test]
+    fn the_icon_setting_is_checked_before_the_domain_is_worked_out() {
+        let code = code_only(production());
+        let guard = code
+            .find("if !fetch.enabled {")
+            .expect("the `fetch_icons` guard is no longer in `ensure_icon_loaded`");
+        let question = code
+            .find(concat!("crate::favicon::icon_domain_", "for(item)"))
+            .expect("the loader no longer consults `icon_domain_for`");
+        assert!(
+            guard < question,
+            "the `fetch_icons` guard sits AFTER `icon_domain_for`, so with icons switched off \
+             the app still works out which domain each item would disclose"
+        );
     }
 
     fn routing_item(json: &str) -> VaultItem {

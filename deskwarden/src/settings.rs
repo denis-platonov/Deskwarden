@@ -353,6 +353,43 @@ pub struct Settings {
     /// this one is a network call keyed on the user's passwords, and
     /// making it on their behalf is not ours to decide.
     pub check_breaches: bool,
+    /// Whether an item's site icon is fetched from the icon service.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as) is the behaviour that has always existed: an item
+    /// that answers [`crate::favicon::icon_domain_for`] has that **domain**
+    /// -- not its username, not its password, not which account it belongs
+    /// to -- requested from `favicon::icon_base_url`'s host, and the result
+    /// cached on disk so the same domain is normally asked for once.
+    /// `false` means the question is never asked: the loader returns before
+    /// it consults `icon_domain_for` at all, and every item wears its
+    /// coloured-initials monogram.
+    ///
+    /// **On by default, unlike [`Self::check_breaches`], and the difference
+    /// is who is on the other end rather than which of the two is more
+    /// private.** The rule that field records -- a network call keyed on the
+    /// user's own data is not ours to decide -- is about a request to a party
+    /// with no prior relationship to the vault: `api.pwnedpasswords.com`
+    /// learns something it had no way to know. This request goes to the icon
+    /// service of *the server the vault is already on* -- the user's own
+    /// machine when they self-host, and Bitwarden's when they do not, i.e.
+    /// the party that already stores the item the domain came out of. It
+    /// re-uses a disclosure relationship the user has already chosen instead
+    /// of creating a new one, so making it on their behalf is a
+    /// continuation of their choice rather than a decision taken for them.
+    ///
+    /// That is the argument for the default, and it is deliberately not
+    /// "it is on today". What "on today" *does* decide is the direction the
+    /// upgrade path must not break: defaulting this to `false` would delete
+    /// the icons of every existing user without their asking, and
+    /// `an_older_settings_file_without_the_icon_key_loads_as_on` pins that
+    /// it does not.
+    ///
+    /// The residual case is real and is why the switch exists at all: a
+    /// cloud user who does not want that service's access log to accumulate
+    /// a picture of which domains they hold entries for. `PRIVACY.md` names
+    /// this as the request with the most privacy weight in the app.
+    pub fetch_icons: bool,
     /// Whether a login's TOTP *secret* can be revealed on the details screen.
     ///
     /// `false` (the default, and what an older `settings.json` without this
@@ -483,6 +520,7 @@ impl Default for Settings {
             keep_backend_running: true,
             prompt_on_match: true,
             check_breaches: false,
+            fetch_icons: true,
             reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
@@ -605,6 +643,7 @@ impl Settings {
             keep_backend_running,
             prompt_on_match,
             check_breaches,
+            fetch_icons,
             reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
@@ -620,6 +659,7 @@ impl Settings {
         on_disk.keep_backend_running = *keep_backend_running;
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
+        on_disk.fetch_icons = *fetch_icons;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
@@ -800,6 +840,9 @@ mod tests {
             // (`false`), so a writer that dropped it would round-trip to
             // the default and be indistinguishable from one that kept it.
             check_breaches: true,
+            // Deliberately the OPPOSITE of this field's own default
+            // (`true`), for the reason the line above gives.
+            fetch_icons: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
@@ -970,6 +1013,7 @@ mod tests {
             keep_backend_running: true,
             prompt_on_match: false,
             check_breaches: true,
+            fetch_icons: false,
             reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
@@ -1148,6 +1192,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Icon fetching is the one network preference here that is ON unless it
+    /// is turned off, so this is a statement about the default and not a
+    /// restatement of `Default`. The argument is on the field itself: the
+    /// request goes to the icon service of the server the vault is already
+    /// on, so it re-uses a disclosure relationship the user has already
+    /// chosen rather than creating a new one, which is precisely what
+    /// `check_breaches`'s third-party call does do.
+    ///
+    /// Asserted beside `check_breaches` deliberately: the two are the app's
+    /// two vault-keyed network calls and they default OPPOSITE ways, so a
+    /// change that quietly made them agree fails here whichever way it went.
+    #[test]
+    fn icon_fetching_is_on_by_default_and_breach_checking_is_not() {
+        assert!(Settings::default().fetch_icons);
+        assert!(!Settings::default().check_breaches);
+        // ...and not merely present in the in-memory default: a fresh install
+        // has no file at all, and that path must land on `true` too.
+        assert!(Settings::load(&temp_path("icons-absent")).fetch_icons);
+    }
+
+    /// The upgrade path, which for this field is the direction that matters
+    /// and is the OPPOSITE of `check_breaches`'s: a `settings.json` written
+    /// before the field existed must not read as opted OUT, or upgrading
+    /// deletes the icons of every existing user without their asking.
+    #[test]
+    fn an_older_settings_file_without_the_icon_key_loads_as_on() {
+        let path = temp_path("icons-older-file");
+        let older = br#"{"keep_backend_running": false, "check_breaches": true, "auto_lock_minutes": 9}"#;
+        // The premise, asserted rather than assumed: a fixture that happened
+        // to carry the key would make the rest of this test vacuous.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("fetch_icons"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // And the premise that the file was read at all, rather than falling
+        // back to `Settings::default()` wholesale -- two fields that disagree
+        // with the defaults.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 9);
+        assert!(
+            loaded.fetch_icons,
+            "upgrading turned icon fetching off for a user who never asked, so every item in \
+             their vault silently lost its icon"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard `the_breach_toggle_survives_persist_preferences`
+    /// documents, for `fetch_icons`.** `persist_preferences` destructures
+    /// exhaustively, so a new field cannot go unnamed -- but binding it and
+    /// never assigning `on_disk.fetch_icons` compiles, and that mutant has
+    /// survived the whole suite in this repo before.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`true`) would pass a one-way test.
+    #[test]
+    fn the_icon_toggle_survives_persist_preferences() {
+        let path = temp_path("prefs-icons");
+        Settings::default().save(&path).unwrap();
+        assert!(Settings::load(&path).fetch_icons, "the premise: it starts on");
+
+        Settings { fetch_icons: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            !loaded.fetch_icons,
+            "the icon setting was dropped by persist_preferences, so turning it off lasts only \
+             until the app is restarted -- and the domains start going out again"
+        );
+        // The neighbours it is destructured beside are untouched, so this is
+        // not satisfied by a writer that clobbers the file with something else.
+        assert!(loaded.keep_backend_running);
+        assert!(loaded.prompt_on_match);
+        assert!(!loaded.check_breaches);
+        assert!(loaded.auto_lock_enabled);
+
+        // ...and back on again, so "always writes false" fails too.
+        Settings { fetch_icons: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(Settings::load(&path).fetch_icons);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The field reaches the file under its own name, the way
+    /// `the_breach_toggle_round_trips_through_settings_json_under_its_own_name`
+    /// pins its own. `settings_round_trip_through_disk` compares whole
+    /// structs, which a field renamed on both sides at once would satisfy.
+    #[test]
+    fn the_icon_toggle_round_trips_through_settings_json_under_its_own_name() {
+        let path = temp_path("icons-round-trip");
+        let written = Settings { fetch_icons: false, ..Settings::default() };
+        // The value written disagrees with the default, so a reader that
+        // ignored the file entirely would fail here.
+        assert!(written.fetch_icons != Settings::default().fetch_icons);
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fetch_icons"), "not in the file at all: {text}");
+        assert_eq!(Settings::load(&path), written);
+        assert!(!Settings::load(&path).fetch_icons);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The TOTP-secret row's preference is off unless it is turned on -- the
     /// second such preference here, and for a stronger reason than the first:
     /// a revealed seed does not expire and does not rotate.
@@ -1263,6 +1413,7 @@ mod tests {
             keep_backend_running: false,
             prompt_on_match: true,
             check_breaches: true,
+            fetch_icons: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,

@@ -48,6 +48,12 @@ entries for. It does not disclose your username, your password, or which
 account the entry belongs to. Icons are cached on disk so a given domain is
 normally requested once.
 
+**You can switch it off.** Preferences → General → *Show site icons*. On by
+default, because the icon service belongs to the same server your vault is
+already on — your own machine if you self-host — rather than to a third
+party that would otherwise learn nothing about you. With it off, no domain
+is sent and none is even worked out; items show coloured initials instead.
+
 ### 3. Breach checking — `api.pwnedpasswords.com`
 
 When you ask Deskwarden to check whether a password appears in a known
@@ -95,22 +101,23 @@ It collects no personal information from anyone, of any age.
   is the one network feature that is opt-in, because it is keyed on your
   passwords and making that call on your behalf is not the developer's
   decision to make.
+- **Site icons are on by default and can be turned off** — Preferences →
+  General → *Show site icons*. On rather than off because the icon service
+  belongs to the server your vault is already on, so the request re-uses a
+  relationship you have already chosen instead of creating a new one with a
+  third party. That is a weaker reason to ask first than breach checking's,
+  not no reason, which is why the switch is there.
 - **Everything else is local**, and deleting `%APPDATA%\Deskwarden` removes
   it.
 
-**Two things you cannot currently switch off, stated plainly rather than
+**One thing you cannot currently switch off, stated plainly rather than
 omitted:**
 
-- **Icon fetching has no setting.** If a vault entry has a website, its
-  domain is sent to the icon service described above. There is no toggle for
-  this today. Given it is the request with the most privacy weight, it should
-  have one, and that is a known gap rather than a deliberate choice.
 - **The update check has no setting.** It runs against GitHub's API on its
   own schedule. Microsoft Store builds do not perform it at all, because the
   Store handles updates.
 
-Both are tracked as work to be done. This section will be corrected when they
-are.
+It is tracked as work to be done. This section will be corrected when it is.
 
 ## Changes
 
