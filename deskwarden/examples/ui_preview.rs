@@ -67,6 +67,29 @@ use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
+/// Where the PNGs go: `$CARGO_TARGET_DIR` when the environment sets one,
+/// and the historical relative `target` when it does not.
+///
+/// **Why the environment has to win.** A bare `target/` is resolved against
+/// the process's working directory, which for `cargo run --example` is the
+/// package root -- so in a normal checkout this example dropped nine PNGs
+/// into `deskwarden/target`, the directory this project forbids writing to
+/// because the user runs the shipped app out of it. Anyone who redirects the
+/// build away from that directory, which is the whole point of setting
+/// `CARGO_TARGET_DIR`, was redirecting everything except this.
+///
+/// **Why the fallback is unchanged.** CI sets no `CARGO_TARGET_DIR`, so it
+/// still gets `target/ui_preview` and its nine-PNG path check in
+/// `.github/workflows/ci.yml` keeps working without an edit. The
+/// `create_dir_all` at the write site already handled a base that does not
+/// exist yet, which is what makes an absolute out-of-tree base safe here.
+fn target_dir() -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from("target"),
+    }
+}
+
 /// One screenshotable surface.
 ///
 /// The list is the point of this file: adding a window to the app and not
@@ -245,14 +268,20 @@ fn main() -> eframe::Result {
     // Single-surface runs keep their historical file names, because notes and
     // plans elsewhere refer to them by path. `--all` gets a directory, so the
     // artifact upload is one glob and a reviewer sees the set together.
+    //
+    // The BASE is `target_dir()`, not a bare relative `target/`: this used to
+    // write into whatever `./target` the shell happened to be standing over,
+    // which in a normal checkout is `deskwarden/target` -- the one directory
+    // this project forbids writing to, because the user runs the app out of
+    // it. See `target_dir` for the fallback that keeps CI's path unchanged.
     let out: PathBuf = if all {
-        PathBuf::from("target/ui_preview")
+        target_dir().join("ui_preview")
     } else if signin {
-        PathBuf::from("target/ui_preview_signin.png")
+        target_dir().join("ui_preview_signin.png")
     } else if login {
-        PathBuf::from("target/ui_preview_login.png")
+        target_dir().join("ui_preview_login.png")
     } else {
-        PathBuf::from("target/ui_preview_overlay.png")
+        target_dir().join("ui_preview_overlay.png")
     };
 
     eframe::run_native(

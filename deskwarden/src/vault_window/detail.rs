@@ -20,6 +20,7 @@
 //! display + copy actions; edit mode owns a draft `VaultItem` and validates
 //! it), and the read-mode file was already large enough on its own.
 
+use super::relative_time;
 use super::sidebar::OutOfVault;
 use crate::app_match::AppMatch;
 /// The trigger vocabulary this file still spells is test-only -- see
@@ -913,7 +914,7 @@ fn identity_groups(identity: &IdentityData) -> IdentityGroups {
         .collect()
 }
 
-/// The metadata strip's text: "Updated N days ago · Filled N times ·
+/// The metadata strip's text: "Updated 3d ago · Filled N times ·
 /// Strength: X". `updated_days_ago` is `None` when the item carries no
 /// parseable `revisionDate` (shows "Updated recently" rather than
 /// fabricating a number).
@@ -932,11 +933,29 @@ pub fn metadata_line(updated_days_ago: Option<i64>, fill_count: u32, password: &
     format!("{updated} \u{b7} {filled} \u{b7} Strength: {strength}")
 }
 
+/// When this item was last changed, in words.
+///
+/// **Days are all this caller has.** The number comes from [`days_since`],
+/// which reads only the `YYYY-MM-DD` prefix of the `revisionDate` the vault
+/// sends -- deliberately, so one field does not drag a datetime crate in.
+/// So this goes through [`relative_time::ago_days`] rather than building a
+/// `Duration` from a clock it does not have: the smallest unit it can ever
+/// print is a day, and no hour is invented from a date that never carried
+/// one.
+///
+/// The defect this fixes is `synced_ago_text`'s, one unit up: this counted
+/// days with no ceiling, so an item untouched for two years read "Updated
+/// 700 days ago". It now reads "Updated 1y 335d ago".
+///
+/// Two floors of its own, both older than this change and both kept.
+/// `Some(0)` is "today" rather than "0d ago", because the same-calendar-day
+/// case is the one a reader wants named rather than counted; `None` is
+/// "recently" rather than any number at all, for an item whose date would
+/// not parse.
 fn updated_text(updated_days_ago: Option<i64>) -> String {
     match updated_days_ago {
-        Some(0) => "Updated today".to_string(),
-        Some(1) => "Updated 1 day ago".to_string(),
-        Some(n) => format!("Updated {n} days ago"),
+        Some(n) if n <= 0 => "Updated today".to_string(),
+        Some(n) => format!("Updated {}", relative_time::ago_days(n as u64)),
         None => "Updated recently".to_string(),
     }
 }
@@ -5934,11 +5953,16 @@ fn card_face_line(
 /// fabricated number -- the same rule [`updated_text`] follows for a
 /// missing `revisionDate`, and the same reason `password_history` keeps an
 /// entry whose date is missing: the secret is still real.
+///
+/// The third caller of the shared [`relative_time`] wording, and it has the
+/// same day-only granularity [`updated_text`] does and for the same reason:
+/// [`days_since`] parses a date, not a time. A password replaced three years
+/// ago is exactly the row where an unbounded day count was worst -- these
+/// entries are the oldest thing this pane shows.
 fn history_label(last_used_date: Option<&str>) -> String {
     match last_used_date.and_then(days_since) {
-        Some(0) => "Today".to_string(),
-        Some(1) => "1 day ago".to_string(),
-        Some(n) => format!("{n} days ago"),
+        Some(n) if n <= 0 => "Today".to_string(),
+        Some(n) => relative_time::ago_days(n as u64),
         None => "Earlier".to_string(),
     }
 }
@@ -7855,7 +7879,7 @@ mod tests {
     fn only_logins_claim_a_fill_count_and_a_password_strength() {
         for kind in EVERY_KIND {
             let line = metadata_line_for(kind, Some(3), 0, "");
-            assert!(line.contains("Updated 3 days ago"), "{kind:?}: {line}");
+            assert!(line.contains("Updated 3d ago"), "{kind:?}: {line}");
             assert_eq!(
                 line.contains("Filled"),
                 kind_offers_fill(kind),
@@ -11302,11 +11326,11 @@ mod tests {
     fn metadata_line_pluralizes_fill_count() {
         assert_eq!(
             metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!"),
-            "Updated 3 days ago \u{b7} Filled 41 times \u{b7} Strength: Strong"
+            "Updated 3d ago \u{b7} Filled 41 times \u{b7} Strength: Strong"
         );
         assert_eq!(
             metadata_line(Some(1), 1, "weak"),
-            "Updated 1 day ago \u{b7} Filled 1 time \u{b7} Strength: Weak"
+            "Updated 1d ago \u{b7} Filled 1 time \u{b7} Strength: Weak"
         );
     }
 
@@ -14431,7 +14455,15 @@ mod tests {
         // follows.
         assert_eq!(history_label(None), "Earlier");
         assert_eq!(history_label(Some("not-a-date")), "Earlier");
-        assert_eq!(history_label(Some("1970-01-01T00:00:00.000Z")).ends_with("days ago"), true);
+        // 1970 is decades back, so the shared formatter's largest unit is
+        // what it must reach -- the old assertion here was `ends_with("days
+        // ago")`, which an unbounded day count satisfied forever.
+        let ancient = history_label(Some("1970-01-01T00:00:00.000Z"));
+        assert!(ancient.ends_with(" ago"), "{ancient}");
+        assert!(
+            ancient.contains('y'),
+            "a 1970 date must reach the largest unit, not count days forever: {ancient}"
+        );
 
         let mut item = a_login();
         item.other.insert(
