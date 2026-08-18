@@ -27,6 +27,8 @@ use crate::app_match::AppMatch;
 #[cfg(test)]
 use crate::app_match::TriggerMode;
 use crate::breach::{breach_phrase, BreachCache, BreachStatus};
+use crate::card_brand::{brand_for_number, code_mask_for, mask_for, CardBrand};
+use crate::card_mark;
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
@@ -737,6 +739,63 @@ pub fn card_fields(data: &CardData) -> CardFields {
         expiry: card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref()),
         code: non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string),
     }
+}
+
+/// Which network a card is on, as everything the pane draws from it needs it:
+/// the mark before the number, the number's grouping, and how many dots the
+/// security code gets.
+///
+/// **The stored brand first; the number only when there is no stored one.**
+/// `CardData.brand` is what every other Bitwarden client shows and what the
+/// user may have picked by hand in the edit form, so deriving it from the
+/// digits instead would silently overrule a deliberate choice.
+/// [`brand_for_number`] then covers the card that arrived without one -- an
+/// item whose digits begin `4` and whose `brand` is blank is a Visa, and
+/// masking it in a generic sixteen would be a guess of its own rather than the
+/// absence of one.
+///
+/// Read case-insensitively, because the vault's own fixtures carry both
+/// `"Visa"` and `"visa"` -- that is [`CardBrand::from_canonical`]'s rule and
+/// this function does not repeat it.
+///
+/// `None` is a real answer: a card on a network this app does not know draws
+/// no mark (see [`MaskedFace::lead`]) and masks to the length actually stored
+/// (see `card_brand::mask_for`).
+fn card_brand_of(fields: &CardFields) -> Option<CardBrand> {
+    fields
+        .brand
+        .as_deref()
+        .and_then(CardBrand::from_canonical)
+        .or_else(|| fields.number.as_deref().and_then(brand_for_number))
+}
+
+/// The texture for a network's mark, decoded once and kept in egui's own
+/// per-context store.
+///
+/// **Memoised deliberately.** `Context::load_texture` allocates a new texture
+/// every call, and this is reached from inside the pane's draw closure -- so
+/// an unmemoised version would upload a 48x48 image to the GPU on every frame
+/// the user has a card selected, and leak one texture per frame until the
+/// handles dropped. Keyed on the mark's own file stem rather than on the enum,
+/// so two brands could never share an entry silently.
+///
+/// `None` for a brand with no mark and for bytes that will not decode. Both
+/// draw nothing; neither draws a placeholder, which is the rule the whole
+/// badge follows (see `card_mark`'s module note).
+fn brand_mark_texture(ctx: &egui::Context, brand: CardBrand) -> Option<egui::TextureHandle> {
+    let mark = card_mark::mark_for(brand)?;
+    let id = egui::Id::new(("deskwarden-card-mark", mark.key));
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(texture);
+    }
+    let (width, height, rgba) = crate::favicon::decode_rgba(mark.png)?;
+    let texture = ctx.load_texture(
+        format!("card-mark-{}", mark.key),
+        egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+        egui::TextureOptions::default(),
+    );
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    Some(texture)
 }
 
 /// Every value the SSH key pane shows, emptiness-suppressed once.
@@ -2615,8 +2674,9 @@ pub fn draw_detail_read(
                         // (`CopyShortcut::Totp`), and a second, near-identical
                         // chord for a value that is not the one the user just
                         // read off the screen is how a seed ends up on the
-                        // clipboard by accident.
-                        None,
+                        // clipboard by accident. No mask of its own either: a
+                        // seed has no grouping and no last four.
+                        MaskedFace::default(),
                     );
                 }
             });
@@ -3828,6 +3888,18 @@ pub struct ResolvedApp<'a> {
 const APP_ICON_SIZE: f32 = 18.0;
 const APP_ICON_GAP: f32 = 8.0;
 
+/// How big the card's network mark is drawn on the detail pane, and the gap
+/// between it and the digits.
+///
+/// The same 18pt and 8pt the matched app's icon uses, and deliberately so
+/// rather than by coincidence: both are "a small square identifying the row,
+/// immediately before the row's value", and two different sizes for that would
+/// be two answers to one question. The asset is generated at
+/// `card_mark::MARK_DETAIL_PX` (48) and scaled down here, which resamples;
+/// scaling up would show the generator's own pixels.
+const BRAND_MARK_SIZE: f32 = 18.0;
+const BRAND_MARK_GAP: f32 = 8.0;
+
 /// The `App` row: the icon, the app's real name, and -- when there is
 /// something to open -- a link and a chord that open it.
 ///
@@ -4451,6 +4523,108 @@ fn copy_row(
     }
 }
 
+/// **Half of a row: one label, one value, and a hit area of its own.**
+///
+/// [`copy_row`] is one value per row, and the card's `Expires 08/29   Code •••`
+/// line is two. The design note says why that matters and not merely that it
+/// is different: *every value in this pane is click-to-copy with its own hit
+/// area, and the existing row-level click must not become ambiguous*. A single
+/// tile spanning both pairs would copy one of them from a click on the other,
+/// and nothing about the row would say which.
+///
+/// So this is `copy_row`'s tile, sized to a slice of the line instead of the
+/// whole of it, and the line is two of them side by side. It keeps every
+/// promise the full-width tile makes, in the same words and for the same
+/// reasons:
+///
+/// * the hover tint and the pointing hand, painted into a slot reserved
+///   *before* the contents so the fill cannot cover its own text;
+/// * the "Click to copy" tooltip, gated on `hovered()` so the eye inside the
+///   right-hand half keeps its own "Reveal" (see [`copy_row`], where that gate
+///   is argued at length);
+/// * the toast named off the very label the tile painted, so a confirmation
+///   cannot name a field the row does not.
+///
+/// **The eye still wins its own click for the same structural reason**: the
+/// tile is sensed on a `UiBuilder` background, which egui registers when the
+/// `Ui` is created and therefore before any child, and a click goes to the
+/// topmost widget under the pointer.
+///
+/// The label is laid [`LabelFit::ToText`], not to [`ROW_LABEL_WIDTH`]: two
+/// 130pt label columns do not fit one line on any pane this app can be, and
+/// the caller has already decided this line fits at all (see
+/// [`card_face_line_fits`]).
+///
+/// Only ever called with a value there is something to copy -- both halves
+/// come from [`CardFields`], which has already trimmed and suppressed the
+/// empty ones -- so there is no `copyable` parameter and no inert case.
+fn half_tile(
+    ui: &mut egui::Ui,
+    half: Half<'_>,
+    value: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+    on_copy: DetailAction,
+    action: &mut DetailAction,
+) {
+    let Half { label, width, label_width, hint } = half;
+    let scope = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        ui.set_width(width);
+        let tint = ui.painter().add(egui::Shape::Noop);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ROW_CONTENT_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                label_cell(ui, label, label_width, LabelFit::ToColumn);
+                ui.add_space(ROW_GAP);
+                value(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                    // The chord first, so it ends up FURTHEST right -- the
+                    // control group packs right-to-left, and this is the same
+                    // ordering rule (and the same reason) [`copy_row`] states.
+                    shortcut_hint(ui, hint);
+                    controls(ui);
+                });
+            },
+        );
+        tint
+    });
+    let response = scope.response;
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().set(
+            scope.inner,
+            egui::Shape::rect_filled(response.rect, CornerRadius::ZERO, theme::CARD_TINT),
+        );
+    }
+    let response = if response.hovered() {
+        response.on_hover_text(copy_row_tooltip(hint))
+    } else {
+        response
+    };
+    if response.clicked() {
+        *action = on_copy;
+        note_copied(ui.ctx(), label);
+    }
+}
+
+/// What one half of a shared line is: its name, the slice of the line it gets,
+/// and the chord that copies it. See [`half_tile`].
+#[derive(Clone, Copy)]
+struct Half<'a> {
+    label: &'a str,
+    /// The slice of the line this half occupies.
+    width: f32,
+    /// The width the label cell takes inside it. **The left half is given
+    /// [`ROW_LABEL_WIDTH`]**, so `Expires 08/29` puts its value on exactly the
+    /// column every other row on the pane puts its value on; the right half is
+    /// given its own glyphs' width, because there is nothing to its left on
+    /// the line for it to line up with.
+    label_width: f32,
+    hint: Option<CopyShortcut>,
+}
+
 fn row_impl(
     ui: &mut egui::Ui,
     label: &str,
@@ -5034,8 +5208,37 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
         revealed,
         action,
         DetailAction::CopyPassword,
-        Some(CopyShortcut::Password),
+        MaskedFace { hint: Some(CopyShortcut::Password), ..MaskedFace::default() },
     );
+}
+
+/// The three things that differ between one [`masked_row`] and another, in
+/// **one parameter rather than three**.
+///
+/// Not tidiness: `masked_row` already took seven arguments, which is exactly
+/// clippy's `too_many_arguments` threshold, so a masking string and a leading
+/// mark added positionally would have introduced two findings into a baseline
+/// this change is not allowed to grow. Grouping them with the `hint` they sit
+/// beside keeps the count where it was and gives the three a place to be
+/// documented together.
+#[derive(Default, Clone)]
+struct MaskedFace<'a> {
+    /// The keyboard chord that copies this row's value, named in its tooltip.
+    hint: Option<CopyShortcut>,
+    /// **What is painted while the value is hidden.** `None` is the
+    /// fixed-length bullet run every secret on this pane used to draw -- see
+    /// [`MASKED_BULLETS`] for why its length is a constant.
+    ///
+    /// A card supplies its own (`card_brand::mask_for`,
+    /// `card_brand::code_mask_for`) because a card's mask carries information
+    /// the run of ten does not: the network's own digit grouping, and the last
+    /// four digits, which are printed on every receipt. That is a decision
+    /// about *card numbers* and it is made by the caller; the row still knows
+    /// only "the string to show while hidden".
+    mask: Option<&'a str>,
+    /// A mark painted immediately before the value, on the same line -- the
+    /// card's network badge. `None` draws nothing, never a placeholder.
+    lead: Option<egui::TextureHandle>,
 }
 
 /// A secret row: monospace, bullets until revealed, with Reveal and Copy.
@@ -5095,8 +5298,9 @@ fn masked_row(
     revealed: &mut bool,
     action: &mut DetailAction,
     on_copy: DetailAction,
-    hint: Option<CopyShortcut>,
+    face: MaskedFace<'_>,
 ) {
+    let MaskedFace { hint, mask, lead } = face;
     // **Nothing to hide, so nothing to draw** -- see [`masked_row_visible`].
     // The return is BEFORE any allocation, so the row leaves no band, no
     // hairline slot and no eye behind it.
@@ -5110,19 +5314,25 @@ fn masked_row(
     if !masked_row_visible(value) {
         return;
     }
-    let shown = if *revealed {
-        value.to_string()
-    } else {
-        "•".repeat(MASKED_BULLETS)
+    // **The mask is the caller's when it has one**, and the bullet run only
+    // when it has not. See [`MaskedFace::mask`].
+    let shown = match (*revealed, mask) {
+        (true, _) => value.to_string(),
+        (false, Some(mask)) => mask.to_string(),
+        (false, None) => "•".repeat(MASKED_BULLETS),
     };
-    // What the control group on this row's value line really costs: the eye,
-    // plus the chord this row paints beside it when it has one, plus the gap
-    // between them. Read off the same helpers that draw them, so a retuned
-    // control cannot leave this measurement behind.
+    // What everything on this row's value line *other than the digits* costs:
+    // the eye, plus the chord this row paints beside it when it has one, plus
+    // the gap between them, plus the leading mark when there is one. Read off
+    // the same helpers and constants that draw them, so a retuned control
+    // cannot leave this measurement behind -- and the mark is in the sum
+    // because `digits_fit` decides the shape from what is left over, and a
+    // mark left out of it is a mark that pushes the eye off a narrow pane.
     let controls_width = theme::EYE_TOGGLE_SIZE
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
-        });
+        })
+        + if lead.is_some() { BRAND_MARK_SIZE + BRAND_MARK_GAP } else { 0.0 };
     // Laid out unwrapped, which is the question being asked: how wide does
     // this value WANT to be?
     let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
@@ -5135,7 +5345,21 @@ fn masked_row(
         // The typography, the wrap and the baseline are all
         // [`paint_digits`]'s -- the same three the expiry row gets, so the
         // card's three digit rows cannot drift apart again.
-        |ui| paint_digits(ui, &shown, room),
+        //
+        // The mark, when there is one, is painted first and on the same line,
+        // exactly as `app_name_row` paints the matched app's icon before its
+        // name. It is a `TextureHandle`, so a brand with no mark and an item
+        // with no brand are the same case here: nothing is drawn.
+        |ui| {
+            if let Some(texture) = &lead {
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(egui::vec2(BRAND_MARK_SIZE, BRAND_MARK_SIZE)),
+                );
+                ui.add_space(BRAND_MARK_GAP);
+            }
+            paint_digits(ui, &shown, room);
+        },
         |ui| {
             // AN EYE, not the words "Reveal"/"Hide". The state it shows is
             // the ACTION, the way every password manager spells it: an open
@@ -5214,47 +5438,250 @@ fn card_rows(
         empty_pane_note(ui, "No card details on this item.");
         return;
     }
+    // **Resolved before the struct is taken apart**, because the brand is the
+    // one field that is no longer a row: it is the mark before the number, the
+    // number's grouping and the code's dot count, all at once. See
+    // [`card_brand_of`].
+    let brand = card_brand_of(&fields);
     let CardFields {
         cardholder,
-        brand,
+        // Not drawn as a row any more -- it is `brand` above, and the mark on
+        // the number's line. Bound rather than skipped so that
+        // `CardFields`'s destructuring still names every field here.
+        brand: _brand_text,
         number,
         expiry,
         code,
     } = fields;
 
-    // `first` tracks whether a hairline is owed, so suppressing a row never
-    // leaves a separator with nothing on one side of it.
-    let mut first = true;
-    let separate = |ui: &mut egui::Ui, first: &mut bool| {
-        if *first {
-            *first = false;
-        } else {
+    // Whether the card's FACE -- the number line and the expiry/code line --
+    // drew anything, which is the only thing the cardholder's divider depends
+    // on. There is no hairline *within* the face: those two lines are one
+    // object, and the design's single rule sits between the face and the name
+    // below it.
+    let mut face = false;
+
+    if let Some(v) = &number {
+        face = true;
+        // The mask is the brand's own grouping with the last four shown, and
+        // it is fed to the row's `shown` value -- the typography, the wrap and
+        // the baseline are `paint_digits`'s, untouched, so the three digit
+        // runs stay one seam. See `card_brand::mask_for`.
+        let masked = mask_for(v, brand);
+        masked_row(
+            ui,
+            NUMBER_LABEL,
+            v,
+            &mut reveal.card_number,
+            action,
+            DetailAction::CopyCardNumber,
+            MaskedFace {
+                hint: None,
+                mask: Some(&masked),
+                // **Nothing at all for a brand this app cannot name**, and
+                // nothing for a named brand with no mark. Never a placeholder.
+                lead: brand.and_then(|b| brand_mark_texture(ui.ctx(), b)),
+            },
+        );
+    }
+
+    // The expiry and the security code share a line when both are there and
+    // both fit; otherwise each keeps a row of its own, which is what a pane too
+    // narrow for two label columns can honestly draw.
+    let code_shown = code
+        .as_deref()
+        .map(|v| (v, code_mask_for(v, brand), reveal.card_code));
+    let shared = match (&expiry, &code_shown) {
+        (Some(e), Some((raw, mask, revealed))) => {
+            // Measured on what will actually be PAINTED: a revealed code is a
+            // different length from its mask, and a line that fits the mask
+            // and not the value would break the moment the eye is clicked.
+            let code_run = if *revealed { *raw } else { mask.as_str() };
+            card_face_line_fits(
+                ui,
+                digits_width(ui, e),
+                digits_width(ui, code_run),
+                theme::EYE_TOGGLE_SIZE,
+            )
+        }
+        _ => None,
+    };
+    match (&expiry, &code, shared) {
+        (Some(e), Some(c), Some((left, right))) => {
+            face = true;
+            card_face_line(
+                ui,
+                (e, left),
+                (c, right),
+                &mut reveal.card_code,
+                (brand, action),
+            );
+        }
+        _ => {
+            if let Some(v) = &expiry {
+                face = true;
+                // Digits, on the line above and below -- see [`digits_row`],
+                // and [`digits_job`] for why the expiry is not merely "the
+                // same size as" its neighbours but literally the same
+                // typography.
+                digits_row(ui, EXPIRY_LABEL, v, action, DetailAction::CopyValue(v.clone()));
+            }
+            if let Some(v) = &code {
+                face = true;
+                let masked = code_mask_for(v, brand);
+                masked_row(
+                    ui,
+                    CODE_LABEL,
+                    v,
+                    &mut reveal.card_code,
+                    action,
+                    DetailAction::CopyCardCode,
+                    MaskedFace { hint: None, mask: Some(&masked), lead: None },
+                );
+            }
+        }
+    }
+
+    // **The cardholder last, under the card's one rule.** The design's reason
+    // is that it is the least-consulted field and that this slot is where a
+    // linked identity will render when the vault grows one; the rule is what
+    // says the name is about the card rather than another fact printed on it.
+    if let Some(v) = &cardholder {
+        if face {
             theme::row_rule(ui);
         }
-    };
-    if let Some(v) = &cardholder {
-        separate(ui, &mut first);
-        credential_row(ui, "Cardholder name", v, None, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, CARDHOLDER_LABEL, v, None, action, DetailAction::CopyValue(v.clone()));
     }
-    if let Some(v) = &brand {
-        separate(ui, &mut first);
-        credential_row(ui, "Brand", v, None, action, DetailAction::CopyValue(v.clone()));
-    }
-    if let Some(v) = &number {
-        separate(ui, &mut first);
-        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber, None);
-    }
-    if let Some(v) = &expiry {
-        separate(ui, &mut first);
-        // Digits, between two rows of digits -- see [`digits_row`], and see
-        // [`digits_job`] for why the expiry is not merely "the same size as"
-        // its neighbours but literally the same typography.
-        digits_row(ui, "Expiry", v, action, DetailAction::CopyValue(v.clone()));
-    }
-    if let Some(v) = &code {
-        separate(ui, &mut first);
-        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode, None);
-    }
+}
+
+/// The card pane's row names, in one place each: the row paints it, the copy
+/// toast names it, and [`copy_shortcut_label`]'s argument for that (one string
+/// or they drift) applies to a row with no chord just as much.
+///
+/// `Expires` and `Code` rather than `Expiry` and `Security code`: they share a
+/// line now, and the two long forms do not fit beside one another on a pane
+/// this app can actually be. The words are the design's own.
+const NUMBER_LABEL: &str = "Number";
+const EXPIRY_LABEL: &str = "Expires";
+const CODE_LABEL: &str = "Code";
+const CARDHOLDER_LABEL: &str = "Cardholder name";
+
+/// How wide a digits run wants to be, unwrapped -- the question
+/// [`digits_fit`] asks, asked from outside a row.
+fn digits_width(ui: &egui::Ui, value: &str) -> f32 {
+    ui.painter().layout_job(digits_job(value)).size().x
+}
+
+/// How wide a row label's glyphs are, as [`label_cell`] lays them.
+fn label_run_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            label.to_string(),
+            egui::FontId::new(ROW_LABEL_SIZE, egui::FontFamily::Proportional),
+            theme::TEXT_FAINT,
+        )
+        .size()
+        .x
+}
+
+/// **Whether the expiry and the security code fit on one line**, and the width
+/// each half gets when they do.
+///
+/// The line is split down the middle rather than packed, so the code's label
+/// lands in the same place whatever the expiry says -- a right-hand pair that
+/// slid left and right as `04` became `04/23` would be two columns that are
+/// not columns.
+///
+/// `None` is a real and reachable answer, not a defensive one: the detail pane
+/// is 298pt at its narrowest, which leaves 266pt of content and 133pt a half,
+/// and a revealed security code beside a `Code` label and a Reveal eye does
+/// not always live inside that. The caller then draws the two rows separately,
+/// which is what this pane did for both of them before and still fits.
+fn card_face_line_fits(
+    ui: &egui::Ui,
+    expiry_natural: f32,
+    code_natural: f32,
+    code_controls: f32,
+) -> Option<(f32, f32)> {
+    let content = row_content_width(ui);
+    let half = content / 2.0;
+    let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural;
+    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + CONTROL_GAP
+        + code_controls;
+    (left <= half && right <= half).then_some((half, content - half))
+}
+
+/// `Expires 08/29        Code •••` -- **one line, two hit areas.**
+///
+/// The two halves are [`half_tile`]s, which is where the argument for two hit
+/// areas rather than one lives. Everything else here is arithmetic: each half
+/// knows its own width, and each value knows the room left over once its label
+/// and its controls have been paid for, because a `LayoutJob`'s
+/// `wrap.max_width` defaults to infinity and a run that is not told where to
+/// stop does not stop (see [`masked_row`]).
+///
+/// The security code keeps its Reveal eye and its masking; the expiry has
+/// neither, and [`digits_row`]'s doc says why -- an expiry is printed on the
+/// front of the card, and bullets over it would be a lie about the data.
+fn card_face_line(
+    ui: &mut egui::Ui,
+    expiry: (&str, f32),
+    code: (&str, f32),
+    revealed: &mut bool,
+    brand_and_action: (Option<CardBrand>, &mut DetailAction),
+) {
+    let (expiry, left_width) = expiry;
+    let (code, right_width) = code;
+    let (brand, action) = brand_and_action;
+    let left_room = (left_width - ROW_LABEL_WIDTH - ROW_GAP).max(1.0);
+    let right_room = (right_width
+        - label_run_width(ui, CODE_LABEL)
+        - ROW_GAP
+        - CONTROL_GAP
+        - theme::EYE_TOGGLE_SIZE)
+        .max(1.0);
+    let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                half_tile(
+                    ui,
+                    Half {
+                        label: EXPIRY_LABEL,
+                        width: left_width,
+                        label_width: ROW_LABEL_WIDTH,
+                        hint: None,
+                    },
+                    |ui| paint_digits(ui, expiry, left_room),
+                    |_ui| {},
+                    DetailAction::CopyValue(expiry.to_string()),
+                    action,
+                );
+                half_tile(
+                    ui,
+                    Half {
+                        label: CODE_LABEL,
+                        width: right_width,
+                        label_width: label_run_width(ui, CODE_LABEL),
+                        hint: None,
+                    },
+                    |ui| paint_digits(ui, &shown, right_room),
+                    |ui| {
+                        if theme::eye_toggle(ui, *revealed)
+                            .on_hover_text(if *revealed { "Hide" } else { "Reveal" })
+                            .clicked()
+                        {
+                            *revealed = !*revealed;
+                        }
+                    },
+                    DetailAction::CopyCardCode,
+                    action,
+                );
+            });
+        });
 }
 
 /// A previous password's row label: when it stopped being the current one.
@@ -5315,7 +5742,7 @@ fn history_rows(
             &mut reveal.password_history[index],
             action,
             DetailAction::CopyPasswordHistory(index),
-            None,
+            MaskedFace::default(),
         );
     }
     // Truncation is STATED, never silent. A previous password the pane simply
@@ -5398,7 +5825,15 @@ fn ssh_key_rows(
     }
     if let Some(v) = &private_key {
         separate(ui, &mut first);
-        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey, None);
+        masked_row(
+            ui,
+            "Private key",
+            v,
+            &mut reveal.ssh_private_key,
+            action,
+            DetailAction::CopySshPrivateKey,
+            MaskedFace::default(),
+        );
     }
 }
 
@@ -6587,6 +7022,43 @@ mod tests {
         painted_text(item, totp, false, reveal)
     }
 
+    /// Every text the pane painted, and **the box of every bitmap it
+    /// painted** -- which on a card pane is the network mark and nothing else.
+    ///
+    /// `egui::Image` paints a textured `Shape::Mesh`, and no drawn icon in
+    /// this app does: `detail_edit`'s
+    /// `an_app_icon_bitmap_is_not_mistaken_for_any_drawn_icon` measures
+    /// exactly that separation. Textured `Shape::Rect`s are collected too, so
+    /// the probe does not go blind if egui changes which of the two it emits;
+    /// every caller pairs an emptiness claim with a positive control that
+    /// would catch a probe that found nothing either way.
+    fn painted_with_marks(item: &VaultItem) -> (Vec<String>, Vec<egui::Rect>) {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Mesh(mesh) => out.push(mesh.calc_bounds()),
+                egui::Shape::Rect(rect)
+                    if rect.brush.as_ref().is_some_and(|brush| {
+                        brush.fill_texture_id != egui::TextureId::default()
+                    }) =>
+                {
+                    out.push(rect.rect);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let shapes = frame_shapes(item, &TotpState::NoSecret, RevealState::default());
+        let mut marks = Vec::new();
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut marks);
+        }
+        (painted(item, &TotpState::NoSecret), marks)
+    }
+
     fn contains(texts: &[String], needle: &str) -> bool {
         texts.iter().any(|t| t.contains(needle))
     }
@@ -7345,28 +7817,58 @@ mod tests {
             "CARD DETAILS",
             "Cardholder name",
             "John Doe",
-            "Brand",
-            "visa",
             "Number",
-            "Expiry",
+            "Expires",
             // `MM/YY`, the form the plastic itself is embossed with.
             "04/23",
-            "Security code",
+            "Code",
         ] {
             assert!(contains(&texts, label), "the card pane painted no {label:?}: {texts:?}");
         }
+        // **The Brand ROW is gone, and that is what the badge replaced.**
+        // Design §6: the network is the mark before the digits rather than the
+        // word "visa" on a row of its own, "which removes a whole row". The
+        // negative alone would pass over a pane that drew nothing, which the
+        // loop above rules out; and the badge itself is pinned by
+        // [`an_unrecognised_brand_renders_no_badge_and_masks_to_its_stored_length`],
+        // whose control asserts this very fixture paints exactly one mark.
+        for gone in ["Brand", "visa"] {
+            assert!(
+                !contains(&texts, gone),
+                "the card pane still draws the brand as a row: {texts:?}"
+            );
+        }
     }
 
-    /// **Masked by default.** The assertion is negative on purpose: it is not
-    /// enough that a Reveal button exists, the digits must not be in the
-    /// frame's own shape list at all. `4242` rather than the whole number, so
-    /// a partial mask ("**** 4242") fails too.
+    /// **Masked by default.** It is not enough that a Reveal button exists:
+    /// the digits must not be in the frame's own shape list at all.
+    ///
+    /// **This test used to forbid `"4242"` outright, and the design changed
+    /// under it -- deliberately, not by accident.** §4: the last four are what
+    /// identifies the card to its owner, they are printed on every receipt and
+    /// asked for by every support line, and they are not enough to use it. So
+    /// the rule is no longer "no digit survives" but "**exactly** the last four
+    /// do", and that is what is asserted -- a count, off the painted run
+    /// itself, so a mask that leaked a fifth digit fails here rather than
+    /// passing a substring check.
+    ///
+    /// The security code keeps the old, stricter rule, and §4 says why: a CVV
+    /// has no identification use to trade against its risk.
     #[test]
     fn the_card_number_and_security_code_are_masked_by_default() {
         let texts = painted(&a_full_card(), &TotpState::NoSecret);
         assert!(
-            !contains(&texts, "4242"),
+            !contains(&texts, "4242424242424242"),
             "the card number was painted in the clear by default: {texts:?}"
+        );
+        let number = texts
+            .iter()
+            .find(|t| t.starts_with('•') && t.ends_with("4242"))
+            .unwrap_or_else(|| panic!("no masked number on the pane at all: {texts:?}"));
+        assert_eq!(
+            number.chars().filter(char::is_ascii_digit).count(),
+            4,
+            "the number's mask shows {number:?}, which is more than the last four"
         );
         assert!(
             !contains(&texts, "123"),
@@ -8509,7 +9011,7 @@ mod tests {
                     &mut revealed,
                     &mut action,
                     DetailAction::CopyPassword,
-                    Some(CopyShortcut::Password),
+                    MaskedFace { hint: Some(CopyShortcut::Password), ..MaskedFace::default() },
                 );
                 taken = ui.min_rect().height() - before;
             });
@@ -9805,10 +10307,22 @@ mod tests {
             contains(&code_only, "123"),
             "card_code: true did not reveal the security code: {code_only:?}"
         );
+        // **The whole number, not `"4242"`.** The mask now ENDS in the last
+        // four by design (§4), so a substring check on those digits would fail
+        // against a correctly masked row -- and, worse, would have passed
+        // vacuously if the mask ever stopped showing them.
         assert!(
-            !contains(&code_only, "4242"),
+            !contains(&code_only, "4242424242424242"),
             "revealing the SECURITY CODE also unmasked the number -- the two rows are \
              reading the same flag: {code_only:?}"
+        );
+        // The positive control that gives that its force: the number's row is
+        // on screen and masked, so the absence above is about the mask rather
+        // than about a row that failed to draw.
+        assert!(
+            contains(&code_only, "•••• •••• •••• 4242"),
+            "the number's row is not on screen at all, so the absence above proves \
+             nothing: {code_only:?}"
         );
     }
 
@@ -9818,7 +10332,11 @@ mod tests {
     #[test]
     fn nothing_but_the_number_and_the_code_is_masked_on_a_card() {
         let texts = painted(&a_full_card(), &TotpState::NoSecret);
-        for visible in ["John Doe", "visa", "04/23"] {
+        // `"visa"` used to be in this list and is not a row any more -- the
+        // network is the mark before the digits now (§6). The two that remain
+        // are the pane's whole non-secret text, which is what this test is
+        // about.
+        for visible in ["John Doe", "04/23"] {
             assert!(
                 contains(&texts, visible),
                 "{visible:?} was masked; only the number and the security code may be: {texts:?}"
@@ -10065,14 +10583,25 @@ mod tests {
     /// then offered no way to see or copy it. It also drew the secret's exact
     /// length on screen for anyone looking.
     ///
-    /// Asserted across a 16-digit card number and a ~94-character private
-    /// key, i.e. the shortest and longest masked values the app has, and
-    /// against the constant rather than against each other -- two runs that
-    /// moved together would satisfy an equality check while both being wrong.
+    /// Asserted across a login's password and a ~94-character private key,
+    /// and against the constant rather than against each other -- two runs
+    /// that moved together would satisfy an equality check while both being
+    /// wrong.
+    ///
+    /// **The card is deliberately no longer one of the fixtures**, and that is
+    /// the one exception rather than the rule going soft. Design §4: a card's
+    /// number masks in *its own network's grouping* with the last four shown,
+    /// and its security code draws the number of dots that network's code
+    /// really has. Both of those are facts about the network, printed on the
+    /// plastic and asked for by every support line; neither is the "how long
+    /// is the secret" this constant exists to withhold. What the card does
+    /// draw is pinned positively by
+    /// [`a_cards_masks_are_its_own_networks_and_not_the_fixed_run`], so the
+    /// exception is asserted somewhere rather than merely excused here.
     #[test]
     fn a_masked_row_draws_a_fixed_bullet_run_whatever_it_hides() {
         let expected = "•".repeat(MASKED_BULLETS);
-        for (label, item) in [("card", a_full_card()), ("ssh key", an_ssh_key_item())] {
+        for (label, item) in [("login", a_login()), ("ssh key", an_ssh_key_item())] {
             let texts = painted(&item, &TotpState::NoSecret);
             let runs: Vec<&String> = texts.iter().filter(|t| t.starts_with('•')).collect();
             assert!(
@@ -10088,6 +10617,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A card's masks are its own network's, and the seam they arrive
+    /// through is untouched.**
+    ///
+    /// The positive half of the exception
+    /// [`a_masked_row_draws_a_fixed_bullet_run_whatever_it_hides`] carves out:
+    /// the number reads `•••• •••• •••• 4242` -- the Visa grouping, with the
+    /// four digits every receipt prints -- and the code reads three dots
+    /// because a Visa's code is three digits, not because ten was rounded
+    /// down.
+    ///
+    /// Both are asserted as the exact painted string rather than as a bullet
+    /// count, because a count cannot tell `••••••••••••4242` from the grouped
+    /// run and the grouping is the whole point (an Amex masked in fours tells
+    /// the user their card is a different card).
+    #[test]
+    fn a_cards_masks_are_its_own_networks_and_not_the_fixed_run() {
+        let texts = painted(&a_full_card(), &TotpState::NoSecret);
+        assert!(
+            contains(&texts, "•••• •••• •••• 4242"),
+            "the number is not masked in its network's grouping: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "•••"),
+            "the security code is not masked to its network's code length: {texts:?}"
+        );
+        // The negative that gives those two their force: the fixed run is
+        // NOT what a card draws any more, and neither is the real number.
+        let fixed = "•".repeat(MASKED_BULLETS);
+        assert!(
+            !contains(&texts, &fixed),
+            "a card row still drew the length-hiding run: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "4242424242424242"),
+            "the number was painted in the clear: {texts:?}"
+        );
+    }
+
+    /// **An Amex masks in 4-6-5 and gets four dots, on the pane and not only
+    /// in `card_brand`.**
+    ///
+    /// The unit tests for `mask_for` prove the strings; this proves the pane
+    /// asks for them with the right brand. Without it, a `card_rows` that
+    /// passed `None` where the resolved brand should go would render every
+    /// card as a Visa and every unit test would stay green.
+    #[test]
+    fn an_amex_is_masked_in_its_own_grouping_by_the_pane_itself() {
+        let mut item = a_full_card();
+        let card = item.card.as_mut().expect("a_full_card has card data");
+        card.brand = Some("American Express".to_string());
+        card.number = Some("378282246310005".to_string().into());
+        card.code = Some("1234".to_string().into());
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(
+            contains(&texts, "•••• •••••• •0005"),
+            "an Amex was not masked in 4-6-5: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "••••"),
+            "an Amex security code did not get its fourth dot: {texts:?}"
+        );
+        // The control: the Visa fixture above draws a DIFFERENT pair, so this
+        // is the brand reaching the mask and not one string for every card.
+        assert!(
+            !contains(&texts, "•••• •••• •••• 4242"),
+            "the pane masked an Amex as a Visa: {texts:?}"
+        );
+    }
+
+    /// **A brand this app cannot name draws no badge and still masks true.**
+    ///
+    /// The two halves of the unrecognised case, together, because each alone
+    /// passes over a pane that failed to draw the card at all: no mark is
+    /// painted, and the number still masks to the length actually stored with
+    /// its last four shown.
+    #[test]
+    fn an_unrecognised_brand_renders_no_badge_and_masks_to_its_stored_length() {
+        let mut item = a_full_card();
+        let card = item.card.as_mut().expect("a_full_card has card data");
+        card.brand = Some("Not A Network".to_string());
+        card.number = Some("1234567890123".to_string().into());
+        let (texts, marks) = painted_with_marks(&item);
+        assert!(
+            marks.is_empty(),
+            "an unrecognised brand painted a badge: {marks:?}"
+        );
+        assert!(
+            contains(&texts, "• •••• •••• 0123"),
+            "the number did not mask to the length actually stored: {texts:?}"
+        );
+        // The control, and it is what makes the emptiness above mean
+        // something: the SAME pane with a brand it does know paints exactly
+        // one mark, at the size the pane draws it.
+        let (_, visa) = painted_with_marks(&a_full_card());
+        assert_eq!(
+            visa.len(),
+            1,
+            "a recognised brand painted {} marks, so 'none' proves nothing: {visa:?}",
+            visa.len()
+        );
+        assert_eq!(
+            visa[0].width(),
+            BRAND_MARK_SIZE,
+            "the network mark is not drawn at the pane's own mark size"
+        );
     }
 
     #[test]
@@ -12639,11 +13275,18 @@ mod tests {
     fn every_copyable_row_copies_its_own_value() {
         let item = a_full_card();
         let expected = [
-            ("Cardholder name", DetailAction::CopyValue("John Doe".to_string())),
-            ("Brand", DetailAction::CopyValue("visa".to_string())),
-            ("Number", DetailAction::CopyCardNumber),
-            ("Expiry", DetailAction::CopyValue("04/23".to_string())),
-            ("Security code", DetailAction::CopyCardCode),
+            (CARDHOLDER_LABEL, DetailAction::CopyValue("John Doe".to_string())),
+            (NUMBER_LABEL, DetailAction::CopyCardNumber),
+            // **The two on the SHARED line, and they are the reason this test
+            // still earns its name.** `Expires` and `Code` are one row on the
+            // pane now, so a single row-wide hit area would report one of them
+            // for a click on the other and nothing in the layout would say
+            // which. `rect_of` finds each label where it was really painted --
+            // the left half at the card's own padding, the right half at the
+            // midpoint -- so the two clicks below land in the two halves, and
+            // a crossed pair fails here.
+            (EXPIRY_LABEL, DetailAction::CopyValue("04/23".to_string())),
+            (CODE_LABEL, DetailAction::CopyCardCode),
         ];
         for (label, want) in expected {
             let mut pane = Pane::new();
@@ -12653,6 +13296,52 @@ mod tests {
             assert_eq!(
                 clicked.action, want,
                 "clicking the {label:?} row reported {:?}",
+                clicked.action
+            );
+        }
+    }
+
+    /// **The shared line is two hit areas that meet, not two labels that
+    /// happen to be clickable.**
+    ///
+    /// [`every_copyable_row_copies_its_own_value`] clicks each label, which
+    /// proves the two values are not crossed. It does not prove the halves
+    /// *tile the line*: a pair of tiles the width of their own text would pass
+    /// it while every pixel of the gap between `08/29` and `Code` copied
+    /// nothing at all -- and the pane's promise is that the whole row is the
+    /// affordance, which is what `copy_row`'s tile has always meant.
+    ///
+    /// So this clicks the two points either side of the seam. The row's own
+    /// band is found from a label rather than assumed, and the midpoint from
+    /// the card's geometry, so the test moves with the layout instead of
+    /// pinning a pixel.
+    #[test]
+    fn the_shared_line_is_two_hit_areas_that_meet_at_its_middle() {
+        let item = a_full_card();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let left_label = laid_out.rect_of(EXPIRY_LABEL);
+        let right_label = laid_out.rect_of(CODE_LABEL);
+        // The seam: the right half begins where its label does, and the left
+        // half runs up to it.
+        let seam = right_label.left();
+        assert!(
+            seam > left_label.right(),
+            "the two halves overlap, so 'either side of the seam' is meaningless"
+        );
+        let y = left_label.center().y;
+        for (name, x, want) in [
+            (
+                "just left of the seam",
+                seam - 4.0,
+                DetailAction::CopyValue("04/23".to_string()),
+            ),
+            ("just right of the seam", seam + 4.0, DetailAction::CopyCardCode),
+        ] {
+            let clicked = pane.click(&item, &TotpState::NoSecret, egui::pos2(x, y));
+            assert_eq!(
+                clicked.action, want,
+                "a click {name} reported {:?}",
                 clicked.action
             );
         }
@@ -12780,9 +13469,12 @@ mod tests {
                 "the card's {value:?} row is not tracked like the digit rows beside it"
             );
         }
-        // The rows that are NOT digits keep the pane's ordinary value type --
-        // this is a rule about three rows, not a monospace card.
-        for value in ["John Doe", "visa"] {
+        // The row that is NOT digits keeps the pane's ordinary value type --
+        // this is a rule about three rows, not a monospace card. It used to be
+        // two rows here; `visa` is a mark before the digits now rather than a
+        // row of its own (§6), so the cardholder is the whole of the control.
+        {
+            let value = "John Doe";
             let (font, tracking, ..) = one_run(&painted, value);
             assert_eq!(
                 font,
@@ -12838,12 +13530,24 @@ mod tests {
     fn every_card_value_paints_its_ink_on_one_baseline_with_its_label() {
         let item = a_card_whose_every_value_sits_on_the_baseline();
         let painted = painted_ink(&item, ALL_REVEALED);
+        // **Re-pinned to the pane's four rows, not loosened.** The Brand row
+        // is gone (§6) and with it the `("Brand", "visa")` entry that used to
+        // be this test's reference. The reference is now the Cardholder row,
+        // which is the same thing the old one was -- *an ordinary
+        // proportional value beside an ordinary label* -- and it is still
+        // named rather than written down as a number, so the assertion stays
+        // about the RELATIONSHIP.
+        //
+        // The Expires and Code entries measure the SHARED line, one on each
+        // half, which is the case the old row-per-value list could not reach:
+        // a half tile that centred its own band differently from a full-width
+        // row would show up here as two entries moving away from the other
+        // two.
         let rows = [
-            ("Cardholder name", "John Doe"),
-            ("Brand", "visa"),
-            ("Number", "4242424242424242"),
-            ("Expiry", "04"),
-            ("Security code", "123"),
+            (CARDHOLDER_LABEL, "John Doe"),
+            (NUMBER_LABEL, "4242424242424242"),
+            (EXPIRY_LABEL, "04"),
+            (CODE_LABEL, "123"),
         ];
         let drops: Vec<(&str, f32)> = rows
             .iter()
@@ -12857,7 +13561,7 @@ mod tests {
         // proportional value beside an ordinary label. Naming it rather than
         // writing +4.5 down keeps this test about the RELATIONSHIP, so a
         // retuned row height moves every entry together and reds nothing.
-        let (_, ordinary) = drops[1];
+        let (_, ordinary) = drops[0];
         for (label, drop) in &drops {
             assert!(
                 (drop - ordinary).abs() <= 0.25,
