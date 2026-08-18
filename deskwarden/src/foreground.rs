@@ -983,7 +983,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 44] = [
+        const OPENS_NO_WINDOW: [&str; 45] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1052,6 +1052,10 @@ mod tests {
             // draw what it returns are a later step and are not this module.
             "otpauth",
             "password_strength",
+            // Wraps the QR decoder: an RGBA buffer in, a string out. Pure, with
+            // no I/O at all -- the region capture that will feed it is a
+            // later step and is not this module.
+            "qr",
             // The record payload written into a Send and read back out of
             // one, plus the passphrase seal over the TOTP seed. Pure data
             // with no I/O at all; the surfaces that will draw it are a later

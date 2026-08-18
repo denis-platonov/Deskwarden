@@ -56,6 +56,7 @@ pub mod password_strength;
 pub mod picker_ui;
 pub mod preflight_host;
 pub mod prefs_ui;
+pub mod qr;
 pub mod record;
 pub mod reprompt;
 pub mod scratch_window;

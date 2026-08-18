@@ -2028,7 +2028,22 @@ mod tests {
             // `winresource = "0.1"`. The pin is over the whole file, so a
             // feature list is inside it -- which is right, since turning a
             // feature on is also a way to pull new code into the build.
-            (6328, 0x32ba_5668_4ad3_7725_u64),
+            //
+            // **Re-pinned because a dependency really did move this time**, so
+            // this is the case the pin exists for rather than a feature edit.
+            // `rqrr = { version = "0.10", default-features = false }` was
+            // ADDED, from crates.io, for `src/qr.rs` -- the one-time-code
+            // feature reads a QR code out of a captured region. No existing
+            // name was removed or re-pointed, no `[patch]`/`[replace]` table
+            // was introduced, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. It brings SEVEN crates into the tree:
+            // `rqrr`, `g2p`/`g2gen`/`g2poly` (Galois-field arithmetic for
+            // Reed-Solomon), and `lru` + `hashbrown` + `allocator-api2`.
+            // `default-features = false` is why that number is seven and not
+            // an order of magnitude more: the default `img` feature pulls in
+            // `image` and its format decoders, none of which this app needs.
+            // 6328 -> 7547 bytes, all of it the new entry and its comment.
+            (7547, 0xbc77_ea4e_4b9a_931d_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
