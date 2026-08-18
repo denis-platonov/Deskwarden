@@ -172,6 +172,25 @@ const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
 ];
 
 fn main() {
+    // **First, before anything else in this process can fail.**
+    //
+    // This creates the named mutex `installer/deskwarden.iss` names in
+    // `AppMutex=`, and holding it is the only thing that tells Inno Setup a
+    // Deskwarden is running -- which is what turns "install over a running
+    // copy silently fails or leaves a stale binary" into "please close
+    // Deskwarden, then click OK".
+    //
+    // It is the first statement rather than a tidier one below the logging
+    // setup because everything below can end the process, and every moment
+    // between process start and this line is a live app, with its image
+    // mapped and its files locked, that setup cannot see. The outcome is
+    // carried down to the first `log::` call rather than logged here: the log
+    // file does not exist yet.
+    //
+    // Not fatal if it fails. The mutex is how the installer notices this app,
+    // not how the app works.
+    let mutex_state = deskwarden::app_mutex::acquire();
+
     let project_dirs = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
         .expect("could not resolve config directory");
     let config_dir = project_dirs.config_dir().to_path_buf();
@@ -198,6 +217,29 @@ fn main() {
     match logging::init(&config_dir) {
         Ok(path) => log::info!("deskwarden starting; logging to {}", path.display()),
         Err(e) => eprintln!("warning: {e}"),
+    }
+
+    // Now that there is somewhere to say it, report what the mutex found.
+    //
+    // `AlreadyRunning` is REPORTED AND NOT ACTED ON, deliberately. A second
+    // copy of Deskwarden is arguably already a bug -- its `RegisterHotKey`
+    // cannot succeed while the first copy holds the same combination -- but
+    // making the second copy exit is a behaviour change, not part of fixing
+    // the installer, and it belongs to whoever decides what the second copy
+    // should do instead (raise the first one's vault window, most likely).
+    // This line is the evidence that would justify it.
+    match &mutex_state {
+        Ok(deskwarden::app_mutex::Acquired::First) => {
+            log::debug!("app mutex held: the installer can see this process")
+        }
+        Ok(deskwarden::app_mutex::Acquired::AlreadyRunning) => log::warn!(
+            "another Deskwarden is already running in this session; the global hotkey will \
+             not register in this one"
+        ),
+        Err(e) => log::warn!(
+            "could not create the app mutex ({e}); an installer run while this app is \
+             running will not know to ask you to close it"
+        ),
     }
 
     // Building with windows_subsystem = "windows" (no console) means a

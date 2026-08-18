@@ -956,13 +956,20 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 42] = [
+        const OPENS_NO_WINDOW: [&str; 43] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
             // Draws nothing itself; the edit form paints what it returns.
             "app_identity",
             "app_match",
+            // Creates one named kernel object and holds its handle, so the
+            // installer can tell that this app is running. No UI of any kind:
+            // the window this module causes to appear is Inno Setup's "please
+            // close Deskwarden" box, which belongs to setup, lives in setup's
+            // process, and is the whole point -- see `app_mutex`'s own docs
+            // for why setup asks rather than force-closing.
+            "app_mutex",
             "backend_policy",
             // A test-only brace matcher over source text. It is
             // `#[cfg(test)]` at its declaration and draws nothing.

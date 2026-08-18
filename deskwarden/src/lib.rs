@@ -13,6 +13,10 @@ pub mod accounts;
 pub mod app;
 pub mod app_identity;
 pub mod app_match;
+/// The named Windows mutex the installer looks for before replacing this
+/// app's files. Held for the life of the process; see its own docs for why
+/// setup asks the user to close Deskwarden rather than force-closing it.
+pub mod app_mutex;
 pub mod app_window;
 pub mod backend_policy;
 /// The one brace matcher every below-the-cut source walk uses.
