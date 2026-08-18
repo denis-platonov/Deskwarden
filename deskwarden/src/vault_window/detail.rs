@@ -1132,6 +1132,14 @@ pub enum CopyShortcut {
     /// secret, and the one whose row also does something else on click --
     /// see the Website row in [`draw_detail_read`].
     Url,
+    /// The four card values. **Their own variants rather than a reuse of
+    /// `Password` and `Username`, and the constraint decided that rather than
+    /// taste** -- see [`COPY_SHORTCUTS`]'s note on why option A of design §7
+    /// is not expressible here.
+    CardNumber,
+    CardExpiry,
+    CardCode,
+    Cardholder,
 }
 
 /// The bindings, their keys and the chord each row's tooltip names, in ONE
@@ -1181,7 +1189,53 @@ pub enum CopyShortcut {
 /// website copy could not have been told apart from a username copy at all --
 /// which is also why the two live in the same table with their modifiers in
 /// it, rather than one of them being special-cased somewhere else.
-const COPY_SHORTCUTS: [(CopyShortcut, egui::Modifiers, egui::Key, &str); 4] = [
+/// **The card's four chords, and why they are four rather than two.**
+///
+/// Design §7 recommends option A -- `CTRL+B` copies a card's number and
+/// `CTRL+U` its cardholder, the same *intent* as on a login -- and says the
+/// chord-uniqueness guard decides whether it is even expressible. It was
+/// checked before any of this was written, and it is not, for two separate
+/// reasons:
+///
+/// * **Adding `CardNumber` at `CTRL+B` is refused outright** by
+///   `no_two_bindings_share_a_chord`: two rows of this table with the same
+///   modifiers and key resolve to whichever comes first and the other never
+///   fires. That is the guard the design pointed at, and it forbids exactly
+///   the shape option A asks for.
+/// * **Reusing `CopyShortcut::Password` for the number is refused by
+///   [`copy_shortcut_label`]**, which is the harder of the two. That function
+///   is documented as *the one place a chord-bound field's NAME is written*:
+///   the row paints it as its label and the copy toast speaks the same string,
+///   so they cannot drift. `CopyShortcut::Password` is the string `"Password"`.
+///   Making it copy a card's number would either label the number's row
+///   "Password" or raise "Password copied" over a card number -- the
+///   parallel-table defect the whole arrangement exists to prevent. And
+///   `copy_shortcut_action` is handed a login's four values, so a card's
+///   number could only reach it by being passed *as* the password.
+///
+/// So cards get their own chords. The cost is the one §7 names -- four new
+/// bindings and a second set to learn -- and it is paid deliberately.
+///
+/// **The chords, chosen by reading what the crate already spends.** Every
+/// binding in it, checked rather than assumed: `vault_window::mod` takes
+/// `CTRL+K`, `CTRL+L` and `CTRL+N`; `login_ui` takes `CTRL+H`; the global fill
+/// hotkey is `CTRL+ALT+B` through Win32 `RegisterHotKey`; this pane takes
+/// `CTRL+B`, `CTRL+U`, `CTRL+T`, `CTRL+SHIFT+U` and `CTRL+SHIFT+O`. The only
+/// other `egui::Key` expressions anywhere in the crate are `Escape`, `Enter`,
+/// `Space`, `Backspace`, `End`, and `F` and `A` inside tests.
+///
+/// **All four are shifted, and the letters avoid `K`, `L`, `N` and `H`
+/// specifically.** Those four are matched elsewhere with a *loose*
+/// `i.modifiers.ctrl` test, which is true with shift held -- so `CTRL+SHIFT+N`
+/// would still open the New Item dialog underneath. That is the same
+/// `matches_logically` hazard this table's own note records for `CTRL+ALT+B`,
+/// and it is the reason `N` for *number* and `H` for *holder*, the two best
+/// mnemonics on offer, are not used. `B` for the number is the shifted sibling
+/// of this app's "copy the secret" key, exactly the relationship `CTRL+SHIFT+U`
+/// has to `CTRL+U`; `C` and `E` are the initials of the rows they copy; `A` is
+/// the account holder, and is what is left once the better letters are ruled
+/// out.
+const COPY_SHORTCUTS: [(CopyShortcut, egui::Modifiers, egui::Key, &str); 8] = [
     (CopyShortcut::Password, egui::Modifiers::CTRL, egui::Key::B, "CTRL+B"),
     (CopyShortcut::Username, egui::Modifiers::CTRL, egui::Key::U, "CTRL+U"),
     (CopyShortcut::Totp, egui::Modifiers::CTRL, egui::Key::T, "CTRL+T"),
@@ -1190,6 +1244,30 @@ const COPY_SHORTCUTS: [(CopyShortcut, egui::Modifiers, egui::Key, &str); 4] = [
         egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
         egui::Key::U,
         "CTRL+SHIFT+U",
+    ),
+    (
+        CopyShortcut::CardNumber,
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        egui::Key::B,
+        "CTRL+SHIFT+B",
+    ),
+    (
+        CopyShortcut::CardExpiry,
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        egui::Key::E,
+        "CTRL+SHIFT+E",
+    ),
+    (
+        CopyShortcut::CardCode,
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        egui::Key::C,
+        "CTRL+SHIFT+C",
+    ),
+    (
+        CopyShortcut::Cardholder,
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        egui::Key::A,
+        "CTRL+SHIFT+A",
     ),
 ];
 
@@ -1226,6 +1304,13 @@ fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
         CopyShortcut::Password => "Password",
         CopyShortcut::Totp => "One-time code",
         CopyShortcut::Url => "Website",
+        // The card's four, read off the very constants `card_rows` paints, so
+        // the row's label, the chord's name and the toast are one string in
+        // the strongest sense available: the same `const`.
+        CopyShortcut::CardNumber => NUMBER_LABEL,
+        CopyShortcut::CardExpiry => EXPIRY_LABEL,
+        CopyShortcut::CardCode => CODE_LABEL,
+        CopyShortcut::Cardholder => CARDHOLDER_LABEL,
     }
 }
 
@@ -1274,6 +1359,12 @@ fn pane_chords() -> Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)
             CopyShortcut::Password => ("copy Password", *modifiers, *key, *chord),
             CopyShortcut::Totp => ("copy One-time code", *modifiers, *key, *chord),
             CopyShortcut::Url => ("copy Website", *modifiers, *key, *chord),
+            CopyShortcut::CardNumber => ("copy a card's Number", *modifiers, *key, *chord),
+            CopyShortcut::CardExpiry => ("copy a card's Expires", *modifiers, *key, *chord),
+            CopyShortcut::CardCode => ("copy a card's Code", *modifiers, *key, *chord),
+            CopyShortcut::Cardholder => {
+                ("copy a card's Cardholder name", *modifiers, *key, *chord)
+            }
         })
         .collect();
     all.push(("open the matched app", OPEN_APP_CHORD.0, OPEN_APP_CHORD.1, OPEN_APP_CHORD.2));
@@ -1933,6 +2024,13 @@ fn copy_shortcut_action(
     // whenever that card is not on screen, so the chord and the row it
     // belongs to are gated by one expression (see `draw_detail_read`).
     website: &str,
+    // The card's displayed values, or `None` for an item that is not a card.
+    // **[`CardFields`] and never a `CardData`**, for the reason that type's
+    // own doc gives: it is the only producer of a card's displayed text, and
+    // what a chord copies must be what the row shows -- a number stored with
+    // stray whitespace displayed trimmed and copied untrimmed is a defect this
+    // pane has already had once.
+    card: Option<&CardFields>,
 ) -> Option<DetailAction> {
     match which {
         CopyShortcut::Username => (!username.is_empty()).then_some(DetailAction::CopyUsername),
@@ -1963,6 +2061,32 @@ fn copy_shortcut_action(
             }
             _ => None,
         },
+        // **Each gated on its own field being there**, which is this
+        // function's standing rule and not a card-specific nicety: a card
+        // carries at most five fields and routinely carries fewer, so a chord
+        // that fell back would put the wrong one on the clipboard, and one
+        // that copied an empty string would look like a failed paste.
+        //
+        // The number and the code go through the dedicated `Copy*` actions
+        // rather than `CopyValue`, because `DetailAction`'s doc reserves
+        // `CopyValue` for values the model does not wrap -- these two are
+        // `Zeroizing` on the item and the click path already honours that.
+        CopyShortcut::CardNumber => card
+            .and_then(|c| c.number.as_deref())
+            .filter(|v| row_offers_copy(v))
+            .map(|_| DetailAction::CopyCardNumber),
+        CopyShortcut::CardCode => card
+            .and_then(|c| c.code.as_deref())
+            .filter(|v| row_offers_copy(v))
+            .map(|_| DetailAction::CopyCardCode),
+        CopyShortcut::CardExpiry => card
+            .and_then(|c| c.expiry.as_deref())
+            .filter(|v| row_offers_copy(v))
+            .map(|v| DetailAction::CopyValue(v.to_string())),
+        CopyShortcut::Cardholder => card
+            .and_then(|c| c.cardholder.as_deref())
+            .filter(|v| row_offers_copy(v))
+            .map(|v| DetailAction::CopyValue(v.to_string())),
     }
 }
 
@@ -2877,7 +3001,14 @@ pub fn draw_detail_read(
 
     if matches!(action, DetailAction::None) {
         if let Some(which) = shortcut {
-            if let Some(copy) = copy_shortcut_action(which, username, password, totp, website) {
+            // The card's values are resolved here exactly as the CARD DETAILS
+            // card resolves them -- `item.card.as_ref().map(card_fields)` --
+            // so a chord and a click read one producer and cannot disagree
+            // about trimming or about which fields are there at all.
+            let card = item.card.as_ref().map(card_fields);
+            if let Some(copy) =
+                copy_shortcut_action(which, username, password, totp, website, card.as_ref())
+            {
                 action = copy;
                 // The same confirmation a click gets, named out of
                 // `copy_shortcut_label` -- which is also what the row for
@@ -5154,19 +5285,23 @@ fn digits_row(
     value: &str,
     action: &mut DetailAction,
     on_copy: DetailAction,
+    hint: Option<CopyShortcut>,
 ) {
     // Laid out unwrapped, which is the question being asked: how wide does
-    // this value WANT to be? No controls on this row, so nothing is owed to
-    // them.
+    // this value WANT to be? No controls on this row, so the only thing owed
+    // is the chord hint when there is one.
     let natural = ui.painter().layout_job(digits_job(value)).size().x;
-    let (shape, room) = digits_fit(ui, natural, 0.0);
+    let controls_width = hint.map_or(0.0, |which| {
+        CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
+    });
+    let (shape, room) = digits_fit(ui, natural, controls_width);
     copy_row(
         ui,
         label,
         |ui| paint_digits(ui, value, room),
         |_ui| {},
         on_copy,
-        None,
+        hint,
         row_offers_copy(value),
         action,
         shape,
@@ -5476,7 +5611,7 @@ fn card_rows(
             action,
             DetailAction::CopyCardNumber,
             MaskedFace {
-                hint: None,
+                hint: Some(CopyShortcut::CardNumber),
                 mask: Some(&masked),
                 // **Nothing at all for a brand this app cannot name**, and
                 // nothing for a named brand with no mark. Never a placeholder.
@@ -5497,12 +5632,7 @@ fn card_rows(
             // different length from its mask, and a line that fits the mask
             // and not the value would break the moment the eye is clicked.
             let code_run = if *revealed { *raw } else { mask.as_str() };
-            card_face_line_fits(
-                ui,
-                digits_width(ui, e),
-                digits_width(ui, code_run),
-                theme::EYE_TOGGLE_SIZE,
-            )
+            card_face_line_fits(ui, digits_width(ui, e), digits_width(ui, code_run))
         }
         _ => None,
     };
@@ -5524,7 +5654,14 @@ fn card_rows(
                 // and [`digits_job`] for why the expiry is not merely "the
                 // same size as" its neighbours but literally the same
                 // typography.
-                digits_row(ui, EXPIRY_LABEL, v, action, DetailAction::CopyValue(v.clone()));
+                digits_row(
+                    ui,
+                    EXPIRY_LABEL,
+                    v,
+                    action,
+                    DetailAction::CopyValue(v.clone()),
+                    Some(CopyShortcut::CardExpiry),
+                );
             }
             if let Some(v) = &code {
                 face = true;
@@ -5536,7 +5673,11 @@ fn card_rows(
                     &mut reveal.card_code,
                     action,
                     DetailAction::CopyCardCode,
-                    MaskedFace { hint: None, mask: Some(&masked), lead: None },
+                    MaskedFace {
+                        hint: Some(CopyShortcut::CardCode),
+                        mask: Some(&masked),
+                        lead: None,
+                    },
                 );
             }
         }
@@ -5550,7 +5691,14 @@ fn card_rows(
         if face {
             theme::row_rule(ui);
         }
-        credential_row(ui, CARDHOLDER_LABEL, v, None, action, DetailAction::CopyValue(v.clone()));
+        credential_row(
+            ui,
+            CARDHOLDER_LABEL,
+            v,
+            Some(CopyShortcut::Cardholder),
+            action,
+            DetailAction::CopyValue(v.clone()),
+        );
     }
 }
 
@@ -5597,18 +5745,31 @@ fn label_run_width(ui: &egui::Ui, label: &str) -> f32 {
 /// and a revealed security code beside a `Code` label and a Reveal eye does
 /// not always live inside that. The caller then draws the two rows separately,
 /// which is what this pane did for both of them before and still fits.
-fn card_face_line_fits(
-    ui: &egui::Ui,
-    expiry_natural: f32,
-    code_natural: f32,
-    code_controls: f32,
-) -> Option<(f32, f32)> {
+fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) -> Option<(f32, f32)> {
     let content = row_content_width(ui);
     let half = content / 2.0;
-    let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural;
-    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + CONTROL_GAP
-        + code_controls;
+    let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural + expiry_half_controls(ui);
+    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls(ui);
     (left <= half && right <= half).then_some((half, content - half))
+}
+
+/// What sits to the right of the expiry on the shared line: its chord hint,
+/// and the gap before it.
+///
+/// A function rather than a number at each site, because the width the fit
+/// test reserves and the width the paint subtracts have to be the same
+/// expression or the value wraps somewhere the line said it would not.
+fn expiry_half_controls(ui: &egui::Ui) -> f32 {
+    CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(CopyShortcut::CardExpiry))
+}
+
+/// The same for the security code: its Reveal eye, its chord hint, and the
+/// gaps. See [`expiry_half_controls`].
+fn code_half_controls(ui: &egui::Ui) -> f32 {
+    theme::EYE_TOGGLE_SIZE
+        + CONTROL_GAP
+        + chord_hint_width(ui, copy_shortcut_chord(CopyShortcut::CardCode))
+        + CONTROL_GAP
 }
 
 /// `Expires 08/29        Code •••` -- **one line, two hit areas.**
@@ -5633,13 +5794,9 @@ fn card_face_line(
     let (expiry, left_width) = expiry;
     let (code, right_width) = code;
     let (brand, action) = brand_and_action;
-    let left_room = (left_width - ROW_LABEL_WIDTH - ROW_GAP).max(1.0);
-    let right_room = (right_width
-        - label_run_width(ui, CODE_LABEL)
-        - ROW_GAP
-        - CONTROL_GAP
-        - theme::EYE_TOGGLE_SIZE)
-        .max(1.0);
+    let left_room = (left_width - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
+    let right_room =
+        (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls(ui)).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
@@ -5653,7 +5810,7 @@ fn card_face_line(
                         label: EXPIRY_LABEL,
                         width: left_width,
                         label_width: ROW_LABEL_WIDTH,
-                        hint: None,
+                        hint: Some(CopyShortcut::CardExpiry),
                     },
                     |ui| paint_digits(ui, expiry, left_room),
                     |_ui| {},
@@ -5666,7 +5823,7 @@ fn card_face_line(
                         label: CODE_LABEL,
                         width: right_width,
                         label_width: label_run_width(ui, CODE_LABEL),
-                        hint: None,
+                        hint: Some(CopyShortcut::CardCode),
                     },
                     |ui| paint_digits(ui, &shown, right_room),
                     |ui| {
@@ -9847,10 +10004,10 @@ mod tests {
     fn an_empty_field_is_refused_by_the_click_path_and_the_chord_path_alike() {
         for value in ["", " ", "hunter2"] {
             let chord_takes_username =
-                copy_shortcut_action(CopyShortcut::Username, value, "x", &TotpState::NoSecret, "")
+                copy_shortcut_action(CopyShortcut::Username, value, "x", &TotpState::NoSecret, "", None)
                     .is_some();
             let chord_takes_password =
-                copy_shortcut_action(CopyShortcut::Password, "x", value, &TotpState::NoSecret, "")
+                copy_shortcut_action(CopyShortcut::Password, "x", value, &TotpState::NoSecret, "", None)
                     .is_some();
             assert_eq!(
                 row_offers_copy(value),
@@ -9871,7 +10028,7 @@ mod tests {
             // draws, so a variant test cannot satisfy it.
             let live = TotpState::Code { code: value.to_string(), seconds_left: 17 };
             let chord_takes_totp =
-                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &live, "").is_some();
+                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &live, "", None).is_some();
             assert_eq!(
                 row_offers_copy(value),
                 chord_takes_totp,
@@ -9881,7 +10038,7 @@ mod tests {
             // one whose row already states the rule through the same
             // predicate.
             let chord_takes_url =
-                copy_shortcut_action(CopyShortcut::Url, "x", "x", &TotpState::NoSecret, value)
+                copy_shortcut_action(CopyShortcut::Url, "x", "x", &TotpState::NoSecret, value, None)
                     .is_some();
             assert_eq!(
                 row_offers_copy(value),
@@ -9900,7 +10057,7 @@ mod tests {
         // reading the code must not have thrown away.
         for state in [TotpState::NoSecret, TotpState::Fetching] {
             assert_eq!(
-                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &state, ""),
+                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &state, "", None),
                 None,
                 "CTRL+T reported a copy in {state:?}"
             );
@@ -9911,7 +10068,8 @@ mod tests {
                 "x",
                 "x",
                 &TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
-                ""
+                "",
+                None
             ),
             Some(DetailAction::CopyTotp),
             "CTRL+T refuses a code that really is on screen"
@@ -11454,19 +11612,19 @@ mod tests {
             seconds_left: 9,
         };
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Password, "u", "p", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Password, "u", "p", &code, "w", None),
             Some(DetailAction::CopyPassword)
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Username, "u", "p", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Username, "u", "p", &code, "w", None),
             Some(DetailAction::CopyUsername)
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Totp, "u", "p", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Totp, "u", "p", &code, "w", None),
             Some(DetailAction::CopyTotp)
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, "w", None),
             Some(DetailAction::CopyValue("w".to_string()))
         );
     }
@@ -11484,17 +11642,17 @@ mod tests {
             seconds_left: 9,
         };
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Username, "", "p", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Username, "", "p", &code, "w", None),
             None,
             "CTRL+U on an item with no username put something on the clipboard"
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Password, "u", "", &code, "w"),
+            copy_shortcut_action(CopyShortcut::Password, "u", "", &code, "w", None),
             None,
             "CTRL+B on an item with no password put something on the clipboard"
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, ""),
+            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, "", None),
             None,
             "CTRL+SHIFT+U on an item with no website put something on the clipboard"
         );
@@ -11505,7 +11663,7 @@ mod tests {
             TotpState::NoCodeReported,
         ] {
             assert_eq!(
-                copy_shortcut_action(CopyShortcut::Totp, "u", "p", &empty, "w"),
+                copy_shortcut_action(CopyShortcut::Totp, "u", "p", &empty, "w", None),
                 None,
                 "CTRL+T copied something while the TOTP state was {empty:?} -- there is \
                  no code to copy in it"
@@ -11803,6 +11961,142 @@ mod tests {
                 "CTRL+{} reported {:?}",
                 key.name(),
                 pressed.action
+            );
+        }
+    }
+
+    /// A `CTRL+SHIFT` chord, as [`ctrl`] is a plain `CTRL` one.
+    fn ctrl_shift(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        }]
+    }
+
+    /// **Each card chord copies its own field, through the pane and not only
+    /// through the pure function.**
+    ///
+    /// Four chords and four fields is four chances to cross a pair, and the
+    /// crossing that matters most is invisible from a single assertion: the
+    /// number and the code both go through a dedicated `Copy*` action, so a
+    /// `CardNumber` wired to `CopyCardCode` would still "copy something".
+    /// Every chord is therefore checked against the one action it may report.
+    #[test]
+    fn pressing_each_card_chord_asks_for_that_chords_copy() {
+        let item = a_full_card();
+        for (key, want) in [
+            (egui::Key::B, DetailAction::CopyCardNumber),
+            (egui::Key::C, DetailAction::CopyCardCode),
+            (egui::Key::E, DetailAction::CopyValue("04/23".to_string())),
+            (egui::Key::A, DetailAction::CopyValue("John Doe".to_string())),
+        ] {
+            let mut pane = Pane::new();
+            let idle = pane.idle(&item, &TotpState::NoSecret);
+            assert_eq!(
+                idle.action,
+                DetailAction::None,
+                "the pane reported an action on a frame with no input at all"
+            );
+            let pressed = pane.frame(&item, &TotpState::NoSecret, ctrl_shift(key));
+            assert_eq!(
+                pressed.action,
+                want,
+                "CTRL+SHIFT+{} reported {:?}",
+                key.name(),
+                pressed.action
+            );
+        }
+    }
+
+    /// **A card chord on a login copies nothing, and a login chord on a card
+    /// copies nothing.**
+    ///
+    /// The table is keyed by field role rather than by item kind, so nothing
+    /// about its shape stops `CTRL+SHIFT+B` reaching for a card's number on an
+    /// item that has no card at all -- the gate is `copy_shortcut_action`
+    /// refusing a field that is not there, and this is what holds it. The
+    /// login half is the mirror, and both are paired with the positive control
+    /// that the same harness and the same chords DO fire on the right kind,
+    /// without which either half passes against key events that never arrive.
+    #[test]
+    fn a_card_chord_is_silent_on_a_login_and_the_reverse() {
+        let login = a_login();
+        for key in [egui::Key::B, egui::Key::C, egui::Key::E, egui::Key::A] {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&login, &TotpState::NoSecret);
+            let pressed = pane.frame(&login, &TotpState::NoSecret, ctrl_shift(key));
+            assert_eq!(
+                pressed.action,
+                DetailAction::None,
+                "CTRL+SHIFT+{} on a login copied {:?}",
+                key.name(),
+                pressed.action
+            );
+        }
+        let card = a_full_card();
+        for key in [egui::Key::B, egui::Key::U, egui::Key::T] {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&card, &TotpState::NoSecret);
+            let pressed = pane.frame(&card, &TotpState::NoSecret, ctrl(key));
+            assert_eq!(
+                pressed.action,
+                DetailAction::None,
+                "CTRL+{} on a card copied {:?}",
+                key.name(),
+                pressed.action
+            );
+        }
+        // The controls, both ways round.
+        let mut pane = Pane::new();
+        let _ = pane.idle(&card, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&card, &TotpState::NoSecret, ctrl_shift(egui::Key::B)).action,
+            DetailAction::CopyCardNumber,
+            "the card chords do not fire on a card either, so the silence above proves nothing"
+        );
+        let mut pane = Pane::new();
+        let _ = pane.idle(&login, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&login, &TotpState::NoSecret, ctrl(egui::Key::B)).action,
+            DetailAction::CopyPassword,
+            "the login chords do not fire on a login either, so the silence above proves nothing"
+        );
+    }
+
+    /// **A card's every chord is advertised on the row it belongs to.**
+    ///
+    /// A binding nothing names is a binding nobody finds, which is the rule
+    /// the login rows already keep
+    /// ([`every_chord_is_painted_beside_its_row_and_last_on_the_line`]). The
+    /// row labels are the positive control: "no CTRL+SHIFT+C anywhere" is also
+    /// true of a pane that failed to draw the card at all.
+    #[test]
+    fn every_card_chord_is_painted_beside_its_row() {
+        let mut pane = Pane::new();
+        let frame = pane.idle(&a_full_card(), &TotpState::NoSecret);
+        for label in [NUMBER_LABEL, EXPIRY_LABEL, CODE_LABEL, CARDHOLDER_LABEL] {
+            assert!(
+                frame.painted(label),
+                "the {label:?} row is not on this pane at all, so finding no chord on it \
+                 proves nothing; the pane painted: {:?}",
+                frame.strings()
+            );
+        }
+        for which in [
+            CopyShortcut::CardNumber,
+            CopyShortcut::CardExpiry,
+            CopyShortcut::CardCode,
+            CopyShortcut::Cardholder,
+        ] {
+            let chord = copy_shortcut_chord(which);
+            assert!(
+                frame.painted(chord),
+                "{which:?}'s {chord} hint is not painted beside its row; the pane \
+                 painted: {:?}",
+                frame.strings()
             );
         }
     }
