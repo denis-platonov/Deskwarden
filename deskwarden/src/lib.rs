@@ -28,6 +28,7 @@ pub mod bw_path;
 pub mod bw_serve;
 pub mod card_brand;
 pub mod card_mark;
+pub mod clipboard;
 pub mod dispatch;
 pub mod favicon;
 pub mod file_picker;

@@ -124,7 +124,7 @@ impl eframe::App for PreflightApp {
                 // The clipboard is the one place this value is allowed to go,
                 // and it goes there because the user asked for it in
                 // preference to typing.
-                ctx.copy_text(self.copy_payload.to_string());
+                crate::clipboard::copy_secret(&self.copy_payload);
             }
             *self.answer.borrow_mut() = Some(action);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

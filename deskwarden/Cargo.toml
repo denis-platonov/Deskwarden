@@ -57,6 +57,20 @@ windows = { version = "0.58", features = [
     # versioned install directory of a Microsoft Store (MSIX) package whose
     # stored path has expired (src/app_identity.rs).
     "Win32_System_Registry",
+    # OpenClipboard/EmptyClipboard/SetClipboardData/RegisterClipboardFormatW
+    # and GetClipboardSequenceNumber (src/clipboard.rs). This app sets the
+    # clipboard through raw Win32 rather than through eframe's convenience
+    # copy because the suppression formats that keep a copied password out of
+    # Win+V history and off the user's other devices have to go on in the
+    # SAME clipboard operation as the text, and no convenience API exposes
+    # that.
+    "Win32_System_DataExchange",
+    # GlobalAlloc/GlobalLock/GlobalUnlock/GlobalFree: SetClipboardData takes
+    # ownership of a GMEM_MOVEABLE block, so the payload cannot be an
+    # ordinary Rust allocation.
+    "Win32_System_Memory",
+    # CF_UNICODETEXT and the CLIPBOARD_FORMAT newtype it is expressed in.
+    "Win32_System_Ole",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -2004,12 +2004,19 @@ mod tests {
         let manifest = manifest_raw.replace("\r\n", "\n");
         assert_eq!(
             (manifest.len(), fnv1a64(&manifest)),
-            // Re-pinned deliberately: `argon2 = "0.5"` was added, from
-            // crates.io, for the passphrase seal over a record's TOTP seed
-            // (`record/seal.rs`). No section was re-pointed and no path or
-            // fork was introduced; `[build-dependencies]` still reads exactly
-            // `winresource = "0.1"`.
-            (5525, 0xc437_c18a_eda2_ff85_u64),
+            // Re-pinned deliberately: three FEATURES were added to the
+            // `windows` dependency that was already here --
+            // `Win32_System_DataExchange`, `Win32_System_Memory` and
+            // `Win32_System_Ole` -- for `src/clipboard.rs`, which sets the
+            // clipboard through raw Win32 so a copied password can carry the
+            // formats that keep it out of `Win+V` history and off the user's
+            // other devices. **No dependency moved**: no name was added or
+            // removed, no section was re-pointed, no path or fork was
+            // introduced, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. The pin is over the whole file, so a
+            // feature list is inside it -- which is right, since turning a
+            // feature on is also a way to pull new code into the build.
+            (6328, 0xf4d9_e216_7ff5_b9d7_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

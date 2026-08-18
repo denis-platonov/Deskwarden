@@ -956,7 +956,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 40] = [
+        const OPENS_NO_WINDOW: [&str; 41] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -984,6 +984,11 @@ mod tests {
             // secret derives `Debug`. Like `below_cut` it is `#[cfg(test)]`
             // at its declaration and draws nothing.
             "debug_leak_guard",
+            // Puts a copied secret on the Windows clipboard through raw Win32
+            // and decides when to take it back off again. It talks to the
+            // system clipboard, which is not a window: it opens nothing,
+            // paints nothing, and has no title for `raise_window` to match.
+            "clipboard",
             "dispatch",
             "favicon",
             // **Judgement call, recorded rather than assumed.** It puts the

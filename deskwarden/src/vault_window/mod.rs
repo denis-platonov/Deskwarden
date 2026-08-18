@@ -2375,12 +2375,12 @@ pub fn build_frame(
                     // the detail pane's own Copy buttons.
                     item_list::RowCommand::CopyUsername => {
                         if let Some(username) = login.and_then(|l| l.username.as_deref()) {
-                            ui.ctx().copy_text(username.to_string());
+                            crate::clipboard::copy_secret(username);
                         }
                     }
                     item_list::RowCommand::CopyPassword => {
                         if let Some(password) = login.and_then(|l| l.password.as_deref()) {
-                            ui.ctx().copy_text(password.to_string());
+                            crate::clipboard::copy_secret(password);
                         }
                     }
                     // Read out of the SAME `TotpState` the detail pane
@@ -2395,7 +2395,7 @@ pub fn build_frame(
                     // this says so in the log rather than putting a stale or
                     // empty one on the clipboard.
                     item_list::RowCommand::CopyTotp => match &totp_state {
-                        TotpState::Code { code, .. } => ui.ctx().copy_text(code.clone()),
+                        TotpState::Code { code, .. } => crate::clipboard::copy_secret(code),
                         TotpState::NoSecret
                         | TotpState::Fetching
                         | TotpState::NoCodeReported
@@ -2975,12 +2975,12 @@ pub fn build_frame(
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
                                 DetailAction::CopyUsername => {
                                     if let Some(username) = login.and_then(|l| l.username.as_deref()) {
-                                        ui.ctx().copy_text(username.to_string());
+                                        crate::clipboard::copy_secret(username);
                                     }
                                 }
                                 DetailAction::CopyPassword => {
                                     if let Some(password) = login.and_then(|l| l.password.as_deref()) {
-                                        ui.ctx().copy_text(password.to_string());
+                                        crate::clipboard::copy_secret(password);
                                     }
                                 }
                                 // The two card secrets are looked up from the
@@ -3005,12 +3005,12 @@ pub fn build_frame(
                                     if let Some(number) =
                                         item.card.as_ref().and_then(|c| detail::card_fields(c).number)
                                     {
-                                        ui.ctx().copy_text(number);
+                                        crate::clipboard::copy_secret(&number);
                                     }
                                 }
                                 DetailAction::CopyCardCode => {
                                     if let Some(code) = item.card.as_ref().and_then(|c| detail::card_fields(c).code) {
-                                        ui.ctx().copy_text(code);
+                                        crate::clipboard::copy_secret(&code);
                                     }
                                 }
                                 // The SSH private key, read back off the item
@@ -3024,7 +3024,7 @@ pub fn build_frame(
                                         .as_ref()
                                         .and_then(|s| detail::ssh_key_fields(s).private_key)
                                     {
-                                        ui.ctx().copy_text(key);
+                                        crate::clipboard::copy_secret(&key);
                                     }
                                 }
                                 // A non-secret row (the card's cardholder
@@ -3032,7 +3032,7 @@ pub fn build_frame(
                                 // field) hands its own already-rendered value
                                 // back -- see `DetailAction::CopyValue`.
                                 DetailAction::CopyValue(value) => {
-                                    ui.ctx().copy_text(value);
+                                    crate::clipboard::copy_secret(&value);
                                 }
                                 DetailAction::CopyTotp => {
                                     // Only `Code` has anything to copy --
@@ -3044,7 +3044,7 @@ pub fn build_frame(
                                     // than assuming the button state and the
                                     // action handler can never drift apart).
                                     if let TotpState::Code { code, .. } = &totp_state {
-                                        ui.ctx().copy_text(code.clone());
+                                        crate::clipboard::copy_secret(code);
                                     }
                                 }
                                 // **The SEED, not the code -- and the bare
@@ -3079,7 +3079,7 @@ pub fn build_frame(
                                 // that cannot reach a clipboard at all.
                                 DetailAction::CopyTotpSecret => {
                                     if let Some(key) = detail::totp_secret_clipboard_text(item) {
-                                        ui.ctx().copy_text(key.to_string());
+                                        crate::clipboard::copy_secret(&key);
                                     }
                                 }
                                 DetailAction::OpenWebsite(url) => {
@@ -3158,7 +3158,7 @@ pub fn build_frame(
                                 // copy living for the frame. Resolve it here.
                                 DetailAction::CopyPasswordHistory(index) => {
                                     match crate::vault_bridge::password_history(item).get(index) {
-                                        Some(entry) => ui.ctx().copy_text(entry.password.to_string()),
+                                        Some(entry) => crate::clipboard::copy_secret(&entry.password),
                                         None => log::warn!(
                                             "copy requested for history row {index}, which no \
                                              longer exists on this item"
@@ -5990,6 +5990,20 @@ fn apply_send_action(
         // action itself -- there is no second lookup here that could resolve
         // to a different row. `copy_text` takes an owned `String`, which is
         // why the action owns one.
+        //
+        // **Deliberately NOT `clipboard::copy_secret`, and this is a
+        // judgement call rather than an oversight.** Every vault secret --
+        // password, card number, security code, SSH key, TOTP -- goes through
+        // that path so Windows is asked to keep it out of `Win+V` history and
+        // off the user's other devices. A Send link is the one copied value
+        // whose whole purpose is to be handed to somebody else, normally by
+        // pasting it into a chat window; it is leaving the machine by the
+        // user's own intent and it expires on its own. Suppressing its history
+        // entry would buy very little, and it would cost the end-to-end
+        // coverage in `the_sends_screen_works_in_every_state_the_user_can_reach`,
+        // which drives a real frame and reads the link back out of egui's
+        // clipboard -- the raw Win32 path is unobservable to a test by design,
+        // because no test in this crate may touch the real clipboard.
         send_ui::SendUiAction::CopyLink(url) => ctx.copy_text(url),
         // Refresh and a dismissed band are the same operation: forget the
         // answer, so `wants_fetch` is true on the next frame and the list is
