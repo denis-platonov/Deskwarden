@@ -2011,8 +2011,8 @@ mod tests {
         let manifest = manifest_raw.replace("\r\n", "\n");
         assert_eq!(
             (manifest.len(), fnv1a64(&manifest)),
-            // Re-pinned for the 0.8.0 version bump: `version = "0.7.0"`
-            // became `"0.8.0"`, which is the same LENGTH -- so 6328 is
+            // Re-pinned for the 0.8.1 version bump: `version = "0.8.0"`
+            // became `"0.8.1"`, which is the same LENGTH -- so 6328 is
             // unchanged and only the digest moves. No dependency was added,
             // removed, re-pointed or re-featured by this commit.
             //
@@ -2028,7 +2028,7 @@ mod tests {
             // `winresource = "0.1"`. The pin is over the whole file, so a
             // feature list is inside it -- which is right, since turning a
             // feature on is also a way to pull new code into the build.
-            (6328, 0xa527_6ff9_0276_0ede_u64),
+            (6328, 0x32ba_5668_4ad3_7725_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
