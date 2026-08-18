@@ -3103,7 +3103,7 @@ mod drawn_icon_family_tests {
     /// star they should.
     #[test]
     fn the_envelope_flap_is_not_findable_as_a_star_fill() {
-        let (_, envelope_marks) = control(|ui| send_record_button(ui));
+        let (_, envelope_marks) = control(send_record_button);
         let envelope_tree = egui::Shape::Vec(envelope_marks);
         assert_eq!(
             icon_probe::envelopes(&envelope_tree).len(),
@@ -3145,7 +3145,7 @@ mod drawn_icon_family_tests {
     /// comparison could only restate what this file already says.
     #[test]
     fn the_drawn_close_marks_do_not_share_an_extent() {
-        let (_, pane_marks) = control(|ui| close_pane_button(ui));
+        let (_, pane_marks) = control(close_pane_button);
         let pane_tree = egui::Shape::Vec(pane_marks);
         let found = icon_probe::pane_close_marks(&pane_tree);
         assert_eq!(
@@ -3154,7 +3154,7 @@ mod drawn_icon_family_tests {
             "`close_pane_button` painted no ✕ its own probe can find"
         );
 
-        let (_, dismiss_marks) = control(|ui| close_glyph(ui));
+        let (_, dismiss_marks) = control(close_glyph);
         let dismiss_tree = egui::Shape::Vec(dismiss_marks);
         // The positive control: the dismiss ✕ really is two segments, so
         // "the probe found none of them" is a statement about the extent and
