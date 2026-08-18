@@ -1386,6 +1386,38 @@ const PANE_CLOSE_ARM: f32 = 5.5;
 /// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
 const EYE_PUPIL_RADIUS: f32 = 2.4;
 
+/// The clock face of [`add_totp_button`], as a radius.
+///
+/// **Deliberately none of the other three ring radii in this app.**
+/// [`icon_probe::tune_icons`] matches [`TUNE_KNOB_RADIUS`],
+/// [`icon_probe::kebab_dots`] matches [`KEBAB_DOT_RADIUS`] and the eye's
+/// pupil is [`EYE_PUPIL_RADIUS`]; every one of those is walked out of the
+/// same shape tree this mark is painted into, and a ring that shared a radius
+/// with any of them would be counted as one of that family in every frame the
+/// detail header is drawn in. [`the_drawn_ring_radii_are_all_different`] is
+/// the live guard, and it is the reason this is 8.5 rather than a rounder
+/// number that happened to collide.
+///
+/// 8.5 also puts the face at 17px across, inside the 34px header button and
+/// at the same optical extent as the star's 18 and the envelope's 18.
+const CLOCK_RADIUS: f32 = 8.5;
+
+/// The clock's two hands, as lengths from its centre. The short one points
+/// straight up and the long one to the right -- three o'clock, the reading
+/// that gives the two hands the largest angle a clock face can show, so
+/// neither is hidden under the other at 17px.
+///
+/// **Axis-aligned deliberately**, and not merely for legibility:
+/// [`icon_probe::pane_close_marks`] finds a ✕ by walking every
+/// [`egui::Shape::LineSegment`] whose bounding box is square at
+/// `PANE_CLOSE_ARM * 2`, and this mark is painted into the same strip as that
+/// ✕. A hand on a diagonal has a square bounding box of its own and would be
+/// reported as half a close mark -- which that probe treats as a probe that
+/// has stopped matching, and panics over. A vertical hand's box is zero wide
+/// and a horizontal one's is zero tall, so neither can ever be square.
+const CLOCK_HOUR_HAND: f32 = 4.5;
+const CLOCK_MINUTE_HAND: f32 = 6.0;
+
 /// Slider rows in the Preferences "tune" mark. **Two, where Material
 /// Symbols' own `tune` draws three.**
 ///
@@ -1678,6 +1710,58 @@ pub fn close_pane_button(ui: &mut Ui) -> Response {
     let painter = ui.painter();
     painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
     painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
+    response
+}
+
+/// The detail header's **"Add a one-time code"** control: a clock face,
+/// showing three o'clock.
+///
+/// It sits between the ✉ and the kebab, and it is in this strip for exactly
+/// the reason the ✉ is -- see [`send_record_button`], where the user's
+/// rejection of a titlebar pill *for acting on the selected item* is quoted.
+/// Adding a code acts on the selected item too, so the same argument puts it
+/// in the same strip. The kebab is what it is drawn against: what it opens is
+/// a form that writes a field onto this item, which is the kebab's Edit's
+/// neighbourhood, and it is the one control here that is not drawn for every
+/// item (see `detail::header_controls`).
+///
+/// Square at [`HEADER_BUTTON_HEIGHT`] like the rest of the strip, so all five
+/// controls have the same hit target rather than each being as big as its own
+/// mark.
+///
+/// **A CLOCK, and drawn rather than typed -- with the measurement taken
+/// rather than assumed.** The four obvious codepoints were put to `has_glyph`
+/// against the app's real font stack, and they split exactly the way the
+/// folder's four did: U+23F2 ⏲, U+231A ⌚, U+1F550 🕐 and U+1F551 🕑 resolve
+/// nowhere at all, while **U+23F1 ⏱ DOES resolve -- at ★'s own advance, out
+/// of egui's bundled emoji fallback.** That second answer is the dangerous
+/// one, because it is the one that would have shipped: a `true` from
+/// `has_glyph` is not a licence to type a mark, since the face answering may
+/// be one nobody here chose, at a weight nobody here set. See
+/// [`the_clock_codepoints_are_not_carried_by_this_apps_own_typeface`], which
+/// records both halves, and [`folder_mark`], where the same trap was found.
+///
+/// The hover ink is [`send_record_button`]'s and not [`star_toggle`]'s: this
+/// is an action, and the star's fainter resting grey is the colour of a
+/// toggle that is OFF.
+pub fn add_totp_button(ui: &mut Ui) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    let stroke = Stroke::new(ICON_STROKE, color);
+    let c = rect.center();
+    let painter = ui.painter();
+    // The face. A stroked ring at [`CLOCK_RADIUS`] -- a radius nothing else
+    // in this crate strokes, which is what keeps `icon_probe`'s three other
+    // ring probes from counting it.
+    painter.circle_stroke(c, CLOCK_RADIUS, stroke);
+    // The hands, both on an axis -- see [`CLOCK_HOUR_HAND`] for why that is
+    // load-bearing and not a drawing preference.
+    painter.line_segment([c, c + Vec2::new(0.0, -CLOCK_HOUR_HAND)], stroke);
+    painter.line_segment([c, c + Vec2::new(CLOCK_MINUTE_HAND, 0.0)], stroke);
     response
 }
 
@@ -2980,6 +3064,97 @@ mod tests {
         );
     }
 
+    /// **The same measurement, for the clock**, and it came back split the
+    /// same way the folder's did -- which is why [`add_totp_button`] strokes
+    /// an outline instead of setting a codepoint.
+    ///
+    /// * **U+23F2 ⏲, U+231A ⌚, U+1F550 🕐 and U+1F551 🕑 do not resolve at
+    ///   all.** As text they are tofu boxes in the detail header of every
+    ///   login, and their advance is the replacement box's -- neither the
+    ///   app's own letters' nor the emoji face's.
+    /// * **U+23F1 ⏱ DOES resolve**, out of egui's bundled emoji fallback, at
+    ///   exactly ★'s advance. That is the tell, and it is the same tell
+    ///   [`the_folder_codepoints_are_not_carried_by_this_apps_own_typeface`]
+    ///   caught: a face nobody here chose, laying out a stopwatch and an
+    ///   unrelated star to one identical em.
+    ///
+    /// **The second answer is the whole point of this test.** `has_glyph`
+    /// returning `true` is not a licence to type a mark -- it says only that
+    /// *something* in the stack will draw it -- and ⏱ is what would have
+    /// shipped had the question stopped there: a 34px header control set at
+    /// the emoji fallback's own weight and optical size, beside four marks
+    /// measured from the design.
+    #[test]
+    fn the_clock_codepoints_are_not_carried_by_this_apps_own_typeface() {
+        let ctx = ctx_with_fonts();
+        // 13pt, the size a header control's glyph would have been set at --
+        // a measurement taken at a size this mark is never drawn at would be
+        // a measurement of something else.
+        let font = FontId::new(13.0, FontFamily::Proportional);
+        let width = |s: &str| {
+            ctx.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), INK))
+                .size()
+                .x
+        };
+
+        for absent in ['\u{23F2}', '\u{231A}', '\u{1F550}', '\u{1F551}'] {
+            assert!(
+                !ctx.fonts_mut(|f| f.has_glyph(&font, absent)),
+                "U+{:04X} now resolves; it was recorded as a tofu box in this app's own \
+                 stack, which is half the case for drawing the clock",
+                absent as u32
+            );
+        }
+        // The positive control for those four: `has_glyph` is not simply
+        // answering "no" to everything, and the fonts really did load. The
+        // same control every sibling measurement in this file carries.
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font, 'A')),
+            "the font set resolves no 'A' either, so the assertions above prove nothing"
+        );
+        // And the one that DOES resolve, recorded rather than glossed -- the
+        // reason this mark is drawn is not "no clock codepoint exists".
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font, '\u{23F1}')),
+            "U+23F1 no longer resolves; it did when the clock was drawn, and that -- not \
+             its absence -- is what this test records"
+        );
+        // Out of the EMOJI fallback, which is the whole objection. ★ is
+        // already known to come from there (see the star's own test), and a
+        // proportional text face does not give a star and a stopwatch one
+        // identical advance.
+        assert_eq!(
+            width("\u{23F1}"),
+            width("\u{2605}"),
+            "⏱ no longer advances like ★, so it may now come from a real text face -- \
+             re-measure before trusting the drawn mark's justification"
+        );
+        // The four that do not resolve share the REPLACEMENT box's advance,
+        // and it is not the emoji face's: this is the measurement agreeing
+        // with `has_glyph` rather than merely being asked alongside it.
+        assert_eq!(
+            width("\u{23F2}"),
+            width("\u{1F550}"),
+            "⏲ and 🕐 no longer share one advance, so at least one of them is now a real \
+             glyph rather than the replacement box"
+        );
+        assert_ne!(
+            width("\u{23F2}"),
+            width("\u{2605}"),
+            "⏲ now advances like ★, which DOES resolve -- so the two groups this test \
+             separates have collapsed into one"
+        );
+        // The positive control for those advance arguments, the same one the
+        // sibling tests use: this stack really does measure a proportional
+        // face proportionally, so equal advances mean something.
+        assert_ne!(
+            width("A"),
+            width("W"),
+            "'A' and 'W' advance identically, so the equal-advance argument above is \
+             about the measurement, not about the face"
+        );
+    }
+
     /// The design renders the Lock pill's shortcut in `ui-monospace`, a
     /// visibly different face from the "Lock" label beside it. Asserting
     /// "the code passes `FontFamily::Monospace`" would only restate the
@@ -3282,6 +3457,108 @@ mod drawn_icon_family_tests {
         (rect, marks)
     }
 
+    /// [`control`], **with the pointer resting on the mark** -- the only way
+    /// a control whose entire visible state is its stroke colour can be seen
+    /// in its hovered state at all.
+    ///
+    /// The control is laid out first with no pointer, so its rect is known,
+    /// and only then is the pointer moved onto that rect: egui resolves
+    /// hovering against the widget rects of the frame BEFORE, so a pointer
+    /// supplied in the same frame the widget first appears in hovers nothing.
+    /// Two frames are then run with the pointer held, and the second is the
+    /// one measured -- an arrangement whose failure mode is a test that
+    /// cannot see the hover and therefore FAILS, rather than one that quietly
+    /// measures the resting state and passes.
+    fn hovered_control(mut draw: impl FnMut(&mut Ui) -> Response) -> (Rect, Vec<egui::Shape>) {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
+        let rect = std::cell::Cell::new(Rect::NOTHING);
+        let mut run = |pointer: Option<Pos2>| -> Vec<egui::Shape> {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| rect.set(draw(ui).rect));
+            });
+            output.shapes.into_iter().map(|c| c.shape).collect()
+        };
+        // The same styling dance [`frame`] does, and for the same reason.
+        let _ = run(None);
+        apply(&ctx);
+        let _ = run(None);
+        let at = rect.get().center();
+        let _ = run(Some(at));
+        let shapes = run(Some(at));
+        let rect = rect.get();
+        let marks = marks_in(&shapes, rect);
+        (rect, marks)
+    }
+
+    /// **The clock is one findable mark, and its hands cannot be mistaken for
+    /// a ✕.**
+    ///
+    /// Both halves are measured off what the control actually paints. The
+    /// first is what every `detail.rs` guard over this control depends on;
+    /// the second is the reason [`CLOCK_HOUR_HAND`]'s doc calls the axis
+    /// alignment load-bearing -- [`icon_probe::pane_close_marks`] *panics* on
+    /// an odd number of arms, so a diagonal hand would not merely miscount,
+    /// it would take down every test that renders the detail header.
+    #[test]
+    fn the_one_time_code_clock_is_one_ring_and_no_close_arms() {
+        let (_, marks) = control(add_totp_button);
+        let tree = egui::Shape::Vec(marks);
+        assert_eq!(
+            icon_probe::clocks(&tree).len(),
+            1,
+            "`add_totp_button` painted no clock face its own probe can find"
+        );
+        // The positive control for the ✕ assertion below: the hands really
+        // were painted, so "no close arms" is a statement about their shape
+        // and not about an empty frame.
+        assert_eq!(
+            icon_probe::line_segments(&tree).len(),
+            2,
+            "the clock painted no two hands, so the assertion below proves nothing"
+        );
+        assert!(
+            icon_probe::pane_close_marks(&tree).is_empty(),
+            "a clock hand is being reported as an arm of the detail pane's close ✕"
+        );
+        // And it is none of the other three ring families either -- the
+        // radius guard says the numbers differ, this says the probes agree.
+        assert!(
+            icon_probe::kebab_dots(&tree).is_empty()
+                && icon_probe::tune_icons(&tree).is_empty()
+                && icon_probe::eyes(&tree).is_empty(),
+            "the clock's face is being counted as a kebab dot, a tune knob or an eye"
+        );
+    }
+
+    /// **It darkens on hover, like the ✉ beside it.** Read off the PAINTED
+    /// stroke colour: a constant comparison would only restate that the
+    /// source says so, and this control's entire visible state is that
+    /// colour -- it paints no fill and no string.
+    #[test]
+    fn the_one_time_code_clock_darkens_on_hover() {
+        let (_, resting) = control(add_totp_button);
+        let resting = icon_probe::clocks(&egui::Shape::Vec(resting));
+        assert_eq!(resting.len(), 1, "no clock was painted at rest");
+        assert_eq!(
+            resting[0].1, TEXT_SECONDARY,
+            "the clock rests at {:?}, not the kebab's own resting grey",
+            resting[0].1
+        );
+        let (_, hovered) = hovered_control(add_totp_button);
+        let hovered = icon_probe::clocks(&egui::Shape::Vec(hovered));
+        assert_eq!(hovered.len(), 1, "no clock was painted while hovered");
+        assert_eq!(
+            hovered[0].1, INK,
+            "the clock did not darken to INK on hover, so the control looks inert"
+        );
+    }
+
     /// **The constraint that decides these outlines' vertex counts**, and it
     /// is not decorative: [`icon_probe`] identifies them by point count
     /// ALONE, so two of them sharing a count makes each findable as the
@@ -3404,20 +3681,42 @@ mod drawn_icon_family_tests {
     /// [`TUNE_KNOB_RADIUS`], and the eye's pupil must be neither. Two of them
     /// sharing a radius would report the tune icon's knobs as stray kebab
     /// dots in every frame the vault titlebar is painted in.
+    ///
+    /// **Every pair, generated rather than written out**: the list used to be
+    /// three hand-written rows over three radii, and adding
+    /// [`CLOCK_RADIUS`] to it would have meant three more rows written by
+    /// hand -- with the one that was forgotten being exactly the collision
+    /// nobody would notice. The pairs come off the list of radii now, so a
+    /// fifth ring adds one entry and is compared against all four.
     #[test]
     fn the_drawn_circles_do_not_share_a_radius() {
-        for (a, a_name, b, b_name) in [
-            (TUNE_KNOB_RADIUS, "the tune knob", KEBAB_DOT_RADIUS, "the kebab dot"),
-            (TUNE_KNOB_RADIUS, "the tune knob", EYE_PUPIL_RADIUS, "the eye's pupil"),
-            (KEBAB_DOT_RADIUS, "the kebab dot", EYE_PUPIL_RADIUS, "the eye's pupil"),
-        ] {
-            assert!(
-                (a - b).abs() > 0.01,
-                "{a_name} and {b_name} are both radius {a}, and `icon_probe` tells these \
-                 circles apart by radius alone -- so each is now findable as the other and \
-                 every probe over them is reporting the wrong mark"
-            );
+        let radii = [
+            (TUNE_KNOB_RADIUS, "the tune knob"),
+            (KEBAB_DOT_RADIUS, "the kebab dot"),
+            (EYE_PUPIL_RADIUS, "the eye's pupil"),
+            (CLOCK_RADIUS, "the one-time code clock's face"),
+        ];
+        // The premise, stated so this cannot pass by comparing an empty set:
+        // every radius above is really in the list, and the loop below really
+        // does run over all of their pairs.
+        let mut compared = 0;
+        for (i, (a, a_name)) in radii.iter().enumerate() {
+            for (b, b_name) in &radii[i + 1..] {
+                compared += 1;
+                assert!(
+                    (a - b).abs() > 0.01,
+                    "{a_name} and {b_name} are both radius {a}, and `icon_probe` tells these \
+                     circles apart by radius alone -- so each is now findable as the other and \
+                     every probe over them is reporting the wrong mark"
+                );
+            }
         }
+        assert_eq!(
+            compared,
+            radii.len() * (radii.len() - 1) / 2,
+            "the loop did not compare every pair of radii, so a collision could hide in the \
+             pair it skipped"
+        );
     }
 
     /// **The tune icon is stroked at the weight its neighbours are.** Read
@@ -4004,6 +4303,25 @@ pub mod icon_probe {
             }
             _ => {}
         }
+    }
+
+    /// The "Add a one-time code" clock faces this shape tree paints, each as
+    /// its ring's bounding box and the colour it was stroked in -- which is
+    /// the only way `add_totp_button`'s hover state is visible to a test,
+    /// since it paints no fill and no string.
+    ///
+    /// **Found by its FACE alone**, matched on [`CLOCK_RADIUS`], and that is
+    /// why that number is not shared with the app's other three ring radii:
+    /// this walks the same shape tree [`kebab_dots`], [`tune_icons`] and
+    /// [`eyes`] walk, and the detail header paints a kebab in every frame
+    /// this mark appears in. The hands are deliberately NOT part of the
+    /// identification -- they are axis-aligned segments, which the tune
+    /// icon's own lines and the titlebar's — also draw -- so retuning a hand
+    /// cannot make the control invisible here.
+    pub fn clocks(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        walk_rings(shape, CLOCK_RADIUS, &mut out);
+        out
     }
 
     /// The Preferences tune icons this shape tree paints, each as the union
