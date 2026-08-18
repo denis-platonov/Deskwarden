@@ -5083,7 +5083,7 @@ fn half_tile(
     on_copy: DetailAction,
     action: &mut DetailAction,
 ) {
-    let Half { label, width, label_width, hint, trailing } = half;
+    let Half { label, width, label_width, hint, prints_chord, trailing } = half;
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
         // The TILE is `width` -- the hover tint and the hit area both come
         // from this -- while its CONTENTS stop `trailing` short of the far
@@ -5100,32 +5100,43 @@ fn half_tile(
                 value(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = CONTROL_GAP;
-                    // **No printed chord here, unlike every full-width row on
-                    // this pane.** `hint` is still read -- it is what names
-                    // the chord in this tile's tooltip, through
-                    // [`copy_row_tooltip`] below -- but the twelve monospace
-                    // characters are not painted on the line.
+                    // **The printed chord, on the half that is [`Half::prints
+                    // _chord`] and not on the other.** Added FIRST, so it is
+                    // rightmost -- the ordering [`copy_row`] argues for and
+                    // applies to every full-width row on this pane.
                     //
-                    // The user, of the shared line: "Expires and Code on the
-                    // same line are too close". The gap between the two halves
-                    // grows with the pane now, but at the shipped 638pt width
-                    // it afforded only 12pt, and the reason was visible in the
-                    // rendered `detail_card.png`: `CTRL+SHIFT+E` was printed
-                    // between the expiry's value and the word `Code`. The
-                    // chord hints are the longest runs on this line, and this
-                    // line has the least room of any on the pane.
+                    // The user, of this line: "Expires and Code on the same
+                    // line are too close and when stretch -- only code does
+                    // it". What was in the way was the EXPIRY's chord: at the
+                    // shipped 638pt width the rendered `detail_card.png`
+                    // showed `CTRL+SHIFT+E` printed between the expiry's value
+                    // and the word `Code`, in a gutter that afforded 12pt. The
+                    // left half still prints nothing, and that gutter is still
+                    // the whole of the repair.
                     //
-                    // **Only here.** A full-width row keeps its printed hint:
-                    // it has the room, and a printed chord is real
-                    // discoverability that a tooltip does not give a user who
-                    // never hovers. What the header controls did -- move the
-                    // chord into the tooltip -- is done here for the reason
-                    // they did it, on the one line that cannot afford it.
+                    // **The right half's chord was never in that gutter**, and
+                    // it is printed again. It sits at the far edge of the
+                    // line, in the card's own padding lane, with nothing to
+                    // its right and nothing between it and the pane's rim -- a
+                    // full-width row's position exactly. It came off this line
+                    // as collateral when both were dropped together, and it
+                    // cost two things: the discoverability a printed chord
+                    // gives a user who never hovers, which this file argues
+                    // for one row up; and the COLUMN, because the eye that had
+                    // been inset by a chord's width now packed to the padding
+                    // and stopped lining up with the `Number` row's eye
+                    // directly above it. Reserving that width invisibly would
+                    // have been the "second, invisible indent" this file
+                    // refuses one row over. Printing the chord that belongs
+                    // there fills it with ink that says something.
                     //
-                    // The chords themselves are untouched: `copy_shortcut_action`
-                    // still answers CTRL+SHIFT+E and CTRL+SHIFT+C, and
-                    // `the_shared_lines_chords_still_copy_without_their_printed_hints`
-                    // is what stops this becoming a silent feature removal.
+                    // `hint` is what names the chord in this tile's tooltip
+                    // too, through [`copy_row_tooltip`] below -- so the left
+                    // half, which prints nothing, still tells its chord on
+                    // hover.
+                    if prints_chord {
+                        shortcut_hint(ui, hint);
+                    }
                     controls(ui);
                 });
             },
@@ -5165,6 +5176,20 @@ struct Half<'a> {
     /// the line for it to line up with.
     label_width: f32,
     hint: Option<CopyShortcut>,
+    /// **Whether this half PAINTS its chord as well as naming it on hover.**
+    ///
+    /// True for the right half and false for the left, which is not a
+    /// preference: the left half's chord is the run that sat in the gutter
+    /// between the two columns and rendered `CTRL+SHIFT+ECode`, and the right
+    /// half's is at the outer edge of the line where every full-width row
+    /// puts its own. Both halves still NAME their chord in the tile's
+    /// tooltip; only one prints it.
+    ///
+    /// A field rather than "print it when `trailing` is zero", which would be
+    /// the same two answers derived from a number that means something else
+    /// -- and would silently stop printing the day the right half needed a
+    /// gutter of its own.
+    prints_chord: bool,
     /// Space kept clear inside the tile's RIGHT edge, which its contents
     /// stop short of. On the left half that is the expiry's value, which is
     /// what packs furthest right there now that the chord hint has moved into
@@ -6209,7 +6234,7 @@ fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) ->
     // absent, so a chord hint added back here without being paid for in the
     // fit would not compile past this line.
     let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural;
-    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls();
+    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls(ui);
     // **The left half's CONTENTS have to stop a gutter short of the
     // midpoint.** The expiry's last run is right-aligned inside its half and
     // the code's label is left-aligned inside its own, so halves whose
@@ -6292,17 +6317,22 @@ fn half_gutter(ui: &egui::Ui, expiry: &str, half: f32) -> f32 {
 /// test reserves and the width the paint subtracts have to be the same
 /// expression or the value wraps somewhere the line said it would not.
 ///
-/// **It used to include a chord hint, and there is no `expiry_half_controls`
-/// beside it any more for the same reason**: the printed `CTRL+SHIFT+E` and
-/// `CTRL+SHIFT+C` are gone from this line, so the expiry half now owes
-/// nothing at all to its right and the code half owes only its eye. See
-/// [`half_tile`], where the removal is argued and scoped. The chords are
-/// unchanged; only the printed hints went, into the tiles' tooltips.
+/// **The chord hint is back in the sum, and there is still no
+/// `expiry_half_controls` beside it.** That asymmetry is the whole shape of
+/// this line: the printed `CTRL+SHIFT+E` is gone from the left half for good
+/// -- it is what rendered `CTRL+SHIFT+ECode` in the gutter between the two
+/// columns -- while `CTRL+SHIFT+C` sits at the outer edge of the line, in the
+/// card's own padding lane, exactly where a full-width row puts its own. So
+/// the expiry half owes nothing to its right and the code half owes its eye
+/// AND its chord. See [`half_tile`].
 ///
-/// It no longer needs a `Ui`, which is the measurable trace of the change: the
-/// only thing here that had to be laid out to be measured was the chord.
-fn code_half_controls() -> f32 {
-    theme::EYE_TOGGLE_SIZE + CONTROL_GAP
+/// It needs a `Ui` again, which is the measurable trace of that: the chord is
+/// the only thing here that has to be laid out to be measured.
+fn code_half_controls(ui: &egui::Ui) -> f32 {
+    chord_hint_width(ui, copy_shortcut_chord(CopyShortcut::CardCode))
+        + CONTROL_GAP
+        + theme::EYE_TOGGLE_SIZE
+        + CONTROL_GAP
 }
 
 /// `Expires 08/29        Code •••` -- **one line, two hit areas.**
@@ -6325,7 +6355,7 @@ fn card_face_line(
     brand_and_action: (Option<CardBrand>, &mut DetailAction),
 ) {
     let (expiry, left_width) = expiry;
-    let (code, right_width) = code;
+    let (code, _) = code;
     let (brand, action) = brand_and_action;
     // **Whatever the width affords, floored at [`HALF_GUTTER`].** See
     // [`half_gutter`]; computed once and used for both the room the expiry
@@ -6333,14 +6363,41 @@ fn card_face_line(
     let left_gutter = half_gutter(ui, expiry, left_width);
     let left_room =
         (left_width - left_gutter - ROW_LABEL_WIDTH - ROW_GAP).max(1.0);
-    let right_room =
-        (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls()).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.x = 0.0;
+            // **The right half is measured from INSIDE this frame, and the
+            // width `card_face_line_fits` handed down is deliberately
+            // dropped.**
+            //
+            // The two are not the same number. The fit test measures with
+            // [`row_content_width`], which reads the scroll viewport's clip
+            // rect, while a row's ink is laid inside this `Frame` -- and on
+            // this pane the two differ by a point. That did not matter while
+            // the code half's outer edge carried nothing: the shared line ran
+            // a point past a full-width row's and no ink was near enough to
+            // the edge to show it. It matters now, because the mark at that
+            // edge is a reveal eye and the `Number` row directly above has one
+            // too -- and one point apart is still not a column.
+            //
+            // So the fit test decides WHETHER the line happens, on a
+            // conservative measure taken before this frame exists, and this
+            // decides WHERE its halves end, on the frame the ink is actually
+            // in. The left half keeps the width the fit test gave it, because
+            // it is the one the midpoint is defined by; the right takes the
+            // remainder, so its outer edge is this frame's own -- the same
+            // edge `row_body` right-aligns every full-width row's controls to.
+            // `the_cards_two_reveal_eyes_stand_in_one_column` is what holds
+            // the two edges together.
+            let right_width = (ui.available_width() - left_width).max(1.0);
+            let right_room = (right_width
+                - label_run_width(ui, CODE_LABEL)
+                - ROW_GAP
+                - code_half_controls(ui))
+            .max(1.0);
             ui.horizontal(|ui| {
                 half_tile(
                     ui,
@@ -6349,6 +6406,10 @@ fn card_face_line(
                         width: left_width,
                         label_width: ROW_LABEL_WIDTH,
                         hint: Some(CopyShortcut::CardExpiry),
+                        // Named on hover, never printed. See
+                        // [`Half::prints_chord`] -- this is the run the user
+                        // saw run into the word `Code`.
+                        prints_chord: false,
                         // The clear space before the code's label -- the
                         // pane's width less this half's content, never below
                         // [`HALF_GUTTER`]. See [`half_gutter`]. The TILE is
@@ -6368,6 +6429,13 @@ fn card_face_line(
                         width: right_width,
                         label_width: label_run_width(ui, CODE_LABEL),
                         hint: Some(CopyShortcut::CardCode),
+                        // **Printed**, because nothing is to its right but the
+                        // card's own padding -- the position every full-width
+                        // row prints its chord in, and the position that puts
+                        // this half's eye in the same column as the `Number`
+                        // row's. See [`Half::prints_chord`] and
+                        // `the_cards_two_reveal_eyes_stand_in_one_column`.
+                        prints_chord: true,
                         // Nothing to its right but the card's own padding.
                         trailing: 0.0,
                     },
@@ -8923,6 +8991,70 @@ mod tests {
             pane.idle(&a_full_card(), &TotpState::NoSecret).eyes.len(),
             2,
             "the card pane offers no way to reveal what it masked"
+        );
+    }
+
+    /// **The card's two reveal eyes stand in one column.**
+    ///
+    /// The `Number` row and the shared line's `Code` half are the only two
+    /// masked values on this pane, one directly under the other, and their
+    /// eyes are the only controls either row carries. Two identical marks
+    /// 74pt apart in adjacent rows read as a mistake, because they are one.
+    ///
+    /// They came apart when the shared line dropped its printed chords: the
+    /// `Number` row's eye sits inset by its `CTRL+SHIFT+B`, and with nothing
+    /// to the code's right the code's eye packed to the card's own padding.
+    /// The fix was not to reserve the chord's width invisibly -- this file
+    /// argues against a "second, invisible indent" one row over -- but to
+    /// give the code half back the printed chord it had lost as collateral;
+    /// see [`half_tile`].
+    ///
+    /// **Measured at several widths, and only where the shared line actually
+    /// happens.** Below about 468pt the pane honestly gives the code a
+    /// full-width row of its own, and there the two eyes already lined up --
+    /// which is the tell that this was never about the eye and always about
+    /// the chord. `shared_somewhere` keeps the loop from passing vacuously if
+    /// the shared line ever stops occurring at all.
+    #[test]
+    fn the_cards_two_reveal_eyes_stand_in_one_column() {
+        let item = a_full_card();
+        let mut shared_somewhere = false;
+        for width in [500.0, 638.0, 700.0, PANE, 1100.0] {
+            let mut pane = Pane::wide(width);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let eyes = frame.eyes();
+            assert_eq!(
+                eyes.len(),
+                2,
+                "at a {width}pt pane the card offers {} reveal eyes, not the number's and \
+                 the code's",
+                eyes.len()
+            );
+            // Two DIFFERENT rows, or the comparison below is an eye against
+            // itself -- which no amount of misalignment could fail.
+            assert!(
+                (eyes[0].center().y - eyes[1].center().y).abs() > ROW_CONTENT_HEIGHT,
+                "at a {width}pt pane both eyes are on one line, so the column assertion is \
+                 comparing a mark with itself: {eyes:?}"
+            );
+            if frame.painted(EXPIRY_LABEL) && frame.painted(CODE_LABEL) {
+                let expiry = frame.rect_of(EXPIRY_LABEL);
+                let code = frame.rect_of(CODE_LABEL);
+                shared_somewhere |= (expiry.center().y - code.center().y).abs() < 1.0;
+            }
+            assert!(
+                (eyes[0].center().x - eyes[1].center().x).abs() < 0.01,
+                "at a {width}pt pane the Number row's eye is centred at x {} and the \
+                 security code's at x {} -- the two are one under the other and do not \
+                 share a column",
+                eyes[0].center().x,
+                eyes[1].center().x
+            );
+        }
+        assert!(
+            shared_somewhere,
+            "the expiry and the code never shared a line at any width in this sweep, so \
+             the column this test is about was never actually drawn"
         );
     }
 
@@ -13483,13 +13615,26 @@ mod tests {
     /// row labels are the positive control: "no CTRL+SHIFT+C anywhere" is also
     /// true of a pane that failed to draw the card at all.
     ///
-    /// **The two full-width rows still PRINT theirs; the shared line's two do
-    /// not.** That split is the change and not an inconsistency left lying
-    /// about: a printed chord is discoverability a tooltip cannot give a user
-    /// who never hovers, so it is kept everywhere there is room for it and
-    /// dropped on the one line there is not -- see [`half_tile`]. What the
-    /// rule really is, and what this test now asserts, is that every chord is
-    /// NAMED somewhere the row itself offers.
+    /// **Three of the four PRINT theirs; only the expiry does not.** That
+    /// split is the rule and not an inconsistency left lying about: a printed
+    /// chord is discoverability a tooltip cannot give a user who never
+    /// hovers, so it is kept everywhere it can stand at the OUTER edge of its
+    /// line -- which is where the two full-width rows put theirs and where
+    /// the code half's sits too. The expiry's is the one that cannot: its
+    /// half ends at the midpoint of the line, and a chord printed there ran
+    /// into the word `Code` (`CTRL+SHIFT+ECode`, on the shipped 638pt pane).
+    /// See [`half_tile`].
+    ///
+    /// **The code half's chord came back**, and this test moved with it. It
+    /// was dropped as collateral when both halves' hints went together, and
+    /// the cost was two things: this discoverability, and the column -- the
+    /// eye behind that chord packed to the card's padding and stopped lining
+    /// up with the `Number` row's eye above it. See
+    /// `the_cards_two_reveal_eyes_stand_in_one_column`.
+    ///
+    /// What the rule really is, and what this test asserts, is that every
+    /// chord is NAMED somewhere the row itself offers -- printed where the
+    /// line's outer edge is available to it, and on hover always.
     ///
     /// SEE ALSO [`the_expiry_never_runs_into_the_code_label`], which asks the
     /// question this one cannot: not whether the chord is named but where the
@@ -13508,84 +13653,108 @@ mod tests {
                 frame.strings()
             );
         }
-        // The full-width rows: printed on the line, as before.
-        for which in [CopyShortcut::CardNumber, CopyShortcut::Cardholder] {
-            let chord = copy_shortcut_chord(which);
-            assert!(
-                frame.painted(chord),
-                "{which:?}'s {chord} hint is not painted beside its full-width row; the \
-                 pane painted: {:?}",
-                frame.strings()
-            );
-        }
-        // The shared line's two: NOT printed, and named in the tile's own
-        // tooltip. Both halves asserted, because either alone is satisfied by
-        // a mistake -- a chord still printed passes the tooltip check, and a
-        // chord dropped from the tooltip too passes the absence check.
-        for (which, label) in
-            [(CopyShortcut::CardExpiry, EXPIRY_LABEL), (CopyShortcut::CardCode, CODE_LABEL)]
+        // Printed on the line: the two full-width rows, and the shared
+        // line's CODE half -- whose chord sits at the outer edge of the line,
+        // in the card's own padding lane, exactly where the other two put
+        // theirs.
+        for which in
+            [CopyShortcut::CardNumber, CopyShortcut::Cardholder, CopyShortcut::CardCode]
         {
             let chord = copy_shortcut_chord(which);
             assert!(
-                !frame.painted(chord),
-                "{which:?}'s {chord} hint is printed on the shared line again; the pane \
-                 painted: {:?}",
+                frame.painted(chord),
+                "{which:?}'s {chord} hint is not painted at the outer edge of its line; \
+                 the pane painted: {:?}",
                 frame.strings()
             );
+        }
+        // NOT printed: the expiry alone. Its half ends at the midpoint, and
+        // this is the run that rendered `CTRL+SHIFT+ECode`.
+        let expiry_chord = copy_shortcut_chord(CopyShortcut::CardExpiry);
+        assert!(
+            !frame.painted(expiry_chord),
+            "the expiry's {expiry_chord} hint is printed on the shared line again, in the \
+             gutter it once ran through; the pane painted: {:?}",
+            frame.strings()
+        );
+        // And every one of the four is NAMED on hover, printed or not --
+        // asserted for all four rather than only for the unprinted one,
+        // because "it is printed" was never the promise this test makes.
+        for (which, label) in [
+            (CopyShortcut::CardNumber, NUMBER_LABEL),
+            (CopyShortcut::CardExpiry, EXPIRY_LABEL),
+            (CopyShortcut::CardCode, CODE_LABEL),
+            (CopyShortcut::Cardholder, CARDHOLDER_LABEL),
+        ] {
+            let chord = copy_shortcut_chord(which);
             let mut pane = Pane::new();
             let tile = pane.idle(&item, &totp).rect_of(label);
             let hovered = pane.hover_settled(&item, &totp, tile.center());
             let want = copy_row_tooltip(Some(which));
             assert!(
                 hovered.painted(&want),
-                "hovering the {label:?} half painted no {want:?}, so {chord} is now named \
-                 nowhere at all; it painted: {:?}",
+                "hovering the {label:?} row painted no {want:?}, so {chord} is named \
+                 nowhere the row itself offers; it painted: {:?}",
                 hovered.strings()
             );
         }
     }
 
-    /// **The chords the shared line stopped printing still copy.**
+    /// **Both of the shared line's chords still copy -- including the one it
+    /// does not print.**
     ///
-    /// This is what keeps the change above from being a silent feature
-    /// removal. Only the printed hint moved into the tooltip; the key handling
-    /// is untouched, and a `COPY_SHORTCUTS` entry quietly dropped alongside
-    /// the hint would leave every other test on this pane green.
+    /// This is what keeps the printed hints' comings and goings from being a
+    /// silent feature change. The key handling is untouched by either, and a
+    /// `COPY_SHORTCUTS` entry quietly dropped alongside a hint would leave
+    /// every other test on this pane green.
     ///
     /// Driven through the pane's own frame rather than through
     /// [`copy_shortcut_action`], because the pure function is exactly the
     /// layer a removal would not have touched: the question is whether a real
     /// keypress on a real rendered card still reaches the clipboard action.
     ///
+    /// **The expiry carries the premise now, and it carries it alone.** The
+    /// code half prints its chord again (see [`half_tile`]), so it is no
+    /// longer an unadvertised binding and asserting that it is would fail for
+    /// the right reason at the wrong test. The expiry still is, and the
+    /// premise is checked on it -- otherwise this becomes a test of a chord
+    /// that is advertised anyway, which is a weaker claim than it reads as.
+    ///
     /// The negative control is the login beside it: the same two chords report
     /// nothing on an item with no card, so "the action came back" is about the
     /// binding and not about a pane that answers everything.
     #[test]
-    fn the_shared_lines_chords_still_copy_without_their_printed_hints() {
+    fn the_shared_lines_chords_still_copy_including_the_one_it_does_not_print() {
         let card = a_full_card();
-        for (which, key, want) in [
+        for (which, key, want, printed) in [
             (
                 CopyShortcut::CardExpiry,
                 egui::Key::E,
                 DetailAction::CopyValue("04/23".to_string()),
+                false,
             ),
-            (CopyShortcut::CardCode, egui::Key::C, DetailAction::CopyCardCode),
+            (CopyShortcut::CardCode, egui::Key::C, DetailAction::CopyCardCode, true),
         ] {
             let chord = copy_shortcut_chord(which);
             let mut pane = Pane::new();
             let frame = pane.idle(&card, &TotpState::NoSecret);
-            // The premise: the hint really is off the line, so this is not a
-            // test of a chord that is still advertised anyway.
-            assert!(
-                !frame.painted(chord),
-                "{chord} is still printed on the shared line, so this test is not about \
-                 an unadvertised chord at all"
+            // The premise, in whichever direction this half is meant to be:
+            // the expiry unadvertised on the line, the code advertised. Both
+            // are asserted rather than only the interesting one, because a
+            // hint that silently swapped halves would put the long run back
+            // in the gutter and pass a one-sided check.
+            assert_eq!(
+                frame.painted(chord),
+                printed,
+                "{chord} is {} on the shared line, which is not where this half's hint \
+                 belongs",
+                if printed { "no longer printed" } else { "printed" }
             );
             assert_eq!(
                 pane.frame(&card, &TotpState::NoSecret, ctrl_shift(key)).action,
                 want,
-                "{chord} no longer copies the card's {which:?} -- the printed hint was \
-                 meant to move into the tooltip, not to take the binding with it"
+                "{chord} no longer copies the card's {which:?} -- a printed hint moving \
+                 on or off this line must never take the binding with it"
             );
             let login = a_login();
             let mut pane = Pane::new();
