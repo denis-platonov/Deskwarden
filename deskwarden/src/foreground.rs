@@ -956,7 +956,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 41] = [
+        const OPENS_NO_WINDOW: [&str; 42] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1018,6 +1018,16 @@ mod tests {
             // with no I/O at all; the surfaces that will draw it are a later
             // step and are not this module.
             "record",
+            // **Judgement call, recorded rather than assumed**, and the same
+            // one `file_picker` above carries. The master-password re-prompt
+            // does put a window on screen -- the Windows Hello verification
+            // dialog -- but it is not a window THIS crate opens: it belongs
+            // to the OS, which foregrounds and destroys it, and this module
+            // has no title constant and no `run_ui_native` call for
+            // `RAISING_SITES` to find. The module itself is a decision and a
+            // gate over one call into `hello`, which is on this list for
+            // exactly the same reason.
+            "reprompt",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.

@@ -877,6 +877,22 @@ pub fn build_frame(
     // `detail_edit.rs`. Cleared by the selection-change reset block below,
     // so a revealed card number cannot follow the user onto the next item.
     let mut reveal = detail::RevealState::default();
+    // **The master-password re-prompt, for this window's account.** Built
+    // once, here, rather than per frame: the production builder probes
+    // Windows Hello over WinRT, and the answer cannot change while a vault
+    // window is up (enrolling happens on the login window, which is never on
+    // screen at the same time). Through `env` and not called directly, so no
+    // test can pop a biometric prompt -- see `VaultFrameEnv::reprompt`.
+    let reprompt_gate = (env.reprompt)(accounts.as_ref().map(|a| &a.active().id));
+    // The most recent proof of presence, valid for `reprompt::PROOF_LASTS`.
+    //
+    // **It lives HERE, in the window's own state, and that is what ends it at
+    // a lock.** Locking sets the `locked` handle, `should_close` reads it and
+    // the window ends -- taking this binding with it -- which is the same
+    // rule `ends_a_copied_secrets_life` states for a copied secret, arrived
+    // at by ownership rather than by a call. `Proof::forget` exists for the
+    // same event and is what a test drives.
+    let mut reprompt_proof = crate::reprompt::Proof::default();
     let mut icons = IconCache::default();
     // The edit form's app block resolves a matched executable's real name (and
     // icon) off the UI thread and caches it per path -- see `app_identity`. It
@@ -2370,6 +2386,18 @@ pub fn build_frame(
             .iter()
             .find(|i| i.id == id);
             if let Some(item) = from_list.cloned() {
+                // **The re-prompt, in the gating position, before the match
+                // that acts.** A refused command becomes `None` here and the
+                // block below is skipped entirely, so there is no arm that
+                // can reach the clipboard with the refusal having fired.
+                let permitted = permit_row_command(
+                    ui.ctx(),
+                    command,
+                    &item,
+                    &reprompt_gate,
+                    &mut reprompt_proof,
+                );
+                if let Some(command) = permitted {
                 let login = item.login.as_ref();
                 match command {
                     // No reveal and no confirmation on either copy, matching
@@ -2631,6 +2659,7 @@ pub fn build_frame(
                             }
                         }
                     }
+                }
                 }
             }
         }
@@ -2953,6 +2982,11 @@ pub fn build_frame(
                                 .borrow()
                                 .as_ref()
                                 .map_or(reveal_totp_seed_at_open, |s| s.reveal_totp_seed);
+                            // The reveal flags as they stood BEFORE the pane
+                            // drew. `RevealState` is `Copy`, so this is the
+                            // value and not a borrow, which is what lets the
+                            // refusal below put it back.
+                            let reveal_before = reveal;
                             let action = draw_read_arm(
                                 ui,
                                 item,
@@ -2967,6 +3001,55 @@ pub fn build_frame(
                                 reveal_totp_seed,
                                 &mut breaches,
                             );
+                            // **The re-prompt, in the gating position.** A
+                            // refused action becomes `DetailAction::None`
+                            // before the match below runs, which is what
+                            // makes this one question rather than an `if`
+                            // repeated across nine arms. Both routes into a
+                            // copy -- the row's button and the CTRL chord --
+                            // arrive as the same `DetailAction`, so both are
+                            // gated by this one call.
+                            let action = permit_detail_action(
+                                ui.ctx(),
+                                action,
+                                item,
+                                &reprompt_gate,
+                                &mut reprompt_proof,
+                            );
+                            // The reveal is not an action -- the eye writes
+                            // straight into the caller-owned `RevealState` --
+                            // so it is gated on the TRANSITION instead, and
+                            // rolled back when the proof is refused. Rolled
+                            // back rather than blocked, because the pane has
+                            // already flipped the flag by the time it
+                            // returns; this frame paints from `reveal` after
+                            // this line.
+                            if reveal_gained(&reveal_before, &reveal) {
+                                let protected = crate::vault_bridge::reprompt_protected(item);
+                                match crate::reprompt::permit(
+                                    &reprompt_gate,
+                                    protected,
+                                    &mut reprompt_proof,
+                                    Instant::now(),
+                                    || (),
+                                ) {
+                                    crate::reprompt::Outcome::Done(()) => {}
+                                    crate::reprompt::Outcome::Refused => {
+                                        reveal = reveal_before;
+                                        detail::note_refused(
+                                            ui.ctx(),
+                                            crate::reprompt::refusal_text(false),
+                                        );
+                                    }
+                                    crate::reprompt::Outcome::Cannot => {
+                                        reveal = reveal_before;
+                                        detail::note_refused(
+                                            ui.ctx(),
+                                            crate::reprompt::refusal_text(true),
+                                        );
+                                    }
+                                }
+                            }
                             // `item` and `totp_code` already hold everything
                             // a copy action needs -- `draw_detail_read` only
                             // needs to report *which* field was clicked, not
@@ -3870,7 +3953,36 @@ pub struct VaultFrameEnv {
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
     settings_path: Option<std::path::PathBuf>,
+    /// `reprompt::gate_for_account` in production -- how this window asks the
+    /// user to prove themselves for an item carrying Bitwarden's master
+    /// password re-prompt flag.
+    ///
+    /// Here, and not called directly at the point of use, for the reason
+    /// every other field in this struct is here: the production prover pops a
+    /// **Windows Hello dialog on the developer's own desktop**, and it probes
+    /// WinRT to decide whether it can. A test that reached it would either
+    /// hang on a biometric prompt or pass because the machine it ran on
+    /// happened to have no enrollment. Behind this seam, "the user proved
+    /// themselves" and "the user cancelled" are both values, and what the
+    /// tests assert is ROUTING -- that a refused proof does not reach the
+    /// clipboard, the reveal or the Send composer.
+    reprompt: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
 }
+
+/// The production re-prompt gate: `reprompt::gate_for_account`, and nothing
+/// else.
+///
+/// A function here rather than that path written straight into
+/// [`VaultFrameEnv::production`], because every other field of that struct is
+/// handed a FUNCTION'S OWN NAME and `every_frame_env_seam_has_a_whole_body_pin`
+/// requires exactly that: a field filled with a call is a gate, a wrapper or a
+/// factory standing between the constructor and the real thing, with the
+/// address pin still green. This body is one call and is pinned whole, so
+/// hollowing it out is a red rather than a silently unprotected vault.
+///
+/// One line, deliberately: the pin that holds it is a whole-body equality,
+/// and every line break here is a line break someone has to reproduce there.
+fn reprompt_gate_for(account: Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate { crate::reprompt::gate_for_account(account) }
 
 impl VaultFrameEnv {
     /// The real world. The only constructor a shipping build has.
@@ -3884,6 +3996,7 @@ impl VaultFrameEnv {
             send_create: send_create_thread::spawn_send_create,
             aux_load: spawn_aux_load,
             settings_path: crate::settings::default_path(),
+            reprompt: reprompt_gate_for,
         }
     }
 }
@@ -4024,6 +4137,160 @@ pub fn run(
     }
     result
 }
+
+/// Whether this detail action would put one of the item's secrets somewhere
+/// the user -- or whoever is looking over their shoulder -- can read it.
+///
+/// **Exhaustive with no catch-all.** A future `DetailAction` variant is a
+/// compile error here rather than silently inheriting "no, that one is not a
+/// secret", which is precisely how the next surface added after this work
+/// would otherwise walk straight past the re-prompt.
+///
+/// `CopyValue` is on the exposing side even though its own doc says nothing
+/// that reaches it is `Zeroizing` in the model. A card's expiry and an
+/// identity's passport number are part of what the user ticked the box over;
+/// the flag protects the ITEM, not the subset of its fields this crate
+/// happens to wrap.
+///
+/// `Edit` is on it too, and that is the one judgement call in the set: the
+/// edit form holds the password in a draft and offers its own reveal, so
+/// letting an unproven user open it would be a door around every other row.
+fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
+    match action {
+        DetailAction::CopyUsername
+        | DetailAction::CopyPassword
+        | DetailAction::CopyTotp
+        | DetailAction::CopyTotpSecret
+        | DetailAction::CopyCardNumber
+        | DetailAction::CopyCardCode
+        | DetailAction::CopySshPrivateKey
+        | DetailAction::CopyValue(_)
+        | DetailAction::CopyPasswordHistory(_)
+        | DetailAction::Edit => true,
+        DetailAction::None
+        | DetailAction::OpenWebsite(_)
+        | DetailAction::Delete
+        | DetailAction::ToggleFavorite(_)
+        | DetailAction::RemoveAppMatch
+        | DetailAction::OpenApp(_) => false,
+    }
+}
+
+/// [`detail_action_exposes_secrets`] for the item list's right-click menu.
+///
+/// The same three copies reach the clipboard from here, by a different route,
+/// and a second enumeration is exactly the defect this crate keeps losing to
+/// -- so both routes ask the same question of the same gate, and both are
+/// exhaustive.
+fn row_command_exposes_secrets(command: &item_list::RowCommand) -> bool {
+    match command {
+        item_list::RowCommand::CopyUsername
+        | item_list::RowCommand::CopyPassword
+        | item_list::RowCommand::CopyTotp
+        | item_list::RowCommand::Edit => true,
+        item_list::RowCommand::OpenWebsite(_)
+        | item_list::RowCommand::MoveToFolder(_)
+        | item_list::RowCommand::Delete
+        | item_list::RowCommand::Archive
+        | item_list::RowCommand::Unarchive
+        | item_list::RowCommand::Restore
+        | item_list::RowCommand::PurgeForever => false,
+    }
+}
+
+/// Whether `after` reveals something `before` did not.
+///
+/// **The reveal gate reads a TRANSITION and not a state**, because the state
+/// is what the user is trying to reach: a flag that is already on was paid
+/// for on the frame it went on, and asking about the state every frame would
+/// pop a Hello dialog sixty times a second. Field by field with no `..`, so a
+/// sixth masked row is a compile error here rather than a row that reveals
+/// for free.
+fn reveal_gained(before: &detail::RevealState, after: &detail::RevealState) -> bool {
+    let detail::RevealState {
+        password,
+        card_number,
+        card_code,
+        password_history,
+        ssh_private_key,
+        totp_secret,
+    } = *after;
+    (password && !before.password)
+        || (card_number && !before.card_number)
+        || (card_code && !before.card_code)
+        || (ssh_private_key && !before.ssh_private_key)
+        || (totp_secret && !before.totp_secret)
+        // Indexed rather than paired with an iterator adaptor, and this is
+        // not a style choice: `the_menu_offers_one_format_and_no_choice_of_format`
+        // reds on the three letters that adaptor is spelled with, anywhere in
+        // this file, because they are also an export format. Both arrays are
+        // `[bool; MAX_HISTORY_ROWS]`, so the index cannot be out of range on
+        // either side.
+        || (0..detail::MAX_HISTORY_ROWS)
+            .any(|i| password_history[i] && !before.password_history[i])
+}
+
+/// **The one place a `DetailAction` that would expose a secret is allowed
+/// to**, and the reason it returns an action rather than a `bool`: a refused
+/// action is turned into [`DetailAction::None`] *before* the match that acts
+/// on it, so there is no ordering of arms that reaches the clipboard with the
+/// refusal having fired.
+///
+/// The refusal also OVERWRITES the pane's own confirmation. `note_copied`
+/// runs inside `draw_detail_read`, at the click, so by the time this refuses,
+/// "Password copied" is already on screen -- and a refusal that left it there
+/// would have this app claiming the password is on the clipboard when the
+/// whole point is that it is not.
+fn permit_detail_action(
+    ctx: &egui::Context,
+    action: DetailAction,
+    item: &VaultItem,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> DetailAction {
+    if !detail_action_exposes_secrets(&action) {
+        return action;
+    }
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || action) {
+        crate::reprompt::Outcome::Done(allowed) => allowed,
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            DetailAction::None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            DetailAction::None
+        }
+    }
+}
+
+/// [`permit_detail_action`] for the item list's right-click menu, in the same
+/// gating position: a refused command becomes `None` before the match runs.
+fn permit_row_command(
+    ctx: &egui::Context,
+    command: item_list::RowCommand,
+    item: &VaultItem,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> Option<item_list::RowCommand> {
+    if !row_command_exposes_secrets(&command) {
+        return Some(command);
+    }
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || command) {
+        crate::reprompt::Outcome::Done(allowed) => Some(allowed),
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            None
+        }
+    }
+}
+
 
 /// **Whether the way this window ended means a copied secret's life is over,
 /// and if so under which of the user's switches.**
@@ -17776,10 +18043,12 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            // 56 as of the clipboard-clearing step, which added
-            // `mod clipboard_end_of_life` -- the decision about which ways of
-            // leaving this window take a copied secret with them.
-            modules, 56,
+            // 57 as of the master-password re-prompt step, which added
+            // `mod reprompt_gating_tests` -- the routing assertions over the
+            // two positions that gate a protected item's secrets. 56 before
+            // that, when the clipboard-clearing step added
+            // `mod clipboard_end_of_life`.
+            modules, 57,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -18202,6 +18471,33 @@ mod export_wiring {
             !pins.contains(&unpinned),
             "control: the body of a function no test pins whole was found in the pin text \
              anyway, so every assertion above passes without any pin existing"
+        );
+    }
+
+    /// **The re-prompt seam is one call and nothing else** -- the whole-body
+    /// equality [`every_frame_env_seam_has_a_whole_body_pin`] requires of
+    /// every seam field of `VaultFrameEnv`.
+    ///
+    /// The address pin over that struct compares POINTERS, so it is satisfied
+    /// by the right function with its body replaced. On this particular seam
+    /// the replacement that matters type-checks in one word --
+    /// `RepromptGate::unprovable()` -- and its effect is that every
+    /// master-password-protected item is refused outright, which reads as a
+    /// deliberate policy rather than as a bug. The other direction is worse
+    /// and just as short. So the body is held here character for character.
+    #[test]
+    fn the_reprompt_seam_only_hands_the_question_to_the_tested_gate() {
+        let body = spawner_body(concat!("reprompt_gate_", "for"));
+        let expected = concat!(
+            "fn reprompt_gate_",
+            "for(account: Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate { crate::reprompt::gate_for_account(account) }"
+        );
+        assert_eq!(
+            code_squashed(expected),
+            body,
+            "the production re-prompt seam is no longer one call to \
+             `reprompt::gate_for_account`. Whatever else it now does, it does on the path \
+             that decides whether a master-password-protected item may be opened at all"
         );
     }
 
@@ -18910,6 +19206,7 @@ mod export_wiring {
             send_create,
             aux_load,
             settings_path,
+            reprompt,
         } = VaultFrameEnv::production();
 
         // Typed `let`s rather than casts off the `fn` items, so each one is a
@@ -18928,6 +19225,9 @@ mod export_wiring {
         let real_delete: SendDeleteSpawn = send_delete_thread::spawn_send_delete;
         let real_create: SendCreateSpawn = send_create_thread::spawn_send_create;
         let real_aux_load: AuxLoadSpawn = spawn_aux_load;
+        let real_reprompt: fn(
+            Option<&crate::accounts::AccountId>,
+        ) -> crate::reprompt::RepromptGate = reprompt_gate_for;
 
         // **A row's NAME is its BINDING's name, spelled by the compiler.**
         // These used to be free string literals sitting beside the
@@ -18946,7 +19246,7 @@ mod export_wiring {
             };
         }
 
-        let checked: [(&str, bool); 7] = [
+        let checked: [(&str, bool); 8] = [
             seam!(sync, real_sync),
             seam!(load, real_load),
             seam!(send_list, real_send_list),
@@ -18962,6 +19262,12 @@ mod export_wiring {
             // existed.
             seam!(send_create, real_create),
             seam!(aux_load, real_aux_load),
+            // The field that decides whether a MASTER-PASSWORD-PROTECTED
+            // item's secrets may be exposed. A forwarder here does not
+            // make a button inert -- it makes the protection inert, which
+            // is the one failure this feature exists to remove, and it
+            // looks exactly like success from every other test.
+            seam!(reprompt, real_reprompt),
         ];
         // The tie to `VAULT_FRAME_ENV_FIELDS`, and the reason it is an
         // assertion and not a comment: the destructuring above stops a ninth
@@ -19205,7 +19511,7 @@ mod export_wiring {
     /// `send_delete_wiring` pins, both below-the-cut guards, and the rest.
     /// The struct's own doc warned about exactly this and it happened anyway,
     /// which is why the number is recorded rather than the lesson.
-    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 8;
+    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 9;
 
     /// **`VaultFrameEnv` is exactly as WIDE as the fields this module pins --
     /// asked of the compiler, not of any source text.**
@@ -25651,6 +25957,16 @@ mod frame_env_seam {
             // which no test could previously construct.
             aux_load: answers_with_no_aux_items,
             settings_path,
+            // **Allows every re-prompt**, and is not a refusal like the
+            // three above. The production prover pops a Windows Hello
+            // dialog and probes WinRT for enrollment, so a harness that
+            // reached it would hang on a biometric prompt or pass by
+            // accident of the machine it ran on. Allowing is also the
+            // only neutral default: a stub that refused would make every
+            // unrelated copy, reveal and fill test a re-prompt test.
+            // `with_reprompt` is how a test that IS about the re-prompt
+            // says so.
+            reprompt: |_| crate::reprompt::RepromptGate::allowing_for_test(),
         }
     }
 
@@ -27107,5 +27423,411 @@ mod clipboard_end_of_life {
             }),
             Some(ClearTrigger::AccountChange)
         );
+    }
+}
+
+#[cfg(test)]
+mod reprompt_gating_tests {
+    //! **The master-password re-prompt, at the two positions that gate it.**
+    //!
+    //! These are ROUTING tests. What they assert is not what
+    //! `reprompt::need` answers -- `reprompt`'s own tests do that -- but
+    //! whether the action that would reach the clipboard survives the gate.
+    //! Neutralising either gating function to `action` / `Some(command)`
+    //! reds every negative here, and deleting the refusal branches reds them
+    //! too; a pin on the pure decision alone would red on neither.
+    use super::*;
+    use crate::reprompt::{Proof, RepromptGate, Scope};
+    use std::path::Path;
+
+    fn account() -> crate::accounts::AccountId {
+        crate::accounts::AccountId::parse("0123456789abcdef0123456789abcdef")
+            .expect("a 32-char lowercase hex id")
+    }
+
+    fn scope() -> Scope {
+        Scope::new(std::path::PathBuf::from("C:/nowhere"), account())
+    }
+
+    fn allows(_: &Path, _: &crate::accounts::AccountId) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn refuses(_: &Path, _: &crate::accounts::AccountId) -> Result<(), String> {
+        Err("the user cancelled the Windows Hello prompt".to_string())
+    }
+
+    /// A gate whose prover would PANIC. Handed to the cases that must not ask
+    /// at all, so "no prompt appeared" is a fact rather than an absence.
+    fn never_asks() -> RepromptGate {
+        fn boom(_: &Path, _: &crate::accounts::AccountId) -> Result<(), String> {
+            panic!("an item that needed no proof popped a Windows Hello prompt");
+        }
+        RepromptGate::with_prover(Some(scope()), boom)
+    }
+
+    fn item(raw: &str) -> VaultItem {
+        serde_json::from_str(raw).expect("the fixture parses")
+    }
+
+    fn plain() -> VaultItem {
+        item(r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[],
+                 "login":{"username":"u","password":"p"}}"#)
+    }
+
+    fn protected() -> VaultItem {
+        item(r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[],
+                 "reprompt":1,"login":{"username":"u","password":"p"}}"#)
+    }
+
+    /// Every `DetailAction` this crate has, so the classification below is
+    /// over the whole enum and not over the six someone remembered. A new
+    /// variant is a compile error in `detail_action_exposes_secrets`; this is
+    /// the other half, and it is what stops the repair for that error being
+    /// "put it on the `false` side and move on" without anybody noticing the
+    /// list here got shorter than the enum.
+    fn every_detail_action() -> Vec<(DetailAction, bool)> {
+        vec![
+            (DetailAction::None, false),
+            (DetailAction::Edit, true),
+            (DetailAction::CopyUsername, true),
+            (DetailAction::CopyPassword, true),
+            (DetailAction::CopyTotp, true),
+            (DetailAction::CopyTotpSecret, true),
+            (DetailAction::CopyCardNumber, true),
+            (DetailAction::CopyCardCode, true),
+            (DetailAction::CopySshPrivateKey, true),
+            (DetailAction::CopyValue("Visa".to_string()), true),
+            (DetailAction::CopyPasswordHistory(0), true),
+            (DetailAction::OpenWebsite("https://example.com".to_string()), false),
+            (DetailAction::Delete, false),
+            (DetailAction::ToggleFavorite(true), false),
+            (DetailAction::RemoveAppMatch, false),
+        ]
+    }
+
+    #[test]
+    fn every_copy_and_the_edit_form_are_exposing_and_the_rest_are_not() {
+        let all = every_detail_action();
+        // CONTROL: both answers are actually represented, so neither loop
+        // below is vacuous.
+        assert!(all.iter().any(|(_, exposes)| *exposes));
+        assert!(all.iter().any(|(_, exposes)| !*exposes));
+        for (action, exposes) in &all {
+            assert_eq!(
+                detail_action_exposes_secrets(action),
+                *exposes,
+                "{action:?} is classified wrongly. On the `false` side that means a route to \
+                 this item's secrets that the master-password re-prompt never sees"
+            );
+        }
+        // Every named chord goes through one of these, so naming the four
+        // copies again here is not redundancy: it is the statement that the
+        // chords are gated, since a chord produces nothing else.
+        for chord in [
+            DetailAction::CopyPassword,
+            DetailAction::CopyUsername,
+            DetailAction::CopyTotp,
+            DetailAction::CopyTotpSecret,
+        ] {
+            assert!(detail_action_exposes_secrets(&chord), "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn the_row_menus_three_copies_and_its_edit_are_exposing_and_the_rest_are_not() {
+        for command in [
+            item_list::RowCommand::CopyUsername,
+            item_list::RowCommand::CopyPassword,
+            item_list::RowCommand::CopyTotp,
+            item_list::RowCommand::Edit,
+        ] {
+            assert!(row_command_exposes_secrets(&command), "{command:?} is not gated");
+        }
+        for command in [
+            item_list::RowCommand::OpenWebsite("https://example.com".to_string()),
+            item_list::RowCommand::MoveToFolder("f1".to_string()),
+            item_list::RowCommand::Delete,
+            item_list::RowCommand::Archive,
+            item_list::RowCommand::Unarchive,
+            item_list::RowCommand::Restore,
+            item_list::RowCommand::PurgeForever,
+        ] {
+            assert!(
+                !row_command_exposes_secrets(&command),
+                "{command:?} would ask for the master password, which would put a Hello \
+                 prompt in front of moving an item between folders"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unprotected_item_copies_without_being_asked_for_anything() {
+        let ctx = egui::Context::default();
+        let mut proof = Proof::default();
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyPassword,
+                &plain(),
+                &never_asks(),
+                &mut proof,
+            ),
+            DetailAction::CopyPassword,
+            "an ordinary item's password copy was altered by the re-prompt gate"
+        );
+        assert_eq!(
+            permit_row_command(
+                &ctx,
+                item_list::RowCommand::CopyPassword,
+                &plain(),
+                &never_asks(),
+                &mut proof,
+            ),
+            Some(item_list::RowCommand::CopyPassword)
+        );
+    }
+
+    #[test]
+    fn a_non_secret_action_on_a_protected_item_is_not_asked_about_either() {
+        let ctx = egui::Context::default();
+        let mut proof = Proof::default();
+        // `never_asks` is the whole assertion: opening a protected item's
+        // website, or favouriting it, must not pop a Hello dialog.
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::ToggleFavorite(true),
+                &protected(),
+                &never_asks(),
+                &mut proof,
+            ),
+            DetailAction::ToggleFavorite(true)
+        );
+        assert_eq!(
+            permit_row_command(
+                &ctx,
+                item_list::RowCommand::Archive,
+                &protected(),
+                &never_asks(),
+                &mut proof,
+            ),
+            Some(item_list::RowCommand::Archive)
+        );
+    }
+
+    #[test]
+    fn a_proved_protected_item_copies() {
+        let ctx = egui::Context::default();
+        let gate = RepromptGate::with_prover(Some(scope()), allows);
+        let mut proof = Proof::default();
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyPassword,
+                &protected(),
+                &gate,
+                &mut proof,
+            ),
+            DetailAction::CopyPassword,
+            "a protected item stayed refused after the user proved themselves"
+        );
+        // And the proof now covers the next one, so a second copy does not
+        // ask again -- `never_asks` panics if it does.
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyUsername,
+                &protected(),
+                &never_asks(),
+                &mut proof,
+            ),
+            DetailAction::CopyUsername
+        );
+    }
+
+    /// **STEP 4, at the detail pane.** A cancelled prompt does not fall
+    /// through to the unprotected path.
+    #[test]
+    fn a_cancelled_prompt_turns_every_copy_into_nothing_at_all() {
+        let ctx = egui::Context::default();
+        let gate = RepromptGate::with_prover(Some(scope()), refuses);
+        let mut proof = Proof::default();
+        for action in [
+            DetailAction::CopyPassword,
+            DetailAction::CopyUsername,
+            DetailAction::CopyTotp,
+            DetailAction::CopyTotpSecret,
+            DetailAction::CopyCardNumber,
+            DetailAction::CopyCardCode,
+            DetailAction::CopySshPrivateKey,
+            DetailAction::CopyValue("Visa".to_string()),
+            DetailAction::CopyPasswordHistory(0),
+            DetailAction::Edit,
+        ] {
+            let refused = permit_detail_action(
+                &ctx,
+                action.clone(),
+                &protected(),
+                &gate,
+                &mut proof,
+            );
+            assert_eq!(
+                refused,
+                DetailAction::None,
+                "{action:?} survived a cancelled master-password prompt, so the secret \
+                 reached the clipboard anyway"
+            );
+        }
+        // THE POSITIVE CONTROL. The same actions, the same item, a prover
+        // that says yes: they all come back intact. Without this, "everything
+        // became None" is also what a gate that refuses unconditionally would
+        // produce -- which would be a broken app, not a secure one.
+        let allowing = RepromptGate::with_prover(Some(scope()), allows);
+        let mut fresh = Proof::default();
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyPassword,
+                &protected(),
+                &allowing,
+                &mut fresh,
+            ),
+            DetailAction::CopyPassword
+        );
+    }
+
+    /// **STEP 4, at the item list's right-click menu**, which is the second
+    /// route to the same three copies.
+    #[test]
+    fn a_cancelled_prompt_drops_the_row_menus_copies_too() {
+        let ctx = egui::Context::default();
+        let gate = RepromptGate::with_prover(Some(scope()), refuses);
+        let mut proof = Proof::default();
+        for command in [
+            item_list::RowCommand::CopyUsername,
+            item_list::RowCommand::CopyPassword,
+            item_list::RowCommand::CopyTotp,
+            item_list::RowCommand::Edit,
+        ] {
+            assert_eq!(
+                permit_row_command(&ctx, command.clone(), &protected(), &gate, &mut proof),
+                None,
+                "{command:?} survived a cancelled master-password prompt"
+            );
+        }
+        let allowing = RepromptGate::with_prover(Some(scope()), allows);
+        let mut fresh = Proof::default();
+        assert_eq!(
+            permit_row_command(
+                &ctx,
+                item_list::RowCommand::CopyPassword,
+                &protected(),
+                &allowing,
+                &mut fresh,
+            ),
+            Some(item_list::RowCommand::CopyPassword),
+            "the control: with a proof given, the same command comes through"
+        );
+    }
+
+    /// An account that cannot be asked at all is refused, not waved through.
+    #[test]
+    fn an_account_with_no_way_to_prove_is_refused_rather_than_allowed() {
+        let ctx = egui::Context::default();
+        let gate = RepromptGate::with_prover(None, allows);
+        let mut proof = Proof::default();
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyPassword,
+                &protected(),
+                &gate,
+                &mut proof,
+            ),
+            DetailAction::None,
+            "an item this build cannot gate was copied anyway -- which is exactly the state \
+             this feature exists to end"
+        );
+        // The control: the same ungatable gate copies an ORDINARY item, so
+        // the refusal is about the flag and not about the gate being inert.
+        assert_eq!(
+            permit_detail_action(
+                &ctx,
+                DetailAction::CopyPassword,
+                &plain(),
+                &gate,
+                &mut proof,
+            ),
+            DetailAction::CopyPassword
+        );
+    }
+
+    #[test]
+    fn a_reveal_is_a_transition_and_not_a_state() {
+        let off = detail::RevealState::default();
+        assert!(
+            !reveal_gained(&off, &off),
+            "nothing changed and the gate still asked, which would pop a Hello dialog on \
+             every frame the pane draws"
+        );
+
+        // Every flag, one at a time, positively.
+        let mut password = off;
+        password.password = true;
+        let mut number = off;
+        number.card_number = true;
+        let mut code = off;
+        code.card_code = true;
+        let mut ssh = off;
+        ssh.ssh_private_key = true;
+        let mut seed = off;
+        seed.totp_secret = true;
+        let mut history = off;
+        history.password_history[detail::MAX_HISTORY_ROWS - 1] = true;
+        for (name, after) in [
+            ("password", password),
+            ("card number", number),
+            ("security code", code),
+            ("ssh private key", ssh),
+            ("totp secret", seed),
+            ("the last previous-password row", history),
+        ] {
+            assert!(
+                reveal_gained(&off, &after),
+                "revealing {name} was not seen as a reveal, so that row would come up in the \
+                 clear on a protected item with no prompt at all"
+            );
+            // And it is not seen a SECOND time once it is already on.
+            assert!(!reveal_gained(&after, &after), "{name} asked twice");
+            // Turning it back OFF is not a reveal either.
+            assert!(!reveal_gained(&after, &off), "hiding {name} asked for a proof");
+        }
+    }
+
+    /// The source pins: both gating calls are in the path, and neither is a
+    /// decision computed beside the match rather than in front of it.
+    #[test]
+    fn both_gating_calls_are_written_into_the_paths_they_gate() {
+        let whole = include_str!("mod.rs");
+        let cut = whole
+            .find(concat!("#[cfg", "(test)]"))
+            .expect("no test module in this file");
+        let source = &whole[..cut];
+        for call in [
+            concat!("let action = permit_detail_", "action("),
+            concat!("let permitted = permit_row_", "command("),
+        ] {
+            assert_eq!(
+                source.matches(call).count(),
+                1,
+                "{call:?} is not written exactly once in this file's production region. The \
+                 re-prompt is enforced by standing in front of the match that acts, and a \
+                 decision computed anywhere else is a decision the action walks past"
+            );
+        }
+        // CONTROL: this reader really read the production region, and would
+        // have noticed had it been handed the empty string.
+        assert!(source.len() > 100_000, "control: the production region is {} bytes", source.len());
     }
 }
