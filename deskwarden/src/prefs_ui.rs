@@ -178,6 +178,20 @@ const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP s
      as an extra masked row under its one-time code, revealed by clicking the eye. The code \
      expires in 30 seconds; the secret behind it never does.";
 
+const UPDATE_CHECK_LABEL: &str = "Check for updates";
+/// **Says what the request discloses and, unusually, argues for leaving it
+/// on.** Every other privacy row here describes a cost; this one has to
+/// describe a cost that is small and a consequence of switching it off that
+/// is not, because the symptom of a missed update is nothing happening and
+/// the user will not attribute it to this pill.
+///
+/// "Nothing about you or your vault" is the accurate claim and is the same
+/// one `PRIVACY.md` makes: the request names this app's own public
+/// repository, not the user.
+const UPDATE_CHECK_DESCRIPTION: &str = "On by default. Deskwarden asks GitHub whether a newer \
+     Deskwarden has been released. The request says nothing about you or your vault. Off means \
+     you will not be told about fixes, including security ones, until you look yourself.";
+
 const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
     "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
@@ -881,6 +895,20 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
                 enabled,
             );
         });
+        row_separator(ui);
+        // **Last, and deliberately not beside the breach and site-icon
+        // rows.** Those two are network calls keyed on the VAULT -- a
+        // password's hash, an item's domain -- and a user weighing one is
+        // weighing the other. This request is keyed on nothing but the app's
+        // own version, so grouping it with them would suggest it discloses
+        // the same kind of thing. It sits at the foot of the card, after the
+        // rows about how this machine behaves.
+        state.settings.check_for_updates = toggle_row(
+            ui,
+            UPDATE_CHECK_LABEL,
+            UPDATE_CHECK_DESCRIPTION,
+            state.settings.check_for_updates,
+        );
     });
 }
 
@@ -1592,12 +1620,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_six_toggles_and_one_stepper() {
+    fn general_paints_exactly_seven_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            6,
-            "six 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches`,              `fetch_icons`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else"
+            7,
+            "seven 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches`,              `fetch_icons`, `reveal_totp_seed`, `auto_lock_enabled` and `check_for_updates`,              and nothing else"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -1709,7 +1737,7 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // Third pill down: backend, prompt, breaches, site icons, TOTP
         // secret, auto-lock.
         let pill = pills[2].center();
@@ -1772,7 +1800,7 @@ mod tests {
         // ... and the pills follow the labels, so it is the row that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
+        assert_eq!(pills.len(), 7);
         assert!(pills[1].top() < pills[2].top(), "the breach pill is not below the prompt pill");
         assert!(pills[2].top() < pills[3].top(), "the breach pill is not above the site-icons pill");
         assert!(pills[3].top() < pills[4].top(), "the site-icons pill is not above the TOTP-secret pill");
@@ -1901,7 +1929,7 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // Fourth pill down: backend, prompt, breaches, site icons, TOTP
         // secret, auto-lock.
         let pill = pills[3].center();
@@ -1922,6 +1950,108 @@ mod tests {
         assert!(state.settings.fetch_icons, "and back on again");
         assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
         assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
+    }
+
+    /// **The update-check switch, driven at the pane.** Starts `true`, so the
+    /// first click turns it OFF, with the same counter-assertions its
+    /// neighbours carry.
+    ///
+    /// The SEVENTH pill, at the foot of the card below the auto-lock stepper
+    /// -- see `draw_general` for why it is not beside the two vault-keyed
+    /// network rows.
+    #[test]
+    fn clicking_the_update_check_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(
+            state.settings.check_for_updates,
+            "the default: Deskwarden tells you about releases until this is clicked"
+        );
+        assert!(state.settings.fetch_icons, "the neighbour starts true");
+        assert!(state.settings.auto_lock_enabled, "the neighbour starts true");
+        assert!(state.settings.keep_backend_running, "the neighbour starts true");
+        assert!(state.settings.prompt_on_match, "the neighbour starts true");
+        assert!(!state.settings.check_breaches, "the neighbour starts false");
+        assert!(!state.settings.reveal_totp_seed, "the neighbour starts false");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        let pill = pills[6].center();
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            !state.settings.check_for_updates,
+            "the update-check toggle did not turn off -- the row is painted but its value is \
+             never written back, so the pill is decoration"
+        );
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+        assert!(state.settings.fetch_icons, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
+        // The stepper it now sits below is untouched, which a click that had
+        // landed on the auto-lock row instead would not leave true.
+        assert_eq!(state.settings.auto_lock_minutes, 15);
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(state.settings.check_for_updates, "and back on again");
+    }
+
+    /// The update row is the LAST one on the card, read off the paint rather
+    /// than off source order -- below the auto-lock stepper it was
+    /// deliberately placed under.
+    #[test]
+    fn the_update_check_row_sits_at_the_foot_of_the_card() {
+        let painted = paint(Section::General);
+        let auto_lock = painted.ink_of(AUTO_LOCK_LABEL).rect;
+        let updates = painted.ink_of(UPDATE_CHECK_LABEL).rect;
+        // The instrument first: two labels at two distinct, non-empty
+        // heights, so `top()` is telling them apart.
+        assert!(auto_lock.height() > 0.0 && updates.height() > 0.0);
+        assert!(
+            auto_lock.top() < updates.top(),
+            "the update row is not below the auto-lock stepper: stepper at {auto_lock:?}, \
+             updates at {updates:?}"
+        );
+        assert!(
+            updates.top() - auto_lock.top() > 1.0,
+            "the two labels are painted at the same height, so the ordering assertion above \
+             cannot fail"
+        );
+        // ...and it is below the site-icons row too, so it is at the foot of
+        // the card rather than merely below one row.
+        assert!(painted.ink_of(FETCH_ICONS_LABEL).rect.top() < updates.top());
+    }
+
+    /// The copy is on screen, not merely declared, and it says the one thing
+    /// this row has to say that the others do not: what switching it OFF
+    /// costs. A missed security fix has no symptom.
+    #[test]
+    fn the_update_check_row_says_what_turning_it_off_costs() {
+        let painted = paint(Section::General);
+        assert!(painted.contains(UPDATE_CHECK_LABEL), "got {:?}", painted.strings());
+        assert!(painted.contains(UPDATE_CHECK_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            UPDATE_CHECK_DESCRIPTION.contains("security"),
+            "the copy has to name what is lost by turning this off; a missed security fix is \
+             invisible, so the pane is the only place the user can learn it"
+        );
+        assert!(
+            UPDATE_CHECK_DESCRIPTION.contains("On by default"),
+            "on-by-default is stated in `Settings::default` and has to be stated on screen too"
+        );
+        let ink = painted.ink_of(UPDATE_CHECK_LABEL);
+        assert!(
+            ink.rect.height() > 0.0 && ink.rect.width() > 0.0,
+            "the label has no box: {:?}",
+            ink.rect
+        );
+        assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
+        let desc = painted.ink_of(UPDATE_CHECK_DESCRIPTION);
+        assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
+        assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
 
     /// The copy is on screen, not merely declared -- and it says the thing
@@ -1982,7 +2112,7 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // Fifth pill down: backend, prompt, breaches, site icons, TOTP
         // secret, auto-lock.
         let pill = pills[4].center();
@@ -2034,7 +2164,7 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
+        assert_eq!(pills.len(), 7);
         assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the site-icons pill");
         assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(

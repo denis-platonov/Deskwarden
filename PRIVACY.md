@@ -69,8 +69,18 @@ about.
 Deskwarden asks GitHub for the latest release of its own public repository.
 This request carries no information about you or your vault beyond what any
 HTTP request necessarily reveals to the server (your IP address, and the fact
-that a request was made). Builds distributed through the Microsoft Store do
-not perform this check, because the Store handles updates.
+that a request was made).
+
+**You can switch it off.** Preferences → General → *Check for updates*. On by
+default, because an app that quietly stops telling you a security fix exists
+is a worse outcome than the IP address the check discloses — and one you
+would have no way to notice.
+
+An earlier version of this policy said that builds distributed through the
+Microsoft Store do not perform this check. **There is no Microsoft Store
+build of Deskwarden**, so that sentence described an intention rather than
+the software, and it has been removed. Should one ever ship, this section
+will say what it actually does before it does it.
 
 ## What Deskwarden does not do
 
@@ -107,17 +117,19 @@ It collects no personal information from anyone, of any age.
   relationship you have already chosen instead of creating a new one with a
   third party. That is a weaker reason to ask first than breach checking's,
   not no reason, which is why the switch is there.
+- **The update check is on by default and can be turned off** —
+  Preferences → General → *Check for updates*. On rather than off for the
+  reason given above: the disclosure is an IP address, and the cost of the
+  other default is a user who is never told about a security fix and has no
+  symptom to notice.
 - **Everything else is local**, and deleting `%APPDATA%\Deskwarden` removes
   it.
 
-**One thing you cannot currently switch off, stated plainly rather than
-omitted:**
-
-- **The update check has no setting.** It runs against GitHub's API on its
-  own schedule. Microsoft Store builds do not perform it at all, because the
-  Store handles updates.
-
-It is tracked as work to be done. This section will be corrected when it is.
+**Every network request this application makes on its own is now something
+you can switch off**, and each of the three has its own row on Preferences →
+General. The vault server is the exception, and only in the sense that
+Deskwarden never contacts it: that is `bw`, which you installed and signed
+in to.
 
 ## Changes
 

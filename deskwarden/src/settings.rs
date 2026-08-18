@@ -390,6 +390,30 @@ pub struct Settings {
     /// a picture of which domains they hold entries for. `PRIVACY.md` names
     /// this as the request with the most privacy weight in the app.
     pub fetch_icons: bool,
+    /// Whether Deskwarden asks GitHub whether a newer Deskwarden exists.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as) is the behaviour that has always existed: one check
+    /// at startup and one every `UPDATE_CHECK_INTERVAL` thereafter, against
+    /// the releases API of this app's own public repository. `false` means
+    /// neither check is made and `updater::check_for_update` is never
+    /// called; nothing else about the updater changes, so an update already
+    /// found and downloaded still installs.
+    ///
+    /// **On by default, and this one is not a close call.** The request
+    /// carries nothing about the user or their vault beyond what any HTTP
+    /// request discloses to any server -- an IP address, and the fact that a
+    /// request happened. Weigh that against what defaulting it off would
+    /// mean: an app that has quietly stopped telling its user that a
+    /// security fix exists. A password manager that silently goes stale is a
+    /// worse failure than the disclosure it avoided, and it is a failure the
+    /// user cannot notice, because the symptom of a missed update is nothing
+    /// happening.
+    ///
+    /// The switch exists anyway, for the user on a metered or monitored
+    /// connection who wants to account for every outbound request, and for
+    /// anyone who updates by another route. `PRIVACY.md` names it.
+    pub check_for_updates: bool,
     /// Whether a login's TOTP *secret* can be revealed on the details screen.
     ///
     /// `false` (the default, and what an older `settings.json` without this
@@ -521,6 +545,7 @@ impl Default for Settings {
             prompt_on_match: true,
             check_breaches: false,
             fetch_icons: true,
+            check_for_updates: true,
             reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
@@ -644,6 +669,7 @@ impl Settings {
             prompt_on_match,
             check_breaches,
             fetch_icons,
+            check_for_updates,
             reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
@@ -660,6 +686,7 @@ impl Settings {
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
+        on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
@@ -843,6 +870,7 @@ mod tests {
             // Deliberately the OPPOSITE of this field's own default
             // (`true`), for the reason the line above gives.
             fetch_icons: false,
+            check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
@@ -1014,6 +1042,7 @@ mod tests {
             prompt_on_match: false,
             check_breaches: true,
             fetch_icons: false,
+            check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
@@ -1298,6 +1327,101 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The update check is on unless it is turned off, and the reason is the
+    /// asymmetry rather than the arithmetic: the request discloses an IP and
+    /// nothing else, and the failure mode of defaulting it off is an app that
+    /// has silently stopped mentioning security fixes.
+    #[test]
+    fn the_update_check_is_on_by_default() {
+        assert!(Settings::default().check_for_updates);
+        // ...and not merely present in the in-memory default: a fresh install
+        // has no file at all, and that path must land on `true` too.
+        assert!(Settings::load(&temp_path("updates-absent")).check_for_updates);
+    }
+
+    /// The upgrade path, in the direction that matters for this field: a
+    /// `settings.json` written before it existed must not read as opted OUT,
+    /// or upgrading is the last update that user is ever told about.
+    #[test]
+    fn an_older_settings_file_without_the_update_key_loads_as_on() {
+        let path = temp_path("updates-older-file");
+        let older = br#"{"keep_backend_running": false, "check_breaches": true, "auto_lock_minutes": 4}"#;
+        // The premise, asserted rather than assumed: a fixture that happened
+        // to carry the key would make the rest of this test vacuous.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("check_for_updates"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // And the premise that the file was read at all, rather than falling
+        // back to `Settings::default()` wholesale.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 4);
+        assert!(
+            loaded.check_for_updates,
+            "upgrading turned the update check off for a user who never asked, so this is the \
+             last release they will hear about"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard the three tests above document**, for
+    /// `check_for_updates`: `persist_preferences` destructures exhaustively,
+    /// but binding a field and never assigning `on_disk.check_for_updates`
+    /// compiles, and that mutant has survived this suite before.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`true`) would pass a one-way test.
+    #[test]
+    fn the_update_toggle_survives_persist_preferences() {
+        let path = temp_path("prefs-updates");
+        Settings::default().save(&path).unwrap();
+        assert!(Settings::load(&path).check_for_updates, "the premise: it starts on");
+
+        Settings { check_for_updates: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            !loaded.check_for_updates,
+            "the update setting was dropped by persist_preferences, so turning it off lasts \
+             only until the app is restarted"
+        );
+        // The neighbours it is destructured beside are untouched, so this is
+        // not satisfied by a writer that clobbers the file with something else.
+        assert!(loaded.keep_backend_running);
+        assert!(loaded.fetch_icons);
+        assert!(!loaded.check_breaches);
+        assert!(loaded.auto_lock_enabled);
+
+        // ...and back on again, so "always writes false" fails too.
+        Settings { check_for_updates: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(Settings::load(&path).check_for_updates);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The field reaches the file under its own name, the way every other
+    /// preference here is pinned. `settings_round_trip_through_disk` compares
+    /// whole structs, which a field renamed on both sides at once would
+    /// satisfy.
+    #[test]
+    fn the_update_toggle_round_trips_through_settings_json_under_its_own_name() {
+        let path = temp_path("updates-round-trip");
+        let written = Settings { check_for_updates: false, ..Settings::default() };
+        // The value written disagrees with the default, so a reader that
+        // ignored the file entirely would fail here.
+        assert!(written.check_for_updates != Settings::default().check_for_updates);
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("check_for_updates"), "not in the file at all: {text}");
+        assert_eq!(Settings::load(&path), written);
+        assert!(!Settings::load(&path).check_for_updates);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The TOTP-secret row's preference is off unless it is turned on -- the
     /// second such preference here, and for a stronger reason than the first:
     /// a revealed seed does not expire and does not rotate.
@@ -1414,6 +1538,7 @@ mod tests {
             prompt_on_match: true,
             check_breaches: true,
             fetch_icons: false,
+            check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,

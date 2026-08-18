@@ -1219,8 +1219,14 @@ fn main() {
         let agent = update_check_agent.clone();
         let version = current_version.clone();
         let tx = update_tx.clone();
+        // `Settings::check_for_updates` as the file had it at startup, which
+        // is the only value that can exist yet -- the tray loop, and with it
+        // the preferences window, has not run a frame.
+        let check_for_updates = estate.settings.check_for_updates;
         std::thread::spawn(move || {
-            if let Some(release) = check_for_update_logged(&version, &agent) {
+            if let Some(release) =
+                check_for_update_logged(GITHUB_API_BASE, check_for_updates, &version, &agent)
+            {
                 let _ = tx.send(release);
             }
         });
@@ -2149,8 +2155,15 @@ fn main() {
             let agent = update_check_agent.clone();
             let version = current_version.clone();
             let tx = update_tx.clone();
+            // Read fresh every cycle, not captured once at startup: the
+            // preferences window writes straight into `estate.settings` when
+            // it returns, so turning the check off takes effect at the next
+            // interval rather than at the next launch.
+            let check_for_updates = estate.settings.check_for_updates;
             std::thread::spawn(move || {
-                if let Some(release) = check_for_update_logged(&version, &agent) {
+                if let Some(release) =
+                    check_for_update_logged(GITHUB_API_BASE, check_for_updates, &version, &agent)
+                {
                     let _ = tx.send(release);
                 }
             });
@@ -2806,17 +2819,36 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     }
 }
 
-/// Calls `updater::check_for_update` against the real GitHub API and logs the
-/// outcome. Network failures, a malformed release, and "no update" are all
-/// deliberately non-fatal here -- this runs on a background thread (see call
-/// sites), so the worst case is that a check is skipped until the next
-/// cycle, not that the app goes down (or hangs) over a transient GitHub API
-/// problem.
+/// Calls `updater::check_for_update` and logs the outcome. Network failures,
+/// a malformed release, and "no update" are all deliberately non-fatal here
+/// -- this runs on a background thread (see call sites), so the worst case is
+/// that a check is skipped until the next cycle, not that the app goes down
+/// (or hangs) over a transient GitHub API problem.
+///
+/// **This is where `Settings::check_for_updates` is obeyed, and it is a
+/// gating position rather than a pure function on purpose.** Both call sites
+/// are `thread::spawn`s that do nothing but call this, so a guard here covers
+/// both and cannot be forgotten by a third; a guard at the call sites would
+/// be two copies of one rule. With the setting off nothing reaches
+/// `updater::check_for_update`, so no request is made at all -- not one that
+/// is made and then ignored.
+///
+/// `api_base` is a parameter rather than `GITHUB_API_BASE` read inside for
+/// one reason: it is what lets `the_update_check_is_not_made_when_the_setting_
+/// is_off` point this function at a loopback mock and COUNT the requests, so
+/// the "no request" claim is observed rather than asserted about a branch.
+/// Production passes `GITHUB_API_BASE` at both call sites.
 fn check_for_update_logged(
+    api_base: &str,
+    check_for_updates: bool,
     current_version: &Version,
     agent: &deskwarden::http_agent::TotalBounded,
 ) -> Option<ReleaseInfo> {
-    match updater::check_for_update(GITHUB_API_BASE, current_version, agent) {
+    if !check_for_updates {
+        log::debug!("update check skipped: turned off in preferences");
+        return None;
+    }
+    match updater::check_for_update(api_base, current_version, agent) {
         Ok(Some(release)) => {
             log::info!(
                 "update available: v{} (current: v{current_version})",
@@ -7355,6 +7387,106 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The update check is not made when the setting is off**, observed as
+    /// a request that never arrives rather than as a branch that was taken.
+    ///
+    /// The server is `mockito`'s, on loopback, exactly as `updater`'s own
+    /// tests use it -- no test here goes near `api.github.com`. What makes
+    /// this an observation is `Mock::matched`: it reports whether the
+    /// releases endpoint was actually hit, so "no request" is a fact about
+    /// the socket and not about the code path.
+    ///
+    /// **The live control is the same mock, the same version and the same
+    /// agent with the setting ON**, and it is the half that matters: without
+    /// it, a mock whose path no longer matched the URL `check_for_update`
+    /// builds -- or a fixture that failed to parse -- would satisfy the off
+    /// case for reasons that have nothing to do with the preference.
+    #[test]
+    fn the_update_check_is_not_made_when_the_setting_is_off() {
+        let body = r#"{
+            "tag_name": "v99.0.0",
+            "assets": [
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+            ]
+        }"#;
+        let current = Version::parse("1.0.0").unwrap();
+
+        // -- off: nothing reaches the wire ---------------------------------
+        let mut off_server = mockito::Server::new();
+        let off_mock = off_server
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let found = check_for_update_logged(
+            &off_server.url(),
+            false,
+            &current,
+            &updater::build_api_agent(),
+        );
+        assert!(
+            !off_mock.matched(),
+            "the releases endpoint was hit with `check_for_updates: false` -- the setting \
+             exists but the update path ignores it"
+        );
+        assert!(
+            found.is_none(),
+            "an update was reported with the check switched off: {found:?}"
+        );
+
+        // -- on: the SAME request does reach it ----------------------------
+        let mut on_server = mockito::Server::new();
+        let on_mock = on_server
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let found =
+            check_for_update_logged(&on_server.url(), true, &current, &updater::build_api_agent());
+        assert!(
+            on_mock.matched(),
+            "the live control failed: the releases endpoint was not hit even with \
+             `check_for_updates: true`, so the negative half above proves nothing about the \
+             setting"
+        );
+        assert_eq!(
+            found.map(|r| r.version),
+            Some(Version::parse("99.0.0").unwrap()),
+            "the control did not report the update the mock served, so this test is not \
+             exercising the real check"
+        );
+    }
+
+    /// Both spawn sites pass the real GitHub base and a real setting, so the
+    /// parameterisation that makes the test above possible has not turned
+    /// production into something that checks a different host -- or, worse,
+    /// into something that passes a literal `true`.
+    ///
+    /// Source-level because neither call site is reachable from a test: both
+    /// are inside `run_tray_loop`'s startup and its main loop.
+    #[test]
+    fn both_update_check_call_sites_pass_the_real_base_and_the_users_setting() {
+        let source = include_str!("main.rs");
+        let call = concat!("check_for_update_", "logged(GITHUB_API_BASE, check_for_updates,");
+        assert_eq!(
+            source.matches(call).count(),
+            2,
+            "expected the two update-check call sites (startup and the daily interval); a site \
+             that no longer passes `GITHUB_API_BASE` is checking the wrong host, and one that \
+             no longer passes `check_for_updates` has stopped obeying the preference"
+        );
+        // Positive control for that count: the value really is read off the
+        // settings the tray loop holds, in both places, rather than invented
+        // next to the call.
+        assert_eq!(
+            source
+                .matches(concat!("let check_for_updates = estate.settings.check_for_", "updates;"))
+                .count(),
+            2,
+            "the setting is no longer read from `estate.settings` at both call sites"
+        );
+    }
 
     /// The subject DN of the certificate on a real Bitwarden CLI, exactly as
     /// `signature::verify_authenticode` hands it back: `CertNameToStrW` with
