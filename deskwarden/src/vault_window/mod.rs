@@ -1762,15 +1762,14 @@ pub fn build_frame(
         // of the frame is the only thing that turns it into a form, so the
         // button cannot end up wired differently from the keyboard.
         //
-        // **The visible control is NOT here yet, and that is a stated gap.**
-        // It belongs beside the ✉ in `draw_detail_read`'s header, where the
-        // record composer's control ended up for exactly this reason: adding a
-        // code acts on the SELECTED ITEM, and this titlebar is where things
-        // that act on the window and the account live -- a pill here would
-        // repeat the placement the user already rejected once. `detail.rs` and
-        // `theme.rs` are being edited elsewhere as this lands, so the chord is
-        // the door that exists today and `totp_add::ADD_TOTP_SHORTCUT` is
-        // already the string that button's hover will paint.
+        // **The visible control is the ⏱ in `draw_detail_read`'s header**, and
+        // it is NOT here, in this titlebar, deliberately: adding a code acts
+        // on the SELECTED ITEM, while this strip is where things that act on
+        // the window and the account live -- a pill here would repeat the
+        // placement the user already rejected once for the record composer.
+        // It reaches this flag as `DetailAction::AddTotp`, and its hover
+        // paints `totp_add::ADD_TOTP_SHORTCUT`, so the chord below and the
+        // button advertise one string and set one flag.
         let mut add_totp_asked = false;
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -3541,6 +3540,25 @@ pub fn build_frame(
                                 DetailAction::SendRecord => {
                                     send_record_asked = true;
                                 }
+                                // **The detail header's ⏱**, and it sets the
+                                // SAME frame-local flag the chord sets, for
+                                // the arm above's reason: one door per
+                                // surface. The block that reads this flag is
+                                // several hundred lines below, AFTER every
+                                // panel has been drawn -- which is precisely
+                                // why a control inside the detail pane can
+                                // still be the thing that sets it.
+                                //
+                                // That block keeps its own `login.is_some()`
+                                // filter, and this arm does not repeat it:
+                                // the button is drawn by
+                                // `detail::item_takes_a_one_time_code`, which
+                                // asks the same question, and an arm asking
+                                // it a third time here would be a third place
+                                // for the answer to drift.
+                                DetailAction::AddTotp => {
+                                    add_totp_asked = true;
+                                }
                                 // As with the sidebar's folder ×,
                                 // `confirm_click` gates this on a confirming
                                 // second click -- see its doc comment. Only
@@ -4899,6 +4917,16 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // here would put TWO Hello prompts between the click and the
         // composer for one act.
         | DetailAction::SendRecord
+        // **And `AddTotp` is on this side for a DIFFERENT reason from
+        // `SendRecord`'s, which is why it is argued and not merely appended.**
+        // `SendRecord` is here because its exposure is gated further down;
+        // this one is here because there is no exposure to gate. The form it
+        // opens reads nothing out of the item but its name, and shows nothing
+        // but what the user is typing into it -- `totp_add`'s own argument,
+        // and the reason that surface was built without a re-prompt. Wiring a
+        // button to it changes nothing about what it shows, so it does not
+        // reopen that decision.
+        | DetailAction::AddTotp
         | DetailAction::OpenApp(_) => false,
     }
 }

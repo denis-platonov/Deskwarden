@@ -22,6 +22,7 @@
 
 use super::record_ui;
 use super::relative_time;
+use super::totp_add;
 use super::sidebar::OutOfVault;
 use crate::app_match::AppMatch;
 /// The trigger vocabulary this file still spells is test-only -- see
@@ -55,7 +56,7 @@ const HEADER_PAD_Y: i8 = 20;
 const HEADER_GAP: f32 = 14.0;
 /// The strip's `width: 44px; height: 44px` avatar tile.
 const HEADER_AVATAR: f32 = 44.0;
-/// **How many controls the header strip draws**, in one place, because the
+/// **How many controls the header strip draws for EVERY item**, because the
 /// strip *reserves* its room before it draws anything and drift between the
 /// two is the failure mode that painted a control at x = -34.5.
 ///
@@ -66,11 +67,46 @@ const HEADER_AVATAR: f32 = 44.0;
 /// and that is exactly why this used to be an expression rather than a
 /// number.
 ///
-/// Not merely a constant two call sites share: `the_strip_reserves_room_for
-/// _every_control_it_draws` counts the controls actually PAINTED and fails
-/// if this disagrees with them, so a fifth control added to `draw_controls`
-/// alone cannot ride on a stale reservation.
-const HEADER_CONTROLS: usize = 4;
+/// **This is no longer the whole count**, and that is the change the ⏱
+/// brought: read [`header_controls`], never this, when reserving room.
+const HEADER_CONTROLS_ALWAYS: usize = 4;
+
+/// **How many controls the strip draws for THIS item** -- the number the
+/// reservation is computed from, and the number
+/// `the_strip_reserves_room_for_every_control_it_draws` counts the painted
+/// marks against.
+///
+/// [`HEADER_CONTROLS_ALWAYS`] plus the ⏱, which is drawn only where it would
+/// do something. `vault_window::mod`'s one block that opens the form resolves
+/// the selection and filters it on `login.is_some()`; a ⏱ on a card or a note
+/// would be a control that reports an action nothing acts on -- exactly the
+/// "there is nothing to do me to" state that got the record composer's
+/// titlebar pill rejected, and the reason it is now in this strip at all.
+///
+/// **Read off the item and not off [`ItemKind`]**, because that filter is: a
+/// `type: 1` item carrying no `login` object has nowhere to put a seed, and
+/// gating on the kind would draw the control for it anyway.
+///
+/// Not merely a helper two call sites share: the guard counts the controls
+/// actually PAINTED and fails if this disagrees with them, so a sixth control
+/// added to `draw_controls` alone cannot ride on a stale reservation. It is
+/// asserted at both answers -- a login and a card -- because a function of
+/// the item that was checked at one item is a constant that was checked once.
+fn header_controls(item: &VaultItem) -> usize {
+    HEADER_CONTROLS_ALWAYS + usize::from(item_takes_a_one_time_code(item))
+}
+
+/// **Whether this item is one a one-time code could be added to** -- and the
+/// single expression both the strip and its guards read.
+///
+/// `login.is_some()`, which is `vault_window::mod`'s own filter on the block
+/// that opens the form, written here as the thing the button is drawn by.
+/// Two spellings of this question are how a control and the door it knocks on
+/// come to disagree; `the_clock_is_drawn_for_exactly_the_items_the_form_opens
+/// _for` is what holds them to one.
+fn item_takes_a_one_time_code(item: &VaultItem) -> bool {
+    item.login.is_some()
+}
 /// `font-size: 22px` on the item title.
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
@@ -473,6 +509,27 @@ pub enum DetailAction {
     /// the composer re-resolves the id when it opens, and again when Create
     /// is pressed.
     SendRecord,
+    /// The header's clock was clicked: the user wants the **"Add a one-time
+    /// code"** form for this item.
+    ///
+    /// **It REPORTS and does not open**, for [`Self::SendRecord`]'s reason
+    /// exactly: `vault_window::mod` has one block that turns a request for
+    /// that form into one, and this control and CTRL+SHIFT+2 both arrive
+    /// there as the same frame-local `add_totp_asked` flag. The comment at
+    /// that flag's declaration named this control as the door that did not
+    /// exist yet; this is it.
+    ///
+    /// **Deliberately NOT on `detail_action_exposes_secrets`' exposing
+    /// side**, and that is a decision inherited rather than made here: the
+    /// form shows nothing out of the vault -- only what the user is typing
+    /// into it -- so there is nothing for a master-password re-prompt to
+    /// protect. That is `totp_add`'s own argument, and wiring a button to it
+    /// does not reopen it.
+    ///
+    /// Carrying no item, because the block that opens the form re-resolves
+    /// the selection out of `items` and applies its own `login.is_some()`
+    /// filter -- the same filter [`header_controls`] draws this control by.
+    AddTotp,
     /// The header's favourite control was clicked, carrying **the state the
     /// item should end up in**, not "it was clicked".
     ///
@@ -2544,21 +2601,28 @@ pub fn draw_detail_read(
             // and the room its controls take is the failure mode that put a
             // control off the edge of the pane once already.
             //
-            // The star, the envelope, the kebab and the close ✕ -- square at
-            // the strip's own control height -- plus the three gaps between
-            // them. The whole of what this strip draws. There is no per-item
-            // term: the worded primary button that used to contribute one has
-            // been removed.
+            // The star, the envelope, the clock, the kebab and the close ✕ --
+            // square at the strip's own control height -- plus the gaps
+            // between them. The whole of what this strip draws.
             //
-            // Spelled as a count and not as four additions, because
+            // **There IS a per-item term again, and it is a count and not a
+            // width**: [`header_controls`] answers four or five depending on
+            // whether the ⏱ is drawn for this item. That is why the worded
+            // "Fill in app" button's removal turned this into a number, and
+            // why the number is now behind a function -- every control here
+            // is still square at [`theme::HEADER_BUTTON_HEIGHT`], so how many
+            // there are is the whole question.
+            //
+            // Spelled as a count and not as five additions, because
             // `the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide
-            // _one` spells it the same way -- a fifth control added to
+            // _one` spells it the same way -- a control added to
             // `draw_controls` and not here is the drift that painted a
             // control at x = -34.5 once already, and
             // `the_strip_reserves_room_for_every_control_it_draws` is what
             // now measures the two against each other.
-            let controls_width = theme::HEADER_BUTTON_HEIGHT * HEADER_CONTROLS as f32
-                + HEADER_GAP * (HEADER_CONTROLS - 1) as f32;
+            let controls = header_controls(item);
+            let controls_width = theme::HEADER_BUTTON_HEIGHT * controls as f32
+                + HEADER_GAP * (controls - 1) as f32;
             let layout = header_layout(content_width, controls_width);
 
             // The three pieces of the strip, as closures, because the two
@@ -2632,7 +2696,7 @@ pub fn draw_detail_read(
                     });
                 });
             };
-            // **Right-to-left, so what reads left-to-right is ★, ✉, ⋮, ✕.**
+            // **Right-to-left, so what reads left-to-right is ★, ✉, ⏱, ⋮, ✕.**
             // The caller supplies a `Ui` already in that layout and already
             // carrying `HEADER_GAP` spacing; this only fills it.
             //
@@ -2643,19 +2707,21 @@ pub fn draw_detail_read(
             // updated with it, so for some months the strip's own header
             // described a control the strip did not draw. It is corrected
             // rather than merely deleted because the count is load-bearing:
-            // see [`HEADER_CONTROLS`], which is what the room reserved above
+            // see [`header_controls`], which is what the room reserved above
             // is computed from.
             //
-            // **Every one of these four states its chord on hover, or has
-            // none to state.** The user's request was "for all of those --
-            // show keys in tooltip on hover not just a description", which
-            // the rows below this strip have done since `copy_shortcut_chord`
-            // (`"Click to copy · CTRL+B"`). Only ✉ has a chord: ★, ⋮ and ✕
-            // are bound to no key anywhere in this crate, and inventing one
-            // in a tooltip would advertise a binding the code does not have
-            // -- which `COPY_SHORTCUTS`' own doc calls worse than no hint at
-            // all. ✉ reads its chord from `record_ui::SEND_RECORD_SHORTCUT`,
-            // never from a string written here; see that call.
+            // **Every one of these states its chord on hover, or has none to
+            // state.** The user's request was "for all of those -- show keys
+            // in tooltip on hover not just a description", which the rows
+            // below this strip have done since `copy_shortcut_chord`
+            // (`"Click to copy · CTRL+B"`). Only ✉ and ⏱ have chords: ★, ⋮
+            // and ✕ are bound to no key anywhere in this crate, and inventing
+            // one in a tooltip would advertise a binding the code does not
+            // have -- which `COPY_SHORTCUTS`' own doc calls worse than no
+            // hint at all. ✉ reads its chord from
+            // `record_ui::SEND_RECORD_SHORTCUT` and ⏱ from
+            // `totp_add::ADD_TOTP_SHORTCUT`, never from a string written
+            // here; see those calls.
             let mut draw_controls = |ui: &mut egui::Ui| {
                 // **The pane's own close, rightmost -- to the right of the
                 // kebab, where the user asked for it**: "Add X button to the
@@ -2727,6 +2793,63 @@ pub fn draw_detail_read(
                         action = DetailAction::Delete;
                     }
                 });
+                // **"Add a one-time code", and this is the control
+                // `vault_window::mod` left a stated gap for.** Until now the
+                // whole feature -- the form, the 6c confirmation, the replace
+                // warning -- was reachable by CTRL+SHIFT+2 and by nothing a
+                // user could see.
+                //
+                // **Here, beside the ✉, for the ✉'s own reason.** The record
+                // composer's control moved off the window titlebar because a
+                // pill there acted on the SELECTED ITEM from a strip whose
+                // every other control is global, and had to grey itself out
+                // with nothing selected to say so. Adding a code acts on the
+                // selected item too, so a titlebar pill for it would have
+                // repeated a placement the user has already rejected once.
+                //
+                // **Between the ✉ and the kebab**, which is a position and
+                // not a leftover. The two marks on either side are what it
+                // belongs between: what it opens WRITES a field onto this
+                // item, which is Edit's neighbourhood and Edit is inside that
+                // kebab; and it is the one control in this strip that is not
+                // drawn for every item, so it sits against the boundary
+                // rather than between two marks that are always there. The
+                // pair the user named -- the star and the envelope after it
+                // -- keep their order and their adjacency untouched.
+                //
+                // **Gated, and on the same expression the form's own door
+                // uses**: see `item_takes_a_one_time_code`. The alternative
+                // is a ⏱ on a secure note that reports an action
+                // `vault_window::mod` then filters away -- a control that
+                // does nothing and cannot say so, which is the exact defect
+                // that got the titlebar pill removed.
+                //
+                // **It REPORTS, through `DetailAction::AddTotp`**, into the
+                // same frame-local `add_totp_asked` the chord sets. One door
+                // per surface; see that variant.
+                //
+                // **The hover carries the chord from
+                // `totp_add::ADD_TOTP_SHORTCUT`**, and the words from
+                // `totp_add::ADD_TOTP_LABEL` -- the same rule and the same
+                // separator the ✉ beside it follows, and for the same reason:
+                // a literal typed here would be a second home for a fact the
+                // key handler owns, and a rebinding would leave this tooltip
+                // lying.
+                if item_takes_a_one_time_code(item) {
+                    // Bound before it is asked, rather than chained into the
+                    // `if` above: collapsing the two conditions would make
+                    // PAINTING this control a side effect of evaluating a
+                    // boolean, which is how a gate and a mark come to be read
+                    // as one thing.
+                    let clock = theme::add_totp_button(ui).on_hover_text(format!(
+                        "{} · {}",
+                        totp_add::ADD_TOTP_LABEL,
+                        totp_add::ADD_TOTP_SHORTCUT
+                    ));
+                    if clock.clicked() {
+                        action = DetailAction::AddTotp;
+                    }
+                }
                 // **"Send a record", MOVED HERE off the window titlebar** at
                 // the user's direction: "remove huge button Send a record on
                 // top -- those are global things to the details like email
@@ -6802,6 +6925,7 @@ mod tests {
             kebab_dots: Vec::new(),
             envelopes: Vec::new(),
             pane_closes: Vec::new(),
+            clocks: Vec::new(),
             segments: Vec::new(),
             images: Vec::new(),
             shapes: egui::Shape::Noop,
@@ -6821,6 +6945,7 @@ mod tests {
         frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
         frame.envelopes = theme::icon_probe::envelopes(&all);
         frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
+        frame.clocks = theme::icon_probe::clocks(&all);
         frame.segments = theme::icon_probe::line_segments(&all);
         collect_images(&all, &mut frame.images);
         frame.shapes = all;
@@ -7250,6 +7375,12 @@ mod tests {
         /// it is, is that it must not read as the Delete sitting one control
         /// to its left.
         pane_closes: Vec<(egui::Rect, egui::Color32)>,
+        /// The header's "Add a one-time code" clock faces, with their
+        /// colour. Like the envelope, this mark paints no fill and no
+        /// string, so the probe is the only way a test sees it at all --
+        /// and unlike the envelope it is drawn for SOME items only, which
+        /// is what most of the guards over it are about.
+        clocks: Vec<(egui::Rect, egui::Color32)>,
         segments: Vec<egui::Rect>,
         /// Every textured rect -- the matched app's icon is the only one this
         /// pane can paint. See [`collect_images`].
@@ -7410,6 +7541,22 @@ mod tests {
                 self.strings()
             );
             self.pane_closes[0]
+        }
+
+        /// The header's "Add a one-time code" clock, with its stroke colour.
+        /// Exactly one, for [`Frame::star`]'s reason -- and here that also
+        /// proves the clock's face is not being confused with any other ring
+        /// this pane strokes, of which every masked row paints a pupil.
+        fn clock(&self) -> (egui::Rect, egui::Color32) {
+            assert_eq!(
+                self.clocks.len(),
+                1,
+                "expected exactly one one-time-code clock in the header, found {}; the \r
+                 pane painted: {:?}",
+                self.clocks.len(),
+                self.strings()
+            );
+            self.clocks[0]
         }
 
         /// The colour the kebab's three dots were filled in -- one colour,
@@ -7624,6 +7771,7 @@ mod tests {
                 kebab_dots: Vec::new(),
                 envelopes: Vec::new(),
                 pane_closes: Vec::new(),
+                clocks: Vec::new(),
                 segments: Vec::new(),
                 images: Vec::new(),
                 shapes: egui::Shape::Noop,
@@ -7647,6 +7795,7 @@ mod tests {
             frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
             frame.envelopes = theme::icon_probe::envelopes(&all);
             frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
+            frame.clocks = theme::icon_probe::clocks(&all);
             frame.segments = theme::icon_probe::line_segments(&all);
             collect_images(&all, &mut frame.images);
             frame.shapes = all;
@@ -12400,6 +12549,11 @@ mod tests {
                 ("the Send envelope", frame.envelope().0),
                 ("the kebab", frame.kebab()),
                 ("the close ✕", frame.pane_close().0),
+                // The fifth control. The sweep's item is a login, so it is
+                // drawn at every width here -- and it is the control the
+                // reservation grew for, which makes it the one most likely
+                // to be the mark pushed off the pane.
+                ("the one-time code clock", frame.clock().0),
             ] {
                 assert!(
                     bounds.contains_rect(rect),
@@ -12433,7 +12587,7 @@ mod tests {
     ///
     /// Removing the header's "Fill in app" button took a rung off this
     /// ladder: the strip's controls used to be a per-item width with a
-    /// shortcut hint that could be shed, and are now [`HEADER_CONTROLS`]
+    /// shortcut hint that could be shed, and are now [`header_controls`]
     /// fixed squares. A collapse that far can quietly leave a function with
     /// one reachable branch, and this is the pane whose controls were once
     /// painted at x = -34.5 -- so the branch that keeps them off the title at
@@ -12442,72 +12596,145 @@ mod tests {
     /// The controls' width is spelled the way `draw_detail_read` spells it,
     /// and the content width the way the strip's `Frame` produces it, so this
     /// cannot pass on numbers the real header does not use. It went from two
-    /// controls to four when the ✉ and the ✕ were added, and the stacking
-    /// threshold moved with it from ~322pt to ~418pt -- which is why the
-    /// sweep above still crosses it: that sweep runs to 560.
+    /// controls to four when the ✉ and the ✕ were added -- moving the
+    /// threshold from ~322pt to ~418pt -- and to FIVE when the ⏱ was, which
+    /// moves it again, to ~466pt. The sweep above runs to 560 and still
+    /// crosses it.
+    ///
+    /// **Asserted at both counts**, because the ⏱ is drawn for some items
+    /// and not others: a stacking rule checked only at the wider of the two
+    /// is a rule checked for logins and assumed for everything else.
     #[test]
     fn the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide_one() {
-        let controls = theme::HEADER_BUTTON_HEIGHT * HEADER_CONTROLS as f32
-            + HEADER_GAP * (HEADER_CONTROLS - 1) as f32;
         let content = |pane: f32| pane - f32::from(HEADER_PAD_X) * 2.0;
+        let width_of = |item: &VaultItem| {
+            let n = header_controls(item);
+            theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32
+        };
+        // A login draws five controls and a card four -- the premise for the
+        // loop below being two cases and not one twice.
+        let login = a_login();
+        let card = a_full_card();
+        assert_eq!(
+            (header_controls(&login), header_controls(&card)),
+            (HEADER_CONTROLS_ALWAYS + 1, HEADER_CONTROLS_ALWAYS),
+            "these two items no longer draw different numbers of controls, so this test is \
+             checking one arrangement twice"
+        );
 
+        for (what, item) in [("a login", &login), ("a card", &card)] {
+            let controls = width_of(item);
+            assert!(
+                header_layout(content(MIN_PANE), controls).stacked,
+                "at the app's minimum, with {what} selected, the controls and a \
+                 {TITLE_MIN}pt title are being kept on one line -- which is how the strip \
+                 painted a control off the pane before"
+            );
+            assert!(
+                !header_layout(content(PANE), controls).stacked,
+                "the ordinary {PANE}pt pane is stacking with {what} selected, so the \
+                 unstacked branch is dead"
+            );
+        }
+    }
+
+    /// **Every control still fits inside the app's own minimum window.**
+    ///
+    /// [`header_layout`] answers "stacked" or "not", and neither answer is
+    /// "they do not fit at all": the stacked branch gives the controls a row
+    /// of the full content width and then trusts them to live in it. That
+    /// trust was worth little while the strip drew four fixed squares with
+    /// 24pt to spare; the ⏱ spends 48 of that, leaving 24, and a SIXTH
+    /// control would overflow the narrowest pane this app can be with no
+    /// branch left to take.
+    ///
+    /// So the arithmetic is asserted rather than left implied -- at the
+    /// widest count the strip can draw, which is the login's.
+    #[test]
+    fn the_strips_controls_fit_the_apps_minimum_window() {
+        let item = a_login();
+        let n = header_controls(&item);
+        let controls = theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32;
+        let content = MIN_PANE - f32::from(HEADER_PAD_X) * 2.0;
         assert!(
-            header_layout(content(MIN_PANE), controls).stacked,
-            "at the app's minimum the controls and a {TITLE_MIN}pt title are being kept on \
-             one line -- which is how the strip painted a control off the pane before"
+            header_layout(content, controls).stacked,
+            "the minimum pane is not stacking, so the controls are not getting the full \
+             content width this assertion assumes"
         );
         assert!(
-            !header_layout(content(PANE), controls).stacked,
-            "the ordinary {PANE}pt pane is stacking, so the unstacked branch is dead"
+            controls <= content,
+            "at the app's minimum the strip's {n} controls want {controls}pt and the \
+             stacked row has {content}pt -- a control is being painted off the pane, which \
+             is the exact failure this file has already shipped once"
         );
     }
 
     /// **The strip reserves room for exactly the controls it draws.**
     ///
-    /// [`HEADER_CONTROLS`] is read before anything is painted, to decide
+    /// [`header_controls`] is read before anything is painted, to decide
     /// whether the strip fits on one line, and `draw_controls` is what
     /// actually paints. Drift between those two is not hypothetical: it is
     /// the failure mode that put a control at x = -34.5, entirely off the
     /// pane, under a title running straight through the buttons.
     ///
     /// So the count is not merely shared -- the controls PAINTED are counted
-    /// off the shape tree and compared to it. A fifth control added to
-    /// `draw_controls` and not to the constant reds here, at the pane width
+    /// off the shape tree and compared to it. A sixth control added to
+    /// `draw_controls` and not to the function reds here, at the pane width
     /// where the reservation matters most.
     ///
     /// Each control is found by its own probe, which is also what makes this
-    /// a count of four *different* marks rather than of four of anything: a
-    /// star found four times would not satisfy it.
+    /// a count of *different* marks rather than of that many of anything: a
+    /// star found five times would not satisfy it.
+    ///
+    /// **Run for BOTH answers the strip can give**, since [`header_controls`]
+    /// is a function of the item now: a login, which gets the ⏱, and a card,
+    /// which does not. A reservation checked at one answer of a two-answer
+    /// function is a reservation that has been checked once.
     #[test]
     fn the_strip_reserves_room_for_every_control_it_draws() {
-        let item = a_login();
-        let mut pane = Pane::wide(MIN_PANE);
-        let frame = pane.idle(&item, &TotpState::NoSecret);
+        for (what, item) in [("a login", a_login()), ("a card", a_full_card())] {
+            let mut pane = Pane::wide(MIN_PANE);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
 
-        let painted = [
-            ("the favourite star", frame.stars.len()),
-            ("the Send envelope", frame.envelopes.len()),
-            // Three dots, one control -- `Frame::kebab` is what asserts the
-            // count of dots, and it is called here for that assertion.
-            ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
-            ("the close ✕", frame.pane_closes.len()),
-        ];
-        let _ = frame.kebab();
-        for (name, count) in painted {
+            let mut painted = vec![
+                ("the favourite star", frame.stars.len()),
+                ("the Send envelope", frame.envelopes.len()),
+                // Three dots, one control -- `Frame::kebab` is what asserts
+                // the count of dots, and it is called here for that assertion.
+                ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
+                ("the close ✕", frame.pane_closes.len()),
+            ];
+            // The conditional one, listed only where it is meant to be drawn
+            // -- and its ABSENCE asserted on the other item, so a ⏱ that
+            // started appearing on cards fails here rather than merely making
+            // two counts agree with each other.
+            if item_takes_a_one_time_code(&item) {
+                painted.push(("the one-time code clock", frame.clocks.len()));
+            } else {
+                assert!(
+                    frame.clocks.is_empty(),
+                    "{what} was drawn a one-time-code clock, and there is nothing on it \
+                     for a code to go into"
+                );
+            }
+            let _ = frame.kebab();
+            for (name, count) in &painted {
+                assert_eq!(
+                    *count, 1,
+                    "with {what} selected the header painted {count} of {name}, so the \
+                     count below is not counting distinct controls"
+                );
+            }
             assert_eq!(
-                count, 1,
-                "the header painted {count} of {name}, so the count below is not counting \
-                 four distinct controls"
+                painted.len(),
+                header_controls(&item),
+                "with {what} selected the strip draws {} controls and reserves room for \
+                 {} -- a control the reservation does not know about is a control that \
+                 gets painted off the pane",
+                painted.len(),
+                header_controls(&item)
             );
         }
-        assert_eq!(
-            painted.len(),
-            HEADER_CONTROLS,
-            "the strip draws {} controls and reserves room for {HEADER_CONTROLS} -- a \
-             control the reservation does not know about is a control that gets painted \
-             off the pane",
-            painted.len()
-        );
     }
 
     /// **The ✕ reports `ClosePane`, and the ✉ reports `SendRecord`.**
@@ -12545,6 +12772,137 @@ mod tests {
             "clicking the header's ✉ did not report `SendRecord`, so the record composer \
              is unreachable from the only control that opens it"
         );
+    }
+
+    /// **The ⏱ reports `AddTotp`, pressed where the header really painted
+    /// it -- and it is the ONLY control in the strip that does.**
+    ///
+    /// Both halves are needed. The first says the control is not inert; the
+    /// second says it was not wired by pressing something else, which is the
+    /// slip a single positive assertion cannot see -- four other marks sit in
+    /// this strip and one of them is 48pt away.
+    #[test]
+    fn the_header_clock_reports_add_totp_and_no_other_control_does() {
+        let item = a_login();
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let clock_at = laid_out.clock().0.center();
+        let others = [
+            ("the favourite star", laid_out.star().rect.center()),
+            ("the Send envelope", laid_out.envelope().0.center()),
+            ("the kebab", laid_out.kebab().center()),
+            ("the close ✕", laid_out.pane_close().0.center()),
+        ];
+        assert!(!clock_at.any_nan(), "the header painted no clock to press");
+
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.click(&item, &TotpState::NoSecret, clock_at).action,
+            DetailAction::AddTotp,
+            "clicking the header's ⏱ did not report `AddTotp`, so the one-time code form \
+             is still reachable only by a chord nothing on screen mentions"
+        );
+
+        for (name, at) in others {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            assert_ne!(
+                pane.click(&item, &TotpState::NoSecret, at).action,
+                DetailAction::AddTotp,
+                "clicking {name} also reported `AddTotp`, so the ⏱'s own assertion above \
+                 says nothing about which mark was pressed"
+            );
+        }
+    }
+
+    /// **The ⏱ is drawn for exactly the items the form will open for.**
+    ///
+    /// `vault_window::mod`'s block filters the selection on `login.is_some()`
+    /// before it builds a `TotpAdd`. A control drawn wider than that filter
+    /// is a control that reports an action and produces nothing -- the exact
+    /// "there is nothing to do me to" state that got the record composer's
+    /// titlebar pill removed, and the reason this control is in this strip.
+    ///
+    /// Asserted over every kind this pane draws, and in both directions, so
+    /// neither a ⏱ that appeared on a note nor one that vanished from a
+    /// login can pass. The premise -- that these fixtures really do differ --
+    /// is checked first, because a list of five items that all happened to
+    /// carry a login would satisfy the loop by never taking one branch.
+    #[test]
+    fn the_clock_is_drawn_for_exactly_the_items_the_form_opens_for() {
+        let cases = [
+            ("a login", a_login()),
+            ("a card", a_full_card()),
+            ("a secure note", an_item(Some(2))),
+            ("an identity", an_item(Some(4))),
+            ("an SSH key", an_item(Some(5))),
+        ];
+        assert!(
+            cases.iter().any(|(_, i)| item_takes_a_one_time_code(i))
+                && cases.iter().any(|(_, i)| !item_takes_a_one_time_code(i)),
+            "every fixture answers the same way, so this loop only ever tests one branch"
+        );
+
+        for (what, item) in &cases {
+            let mut pane = Pane::new();
+            let frame = pane.idle(item, &TotpState::NoSecret);
+            // The premise for each case separately: the header really was
+            // drawn for this item, so "no clock" is a statement about the
+            // gate and not about an empty pane.
+            let _ = frame.kebab();
+            if item_takes_a_one_time_code(item) {
+                assert_eq!(
+                    frame.clocks.len(),
+                    1,
+                    "{what} can take a one-time code and the header offers no way to add one"
+                );
+            } else {
+                assert!(
+                    frame.clocks.is_empty(),
+                    "{what} was drawn a ⏱, and the block that would open the form filters \
+                     it out -- so the control reports an action and nothing happens"
+                );
+            }
+        }
+    }
+
+    /// **The ⏱'s hover states its chord, and states it from the constant
+    /// the key handler is held to.**
+    ///
+    /// The user's request for this strip was "show keys in tooltip on hover
+    /// not just a description". The ✉ beside it does that from
+    /// `record_ui::SEND_RECORD_SHORTCUT`; this does it from
+    /// `totp_add::ADD_TOTP_SHORTCUT`, which
+    /// `vault_window::mod`'s `the_add_code_chord_is_spelled_the_way_it_is_bound`
+    /// already compares against `ADD_TOTP_MODIFIERS` and `ADD_TOTP_KEY` --
+    /// the values the key handler actually matches on. So a rebinding cannot
+    /// leave this tooltip lying.
+    ///
+    /// Read off the SOURCE and not off a rendered tooltip, deliberately and
+    /// with its limit stated: egui paints a tooltip in a layer this pane's
+    /// harness does not drive, so there is no frame in which the words are
+    /// findable text. What can be checked -- and what a literal typed at the
+    /// call site would fail -- is that neither string is spelled here.
+    #[test]
+    fn the_clocks_hover_carries_the_chord_from_the_one_place_it_is_spelled() {
+        let source = include_str!("detail.rs");
+        let code = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<String>();
+        assert!(
+            code.contains("totp_add::ADD_TOTP_LABEL") && code.contains("totp_add::ADD_TOTP_SHORTCUT"),
+            "the ⏱'s hover no longer reads its words and its chord from `totp_add`"
+        );
+        for spelled in [totp_add::ADD_TOTP_LABEL, totp_add::ADD_TOTP_SHORTCUT] {
+            assert!(
+                !code.contains(&format!("\"{spelled}")),
+                "{spelled:?} is written out as a literal in this file, so there are now two \
+                 homes for it and a rebinding will leave one of them lying"
+            );
+        }
     }
 
     /// **The ✕ does not look like the Delete it sits beside.**
