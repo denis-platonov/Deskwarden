@@ -1420,6 +1420,22 @@ fn main() {
                 // `process::exit` actually tearing the process down.
                 log::info!("quit requested from tray; killing bw serve");
                 estate.cache.clear();
+                // **And the clipboard, for exactly the reason the line above
+                // gives.** The clipboard outlives this process: a password
+                // copied a moment ago would otherwise still be pasteable long
+                // after the user believes Deskwarden is gone, and the
+                // 45-second timer that would have taken it back dies with the
+                // thread waiting it out. `clear_if_still_ours` refuses to
+                // touch a clipboard that has moved on since, so quitting
+                // cannot cost the user something they copied from elsewhere.
+                //
+                // **This covers a clean quit and nothing more.** A crash, a
+                // Task Manager kill or a power cut all leave the secret on
+                // the clipboard, and no in-process arrangement can change
+                // that -- which is the other half of why the copy is written
+                // with the formats that keep it out of `Win+V` in the first
+                // place.
+                deskwarden::clipboard::clear_if_still_ours();
                 if let Some(child) = estate.child.as_mut() {
                     bw_serve::stop_bw_serve(child);
                 }
@@ -2225,6 +2241,11 @@ fn main() {
                     // longer than it takes to tear down.
                     log::info!("update installer launched; shutting down for update");
                     estate.cache.clear();
+                    // The clipboard too, for the same reason and with the
+                    // same caveat as the Quit handler above. The installer
+                    // relaunches this binary, so the waiting thread is
+                    // certainly gone.
+                    deskwarden::clipboard::clear_if_still_ours();
                     if let Some(child) = estate.child.as_mut() {
                         bw_serve::stop_bw_serve(child);
                     }

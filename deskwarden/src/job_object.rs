@@ -1357,6 +1357,13 @@ mod tests {
         ("app_identity.rs", 1),
         ("app_window.rs", 4),
         ("breach.rs", 2),
+        // One: the waiter that sleeps out `clipboard::CLEAR_AFTER` and then
+        // takes a copied secret back off the clipboard. A thread rather than a
+        // tick in some frame loop because the vault window can be closed --
+        // and usually is -- long before the 45 seconds are up, and a timer
+        // that only runs while a window is open would never fire in the case
+        // it exists for.
+        ("clipboard.rs", 1),
         ("http_agent.rs", 4),
         ("injector/mod.rs", 1),
         ("injector/sequence.rs", 1),

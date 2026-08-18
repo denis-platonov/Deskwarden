@@ -4009,7 +4009,59 @@ pub fn run(
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| frame_fn(ui));
 
-    handles.finish()
+    let result = handles.finish();
+    // **The effect sits here and the decision sits in
+    // `ends_a_copied_secrets_life`**, which is a pure function over the result
+    // this window just produced. It is here rather than inside `finish` for
+    // one reason: `finish` is called by tests over fake handles, and
+    // `clear_if_still_ours` reaches the real Windows clipboard -- the one
+    // belonging to whoever is running `cargo test`. `run` is an eframe
+    // application no test in this crate can call, which makes it the right
+    // side of that line.
+    if ends_a_copied_secrets_life(&result) {
+        crate::clipboard::clear_if_still_ours();
+    }
+    result
+}
+
+/// **Whether the way this window ended means a copied secret's life is over.**
+///
+/// Locking is the case this exists for. A password sitting on the clipboard is
+/// exactly what locking the vault is supposed to put out of reach, and a lock
+/// that leaves it there has locked the front door with the key still in it.
+/// `needs_reauth` is the same event arriving from the other direction -- the
+/// session was invalidated elsewhere -- and the caller already treats the two
+/// identically. An account switch, an add and a remove all mean the user has
+/// moved to a different vault, and a credential from the one they left has no
+/// business surviving the move.
+///
+/// **Closing the window is deliberately NOT on that list, and this is the one
+/// judgement call in the set.** The app does not exit when the vault window
+/// closes -- it goes on living in the tray -- and closing the window is a
+/// perfectly ordinary thing to do *in order to* get at the application you
+/// meant to paste into. Clearing here would break the most common successful
+/// use of the feature to protect against a case that the 45-second timer
+/// already covers a few moments later. The other five are moments where the
+/// user has said they are finished; a close is not one, it is usually a
+/// user getting on with it.
+///
+/// Whatever this answers, [`crate::clipboard::clear_if_still_ours`] still
+/// refuses to touch a clipboard that has moved on since.
+#[must_use]
+fn ends_a_copied_secrets_life(result: &VaultWindowResult) -> bool {
+    let VaultWindowResult {
+        locked,
+        needs_reauth,
+        switch_to,
+        add_account,
+        remove_account,
+        // Neither is a reason the window closed. A preference change says
+        // nothing about the session (see the field's own doc), and the
+        // account details are a cache riding along.
+        edited_settings: _,
+        account_details: _,
+    } = result;
+    *locked || *needs_reauth || switch_to.is_some() || *add_account || *remove_account
 }
 
 /// If `e` is `VaultError::Unauthorized`, flags the window to close and
@@ -17703,8 +17755,10 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            // 55 as of Sends step 5, which added `mod send_create_wiring`.
-            modules, 55,
+            // 56 as of the clipboard-clearing step, which added
+            // `mod clipboard_end_of_life` -- the decision about which ways of
+            // leaving this window take a copied secret with them.
+            modules, 56,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -26892,5 +26946,92 @@ mod send_create_wiring {
                  allocator in the clear when it was let go (publishing: {wipe_by_publishing})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_end_of_life {
+    use super::*;
+
+    /// A result that means "the window just closed and nothing else
+    /// happened": every reason-it-closed field false or absent.
+    fn plain_close() -> VaultWindowResult {
+        VaultWindowResult {
+            locked: false,
+            needs_reauth: false,
+            edited_settings: None,
+            switch_to: None,
+            add_account: false,
+            remove_account: false,
+            account_details: None,
+        }
+    }
+
+    /// **Every way the session ends takes the clipboard with it**, named one
+    /// at a time so that dropping any single one reds this test rather than
+    /// being absorbed by the others.
+    #[test]
+    fn locking_switching_and_leaving_an_account_all_end_a_copied_secrets_life() {
+        let cases: [(&str, VaultWindowResult); 5] = [
+            ("a manual or idle lock", VaultWindowResult { locked: true, ..plain_close() }),
+            (
+                "the session being invalidated elsewhere",
+                VaultWindowResult { needs_reauth: true, ..plain_close() },
+            ),
+            (
+                "switching to another account",
+                VaultWindowResult {
+                    switch_to: Some(crate::accounts::AccountId::generate()),
+                    ..plain_close()
+                },
+            ),
+            ("adding an account", VaultWindowResult { add_account: true, ..plain_close() }),
+            ("removing an account", VaultWindowResult { remove_account: true, ..plain_close() }),
+        ];
+        for (what, result) in &cases {
+            assert!(
+                ends_a_copied_secrets_life(result),
+                "{what} left a copied password on the clipboard"
+            );
+        }
+        // Control: the projection is not simply true for everything.
+        assert!(
+            !ends_a_copied_secrets_life(&plain_close()),
+            "control: a plain close answers the same as a lock, so every case above is vacuous"
+        );
+    }
+
+    /// **Closing the window does not, and neither does visiting Preferences.**
+    /// The decision and the reasoning are in the function's own doc; this is
+    /// the pin that makes changing it a deliberate act.
+    ///
+    /// The app lives on in the tray after the window closes, and closing it to
+    /// get at the thing you meant to paste into is the ordinary successful
+    /// path. The timer covers the walk-away case a few moments later.
+    #[test]
+    fn merely_closing_the_window_leaves_the_clipboard_alone() {
+        assert!(
+            !ends_a_copied_secrets_life(&plain_close()),
+            "closing the vault window wiped the password the user closed it in order to paste"
+        );
+        assert!(
+            !ends_a_copied_secrets_life(&VaultWindowResult {
+                edited_settings: Some(crate::settings::Settings::default()),
+                ..plain_close()
+            }),
+            "opening Preferences and closing the window wiped the clipboard; a preference \
+             change says nothing at all about the session"
+        );
+        // ...and a lock reported alongside the very same preference edit
+        // still clears, so the field above is being ignored rather than
+        // suppressing the decision.
+        assert!(
+            ends_a_copied_secrets_life(&VaultWindowResult {
+                locked: true,
+                edited_settings: Some(crate::settings::Settings::default()),
+                ..plain_close()
+            }),
+            "control: a preference edit alongside a lock cancelled the lock's clear"
+        );
     }
 }
