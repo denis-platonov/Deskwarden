@@ -227,6 +227,54 @@ fn prove_by_hello(config_dir: &Path, account: &AccountId) -> Result<(), String> 
     crate::hello::unlock_password_for(config_dir, account).map(|_| ())
 }
 
+/// The gate for `scope`, given whether that account is Hello-enrolled.
+///
+/// The pure half of [`gate_for_account`]: `enrolled` is the one thing that
+/// call has to ask the operating system, so it is a parameter here and both
+/// answers are reachable from a test.
+///
+/// An account with no scope -- no resolvable config directory, or no account
+/// at all -- is [`RepromptGate::unprovable`] for the same reason an
+/// un-enrolled one is: there is nowhere to look for the enrollment that would
+/// prove anything.
+pub fn gate_from(scope: Option<Scope>, enrolled: bool) -> RepromptGate {
+    match scope {
+        Some(scope) if enrolled => RepromptGate::production(scope),
+        _ => RepromptGate::unprovable(),
+    }
+}
+
+/// Where this app's per-account files live, or `None` on a platform with no
+/// resolvable config directory.
+///
+/// Derived from [`crate::settings::default_path`]'s parent rather than
+/// resolving `ProjectDirs` a second time: two spellings of "the config
+/// directory" is exactly how one of them ends up pointing somewhere else.
+pub fn config_dir() -> Option<PathBuf> {
+    crate::settings::default_path()
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+/// The gate for the account this window is showing.
+///
+/// Probes Windows Hello **once**, when the window opens, rather than per
+/// frame: `hello::state_for` is a WinRT round trip and the answer cannot
+/// change while one vault window is up (enrolling happens on the login
+/// window, which is not on screen at the same time).
+pub fn gate_for_account(account: Option<&AccountId>) -> RepromptGate {
+    let scope = match (config_dir(), account) {
+        (Some(dir), Some(id)) => Some(Scope::new(dir, id.clone())),
+        _ => None,
+    };
+    let enrolled = match &scope {
+        Some(s) => crate::hello::state_for(&s.config_dir, &s.account).enrolled,
+        None => false,
+    };
+    gate_from(scope, enrolled)
+}
+
 /// The one place a protected item's secrets may be exposed, **and it is a
 /// gating function rather than an `if` at each call site**.
 ///
@@ -265,9 +313,37 @@ impl RepromptGate {
     }
 
     /// A gate whose prover is `prove`, for tests.
+    ///
+    /// `pub(crate)` and test-only: the surfaces that must be driven through a
+    /// refused and an allowed proof -- the copy rows, the copy chords, the
+    /// reveal, the fill and the Send builder -- live in other modules, and a
+    /// test there cannot pop a real Hello dialog. Not reachable from
+    /// production code at all, so no shipped path can hand itself a prover
+    /// that always says yes.
     #[cfg(test)]
-    fn with_prover(scope: Option<Scope>, prove: fn(&Path, &AccountId) -> Result<(), String>) -> Self {
+    pub(crate) fn with_prover(
+        scope: Option<Scope>,
+        prove: fn(&Path, &AccountId) -> Result<(), String>,
+    ) -> Self {
         Self { scope, prove }
+    }
+
+    /// A gate that always allows, for tests of surfaces that are not about
+    /// the re-prompt: driving an ordinary copy through a window whose gate
+    /// refuses everything would make every unrelated test a re-prompt test.
+    #[cfg(test)]
+    pub(crate) fn allowing_for_test() -> Self {
+        fn yes(_: &Path, _: &AccountId) -> Result<(), String> {
+            Ok(())
+        }
+        Self {
+            scope: Some(Scope::new(
+                PathBuf::from("C:/nowhere"),
+                AccountId::parse("0123456789abcdef0123456789abcdef")
+                    .expect("a 32-char lowercase hex id"),
+            )),
+            prove: yes,
+        }
     }
 
     /// Whether a proof can be taken at all -- [`need`]'s `can_prove`.
@@ -573,6 +649,18 @@ mod tests {
              `prove` are not independent"
         );
         assert!(!RepromptGate::unprovable().can_prove());
+    }
+
+    #[test]
+    fn only_an_enrolled_account_with_somewhere_to_look_can_be_asked() {
+        assert!(
+            gate_from(Some(scope()), true).can_prove(),
+            "an enrolled account was given a gate that can never ask, so every protected item \
+             would be refused outright"
+        );
+        assert!(!gate_from(Some(scope()), false).can_prove());
+        assert!(!gate_from(None, true).can_prove());
+        assert!(!gate_from(None, false).can_prove());
     }
 
     #[test]

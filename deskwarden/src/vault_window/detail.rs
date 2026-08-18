@@ -1404,7 +1404,18 @@ const COPY_TOAST_TEXT_SIZE: f32 = 13.0;
 #[derive(Clone, Debug, PartialEq)]
 struct CopyToast {
     /// The row's label. **Never the value.** See [`copy_toast_text`].
+    ///
+    /// When `verbatim` is set this is the whole sentence instead, and the
+    /// same rule still holds: nothing that reaches here is a secret.
     label: String,
+    /// Whether `label` is already the sentence to show.
+    ///
+    /// A flag rather than a second egui data entry, so that a refusal and a
+    /// confirmation cannot both be live at once. That matters more than it
+    /// sounds: the refusal this exists for is "nothing was copied", and a
+    /// stale "Password copied" sitting beside it would be the exact untruth
+    /// the refusal is there to prevent.
+    verbatim: bool,
     shown_at: f64,
 }
 
@@ -1507,8 +1518,12 @@ fn forget_copy_toast_in(data: &mut egui::util::IdTypeMap) {
 /// the corner of the window is precisely the surface a shoulder-surfer reads.
 /// The value is not a parameter here, so it cannot be interpolated by
 /// accident.
-fn copy_toast_text(label: &str) -> String {
-    format!("{label} copied")
+fn copy_toast_text(label: &str, verbatim: bool) -> String {
+    if verbatim {
+        label.to_string()
+    } else {
+        format!("{label} copied")
+    }
 }
 
 /// What the confirmation should say **now**, and how many seconds are left --
@@ -1531,7 +1546,7 @@ fn copy_toast_text(label: &str) -> String {
 fn copy_toast_now(toast: Option<&CopyToast>, now: f64) -> Option<(String, f64)> {
     let toast = toast?;
     let left = COPY_TOAST_SECONDS - (now - toast.shown_at);
-    (left > 0.0).then(|| (copy_toast_text(&toast.label), left))
+    (left > 0.0).then(|| (copy_toast_text(&toast.label, toast.verbatim), left))
 }
 
 /// Records that `label`'s row was just copied, starting the confirmation.
@@ -1548,6 +1563,31 @@ fn note_copied(ctx: &egui::Context, label: &str) {
             copy_toast_id(),
             CopyToast {
                 label: label.to_string(),
+                verbatim: false,
+                shown_at,
+            },
+        )
+    });
+}
+
+/// Replaces any confirmation with `text`, shown as written.
+///
+/// **This is how a refusal reaches the user, and it is a replacement rather
+/// than an addition.** `note_copied` runs inside the pane, at the click; the
+/// master-password re-prompt is decided one level out, in `vault_window::mod`,
+/// once the pane has already reported which row was pressed. So by the time a
+/// copy is refused, "Password copied" is already live -- and leaving it there
+/// while refusing the copy would be this app telling the user their password
+/// is on the clipboard when it is not. Writing to the same egui entry
+/// overwrites it, label and clock together.
+pub(crate) fn note_refused(ctx: &egui::Context, text: &str) {
+    let shown_at = ctx.input(|i| i.time);
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            copy_toast_id(),
+            CopyToast {
+                label: text.to_string(),
+                verbatim: true,
                 shown_at,
             },
         )
@@ -8776,7 +8816,7 @@ mod tests {
         );
         let after = pane.idle(&item, &TotpState::NoSecret);
         assert!(
-            after.painted(&copy_toast_text(NOTES_COPY_LABEL)),
+            after.painted(&copy_toast_text(NOTES_COPY_LABEL, false)),
             "the note copied without saying so; painted: {:?}",
             after.strings()
         );
@@ -8890,7 +8930,7 @@ mod tests {
         );
         let after = pane.idle(&item, &TotpState::NoSecret);
         assert!(
-            !after.painted(&copy_toast_text(NOTES_COPY_LABEL)),
+            !after.painted(&copy_toast_text(NOTES_COPY_LABEL, false)),
             "a selection drag raised a copy confirmation; painted: {:?}",
             after.strings()
         );
@@ -14495,7 +14535,7 @@ mod tests {
         // the items, so this test still fails if a fixture changes.
         let secrets = ["hunter2", "4242424242424242", "a.novak@ledgerline.com"];
         for label in ["Password", "Username", "One-time code", "Website", "Number"] {
-            let text = copy_toast_text(label);
+            let text = copy_toast_text(label, false);
             assert_eq!(text, format!("{label} copied"));
             for secret in secrets {
                 assert!(
@@ -14573,6 +14613,7 @@ mod tests {
     fn the_confirmation_lasts_five_seconds_and_reports_the_time_left() {
         let toast = CopyToast {
             label: "Password".to_string(),
+            verbatim: false,
             shown_at: 100.0,
         };
         assert_eq!(
@@ -14607,6 +14648,7 @@ mod tests {
     fn a_second_copy_replaces_the_message_and_restarts_the_five_seconds() {
         let first = CopyToast {
             label: "Password".to_string(),
+            verbatim: false,
             shown_at: 100.0,
         };
         // Four seconds in, one second left.
@@ -14618,6 +14660,7 @@ mod tests {
         // whole, so the label and the deadline move together.
         let second = CopyToast {
             label: "Username".to_string(),
+            verbatim: false,
             shown_at: 104.0,
         };
         assert_eq!(
@@ -17268,7 +17311,7 @@ mod read_pane_scroll_tests {
         note_copied(&pane.ctx, "Password");
         let shot = pane.idle(&item);
 
-        let text = copy_toast_text("Password");
+        let text = copy_toast_text("Password", false);
         let glyphs = shot.rect_of(&text).unwrap_or_else(|| {
             panic!(
                 "the confirmation was not painted; the pane painted {:?}",
