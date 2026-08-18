@@ -853,6 +853,12 @@ pub fn build_frame(
     // The rules relating those three are `apply_send_action` and
     // `drain_send_create`, which are plain functions the tests run.
     let mut send_create = SendCreateState::default();
+    // One record import's fetch reporting back. The whole of it -- the
+    // `bw send receive` child and the strict `read_json` both -- happens on
+    // the worker thread `send_receive_thread::spawn_send_receive` starts, so
+    // nothing here waits and no fetched payload ever sits on this thread.
+    let (record_import_tx, record_import_rx): (RecordImportSender, Receiver<RecordImportReport>) =
+        mpsc::channel();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -992,6 +998,34 @@ pub fn build_frame(
     // re-prompt cannot be bypassed by a second door -- see
     // `permit_record_send`.
     let mut record_send: Option<record_ui::RecordSend> = None;
+    // **The record IMPORT form**, `None` when it is not on screen, for
+    // `record_send`'s reason exactly: the draft holds a `Zeroizing`
+    // passphrase for a sealed seed, and dropping the whole value is what
+    // wipes it.
+    //
+    // **Not gated by `reprompt::permit`, and that is a decision rather than
+    // an omission.** The gate answers one question -- "is THIS ITEM carrying
+    // Bitwarden's master-password re-prompt flag" -- and every other caller
+    // reads that flag off a `VaultItem` through
+    // `vault_bridge::reprompt_protected`. An import has no item to read it
+    // off: the item does not exist yet, and the record arrived from somebody
+    // else's vault where the flag, if it was ever set, was theirs. Passing
+    // `true` regardless would be inventing a flag nobody set, and passing
+    // `false` is the gate doing nothing.
+    //
+    // The deeper reason is what the flag is FOR. It protects the user's own
+    // secrets from being EXPOSED -- copied, revealed, typed into a window,
+    // published to a link -- which is why the three gated paths are the copy
+    // rows, the reveals and "Send a record". An import exposes nothing of
+    // this vault; it brings something in. The two secrets it touches are the
+    // sender's, and the user is holding the link to them already.
+    //
+    // The one step here that can destroy something the user had is Replace,
+    // and it is guarded -- better than a biometric prompt would guard it --
+    // by `record_ui`'s collision question with NOTHING PRESELECTED. A
+    // Windows Hello prompt at the open would have been asked minutes before
+    // that choice and would have proved nothing about it.
+    let mut record_import: Option<record_ui::RecordImport> = None;
     // The app launch that has been asked for and has not happened yet. See
     // [`PendingLaunch`]: the Open arm records the request and NOTHING there
     // starts a program, so every launch in this window goes through the one
@@ -1454,6 +1488,7 @@ pub fn build_frame(
         // The create's answer, on the same terms and for the same reason: a
         // published Send is a row the list on screen does not have.
         drain_send_create(&send_create_rx, &mut send_create, &mut send_fetch);
+        drain_record_import(&record_import_rx, &mut record_import);
 
         // Non-blocking, like the favicon drain above: the sync thread
         // (spawned from the Sync button below) reports its outcome here, and
@@ -2342,6 +2377,27 @@ pub fn build_frame(
                         // menu has no other rows.
                         ItemListAction::NewItem(kind) => {
                             mode = DetailMode::Create(EditDraft::empty_of(kind))
+                        }
+                        // **The way into the record import**, and the ONLY
+                        // line in this file that opens it. Nothing is
+                        // fetched, nothing is created: it opens an empty
+                        // form, which is the whole of what a menu row that
+                        // ends in an ellipsis may do.
+                        //
+                        // It needs no selection and reads none -- see
+                        // `record_ui::IMPORT_FROM_SEND_LABEL` for why the row
+                        // is on `+ New` rather than beside the titlebar's
+                        // send pill.
+                        //
+                        // A second press while a form is already open is
+                        // ignored rather than replacing it: the open form may
+                        // hold a typed link, a typed passphrase and a
+                        // collision answer, and re-opening would silently
+                        // discard all three.
+                        ItemListAction::ImportFromSend => {
+                            if record_import.is_none() {
+                                record_import = Some(record_ui::RecordImport::opening());
+                            }
                         }
                         // Not acted on here: this closure holds `items` borrowed
                         // (a Delete has to drain it) and, more importantly, the
@@ -3854,14 +3910,188 @@ pub fn build_frame(
                     record_send = None;
                 }
                 record_ui::RecordUiAction::Cancel => record_send = None,
-                // The import form's three actions are unreachable from this
-                // modal, which draws the export form alone. See
-                // `record_ui::draw_import_form`, which still has no caller:
-                // fetching a link needs a `bw send receive` executor, and
-                // `crate::send` exposes none.
+                // The import form's two actions are unreachable from this
+                // modal, which draws the export form alone -- the import form
+                // is drawn by the block immediately below, out of its own
+                // state. Spelled out rather than caught by a `_ =>` so that a
+                // fourth action added to `RecordUiAction` cannot be silently
+                // ignored by either modal.
                 record_ui::RecordUiAction::FetchLink
                 | record_ui::RecordUiAction::SubmitImport
                 | record_ui::RecordUiAction::None => {}
+            }
+        }
+
+        // **The record import**, drawn here for the composer's reason exactly:
+        // last, so the card and its scrim are over the three panels.
+        //
+        // The fetch goes through `send_receive_thread::spawn_send_receive` --
+        // the only route in this crate to a `bw send receive`, and sealed
+        // inside that module for `spawn_send_create`'s reason: the child
+        // blocks for up to sixty seconds and this line runs on the eframe
+        // thread.
+        //
+        // The CREATE, by contrast, is synchronous and deliberately so: it is a
+        // `POST /object/item` to the local `bw serve` this window is already
+        // talking to on this thread for every other write, and the create
+        // form four hundred lines above does exactly the same thing. A second
+        // threading model for one of the two writes would be two ways to
+        // create an item.
+        if let Some(state) = &mut record_import {
+            // Asked fresh every frame, from the items this frame holds. The
+            // vault can be re-read between the fetch and the press, so a
+            // collision decided once at fetch time is a collision decided
+            // about a vault that has moved on. `collides` is pure and matches
+            // on name only; it returns a value and decides nothing.
+            let collision = state
+                .fetched
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(|record| crate::record::import::collides(record, &items))
+                .unwrap_or(crate::record::import::Collision::Fresh);
+            let action = record_ui::draw_import_modal(
+                ui.ctx(),
+                state,
+                &collision,
+                // The real clock, read here. `stale_note` needs it to decide
+                // whether the sender's `not_after` has passed -- which is
+                // ADVISORY COPY and nothing else. Nothing in this block reads
+                // `not_after` at all, and `record::import` has a test
+                // forbidding it from becoming a gate.
+                &crate::send::SystemClock,
+            );
+            // Whether this frame's action ends the form. Collected rather than
+            // assigned inside the match so that `record_import` is written in
+            // one place, after the borrow above has ended.
+            let mut close = false;
+            match action {
+                record_ui::RecordUiAction::FetchLink => {
+                    let link = state.draft.link.trim().to_string();
+                    if !state.in_flight && !link.is_empty() {
+                        state.in_flight = true;
+                        state.failure = None;
+                        // The previous answer goes now rather than when the
+                        // new one lands: a form showing the last link's fields
+                        // while a new link is being fetched is a form whose
+                        // Import button would create the wrong item.
+                        state.fetched = None;
+                        state.draft.choice = None;
+                        send_receive_thread::spawn_send_receive(
+                            ui.ctx().clone(),
+                            record_import_tx.clone(),
+                            link,
+                        );
+                    }
+                }
+                record_ui::RecordUiAction::SubmitImport => {
+                    // `import_can_proceed` already withheld the button for a
+                    // missing passphrase and for an unanswered collision;
+                    // these are the same conditions re-read at the point of
+                    // effect, because a button's enabled-ness is a statement
+                    // about the frame it was painted on.
+                    let ready = !state.in_flight
+                        && record_ui::import_can_proceed(
+                            state.fetched.as_ref().and_then(|r| r.as_ref().ok()),
+                            &state.draft,
+                            &collision,
+                            state.in_flight,
+                        );
+                    let record = state.fetched.as_ref().and_then(|r| r.as_ref().ok());
+                    if let (true, Some(record)) = (ready, record) {
+                        // The passphrase is offered only for a sealed seed.
+                        // For a record that carries none, `item_from` is
+                        // handed `None` and there is no arm in it that can
+                        // produce a seed from a passphrase nobody needed.
+                        let passphrase = if record_ui::needs_passphrase(record) {
+                            Some(state.draft.passphrase.as_str())
+                        } else {
+                            None
+                        };
+                        match crate::record::import::item_from(record, passphrase) {
+                            // A seal that will not open produces NO ITEM AT
+                            // ALL -- `item_from`'s own rule -- so there is
+                            // nothing to undo here and the form stays open
+                            // with the reason on it.
+                            Err(refusal) => {
+                                state.failure = Some(refusal.sentence().to_string());
+                            }
+                            Ok(new_item) => match cache.create_item(&new_item) {
+                                Ok(created) => {
+                                    // **The replace happens only AFTER the new
+                                    // item exists**, and only when the user
+                                    // chose it. This is the one step in the
+                                    // whole feature that can destroy something
+                                    // the user already had, so the ordering is
+                                    // the ordering in which a failure destroys
+                                    // nothing: a create that fails leaves the
+                                    // existing item untouched, and this line is
+                                    // never reached.
+                                    if let (
+                                        crate::record::import::Collision::SameName {
+                                            existing_id,
+                                        },
+                                        Some(record_ui::CollisionChoice::Replace),
+                                    ) = (&collision, state.draft.choice)
+                                    {
+                                        match cache.delete_item(existing_id) {
+                                            Ok(()) => items.retain(|i| &i.id != existing_id),
+                                            // The import SUCCEEDED; only the
+                                            // tidy-up did not. Saying "import
+                                            // failed" here would be false and
+                                            // would invite a retry that made a
+                                            // third copy, so the band names
+                                            // what really happened.
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "imported record created, but the item it \
+                                                     replaced could not be removed: {e:?}"
+                                                );
+                                                move_error = Some(
+                                                    IMPORT_REPLACED_NOTHING.to_string(),
+                                                );
+                                                flag_reauth_if_unauthorized(
+                                                    ui.ctx(),
+                                                    &needs_reauth_for_closure,
+                                                    &e,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    selected_id = Some(created.id.clone());
+                                    items.push(created);
+                                    mode = DetailMode::Read;
+                                    close = true;
+                                }
+                                Err(e) => {
+                                    log::warn!("failed to create an imported item: {e:?}");
+                                    state.failure = Some(item_write_failure_message(
+                                        ItemWrite::Create,
+                                        new_item.name(),
+                                        &e,
+                                    ));
+                                    flag_reauth_if_unauthorized(
+                                        ui.ctx(),
+                                        &needs_reauth_for_closure,
+                                        &e,
+                                    );
+                                }
+                            },
+                        }
+                    }
+                }
+                record_ui::RecordUiAction::Cancel => close = true,
+                // Unreachable from this modal, which draws the import form
+                // alone. Spelled out for the reason the export modal's arm
+                // above gives.
+                record_ui::RecordUiAction::SubmitExport
+                | record_ui::RecordUiAction::None => {}
+            }
+            if close {
+                // **Closed by replacing the whole value**, for the composer's
+                // reason: the draft holds a `Zeroizing` passphrase for a
+                // sealed seed, and an `open = false` would leave it resident
+                // for the life of the window.
+                record_import = None;
             }
         }
 
@@ -7106,6 +7336,206 @@ fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bo
                 });
         });
     dismissed
+}
+
+// ===========================================================================
+// The record import: fetching one Send and reading what it carried
+// ===========================================================================
+
+/// What one `bw send receive` ended as, carried back from the worker thread
+/// it runs on.
+///
+/// **The payload is READ on the worker thread, not here**, which is why this
+/// carries a `Record` and not the fetched text. Two reasons and they point
+/// the same way: `record::payload::read_json` is strict -- it enforces a size
+/// cap before parsing and refuses unknown fields -- so it is real work that
+/// has no business on the eframe thread; and the raw body, which is a
+/// stranger's whole record in plaintext, then never crosses the channel at
+/// all. What crosses is the parsed record or the refusal.
+///
+/// **[`Self::Failed`] is not a refusal and must not be rendered as one.** A
+/// `RecordRefusal` names what was wrong with a payload that ARRIVED; a fetch
+/// that returned nothing is a different sentence, and `record_ui::RecordImport`
+/// keeps the two in separate fields for that reason.
+///
+/// **No `Debug`, derived or otherwise.** `Record` carries a password and a
+/// sealed seed and hand-writes its own redacting `Debug`; a derived one here
+/// would print the whole record into any log line that formatted a report.
+enum RecordImportReport {
+    /// `bw send receive` exited zero and the body was put through
+    /// `read_json`. `Err` is a payload that arrived and was refused.
+    Read(Box<Result<crate::record::payload::Record, crate::record::payload::RecordRefusal>>),
+    /// The fetch itself did not produce a body, and this is the sentence for
+    /// it.
+    Failed(String),
+}
+
+type RecordImportSender = mpsc::Sender<RecordImportReport>;
+
+/// The import's off-thread half.
+mod send_receive_thread {
+    //! **Everything about a receive that blocks lives in here, and the frame
+    //! closure's only entry point is [`spawn_send_receive`]** -- `mod
+    //! send_create_thread`'s shape, for `mod send_fetch_thread`'s reason.
+    //! `crate::send::cli_send_receive` waits on a `bw` child for up to
+    //! `send::SEND_TIMEOUT`, sixty seconds, and a synchronous call from a
+    //! frame would freeze the whole window, titlebar included, for a minute
+    //! on the frame the user presses Fetch.
+    //!
+    //! The seal is
+    //! `super::send_create_wiring::every_mention_of_the_blocking_receive_is_sealed_inside_its_own_module`:
+    //! every occurrence of `cli_send_receive` and `real_send_receive` in the
+    //! crate's production, outside `send.rs` where the first is defined, must
+    //! be inside this block. A call written in the frame closure spells the
+    //! first of those and fails.
+    //!
+    //! **The link reaches the child in argv and there is nowhere else it
+    //! could.** That decision is not taken here: `crate::send::receive_invocation`
+    //! builds the argument vector, and it is the one invocation in that module
+    //! whose whole vector its `Debug` elides, because a Send's access URL
+    //! carries the decryption key in its fragment.
+    //!
+    //! **No session.** A receive is anonymous -- the link is the credential --
+    //! so unlike the create's worker this one is handed no `Zeroizing<String>`
+    //! session at all, and there is nothing here to leak one from.
+
+    use eframe::egui;
+
+    use super::{RecordImportReport, RecordImportSender};
+
+    /// The job every `bw send receive` child this window starts is placed in.
+    ///
+    /// **`super::send_fetch_thread::sends_job` itself, reused rather than
+    /// mirrored**, for `mod send_create_thread`'s `create_job` reason and not
+    /// a new one: the child is the same `bw send` started by the same window,
+    /// and two jobs would be two handles held for one purpose.
+    fn receive_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+        super::send_fetch_thread::sends_job()
+    }
+
+    /// **One whole fetch, blocking, from the link to the record** -- the
+    /// wiring's own entry point, in the sense that everything above it is a
+    /// thread and everything below it is `send.rs` and `record::payload`.
+    ///
+    /// `real_send_create`'s shape: nothing is injected, so the job, the
+    /// profile directory, the runner and the spawn are all the production
+    /// ones.
+    ///
+    /// **No share password is offered, and that is deliberate rather than
+    /// unfinished.** A Send this app creates carries none --
+    /// `record_ui::send_plan_from` builds a hidden text Send with
+    /// `password: None` -- so the field would be a box asking for a secret
+    /// that does not exist, on the same form that already asks for the seed
+    /// passphrase. Two password boxes, one of which is always blank, is how a
+    /// user puts the seed passphrase in the wrong one. `receive_invocation`
+    /// takes the `Option` and this passes `None`; the day a record Send is
+    /// given a share password, this is the line that grows an argument.
+    pub(super) fn real_send_receive(link: &str) -> RecordImportReport {
+        // Read on the fetching thread, not captured from the frame:
+        // `bw_path` keeps the active account's profile directory as process
+        // state precisely so every spawn in this crate reaches the same
+        // account, and a copy taken a frame earlier can be stale.
+        let data_dir = crate::bw_path::active_data_dir();
+        match crate::send::cli_send_receive(receive_job(), data_dir.as_deref(), link, None) {
+            // The read happens HERE, on this thread. See
+            // `super::RecordImportReport` for why the raw body must not cross
+            // the channel.
+            Ok(body) => RecordImportReport::Read(Box::new(
+                crate::record::payload::read_json(&body),
+            )),
+            Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
+        }
+    }
+
+    /// Fetches one Send on a background thread. The frame closure's one entry
+    /// point, and *nothing but* the delegation.
+    pub(super) fn spawn_send_receive(
+        ctx_for_receive: egui::Context,
+        tx: RecordImportSender,
+        link: String,
+    ) {
+        spawn_send_receive_with(ctx_for_receive, tx, move || real_send_receive(&link));
+    }
+
+    /// The off-thread half, **generic over the work so that it can be
+    /// tested** -- `spawn_send_create_with`'s shape and its reason, and its
+    /// `catch_unwind` too: `in_flight` is cleared by the drain and by nothing
+    /// else, so a worker that panics before sending leaves the form painted
+    /// with every control disabled for the life of the window.
+    ///
+    /// The panic becomes a FAILURE and not an empty record, because a
+    /// panicked worker fetched nothing this app can vouch for and an import
+    /// must never be offered a payload nobody read.
+    pub(super) fn spawn_send_receive_with<F>(
+        ctx_for_receive: egui::Context,
+        tx: RecordImportSender,
+        work: F,
+    ) where
+        F: FnOnce() -> RecordImportReport + Send + 'static,
+    {
+        super::spawn_reporting(ctx_for_receive, tx, work, || {
+            RecordImportReport::Failed(super::RECEIVE_PANICKED.to_string())
+        });
+    }
+}
+
+/// What the user is told when an imported item was created and the item it was
+/// meant to replace could not be removed.
+///
+/// **It does not say the import failed**, because it did not: the record is in
+/// the vault. Saying otherwise would invite a retry, and a retry would make a
+/// third copy of the same record -- which is worse than the leftover this
+/// sentence describes.
+const IMPORT_REPLACED_NOTHING: &str =
+    "The record was imported, but the item it was meant to replace is still there. \
+     Delete it yourself if you still want it gone.";
+
+/// What the user is told when the fetch worker panicked.
+///
+/// Its own constant so the test that drives `spawn_send_receive_with` through
+/// a panicking fetch can assert the sentence rather than "something failed".
+const RECEIVE_PANICKED: &str =
+    "Deskwarden could not fetch that link. Nothing was imported.";
+
+/// Applies one finished fetch to the import form, or does nothing.
+///
+/// A plain function rather than a block in the frame closure, for
+/// [`drain_send_create`]'s reason: the rules relating the three fields --
+/// in-flight is cleared whatever happened, a success replaces the previous
+/// answer AND clears the previous failure, a failure clears the previous
+/// answer so a stale record cannot be imported under a new link -- are rules
+/// no test could run if they were written between panels.
+///
+/// **A report that arrives with no form open is dropped**, which is what the
+/// `Option` does: the user cancelled while a `bw` was still running, and
+/// re-opening a form the user closed is the one thing this must not do.
+fn drain_record_import(
+    rx: &Receiver<RecordImportReport>,
+    state: &mut Option<record_ui::RecordImport>,
+) {
+    while let Ok(report) = rx.try_recv() {
+        let Some(state) = state.as_mut() else { continue };
+        state.in_flight = false;
+        match report {
+            RecordImportReport::Read(read) => {
+                state.fetched = Some(*read);
+                state.failure = None;
+            }
+            RecordImportReport::Failed(why) => {
+                // The previous answer goes with it. A form showing the fields
+                // of a record fetched from an EARLIER link, under a link that
+                // has just failed, is a form whose Import button would create
+                // the wrong item.
+                state.fetched = None;
+                state.failure = Some(why);
+            }
+        }
+        // A new payload is a new set of answers to give: a collision choice
+        // made about the last record is not an answer about this one, and
+        // leaving it would let a `Replace` chosen for one item destroy
+        // another.
+        state.draft.choice = None;
+    }
 }
 
 type SendCreateSender = mpsc::Sender<SendCreateReport>;

@@ -35,6 +35,13 @@ pub enum ItemListAction {
     ///
     /// [`detail_edit::CREATABLE_KINDS`]: super::detail_edit::CREATABLE_KINDS
     NewItem(ItemKind),
+    /// The `+ New` menu's "Import from a Send..." row was chosen.
+    ///
+    /// Carries no kind, unlike [`Self::NewItem`]: the item an import creates
+    /// takes its shape from the payload that arrives, and this menu has no
+    /// say in it. It is also the one entry here that needs NO SELECTION --
+    /// the point of it is to create something that is not there yet.
+    ImportFromSend,
     /// The inline "that move did not happen" band was clicked away.
     DismissMoveError,
     /// An entry of some row's right-click menu was chosen.
@@ -878,6 +885,24 @@ pub fn draw_item_list(
                                 action = ItemListAction::NewItem(kind);
                                 ui.close();
                             }
+                        }
+                        // **The import, below a separator, and NOT a row of
+                        // the loop above.** It is not a kind: it makes an
+                        // item whose type comes from the payload, not from
+                        // this menu, so putting it in `CREATABLE_KINDS`
+                        // would have added a fake `ItemKind` to the one
+                        // array three doors depend on for keeping
+                        // `ItemKind::Unknown` out of creation.
+                        //
+                        // Here rather than in the titlebar beside "Send a
+                        // record" -- see `record_ui::IMPORT_FROM_SEND_LABEL`
+                        // for the argument. The short of it: this control is
+                        // "make me a new item", and the import is one, while
+                        // the send narrows an item already selected.
+                        ui.separator();
+                        if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
+                            action = ItemListAction::ImportFromSend;
+                            ui.close();
                         }
                     });
                     // "Search 180 logins" -- see `search_hint`, which owns
@@ -5151,10 +5176,71 @@ mod row_tile_tests {
         let items = [full_login("Ledgerline"), full_login("Vantage")];
         let closed = paint(&items, None);
         let open = open_new_menu(&items);
+        // **The five kinds, then the import.** The import row is deliberately
+        // NOT in `NEW_MENU_ROWS`: that constant is one half of the pair that
+        // pins `CREATABLE_KINDS`, and an entry there that is not a kind would
+        // make the OTHER half of the pair
+        // (`the_creatable_kinds_are_exactly_the_five_the_menu_is_pinned_to`)
+        // demand a sixth `ItemKind` for a row that has none. It is written
+        // out here instead, where the claim is about what the menu PAINTS.
+        //
+        // Order is asserted with it: the import sits below the kinds, behind a
+        // separator, because it is the one row that is not a shape this menu
+        // chose.
+        let expected: Vec<String> = NEW_MENU_ROWS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once(
+                super::super::record_ui::IMPORT_FROM_SEND_LABEL.to_string(),
+            ))
+            .collect();
         assert_eq!(
             extra_texts(&closed, &open),
-            NEW_MENU_ROWS,
-            "the \"+ New\" menu drew something other than exactly the creatable kinds"
+            expected,
+            "the \"+ New\" menu drew something other than the creatable kinds and the import"
+        );
+    }
+
+    /// **Picking the import row asks for the import and creates nothing.**
+    ///
+    /// The row is the whole of how a user reaches the record import: there is
+    /// no chord for it and no other control anywhere in this window that
+    /// opens it. A row that painted and reported `None` would look identical
+    /// on screen and be the same defect the import surface already shipped
+    /// with once -- a finished screen nobody can get to.
+    #[test]
+    fn picking_the_import_row_asks_to_import_a_record() {
+        let items = [full_login("Ledgerline")];
+        let row = text_centre(
+            &open_new_menu(&items),
+            super::super::record_ui::IMPORT_FROM_SEND_LABEL,
+        );
+        let at = new_button_centre(&items);
+        let mut frames = click_frames(at, egui::PointerButton::Primary);
+        let mut pick = click_frames(row, egui::PointerButton::Primary);
+        // Measured on the release, which is the frame egui resolves the click
+        // on -- `picking_a_kind_asks_for_a_new_item_of_that_kind`'s rule.
+        pick.pop();
+        frames.extend(pick);
+        let p = paint_core(
+            &items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu {
+                folders: vec![],
+                delete_pending: None,
+                frames,
+                filter: SidebarFilter::All,
+            },
+        );
+        assert_eq!(
+            p.action,
+            ItemListAction::ImportFromSend,
+            "clicking the import row reported {:?}, so the one way into the record import \
+             does nothing",
+            p.action
         );
     }
 
