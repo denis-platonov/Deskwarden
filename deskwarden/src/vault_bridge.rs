@@ -775,6 +775,41 @@ pub fn without_deleted_date(item: &VaultItem) -> VaultItem {
     restored
 }
 
+/// The key Bitwarden puts on an item whose secrets are meant to sit behind a
+/// fresh proof of the master password ("Master password re-prompt" in the
+/// other clients).
+///
+/// Like [`DELETED_DATE_KEY`] it is **deliberately not a field on
+/// [`VaultItem`]**, for the reason recorded there: a field is a compile error
+/// at nineteen struct literals across nine files, and an accessor over the
+/// catch-all buys every caller the same answer. Reading it through `other`
+/// also makes the round-trip guarantee structural rather than remembered --
+/// nothing on this path rebuilds the item, so the key is written back
+/// byte-identically because it was never taken out.
+const REPROMPT_KEY: &str = "reprompt";
+
+/// Whether `item` asks for the master password again before its secrets are
+/// revealed, copied, filled or sent.
+///
+/// **Absent or `0` is "no". Everything else is "yes".** Bitwarden documents
+/// `1` and this crate has only ever observed `0` and `1`, so `1` is the value
+/// the UI will meet; the accepted values are deliberately *not* enumerated
+/// here, because the only safe way to be wrong about an unknown one is to
+/// protect the item. A `match` on `1` alone would read a hypothetical `2` --
+/// or a string, or whatever a future server version invents -- as unprotected,
+/// which is the failure this whole feature exists to remove.
+///
+/// A non-number is protected for the same reason: the key arriving in a shape
+/// this crate does not understand is not evidence that the user left the box
+/// unticked. `null` is the one exception, and is treated as absent, because
+/// that is what "no value" is spelled as in JSON.
+pub fn reprompt_protected(item: &VaultItem) -> bool {
+    match item.other.get(REPROMPT_KEY) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value.as_u64() != Some(0),
+    }
+}
+
 /// The request body for a move: the item's ordinary write shape, with
 /// `folderId` **stated explicitly** -- present, and `null` when the item is
 /// being un-filed.
@@ -2601,6 +2636,96 @@ mod tests {
         );
 
         assert_eq!(expected, after, "a real-shaped item changed shape across a round trip");
+    }
+
+    /// The whole truth table of [`reprompt_protected`], stated positively as
+    /// well as negatively so that a function hard-wired to either answer reds.
+    ///
+    /// The unknown values are the point. Bitwarden documents `0` and `1`, and
+    /// those two are all this crate has seen; `2`, `"1"` and `true` are here
+    /// because a `match` on `1` alone would call them unprotected, and being
+    /// wrong in that direction is the exact failure this feature removes.
+    #[test]
+    fn reprompt_is_off_only_for_an_absent_null_or_zero_flag() {
+        fn item_with(raw: &str) -> VaultItem {
+            serde_json::from_str(raw).expect("the fixture parses")
+        }
+        const HEAD: &str = r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[]"#;
+
+        for (json, why) in [
+            ("", "an item with no reprompt key at all"),
+            (r#","reprompt":0"#, "the flag explicitly off"),
+            (r#","reprompt":null"#, "the flag present but null"),
+        ] {
+            let item = item_with(&format!("{HEAD}{json}}}"));
+            assert!(
+                !reprompt_protected(&item),
+                "{why} was read as protected, which would prompt for every item in the vault"
+            );
+        }
+
+        for (json, why) in [
+            (r#","reprompt":1"#, "the documented on value"),
+            (r#","reprompt":2"#, "an unknown non-zero number"),
+            (r#","reprompt":"1""#, "the flag as a string"),
+            (r#","reprompt":true"#, "the flag as a bool"),
+        ] {
+            let item = item_with(&format!("{HEAD}{json}}}"));
+            assert!(
+                reprompt_protected(&item),
+                "{why} was read as unprotected -- an item the user ticked the box on would be \
+                 revealed, copied and filled with no prompt at all"
+            );
+        }
+    }
+
+    /// The round trip, for the case this feature is about: an item the user
+    /// marked for re-prompt is written back carrying `reprompt: 1` and every
+    /// other key it arrived with.
+    ///
+    /// [`reprompt_protected`] reads through `other` rather than lifting the
+    /// key onto [`VaultItem`] precisely so this holds by construction, and
+    /// this test is what would red if someone modelled it as a field and
+    /// rebuilt items from name and value alone -- the defect
+    /// [`with_app_match`]'s doc records.
+    #[test]
+    fn an_item_marked_for_reprompt_writes_back_with_the_flag_and_every_other_key() {
+        let raw = r#"{"id":"1","object":"item","type":1,"name":"Site",
+            "notes":"a note","favorite":false,"fields":[],
+            "collectionIds":[],"attachments":[],"key":"K","reprompt":1,
+            "passwordHistory":[{"password":"old","lastUsedDate":"2020-01-01T00:00:00.000Z"}],
+            "creationDate":"2020-01-01T00:00:00.000Z",
+            "revisionDate":"2021-01-01T00:00:00.000Z",
+            "login":{"username":"u","password":"p","totp":"seed",
+                     "fido2Credentials":[],"passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+
+        // THE LIVE CONTROL. Without it the equality below is satisfied by an
+        // item whose catch-all is empty -- which is what a future change that
+        // modelled these keys as fields, or dropped them at parse, would
+        // leave behind. Naming them one by one is what makes "everything else
+        // intact" mean something.
+        for key in ["object", "collectionIds", "attachments", "key", "reprompt",
+                    "passwordHistory", "creationDate", "revisionDate"] {
+            assert!(
+                item.other.contains_key(key),
+                "the fixture did not actually carry {key} on the catch-all, so the round-trip \
+                 assertion below proves nothing about it"
+            );
+        }
+        assert!(
+            reprompt_protected(&item),
+            "the fixture is meant to be a protected item and is not"
+        );
+
+        // No normalisations to subtract this time: `folderId` is absent
+        // rather than null and `login.uris` is absent rather than empty, so
+        // the write is expected byte-identical.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+            "a re-prompt item changed shape across a round trip"
+        );
     }
 
     #[test]
