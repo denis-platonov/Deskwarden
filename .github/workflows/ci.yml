@@ -119,6 +119,9 @@ jobs:
   screenshots:
     name: Screenshots of every surface
     runs-on: windows-latest
+    # Nothing here needs to write, and a third-party DLL runs in this job.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
 
@@ -129,12 +132,49 @@ jobs:
         with:
           workspaces: deskwarden
 
-      # `--all` walks every surface in ONE process, resizing the viewport
-      # between them, rather than one invocation per surface: a window
-      # creation and an eframe startup each cost more than the frames they
-      # exist to produce.
+      # A SOFTWARE OpenGL, because the runner has none.
+      #
+      # This job wrote zero PNGs from the day it was added until 2026-08-18,
+      # and the reason was only visible once the walk stopped masking it:
+      # `egui_glow requires opengl 2.0+`. GitHub's windows-latest images ship
+      # no OpenGL 2.0 driver, and this app uses eframe's glow renderer on
+      # purpose -- the wgpu DX12 backend pins a newer `windows` crate than the
+      # app does, and the two cannot coexist (see Cargo.toml).
+      #
+      # Mesa's llvmpipe is a software rasteriser: drop its opengl32.dll beside
+      # the executable and the same frames render on the CPU.
+      #
+      # PINNED AND HASH-VERIFIED, and that is not ceremony. This is a
+      # third-party binary executing inside the CI of a credential tool, so
+      # the version is fixed, the SHA-256 is checked before anything is
+      # extracted, and the job is `contents: read` so the token it runs under
+      # can do nothing but read this repository. If the download changes under
+      # the tag, the hash check fails and nothing runs.
+      - name: Build the preview
+        working-directory: deskwarden
+        run: cargo build --example ui_preview
+
+      - name: Install a software OpenGL (Mesa3D llvmpipe)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.0/mesa3d-26.2.0-release-msvc.7z'
+          $want = 'dcb2719ef346dab5b609fcb193a5f13cfc4b0502e3f4de1ad43d349477402f47'
+          Invoke-WebRequest -Uri $url -OutFile mesa.7z
+          $got = (Get-FileHash mesa.7z -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) {
+            Write-Error "Mesa archive hash mismatch. wanted $want, got $got -- refusing to extract."
+            exit 1
+          }
+          7z x mesa.7z -omesa -y | Out-Null
+          Copy-Item mesa/x64/*.dll deskwarden/target/debug/examples/ -Force
+          Write-Host "placed:"; Get-ChildItem deskwarden/target/debug/examples/*.dll | Select-Object -ExpandProperty Name
+
       - name: Render every surface
         working-directory: deskwarden
+        env:
+          # Force the software rasteriser rather than whatever the loader
+          # would otherwise pick.
+          GALLIUM_DRIVER: llvmpipe
         run: cargo run --example ui_preview -- --all
 
       # The walk asserts its own count now -- see the tail of
