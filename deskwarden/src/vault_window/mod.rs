@@ -14830,8 +14830,14 @@ mod draw_read_arm_tests {
         let item = an_item(Some(1));
 
         let (_, texts) = run_read_arm(&item, Some("Engineering"), false);
+        // TWO runs, because the subtitle now paints `theme::folder_mark`
+        // between the separator and the name and a mark cannot be painted
+        // inside a galley. `detail.rs` owns the shape of that line; what this
+        // arm has to prove is only that the NAME it was handed arrived, which
+        // is the second run.
         assert!(
-            texts.contains(&"Login · Engineering".to_string()),
+            texts.contains(&"Login · ".to_string())
+                && texts.contains(&"Engineering".to_string()),
             "the read arm painted no `<kind> · <folder>` subtitle for an item in a \
              folder; painted: {texts:?}"
         );

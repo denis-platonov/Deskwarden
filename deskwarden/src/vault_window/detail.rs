@@ -75,6 +75,11 @@ const HEADER_CONTROLS: usize = 4;
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
 const TITLE_GAP: f32 = 3.0;
+/// `font-size: 12px` on the subtitle under it. A constant rather than a
+/// literal since the folder mark split that line into two labels: two runs of
+/// one sentence set at two sizes is a slip nothing else would catch, and
+/// `theme::FOLDER_MARK_SIZE`'s height is measured against this number.
+const SUBTITLE_SIZE: f32 = 12.0;
 /// **The floor under the item title, and the thing the rest of the strip
 /// gives way to.** Not from the design: 2b draws this pane at one width and
 /// says nothing about what happens below it.
@@ -2216,10 +2221,30 @@ fn copy_shortcut_action(
 /// Pure, and separate from the closure that draws it, for this file's standing
 /// reason: a decision reachable only from inside an eframe closure is a
 /// decision that will not be tested.
-fn header_subtitle(kind: ItemKind, folder: Option<&str>) -> String {
+///
+/// **Returned SPLIT, at the point the folder mark goes**: everything up to and
+/// including the separator, then the folder's name when there is one.
+///
+/// The user, of `Card · Work`: *"For foldered items also show folder icon left
+/// to folder name in subtitle, otherwise not clear two words what they mean."*
+/// Two bare words with nothing saying which is the item's TYPE and which is
+/// where it lives -- and a line the design gives one row cannot say it in more
+/// words. `theme::folder_mark` says it in a mark instead, and a mark has to be
+/// painted BETWEEN two runs of text, which a single `String` could not express.
+///
+/// The split is what changed; the reading order is not. The pane paints these
+/// two runs adjacent with nothing between them but the mark, so the line still
+/// reads exactly `<kind> · <folder>` -- `the_header_paints_the_folder_beside_
+/// the_kind_under_the_item_name` reads it back off the rendered frame rather
+/// than trusting this sentence.
+///
+/// **`None` is the whole of the unfoldered case.** An item with no folder
+/// keeps the bare kind label and gains no mark: the mark introduces a folder
+/// name, and there is no name to introduce.
+fn header_subtitle_parts(kind: ItemKind, folder: Option<&str>) -> (String, Option<&str>) {
     match folder {
-        Some(name) => format!("{} · {name}", kind.label()),
-        None => kind.label(),
+        Some(name) => (format!("{} · ", kind.label()), Some(name)),
+        None => (kind.label(), None),
     }
 }
 
@@ -2571,11 +2596,39 @@ pub fn draw_detail_read(
                         title.wrap =
                             egui::text::TextWrapping::truncate_at_width(ui.available_width());
                         ui.label(title);
-                        ui.label(
-                            RichText::new(header_subtitle(kind, folder))
-                                .size(12.0)
-                                .color(theme::TEXT_FAINT),
-                        );
+                        // The subtitle, in the two runs [`header_subtitle_parts`]
+                        // splits it into with the folder mark painted between
+                        // them. An unfoldered item has no second run and no
+                        // mark, so this is one label again -- exactly what it
+                        // was before the mark existed.
+                        //
+                        // `item_spacing.x = 0`: the separator run already ends
+                        // in its own space and the mark's box carries 3px of
+                        // air on each side (`theme::FOLDER_MARK_SIZE`), so
+                        // egui's default 8pt between widgets would open two
+                        // gaps this line did not ask for and push the name
+                        // away from the mark that introduces it.
+                        let (lead, name) = header_subtitle_parts(kind, folder);
+                        let faint = |text: String| {
+                            RichText::new(text).size(SUBTITLE_SIZE).color(theme::TEXT_FAINT)
+                        };
+                        match name {
+                            None => {
+                                ui.label(faint(lead));
+                            }
+                            Some(name) => {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.label(faint(lead));
+                                    // TEXT_FAINT, the subtitle's own ink: the
+                                    // mark introduces this secondary text and
+                                    // must not be louder than the words it
+                                    // introduces.
+                                    theme::folder_mark(ui, theme::TEXT_FAINT);
+                                    ui.label(faint(name.to_string()));
+                                });
+                            }
+                        }
                     });
                 });
             };
@@ -7699,15 +7752,34 @@ mod tests {
     #[test]
     fn the_header_subtitle_carries_the_folder_after_the_kind_and_nothing_when_there_is_none() {
         for kind in EVERY_KIND {
+            // The two runs REJOINED, which is the reading order the design
+            // asks for and the thing splitting the line for the folder mark
+            // could quietly have broken: a lead that lost its separator, or a
+            // name put before the kind, reads wrong here and nowhere else in
+            // this pure test.
+            let (lead, name) = header_subtitle_parts(kind, Some("Engineering"));
             assert_eq!(
-                header_subtitle(kind, Some("Engineering")),
+                format!("{lead}{}", name.unwrap_or_default()),
                 format!("{} · Engineering", kind.label()),
                 "{kind:?} does not read as the design's `<kind> · <folder>`"
             );
+            // And the split is where the MARK goes -- after the separator,
+            // immediately before the name. A lead that swallowed the folder
+            // name would rejoin correctly above and leave the mark with
+            // nothing to introduce.
             assert_eq!(
-                header_subtitle(kind, None),
-                kind.label(),
-                "{kind:?} with no folder does not still name its kind"
+                name,
+                Some("Engineering"),
+                "{kind:?} does not hand the folder name back as its own run, so the \
+                 folder mark has nothing to sit in front of"
+            );
+
+            let (lead, name) = header_subtitle_parts(kind, None);
+            assert_eq!(lead, kind.label(), "{kind:?} with no folder does not still name its kind");
+            assert_eq!(
+                name, None,
+                "{kind:?} with no folder still offers a second run, so the unfoldered \
+                 header would draw a folder mark"
             );
         }
     }
@@ -7715,9 +7787,17 @@ mod tests {
     /// **And the header really paints it, on the title's own line-under.**
     ///
     /// The decision above is pure; this is the other half. It also holds the
-    /// shape: ONE run, so a folder painted as a second line under the kind --
+    /// shape: ONE LINE, so a folder painted as a second line under the kind --
     /// which is what "show Folder under the title" could equally have meant --
     /// fails here rather than shipping.
+    ///
+    /// **The line is two runs now, and that is exactly what has to be pinned
+    /// rather than assumed.** `theme::folder_mark` is painted between them, so
+    /// the subtitle can no longer be one galley; what makes it still one line
+    /// is that the two runs share a baseline and sit adjacent in reading
+    /// order, which is what the geometry below asks. A "· " lead that had
+    /// wrapped its name onto a row of its own would satisfy every string
+    /// assertion here and fail the baseline one.
     ///
     /// An item whose `folder_id` names a folder that is not in the list never
     /// reaches this function with a name at all: `sidebar::folder_name`
@@ -7729,33 +7809,190 @@ mod tests {
         let mut pane = Pane::new().in_folder("Engineering");
         let frame = pane.idle(&a_login(), &TotpState::NoSecret);
 
-        assert!(
-            frame.painted("Login · Engineering"),
-            "the header painted no `<kind> · <folder>` subtitle; it painted: {:?}",
-            frame.strings()
-        );
-        // Neither half on its own: a bare "Login" beside the combined line
-        // would be the old subtitle still there, and a bare "Engineering"
-        // would be the second line the design does not draw.
-        for stray in ["Login", "Engineering"] {
+        for run in ["Login · ", "Engineering"] {
             assert!(
-                !frame.strings().iter().any(|t| *t == stray),
-                "the header painted {stray:?} as a run of its own, so the subtitle is \
-                 not the design's single line; it painted: {:?}",
+                frame.painted(run),
+                "the header painted no {run:?} run of its subtitle; it painted: {:?}",
                 frame.strings()
             );
         }
+        // Not a bare "Login": that would be the kind's own run having lost the
+        // separator, which is the folder line broken back into two unrelated
+        // words -- the very complaint this pane's mark exists to answer.
+        assert!(
+            !frame.strings().iter().any(|t| *t == "Login"),
+            "the header painted a bare \"Login\" run, so the subtitle's separator is \
+             gone; it painted: {:?}",
+            frame.strings()
+        );
 
         let title = frame.rect_of("Sample");
-        let subtitle = frame.rect_of("Login · Engineering");
+        let kind = frame.rect_of("Login · ");
+        let folder = frame.rect_of("Engineering");
         assert!(
-            (subtitle.left() - title.left()).abs() < 0.5,
-            "the subtitle at {subtitle:?} does not share the title's column ({title:?})"
+            (kind.left() - title.left()).abs() < 0.5,
+            "the subtitle at {kind:?} does not share the title's column ({title:?})"
         );
         assert!(
-            subtitle.top() > title.top(),
-            "the subtitle at {subtitle:?} is not UNDER the title at {title:?}"
+            kind.top() > title.top(),
+            "the subtitle at {kind:?} is not UNDER the title at {title:?}"
         );
+        // ONE LINE: the folder's run sits to the RIGHT of the kind's, on the
+        // same baseline, not under it.
+        assert!(
+            folder.left() > kind.right(),
+            "the folder run at {folder:?} is not to the right of the kind run at \
+             {kind:?}, so the subtitle is not one line"
+        );
+        assert!(
+            (folder.bottom() - kind.bottom()).abs() < 1.0,
+            "the folder run at {folder:?} does not share the kind run's baseline \
+             ({kind:?}), so the subtitle wrapped onto two lines"
+        );
+    }
+
+    /// Every folder mark in a frame, as its outline's box and the colour it
+    /// was stroked in. See `theme::icon_probe::folder_marks`.
+    fn folder_marks(frame: &Frame) -> Vec<(egui::Rect, egui::Color32)> {
+        theme::icon_probe::folder_marks(&frame.shapes)
+    }
+
+    /// **The folder mark, between the separator and the name it introduces.**
+    ///
+    /// The user: *"For foldered items also show folder icon left to folder
+    /// name in subtitle, otherwise not clear two words what they mean."* So
+    /// the mark's position is the requirement, not merely its presence -- a
+    /// mark at the far end of the line, or before the kind, would be painted
+    /// and would answer nothing.
+    ///
+    /// **Drawn, not typed**, which is why this is asked of the shape stream at
+    /// all: the mark paints no string, so no text assertion in this file can
+    /// see it. `theme::the_folder_codepoints_are_not_carried_by_this_apps_own_
+    /// typeface` is the measurement behind that choice -- 📁, 📂 and 🗀 all
+    /// come back absent from the real font stack, so as text this would be a
+    /// tofu box in every foldered item's header.
+    #[test]
+    fn the_folder_mark_sits_between_the_separator_and_the_folder_name() {
+        let mut pane = Pane::new().in_folder("Engineering");
+        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+
+        let marks = folder_marks(&frame);
+        assert_eq!(
+            marks.len(),
+            1,
+            "expected exactly one folder mark in a foldered item's header, found {}",
+            marks.len()
+        );
+        let (mark, color) = marks[0];
+        // `rect_of`, not `ink_of`: both runs are laid out LEFT to right, which
+        // is the case `rect_of` reports exactly -- its documented inaccuracy
+        // is the `halign: Max` of a right-to-left control line, and neither of
+        // these is on one. It is also the only one of the two that can be
+        // compared with a painted shape's box vertically.
+        let kind = frame.rect_of("Login · ");
+        let folder = frame.rect_of("Engineering");
+        assert!(
+            mark.left() >= kind.right() - 1.0 && mark.right() <= folder.left() + 1.0,
+            "the folder mark at {mark:?} is not between the separator ({kind:?}) and the \
+             folder name ({folder:?})"
+        );
+        // Vertically ON the line, not floating above or below it: the mark's
+        // box is the subtitle's line height, so its centre is the run's.
+        assert!(
+            (mark.center().y - folder.center().y).abs() < 3.0,
+            "the folder mark at {mark:?} is not on the folder name's line ({folder:?})"
+        );
+        // **The subtitle's own ink, not louder.** This is the assertion that
+        // is easiest to write blind -- the mark paints no fill and no string,
+        // so `TEXT_FAINT` is visible to a test only through the stroke colour
+        // `icon_probe::folder_marks` reports. The negative half is the proof
+        // the positive one can see anything: INK is what the mark would be
+        // stroked in if it had been given the title's colour by mistake, and
+        // the two are different values.
+        assert_eq!(
+            color,
+            theme::TEXT_FAINT,
+            "the folder mark is stroked in {color:?}, not the subtitle's own TEXT_FAINT"
+        );
+        assert_ne!(
+            theme::TEXT_FAINT,
+            theme::INK,
+            "TEXT_FAINT and INK are the same colour, so the assertion above could not \
+             have failed for a mark painted in the title's ink"
+        );
+    }
+
+    /// **And an item with no folder gets no mark at all.**
+    ///
+    /// The other half of the one above, and the half that would rot silently:
+    /// a mark painted unconditionally sits after a bare `Login` introducing
+    /// nothing, and every assertion in the test above still passes.
+    ///
+    /// The positive control is the foldered frame right beside it, so a probe
+    /// that had stopped finding this mark entirely cannot pass this test by
+    /// finding nothing.
+    #[test]
+    fn an_unfoldered_item_paints_no_folder_mark() {
+        let unfoldered = folder_marks(&Pane::new().idle(&a_login(), &TotpState::NoSecret));
+        assert!(
+            unfoldered.is_empty(),
+            "an item with no folder painted {} folder mark(s) at {unfoldered:?}",
+            unfoldered.len()
+        );
+        let foldered =
+            folder_marks(&Pane::new().in_folder("Engineering").idle(&a_login(), &TotpState::NoSecret));
+        assert_eq!(
+            foldered.len(),
+            1,
+            "the foldered control painted {} marks, so the emptiness above is about the \
+             probe rather than about the folder",
+            foldered.len()
+        );
+    }
+
+    /// **`FOLDER_VERTICES` really is unique in a rendered header.**
+    ///
+    /// `icon_probe::folder_marks` matches a six-point unfilled closed path and
+    /// nothing else. That is a claim about the whole crate's painting, made in
+    /// `theme.rs`'s doc, and this is what holds it: a frame of the real detail
+    /// pane paints the star, the envelope and its flap, the kebab, the pane
+    /// close, the eyes -- every drawn mark this app has -- and exactly one of
+    /// the paths in it has six points.
+    ///
+    /// Asked over the UNFOLDERED frame as well, which is where a collision
+    /// would actually show: `an_unfoldered_item_paints_no_folder_mark` asserts
+    /// emptiness there, and a second six-point path from some other control
+    /// would make that test fail for a reason nobody would guess from its
+    /// name.
+    #[test]
+    fn the_folder_mark_is_the_only_six_point_path_in_the_header() {
+        fn six_point_paths(shape: &egui::Shape, out: &mut usize) {
+            match shape {
+                egui::Shape::Path(p) if p.points.len() == theme::FOLDER_VERTICES => *out += 1,
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        six_point_paths(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (folder, want) in [(None, 0), (Some("Engineering"), 1)] {
+            let mut pane = Pane::new();
+            if let Some(name) = folder {
+                pane = pane.in_folder(name);
+            }
+            let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+            let mut found = 0;
+            six_point_paths(&frame.shapes, &mut found);
+            assert_eq!(
+                found, want,
+                "a frame with folder {folder:?} paints {found} six-point path(s), not \
+                 {want} -- `theme::FOLDER_VERTICES` is no longer a point count only the \
+                 folder mark uses, so `icon_probe::folder_marks` reports marks that are \
+                 not folders"
+            );
+        }
     }
 
     /// An AUTOFILL TARGETS card on a non-login would advertise a capability
