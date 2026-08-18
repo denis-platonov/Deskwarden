@@ -1195,6 +1195,15 @@ pub fn build_frame(
         // whole of how they stay fixed-size.
         crate::login_ui::draw_resize_handles(ui.ctx());
 
+        // **4d's rehearsal window, one frame of it.** HERE, above the body
+        // match and above every early return below, for the same reason the
+        // resize handles are: a deferred viewport exists for exactly as long
+        // as something keeps asking for it, so a frame that returned early
+        // without this call would take the rehearsal window off the screen
+        // while a `SendInput` burst was still in flight. It does nothing at
+        // all when no rehearsal is open. See `scratch_window`.
+        crate::scratch_window::show_open_rehearsal(ui.ctx());
+
         // EVERY frame schedules the next one, and it is done HERE -- above the
         // body match, next to `draw_resize_handles`, for the same structural
         // reason that call is here (review 31's Important 1).
@@ -3624,14 +3633,14 @@ pub fn build_frame(
                                     draft.set_app_path(&path);
                                 }
                             }
-                            // **4d.** Opened HERE, exactly as the file dialog
-                            // above is, and for a stronger version of the same
-                            // reason: the scratch window pumps its OWN message
-                            // loop for as long as the sequence is typing, so it
-                            // cannot be opened from inside the form's closure.
-                            // It is a plain Win32 window rather than an
-                            // `eframe` one precisely because this line is
-                            // inside a running event loop -- see
+                            // **4d.** Started HERE, exactly as the file dialog
+                            // above is, and for a related reason: this line is
+                            // inside a running event loop, so the rehearsal
+                            // window cannot be a second `run_*native`. It is an
+                            // `egui` viewport -- a real OS window opened inside
+                            // THIS loop and painted with this app's theme --
+                            // which is why this call only STARTS a rehearsal
+                            // and `show_open_rehearsal` above draws it. See
                             // `scratch_window`'s header.
                             //
                             // Nothing from the item is passed: `sample_plan`

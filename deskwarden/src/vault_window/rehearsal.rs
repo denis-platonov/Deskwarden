@@ -245,16 +245,30 @@ pub fn scratch_target() -> Option<isize> {
 // ---------------------------------------------------------------------------
 
 /// What the readout says while the sequence is still being typed.
-pub const WAITING_NOTE: &str = "Rehearsing\u{2026} watch the box above.";
+pub const WAITING_NOTE: &str = "Rehearsing\u{2026} watch the panel below.";
 
 /// The design's heading for the panel showing what really landed.
 pub const ARRIVED_HEADING: &str = "WHAT ARRIVED";
 
-/// The design's glyph for a Tab that arrived.
-pub const ARRIVED_TAB: char = '\u{21e5}';
+/// The glyph for a Tab that arrived.
+///
+/// **Not the design's U+21E5.** 4d draws these two marks in a browser, which
+/// falls through to a system font that has them; this crate's monospace stack
+/// is Consolas over egui's Hack, and `has_glyph` answers `false` for U+21E5,
+/// U+23CE *and* U+21B5 in both. A codepoint the stack lacks is drawn as a tofu
+/// box -- which is exactly the blank a rehearsal must not answer with, and the
+/// same trap [`crate::theme::close_glyph`] exists for. Bundling a fourth face
+/// for two characters was rejected against changing the two characters.
+///
+/// U+2192 and U+00B6 both render, and
+/// `scratch_window::the_tab_and_enter_glyphs_are_drawable_in_the_panel_font`
+/// asks the real font stack rather than assuming -- so a stack change that
+/// took these away is red rather than a rectangle in a screenshot.
+pub const ARRIVED_TAB: char = '\u{2192}';
 
-/// The design's glyph for an Enter that arrived.
-pub const ARRIVED_ENTER: char = '\u{23ce}';
+/// The glyph for an Enter that arrived. See [`ARRIVED_TAB`] for why this is a
+/// pilcrow and not the design's U+23CE.
+pub const ARRIVED_ENTER: char = '\u{00b6}';
 
 /// The characters that really landed, with the two invisible keys drawn.
 ///

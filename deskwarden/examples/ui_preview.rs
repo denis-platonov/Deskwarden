@@ -63,7 +63,8 @@ use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
-use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, theme};
+use deskwarden::vault_window::rehearsal;
+use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
@@ -130,6 +131,14 @@ enum Surface {
     /// because "looks disabled" is precisely the claim a picture can check
     /// and a `contains` assertion cannot.
     PrefsClipboardOff,
+    /// **Design 4d's rehearsal window, finished.** The twelfth surface, and
+    /// the one this example exists for: this window shipped as a raw Win32
+    /// dialog with none of the app's theme, tokens or type, and no screenshot
+    /// job ever looked at it. It is drawn through `scratch_window::draw` --
+    /// the exact function the viewport paints -- with a transcript built by
+    /// the real `rehearsal::transcript`, so what this PNG shows is what a user
+    /// watching a rehearsal sees.
+    Rehearsal,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -173,6 +182,7 @@ const ALL: &[Surface] = &[
     Surface::PreflightRefused,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
+    Surface::Rehearsal,
 ];
 
 impl Surface {
@@ -191,6 +201,7 @@ impl Surface {
             Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
+            Surface::Rehearsal => "rehearsal",
         }
     }
 
@@ -223,6 +234,12 @@ impl Surface {
             // page lays out against exactly the width it has in the app.
             Surface::PrefsClipboard | Surface::PrefsClipboardOff => {
                 egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT)
+            }
+            // The viewport's own inner size, read off the module that builds
+            // it -- so a window resized in the app is a preview resized with
+            // it, rather than a picture of a layout nobody ships.
+            Surface::Rehearsal => {
+                egui::vec2(scratch_window::SCRATCH_WIDTH, scratch_window::SCRATCH_HEIGHT)
             }
         }
     }
@@ -442,6 +459,7 @@ impl eframe::App for Preview {
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
+            Surface::Rehearsal => self.draw_rehearsal(root),
         }
 
         if self.screenshot && !self.done {
@@ -602,6 +620,25 @@ impl Preview {
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
     }
 
+    /// **Design 4d, finished**, drawn exactly as the rehearsal viewport draws
+    /// it: `scratch_window::draw` on a root `Ui` filling the window, which is
+    /// what `show_viewport_deferred` hands its callback.
+    ///
+    /// The arrived text is the literal a Win32 edit control would hold after
+    /// the design's sequence -- a tab and a Windows line ending -- so the two
+    /// glyph substitutions `rehearsal::arrived_panel` makes are in the
+    /// picture rather than merely in a unit test.
+    ///
+    /// Nothing here sends anything: there is no window, no `Injector` and no
+    /// plan. The view is a value.
+    fn draw_rehearsal(&mut self, root: &mut egui::Ui) {
+        let _ = scratch_window::draw(
+            root,
+            &self.fixtures.rehearsal,
+            &mut self.fixtures.rehearsal_arrived,
+        );
+    }
+
     /// The surfaces that live *inside* the vault window rather than in one of
     /// their own, drawn on the window's own canvas so the PNG shows them
     /// against the background they actually sit on.
@@ -688,6 +725,8 @@ struct Fixtures {
     record: RecordDraft,
     allowed: PreflightState,
     refused: PreflightState,
+    rehearsal: scratch_window::RehearsalView,
+    rehearsal_arrived: String,
 }
 
 impl Fixtures {
@@ -727,12 +766,46 @@ impl Fixtures {
             })),
             allowed: preflight_state(true, &login, &totp),
             refused: preflight_state(false, &login, &totp),
+            rehearsal: rehearsal_view(),
+            // What a text field really holds after the design's sequence: the
+            // Tab arrived as a tab, the Enter as a Windows line ending.
+            rehearsal_arrived: format!(
+                "{}	
+{}
+",
+                rehearsal::SAMPLE_USER,
+                rehearsal::SAMPLE_PASSWORD
+            ),
             record,
             draft,
             login,
             card,
             totp,
         }
+    }
+}
+
+/// **Design 4d's finished rehearsal, built the way production builds it.**
+///
+/// `sample_plan` -> `rehearsal_plan` -> `transcript` is the exact chain the
+/// window runs, so the acts listed in the PNG are the acts a real rehearsal of
+/// the design's sequence produces -- chunking, joining and all -- rather than a
+/// hand-written list that could drift from it. No vault is touched: every field
+/// in that plan resolves to a fixed sample by construction.
+fn rehearsal_view() -> scratch_window::RehearsalView {
+    const DESIGN_SEQUENCE: &str = "{USERNAME}{TAB}{DELAY 250}{PASSWORD}{ENTER}";
+    let planned = rehearsal::sample_plan(DESIGN_SEQUENCE).expect("the design's sequence plans");
+    let sent = rehearsal::transcript(
+        &rehearsal::rehearsal_plan(&planned).expect("the substituted sequence re-plans"),
+    );
+    scratch_window::RehearsalView {
+        headline: rehearsal::finished_line(
+            std::time::Duration::from_millis(2100),
+            sent.len(),
+        ),
+        finished: true,
+        sent,
+        failure: None,
     }
 }
 
