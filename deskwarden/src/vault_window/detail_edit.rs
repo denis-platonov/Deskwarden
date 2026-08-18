@@ -1095,20 +1095,222 @@ pub struct EditDraft {
     pub discard_prompt: bool,
 }
 
-/// The generator's own form state: which kind of secret to make, and how big.
+/// The four character classes, in a wrapper that **cannot hold all four off**.
+///
+/// This is its own module, and its fields are private to it, for one reason
+/// that is worth the ceremony. `GenerateRequest::query`'s doc records, from
+/// the serve route's own code, that when `uppercase`, `lowercase`, `number`
+/// and `special` all arrive false the command **silently substitutes
+/// uppercase + lowercase + number**. No error, status 200. A user who
+/// deliberately switched every class off would be handed a three-class
+/// password and told nothing -- the exact "succeeds and ignores you" shape
+/// that `a_length_the_route_would_silently_raise_is_clamped_before_it_is_sent`
+/// exists to keep out of this form.
+///
+/// The answer here is **not a validation check**. A check is a line of code a
+/// later refactor can route around, and the bad request would go back on the
+/// wire the moment somebody built a recipe by a path that skipped it. Instead
+/// the four booleans are private to `char_classes`, the only constructor is
+/// [`CharClasses::default`] (all four ON), and the only mutator is
+/// [`CharClasses::set`], which **refuses** to switch off the last class
+/// standing. Nothing outside this module -- including the rest of
+/// `detail_edit`, including its own test module, which is a child of
+/// `detail_edit` and not of this -- can name the fields, so there is no
+/// expression anywhere in the crate that evaluates to an all-off
+/// `CharClasses`. The state is unrepresentable rather than rejected.
+mod char_classes {
+    /// One character class. An enum rather than four call sites, so the UI can
+    /// draw the chips from [`CharClass::ALL`] and a test can sweep them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CharClass {
+        Uppercase,
+        Lowercase,
+        Number,
+        Special,
+    }
+
+    impl CharClass {
+        /// Every class, in the order the chips are drawn and the order
+        /// `PasswordRecipe` lists them.
+        pub const ALL: [Self; 4] = [Self::Uppercase, Self::Lowercase, Self::Number, Self::Special];
+
+        /// The chip's label: the characters themselves rather than the word
+        /// for them, because "Symbols" does not tell a user facing a site
+        /// that rejects `!` whether `!` is in the set.
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Uppercase => "A-Z",
+                Self::Lowercase => "a-z",
+                Self::Number => "0-9",
+                Self::Special => "!@#",
+            }
+        }
+    }
+
+    /// Which classes the next password may draw from. **Never none of them.**
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CharClasses {
+        uppercase: bool,
+        lowercase: bool,
+        number: bool,
+        special: bool,
+    }
+
+    /// All four on -- `PasswordRecipe::default()`'s own answer, and the one
+    /// this type has to agree with. `a_fresh_generator_asks_for_exactly_the_
+    /// crates_default_recipe` pins that they do.
+    impl Default for CharClasses {
+        fn default() -> Self {
+            Self { uppercase: true, lowercase: true, number: true, special: true }
+        }
+    }
+
+    impl CharClasses {
+        pub fn is_on(&self, class: CharClass) -> bool {
+            match class {
+                CharClass::Uppercase => self.uppercase,
+                CharClass::Lowercase => self.lowercase,
+                CharClass::Number => self.number,
+                CharClass::Special => self.special,
+            }
+        }
+
+        /// Whether `class` is the only one still on -- i.e. whether the
+        /// control for it should be disabled.
+        ///
+        /// `pub` because the UI needs it *before* it draws: a chip that looks
+        /// live and does nothing when clicked is worse than a greyed one, so
+        /// the refusal below has to be visible rather than merely safe.
+        pub fn is_last_on(&self, class: CharClass) -> bool {
+            self.is_on(class) && self.count() == 1
+        }
+
+        /// Switches `class` on or off, and answers whether anything moved.
+        ///
+        /// **Returns `false` and changes nothing** when asked to switch off
+        /// the last class that is on. That refusal is the invariant: with the
+        /// fields private and `Default` starting from all-on, no sequence of
+        /// calls to this function can reach all-off, so no `CharClasses`
+        /// value exists that would trip the route's silent substitution.
+        pub fn set(&mut self, class: CharClass, on: bool) -> bool {
+            if self.is_on(class) == on {
+                return false;
+            }
+            if !on && self.count() == 1 {
+                return false;
+            }
+            let slot = match class {
+                CharClass::Uppercase => &mut self.uppercase,
+                CharClass::Lowercase => &mut self.lowercase,
+                CharClass::Number => &mut self.number,
+                CharClass::Special => &mut self.special,
+            };
+            *slot = on;
+            true
+        }
+
+        /// Flips `class`, subject to the same refusal as [`Self::set`].
+        pub fn toggle(&mut self, class: CharClass) -> bool {
+            self.set(class, !self.is_on(class))
+        }
+
+        fn count(&self) -> usize {
+            [self.uppercase, self.lowercase, self.number, self.special]
+                .into_iter()
+                .filter(|on| *on)
+                .count()
+        }
+    }
+}
+
+pub use char_classes::{CharClass, CharClasses};
+
+/// What goes between a passphrase's words, as a **closed set of choices**
+/// rather than a text box.
+///
+/// `PassphraseRecipe::separator` is a `String`, and its doc records two
+/// things about the route that a free-text box would walk straight into: it
+/// takes only the **first character** of anything longer than one, and it
+/// treats the literal words `space` and `empty` as `" "` and `""`. So a user
+/// who typed `::` would get one colon, and a user who typed the word `space`
+/// intending those five letters would get a blank -- in both cases a form
+/// that says one thing and a password that is another, with no error. Every
+/// variant here maps to either a single character or one of those two
+/// literals, which is exactly the set the route reads without reinterpreting,
+/// so the form and the result cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Separator {
+    Hyphen,
+    Underscore,
+    Period,
+    Comma,
+    Space,
+    None,
+}
+
+impl Separator {
+    /// Every choice, in the order the combo box offers them.
+    pub const ALL: [Self; 6] =
+        [Self::Hyphen, Self::Underscore, Self::Period, Self::Comma, Self::Space, Self::None];
+
+    /// What the combo box shows. The character is in the label because
+    /// "Period" and "Comma" are two words for two marks a reader has to be
+    /// able to tell apart at a glance.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hyphen => "Hyphen  -",
+            Self::Underscore => "Underscore  _",
+            Self::Period => "Period  .",
+            Self::Comma => "Comma  ,",
+            Self::Space => "Space",
+            Self::None => "None",
+        }
+    }
+
+    /// Exactly what goes on the wire as `separator`. See this type's doc for
+    /// why `space`/`empty` are words and everything else is one character.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Hyphen => "-",
+            Self::Underscore => "_",
+            Self::Period => ".",
+            Self::Comma => ",",
+            Self::Space => "space",
+            Self::None => "empty",
+        }
+    }
+}
+
+/// The generator's own form state: which kind of secret to make, how big, and
+/// -- since this commit -- every option `bw serve`'s `/generate` route
+/// actually reads.
 ///
 /// **Deliberately not a [`crate::vault_bridge::GenerateRequest`].** That type
-/// is the wire shape and holds a `String` separator and eight booleans; this
-/// is what two or three widgets edit across frames, and
-/// [`EditDraft::generator_request`] is the one conversion between them. Every
-/// option the form does not offer is supplied there from
-/// `PasswordRecipe::default()`/`PassphraseRecipe::default()`, so adding a
-/// control later changes this struct and that function and nothing else.
+/// is the wire shape and holds a `String` separator; this is what the widgets
+/// edit across frames, and [`EditDraft::generator_request`] is the one
+/// conversion between them. The two places this struct is *not* a plain mirror
+/// of the wire are the two the wire gets wrong on its own: [`CharClasses`],
+/// which makes the all-off request unrepresentable, and [`Separator`], which
+/// makes the form's separator and the route's reading of it the same thing.
 ///
 /// `length` and `words` are **both** kept, rather than one number reinterpreted
 /// by `passphrase`: 20 characters and 20 words are wildly different requests,
 /// and a shared field would silently carry one over as the other when the
-/// combo box is flipped.
+/// combo box is flipped. The same argument keeps the password's options and
+/// the passphrase's options side by side rather than in an enum: flipping the
+/// combo to look at a passphrase and back must not throw away the class the
+/// user just switched off.
+///
+/// **Remembered for the life of the form, and no longer.** These fields live
+/// on the draft, so a second Generate repeats the first one's recipe and
+/// `set_kind` carries them across a type change (see
+/// `switching_kind_keeps_the_generator_settings`) -- a user who turns symbols
+/// off for a site that rejects them is not asked twice. They are *not*
+/// persisted: every constructor of [`EditDraft`] starts from
+/// [`GeneratorDraft::default`], so opening any other item begins again at
+/// Deskwarden's own strong recipe. A weakened setting therefore cannot follow
+/// a user from the one site that demanded it to every item they open next,
+/// which is the failure mode that matters more than the retyping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratorDraft {
     /// A word passphrase rather than a character password.
@@ -1117,14 +1319,55 @@ pub struct GeneratorDraft {
     pub length: u32,
     /// Words, when generating a passphrase. The route clamps below 3.
     pub words: u32,
+    /// Which character classes a password may draw from. Never none.
+    pub classes: CharClasses,
+    /// `minNumber`. Meaningful only while [`CharClass::Number`] is on -- see
+    /// [`EditDraft::generator_request`] for what the wire is told when it is
+    /// not, and why the value is kept rather than zeroed here.
+    pub min_number: u32,
+    /// `minSpecial`, and the same story as [`Self::min_number`].
+    pub min_special: u32,
+    /// Leave out the characters nobody can read aloud.
+    pub avoid_ambiguous: bool,
+    /// What goes between a passphrase's words.
+    pub separator: Separator,
+    /// Capitalise each of a passphrase's words.
+    pub capitalize: bool,
+    /// `includeNumber`: put a digit on one of the words.
+    pub include_number: bool,
+    /// The options disclosure is open.
+    ///
+    /// **View state, and the one field on this struct that is.** It is what a
+    /// user does to the FORM, so it is excluded from
+    /// [`EditDraft::content_digest`] by name -- a draft that went dirty
+    /// because somebody opened the options would make Cancel ask about a
+    /// change that does not exist.
+    pub options_open: bool,
 }
 
 impl Default for GeneratorDraft {
+    /// Every field taken from the crate's own default recipes rather than
+    /// written out again, so the form's starting state and
+    /// `PasswordRecipe::default()`/`PassphraseRecipe::default()` cannot drift
+    /// apart. `separator` is the one that cannot be copied -- the recipe's is
+    /// a `String` and this is a closed enum -- so
+    /// `the_default_separator_is_the_default_recipes_separator` asserts the
+    /// two agree.
     fn default() -> Self {
+        let password = PasswordRecipe::default();
+        let passphrase = PassphraseRecipe::default();
         Self {
             passphrase: false,
-            length: PasswordRecipe::default().length,
-            words: PassphraseRecipe::default().words,
+            length: password.length,
+            words: passphrase.words,
+            classes: CharClasses::default(),
+            min_number: password.min_number,
+            min_special: password.min_special,
+            avoid_ambiguous: password.avoid_ambiguous,
+            separator: Separator::Hyphen,
+            capitalize: passphrase.capitalize,
+            include_number: passphrase.include_number,
+            options_open: false,
         }
     }
 }
@@ -1140,6 +1383,16 @@ const MIN_LENGTH: u32 = 5;
 const MAX_LENGTH: u32 = 128;
 const MIN_WORDS: u32 = 3;
 const MAX_WORDS: u32 = 20;
+
+/// The most digits or symbols the form will let a user *demand*.
+///
+/// This app's, not the route's -- nothing in `GenerateCommand` caps
+/// `minNumber` or `minSpecial`. It is deliberately far below [`MIN_LENGTH`]
+/// so the two spinners can never between them ask for more characters than
+/// the password has room for; [`EditDraft::generator_request`] clamps against
+/// the length as well, for the case where the user lowers the length
+/// afterwards.
+const MAX_MIN_CLASS: u32 = 4;
 
 impl Default for EditDraft {
     /// A blank **login** draft. `ItemKind` has no `Default` of its own on
@@ -1457,28 +1710,72 @@ impl EditDraft {
     ///
     /// **The one conversion between the form and the wire**, so a control
     /// added to [`GeneratorDraft`] has exactly one place to be honoured and
-    /// cannot half-arrive. The unoffered options are taken from
-    /// `PasswordRecipe::default()` (all four character classes on, a minimum
-    /// of one digit and one symbol, ambiguous characters avoided) and
-    /// `PassphraseRecipe::default()` (a `-` separator, capitalised, with a
-    /// number) -- see those types for why those defaults are Deskwarden's and
-    /// not the CLI's weaker ones.
+    /// cannot half-arrive.
+    ///
+    /// **Both recipes are built field by field, with no `..Default::default()`
+    /// tail.** The form now offers every option the route reads, so a struct
+    /// update syntax here would no longer be filling in what the form does not
+    /// ask about -- it would be a silent catch-all that let a field added to
+    /// `PasswordRecipe` later reach the wire as a default nobody chose, and
+    /// that let a field added to [`GeneratorDraft`] be forgotten here without
+    /// a compile error. Spelling every field out is what makes "cannot
+    /// half-arrive" true rather than aspirational.
     ///
     /// The lengths are clamped here as well as in the widget. Not belt and
     /// braces: the route silently raises a too-small `length`/`words` to its
     /// own minimum, so an unclamped 1 would come back as a 5-character
     /// password against a form that said 1 -- a request that "succeeds" and
     /// ignores what was asked. Clamping means the form and the result agree.
+    ///
+    /// **The minimums are made coherent with their classes here.**
+    /// `minNumber: 1` with `number: false` is a contradiction, and it is one
+    /// the route resolves in a direction the user did not pick. Two rules,
+    /// both one-way:
+    ///
+    /// * A class that is **off** sends a minimum of `0`, whatever the spinner
+    ///   holds. The draft keeps the number, so switching the class back on
+    ///   restores what the user chose rather than a zero they never typed --
+    ///   the same argument `theme::toggle_pill_disabled` makes for still
+    ///   showing its state.
+    /// * A minimum can never exceed the room the password has. `min_number`
+    ///   is capped at the clamped `length` and `min_special` at whatever is
+    ///   left after it, so "5 characters, 4 digits and 4 symbols" cannot go
+    ///   out. [`MAX_MIN_CLASS`] keeps the widgets well inside this; the clamp
+    ///   is for the user who sets the minimums first and *then* shortens the
+    ///   password.
+    ///
+    /// The character classes need no rule at all, which is the point of
+    /// [`CharClasses`]: there is no value of it that could produce the
+    /// all-off request the route silently rewrites.
     pub fn generator_request(&self) -> GenerateRequest {
-        if self.generator.passphrase {
+        let generator = &self.generator;
+        if generator.passphrase {
             GenerateRequest::Passphrase(PassphraseRecipe {
-                words: self.generator.words.clamp(MIN_WORDS, MAX_WORDS),
-                ..PassphraseRecipe::default()
+                words: generator.words.clamp(MIN_WORDS, MAX_WORDS),
+                separator: generator.separator.wire().to_string(),
+                capitalize: generator.capitalize,
+                include_number: generator.include_number,
             })
         } else {
+            let length = generator.length.clamp(MIN_LENGTH, MAX_LENGTH);
+            let number = generator.classes.is_on(CharClass::Number);
+            let special = generator.classes.is_on(CharClass::Special);
+            let min_number =
+                if number { generator.min_number.min(MAX_MIN_CLASS).min(length) } else { 0 };
+            let min_special = if special {
+                generator.min_special.min(MAX_MIN_CLASS).min(length.saturating_sub(min_number))
+            } else {
+                0
+            };
             GenerateRequest::Password(PasswordRecipe {
-                length: self.generator.length.clamp(MIN_LENGTH, MAX_LENGTH),
-                ..PasswordRecipe::default()
+                length,
+                uppercase: generator.classes.is_on(CharClass::Uppercase),
+                lowercase: generator.classes.is_on(CharClass::Lowercase),
+                number,
+                special,
+                min_number,
+                min_special,
+                avoid_ambiguous: generator.avoid_ambiguous,
             })
         }
     }
@@ -1557,7 +1854,8 @@ impl EditDraft {
     ///
     /// **The exclusions are the whole design of this function.** Revealing a
     /// password, opening the window picker, filtering it, previewing a
-    /// sequence and opening the discard confirmation are all things the user
+    /// sequence, setting up the generator and opening the discard
+    /// confirmation are all things the user
     /// does to the form rather than to the item; if any of them counted, a
     /// form nobody had edited would ask "discard your changes?" on the way
     /// out. A confirmation that fires when there is nothing to lose is worse
@@ -1602,7 +1900,22 @@ impl EditDraft {
             identity,
             ssh_key,
             note_body,
-            generator,
+            // **View state, all of it, and this is a change of mind.** The
+            // generator used to be digested whole, so nudging the length
+            // spinner made the form dirty. It should not: nothing in
+            // `GeneratorDraft` is ever written back to the item -- neither
+            // `to_new_item` nor `apply_to` so much as reads it -- so a Cancel
+            // that asked about it would be asking the user to confirm losing
+            // something that was never going to be saved. It describes what
+            // the user wants their NEXT password to look like, which is a
+            // fact about the form, exactly like an open picker or a revealed
+            // box. And with the options disclosure now on this struct, the
+            // old reading would have made merely OPENING the generator an
+            // edit.
+            //
+            // (`set_generated_password` is what turns a generate into a real
+            // change, and `password` above already counts that.)
+            generator: _,
             app,
             fields,
             // The measurement itself, and the question being asked about it.
@@ -1652,7 +1965,7 @@ impl EditDraft {
              {cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
              {code}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}\
              {private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}\
-             {identity:?}\u{0}{note_body}\u{0}{generator:?}\u{0}"
+             {identity:?}\u{0}{note_body}\u{0}"
         );
         match app {
             Some(app) => {
@@ -4074,6 +4387,111 @@ fn note_form_overflow(ctx: &egui::Context, overflowed: bool) {
     ctx.data_mut(|data| data.insert_temp(form_overflow_id(), overflowed));
 }
 
+/// The label the generator's options disclosure wears.
+const GENERATOR_OPTIONS: &str = "Options";
+
+/// The hint under the character-class chips when one of them is the last one
+/// standing.
+///
+/// **Shown rather than merely enforced.** [`CharClasses::set`] refuses to
+/// switch off the last class, so the request is safe whether or not this line
+/// is on screen -- but a chip that quietly ignores a click is a control the
+/// user is entitled to think is broken. The greyed chip says "not this one"
+/// and this says why.
+const LAST_CLASS_HINT: &str = "A password has to come from somewhere.";
+
+/// The generator's options, drawn under its control row when the disclosure
+/// is open.
+///
+/// A free function taking only the [`GeneratorDraft`] rather than a method on
+/// the form: it needs no other part of the draft and produces no
+/// [`EditAction`], and keeping it that way is what lets its layout be tested
+/// against a `GeneratorDraft` alone.
+///
+/// **Every row here is `horizontal_wrapped`.** See the disclosure's own
+/// comment in the generator row for why that is not a style choice: the row
+/// above has a content floor wider than the card at the app's minimum window
+/// size and survives only by wrapping, and a block of options laid out in
+/// unwrapped rows would reintroduce exactly the defect (`aae9429`) that one
+/// was written to avoid.
+fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
+    ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
+    if generator.passphrase {
+        theme::field_label(ui, "Between words");
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("generator-separator")
+                .selected_text(generator.separator.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for choice in Separator::ALL {
+                        ui.selectable_value(&mut generator.separator, choice, choice.label());
+                    }
+                });
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(generator.capitalize, "Capitalise").clicked() {
+                generator.capitalize = !generator.capitalize;
+            }
+            if ui.selectable_label(generator.include_number, "Include a number").clicked() {
+                generator.include_number = !generator.include_number;
+            }
+        });
+        return;
+    }
+
+    theme::field_label(ui, "Use these characters");
+    ui.horizontal_wrapped(|ui| {
+        for class in CharClass::ALL {
+            let on = generator.classes.is_on(class);
+            // The greyed chip is the refusal made visible. `add_enabled`
+            // rather than skipping the chip: the class is still ON and the
+            // user needs to see that it is, which is the same argument
+            // `theme::toggle_pill_disabled` makes.
+            let last = generator.classes.is_last_on(class);
+            let chip = ui.add_enabled(!last, egui::Button::selectable(on, class.label()));
+            if chip.clicked() {
+                generator.classes.toggle(class);
+            }
+        }
+    });
+    if CharClass::ALL.iter().any(|class| generator.classes.is_last_on(*class)) {
+        ui.add_space(2.0);
+        ui.label(RichText::new(LAST_CLASS_HINT).size(11.0).color(theme::TEXT_FAINT));
+    }
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        // Disabled, not hidden, and for the reason `generator_request`'s doc
+        // gives: the number is still the user's, it comes straight back when
+        // the class does, and a control that vanished would look like a
+        // setting that had been forgotten rather than one that is waiting.
+        ui.add_enabled(
+            generator.classes.is_on(CharClass::Number),
+            egui::DragValue::new(&mut generator.min_number)
+                .range(0..=MAX_MIN_CLASS)
+                .prefix("min ")
+                .suffix(" digits"),
+        );
+        ui.add_enabled(
+            generator.classes.is_on(CharClass::Special),
+            egui::DragValue::new(&mut generator.min_special)
+                .range(0..=MAX_MIN_CLASS)
+                .prefix("min ")
+                .suffix(" symbols"),
+        );
+    });
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(generator.avoid_ambiguous, AVOID_AMBIGUOUS).clicked() {
+            generator.avoid_ambiguous = !generator.avoid_ambiguous;
+        }
+    });
+}
+
+/// The ambiguous-characters chip's label. Named because two tests and the
+/// widget have to agree on it.
+const AVOID_AMBIGUOUS: &str = "Avoid lookalikes (0/O, 1/l)";
+
 pub fn draw_detail_edit(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
@@ -4402,7 +4820,38 @@ pub fn draw_detail_edit(
                                     .suffix(" chars"),
                             );
                         }
+                        // **A disclosure, not seven more controls on this
+                        // row.** The comment above measures this row's
+                        // content floor at 279.4pt against the 264 the card
+                        // offers at the app's minimum window size; it already
+                        // wraps. Seven more fixed-width controls beside them
+                        // would be seven more items in the same wrap, and a
+                        // popover or a modal would put the generator's own
+                        // chrome into a stacked label/field form -- which is
+                        // design block 3d's job, in the OVERLAY, in a file
+                        // this work does not own.
+                        //
+                        // So: one more chip here, and the options themselves
+                        // laid out BELOW in wrapped rows of their own. Every
+                        // control down there is a chip, a combo or a
+                        // spinner in its own `horizontal_wrapped`, so the
+                        // block's width floor is one widest chip rather than
+                        // a sum -- it cannot push the card out however many
+                        // options it grows, which is the property this row
+                        // does not have and the reason it is not the place to
+                        // put them. See
+                        // `every_generator_option_is_reachable_at_the_apps_minimum_width`.
+                        if ui
+                            .selectable_label(draft.generator.options_open, GENERATOR_OPTIONS)
+                            .clicked()
+                        {
+                            draft.generator.options_open = !draft.generator.options_open;
+                        }
                     });
+                    if draft.generator.options_open {
+                        ui.add_space(6.0);
+                        generator_options(ui, &mut draft.generator);
+                    }
                     ui.add_space(10.0);
 
                     // Below the password and its generator, because that is
@@ -6925,19 +7374,337 @@ mod tests {
     }
 
     #[test]
-    fn the_generators_unoffered_options_come_from_the_crates_own_default_recipe() {
-        // The form offers a kind and a size and nothing else, so everything
-        // that makes the result STRONG -- all four character classes, a
-        // minimum digit and symbol, ambiguous characters avoided -- is
-        // supplied by `generator_request`. Nothing else in the app would
-        // notice if it quietly stopped being.
-        match EditDraft::empty().generator_request() {
+    fn a_fresh_form_asks_for_exactly_the_crates_own_default_recipe() {
+        // The form now offers every option the route reads, which makes the
+        // STARTING state the thing worth pinning: a user who never opens the
+        // options gets all four character classes, a minimum digit and
+        // symbol, and ambiguous characters avoided -- Deskwarden's recipe,
+        // not the CLI's weaker one. `assert_eq` against the whole recipe
+        // rather than field by field, so an option added to `PasswordRecipe`
+        // whose default the form starts somewhere else cannot slip past.
+        let mut draft = EditDraft::empty();
+        assert_eq!(
+            draft.generator_request(),
+            GenerateRequest::Password(PasswordRecipe::default()),
+            "a form nobody has touched no longer asks for the crate's own default recipe"
+        );
+        draft.generator.passphrase = true;
+        assert_eq!(
+            draft.generator_request(),
+            GenerateRequest::Passphrase(PassphraseRecipe::default()),
+            "...and the same for a passphrase"
+        );
+    }
+
+    #[test]
+    fn the_default_separator_is_the_default_recipes_separator() {
+        // `Separator` is a closed enum and `PassphraseRecipe::separator` is a
+        // `String`, so this is the one field of `GeneratorDraft::default`
+        // that cannot be copied across and has to be asserted equal instead.
+        assert_eq!(
+            GeneratorDraft::default().separator.wire(),
+            PassphraseRecipe::default().separator,
+            "the form starts on a different separator from the crate's default recipe"
+        );
+    }
+
+    // -- the all-classes-off request, which must not be buildable -----------
+
+    /// **THE GUARD.** `GenerateRequest::query`'s doc records, from the serve
+    /// route's own code, that all four classes false comes back as a
+    /// uppercase+lowercase+number password with no error. Adding the chips
+    /// added the reachability, so this sweeps **every** way of getting there:
+    /// each of the sixteen subsets of classes the user could try to switch
+    /// off, in each of the twenty-four orders they could click them in.
+    ///
+    /// It would go red for a `CharClasses::set` that dropped the refusal --
+    /// which is the mutation, and the reason the refusal is not a `if
+    /// !any() { restore }` written after the fact somewhere in the UI.
+    #[test]
+    fn no_sequence_of_clicks_can_ask_for_a_password_made_of_nothing() {
+        let orders = [
+            [0usize, 1, 2, 3],
+            [0, 1, 3, 2],
+            [0, 2, 1, 3],
+            [0, 2, 3, 1],
+            [0, 3, 1, 2],
+            [0, 3, 2, 1],
+            [1, 0, 2, 3],
+            [1, 0, 3, 2],
+            [1, 2, 0, 3],
+            [1, 2, 3, 0],
+            [1, 3, 0, 2],
+            [1, 3, 2, 0],
+            [2, 0, 1, 3],
+            [2, 0, 3, 1],
+            [2, 1, 0, 3],
+            [2, 1, 3, 0],
+            [2, 3, 0, 1],
+            [2, 3, 1, 0],
+            [3, 0, 1, 2],
+            [3, 0, 2, 1],
+            [3, 1, 0, 2],
+            [3, 1, 2, 0],
+            [3, 2, 0, 1],
+            [3, 2, 1, 0],
+        ];
+        let mut swept = 0;
+        for order in orders {
+            for subset in 0u8..16 {
+                let mut draft = EditDraft::empty();
+                for (step, index) in order.into_iter().enumerate() {
+                    if subset & (1 << step) != 0 {
+                        draft.generator.classes.set(CharClass::ALL[index], false);
+                    }
+                }
+                assert!(
+                    CharClass::ALL.iter().any(|class| draft.generator.classes.is_on(*class)),
+                    "clicking {order:?} with subset {subset:04b} switched every class off"
+                );
+                match draft.generator_request() {
+                    GenerateRequest::Password(p) => assert!(
+                        p.uppercase || p.lowercase || p.number || p.special,
+                        "a request with no character class at all reached the wire: {p:?} -- \
+                         `bw serve` answers this 200 with a three-class password and says nothing"
+                    ),
+                    other => panic!("expected a password request: {other:?}"),
+                }
+                swept += 1;
+            }
+        }
+        assert_eq!(swept, 24 * 16, "the sweep did not run");
+    }
+
+    #[test]
+    fn the_last_character_class_standing_refuses_to_be_switched_off() {
+        // The positive control for the sweep above: without this, a `set`
+        // that silently *ignored every* request would also pass it.
+        for last in CharClass::ALL {
+            let mut classes = CharClasses::default();
+            for other in CharClass::ALL {
+                if other != last {
+                    assert!(
+                        classes.set(other, false),
+                        "switching {other:?} off was refused while {last:?} was still on"
+                    );
+                }
+            }
+            assert!(classes.is_last_on(last), "{last:?} should be the last one on");
+            assert!(!classes.set(last, false), "the last class reported that it moved");
+            assert!(classes.is_on(last), "the last class standing was switched off");
+            // ...and it comes back on the moment another one does.
+            assert!(classes.set(CharClass::ALL[0], true) || last == CharClass::ALL[0]);
+        }
+    }
+
+    #[test]
+    fn every_character_class_reaches_the_request_on_its_own() {
+        // Paired with the sweep: that one says a class can never *all* go
+        // off, this one says switching one off is honoured rather than
+        // ignored -- the two together are what "unrepresentable, not
+        // validated" means in practice.
+        for off in CharClass::ALL {
+            let mut draft = EditDraft::empty();
+            assert!(draft.generator.classes.set(off, false), "{off:?} refused to move");
+            match draft.generator_request() {
+                GenerateRequest::Password(p) => {
+                    let sent = [
+                        (CharClass::Uppercase, p.uppercase),
+                        (CharClass::Lowercase, p.lowercase),
+                        (CharClass::Number, p.number),
+                        (CharClass::Special, p.special),
+                    ];
+                    for (class, on) in sent {
+                        assert_eq!(
+                            on,
+                            class != off,
+                            "with {off:?} switched off the request said {class:?} = {on}: {p:?}"
+                        );
+                    }
+                }
+                other => panic!("expected a password request: {other:?}"),
+            }
+        }
+    }
+
+    // -- the minimums, coherent with their classes -------------------------
+
+    #[test]
+    fn a_minimum_for_a_class_that_is_off_is_not_sent() {
+        // `minNumber: 1` with `number: false` is a contradiction, and the
+        // route resolves it in a direction nobody picked. The class going off
+        // takes its minimum to zero on the wire...
+        let mut draft = EditDraft::empty();
+        draft.generator.min_number = 3;
+        draft.generator.min_special = 3;
+        assert!(draft.generator.classes.set(CharClass::Number, false));
+        assert!(draft.generator.classes.set(CharClass::Special, false));
+        match draft.generator_request() {
             GenerateRequest::Password(p) => {
-                assert!(p.uppercase && p.lowercase && p.number && p.special, "{p:?}");
-                assert!(p.min_number >= 1 && p.min_special >= 1, "{p:?}");
-                assert!(p.avoid_ambiguous, "{p:?}");
+                assert_eq!(p.min_number, 0, "a digit minimum went out with digits off: {p:?}");
+                assert_eq!(p.min_special, 0, "a symbol minimum went out with symbols off: {p:?}");
             }
             other => panic!("expected a password request: {other:?}"),
+        }
+        // ...and the DRAFT keeps it, so the user's number comes straight back
+        // rather than a zero they never typed.
+        assert_eq!(draft.generator.min_number, 3);
+        assert_eq!(draft.generator.min_special, 3);
+        assert!(draft.generator.classes.set(CharClass::Number, true));
+        match draft.generator_request() {
+            GenerateRequest::Password(p) => assert_eq!(p.min_number, 3, "{p:?}"),
+            other => panic!("expected a password request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_minimums_can_never_between_them_exceed_the_password() {
+        // "5 characters, of which at least 4 digits and at least 4 symbols"
+        // is not a request any generator can honour. Reachable by setting the
+        // minimums first and shortening the password afterwards, which is why
+        // the clamp is here and not only in the widget's range.
+        let mut draft = EditDraft::empty();
+        draft.generator.length = MIN_LENGTH;
+        draft.generator.min_number = MAX_MIN_CLASS;
+        draft.generator.min_special = MAX_MIN_CLASS;
+        match draft.generator_request() {
+            GenerateRequest::Password(p) => assert!(
+                p.min_number + p.min_special <= p.length,
+                "the request demanded {} digits and {} symbols in {} characters",
+                p.min_number,
+                p.min_special,
+                p.length
+            ),
+            other => panic!("expected a password request: {other:?}"),
+        }
+    }
+
+    // -- the passphrase's options ------------------------------------------
+
+    #[test]
+    fn every_separator_the_form_offers_is_one_the_route_reads_unchanged() {
+        // THE "FORM AND RESULT DISAGREE" GUARD for the separator.
+        // `PassphraseRecipe`'s doc records that the route takes only the
+        // FIRST character of anything longer than one, and reads the literal
+        // words `space` and `empty` specially. So every choice this form
+        // offers has to be either a single character or one of those two
+        // words -- anything else would be a menu entry that produces
+        // something other than what it says.
+        for choice in Separator::ALL {
+            let wire = choice.wire();
+            let understood = wire.chars().count() == 1 || wire == "space" || wire == "empty";
+            assert!(
+                understood,
+                "the separator {:?} sends {wire:?}, which the route would truncate to its first \
+                 character -- the menu would say one thing and the passphrase be another",
+                choice.label()
+            );
+            // ...and a one-character choice must not collide with the two
+            // magic words, which is the other half of the same trap.
+            assert!(
+                wire.chars().count() == 1 || choice == Separator::Space || choice == Separator::None,
+                "{choice:?} sends a magic word it did not mean to"
+            );
+        }
+    }
+
+    #[test]
+    fn every_separator_reaches_the_request_as_the_wire_spells_it() {
+        for choice in Separator::ALL {
+            let mut draft = EditDraft::empty();
+            draft.generator.passphrase = true;
+            draft.generator.separator = choice;
+            match draft.generator_request() {
+                GenerateRequest::Passphrase(p) => assert_eq!(
+                    p.separator,
+                    choice.wire(),
+                    "the {:?} separator did not reach the request",
+                    choice.label()
+                ),
+                other => panic!("expected a passphrase request: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_passphrases_switches_reach_the_request() {
+        // Both off, so a conversion that hard-coded the default `true` for
+        // either one is caught. Paired with
+        // `a_fresh_form_asks_for_exactly_the_crates_default_recipe`, which is
+        // the both-on side.
+        let mut draft = EditDraft::empty();
+        draft.generator.passphrase = true;
+        draft.generator.capitalize = false;
+        draft.generator.include_number = false;
+        match draft.generator_request() {
+            GenerateRequest::Passphrase(p) => {
+                assert!(!p.capitalize, "capitalisation stayed on: {p:?}");
+                assert!(!p.include_number, "the number stayed on: {p:?}");
+            }
+            other => panic!("expected a passphrase request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_password_options_do_not_leak_into_a_passphrase_request_or_back() {
+        // `GeneratorDraft` keeps both halves side by side rather than in an
+        // enum, so that flipping the combo to look at a passphrase and back
+        // does not throw away a class the user just switched off. The price
+        // is that the conversion has to pick the right half, and this is what
+        // says it does: a passphrase request states no character length and
+        // no classes at all (`GenerateRequest`'s own doc: the command reads
+        // every key on every request), and a password request states no
+        // separator.
+        let mut draft = EditDraft::empty();
+        draft.generator.avoid_ambiguous = false;
+        assert!(draft.generator.classes.set(CharClass::Special, false));
+        draft.generator.separator = Separator::None;
+        draft.generator.passphrase = true;
+
+        let passphrase = draft.generator_request();
+        assert!(matches!(passphrase, GenerateRequest::Passphrase(_)), "{passphrase:?}");
+
+        draft.generator.passphrase = false;
+        match draft.generator_request() {
+            GenerateRequest::Password(p) => {
+                assert!(!p.special, "the class the user switched off came back: {p:?}");
+                assert!(!p.avoid_ambiguous, "the lookalike setting came back: {p:?}");
+            }
+            other => panic!("expected a password request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switching_kind_keeps_the_generator_options_too() {
+        // The same exemption `switching_kind_keeps_the_generator_settings`
+        // pins for the size and the kind, extended to the options -- a user
+        // who turned symbols off for a site that rejects them must not have
+        // to do it again because they touched the type menu.
+        let mut draft = EditDraft::empty();
+        assert!(draft.generator.classes.set(CharClass::Special, false));
+        draft.generator.avoid_ambiguous = false;
+        draft.generator.separator = Separator::Space;
+        draft.set_kind(ItemKind::Card);
+        draft.set_kind(ItemKind::Login);
+        assert!(!draft.generator.classes.is_on(CharClass::Special));
+        assert!(!draft.generator.avoid_ambiguous);
+        assert_eq!(draft.generator.separator, Separator::Space);
+    }
+
+    #[test]
+    fn a_newly_opened_form_starts_from_the_default_recipe_again() {
+        // The other half of "remembered". They are remembered for the LIFE OF
+        // THE FORM and no longer: a weakened setting must not follow the user
+        // from the one site that demanded it to every item they open next.
+        // There is no persistence path for `GeneratorDraft` at all, and this
+        // is what would go red if somebody added one.
+        for draft in [EditDraft::empty(), EditDraft::empty_of(ItemKind::Login), EditDraft::default()]
+        {
+            assert_eq!(
+                draft.generator,
+                GeneratorDraft::default(),
+                "a freshly opened form did not start from the crate's own default recipe"
+            );
         }
     }
 }
@@ -7126,7 +7893,7 @@ mod generator_row_tests {
     /// rather than a coincidentally right one.
     fn login_draft(passphrase: bool) -> EditDraft {
         let mut draft = EditDraft::empty();
-        draft.generator = GeneratorDraft { passphrase, length: 33, words: 7 };
+        draft.generator = GeneratorDraft { passphrase, length: 33, words: 7, ..GeneratorDraft::default() };
         draft
     }
 
@@ -7329,6 +8096,195 @@ mod generator_row_tests {
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
             }],
+        );
+    }
+
+    // -- the options disclosure and its controls ----------------------------
+    //
+    // Same standing as the three above: `generator_request`, `CharClasses` and
+    // `Separator` are pure and tested to death in `tests`, and none of that
+    // says the chips are WIRED. Each of these names the mutation it catches.
+
+    #[test]
+    fn the_options_chip_opens_and_closes_the_block() {
+        // Mutation this catches: draw the block unconditionally, or never.
+        // Both leave every pure test green.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+
+        let (_, shut) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            !shut.strings().contains(&"Use these characters"),
+            "the options block is on screen before anybody opened it: {:?}",
+            shut.strings()
+        );
+        let chip = shut.rect_of(GENERATOR_OPTIONS);
+
+        let _ = frame(&ctx, &mut draft, &click(chip.center()));
+        assert!(draft.generator.options_open, "clicking Options did not open the block");
+        let (_, open) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            open.strings().contains(&"Use these characters"),
+            "the block is flagged open and paints nothing: {:?}",
+            open.strings()
+        );
+
+        let _ = frame(&ctx, &mut draft, &click(chip.center()));
+        assert!(!draft.generator.options_open, "clicking Options again did not close the block");
+    }
+
+    #[test]
+    fn a_click_that_misses_the_options_chip_opens_nothing() {
+        // The positive control: a click anywhere toggling the disclosure
+        // would pass the test above with the chip deleted.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+        let (_, first) = frame(&ctx, &mut draft, &[]);
+        let chip = first.rect_of(GENERATOR_OPTIONS);
+        let miss = Pos2::new(chip.center().x, chip.top() - 60.0);
+        let _ = frame(&ctx, &mut draft, &click(miss));
+        assert!(!draft.generator.options_open, "a click that hit nothing opened the options");
+    }
+
+    /// Opens the block and clicks the chip labelled `label`, answering with
+    /// the generator afterwards.
+    fn click_option(mut draft: EditDraft, label: &str) -> GeneratorDraft {
+        let ctx = styled_context();
+        draft.generator.options_open = true;
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let chip = painted.rect_of(label);
+        let _ = frame(&ctx, &mut draft, &click(chip.center()));
+        draft.generator.clone()
+    }
+
+    #[test]
+    fn each_character_class_chip_switches_its_own_class() {
+        // Mutation this catches: every chip bound to the same class, or to
+        // the wrong one -- a user who clicks "!@#" to satisfy a site that
+        // rejects symbols and silently loses their digits instead.
+        for class in CharClass::ALL {
+            let after = click_option(login_draft(false), class.label());
+            assert!(
+                !after.classes.is_on(class),
+                "clicking the {:?} chip did not switch {class:?} off",
+                class.label()
+            );
+            for other in CharClass::ALL {
+                if other != class {
+                    assert!(
+                        after.classes.is_on(other),
+                        "clicking the {:?} chip also switched {other:?} off",
+                        class.label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_character_class_chip_is_greyed_and_does_nothing() {
+        // **The reachability guard at the widget.** `CharClasses::set`
+        // refuses the request, so the wire is safe either way; what this
+        // says is that the user is told, rather than left clicking a live
+        // chip that ignores them. Mutation it catches: `add_enabled(true,
+        // ..)` -- the refusal becomes invisible and the chip becomes a
+        // control that lies about being a control.
+        let mut draft = login_draft(false);
+        for class in CharClass::ALL {
+            if class != CharClass::Lowercase {
+                assert!(draft.generator.classes.set(class, false), "the premise");
+            }
+        }
+        assert!(draft.generator.classes.is_last_on(CharClass::Lowercase), "the premise");
+
+        let ctx = styled_context();
+        draft.generator.options_open = true;
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            painted.strings().contains(&LAST_CLASS_HINT),
+            "the last class standing is greyed with no explanation: {:?}",
+            painted.strings()
+        );
+        let chip = painted.rect_of(CharClass::Lowercase.label());
+        let _ = frame(&ctx, &mut draft, &click(chip.center()));
+        assert!(
+            draft.generator.classes.is_on(CharClass::Lowercase),
+            "clicking the last character class standing switched it off -- `bw serve` would \
+             answer this with a three-class password and no error"
+        );
+    }
+
+    #[test]
+    fn the_lookalike_chip_is_wired_to_the_lookalike_setting() {
+        let after = click_option(login_draft(false), AVOID_AMBIGUOUS);
+        assert!(!after.avoid_ambiguous, "clicking the lookalike chip changed nothing");
+    }
+
+    #[test]
+    fn the_passphrase_chips_are_wired_to_their_own_switches() {
+        // Mutation this catches: both chips bound to `capitalize`.
+        let capitalised = click_option(login_draft(true), "Capitalise");
+        assert!(!capitalised.capitalize, "the Capitalise chip changed nothing");
+        assert!(capitalised.include_number, "the Capitalise chip also turned the number off");
+
+        let numbered = click_option(login_draft(true), "Include a number");
+        assert!(!numbered.include_number, "the Include a number chip changed nothing");
+        assert!(numbered.capitalize, "the Include a number chip also turned capitalisation off");
+    }
+
+    #[test]
+    fn the_two_halves_of_the_block_do_not_appear_together() {
+        // A password has no separator and a passphrase has no character
+        // classes -- `GenerateRequest`'s doc records that the command reads
+        // every key on every request, so a form that offered both would be
+        // offering controls that do nothing.
+        let ctx = styled_context();
+        for passphrase in [false, true] {
+            let mut draft = login_draft(passphrase);
+            draft.generator.options_open = true;
+            let (_, painted) = frame(&ctx, &mut draft, &[]);
+            let strings = painted.strings();
+            assert_eq!(
+                strings.contains(&"Use these characters"),
+                !passphrase,
+                "the character classes are on the wrong half (passphrase={passphrase}): \
+                 {strings:?}"
+            );
+            assert_eq!(
+                strings.contains(&"Between words"),
+                passphrase,
+                "the separator is on the wrong half (passphrase={passphrase}): {strings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_separator_combo_offers_every_choice_and_picks_the_one_clicked() {
+        // Mutation this catches: a hand-written list of entries that has
+        // drifted from `Separator::ALL`, which is how a menu ends up offering
+        // a separator the conversion cannot spell.
+        let ctx = styled_context();
+        let mut draft = login_draft(true);
+        draft.generator.options_open = true;
+
+        let (_, closed) = frame(&ctx, &mut draft, &[]);
+        let button = closed.combo_button(Separator::Hyphen.label());
+        let _ = frame(&ctx, &mut draft, &click(button.center()));
+        let (_, open) = frame(&ctx, &mut draft, &[]);
+        for choice in Separator::ALL {
+            assert!(
+                open.strings().contains(&choice.label()),
+                "the separator menu does not offer {:?}: {:?}",
+                choice.label(),
+                open.strings()
+            );
+        }
+        let row = open.popup_entry(Separator::Space.label(), button);
+        let _ = frame(&ctx, &mut draft, &click(row.center()));
+        assert_eq!(
+            draft.generator.separator,
+            Separator::Space,
+            "picking Space in the separator menu did not take"
         );
     }
 
@@ -10278,7 +11234,7 @@ mod edit_pane_layout_tests {
     /// This is the case the user hit.
     fn tallest_draft() -> EditDraft {
         let mut draft = EditDraft::empty();
-        draft.generator = GeneratorDraft { passphrase: false, length: 33, words: 7 };
+        draft.generator = GeneratorDraft { passphrase: false, length: 33, words: 7, ..GeneratorDraft::default() };
         draft.app = Some(AppMatchDraft::from_match(&AppMatch {
             process: "chrome.exe".to_string(),
             title: String::new(),
@@ -10552,6 +11508,148 @@ mod edit_pane_layout_tests {
                 painted.rendered_glyphs(suffix),
                 suffix,
                 "the size spinner's suffix was squeezed away at the minimum width"
+            );
+        }
+    }
+
+    /// **The generator's OPTIONS are reachable at the minimum width too**,
+    /// which is the whole reason they are not seven more controls on the row
+    /// above.
+    ///
+    /// That row's own comment measures its content floor at 279.4pt against
+    /// the 264 the card offers here; it survives only by wrapping. Seven more
+    /// fixed-width controls in the same wrap would have been seven more
+    /// chances to push the card out to `aae9429`'s 307pt-inside-298pt and
+    /// corrupt every `available_width()` measured after it. The disclosure
+    /// answers that by putting the options in wrapped rows of their OWN, so
+    /// the block's floor is one widest chip rather than a sum -- and this is
+    /// the measurement that says so, in the same shape as the row's guard
+    /// above: painted, in the pane, at a real size, with the glyphs still the
+    /// glyphs.
+    ///
+    /// **Both states**, because the disclosure paints two disjoint sets of
+    /// controls and a guard that only ever saw the password half would be
+    /// blind to the passphrase's separator combo -- the widest single control
+    /// in the block, and the one most likely to be the one that does not fit.
+    #[test]
+    fn every_generator_option_is_reachable_at_the_apps_minimum_width() {
+        for passphrase in [false, true] {
+            let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
+            let ctx = styled_context(pane);
+            let mut draft = tallest_draft();
+            draft.generator.passphrase = passphrase;
+            draft.generator.options_open = true;
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let painted = frame(&ctx, pane, &mut draft, true, &[]);
+
+            let labels: Vec<String> = if passphrase {
+                let mut labels =
+                    vec!["Between words".to_string(), Separator::Hyphen.label().to_string()];
+                labels.push("Capitalise".to_string());
+                labels.push("Include a number".to_string());
+                labels
+            } else {
+                let mut labels = vec!["Use these characters".to_string()];
+                labels.extend(CharClass::ALL.iter().map(|c| c.label().to_string()));
+                // A `DragValue` paints its prefix, its number and its suffix
+                // as three separate runs, so the suffixes are what can be
+                // named uniquely; the shared `"min "` prefix is counted just
+                // below instead.
+                labels.push(" digits".to_string());
+                labels.push(" symbols".to_string());
+                labels.push(AVOID_AMBIGUOUS.to_string());
+                labels
+            };
+
+            // The disclosure chip itself first: an option block nobody can
+            // open is not reachable however well it fits.
+            assert_inside("the generator's Options chip", GENERATOR_OPTIONS, pane, &painted);
+            for label in &labels {
+                assert_inside(
+                    &format!("the generator option {label:?} (passphrase={passphrase})"),
+                    label,
+                    pane,
+                    &painted,
+                );
+                let frame_rect = painted.frame_around(painted.rect_of(label));
+                assert!(
+                    frame_rect.width() > 1.0 && frame_rect.height() > 1.0,
+                    "the generator option {label:?} painted a {frame_rect:?} at the minimum \
+                     width -- a control drawn at no size passes every in-pane assertion and \
+                     cannot be clicked"
+                );
+            }
+            if !passphrase {
+                // Both minimum spinners kept their prefix. `rects_of`, not
+                // `rect_of`, because the two share the string -- and the
+                // count is the assertion: one squeezed away would be one.
+                let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+                let prefixes = painted.rects_of("min ");
+                assert_eq!(
+                    prefixes.len(),
+                    2,
+                    "expected both minimum spinners to keep their \"min \" prefix at the \
+                     minimum width; painted: {:?}",
+                    painted.strings()
+                );
+                for rect in prefixes {
+                    assert!(
+                        bounds.contains_rect(rect),
+                        "a minimum spinner's prefix is painted at {rect:?}, off the {}x{} pane",
+                        pane.x,
+                        pane.y
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The options block does not widen the card**, which is the failure
+    /// `every_generator_option_is_reachable_at_the_apps_minimum_width` cannot
+    /// see on its own.
+    ///
+    /// `aae9429`'s defect was not that a control landed off-pane -- it was
+    /// that an unwrapped row pushed the CARD out and every
+    /// `available_width()` measured afterwards answered with the inflated
+    /// number, so everything below it was laid out against a width the pane
+    /// does not have. The controls above the generator would still be inside
+    /// the pane; the ones below would not. So this measures a field BELOW the
+    /// block, with the block open and closed, and asserts the two agree.
+    #[test]
+    fn opening_the_generator_options_does_not_move_the_form_around_it() {
+        /// The widest thing the frame filled -- the card, which is what
+        /// `aae9429` inflated. Measured rather than located, so it cannot
+        /// quietly start reporting some inner box instead.
+        fn widest(painted: &Painted) -> f32 {
+            painted.rects.iter().map(|(rect, _)| rect.width()).fold(0.0, f32::max)
+        }
+
+        for passphrase in [false, true] {
+            let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
+            let ctx = styled_context(pane);
+
+            let mut shut = tallest_draft();
+            shut.generator.passphrase = passphrase;
+            let _ = frame(&ctx, pane, &mut shut, true, &[]);
+            let closed = widest(&frame(&ctx, pane, &mut shut, true, &[]));
+
+            let mut open = tallest_draft();
+            open.generator.passphrase = passphrase;
+            open.generator.options_open = true;
+            let _ = frame(&ctx, pane, &mut open, true, &[]);
+            let opened = widest(&frame(&ctx, pane, &mut open, true, &[]));
+
+            assert!(closed > 1.0, "the closed form filled nothing; the measurement is vacuous");
+            assert_eq!(
+                closed, opened,
+                "opening the generator's options changed the card's width at the minimum pane \
+                 size (passphrase={passphrase}) -- that is `aae9429`, and every control below \
+                 the block is now laid out against a width the pane does not have"
+            );
+            assert!(
+                opened <= pane.x,
+                "the card is {opened}pt wide inside a {}pt pane with the options open",
+                pane.x
             );
         }
     }
@@ -12764,8 +13862,6 @@ mod draft_dirtiness_tests {
             ("the card's code", |d| d.card.code = "919".to_string()),
             ("an identity field", |d| d.identity.first_name = "Ada".to_string()),
             ("the private key", |d| d.ssh_key.private_key = "-----BEGIN".to_string()),
-            ("the generator's size", |d| d.generator.length = 64),
-            ("the generator's kind", |d| d.generator.passphrase = true),
             ("a new custom field", |d| d.fields.push(FieldDraft::new_of(FieldRole::Text))),
             ("the item type", |d| d.set_kind(ItemKind::Card)),
         ];
@@ -12787,10 +13883,33 @@ mod draft_dirtiness_tests {
     /// dialog honest. Revealing a secret and opening the confirmation itself
     /// are things done to the FORM. If either counted, Cancel on a form the
     /// user had merely looked at would ask them to confirm losing nothing.
+    ///
+    /// **The generator is on this list, and it used to be on the other one.**
+    /// Setting up a generator is a thing done to the form: nothing in
+    /// `GeneratorDraft` is ever written back -- `to_new_item` and `apply_to`
+    /// do not read it -- so a Cancel that stopped to ask about it would be
+    /// asking the user to confirm losing something that was never going to be
+    /// saved. What a generate really changes is `password`, which the list
+    /// above already covers. Every option is swept here rather than a
+    /// representative one, because a digest that had learnt about six of the
+    /// seven would be the same defect with a smaller blast radius.
     #[test]
     fn merely_looking_at_the_form_does_not_make_it_dirty() {
         let looks: Vec<Touch> = vec![
             ("revealing the password", |d| d.reveal_password = true),
+            ("opening the generator's options", |d| d.generator.options_open = true),
+            ("resizing the generator", |d| d.generator.length = 64),
+            ("switching the generator to a passphrase", |d| d.generator.passphrase = true),
+            ("resizing the generator's passphrase", |d| d.generator.words = 9),
+            ("switching a character class off", |d| {
+                assert!(d.generator.classes.toggle(CharClass::Special), "the premise");
+            }),
+            ("raising the minimum digits", |d| d.generator.min_number = 3),
+            ("raising the minimum symbols", |d| d.generator.min_special = 3),
+            ("allowing lookalike characters", |d| d.generator.avoid_ambiguous = false),
+            ("choosing another separator", |d| d.generator.separator = Separator::Space),
+            ("turning capitalisation off", |d| d.generator.capitalize = false),
+            ("turning the passphrase's number off", |d| d.generator.include_number = false),
             ("revealing the TOTP seed", |d| d.reveal_totp = true),
             ("revealing the card number", |d| d.card.reveal_number = true),
             ("revealing the card's code", |d| d.card.reveal_code = true),
