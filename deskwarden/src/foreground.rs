@@ -707,10 +707,11 @@ mod tests {
         // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
         "preflight_host",
         "prefs_ui",
-        // The 4d rehearsal scratch window. The one window in this crate that
-        // is NOT an `eframe` one -- see
-        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
-        // holds its raise.
+        // The 4d rehearsal scratch window. The one window in this crate
+        // `eframe` does not start a loop for -- it is an egui VIEWPORT, opened
+        // inside the vault window's running loop. See
+        // [`OPENS_A_VIEWPORT_AND_RAISES_IT`], which is the table that holds
+        // its raise.
         "scratch_window",
         "vault_window",
     ];
@@ -736,22 +737,31 @@ mod tests {
         ("picker_ui", include_str!("picker_ui.rs"), "PICK_ITEM_TITLE", 1),
     ];
 
-    /// **Opens a window that is not an `eframe` one, and raises it anyway.**
+    /// **Opens a window `eframe` did not start a loop for, and raises it.**
     ///
     /// The third category, and it exists because [`RAISING_SITES`] holds its
     /// windows by grepping for `run_ui_native(TITLE,` -- a needle that names
-    /// `eframe`'s entry point and nothing else. `scratch_window` opens a plain
-    /// Win32 window with `CreateWindowExW`, for a reason recorded at length in
-    /// that module's header (a rehearsal is started from *inside* the vault
-    /// window's event loop, and `winit` will not build a second one), so it
-    /// would count zero there.
+    /// `eframe`'s entry point and nothing else. `scratch_window` opens neither
+    /// that nor a Win32 window: a rehearsal is started from *inside* the vault
+    /// window's event loop, `winit` will not build a second one, and the answer
+    /// is `show_viewport_deferred` -- a second real OS window on the SAME loop,
+    /// painted by egui. It would count zero under `run_ui_native(`.
     ///
     /// Zero is exactly the wrong answer. Left in [`RAISING_SITES`] the guard
     /// would fail on a window that does everything right; moved to the
     /// exemption list it would be excused from raising when it is the one
     /// window in this crate the user is meant to sit and watch. So it is held
     /// here instead, by the needle that names how it really opens.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 1] =
+    ///
+    /// **This table was `OPENS_A_WIN32_WINDOW_AND_RAISES_IT`, and its needle
+    /// was `CreateWindowExW(`.** That was true of the rehearsal window's first
+    /// implementation, which was a raw Win32 window with system `EDIT` controls
+    /// and was therefore the only surface in the product with none of the app's
+    /// theme, tokens or type. The table is renamed rather than joined by a
+    /// fourth: there is no Win32 window left in this crate for the old one to
+    /// hold, and a table kept alive for a case that no longer exists is a guard
+    /// that counts zero forever.
+    const OPENS_A_VIEWPORT_AND_RAISES_IT: [(&str, &str, &str); 1] =
         [("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE")];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
@@ -890,15 +900,23 @@ mod tests {
     }
 
     /// The same claim [`every_window_this_crate_opens_asks_to_be_brought_to_the_front`]
-    /// makes, for the windows that are not `eframe`'s.
+    /// makes, for the window `eframe` did not start a loop for.
     ///
-    /// What it can see: the module really opens a window (`CreateWindowExW`),
-    /// really raises the title it opened under, and has not quietly become an
-    /// `eframe` window -- which would move it into the other table's remit and
-    /// out of this one's, with both guards then reading zero.
+    /// What it can see: the module really opens a viewport, really opens it
+    /// under the title it raises -- which is the whole of why this window may
+    /// be alive alongside the vault window, see
+    /// [`only_one_window_of_this_process_can_exist_at_a_time`] -- really raises
+    /// that title, and has not quietly become an `eframe` window, which would
+    /// move it into the other table's remit and out of this one's with both
+    /// guards then reading zero.
+    ///
+    /// **Exactly one viewport, not at least one.** A second
+    /// `show_viewport_deferred` here would be a second OS window that no table
+    /// holds and no title distinguishes, which is precisely the collision the
+    /// title-uniqueness argument exists to rule out.
     #[test]
-    fn every_win32_window_this_crate_opens_asks_to_be_brought_to_the_front() {
-        for (name, source, title) in OPENS_A_WIN32_WINDOW_AND_RAISES_IT {
+    fn every_viewport_window_this_crate_opens_asks_to_be_brought_to_the_front() {
+        for (name, source, title) in OPENS_A_VIEWPORT_AND_RAISES_IT {
             // The production half and then `code()`, for both reasons the
             // exemption loop below gives: an exact count over another module's
             // file false-fires on a fixture that spells the needle, and a
@@ -906,9 +924,18 @@ mod tests {
             let (production, cut) = production_half(source);
             assert!(cut > 0, "no test module was cut out of `{name}`");
             let source = code(&production);
-            assert!(
-                source.contains("CreateWindowExW("),
-                "`{name}` is listed as opening a Win32 window and opens none"
+            assert_eq!(
+                source.matches("show_viewport_deferred(").count(),
+                1,
+                "`{name}` is listed as opening exactly one viewport and opens a different \
+                 number of them"
+            );
+            assert_eq!(
+                source.matches(&format!("with_title({title})")).count(),
+                1,
+                "`{name}` raises `{title}` but does not OPEN its viewport under that title. \
+                 `own_window_titled` matches on the string, so a viewport built without it is a \
+                 window no raise can find and no rehearsal has a target in."
             );
             assert_eq!(
                 source.matches(&format!("raise_window({title})")).count(),
@@ -1090,7 +1117,7 @@ mod tests {
         let raises: Vec<&str> = RAISING_SITES
             .iter()
             .map(|(module, ..)| *module)
-            .chain(OPENS_A_WIN32_WINDOW_AND_RAISES_IT.iter().map(|(module, ..)| *module))
+            .chain(OPENS_A_VIEWPORT_AND_RAISES_IT.iter().map(|(module, ..)| *module))
             .collect();
         let excused: Vec<&str> = OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
             .iter()
@@ -1101,12 +1128,12 @@ mod tests {
         // reading real names rather than iterating an empty vector.
         assert_eq!(
             raises.len(),
-            RAISING_SITES.len() + OPENS_A_WIN32_WINDOW_AND_RAISES_IT.len(),
-            "control: a name per raising site, `eframe`'s and Win32's alike"
+            RAISING_SITES.len() + OPENS_A_VIEWPORT_AND_RAISES_IT.len(),
+            "control: a name per raising site, `eframe`'s loops and the viewport alike"
         );
         assert!(
             raises.contains(&"scratch_window"),
-            "control: the Win32 raise table is being read at all: {raises:?}"
+            "control: the viewport raise table is being read at all: {raises:?}"
         );
         assert!(
             raises.contains(&"vault_window"),
@@ -1259,10 +1286,18 @@ mod tests {
     ///   window opened from a spawned thread is not a second window but a
     ///   crash. This is what makes the spawn side unnecessary to check
     ///   separately: `with_any_thread` is the only door to it.
-    /// * **One viewport per loop.** `show_viewport*` opens a second OS window
-    ///   inside a running loop, on the same thread, with no `run_*native` call
-    ///   for `RAISING_SITES` to count and no title for it to compare. Nothing
-    ///   in this crate calls it.
+    /// * **One viewport per loop, and exactly one place that opens one.**
+    ///   `show_viewport*` opens a second OS window inside a running loop, on
+    ///   the same thread, with no `run_*native` call for `RAISING_SITES` to
+    ///   count and no title for it to compare. This bullet said "Nothing in
+    ///   this crate calls it" until design 4d's rehearsal window stopped being
+    ///   a raw Win32 window and became one. `scratch_window` now calls
+    ///   `show_viewport_deferred` exactly once, under `SCRATCH_TITLE`, and
+    ///   `OPENS_A_VIEWPORT_AND_RAISES_IT` is the table that holds it. The count
+    ///   below is therefore per-module rather than globally zero -- and the
+    ///   title it opens under is asserted, above, to be distinct from the one
+    ///   the five `eframe` windows share, which is what keeps `pick`'s `find`
+    ///   exact even while two windows are on screen.
     ///
     /// Together with `run_*native` blocking until its window closes -- which
     /// the queued-tray-click behaviour is itself the evidence of -- that makes
@@ -1308,7 +1343,7 @@ mod tests {
             .iter()
             .map(|(module, source, ..)| (*module, *source))
             .chain(
-                OPENS_A_WIN32_WINDOW_AND_RAISES_IT
+                OPENS_A_VIEWPORT_AND_RAISES_IT
                     .iter()
                     .map(|(module, source, _)| (*module, *source)),
             )
@@ -1361,11 +1396,13 @@ mod tests {
             // `with_any_thread` by name inside a window module fails this test
             // -- which is a build failure that says exactly what it means.)
             assert!(
-                source.contains("ViewportBuilder") || source.contains("CreateWindowExW"),
-                "control: `{module}`'s source neither builds a viewport nor creates a Win32
-                 window, so it is either not the file this thinks it is or not a
-                 window-opening module -- and the two counts below are then zero for a reason
-                 that has nothing to do with the invariant"
+                source.contains("ViewportBuilder"),
+                "control: `{module}`'s source does not build a viewport at all, so it is
+                 either not the file this thinks it is or not a window-opening module -- and
+                 the counts below are then zero for a reason that has nothing to do with the
+                 invariant. (This used to accept `CreateWindowExW` as well, for the rehearsal
+                 window's first, raw-Win32 implementation. That window is now an egui
+                 viewport, and every window this crate opens builds a `ViewportBuilder`.)"
             );
             assert_eq!(
                 source.matches("with_any_thread").count(),
@@ -1377,12 +1414,42 @@ mod tests {
                  that brings an arbitrary one forward. Without this call winit panics off the \
                  main thread, which is what keeps them one at a time."
             );
+            // **This count is zero for every module except the one that
+            // deliberately opens a viewport, and that module is checked
+            // elsewhere rather than loosely here.**
+            //
+            // The zero is raw -- not over `code()`, not over
+            // `production_half` -- for the reason given above: it must be 0, so
+            // a comment holding the needle is a false alarm and nothing worse,
+            // and raw is the stricter side of that trade. That strictness is
+            // exactly why `scratch_window` cannot be checked here for a count
+            // of ONE: its own header and its own tests discuss
+            // `show_viewport_deferred` by name, and a raw count over that file
+            // is seven. Loosening this to `code(production_half(..))` for
+            // everyone would weaken the zero for the eight modules the zero is
+            // actually about.
+            //
+            // So the viewport module is skipped here and held by
+            // `every_viewport_window_this_crate_opens_asks_to_be_brought_to_the_front`,
+            // which counts `show_viewport_deferred(` over that file's stripped
+            // production half and requires exactly one -- together with the
+            // `with_title(SCRATCH_TITLE)` that gives the window the unique
+            // title this whole test rests on. Skipping is safe because the
+            // module is not skipped from the loop: the `with_any_thread` count
+            // above still runs over it, and
+            // `every_module_in_this_crate_is_classified_as_opening_windows_or_not`
+            // still requires it to be in exactly one raise table.
+            if OPENS_A_VIEWPORT_AND_RAISES_IT.iter().any(|(name, ..)| *name == module) {
+                continue;
+            }
             assert_eq!(
                 source.matches("show_viewport").count(),
                 0,
                 "`{module}` opens a second viewport, which is a second OS window on the same \
                  event loop -- with no `run_*native` call for `RAISING_SITES` to count and no \
-                 title for it to compare. See the title collision described on this test."
+                 title for it to compare. If that is deliberate, it belongs in \
+                 `OPENS_A_VIEWPORT_AND_RAISES_IT`, which holds the title it opens under. See \
+                 the title collision described on this test."
             );
         }
 
