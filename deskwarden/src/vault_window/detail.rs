@@ -7551,7 +7551,7 @@ mod tests {
             assert_eq!(
                 self.clocks.len(),
                 1,
-                "expected exactly one one-time-code clock in the header, found {}; the \r
+                "expected exactly one one-time-code clock in the header, found {}; the \
                  pane painted: {:?}",
                 self.clocks.len(),
                 self.strings()
