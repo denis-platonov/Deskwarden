@@ -190,6 +190,8 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 /// `&dyn` and not a third type parameter: the call is once per fill, and the
 /// alternative would have added a turbofish-shaped burden to every one of this
 /// function's and [`handle_match`]'s call sites for nothing.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
     injector: &Injector<A, B>,
@@ -198,6 +200,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     hwnd: isize,
     choice: FillChoice,
     notifier: &dyn sequence::Notifier,
+    reprompt: &mut Reprompt<'_>,
 ) {
     fill_from_vault_with(
         cache,
@@ -208,7 +211,162 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
         choice,
         notifier,
         &crate::vault_window::preflight::SendGate::production(),
+        reprompt,
     )
+}
+
+/// **Where the fill path's master-password re-prompt is scoped, and what it
+/// remembers.**
+///
+/// Three things travel together because none of them means anything without
+/// the other two, and passing them as three arguments through
+/// [`handle_match`] and `main`'s event loop is three chances to hand one of
+/// them a placeholder:
+///
+/// * `account` -- **the reason this type exists.** [`crate::reprompt::permit`]
+///   proves presence with a Windows Hello gesture, and a gesture is verified
+///   *for an account*: [`crate::reprompt::gate_from`] answers
+///   [`crate::reprompt::RepromptGate::unprovable`] for `None`, and an
+///   unprovable gate refuses **every** protected item. So a fill that could
+///   not name its account would not be gated, it would be broken -- refused
+///   for every enrolled user. `app` has never received an account id; `main`
+///   has one, and this is what carries it down.
+/// * `proof` -- borrowed, never owned, so that the
+///   [`crate::reprompt::PROOF_LASTS`] window is the *same* window across
+///   consecutive fills. A `Proof::default()` constructed per fill would ask
+///   for a gesture on every single one, which is the friction the sixty
+///   seconds exist to avoid.
+/// * `gate_for` -- the seam. Building the production gate calls
+///   [`crate::hello::state_for`], a WinRT round trip, and satisfying it opens
+///   a real Hello dialog on the desktop of whoever ran `cargo test`. This is
+///   the same `fn` pointer shape `vault_window::VaultDeps::reprompt` uses and
+///   for the same reason recorded there: an `impl Fn` seam could be handed a
+///   wrapper that the identity pin could not see.
+pub struct Reprompt<'a> {
+    /// The account whose Hello enrollment a proof would be taken against.
+    ///
+    /// Owned rather than borrowed, so the borrow of `main`'s estate that
+    /// produced it ends at the call and cannot fight the `&mut` on the proof.
+    account: Option<crate::accounts::AccountId>,
+    /// The most recent proof, owned by the loop that outlives any one fill.
+    proof: &'a mut crate::reprompt::Proof,
+    /// [`crate::reprompt::gate_for_account`] in production, a fixture in a
+    /// test.
+    gate_for: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
+}
+
+impl Reprompt<'_> {
+    /// The same, with the gate substituted. Test-only, so no shipped path can
+    /// hand itself a prover that always says yes.
+    #[cfg(test)]
+    pub(crate) fn with_gate_for(
+        proof: &mut crate::reprompt::Proof,
+        gate_for: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
+    ) -> Reprompt<'_> {
+        Reprompt {
+            account: crate::accounts::AccountId::parse("0123456789abcdef0123456789abcdef"),
+            proof,
+            gate_for,
+        }
+    }
+}
+
+/// **The fill path's proof of presence, and the account it was taken for.**
+///
+/// Held by `main`'s event loop, because the [`crate::reprompt::PROOF_LASTS`]
+/// window has to outlive any one fill for it to mean anything -- a
+/// `Proof::default()` built per fill would ask for a gesture every time.
+///
+/// The second field is the part that is not decoration. The gate is rebuilt
+/// per fill from whichever account is active *now*, but the proof is not: an
+/// account switch inside the window would otherwise let a gesture given for
+/// account A cover a protected item belonging to account B, which is precisely
+/// the confusion [`crate::reprompt::Scope`] exists to prevent one level down.
+/// [`Self::scoped_to`] is the only way to reach the proof, and it forgets it
+/// the moment the account it was taken for is not the account being filled
+/// from -- the same rule `Proof::forget` states for a lock.
+#[derive(Debug, Default)]
+pub struct FillProof {
+    proof: crate::reprompt::Proof,
+    taken_for: Option<crate::accounts::AccountId>,
+}
+
+impl FillProof {
+    /// A [`Reprompt`] for `account`, with any proof taken for a *different*
+    /// account already forgotten.
+    pub fn scoped_to(&mut self, account: Option<&crate::accounts::AccountId>) -> Reprompt<'_> {
+        if self.taken_for.as_ref() != account {
+            self.proof.forget();
+            self.taken_for = account.cloned();
+        }
+        Reprompt {
+            account: account.cloned(),
+            proof: &mut self.proof,
+            gate_for: crate::reprompt::gate_for_account,
+        }
+    }
+}
+
+/// **Whether this item's secrets may be typed at all**, asked once, before
+/// anything is fetched, rendered, shown or sent.
+///
+/// The shape is `vault_window`'s `permitted`/`gated_command`: the decision
+/// goes through [`crate::reprompt::permit`] -- the one public way to combine
+/// [`crate::reprompt::need`] with an action -- and the caller acts only on a
+/// `true`. It is *not* a second decision path; it is the same one, at the fill.
+///
+/// # Why it is the first thing in the arm
+///
+/// Below this line the fill splits in two -- [`FillAction::Default`]'s UI
+/// Automation fill and [`FillAction::Sequence`]'s typed plan -- and a gate on
+/// either arm alone leaves the other ungated. Worse, a gate placed *inside*
+/// the sequence arm would sit after `get_totp`, after `credentials_for`, and
+/// after the preflight had already put the target, the username and a
+/// "Copy instead" button carrying the plaintext password on screen. Refusing
+/// there is refusing after the exposure.
+///
+/// This position also answers the "no partial fill" requirement by
+/// construction rather than by care: nothing has been typed when it returns
+/// `false`, because nothing has been *resolved*.
+///
+/// # The gate is built only for a protected item
+///
+/// [`crate::reprompt::gate_for_account`] probes Windows Hello, and
+/// [`crate::reprompt::need`] answers [`crate::reprompt::Need::Nothing`] for an
+/// unprotected item whatever `can_prove` says -- proved by
+/// `an_unprotected_item_never_asks_for_anything`. So an unprotected fill pays
+/// for no WinRT round trip, and `unprovable()` in that branch cannot change
+/// any answer.
+///
+/// # The refusal is spoken, not swallowed
+///
+/// Through the same [`sequence::Notifier`] the two other refusals on this path
+/// already use, for the reason recorded on them: this path routinely runs with
+/// no window of ours in front of the user, so a silent no-op is
+/// indistinguishable from a hotkey that never registered -- and here the user
+/// would conclude that autofill is broken rather than that the item they
+/// themselves ticked "master password re-prompt" on is doing what they asked.
+fn permitted_by_reprompt(
+    reprompt: &mut Reprompt<'_>,
+    item: &VaultItem,
+    item_id: &str,
+    notifier: &dyn sequence::Notifier,
+) -> bool {
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    let gate = if protected {
+        (reprompt.gate_for)(reprompt.account.as_ref())
+    } else {
+        crate::reprompt::RepromptGate::unprovable()
+    };
+    let outcome =
+        crate::reprompt::permit(&gate, protected, reprompt.proof, std::time::Instant::now(), || {});
+    if outcome.happened() {
+        return true;
+    }
+    let message = crate::reprompt::refusal_text(matches!(outcome, crate::reprompt::Outcome::Cannot));
+    log::warn!("a master-password re-prompt withheld a fill of item {item_id}: {message}");
+    notifier.refused(message);
+    false
 }
 
 /// [`fill_from_vault`] with the preflight's foreground lookup **injected**.
@@ -232,6 +390,7 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
     choice: FillChoice,
     notifier: &dyn sequence::Notifier,
     gate: &crate::vault_window::preflight::SendGate,
+    reprompt: &mut Reprompt<'_>,
 ) {
     let item = cache
         .items()
@@ -244,6 +403,13 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
         });
     match item {
         Ok(item) => {
+            // **The master-password re-prompt, ahead of everything.** See
+            // [`permitted_by_reprompt`] for why this line and not one inside
+            // either arm below, and why it is deliberately ABOVE the
+            // preflight rather than beside it.
+            if !permitted_by_reprompt(reprompt, &item, item_id, notifier) {
+                return;
+            }
             // The one-time code is fetched **only** when the sequence asks
             // for one. `get_totp` is an HTTP round trip to `bw serve`, and
             // making every fill pay for it -- including the overwhelming
@@ -859,6 +1025,7 @@ pub fn match_arms_hotkey(_prompt_on_match: bool) -> bool {
 /// event loop, where no test reaches -- can pass a title that belongs to no
 /// window, and the overlay then names the wrong thing while every test here
 /// stays green.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
     injector: &Injector<A, B>,
@@ -867,6 +1034,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     prompt_on_match: bool,
     window: &crate::window_watch::ForegroundEvent,
     notifier: &dyn sequence::Notifier,
+    reprompt: &mut Reprompt<'_>,
 ) -> Option<(String, isize)> {
     let hwnd = window.hwnd;
     match match_disposition(prompt_on_match) {
@@ -916,7 +1084,9 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
                 // really supports, so `UserTabPass` and `Just(field)` are
                 // both reachable here and naming a literal `Saved` would type
                 // something other than the row the user clicked.
-                fill_from_vault(cache, injector, fill_stats, item_id, hwnd, choice, notifier);
+                fill_from_vault(
+                    cache, injector, fill_stats, item_id, hwnd, choice, notifier, reprompt,
+                );
             }
         }
     }
@@ -2665,8 +2835,19 @@ mod fill_call_site_tests {
     /// one-time-code row and their password is typed.
     #[test]
     fn the_prompt_path_forwards_the_answer_it_was_given_rather_than_naming_one() {
-        let needle =
-            concat!("fill_from_vault", "(cache, injector, fill_stats, item_id, hwnd, choice, ");
+        // **Re-pinned when the re-prompt was threaded through.** The call
+        // gained a ninth argument and no longer fits on one line, so the text
+        // this pin quotes had to change with it -- deliberately, and to the
+        // *whole* new list rather than to a prefix that would stop noticing
+        // where `choice` sits. `reprompt` is pinned here too: it is the last
+        // argument, and a call that dropped it would not compile, but a call
+        // that passed a *different* scoping would -- and the whole list is
+        // what this test exists to hold.
+        let needle = concat!(
+            "fill_from_vault", "(\n",
+            "                    cache, injector, fill_stats, item_id, hwnd, choice, notifier, ",
+            "reprompt,\n",
+        );
         assert_eq!(
             production_only(include_str!("app.rs")).matches(needle).count(),
             1,
@@ -3305,6 +3486,19 @@ mod fill_dispatch_tests {
     /// assertion about it passes for entirely the wrong reason, the negative
     /// controls most of all. Every negative control below is paired with a
     /// positive one on the same helper for exactly that reason.
+    /// The re-prompt scoping for every fill test that is **not about** the
+    /// re-prompt: a gate that would allow, and a fresh proof.
+    ///
+    /// None of the fixtures below carries `reprompt: 1`, so
+    /// `permitted_by_reprompt` never even builds a gate for them -- this is
+    /// what stops the argument being written as `RepromptGate::unprovable()`
+    /// at a dozen call sites and one of them quietly becoming the reason a
+    /// test passes. The re-prompt's own tests are
+    /// `the_reprompt_gates_the_fill`, and they hand in provers.
+    fn ungated(proof: &mut crate::reprompt::Proof) -> Reprompt<'_> {
+        Reprompt::with_gate_for(proof, |_| crate::reprompt::RepromptGate::allowing_for_test())
+    }
+
     fn scratch_stats(label: &str) -> crate::fill_stats::FillStats {
         let dir = std::env::temp_dir().join(format!(
             "deskwarden-fill-dispatch-{label}-{}-{:?}-{:?}",
@@ -3353,6 +3547,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Saved,
             &notifier,
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         (rec, stats, notifier.take())
     }
@@ -3637,6 +3832,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Saved,
             &sequence::RecordingNotifier::default(),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
 
         totp.assert();
@@ -3688,6 +3884,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Saved,
             &sequence::RecordingNotifier::default(),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
 
         assert_eq!(rec.sequences.lock().unwrap().len(), 1);
@@ -3743,6 +3940,7 @@ mod fill_dispatch_tests {
             &crate::vault_window::preflight::SendGate::describing(
                 a_masked_box_in_the_rules_process,
             ),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
 
         totp.assert();
@@ -3789,6 +3987,7 @@ mod fill_dispatch_tests {
             &crate::vault_window::preflight::SendGate::describing(
                 a_masked_box_in_the_rules_process,
             ),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
 
         // Positive control: the fill really ran and really typed, so
@@ -3841,6 +4040,7 @@ mod fill_dispatch_tests {
             FillChoice::Just(key_sequence::FieldRef::Password),
             &notifier,
             &crate::vault_window::preflight::SendGate::describing(describe),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         let typed = rec.sequences.lock().unwrap().len();
         (typed, notifier.take())
@@ -3921,6 +4121,7 @@ mod fill_dispatch_tests {
                 a_masked_box_in_the_rules_process,
                 confirm,
             ),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         let typed = rec.sequences.lock().unwrap().len();
         (CONFIRMS_ASKED.load(std::sync::atomic::Ordering::SeqCst), typed)
@@ -4038,6 +4239,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::UserTabPass,
             &sequence::RecordingNotifier::default(),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         assert_eq!(
             *rec.default_fills.lock().unwrap(),
@@ -4115,6 +4317,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Saved,
             &notifier,
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         drop(held);
         (rec, stats, notifier.take())
@@ -4237,6 +4440,7 @@ mod fill_dispatch_tests {
             4242,
             FillChoice::Saved,
             &notifier,
+            &mut ungated(&mut crate::reprompt::Proof::default()),
         );
 
         // Positive control: the fill really did take the sequence path and
@@ -4351,6 +4555,7 @@ mod fill_dispatch_tests {
                 4242,
                 FillChoice::Saved,
                 &notifier,
+                &mut ungated(&mut crate::reprompt::Proof::default()),
             );
         });
 
@@ -4359,6 +4564,343 @@ mod fill_dispatch_tests {
         // happened".
         assert_eq!(rec.default_fills.lock().unwrap().len(), 1);
         assert!(!leaked, "the default fill freed the password in the clear");
+    }
+
+    // ---- the master-password re-prompt, driven from the entry point --------
+    //
+    // Every test below counts KEYSTROKES, not answers: `reprompt::need` has
+    // its own truth table and it was already green while the fill -- the most
+    // consequential exposure in the app, because it types the password into
+    // another process -- ignored it completely. So what is asserted here is
+    // that the recording filler saw nothing.
+    //
+    // Both fill arms are exercised. A gate on one of them leaves the other
+    // open, and the two are reached by different choices.
+
+    fn a_protected(item: VaultItem) -> VaultItem {
+        let mut item = item;
+        item.other.insert("reprompt".to_string(), serde_json::json!(1));
+        assert!(
+            crate::vault_bridge::reprompt_protected(&item),
+            "the fixture is not protected, so nothing below is a re-prompt test"
+        );
+        item
+    }
+
+    fn a_scope() -> crate::reprompt::Scope {
+        crate::reprompt::Scope::new(
+            std::path::PathBuf::from("C:/nowhere"),
+            crate::accounts::AccountId::parse("0123456789abcdef0123456789abcdef")
+                .expect("a 32-char lowercase hex id"),
+        )
+    }
+
+    fn allows(_: &std::path::Path, _: &crate::accounts::AccountId) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn refuses(_: &std::path::Path, _: &crate::accounts::AccountId) -> Result<(), String> {
+        Err("the user cancelled the Windows Hello prompt".to_string())
+    }
+
+    fn a_satisfied_gesture(
+        _: Option<&crate::accounts::AccountId>,
+    ) -> crate::reprompt::RepromptGate {
+        crate::reprompt::RepromptGate::with_prover(Some(a_scope()), allows)
+    }
+
+    fn a_cancelled_gesture(
+        _: Option<&crate::accounts::AccountId>,
+    ) -> crate::reprompt::RepromptGate {
+        crate::reprompt::RepromptGate::with_prover(Some(a_scope()), refuses)
+    }
+
+    /// No enrollment: `permit` answers `Cannot` without asking anything. The
+    /// prover is still the one that would allow, so a `Cannot` here cannot be
+    /// the prover's doing.
+    fn no_way_to_ask(_: Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate {
+        crate::reprompt::RepromptGate::with_prover(None, allows)
+    }
+
+    /// A gate that must never be built. Handed to the unprotected control
+    /// below: an item with no `reprompt` flag must not cost a Hello probe,
+    /// let alone a gesture.
+    fn must_not_be_asked_at_all(
+        _: Option<&crate::accounts::AccountId>,
+    ) -> crate::reprompt::RepromptGate {
+        panic!("an unprotected item built a re-prompt gate");
+    }
+
+    /// A whole fill, with the re-prompt's prover as a fixture, reported as
+    /// (default fills, sequences typed, what the user was told).
+    fn fill_under(
+        item: VaultItem,
+        choice: FillChoice,
+        gate_for: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
+    ) -> (usize, usize, Vec<String>) {
+        let _serialised = crate::injector::sequence_test_lock();
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("reprompt-routing");
+        let notifier = sequence::RecordingNotifier::default();
+        let mut proof = crate::reprompt::Proof::default();
+        fill_from_vault_with(
+            &cache_with(item),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            choice,
+            &notifier,
+            &crate::vault_window::preflight::SendGate::describing(
+                a_masked_box_in_the_rules_process,
+            ),
+            &mut Reprompt::with_gate_for(&mut proof, gate_for),
+        );
+        let defaults = rec.default_fills.lock().unwrap().len();
+        let sequences = rec.sequences.lock().unwrap().len();
+        (defaults, sequences, notifier.take())
+    }
+
+    /// **A cancelled gesture types nothing, on either arm.**
+    ///
+    /// Neutralise the gate -- `let _ = permitted_by_reprompt(..);`, the
+    /// shape this crate has measured surviving a whole suite at zero warnings
+    /// -- and both halves of this are red.
+    #[test]
+    fn a_cancelled_reprompt_types_no_part_of_a_protected_item() {
+        let (defaults, sequences, told) = fill_under(
+            a_protected(item_with("")),
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            a_cancelled_gesture,
+        );
+        assert_eq!(sequences, 0, "a cancelled re-prompt typed the password anyway");
+        assert_eq!(defaults, 0);
+
+        // The other arm. `UserTabPass` on the same protected item goes to
+        // `FillAction::Default`, which is UI Automation and then SendInput --
+        // a gate written into the sequence arm alone would leave this open,
+        // and this is the arm that types a USERNAME first. A half-typed login
+        // is worse than none: the user sees it and retries.
+        let (defaults, sequences, _) = fill_under(
+            a_protected(item_with("")),
+            FillChoice::UserTabPass,
+            a_cancelled_gesture,
+        );
+        assert_eq!(defaults, 0, "a cancelled re-prompt still typed the username and password");
+        assert_eq!(sequences, 0);
+
+        // **The refusal reaches the user.** This path routinely runs with no
+        // window of ours in front of them, so a silent no-op reads as a
+        // broken hotkey.
+        assert_eq!(
+            told,
+            vec![crate::reprompt::refusal_text(false).to_string()],
+            "a cancelled re-prompt said nothing, or said the wrong one of the two refusals"
+        );
+    }
+
+    /// The positive control, on the same fixtures: a *satisfied* gesture and
+    /// both arms type. Without this, the zeros above are also what a fill
+    /// that never runs anything produces -- and a `return` accidentally left
+    /// above the gate would pass every assertion in the test above.
+    #[test]
+    fn a_satisfied_reprompt_lets_a_protected_item_fill() {
+        let (_, sequences, told) = fill_under(
+            a_protected(item_with("")),
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            a_satisfied_gesture,
+        );
+        assert_eq!(sequences, 1, "a satisfied re-prompt did not let the fill through");
+        assert!(told.is_empty(), "an allowed fill told the user it had been refused");
+
+        let (defaults, _, _) = fill_under(
+            a_protected(item_with("")),
+            FillChoice::UserTabPass,
+            a_satisfied_gesture,
+        );
+        assert_eq!(defaults, 1, "a satisfied re-prompt did not let the default fill through");
+    }
+
+    /// **The account that cannot prove is refused, and told how to stop
+    /// being one.** `Cannot` and `Refused` are different words, and this is
+    /// the one the user can act on.
+    #[test]
+    fn an_account_with_no_enrollment_does_not_fill_and_says_what_to_turn_on() {
+        let (defaults, sequences, told) = fill_under(
+            a_protected(item_with("")),
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            no_way_to_ask,
+        );
+        assert_eq!((defaults, sequences), (0, 0), "an ungateable item was typed anyway");
+        assert_eq!(
+            told,
+            vec![crate::reprompt::refusal_text(true).to_string()],
+            "the refusal a user can act on was not the one they were given"
+        );
+        assert_ne!(
+            crate::reprompt::refusal_text(true),
+            crate::reprompt::refusal_text(false),
+            "control: the two refusals are distinguishable, so the assertion above means \
+             something"
+        );
+    }
+
+    /// **The negative control the whole feature depends on**: an item with no
+    /// `reprompt` flag fills exactly as it always did, and does not even
+    /// build a gate -- so no ordinary fill pays for a WinRT round trip, and
+    /// a mutation that makes the gate refuse everything is red here rather
+    /// than invisible.
+    #[test]
+    fn an_unprotected_item_fills_without_asking_anything() {
+        let (_, sequences, told) = fill_under(
+            item_with(""),
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            must_not_be_asked_at_all,
+        );
+        assert_eq!(sequences, 1, "an ordinary fill was refused, or never ran");
+        assert!(told.is_empty());
+    }
+
+    /// **One gesture covers the next fill**, which is what
+    /// `reprompt::PROOF_LASTS` is for and what a `Proof` constructed per fill
+    /// would silently retire: a user filling a protected item twice in a
+    /// minute would meet two Hello dialogs.
+    #[test]
+    fn a_proof_taken_by_one_fill_covers_the_next() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("reprompt-window");
+        let notifier = sequence::RecordingNotifier::default();
+        let cache = cache_with(a_protected(item_with("")));
+        let mut proof = crate::reprompt::Proof::default();
+
+        let fill = |gate_for: fn(
+            Option<&crate::accounts::AccountId>,
+        ) -> crate::reprompt::RepromptGate,
+                        proof: &mut crate::reprompt::Proof| {
+            fill_from_vault_with(
+                &cache,
+                &injector,
+                &stats,
+                "item-1",
+                4242,
+                FillChoice::Just(key_sequence::FieldRef::Password),
+                &notifier,
+                &crate::vault_window::preflight::SendGate::describing(
+                    a_masked_box_in_the_rules_process,
+                ),
+                &mut Reprompt::with_gate_for(proof, gate_for),
+            );
+        };
+
+        fill(a_satisfied_gesture, &mut proof);
+        assert_eq!(rec.sequences.lock().unwrap().len(), 1, "the premise: the first fill typed");
+
+        // The second fill is handed a gate that CANNOT ask at all. It types
+        // only if the proof the first one recorded is still doing the work.
+        fill(no_way_to_ask, &mut proof);
+        assert_eq!(
+            rec.sequences.lock().unwrap().len(),
+            2,
+            "the proof from the first fill did not cover the second, so every consecutive \
+             fill of a protected item asks again"
+        );
+    }
+
+    /// **`FillProof` forgets across an account switch.**
+    ///
+    /// The gate is rebuilt per fill from whoever is active now, but the proof
+    /// is not -- so without this a gesture given for one account would cover
+    /// a protected item belonging to another for the rest of the minute.
+    #[test]
+    fn a_proof_does_not_survive_a_change_of_account() {
+        let a = crate::accounts::AccountId::parse(&"a".repeat(32)).expect("a 32-char hex id");
+        let b = crate::accounts::AccountId::parse(&"b".repeat(32)).expect("a 32-char hex id");
+        let now = std::time::Instant::now();
+
+        let mut held = FillProof::default();
+        held.scoped_to(Some(&a)).proof.record(now);
+        assert_eq!(
+            held.scoped_to(Some(&a)).proof.need(true, true, now),
+            crate::reprompt::Need::Nothing,
+            "the premise: the proof covers the account it was taken for"
+        );
+        assert_eq!(
+            held.scoped_to(Some(&b)).proof.need(true, true, now),
+            crate::reprompt::Need::Prove,
+            "a proof given for one account still covered another account's protected item"
+        );
+        // And back to `a` does not resurrect it.
+        assert_eq!(
+            held.scoped_to(Some(&a)).proof.need(true, true, now),
+            crate::reprompt::Need::Prove
+        );
+    }
+
+    /// **Production goes through the real gate.** The seam is only worth
+    /// having if it is not also the shipped answer: a `|_| RepromptGate::
+    /// allowing_for_test()` left in `scoped_to` would leave every test above
+    /// green and every protected item unprotected. Compared by address, as
+    /// `SendGate`'s and `RepromptGate`'s own guards are.
+    #[test]
+    fn the_production_scoping_is_wired_to_the_real_gate() {
+        let mut held = FillProof::default();
+        let reprompt = held.scoped_to(None);
+        assert!(
+            std::ptr::fn_addr_eq(
+                reprompt.gate_for,
+                crate::reprompt::gate_for_account
+                    as fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate
+            ),
+            "the fill path's re-prompt gate is not `reprompt::gate_for_account`"
+        );
+    }
+
+    /// **The account really is carried, and it is the one it was given.**
+    ///
+    /// `gate_from` answers `unprovable()` for `None`, and an unprovable gate
+    /// refuses EVERY protected item -- so a `scoped_to` that dropped its
+    /// argument on the floor would not be a weaker gate, it would be autofill
+    /// switched off for every enrolled user with a protected item. Nothing
+    /// else here can see that, because every gate above ignores the account.
+    #[test]
+    fn the_account_reaches_the_gate_that_would_be_asked() {
+        static SAW: std::sync::Mutex<Option<Option<crate::accounts::AccountId>>> =
+            std::sync::Mutex::new(None);
+        fn record(account: Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate {
+            *SAW.lock().unwrap() = Some(account.cloned());
+            crate::reprompt::RepromptGate::with_prover(Some(a_scope()), allows)
+        }
+
+        let _serialised = crate::injector::sequence_test_lock();
+        *SAW.lock().unwrap() = None;
+        let id = crate::accounts::AccountId::parse(&"c".repeat(32)).expect("a 32-char hex id");
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("reprompt-account");
+        let mut proof = crate::reprompt::Proof::default();
+        let mut reprompt = Reprompt::with_gate_for(&mut proof, record);
+        reprompt.account = Some(id.clone());
+        fill_from_vault_with(
+            &cache_with(a_protected(item_with(""))),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            &sequence::RecordingNotifier::default(),
+            &crate::vault_window::preflight::SendGate::describing(
+                a_masked_box_in_the_rules_process,
+            ),
+            &mut reprompt,
+        );
+        assert_eq!(
+            SAW.lock().unwrap().clone(),
+            Some(Some(id)),
+            "the gate was built for a different account than the fill was scoped to"
+        );
     }
 }
 

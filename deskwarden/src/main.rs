@@ -1243,6 +1243,21 @@ fn main() {
     }
     let mut last_update_check = Instant::now();
 
+    // **The fill path's master-password re-prompt proof.**
+    //
+    // Declared here, in `run`, because it is the only thing on this path that
+    // outlives a fill: `reprompt::PROOF_LASTS` is sixty seconds and the whole
+    // point of it is that a user who has just proved themselves is not asked
+    // again for the next thing they do. Both production fills below --
+    // `process_foreground_event`'s prompt overlay and the Ctrl+Alt+B hotkey --
+    // borrow it through `FillProof::scoped_to`, which is also what forgets it
+    // when the active account changes.
+    //
+    // Below the startup window with the rest of them, and for the same
+    // reason: the account this is scoped to is `estate.active_account`, which
+    // that window can still switch, add or remove.
+    let mut fill_proof = deskwarden::app::FillProof::default();
+
     // Prefetches the account email + server URL the vault window's toolbar
     // needs (see `open_vault_window`), on its own thread: `bw status`
     // regularly takes 1-3s to spawn on Windows, and `open_vault_window`
@@ -1347,6 +1362,7 @@ fn main() {
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
             &deskwarden::injector::sequence::REAL_NOTIFIER,
+            &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
         );
     }
 
@@ -2073,6 +2089,12 @@ fn main() {
                         hwnd,
                         deskwarden::app::FillChoice::Saved,
                         &deskwarden::injector::sequence::REAL_NOTIFIER,
+                        // **The hotkey is gated too.** It is the fill with no
+                        // window of ours in front of the user, so it is the
+                        // one where a silent no-op would read as a broken
+                        // shortcut -- which is why the refusal below goes to
+                        // the real notifier and not only to the log.
+                        &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
                     );
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
@@ -2298,6 +2320,7 @@ fn main() {
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
+                &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
             );
         }
     }
@@ -2806,6 +2829,10 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
     notifier: &dyn Notifier,
+    // The re-prompt scoping, borrowed for the duration of one event rather
+    // than owned here: the proof it carries has to outlive this call for
+    // `reprompt::PROOF_LASTS` to mean anything. See `run`'s `fill_proof`.
+    reprompt: &mut deskwarden::app::Reprompt<'_>,
 ) {
     // Our own windows (prompt overlay, process picker, login) are focused,
     // always-on-top windows, so showing one fires EVENT_SYSTEM_FOREGROUND for
@@ -2853,7 +2880,16 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             deskwarden::app::match_disposition(prompt_on_match)
         );
         if let Some(armed) =
-            handle_match(cache, injector, fill_stats, item_id, prompt_on_match, event, notifier)
+            handle_match(
+                cache,
+                injector,
+                fill_stats,
+                item_id,
+                prompt_on_match,
+                event,
+                notifier,
+                reprompt,
+            )
         {
             *pending_hotkey_fill = Some(armed);
         }
@@ -20353,6 +20389,25 @@ mod tests {
             deskwarden::injector::sequence::RecordingNotifier::default()
         }
 
+        /// The re-prompt scoping for a dispatch test, and **the reason it is
+        /// safe for one to exist here.**
+        ///
+        /// No fixture in this file carries `reprompt: 1`, and
+        /// `app::permitted_by_reprompt` builds a gate *only* for a protected
+        /// item -- so this never reaches `hello::state_for` and can never open
+        /// a Windows Hello dialog on the desktop of whoever ran `cargo test`,
+        /// which is the same hazard `recorder()` exists for. `None` for the
+        /// account is the honest value: a dispatch test has no account.
+        ///
+        /// The proof is leaked rather than held, because the borrow has to
+        /// outlive the call and these are one-line call sites.
+        ///
+        /// The re-prompt's own behaviour is proved in `app`, where the prover
+        /// is a fixture: see `the_reprompt_is_what_gates_the_fill`.
+        fn no_reprompt() -> deskwarden::app::Reprompt<'static> {
+            Box::leak(Box::new(deskwarden::app::FillProof::default())).scoped_to(None)
+        }
+
         /// **What is left unreachable, held by source position.**
         ///
         /// Handing the notifier in is what makes a test-opened dialog
@@ -20365,7 +20420,6 @@ mod tests {
         #[test]
         fn the_production_dispatch_uses_the_real_notifier() {
             let source = include_str!("main.rs");
-            // Split so this test's own text is not one of the three.
             let real = concat!("&deskwarden::injector::sequence::", "REAL_", "NOTIFIER,");
             // Bare, for the test half: not merely "not passed as an argument"
             // but *not nameable at all* below the boundary, so
@@ -20391,6 +20445,58 @@ mod tests {
                 "a test passes the real notifier. That opens a task-modal `MessageBoxW` on \
                  the desktop of whoever ran `cargo test`, which is the entire hazard this \
                  parameter exists to remove: use `recorder()`"
+            );
+        }
+
+        /// **The re-prompt is scoped to the account, on the three lines no
+        /// test can execute.**
+        ///
+        /// This is the pin the whole threading exists for, and it guards a
+        /// failure that is the opposite of the usual one. `reprompt::gate_from`
+        /// answers `RepromptGate::unprovable()` for a `None` account, and an
+        /// unprovable gate refuses **every** protected item -- so a
+        /// `scoped_to(None)` written on any of these three lines does not
+        /// weaken the gate, it switches autofill off for every enrolled user
+        /// who ever ticked "master password re-prompt". Nothing below can see
+        /// it: every dispatch test here passes `no_reprompt()` deliberately,
+        /// because the real thing probes Windows Hello.
+        ///
+        /// The mirror image is guarded too. `app`'s
+        /// `the_production_scoping_is_wired_to_the_real_gate` compares
+        /// `FillProof::scoped_to`'s gate by address against
+        /// `reprompt::gate_for_account`, so the other way to make these three
+        /// lines lie -- keep the account and substitute the gate -- is red
+        /// there.
+        ///
+        /// Bounded by the same syntax as its two siblings, and counted for
+        /// the same reason.
+        #[test]
+        fn the_production_fills_scope_the_reprompt_to_the_active_account() {
+            let source = include_str!("main.rs");
+            // Split so this test's own text is not one of the three, and split
+            // at a point that also keeps it clear of the second needle below.
+            let needle = concat!(
+                "fill_proof.scoped_to(estate.active_",
+                "account.as_ref().map(|a| &a.id))"
+            );
+            let boundary = source
+                .find(concat!("fn process_foreground", "_event<A:"))
+                .expect("`process_foreground_event`'s definition is gone from main.rs");
+            assert_eq!(
+                source[..boundary].matches(needle).count(),
+                3,
+                "expected the re-prompt to be scoped to the active account exactly three times \
+                 in `run` -- the two `process_foreground_event` calls and the hotkey \
+                 `fill_from_vault`. Fewer means a production fill of a protected item is \
+                 gated against no account at all, which refuses it outright for every user; \
+                 more means a fourth production fill appeared that nobody has thought about"
+            );
+            assert_eq!(
+                source[boundary..].matches(concat!("scoped_to(estate.", "active_account")).count(),
+                0,
+                "a test scopes the re-prompt to the real active account. That reaches \
+                 `hello::state_for` and can open a Windows Hello dialog on the desktop of \
+                 whoever ran `cargo test`: use `no_reprompt()`"
             );
         }
 
@@ -20467,6 +20573,7 @@ mod tests {
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &recorder(),
+                &mut no_reprompt(),
             );
 
             assert!(
@@ -20516,6 +20623,7 @@ mod tests {
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &recorder(),
+                    &mut no_reprompt(),
                 );
                 armed.push(pending_hotkey_fill);
             }
@@ -20562,6 +20670,7 @@ mod tests {
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &recorder(),
+                &mut no_reprompt(),
             );
 
             assert!(filled.seen().is_empty(), "an unmatched window must never be filled");
@@ -20596,6 +20705,7 @@ mod tests {
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &recorder(),
+                    &mut no_reprompt(),
                 );
             });
 
@@ -20640,6 +20750,7 @@ mod tests {
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &recorder(),
+                    &mut no_reprompt(),
                 );
             });
 
