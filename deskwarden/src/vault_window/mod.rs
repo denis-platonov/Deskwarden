@@ -15,6 +15,7 @@ pub mod rehearsal;
 pub mod relative_time;
 pub mod send_ui;
 pub mod sidebar;
+pub mod totp_add;
 
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
 use crate::clipboard::ClearTrigger;
@@ -1056,6 +1057,24 @@ pub fn build_frame(
     // Windows Hello prompt at the open would have been asked minutes before
     // that choice and would have proved nothing about it.
     let mut record_import: Option<record_ui::RecordImport> = None;
+    // **"Add a one-time code", open against one item**, or `None`.
+    //
+    // Held here rather than in a `RefCell` for `record_send`'s reason: it is
+    // frame state of this window and nothing outside the update closure reads
+    // it. The state holds a `Zeroizing` seed, so it is closed by being
+    // REPLACED with `None` and never by an `open = false` -- see
+    // `record_import`'s close, which is the same rule for the same reason.
+    //
+    // **NOT re-prompt gated, deliberately.** Every gated door in this window
+    // is one that EXPOSES a secret the vault already holds -- the copy rows,
+    // the reveals, the record composer's publish. This one exposes nothing: it
+    // shows only what the user is typing into it at that moment, and the item's
+    // existing seed is never painted, revealed or copied by it. What it can do
+    // is DESTROY one, and the guard for that is `totp_add::REPLACE_WARNING`
+    // plus a button that says "Replace code" on its face -- the same shape as
+    // `record_ui`'s collision question, and for the same reason: a proof
+    // demanded at the open proves nothing about a choice made a minute later.
+    let mut totp_add_state: Option<totp_add::TotpAdd> = None;
     // The app launch that has been asked for and has not happened yet. See
     // [`PendingLaunch`]: the Open arm records the request and NOTHING there
     // starts a program, so every launch in this window goes through the one
@@ -1732,6 +1751,27 @@ pub fn build_frame(
         // controls at all, so "send the thing I threw away" is still refused,
         // and now by the pane's own shape rather than by a greyed button.
         let mut send_record_asked = false;
+        // **"Add a one-time code" was ASKED FOR**, by the chord, and nothing
+        // has been decided about it yet.
+        //
+        // A request and not an open, for `send_record_asked`'s reason: the
+        // chord is read up here, before anything is drawn, and the visible
+        // control this feature is owed lives in the detail pane's own header
+        // strip -- which is drawn several hundred lines below. Both doors
+        // write this one frame-local flag, and the single block near the end
+        // of the frame is the only thing that turns it into a form, so the
+        // button cannot end up wired differently from the keyboard.
+        //
+        // **The visible control is NOT here yet, and that is a stated gap.**
+        // It belongs beside the ✉ in `draw_detail_read`'s header, where the
+        // record composer's control ended up for exactly this reason: adding a
+        // code acts on the SELECTED ITEM, and this titlebar is where things
+        // that act on the window and the account live -- a pill here would
+        // repeat the placement the user already rejected once. `detail.rs` and
+        // `theme.rs` are being edited elsewhere as this lands, so the chord is
+        // the door that exists today and `totp_add::ADD_TOTP_SHORTCUT` is
+        // already the string that button's hover will paint.
+        let mut add_totp_asked = false;
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
         match draw_window_chrome_with_extra(
@@ -1955,7 +1995,7 @@ pub fn build_frame(
         // into a new-item form they cannot see. `keyboard_shortcuts_enabled`
         // is the decision, made where a test can reach it.
         let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
-        let (ctrl_k, ctrl_l, ctrl_n, send_record_chord) = ui.ctx().input(|i| {
+        let (ctrl_k, ctrl_l, ctrl_n, send_record_chord, add_totp_chord) = ui.ctx().input(|i| {
             (
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::L),
@@ -1979,10 +2019,24 @@ pub fn build_frame(
                 shortcuts
                     && i.modifiers.matches_exact(SEND_RECORD_MODIFIERS)
                     && i.key_pressed(SEND_RECORD_KEY),
+                // "Add a one-time code", on the same terms as the chord above
+                // and for the same two reasons: `matches_exact`, so a held
+                // modifier cannot drag in a plain-CTRL binding underneath it,
+                // and a key nothing else in this crate binds --
+                // `the_add_code_chord_is_a_key_no_other_binding_takes` asserts
+                // that rather than this comment. `T` would have been the
+                // mnemonic and `detail.rs` already binds it to "copy the
+                // one-time code"; `2` is the second factor the code is.
+                shortcuts
+                    && i.modifiers.matches_exact(ADD_TOTP_MODIFIERS)
+                    && i.key_pressed(ADD_TOTP_KEY),
             )
         });
         if send_record_chord {
             send_record_asked = true;
+        }
+        if add_totp_chord {
+            add_totp_asked = true;
         }
         if ctrl_k {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
@@ -4197,6 +4251,135 @@ pub fn build_frame(
             }
         }
 
+        // **THE ONE LINE THAT OPENS "Add a one-time code".** Every door --
+        // today the chord, tomorrow the detail header's control -- arrives
+        // here as `add_totp_asked`, for `send_record_asked`'s reason: one
+        // door per surface is how a control and a keyboard binding come to
+        // behave differently, and this window has paid for that once already.
+        //
+        // Placed after every panel has been drawn, so a control inside the
+        // detail pane can still be the thing that set the flag: the flag is
+        // frame-local, and a gate above the pane would see the chord and
+        // never the button.
+        //
+        // Resolved out of `items` and NOT `list_for`, which is what keeps a
+        // row selected under Trash or Archive out of this: a deleted item is
+        // not a thing to enrol a second factor on. `login.is_some()` for the
+        // same kind of reason -- `totp` lives in the login object, and a card
+        // or a note has nowhere to put one.
+        //
+        // A second press while a form is already open is ignored rather than
+        // replacing it: the open form holds a typed seed and two parameter
+        // choices, and re-opening would silently discard all three.
+        if add_totp_asked && totp_add_state.is_none() {
+            if let Some(item) = selected_id
+                .as_ref()
+                .and_then(|id| items.iter().find(|i| &i.id == id))
+                .filter(|item| item.login.is_some())
+            {
+                totp_add_state = Some(totp_add::TotpAdd::opening(
+                    &item.id,
+                    &item.name,
+                    // Read ONCE, at the open, so the replace warning cannot
+                    // appear or vanish under the user mid-form -- a sync
+                    // landing while the form is up must not turn a "Save code"
+                    // into a "Replace code" between the reading and the press.
+                    item.login.as_ref().is_some_and(|login| login.totp.is_some()),
+                ));
+            }
+        }
+
+        // The form itself, drawn here for `folder_edit`'s reason exactly:
+        // last, so the card and its scrim are over the three panels.
+        //
+        // `close` is a flag rather than an assignment inside the match for the
+        // import form's reason: the state is borrowed for the length of the
+        // call, and it is closed by being REPLACED with `None` because it
+        // holds a `Zeroizing` seed.
+        if let Some(state) = &mut totp_add_state {
+            // The one clock read for this surface. `totp_add` takes the time
+            // as an argument rather than reading it, so every assertion about
+            // the live code and its countdown is a test that can name an
+            // instant; this is the only place a real clock enters.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0);
+            // **No repaint request here, deliberately.** The countdown needs
+            // this window to keep drawing while nobody touches it, and it
+            // already does: the frame closure schedules its successor at
+            // `FRAME_INTERVAL` (500 ms) unconditionally, above every early
+            // return, which is twice the rate a one-second countdown needs. A
+            // `request_repaint_after` here would be a third scheduler in a
+            // file whose whole cadence story is that there are two, and
+            // `nothing_else_schedules_a_frame_behind_its_back` would say so.
+            let mut close = false;
+            match totp_add::draw_add_modal(ui.ctx(), state, now_unix) {
+                totp_add::TotpAddAction::Save => {
+                    // Re-resolved by id, for the record composer's reason: the
+                    // vault may have been re-read between the open and this
+                    // press, and the item that should be written is the one the
+                    // window is holding now. If it is gone, the form closes
+                    // with nothing written rather than writing a stale copy.
+                    let target = items.iter().find(|i| i.id == state.item_id).cloned();
+                    // **The whole URI, from `uri_to_write`** -- never the bare
+                    // seed, and never a value this file built for itself.
+                    if let (Some(uri), Some(item)) = (totp_add::uri_to_write(state), target) {
+                        let mut updated = item;
+                        let login = updated.login.get_or_insert_with(Default::default);
+                        login.totp = Some(zeroize::Zeroizing::new(uri.to_string()));
+                        match cache.update_item(&updated) {
+                            // The SERVER's copy, not `updated`: see the Save
+                            // arm of the edit form above and `vault_bridge`'s
+                            // `REVISION_DATE_KEY`.
+                            // The SERVER's copy, under a name of this arm's
+                            // own -- `written`, beside the edit pane's
+                            // `saved`, the move's `moved` and the favourite's
+                            // `starred`. Each write arm in this file names the
+                            // value it adopted after what it did, so
+                            // `write_arms_adopt_the_backends_copy_tests` can
+                            // pin each one separately; a second `saved` here
+                            // would make that suite's exactly-once counts
+                            // meaningless rather than merely wrong.
+                            Ok(written) => {
+                                if let Some(pos) = items.iter().position(|i| i.id == updated.id) {
+                                    items[pos] = written;
+                                }
+                                close = true;
+                            }
+                            // The refused write is REPORTED, the way every
+                            // other write in this closure reports one, and the
+                            // form stays open holding what was typed. A seed
+                            // silently dropped on a failed PUT is a seed the
+                            // user believes is saved.
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to write a one-time code to {}: {e:?}",
+                                    updated.id
+                                );
+                                generate_error = None;
+                                move_error = Some(item_write_failure_message(
+                                    ItemWrite::Save,
+                                    &updated.name,
+                                    &e,
+                                ));
+                                flag_reauth_if_unauthorized(
+                                    ui.ctx(),
+                                    &needs_reauth_for_closure,
+                                    &e,
+                                );
+                            }
+                        }
+                    }
+                }
+                totp_add::TotpAddAction::Cancel => close = true,
+                totp_add::TotpAddAction::None => {}
+            }
+            if close {
+                totp_add_state = None;
+            }
+        }
+
         // The export's answer, drawn here for `folder_edit`'s reason: last, so
         // the card is over the three panels.
         //
@@ -4820,6 +5003,20 @@ const SEND_RECORD_MODIFIERS: egui::Modifiers =
     egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
 /// See [`SEND_RECORD_MODIFIERS`].
 const SEND_RECORD_KEY: egui::Key = egui::Key::S;
+
+/// The modifiers of the chord that opens "Add a one-time code".
+///
+/// A named pair rather than a literal at the read, for
+/// [`SEND_RECORD_MODIFIERS`]'s reason: [`totp_add::ADD_TOTP_SHORTCUT`] -- the
+/// string the control will advertise -- and the keys actually bound are one
+/// fact a test can compare, and `the_add_code_chord_is_spelled_the_way_it_is_bound`
+/// compares them.
+const ADD_TOTP_MODIFIERS: egui::Modifiers =
+    egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+/// See [`ADD_TOTP_MODIFIERS`]. **`2`, not `T`**: `detail.rs` binds CTRL+T to
+/// "copy the one-time code", and two bindings on one key resolve to whichever
+/// is read first with the other silently dead.
+const ADD_TOTP_KEY: egui::Key = egui::Key::Num2;
 
 /// **[`permit_detail_action`]'s sibling for "Send a record", and the reason
 /// the composer is gated at its OPEN rather than at its Create.**
@@ -10256,6 +10453,11 @@ mod write_arms_adopt_the_backends_copy_tests {
     const MOVE_ARM: &str = concat!("items[pos] = ", "moved;");
     const SAVE_ARM: &str = concat!("items[pos] = ", "saved;");
     const FAVOURITE_ARM: &str = concat!("items[pos] = ", "starred;");
+    /// The "Add a one-time code" write arm. Its own name for the same reason
+    /// the three above have theirs: a shared binding name would collapse four
+    /// exactly-once counts into one count of four, which no longer says
+    /// anything about any individual arm.
+    const TOTP_ARM: &str = concat!("items[pos] = ", "written;");
     /// What the move arm used to do: rebuild the row locally from the item it
     /// sent. Present nowhere in this file once the arm is right.
     const MOVE_ARM_REBUILD: &str = concat!("items[pos] = crate::vault_bridge::", "with_folder(");
@@ -10375,6 +10577,31 @@ mod write_arms_adopt_the_backends_copy_tests {
             source().matches(FAVOURITE_ARM).count(),
             1,
             "the star's arm does not adopt the cache's returned item exactly once (needle              {FAVOURITE_ARM:?})"
+        );
+    }
+
+    /// The one-time code's write arm, on the same terms as the three above.
+    ///
+    /// It PUTs the item, so it carries the identical `revisionDate` hazard: an
+    /// arm that reinstated the copy it sent would make the user's NEXT edit of
+    /// that item fail with a 400 -- and this arm is the one a user reaches
+    /// immediately after enrolling a second factor, i.e. exactly when they are
+    /// most likely to edit the item again.
+    #[test]
+    fn the_one_time_code_arm_takes_the_item_the_cache_returned() {
+        assert_eq!(
+            source().matches(TOTP_ARM).count(),
+            1,
+            "the one-time code's arm does not adopt the cache's returned item exactly once \
+             (needle {TOTP_ARM:?})"
+        );
+        // And it lands on the row it wrote, not on row 0 -- the half of
+        // "adopt the backend's copy" that stayed green under a mutated
+        // predicate until `arm_pins_its_row` existed.
+        arm_pins_its_row(
+            TOTP_ARM,
+            concat!("items.iter().position(|i| i.id == ", "updated.id)"),
+            "the one-time code's write arm",
         );
     }
 
@@ -29436,6 +29663,89 @@ mod send_create_wiring {
             1,
             "`egui::Key::S` is spelled more than once in this file's production, so the \
              constant is no longer the single place the record chord's key is written"
+        );
+    }
+
+    /// **The "Add a one-time code" chord, on exactly the terms the record
+    /// chord is held to.**
+    ///
+    /// Written as a sibling rather than folded into the test above, because
+    /// each asserts the thing about ITS OWN binding and a merged one would
+    /// pass with either half aimed at the other's constants.
+    #[test]
+    fn the_add_code_chord_is_spelled_the_way_it_is_bound() {
+        // Spelled FROM the modifiers the binding really carries, so a chord
+        // that quietly picked up ALT is spelled "CTRL+SHIFT+ALT+2" here and
+        // fails against the advertised string -- rather than two written-out
+        // constants agreeing with each other.
+        let modifiers = super::ADD_TOTP_MODIFIERS;
+        let mut spelled = String::new();
+        for (held, name) in [
+            (modifiers.ctrl, "CTRL"),
+            (modifiers.shift, "SHIFT"),
+            (modifiers.alt, "ALT"),
+            (modifiers.mac_cmd, "CMD"),
+        ] {
+            if held {
+                if !spelled.is_empty() {
+                    spelled.push('+');
+                }
+                spelled.push_str(name);
+            }
+        }
+        assert_eq!(
+            totp_add::ADD_TOTP_SHORTCUT,
+            format!("{spelled}+{}", super::ADD_TOTP_KEY.name()),
+            "the one-time code control advertises a chord the code does not bind"
+        );
+
+        // The read is exact, not `i.modifiers.ctrl`: a loose CTRL test would
+        // fire this chord AND any plain-CTRL binding on the same key.
+        let code = code_without_comments(include_str!("mod.rs"));
+        assert!(
+            code.contains(concat!("i.modifiers.matches_", "exact(ADD_TOTP_MODIFIERS)")),
+            "the add-code chord is no longer matched exactly"
+        );
+    }
+
+    /// The key itself is unspent, and `T` -- the mnemonic -- deliberately is
+    /// not the one taken.
+    #[test]
+    fn the_add_code_chord_is_a_key_no_other_binding_takes() {
+        let key = concat!("Key", "::Num2");
+        let elsewhere: Vec<String> = every_source_file()
+            .into_iter()
+            .filter(|(path, text)| {
+                path != "vault_window/mod.rs" && code_without_comments(text).contains(key)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "`egui::Key::Num2` is bound somewhere else in production too: {elsewhere:?}. Two \
+             bindings on one key resolve to whichever is read first and the other silently \
+             never fires"
+        );
+        assert_eq!(
+            code_without_comments(include_str!("mod.rs")).matches(key).count(),
+            1,
+            "`egui::Key::Num2` is spelled more than once in this file's production, so the \
+             constant is no longer the single place this chord's key is written"
+        );
+
+        // **CONTROL, and the reason this chord is not on `T`.** `detail.rs`
+        // really does bind CTRL+T to "copy the one-time code", so the obvious
+        // mnemonic was taken -- asserted, so that a future tidy-up which frees
+        // `T` is told this constant may move rather than left guessing.
+        let detail = every_source_file()
+            .into_iter()
+            .find(|(path, _)| path == "vault_window/detail.rs")
+            .map(|(_, text)| code_without_comments(&text))
+            .expect("the crate walk did not reach detail.rs");
+        assert!(
+            detail.contains(concat!("Key", "::T,")) || detail.contains(concat!("Key", "::T)")),
+            "`detail.rs` no longer binds the T key, so this chord's reason for being on `2` \
+             instead of the mnemonic no longer holds"
         );
     }
 

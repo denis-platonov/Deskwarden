@@ -64,9 +64,17 @@ use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
+use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
+
+/// The instant every time-dependent preview is drawn at.
+///
+/// A literal, not `SystemTime::now()`: the one-time code shot's two most
+/// prominent numbers are a code and a countdown, and a screenshot that changes
+/// every run is one no reviewer can diff against the last.
+const PREVIEW_UNIX: u64 = 1_699_999_980;
 
 /// Where the PNGs go: `$CARGO_TARGET_DIR` when the environment sets one,
 /// and the historical relative `target` when it does not.
@@ -124,6 +132,13 @@ enum Surface {
     DiscardConfirm,
     /// The record composer -- the Send export form and its seed warning.
     RecordComposer,
+    /// **Design 6c/6d**: the by-hand "add a one-time code" form, with a URI
+    /// typed in so the confirmation -- the live code, its countdown, the
+    /// masked secret and the spelled-out parameters -- is on screen, and
+    /// against an item that ALREADY has a code so the replace warning is too.
+    /// Those two are the whole surface; a shot of the empty form would show
+    /// neither.
+    TotpAddConfirm,
     /// The preflight, allowed: the rule's process is in front and the focused
     /// control is masked, so the hold-to-send is offered.
     PreflightAllowed,
@@ -189,6 +204,7 @@ const ALL: &[Surface] = &[
     Surface::CardDetailRevealed,
     Surface::DiscardConfirm,
     Surface::RecordComposer,
+    Surface::TotpAddConfirm,
     Surface::PreflightAllowed,
     Surface::PreflightRefused,
     Surface::PrefsClipboard,
@@ -209,6 +225,7 @@ impl Surface {
             Surface::CardDetailRevealed => "detail_card_revealed",
             Surface::DiscardConfirm => "edit_discard_confirm",
             Surface::RecordComposer => "record_composer",
+            Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::PreflightAllowed => "preflight_allowed",
             Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
@@ -237,7 +254,8 @@ impl Surface {
             | Surface::CardDetail
             | Surface::CardDetailRevealed
             | Surface::DiscardConfirm
-            | Surface::RecordComposer => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            | Surface::RecordComposer
+            | Surface::TotpAddConfirm => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
                 deskwarden::preflight_host::PREFLIGHT_WIDTH,
                 deskwarden::preflight_host::PREFLIGHT_HEIGHT,
@@ -471,6 +489,7 @@ impl eframe::App for Preview {
             }
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
+            Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
@@ -525,6 +544,8 @@ enum PaneKind {
     Discard,
     /// The Send record composer.
     Composer,
+    /// The "add a one-time code" form, mid-confirmation.
+    TotpAdd,
     /// The preflight; `true` for the allowed state, `false` for the refusal.
     Preflight(bool),
 }
@@ -749,6 +770,13 @@ impl Preview {
                         false,
                     );
                 }
+                PaneKind::TotpAdd => {
+                    // A FIXED instant, not `SystemTime::now()`: the code and
+                    // the countdown are the point of this shot, and a
+                    // screenshot whose two most prominent numbers change every
+                    // run is a screenshot no reviewer can diff.
+                    let _ = totp_add::draw_add_form(ui, &mut fixtures.totp_add, PREVIEW_UNIX);
+                }
                 PaneKind::Preflight(allowed) => {
                     let state = if allowed { &mut fixtures.allowed } else { &mut fixtures.refused };
                     let _ = preflight::draw(ui, state);
@@ -768,6 +796,7 @@ struct Fixtures {
     breaches: BreachCache,
     draft: EditDraft,
     record: RecordDraft,
+    totp_add: TotpAdd,
     allowed: PreflightState,
     refused: PreflightState,
     rehearsal: scratch_window::RehearsalView,
@@ -789,6 +818,17 @@ impl Fixtures {
         // that decides whether that tick was a mistake -- is in the picture.
         let mut record = RecordDraft { open: true, ..Default::default() };
         record.set_totp(true);
+        // Opened against an item that ALREADY has a code, so the replace
+        // warning is in the picture, and with a URI typed whose parameters are
+        // all non-default -- 8 digits over 60 seconds under SHA-256 -- because
+        // that is the case the confirmation exists to catch and the one a shot
+        // of a plain 6/30 card cannot show.
+        let mut totp_add = TotpAdd::opening("preview", "Git Host \u{b7} anovak", true);
+        totp_add.typed = zeroize::Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&issuer=Git%20Host\
+             &digits=8&period=60&algorithm=SHA256"
+                .to_string(),
+        );
 
         Self {
             folders: vec![
@@ -822,6 +862,7 @@ impl Fixtures {
                 rehearsal::SAMPLE_PASSWORD
             ),
             record,
+            totp_add,
             draft,
             login,
             card,

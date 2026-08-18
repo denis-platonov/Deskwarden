@@ -2220,12 +2220,33 @@ mod tests {
     /// naming `sha1::` would be a real second implementation, and is still a
     /// failure. Pinned by
     /// [`the_sha1_carve_out_is_only_the_name_and_only_that_file`].
+    ///
+    /// **`vault_window/totp_add.rs` may use the CRATE, and that is a
+    /// deliberate re-pin of the claim above.** "This crate computes no HMAC at
+    /// any point" stopped being true when the by-hand route to adding a
+    /// one-time code landed: that screen shows a **live code beside a
+    /// countdown** so the user can compare it against the site *before*
+    /// saving, and the seed it is computed from **is not in the vault yet** --
+    /// there is no item for `vault_bridge::get_totp` to ask `bw serve` about,
+    /// and writing the seed first in order to check it afterwards inverts the
+    /// only confirmation this feature has. So the HMAC is computed there, over
+    /// `sha1`/`sha2`, pinned against RFC 2202/4231's HMAC vectors and RFC
+    /// 6238's TOTP vectors.
+    ///
+    /// The rule this test protects is unchanged and still worth having: **no
+    /// SECOND implementation of SHA-1, and no use of it as a security
+    /// primitive nobody looked at.** Two files may name it, each for a reason
+    /// written down here; every other file in the crate still may not. A named
+    /// list rather than a loosened needle, for the same reason as before.
     #[test]
     fn sha1_is_confined_to_the_breach_module() {
         const TYPE_NAME: &str = concat!("Sha", "1");
         const CRATE_PATH: &str = concat!("sha", "1::");
         /// The one file allowed to write the type name; see this test's docs.
         const NAME_ONLY_EXEMPT: &str = "otpauth.rs";
+        /// The one file allowed BOTH needles: the live code on the "add a
+        /// one-time code" confirmation. See this test's docs.
+        const HMAC_EXEMPT: &str = "vault_window/totp_add.rs";
 
         let files = crate_source_files();
         assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
@@ -2240,7 +2261,7 @@ mod tests {
 
         let mut offenders = Vec::new();
         for (path, text) in &files {
-            if path == "breach.rs" {
+            if path == "breach.rs" || path == HMAC_EXEMPT {
                 continue;
             }
             for needle in [TYPE_NAME, CRATE_PATH] {
@@ -2296,6 +2317,34 @@ mod tests {
             "{NAME_ONLY_EXEMPT} names {CRATE_PATH:?}. The carve-out is for the algorithm's \
              NAME being carried from a QR code to the vault, not for a second SHA-1 in this \
              crate"
+        );
+
+        // 3. The SECOND carve-out, on the same terms: it names a file that
+        //    exists, and it is load-bearing -- that file really does use the
+        //    crate, so the guard above would fail without it. A carve-out for
+        //    a file that no longer needs one is a hole nobody is watching.
+        const HMAC_EXEMPT: &str = "vault_window/totp_add.rs";
+        let hmac = files
+            .iter()
+            .find(|(path, _)| path == HMAC_EXEMPT)
+            .expect("the HMAC carve-out names a file that is not in this crate");
+        assert!(
+            hmac.1.contains(CRATE_PATH),
+            "{HMAC_EXEMPT} no longer uses {CRATE_PATH:?}, so its carve-out in \
+             `sha1_is_confined_to_the_breach_module` is an open hole with no reason left. \
+             Delete it."
+        );
+
+        // 4. And the reason it holds is that the file really does compute a
+        //    live code from a seed that is not saved yet. An exemption for a
+        //    file that had stopped doing that would be an exemption for
+        //    nothing, granted to the one place a second SHA-1 would be easiest
+        //    to hide.
+        assert!(
+            hmac.1.contains(concat!("fn hmac(", "algorithm"))
+                && hmac.1.contains(concat!("pub fn code", "_at(")),
+            "{HMAC_EXEMPT} no longer computes a one-time code, which is the whole reason it \
+             may name SHA-1 at all"
         );
     }
 
