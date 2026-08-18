@@ -696,7 +696,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 9] = [
+    const OPENS_WINDOWS: [&str; 10] = [
         "app_window",
         "loading_ui",
         "login_ui",
@@ -707,7 +707,11 @@ mod tests {
         // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
         "preflight_host",
         "prefs_ui",
-        // The 4d rehearsal scratch window. The one window in this crate
+        // The 6b region-selection overlay. The SECOND egui viewport in this
+        // crate, and the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] stopped
+        // being a one-row table -- see the argument on it.
+        "region_overlay",
+        // The 4d rehearsal scratch window. The first window in this crate
         // `eframe` does not start a loop for -- it is an egui VIEWPORT, opened
         // inside the vault window's running loop. See
         // [`OPENS_A_VIEWPORT_AND_RAISES_IT`], which is the table that holds
@@ -761,8 +765,51 @@ mod tests {
     /// fourth: there is no Win32 window left in this crate for the old one to
     /// hold, and a table kept alive for a case that no longer exists is a guard
     /// that counts zero forever.
-    const OPENS_A_VIEWPORT_AND_RAISES_IT: [(&str, &str, &str); 1] =
-        [("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE")];
+    ///
+    /// # Widened to two rows rather than made a count, and why
+    ///
+    /// It held one row while `scratch_window` was the only viewport in this
+    /// crate, and design 6b's region overlay is the second. Three shapes were
+    /// available and two of them are worse:
+    ///
+    /// * **A global count of `show_viewport_deferred` across the crate.** That
+    ///   is what the prose on
+    ///   [`only_one_window_of_this_process_can_exist_at_a_time`] used to imply
+    ///   ("Nothing in this crate calls it"), and it is the shape that ages
+    ///   badly: with two callers the guard can only say "two viewports exist
+    ///   somewhere", which is satisfied by one module opening both -- the exact
+    ///   case the exactly-one claim was written to rule out.
+    /// * **A second table for the second window.** A table per window turns a
+    ///   guard into a registry and the reconciliation below into a chain of
+    ///   `len()`s, which is how a list stops failing.
+    ///
+    /// So: one row per viewport module, and every assertion in
+    /// [`every_viewport_window_this_crate_opens_asks_to_be_brought_to_the_front`]
+    /// stays **per-module** -- exactly one `show_viewport_deferred(`, exactly
+    /// one `with_title(TITLE)`, exactly one `raise_window(TITLE)`, in *that
+    /// module's own source*. Widening the array does not weaken any of them; it
+    /// makes the same claim about one more file. The one property that is
+    /// genuinely about the pair rather than about either row is that the titles
+    /// are distinct, and that is asserted directly on the constants in
+    /// [`only_one_window_of_this_process_can_exist_at_a_time`].
+    ///
+    /// **`region_overlay` raises, and the decision is not the automatic one.**
+    /// Two windows in this crate are excused from raising precisely because
+    /// they are `with_always_on_top()`, and this one is too -- so the same
+    /// argument appears to apply. It does not, for a reason particular to this
+    /// window: always-on-top governs Z-order, not **focus**, and this surface
+    /// has to receive keyboard input. Escape cancels it and `A` selects the
+    /// whole screen; without the foreground those keys go to whatever the user
+    /// was in, and Escape landing in someone else's app while a full-screen
+    /// dimmed overlay sits on top of it with no way out is the worst failure
+    /// this feature has. `overlay_ui`'s and `preflight_host`'s other reason
+    /// does not apply either: both open under the literal `"Deskwarden"` that
+    /// three raising windows share, so a raise there could pick the wrong one.
+    /// `REGION_TITLE` is unique, so `raise_window`'s `find` is exact.
+    const OPENS_A_VIEWPORT_AND_RAISES_IT: [(&str, &str, &str); 2] = [
+        ("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE"),
+        ("region_overlay", include_str!("region_overlay.rs"), "REGION_TITLE"),
+    ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
@@ -1079,10 +1126,10 @@ mod tests {
             // window: it has no HWND, no title, nothing for `raise_window`
             // to match on and nothing that could steal the foreground. The
             // dimmed full-screen surface the user drags on IS a window, and
-            // it is `vault_window::region_overlay`, a later step and not this
-            // module -- which is the whole point of the split: the part that
-            // shows something and the part that touches the OS are separate
-            // files so that this one can stay windowless.
+            // it is `region_overlay` -- which is now in `OPENS_WINDOWS` above,
+            // and which is the whole point of the split: the part that shows
+            // something and the part that touches the OS are separate files so
+            // that this one can stay windowless.
             "screen_capture",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
@@ -1308,18 +1355,23 @@ mod tests {
     ///   window opened from a spawned thread is not a second window but a
     ///   crash. This is what makes the spawn side unnecessary to check
     ///   separately: `with_any_thread` is the only door to it.
-    /// * **One viewport per loop, and exactly one place that opens one.**
+    /// * **One viewport per viewport module, and every one of them named.**
     ///   `show_viewport*` opens a second OS window inside a running loop, on
     ///   the same thread, with no `run_*native` call for `RAISING_SITES` to
     ///   count and no title for it to compare. This bullet said "Nothing in
     ///   this crate calls it" until design 4d's rehearsal window stopped being
-    ///   a raw Win32 window and became one. `scratch_window` now calls
-    ///   `show_viewport_deferred` exactly once, under `SCRATCH_TITLE`, and
-    ///   `OPENS_A_VIEWPORT_AND_RAISES_IT` is the table that holds it. The count
-    ///   below is therefore per-module rather than globally zero -- and the
-    ///   title it opens under is asserted, above, to be distinct from the one
-    ///   the five `eframe` windows share, which is what keeps `pick`'s `find`
-    ///   exact even while two windows are on screen.
+    ///   a raw Win32 window and became one, and it said "exactly one place"
+    ///   until design 6b's region overlay became the second. Both are held the
+    ///   same way: `OPENS_A_VIEWPORT_AND_RAISES_IT` carries one row per
+    ///   module, and the checks on it are **per-module** -- `scratch_window`
+    ///   calls `show_viewport_deferred` exactly once under `SCRATCH_TITLE`,
+    ///   `region_overlay` exactly once under `REGION_TITLE`. See that table for
+    ///   why it was widened rather than turned into a crate-wide count. The
+    ///   count below is therefore per-module rather than globally zero -- and
+    ///   the two titles they open under are asserted, above, to be distinct
+    ///   from each other and from the literal the five `eframe` windows share,
+    ///   which is what keeps `pick`'s `find` exact while more than one window
+    ///   is on screen.
     ///
     /// Together with `run_*native` blocking until its window closes -- which
     /// the queued-tray-click behaviour is itself the evidence of -- that makes
@@ -1360,6 +1412,32 @@ mod tests {
         // string, so an `assert_ne!` against either is an assertion about the
         // shared literal and not about two unrelated names.
         assert_eq!(crate::vault_window::WINDOW_TITLE, crate::preflight_host::PREFLIGHT_TITLE);
+
+        // **The 6b region overlay, the second viewport.** It is open alongside
+        // the vault window too, and it takes the foreground deliberately -- so
+        // a title it shared with anything would let `raise_window` bring the
+        // wrong window forward while a full-screen dimmed overlay is up. All
+        // three comparisons, so that a `REGION_TITLE` set to any of the titles
+        // this crate already uses fails here rather than in production.
+        assert_ne!(
+            crate::region_overlay::REGION_TITLE,
+            crate::vault_window::WINDOW_TITLE,
+            "the region overlay shares a title with a window it is open alongside"
+        );
+        assert_ne!(
+            crate::region_overlay::REGION_TITLE,
+            crate::preflight_host::PREFLIGHT_TITLE
+        );
+        assert_ne!(
+            crate::region_overlay::REGION_TITLE,
+            crate::vault_window::rehearsal::SCRATCH_TITLE,
+            "the two viewport windows share a title, and each is found by its own"
+        );
+        // Control on the three above: they are comparisons between real,
+        // non-empty strings, so an `assert_ne!` against a constant that had
+        // become empty would not be quietly true of everything.
+        assert!(!crate::region_overlay::REGION_TITLE.is_empty());
+        assert!(!crate::vault_window::rehearsal::SCRATCH_TITLE.is_empty());
 
         let sources = RAISING_SITES
             .iter()
