@@ -3561,6 +3561,26 @@ pub fn build_frame(
                                 // failure of the same operation and the user
                                 // has already been taught where that message
                                 // appears.
+                                // **Clone: seed the ordinary create form from
+                                // this item and open it.** Nothing is written
+                                // here -- `cache.create_item` is reached only
+                                // by the user pressing Save in that form,
+                                // through the same `DetailMode::Create` arm
+                                // "+ New" uses. See `DetailAction::Clone` for
+                                // why a silent POST was rejected.
+                                //
+                                // Guarded on `DetailMode::Read` exactly as
+                                // the row menu's `Edit` is: a draft already
+                                // open is work the user has typed, and
+                                // discarding it to seed a clone would lose it
+                                // with no way back.
+                                DetailAction::Clone => {
+                                    if matches!(mode, DetailMode::Read) {
+                                        let mut draft = EditDraft::from_item(item);
+                                        draft.name = clone_name(&draft.name);
+                                        mode = DetailMode::Create(draft);
+                                    }
+                                }
                                 DetailAction::MoveToFolder(folder_id) => {
                                     move_error = move_item_into_folder(
                                         ui.ctx(),
@@ -5032,6 +5052,16 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::CopySshPrivateKey
         | DetailAction::CopyValue(_)
         | DetailAction::CopyPasswordHistory(_)
+        // **`Clone` for `Edit`'s reason, and a slightly stronger one.** What
+        // it opens is the same form holding this item's password in a draft
+        // behind the same reveal control, so an unproven user reaching it
+        // would have a door around every masked row on the read pane. The
+        // stronger half: the draft it opens is destined for a NEW item, and
+        // `reprompt` is not among the keys a create carries -- so the copy
+        // this makes is not protected the way its source was, and the one
+        // moment to ask for the password is before the secrets are on screen
+        // rather than after.
+        | DetailAction::Clone
         | DetailAction::Edit => true,
         DetailAction::None
         | DetailAction::OpenWebsite(_)
@@ -5384,6 +5414,34 @@ fn delete_vault_item(
             Some(list_command_failure_message(ListCommand::Delete, &item.name, &e))
         }
     }
+}
+
+/// What a cloned item is called before the user touches the name box.
+///
+/// **The name MUST change, and this is the whole reason the clone opens a
+/// form with the new name already in it rather than one the user has to
+/// remember to edit.** Two items both called "SAP Production" are
+/// indistinguishable in the item list, in search, and in the autofill
+/// picker -- and the one place the difference would show is a `revisionDate`
+/// nothing paints. A clone the user forgot to rename is not a harmless
+/// duplicate; it is a vault they can no longer read.
+///
+/// `" - Clone"`, appended, matching Bitwarden's own clients (which suffix
+/// " – Clone" on the pre-filled Add-item screen). The suffix goes on the END
+/// rather than the front so the two sort together and the shared prefix still
+/// finds both -- a "Clone of X" would file every copy in the vault under C.
+///
+/// **Not made unique against the rest of the vault, deliberately.** Cloning
+/// twice gives two items called "X - Clone", and that is correct: the name is
+/// a *suggestion* sitting in an editable box in an unsaved form, and the user
+/// is looking at it. Numbering it here would mean reading the whole item list
+/// to answer a question the user is about to answer better, and it would put a
+/// second naming authority next to the box they are typing in.
+///
+/// A pure function, so the rule is asserted directly rather than inferred from
+/// a form that has to be driven to see it.
+fn clone_name(name: &str) -> String {
+    format!("{name} - Clone")
 }
 
 /// Moves `item_id` into `folder_id`, **reverting the window's own list if the
@@ -11150,6 +11208,110 @@ mod delete_confirm_tests {
         assert!(!confirm_click_at(&mut pending, "f1", after_window));
         // Re-armed, not confirmed or empty.
         assert!(pending.is_some());
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod clone_name_tests {
+    //! What a cloned item is called, and why it cannot simply be the
+    //! original's name.
+    use super::*;
+
+    /// The name **must** change: two items called "SAP Production" are
+    /// indistinguishable in the item list, in search and in the autofill
+    /// picker. Both halves asserted -- that the original survives in the new
+    /// name, and that the new name is not the original -- because a rule that
+    /// only checked one would pass against a clone called "Clone".
+    #[test]
+    fn a_clone_keeps_the_original_name_and_is_still_told_apart_from_it() {
+        let cloned = clone_name("SAP Production");
+        assert_ne!(
+            cloned, "SAP Production",
+            "a clone carries its source's name unchanged, so the two are \
+             indistinguishable everywhere the vault shows a name"
+        );
+        assert!(
+            cloned.starts_with("SAP Production"),
+            "the clone's name {cloned:?} does not open with the original, so a search for \
+             the original no longer finds the copy"
+        );
+        assert_eq!(cloned, "SAP Production - Clone");
+    }
+
+    /// The suffix goes on the END. A "Clone of X" would file every copy in
+    /// the vault under C, away from the item it was made from -- the item
+    /// list sorts by name.
+    #[test]
+    fn the_clone_marker_is_a_suffix_so_the_two_sort_together() {
+        let mut names = [clone_name("Ledgerline"), "Ledgerline".to_string()];
+        names.sort();
+        assert_eq!(
+            names,
+            ["Ledgerline", "Ledgerline - Clone"],
+            "the clone does not sort next to its source"
+        );
+    }
+
+    /// **The other half of the clone: the draft the form opens on.**
+    ///
+    /// The kebab's action is proven reachable in `detail.rs`; this is what
+    /// `run`'s arm makes of it -- the two lines of it, asserted as one value
+    /// rather than left to a source-text guard. What matters is that the
+    /// draft really carries the item's contents (a clone of nothing is not a
+    /// clone) *and* that it carries the new name (see `clone_name`).
+    #[test]
+    fn the_clone_draft_carries_the_items_contents_under_the_new_name() {
+        let item = VaultItem {
+            id: "i1".into(),
+            name: "Ledgerline".into(),
+            fields: vec![],
+            login: Some(crate::vault_bridge::LoginData {
+                username: Some("ada".into()),
+                password: Some(zeroize::Zeroizing::new("hunter2".to_string())),
+                totp: None,
+                uris: vec![],
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: Some("f1".into()),
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+
+        // Exactly what the `DetailAction::Clone` arm does.
+        let mut draft = EditDraft::from_item(&item);
+        draft.name = clone_name(&draft.name);
+
+        assert_eq!(draft.name, "Ledgerline - Clone");
+        // The contents, so this cannot pass against a blank draft that merely
+        // got the name right.
+        assert_eq!(draft.username, "ada", "the clone draft lost the username");
+        assert_eq!(draft.password, "hunter2", "the clone draft lost the password");
+        assert_eq!(
+            draft.folder_id,
+            Some("f1".to_string()),
+            "the clone draft lost the folder, so the copy would land somewhere else"
+        );
+        // And the source is untouched -- a clone that renamed the original
+        // would be a rename wearing a clone's label.
+        assert_eq!(item.name, "Ledgerline");
+    }
+
+    /// Cloning a clone appends again rather than collapsing, which is what
+    /// makes the second copy tellable from the first. The name is a
+    /// suggestion in an editable box; it is not made unique against the
+    /// vault, deliberately (see `clone_name`).
+    #[test]
+    fn cloning_a_clone_appends_again_rather_than_collapsing_onto_one_name() {
+        let once = clone_name("Ledgerline");
+        let twice = clone_name(&once);
+        assert_ne!(once, twice, "a clone of a clone has the same name as the clone");
+        assert_eq!(twice, "Ledgerline - Clone - Clone");
     }
 }
 
@@ -19456,7 +19618,10 @@ mod preferences_modal_wiring_tests {
             // 58 as of the record import's wiring, which added
             // `mod record_import_wiring` -- the off-thread fetch and the
             // drain that applies its answer to the form.
-            modules, 58,
+            // 59 as of the kebab's Clone, which added `mod clone_name_tests`
+            // -- what a cloned item is called, and why it cannot simply be
+            // the original's name.
+            modules, 59,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

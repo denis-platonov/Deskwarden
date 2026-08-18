@@ -513,6 +513,48 @@ pub enum DetailAction {
     /// destination list makes the item's current folder visible while the user
     /// is choosing, so there is nothing a confirmation would tell them.
     MoveToFolder(String),
+    /// The kebab's **Clone** was clicked: the user wants a second item like
+    /// this one.
+    ///
+    /// **It REPORTS and does not create.** `vault_window::mod` answers it by
+    /// seeding an `EditDraft` from the item, renaming it, and opening the
+    /// ordinary create form on it -- the same form "+ New" opens and the same
+    /// `cache.create_item` behind its Save. Nothing is written until the user
+    /// presses that Save.
+    ///
+    /// **That indirection IS the fidelity decision, and it is the one
+    /// Bitwarden's own clients make.** A clone that POSTed silently would go
+    /// through `NewItem`, whose `to_payload` emits only `name`, `type`,
+    /// `folderId`, an optional `notes` and the kind's own object -- so it
+    /// would drop the item's custom fields, its URIs, its app-match binding,
+    /// its `passwordHistory`, a login's TOTP seed (`NewItem::Login` has no
+    /// `totp` at all) and, worst, its `reprompt` flag. A "Clone" that quietly
+    /// turns a master-password-protected item into an unprotected one is the
+    /// opposite of what that flag is for.
+    ///
+    /// The faithful-and-silent alternative -- `POST /object/item` carrying a
+    /// whole `VaultItem` -- was rejected because that shape has never been
+    /// observed against this backend. `create_item` has only ever POSTed
+    /// `to_payload`'s keys, and a POST body carrying another item's `id` and
+    /// `key` is precisely the kind of guess this crate does not make (see
+    /// `without_deleted_date`, which drops a key rather than send it and hope).
+    ///
+    /// Opening the form instead converts every one of those losses from a
+    /// silent drop into a *disclosure*: what the create form cannot carry is
+    /// visibly not in the form the user is looking at when they press Save,
+    /// and the login form already says so in as many words
+    /// (`detail_edit::TOTP_CREATE_NOTICE`). That is the same argument the
+    /// import decision made, and it is why this variant carries nothing --
+    /// the caller re-resolves the selected item and builds the draft.
+    ///
+    /// On the **exposing** side of `detail_action_exposes_secrets`, for
+    /// [`Self::Edit`]'s reason exactly and not a weaker one: what this opens
+    /// is a form holding this item's password in a draft, with its own reveal
+    /// control. Letting an unproven user open it would be a door around every
+    /// masked row on the read pane -- and a wider one than Edit's, because
+    /// the draft it opens is destined for a NEW item that the `reprompt` flag
+    /// will not follow.
+    Clone,
     /// The header's ✕ was clicked: the user wants the detail pane GONE and
     /// the item list to take the window.
     ///
@@ -677,6 +719,29 @@ pub fn kind_offers_edit(kind: ItemKind) -> bool {
         ItemKind::Login | ItemKind::SecureNote | ItemKind::Card | ItemKind::Identity => true,
         ItemKind::SshKey | ItemKind::Unknown(_) => false,
     }
+}
+
+/// Whether the kebab offers **Clone** for this kind.
+///
+/// A clone here is a *pre-filled create*: `vault_window::mod` seeds an
+/// `EditDraft` from the item with `EditDraft::from_item`, renames it, and puts
+/// the pane into `DetailMode::Create` with the form open. So a kind may only
+/// be cloned when BOTH halves of that round trip work -- the draft can be
+/// filled from an existing item of that kind, and the filled draft has a
+/// create payload.
+///
+/// That is the intersection of [`kind_offers_edit`] and
+/// [`is_creatable`](super::detail_edit::is_creatable), and it is written as
+/// the intersection rather than as its own list so that neither predicate can
+/// be widened later without this one following. **`SshKey` is exactly why the
+/// intersection is not redundant**: it is creatable but not editable, because
+/// `EditDraft::from_item` leaves an existing key's `SshKeyDraft` blank (there
+/// is no form that fills one on an edit -- see `form_body`'s
+/// `UneditableNotice` arm). A clone built from that draft would POST an SSH
+/// key with three empty strings where the private key should be: an item that
+/// looks like a copy in the list and contains nothing. `Unknown` fails both.
+pub fn kind_offers_clone(kind: ItemKind) -> bool {
+    kind_offers_edit(kind) && super::detail_edit::is_creatable(kind)
 }
 
 /// The item's note body, or `None` when there is nothing worth a card.
@@ -2930,6 +2995,33 @@ pub fn draw_detail_read(
                     if kind_offers_edit(kind) && ui.button("Edit").clicked() {
                         action = DetailAction::Edit;
                         ui.close();
+                    }
+                    // **Clone, next to Edit** -- the two entries that open the
+                    // same form, kept adjacent.
+                    //
+                    // The wording is the user's clue about what it does
+                    // *next*: it opens a form rather than creating anything,
+                    // and the hover says so. Bitwarden's own clients word and
+                    // behave this the same way; see `DetailAction::Clone` for
+                    // why opening the form is the fidelity decision and not a
+                    // shortcut around one.
+                    //
+                    // Gated by `kind_offers_clone`, which is the intersection
+                    // of "can be read into a draft" and "has a create
+                    // payload" -- an SSH key satisfies only the second, and
+                    // cloning one would POST an empty key.
+                    if kind_offers_clone(kind) {
+                        let clone = ui.button("Clone");
+                        if clone
+                            .on_hover_text(
+                                "Open a new item pre-filled from this one. Nothing is saved \
+                                 until you press Save.",
+                            )
+                            .clicked()
+                        {
+                            action = DetailAction::Clone;
+                            ui.close();
+                        }
                     }
                     // **Move to folder, drawn from the item row's own
                     // `move_menu` and `menu_command`** -- called, not
@@ -8656,6 +8748,78 @@ mod tests {
             DetailAction::Edit,
             "clicking the menu's Edit reported {:?}",
             clicked.action
+        );
+    }
+
+    /// Clone is reachable, and reachable only through the kebab -- pressed at
+    /// the coordinates the pane painted, and read back as the action the pane
+    /// reported.
+    #[test]
+    fn clicking_clone_in_the_kebab_menu_asks_the_caller_to_clone() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let entry = open.rect_of("Clone");
+        let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::Clone,
+            "clicking the menu's Clone reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **An SSH key's kebab carries no Clone, and that is the point of
+    /// `kind_offers_clone` being an intersection rather than a list.**
+    ///
+    /// `is_creatable` says yes -- `NewItem::ssh_key` POSTs the three key
+    /// fields -- but `EditDraft::from_item` leaves an existing key's draft
+    /// blank, because no form fills one on an edit. A Clone here would create
+    /// an SSH key with three empty strings where the private key should be:
+    /// something that looks like a copy in the list and contains nothing.
+    ///
+    /// Paired with a kind that DOES offer it, so this cannot pass against a
+    /// kebab that lost the entry altogether.
+    #[test]
+    fn every_kinds_kebab_offers_clone_exactly_when_the_copy_would_carry_something() {
+        let mut offered = 0;
+        let mut withheld = 0;
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            let painted = open.painted("Clone");
+            assert_eq!(
+                painted,
+                kind_offers_clone(kind),
+                "{kind:?}'s kebab disagrees with `kind_offers_clone`; it painted: {:?}",
+                open.strings()
+            );
+            if painted {
+                offered += 1;
+                // Not decoration: the entry really reports, for every kind
+                // that draws it.
+                let entry = open.rect_of("Clone");
+                let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+                assert_eq!(
+                    clicked.action,
+                    DetailAction::Clone,
+                    "{kind:?}'s Clone entry is decoration -- clicking it reported {:?}",
+                    clicked.action
+                );
+            } else {
+                withheld += 1;
+            }
+        }
+        // **Both counts, so this cannot pass against a predicate that
+        // collapsed to a constant.** An SSH key is the kind that must be
+        // withheld: `is_creatable` says yes, but `EditDraft::from_item`
+        // leaves an existing key's draft blank, so the copy would be an SSH
+        // key with three empty strings where the private key should be.
+        assert!(
+            offered > 0 && withheld > 0,
+            "every kind answered the same way ({offered} offered, {withheld} withheld), so \
+             this test would pass against `kind_offers_clone` hardcoded either way"
         );
     }
 
