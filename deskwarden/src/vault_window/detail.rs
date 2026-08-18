@@ -4697,12 +4697,15 @@ fn half_tile(
     on_copy: DetailAction,
     action: &mut DetailAction,
 ) {
-    let Half { label, width, label_width, hint } = half;
+    let Half { label, width, label_width, hint, trailing } = half;
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        // The TILE is `width` -- the hover tint and the hit area both come
+        // from this -- while its CONTENTS stop `trailing` short of the far
+        // edge. The two are different on purpose; see [`Half::trailing`].
         ui.set_width(width);
         let tint = ui.painter().add(egui::Shape::Noop);
         ui.allocate_ui_with_layout(
-            egui::vec2(width, ROW_CONTENT_HEIGHT),
+            egui::vec2((width - trailing).max(0.0), ROW_CONTENT_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -4754,6 +4757,17 @@ struct Half<'a> {
     /// the line for it to line up with.
     label_width: f32,
     hint: Option<CopyShortcut>,
+    /// Space kept clear inside the tile's RIGHT edge, which its contents --
+    /// the chord hint above all, since that is what packs furthest right --
+    /// stop short of.
+    ///
+    /// Not the same thing as making the tile narrower. The tile is the hit
+    /// area and the hover tint, and the shared line's promise -- pinned by
+    /// `the_shared_line_is_two_hit_areas_that_meet_at_its_middle` -- is that
+    /// every pixel of the line copies something; a narrower tile would leave
+    /// dead pixels between the halves. What has to move is the ink, so this
+    /// moves the ink and leaves the tile alone.
+    trailing: f32,
 }
 
 fn row_impl(
@@ -5750,8 +5764,31 @@ fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) ->
     let half = content / 2.0;
     let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural + expiry_half_controls(ui);
     let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls(ui);
-    (left <= half && right <= half).then_some((half, content - half))
+    // **The left half's CONTENTS have to stop a gutter short of the
+    // midpoint.** The expiry's chord hint is right-aligned inside its half
+    // and the code's label is left-aligned inside its own, so halves whose
+    // contents both ran to the midpoint put those two runs edge to edge and
+    // painted `CTRL+SHIFT+ECode` -- one word, on a line whose whole job is to
+    // read as two columns. The halves themselves still meet at the midpoint
+    // (they are hit areas, and the line has no dead pixels); only the room
+    // the left one lays ink in is short of it, which is [`Half::trailing`].
+    (left <= half - HALF_GUTTER && right <= content - half).then_some((half, content - half))
 }
+
+/// The clear space between the expiry's chord hint and the code's label --
+/// [`CONTROL_GAP`], the gap this pane already puts between two adjacent
+/// controls, because that is what these two runs are next to each other.
+///
+/// **Not [`ROW_GAP`]**, which is the wider gap between a label and its value.
+/// The difference is not cosmetic: the fit test spends this out of the left
+/// half, and 16pt there is enough to push the shipped 638pt pane back onto
+/// two separate rows -- the shared line loses by about 4pt. The line the
+/// design asks for, with the two runs readably apart, is what 8pt buys.
+///
+/// Withheld from the LEFT half's contents by [`card_face_line_fits`] and by
+/// [`card_face_line`]'s `trailing`; the two have to agree, or a value the fit
+/// test called safe wraps or runs into its neighbour anyway.
+const HALF_GUTTER: f32 = CONTROL_GAP;
 
 /// What sits to the right of the expiry on the shared line: its chord hint,
 /// and the gap before it.
@@ -5794,7 +5831,8 @@ fn card_face_line(
     let (expiry, left_width) = expiry;
     let (code, right_width) = code;
     let (brand, action) = brand_and_action;
-    let left_room = (left_width - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
+    let left_room =
+        (left_width - HALF_GUTTER - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
     let right_room =
         (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls(ui)).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
@@ -5811,6 +5849,9 @@ fn card_face_line(
                         width: left_width,
                         label_width: ROW_LABEL_WIDTH,
                         hint: Some(CopyShortcut::CardExpiry),
+                        // The clear space before the code's label. See
+                        // [`HALF_GUTTER`].
+                        trailing: HALF_GUTTER,
                     },
                     |ui| paint_digits(ui, expiry, left_room),
                     |_ui| {},
@@ -5824,6 +5865,8 @@ fn card_face_line(
                         width: right_width,
                         label_width: label_run_width(ui, CODE_LABEL),
                         hint: Some(CopyShortcut::CardCode),
+                        // Nothing to its right but the card's own padding.
+                        trailing: 0.0,
                     },
                     |ui| paint_digits(ui, &shown, right_room),
                     |ui| {
@@ -6829,6 +6872,50 @@ mod tests {
 
         fn painted(&self, label: &str) -> bool {
             self.texts.iter().any(|(t, _)| t == label)
+        }
+
+        /// The box `label`'s GLYPHS really cover -- which is not
+        /// [`rect_of`](Self::rect_of)'s box, and the difference is the whole
+        /// reason this exists.
+        ///
+        /// `collect_text_rects` records `Rect::from_min_size(shape.pos,
+        /// galley.size())`, and a run painted in a `right_to_left` layout --
+        /// every chord hint and every control on this pane -- is laid out
+        /// with `halign: Max`, so `shape.pos` is its RIGHT edge and that rect
+        /// is the run's own width off to the right of where the ink is. Any
+        /// overlap assertion written against `rect_of` is therefore asking
+        /// about a rectangle nobody can see: it reports a collision where the
+        /// pane is clean, and misses the collision beside it. This walks the
+        /// glyphs (see [`shape_ink::glyph_ink`], which adds `row.pos` and so
+        /// carries the halign shift) and answers about the pixels.
+        fn ink_of(&self, label: &str) -> egui::Rect {
+            let mut found: Vec<egui::Rect> = Vec::new();
+            fn walk(shape: &egui::Shape, label: &str, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        if text.galley.text() == label {
+                            if let Some(ink) = shape_ink::glyph_ink(text) {
+                                out.push(ink);
+                            }
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, label, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            walk(&self.shapes, label, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} in the pane, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
         }
 
         /// The one rect painting `label`, or a failure naming everything
@@ -12073,6 +12160,10 @@ mod tests {
     /// ([`every_chord_is_painted_beside_its_row_and_last_on_the_line`]). The
     /// row labels are the positive control: "no CTRL+SHIFT+C anywhere" is also
     /// true of a pane that failed to draw the card at all.
+    ///
+    /// SEE ALSO [`the_expiry_chord_never_runs_into_the_code_label`], which
+    /// asks the question this one cannot: not whether the chord is painted
+    /// but WHERE.
     #[test]
     fn every_card_chord_is_painted_beside_its_row() {
         let mut pane = Pane::new();
@@ -12099,6 +12190,79 @@ mod tests {
                 frame.strings()
             );
         }
+    }
+
+    /// **The expiry's chord badge stays inside the expiry's half.**
+    ///
+    /// The shared expiry/code line splits the row in two and right-aligns
+    /// each half's controls. With the two halves meeting exactly at the
+    /// midpoint, the expiry's `CTRL+SHIFT+E` ended on the very pixel the
+    /// `Code` label began on and the line rendered as `CTRL+SHIFT+ECode` --
+    /// on the shipped 638pt pane, in the app, for as long as the expiry had
+    /// a chord of its own.
+    ///
+    /// Nothing already here could see it. `every_card_chord_is_painted_beside
+    /// _its_row` asks only whether the chord was painted, the digit-row and
+    /// baseline tests ask about the VALUES, and no test asked where the chord
+    /// sat relative to its neighbour. So this one asserts the geometry, and
+    /// asserts it on the ink rather than on `rect_of` -- see
+    /// [`Frame::ink_of`], without which the halign of a right-aligned run
+    /// makes the answer meaningless.
+    ///
+    /// Every width from the narrowest pane the app can be resized to up
+    /// through the shipped one and beyond: the fit test is a width decision,
+    /// and a gutter that only appears on wide panes is not a fix.
+    #[test]
+    fn the_expiry_chord_never_runs_into_the_code_label() {
+        let expiry_chord = copy_shortcut_chord(CopyShortcut::CardExpiry);
+        // The pane at the shipped window's width (1240 - 212 - 390) among
+        // them, which is the width the defect was seen at.
+        let shipped = 1240.0 - crate::vault_window::SIDEBAR_WIDTH - crate::vault_window::LIST_WIDTH;
+        let mut shared_somewhere = false;
+        for width in [MIN_PANE, 400.0, 500.0, shipped, 700.0, PANE] {
+            let mut pane = Pane::wide(width);
+            let frame = pane.idle(&a_full_card(), &TotpState::NoSecret);
+            // Only meaningful when the two really are on one line; below some
+            // width the pane honestly gives each a row of its own, and there
+            // the question does not arise. `shared_somewhere` keeps the loop
+            // from passing vacuously if the shared line ever stops happening.
+            let expiry = frame.ink_of(EXPIRY_LABEL);
+            let code = frame.ink_of(CODE_LABEL);
+            if (expiry.center().y - code.center().y).abs() > 1.0 {
+                continue;
+            }
+            shared_somewhere = true;
+            let chord = frame.ink_of(expiry_chord);
+            assert!(
+                chord.right() < code.left(),
+                "on a {width}pt pane the expiry's {expiry_chord} badge is painted at \
+                 {chord:?}, into the {CODE_LABEL:?} label at {code:?} -- the line \
+                 reads as one word"
+            );
+            // Not merely a hair clear of it: two runs a fraction of a point
+            // apart still read as one word, which is the defect. The gutter
+            // the halves reserve is what has to be there.
+            assert!(
+                code.left() - chord.right() >= HALF_GUTTER / 2.0,
+                "on a {width}pt pane only {}pt separate the expiry's {expiry_chord} badge \
+                 at {chord:?} from the {CODE_LABEL:?} label at {code:?}",
+                code.left() - chord.right()
+            );
+            // The badge belongs to the expiry, so it must also be on the
+            // expiry's side of the line rather than merely short of the
+            // code's -- otherwise a gutter wide enough to pass the check
+            // above could still have moved the badge into no man's land.
+            assert!(
+                chord.left() > expiry.right(),
+                "on a {width}pt pane the {expiry_chord} badge at {chord:?} is not to the \
+                 right of its own {EXPIRY_LABEL:?} label at {expiry:?}"
+            );
+        }
+        assert!(
+            shared_somewhere,
+            "the expiry and the code never shared a line at any width, so this test \
+             asserted nothing about the line it is named for"
+        );
     }
 
     /// The same chord on an item that has nothing for it stays silent all
