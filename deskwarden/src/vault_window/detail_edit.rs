@@ -4724,10 +4724,20 @@ pub fn draw_detail_edit(
                     theme::password_field(ui, &mut draft.password, &mut draft.reveal_password);
                     ui.add_space(6.0);
                     // The generator, in this form's own idiom rather than
-                    // design block 3d's. 3d is the OVERLAY's generator -- a
-                    // full panel with its own chrome, character-class
-                    // switches and a re-roll -- and it lives in a file this
-                    // work does not own. Porting its chrome into a stacked
+                    // design block 3d's. 3d is the OVERLAY's generator, and it
+                    // lives in a file this work does not own.
+                    //
+                    // **This comment used to say 3d was "a full panel with its
+                    // own chrome, character-class switches and a re-roll". Two of
+                    // those three are wrong**, and the error was believed long
+                    // enough to scope a task from it. 3d (`docs/design/
+                    // Deskwarden.dc.html:1479`, "Generate & fill") draws NO
+                    // character-class switches and no length control: it has a
+                    // Words/Letters/PIN selector, a static "20 chars" readout, a
+                    // CTRL+R re-roll, and a "Fill & save to vault" button. The
+                    // re-roll is the only half that was right.
+                    //
+                    // Porting its chrome into a stacked
                     // label/field form would look like a foreign panel
                     // dropped into the middle of it. So: one control row
                     // under the box it fills, built from the same widgets
