@@ -121,6 +121,24 @@ getrandom = "0.2"
 # ui_preview example's --screenshot mode to save the rendered overlay card
 # as a PNG for visual review.
 png = "0.17"
+# Reads a QR code out of a captured region or an image file (src/qr.rs), so a
+# user can add a one-time code by dragging a box around the QR already on
+# their screen. Pure Rust with NO `unsafe` in its own source, no I/O, no
+# network and no C dependency -- which is why it is this crate rather than a
+# `zbar`/`quirc` binding: the pixels it is handed are the secret in visual
+# form, and a decoder that could not touch a file or a socket is a decoder
+# whose whole failure surface is a wrong answer.
+#
+# `default-features = false` is load-bearing, not tidiness. The default `img`
+# feature pulls in the `image` crate and its format decoders -- a large
+# transitive tree whose entire job is parsing untrusted file formats, and none
+# of which this app needs: `decode_qr` is handed a bare RGBA buffer, and the
+# one file format the image route will ever read is PNG, through the `png`
+# crate already above. Without it, this adds SEVEN crates: `rqrr` itself,
+# `g2p`/`g2gen`/`g2poly` (its Galois-field arithmetic, for Reed-Solomon), and
+# `lru` + `hashbrown` + `allocator-api2`. `proc-macro2`, `quote`, `syn`,
+# `equivalent` and `foldhash` were already in the tree.
+rqrr = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 mockito = "1"
