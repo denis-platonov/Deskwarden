@@ -524,6 +524,74 @@ pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
     updated
 }
 
+/// The custom field a card's billing postcode is stored on.
+///
+/// Namespaced the way [`crate::app_match::APP_MATCH_FIELD_NAME`] and
+/// [`crate::favicon::BANK_DOMAIN_FIELD`] are, and declared **once** for the
+/// same reason: the form that writes it and any reader of it are in different
+/// modules, and two spellings of a field name that must match is a defect
+/// that shows up only as a field the app appears to have forgotten.
+///
+/// **A plain field on the card, not a link to an identity.** An online card
+/// form wants the number, the code and the postcode, and the postcode is the
+/// one the vault had nowhere to put. A `deskwarden:billing-identity` pointing
+/// at an [`ItemKind::Identity`] is the fuller answer and is deliberately not
+/// built here: it needs a picker, a resolution path, and a decision about
+/// what to show when the linked item has been deleted.
+pub const BILLING_ZIP_FIELD: &str = "deskwarden:billing-zip";
+
+/// Pure helper: a copy of `item` with the custom field `name` set to `value`,
+/// or **removed** when `value` is blank.
+///
+/// [`with_app_match`] one step more general, and every word of that function's
+/// reasoning applies here unchanged:
+///
+/// * Every *other* field is cloned wholesale, so anything unmodelled on it
+///   (`type`, `linkedId`, ...) rides [`VaultField::other`] untouched.
+/// * The named field is the one **rebuilt** rather than copied, because its
+///   `value` is the thing being changed -- and its extra keys are still the
+///   server's to keep. `bw` normalises what this app writes (a field created
+///   here with no `type` comes back carrying one), so rebuilding from name
+///   and value alone would drop them on the next write.
+/// * When there is no such field to replace, an empty map is correct:
+///   inventing keys nobody observed would be modelling from memory.
+/// * It is replaced **in place**, not removed and re-appended, because
+///   Bitwarden preserves and displays custom-field order and appending would
+///   visibly reshuffle the user's own fields on every save.
+///
+/// **A blank `value` removes the field rather than storing an empty string.**
+/// These fields mean "this card has a bank" and "this card has a billing
+/// postcode"; an empty one is a claim with nothing behind it, and
+/// `favicon::icon_domain_for` would have to filter it back out anyway.
+pub fn with_card_field(item: &VaultItem, name: &str, value: &str) -> VaultItem {
+    let mut fields: Vec<VaultField> = item.fields.clone();
+    let existing = fields.iter().position(|f| f.name.as_deref() == Some(name));
+
+    if value.trim().is_empty() {
+        if let Some(i) = existing {
+            fields.remove(i);
+        }
+    } else {
+        let other = match existing {
+            Some(i) => fields[i].other.clone(),
+            None => serde_json::Map::new(),
+        };
+        let rebuilt = VaultField {
+            name: Some(name.to_string()),
+            value: Some(Zeroizing::new(value.trim().to_string())),
+            other,
+        };
+        match existing {
+            Some(i) => fields[i] = rebuilt,
+            None => fields.push(rebuilt),
+        }
+    }
+
+    let mut updated = item.clone();
+    updated.fields = fields;
+    updated
+}
+
 /// Pure helper: returns a copy of `item` filed under `folder_id` (or filed
 /// nowhere, when that is `None`). Everything else -- including anything
 /// unmodelled riding [`VaultItem::other`] -- is cloned untouched, exactly as
@@ -2937,6 +3005,138 @@ mod tests {
             vec!["name", "value"],
             "a freshly added app-match field gained keys nobody observed"
         );
+    }
+
+    /// A real-shaped card: two of the user's own custom fields, each carrying
+    /// keys `bw` put there, plus this app's bank-domain field carrying its
+    /// own. Every `with_card_field` test below is built from this one item so
+    /// that "the other fields kept their keys" is a claim about a fixture
+    /// that HAS keys to keep.
+    fn a_card_with_custom_fields() -> VaultItem {
+        let raw = format!(
+            r#"{{"id":"card-1","name":"Ledgerline Debit","type":3,"favorite":false,
+                "card":{{"brand":"Visa","number":"4111111111111111"}},
+                "fields":[{{"name":"PIN","value":"1234","type":1,"linkedId":null}},
+                          {{"name":"{bank}","value":"old-bank.example","type":0,
+                            "linkedId":null}},
+                          {{"name":"Branch","value":"north","type":0,"linkedId":null}}]}}"#,
+            bank = crate::favicon::BANK_DOMAIN_FIELD,
+        );
+        serde_json::from_str(&raw).expect("the fixture is valid item JSON")
+    }
+
+    /// Every custom field of `item`, as JSON objects, in the item's order.
+    fn field_objects(item: &VaultItem) -> Vec<serde_json::Value> {
+        serde_json::to_value(item).unwrap()["fields"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn a_card_field_is_replaced_in_place_and_nothing_else_is_disturbed() {
+        let item = a_card_with_custom_fields();
+
+        // **The live control**, and it is what stops the assertions below
+        // from passing vacuously: the neighbouring fields really do carry
+        // extra keys to begin with, so "they still carry them" is a claim
+        // about preservation rather than about a fixture that had none.
+        let before = field_objects(&item);
+        for (i, name) in [(0usize, "PIN"), (2, "Branch")] {
+            assert_eq!(before[i]["name"], serde_json::json!(name));
+            assert!(
+                before[i].as_object().unwrap().contains_key("type")
+                    && before[i].as_object().unwrap().contains_key("linkedId"),
+                "{name} had no extra keys before the write, so preserving them proves nothing"
+            );
+        }
+
+        let updated =
+            with_card_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "ledgerline.example");
+        let after = field_objects(&updated);
+
+        assert_eq!(after.len(), 3, "the field count changed");
+        assert_eq!(after[0], before[0], "the user's hidden PIN field was rewritten");
+        assert_eq!(after[2], before[2], "the user's Branch field was rewritten");
+        assert_eq!(
+            after[1]["name"],
+            serde_json::json!(crate::favicon::BANK_DOMAIN_FIELD),
+            "the bank-domain field moved out of its slot"
+        );
+        assert_eq!(after[1]["value"], serde_json::json!("ledgerline.example"));
+        // The replaced field's OWN extra keys, which `bw` normalised onto it
+        // and which rebuilding from name+value alone would drop on the next
+        // write. Paired with the control above: they were there, and they
+        // still are.
+        assert_eq!(after[1]["type"], serde_json::json!(0));
+        assert_eq!(after[1]["linkedId"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_card_field_added_where_there_was_none_is_appended_with_no_invented_keys() {
+        // The other half of the rule: nothing to replace means nothing to
+        // carry over, and inventing a `type` nobody observed would be
+        // modelling from memory. Appended at the end, so the user's own
+        // fields keep their slots.
+        let item = a_card_with_custom_fields();
+        let updated = with_card_field(&item, BILLING_ZIP_FIELD, "SW1A 1AA");
+        let after = field_objects(&updated);
+
+        assert_eq!(after.len(), 4, "the zip was not added, or something else was");
+        assert_eq!(after[..3], field_objects(&item)[..], "adding a zip moved the other fields");
+        assert_eq!(
+            after[3].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["name", "value"],
+            "a freshly added card field gained keys nobody observed"
+        );
+        assert_eq!(after[3]["value"], serde_json::json!("SW1A 1AA"));
+    }
+
+    #[test]
+    fn clearing_a_card_field_removes_it_rather_than_storing_a_blank() {
+        // These fields mean "this card has a bank" and "this card has a
+        // billing postcode". An empty one is a claim with nothing behind it,
+        // and `favicon::icon_domain_for` would have to filter it back out.
+        let item = a_card_with_custom_fields();
+        let cleared = with_card_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "   ");
+        let names: Vec<&str> =
+            cleared.fields.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert_eq!(names, vec!["PIN", "Branch"], "the blanked field was kept or too much went");
+        assert_eq!(
+            crate::favicon::icon_domain_for(&cleared),
+            None,
+            "the card still claims a bank domain"
+        );
+        // Control: the same card with a real value DOES claim one, so `None`
+        // above is about the clear and not about a card that never could.
+        assert_eq!(
+            crate::favicon::icon_domain_for(&with_card_field(
+                &item,
+                crate::favicon::BANK_DOMAIN_FIELD,
+                "ledgerline.example"
+            ))
+            .as_deref(),
+            Some("ledgerline.example")
+        );
+    }
+
+    #[test]
+    fn clearing_a_card_field_that_was_never_there_changes_nothing() {
+        let item = a_card_with_custom_fields();
+        let updated = with_card_field(&item, BILLING_ZIP_FIELD, "");
+        assert_eq!(
+            serde_json::to_value(&updated).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+            "clearing an absent field rewrote the item"
+        );
+    }
+
+    #[test]
+    fn the_billing_zip_field_is_namespaced_and_is_not_the_bank_domain() {
+        // Two constants that must never collide: one write would otherwise
+        // silently overwrite the other, and the symptom would be a postcode
+        // being fetched as an icon domain.
+        assert_eq!(BILLING_ZIP_FIELD, "deskwarden:billing-zip");
+        assert!(BILLING_ZIP_FIELD.starts_with("deskwarden:"));
+        assert_ne!(BILLING_ZIP_FIELD, crate::favicon::BANK_DOMAIN_FIELD);
+        assert_ne!(BILLING_ZIP_FIELD, APP_MATCH_FIELD_NAME_FOR_TEST);
     }
 
     #[test]
