@@ -811,6 +811,121 @@ pub fn draw_export_modal(
         .inner
 }
 
+// ---------------------------------------------------------------------------
+// The way in, the other direction
+// ---------------------------------------------------------------------------
+
+/// The label on the `+ New` menu's import row.
+///
+/// **The import lives on `+ New` and not beside [`SEND_RECORD_LABEL`] in the
+/// titlebar, and the two are not symmetric on purpose.** Sending narrows an
+/// item the user has SELECTED, which is why design §5b draws its control in
+/// the header next to the account avatar -- the header is where this window
+/// puts things that act on the window. Importing SELECTS NOTHING and CREATES
+/// AN ITEM, which is the `+ New` button's entire job, so it belongs on the
+/// one control this window already has for "make me a new item". Putting it
+/// in the titlebar instead would have made the pair look symmetric and read
+/// wrong: a user with nothing selected would find the send pill greyed out
+/// and an import pill live beside it, two controls that answer to different
+/// preconditions sitting in one strip.
+///
+/// The ellipsis is this app's usual "this opens something and does not act",
+/// the way `Export vault...` reads on the account menu.
+pub const IMPORT_FROM_SEND_LABEL: &str = "Import from a Send...";
+
+/// The import form's per-open state: the draft, what the link fetched, and
+/// whether a `bw send receive` is running.
+///
+/// **`failure` is a separate field from a refused [`Record`] and must stay
+/// one.** `fetched: Some(Err(refusal))` means a payload ARRIVED and was
+/// rejected by [`crate::record::payload::read_json`], and the form renders
+/// each of those reasons as its own sentence. Everything else that can go
+/// wrong -- a link that fetched nothing, a passphrase that would not open the
+/// seal, a vault that refused the create -- is not a refusal OF A PAYLOAD,
+/// and rendering it through [`refusal_sentence`] would name the wrong reason,
+/// which is the whole thing that function exists to prevent. Those land here,
+/// each already a sentence from the module that produced it.
+///
+/// **No `Debug`, deliberately**, for [`ImportDraft`]'s reason: the draft holds
+/// a `Zeroizing` passphrase and the fetched record holds a password.
+#[derive(Default)]
+pub struct RecordImport {
+    /// The link, the passphrase and the collision answer.
+    pub draft: ImportDraft,
+    /// What the link fetched, once it has. `None` before the first fetch and
+    /// after a failed one.
+    pub fetched: Option<Result<Record, RecordRefusal>>,
+    /// Why the last attempt did not end in an item. See the struct doc.
+    pub failure: Option<String>,
+    /// A `bw send receive` is running for this form.
+    pub in_flight: bool,
+}
+
+impl RecordImport {
+    /// Opens the import form.
+    ///
+    /// `open` is set here rather than left to the caller, for
+    /// [`RecordSend::opening`]'s reason: a `RecordImport` that exists at all
+    /// *is* the form being on screen.
+    pub fn opening() -> Self {
+        Self { draft: ImportDraft { open: true, ..ImportDraft::default() }, ..Self::default() }
+    }
+}
+
+/// [`draw_import_form`] over a dimmed scrim, centred, for `vault_window::mod`
+/// to call from its frame closure.
+///
+/// Built exactly the way [`draw_export_modal`] is -- which is exactly the way
+/// [`super::folder_modal::draw_folder_edit_modal`] is -- because a second
+/// modal built differently is two modals that dim, layer and swallow clicks
+/// two ways. Its `Id`s differ from the export's so that the two cannot share
+/// egui state if both were ever open.
+///
+/// **The fetch failure is painted HERE and not inside the form**, because it
+/// is not a fact about the draft: the form's every other decision is a pure
+/// function of what it was handed, and a fetch that never returned a payload
+/// is a fact about the last `bw` child instead. See [`RecordImport`].
+pub fn draw_import_modal(
+    ctx: &egui::Context,
+    state: &mut RecordImport,
+    collision: &Collision,
+    now: &dyn crate::send::SendClock,
+) -> RecordUiAction {
+    egui::Area::new(egui::Id::new("record-import-scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(90),
+            );
+        });
+
+    egui::Area::new(egui::Id::new("record-import-modal"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(MODAL_WIDTH);
+            let action = draw_import_form(
+                ui,
+                &mut state.draft,
+                state.fetched.as_ref(),
+                collision,
+                state.in_flight,
+                now,
+            );
+            if let Some(why) = &state.failure {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(why).size(12.0).color(theme::ERROR));
+            }
+            action
+        })
+        .inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
