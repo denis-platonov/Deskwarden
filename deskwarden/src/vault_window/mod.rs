@@ -1075,6 +1075,20 @@ pub fn build_frame(
     // `record_ui`'s collision question, and for the same reason: a proof
     // demanded at the open proves nothing about a choice made a minute later.
     let mut totp_add_state: Option<totp_add::TotpAdd> = None;
+    // **Design 6b's overlay, while it is up.**
+    //
+    // Held beside the form rather than inside it because it is a *window*, and
+    // a window has to be re-shown every frame: `RegionOverlay::show` is what
+    // registers the deferred viewport and hands egui its callback, and a frame
+    // that skips the call is a frame in which the OS window closes. (The
+    // viewport is opened THERE and never here -- `region_overlay` is the
+    // module `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT` holds for it, and
+    // this file must stay clear of the needle that guard counts.) Driven from
+    // the block below, unconditionally, exactly as `show_open_rehearsal`
+    // drives `scratch_window` -- and nothing here ever blocks waiting for it.
+    // The overlay reports back through `take_outcome`, which is the only place
+    // a captured region's answer enters this window.
+    let mut region_scan: Option<crate::region_overlay::RegionOverlay> = None;
     // The app launch that has been asked for and has not happened yet. See
     // [`PendingLaunch`]: the Open arm records the request and NOTHING there
     // starts a program, so every launch in this window goes through the one
@@ -4307,6 +4321,40 @@ pub fn build_frame(
             }
         }
 
+        // **Design 6b's overlay, driven once per frame.**
+        //
+        // `show` re-registers the deferred viewport and answers whether the
+        // window is still up; it returns immediately either way, so this line
+        // never blocks the vault window's frame. The drag, the throttled
+        // lock-on decodes and Escape all happen inside the overlay's own
+        // callback, which egui runs on this same thread as part of the frame
+        // it is already running.
+        //
+        // Placed BEFORE the form below so a region read on this frame is
+        // painted on this frame rather than on the next one, and so the card
+        // underneath never shows "Scanning" for a scan that has already
+        // finished.
+        if let Some(overlay) = &region_scan {
+            if !overlay.show(ui.ctx()) {
+                // Closed. Whatever it holds is taken exactly once -- the
+                // pixels it captured were already dropped and wiped inside
+                // `read_region_with`, and what comes back is at most a
+                // `Zeroizing` string.
+                if let (Some(outcome), Some(state)) =
+                    (overlay.take_outcome(), totp_add_state.as_mut())
+                {
+                    totp_add::apply_region_outcome(state, outcome);
+                }
+                region_scan = None;
+            }
+        }
+        // A form closed under an overlay that is still up would leave a
+        // full-screen always-on-top window with nothing behind it to dismiss
+        // it. The two live and die together.
+        if totp_add_state.is_none() {
+            region_scan = None;
+        }
+
         // The form itself, drawn here for `folder_edit`'s reason exactly:
         // last, so the card and its scrim are over the three panels.
         //
@@ -4391,6 +4439,39 @@ pub fn build_frame(
                     }
                 }
                 totp_add::TotpAddAction::Cancel => close = true,
+                // **Design 6b opens from here.**
+                //
+                // `monitor_bounds()` enumerates the real desktop, which is why
+                // the overlay takes it as an argument rather than reading it:
+                // the placement arithmetic is tested without one, and this is
+                // the single production call that supplies the real thing.
+                // `None` means there is no monitor to put a window on, and it
+                // is reported as a refusal rather than as a window that never
+                // appears.
+                //
+                // A second press while a scan is running is ignored: two
+                // full-screen always-on-top windows racing to answer is not a
+                // state this form has an answer for.
+                totp_add::TotpAddAction::ScanRegion => {
+                    if region_scan.is_none() {
+                        let monitors = crate::screen_capture::monitor_bounds();
+                        match crate::region_overlay::RegionOverlay::open(
+                            &monitors,
+                            ui.ctx().pixels_per_point(),
+                        ) {
+                            Some(overlay) => {
+                                region_scan = Some(overlay);
+                                state.stage = totp_add::Stage::Scanning;
+                                state.refusal = None;
+                            }
+                            None => {
+                                state.refusal = Some(totp_add::PickerRefusal::Capture(
+                                    crate::screen_capture::CaptureRefusal::OffScreen,
+                                ));
+                            }
+                        }
+                    }
+                }
                 totp_add::TotpAddAction::None => {}
             }
             if close {

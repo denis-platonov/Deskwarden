@@ -139,6 +139,13 @@ enum Surface {
     /// Those two are the whole surface; a shot of the empty form would show
     /// neither.
     TotpAddConfirm,
+    /// **Design 6a's picker**, which is the door every other route to a
+    /// one-time code is behind. Four rows in the design's order, the fourth
+    /// drawn dead with its reason, and the privacy line pinned under them.
+    /// Its own surface rather than a second state of the one above because
+    /// nothing of it is on that shot: a confirmation card is what happens
+    /// AFTER a route has been chosen.
+    TotpAddPicker,
     /// The preflight, allowed: the rule's process is in front and the focused
     /// control is masked, so the hold-to-send is offered.
     PreflightAllowed,
@@ -205,6 +212,7 @@ const ALL: &[Surface] = &[
     Surface::DiscardConfirm,
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
+    Surface::TotpAddPicker,
     Surface::PreflightAllowed,
     Surface::PreflightRefused,
     Surface::PrefsClipboard,
@@ -226,6 +234,7 @@ impl Surface {
             Surface::DiscardConfirm => "edit_discard_confirm",
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
+            Surface::TotpAddPicker => "totp_add_picker",
             Surface::PreflightAllowed => "preflight_allowed",
             Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
@@ -255,7 +264,8 @@ impl Surface {
             | Surface::CardDetailRevealed
             | Surface::DiscardConfirm
             | Surface::RecordComposer
-            | Surface::TotpAddConfirm => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            | Surface::TotpAddConfirm
+            | Surface::TotpAddPicker => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
                 deskwarden::preflight_host::PREFLIGHT_WIDTH,
                 deskwarden::preflight_host::PREFLIGHT_HEIGHT,
@@ -490,6 +500,7 @@ impl eframe::App for Preview {
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
+            Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
             Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
@@ -546,6 +557,8 @@ enum PaneKind {
     Composer,
     /// The "add a one-time code" form, mid-confirmation.
     TotpAdd,
+    /// Design 6a's picker, the front door onto the four routes.
+    TotpPicker,
     /// The preflight; `true` for the allowed state, `false` for the refusal.
     Preflight(bool),
 }
@@ -777,6 +790,9 @@ impl Preview {
                     // run is a screenshot no reviewer can diff.
                     let _ = totp_add::draw_add_form(ui, &mut fixtures.totp_add, PREVIEW_UNIX);
                 }
+                PaneKind::TotpPicker => {
+                    let _ = totp_add::draw_picker(ui, &mut fixtures.totp_picker);
+                }
                 PaneKind::Preflight(allowed) => {
                     let state = if allowed { &mut fixtures.allowed } else { &mut fixtures.refused };
                     let _ = preflight::draw(ui, state);
@@ -797,6 +813,7 @@ struct Fixtures {
     draft: EditDraft,
     record: RecordDraft,
     totp_add: TotpAdd,
+    totp_picker: TotpAdd,
     allowed: PreflightState,
     refused: PreflightState,
     rehearsal: scratch_window::RehearsalView,
@@ -829,6 +846,12 @@ impl Fixtures {
              &digits=8&period=60&algorithm=SHA256"
                 .to_string(),
         );
+        // A SECOND state of the same form, on design 6a. Carrying a refusal,
+        // because a picker with nothing wrong on it shows three of the four
+        // things this surface has to get right and not the fourth: a refusal
+        // rendered as a sentence that names its reason.
+        let mut totp_picker = TotpAdd::opening("preview", "Git Host \u{b7} anovak", true);
+        totp_picker.refusal = Some(totp_add::PickerRefusal::NoCode(totp_add::CodeSource::Region));
 
         Self {
             folders: vec![
@@ -863,6 +886,7 @@ impl Fixtures {
             ),
             record,
             totp_add,
+            totp_picker,
             draft,
             login,
             card,
