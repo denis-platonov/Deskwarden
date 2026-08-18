@@ -9042,8 +9042,19 @@ fn ensure_icon_loaded(
     // so an item kind that answers it -- a card with a bank domain -- reaches
     // everything below (the disk cache, the fetch, the monogram fallback)
     // without this function knowing such a kind exists.
+    // **An item with no domain is NOT marked**, for the same reason the
+    // `fetch.enabled` skip above is not: the set means "dealt with for
+    // this session", and having no domain is not a fact about the item
+    // that the session cannot change. A card gets its bank domain from a
+    // picker in the edit form, with this window open -- marking it here
+    // meant choosing a bank did nothing until the window was closed and
+    // reopened, which is exactly what a user reported.
+    //
+    // The cost is re-asking `icon_domain_for` each frame for items that
+    // have no icon. That is a field lookup with no I/O, bounded by the
+    // on-screen prefetch window, and the same cost the setting skip
+    // already accepts.
     let Some(domain) = crate::favicon::icon_domain_for(item) else {
-        favicon_requested.insert(item.id.clone());
         return;
     };
     favicon_requested.insert(item.id.clone());
@@ -17182,9 +17193,22 @@ mod account_details_tests {
     }
 
     /// A directory this test process owns, named for `label`.
+    /// A cache directory of this call's very own.
+    ///
+    /// **The counter is what makes it its own**, and it is not decoration:
+    /// the name used to be label-plus-pid, so two tests that happened to
+    /// pass the same label shared a directory -- and `run_icon_loader`
+    /// deletes that directory on its way out, so one test wiped the other's
+    /// cached icon mid-run. That is an intermittent red depending on thread
+    /// scheduling, and it appeared the first time a label was reused
+    /// (`card-hit`, twice). A counter removes the need for label discipline
+    /// rather than asking every future author to remember it; the label
+    /// stays only so a leftover directory names the test that made it.
     fn icon_routing_cache_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "deskwarden-test-icon-routing-{label}-{}",
+            "deskwarden-test-icon-routing-{label}-{}-{nth}",
             std::process::id()
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -17216,11 +17240,14 @@ mod account_details_tests {
     /// id, and it spawns no thread and touches no network -- so this drives
     /// the real loader rather than a copy of its shape.
     fn loads_icon_from_cache(item: &VaultItem, cached_domain: &str, label: &str) -> bool {
-        let (loaded, requested) = run_icon_loader(item, cached_domain, label, true);
-        // Every path through the loader that the SETTING allows marks the
-        // item resolved; asserting it here keeps `loaded == false` meaning
-        // "no domain", not "not run".
-        assert!(requested, "the loader did not run at all");
+        let (loaded, _requested) = run_icon_loader(item, cached_domain, label, true);
+        // **`requested` is no longer a liveness proof, so this no longer
+        // pretends it is.** It was asserted here to keep a `false` meaning
+        // "no domain" rather than "never ran". An item with no domain is
+        // now deliberately left unmarked, so the edit form can give it one
+        // while this window is open -- which means the mark no longer
+        // separates those two cases. Negative callers carry a live control
+        // of their own instead.
         loaded
     }
 
@@ -17380,10 +17407,36 @@ mod account_details_tests {
         let card = routing_item(
             r#"{"id":"c2","name":"Card","type":3,"card":{"number":"4111111111111111"}}"#,
         );
-        assert!(
-            !loads_icon_from_cache(&card, "chase.com", "card-miss"),
-            "a card with no bank domain picked up an icon anyway"
+        assert!(!loads_icon_from_cache(&card, "chase.com", "card-miss"), "a card with no bank domain picked up an icon anyway");
+        // **The live control.** `loads_icon_from_cache` no longer asserts
+        // that the loader ran, so without this the line above would pass
+        // just as happily against a harness that never called it.
+        let banked = routing_item(r#"{"id":"c3","name":"Card","type":3,"card":{"number":"4111111111111111"},"fields":[{"name":"deskwarden:bank-domain","value":"chase.com","type":0}]}"#);
+        assert!(loads_icon_from_cache(&banked, "chase.com", "card-hit"), "the control failed: a card WITH a bank domain does not reach the icon path either, so the assertion above is about a broken harness rather than about the missing field");
+    }
+
+    /// A card with no bank yet keeps its chance at an icon.
+    ///
+    /// The bank domain is written by a picker in the EDIT FORM, with this
+    /// window open. Marking a domainless item "dealt with for the session"
+    /// meant choosing a bank did nothing until the window was closed and
+    /// reopened -- reported by a user as the picker not picking up the image.
+    ///
+    /// Both halves: once the item HAS a domain the mark is what stops the
+    /// loader asking again on every frame, so "never marks" would be as
+    /// wrong as "always marks".
+    #[test]
+    fn a_card_without_a_bank_yet_is_not_marked_resolved_for_the_session() {
+        let bankless = routing_item(
+            r#"{"id":"c4","name":"Card","type":3,"card":{"number":"4111111111111111"}}"#,
         );
+        let (_, marked) = run_icon_loader(&bankless, "chase.com", "bank-none", true);
+        assert!(!marked, "a card with no bank domain was marked resolved for the session, so picking a bank in the edit form leaves the row iconless until the window is closed and reopened");
+
+        let banked = routing_item(r#"{"id":"c5","name":"Card","type":3,"card":{"number":"4111111111111111"},"fields":[{"name":"deskwarden:bank-domain","value":"chase.com","type":0}]}"#);
+        let (loaded, marked_now) = run_icon_loader(&banked, "chase.com", "bank-set", true);
+        assert!(loaded, "the control failed: a banked card does not reach the icon path at all");
+        assert!(marked_now, "the loader stopped marking a card it DID resolve, so it re-asks on every frame");
     }
 
     /// Logins go through the new question and come out where they always did.
