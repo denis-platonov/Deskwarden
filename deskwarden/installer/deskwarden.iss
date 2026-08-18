@@ -24,6 +24,49 @@ DefaultDirName={localappdata}\Deskwarden
 DefaultGroupName=Deskwarden
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+; ------------------------------------------------------------------
+; Installing over a RUNNING Deskwarden.
+;
+; Without the three directives below, setup had no idea the app was running:
+; it went straight to copying over a deskwarden.exe that Windows had mapped
+; as a running image, so the install failed or left a stale binary. The app
+; now creates this exact mutex as the first statement of `fn main` and holds
+; it for its whole life (src/app_mutex.rs), so Inno's OpenMutex on it finds
+; the running copy and shows "please close Deskwarden, then click OK".
+;
+; The name is AUTHORED IN ONE PLACE, `app_mutex::APP_MUTEX_NAME`, and merely
+; copied here because Inno cannot read a Rust constant. It is not kept in
+; sync by hand or by hope: the test
+; `app_mutex::tests::the_installer_names_the_same_mutex_this_process_creates`
+; include_str!s THIS FILE, parses this line, and fails the build if the two
+; ever differ. Change it there first.
+;
+; `Local\` and not `Global\` on purpose: PrivilegesRequired=lowest and
+; DefaultDirName={localappdata} above make this a per-user install, so setup
+; runs in the same logon session as the app it is replacing. A global mutex
+; would additionally let one user's running copy block a different user's
+; install of their own private copy.
+AppMutex=Local\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630
+;
+; And setup ASKS rather than force-closing. Inno 6's Restart Manager could
+; close the app for us (CloseApplications=yes, which is the default when
+; files are found in use), and for this app that is the wrong answer: a
+; Restart Manager close is a TerminateProcess, which runs no destructors and
+; no exit path. Deskwarden's clean shutdown takes a copied password back off
+; the Windows clipboard (clipboard::clear_if_still_ours_for) and every secret
+; in the app zeroizes on drop -- so a force-close would leave the user's
+; password sitting on their clipboard and their secrets unwiped in freed
+; memory, as a side effect of installing an update. The mutex above makes the
+; app exit through its own door instead.
+;
+; What this gives up: there is now NO automatic fallback. If deskwarden.exe
+; is locked by something that does not hold the mutex -- most importantly a
+; copy of version 0.8.0 or earlier, which predates the mutex entirely -- setup
+; will report a file in use rather than quietly closing it. That first upgrade
+; still has to be done with the app closed by hand; every one after it prompts.
+CloseApplications=no
+RestartApplications=no
+; ------------------------------------------------------------------
 OutputBaseFilename=deskwarden-{#AppVersion}-installer
 ; Compiled installer lands directly in installer/, matching what
 ; .github/workflows/release.yml (Task 6) expects to find and publish --

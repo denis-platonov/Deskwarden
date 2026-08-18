@@ -270,6 +270,23 @@ fn installer_is_launchable(info: &crate::signature::SignatureInfo) -> bool {
 /// function without going through the gate above it is what
 /// [`the_only_process_start_in_this_module_is_the_launch_seam`] forbids.
 fn launch_installer(installer_path: &Path) -> Result<(), String> {
+    // **Before the spawn, not after it.**
+    //
+    // `installer/deskwarden.iss` carries `AppMutex=`, so setup refuses to
+    // install over a running Deskwarden and asks the user to close it first.
+    // That is exactly right for a user who double-clicked the installer, and
+    // exactly wrong here: this run is `/VERYSILENT /SUPPRESSMSGBOXES`,
+    // started by the app itself, which is about to exit. There is no user to
+    // ask and the prompt is suppressed, so the update would fail or hang on
+    // whatever default that suppressed box carries.
+    //
+    // Releasing here is not a trick to dodge our own check -- it is the
+    // accurate statement. At this instant this process has handed over to its
+    // own replacement, so "a Deskwarden is running that setup must ask about"
+    // has stopped being true. Everything the shutdown path does -- clearing
+    // the clipboard, killing `bw serve`, zeroizing the cache -- still
+    // happens: `main` reaches it as soon as this returns.
+    crate::app_mutex::release();
     Command::new(installer_path)
         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES"])
         .spawn()
@@ -2233,9 +2250,18 @@ mod tests {
 
     /// The header of the one function in this module allowed to start a
     /// process, and its whole body, pinned exactly.
+    ///
+    /// **Re-pinned when the app mutex was added.** The `app_mutex::release()`
+    /// line below is part of the pin for the same reason the two silent-install
+    /// flags are: without it, setup finds this still-running app holding the
+    /// mutex `installer/deskwarden.iss` names in `AppMutex=` and stops to ask a
+    /// user who is not there, on a run whose message boxes are suppressed.
+    /// Deleting it is as much a broken self-update as deleting `/VERYSILENT`,
+    /// and it is exactly as invisible.
     const LAUNCH_SEAM_HEADER: &str = "fnlaunch_installer(installer_path:&Path)->Result<(),String>";
     const LAUNCH_SEAM: &str = concat!(
         "fnlaunch_installer(installer_path:&Path)->Result<(),String>{",
+        "crate::app_mutex::release();",
         "Command::new(installer_path)",
         ".args([\"/VERYSILENT\",\"/SUPPRESSMSGBOXES\"])",
         ".spawn()",
