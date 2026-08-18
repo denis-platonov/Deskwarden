@@ -20,6 +20,7 @@
 //! display + copy actions; edit mode owns a draft `VaultItem` and validates
 //! it), and the read-mode file was already large enough on its own.
 
+use super::record_ui;
 use super::relative_time;
 use super::sidebar::OutOfVault;
 use crate::app_match::AppMatch;
@@ -54,6 +55,22 @@ const HEADER_PAD_Y: i8 = 20;
 const HEADER_GAP: f32 = 14.0;
 /// The strip's `width: 44px; height: 44px` avatar tile.
 const HEADER_AVATAR: f32 = 44.0;
+/// **How many controls the header strip draws**, in one place, because the
+/// strip *reserves* its room before it draws anything and drift between the
+/// two is the failure mode that painted a control at x = -34.5.
+///
+/// Four: ★, ✉, ⋮, ✕ (`draw_controls` fills them right-to-left, so it emits
+/// them in the other order). Every one of them is square at
+/// [`theme::HEADER_BUTTON_HEIGHT`], which is what makes a count sufficient
+/// -- the removed "Fill in app" button was worded and had a per-item width,
+/// and that is exactly why this used to be an expression rather than a
+/// number.
+///
+/// Not merely a constant two call sites share: `the_strip_reserves_room_for
+/// _every_control_it_draws` counts the controls actually PAINTED and fails
+/// if this disagrees with them, so a fifth control added to `draw_controls`
+/// alone cannot ride on a stale reservation.
+const HEADER_CONTROLS: usize = 4;
 /// `font-size: 22px` on the item title.
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
@@ -421,6 +438,36 @@ pub enum DetailAction {
     /// `delete_pending` (see that param's doc comment) for which label/state
     /// to show.
     Delete,
+    /// The header's ✕ was clicked: the user wants the detail pane GONE and
+    /// the item list to take the window.
+    ///
+    /// It carries nothing, because there is nothing to choose -- the whole
+    /// mechanism is `vault_window::mod` clearing `selected_id`, which is
+    /// already the state the window opens in.
+    ///
+    /// **A `DetailAction` rather than a `bool` out-param**, so it passes
+    /// through `permit_detail_action` with every other thing this pane can
+    /// report. It is on the not-exposing side of
+    /// `detail_action_exposes_secrets` -- closing a pane reveals nothing --
+    /// but a variant that never reached that function would be a variant a
+    /// future secret-bearing sibling could be added next to unnoticed.
+    ClosePane,
+    /// The header's ✉ was clicked: the user wants the record composer for
+    /// this item.
+    ///
+    /// **It REPORTS and does not open**, which is the whole reason it is a
+    /// variant here rather than a call. `vault_window::mod` has exactly one
+    /// line that turns a request for the composer into one, and it is
+    /// `permit_record_send` -- the re-prompt. This control and CTRL+SHIFT+S
+    /// both arrive there as the same `send_record_asked` flag, so the button
+    /// and the keyboard cannot end up two different amounts of gated. That
+    /// is the arrangement `exactly_one_line_opens_the_record_composer`
+    /// refuses to let a second door around.
+    ///
+    /// Carrying no item for the same reason `can_send_record` was a `bool`:
+    /// the composer re-resolves the id when it opens, and again when Create
+    /// is pressed.
+    SendRecord,
     /// The header's favourite control was clicked, carrying **the state the
     /// item should end up in**, not "it was clicked".
     ///
@@ -2472,11 +2519,21 @@ pub fn draw_detail_read(
             // and the room its controls take is the failure mode that put a
             // control off the edge of the pane once already.
             //
-            // The star and the kebab, square at the strip's own control
-            // height, plus the one gap between them -- the whole of what this
-            // strip now draws. There is no per-item term any more: the worded
-            // primary button that used to contribute one has been removed.
-            let controls_width = theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP;
+            // The star, the envelope, the kebab and the close ✕ -- square at
+            // the strip's own control height -- plus the three gaps between
+            // them. The whole of what this strip draws. There is no per-item
+            // term: the worded primary button that used to contribute one has
+            // been removed.
+            //
+            // Spelled as a count and not as four additions, because
+            // `the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide
+            // _one` spells it the same way -- a fifth control added to
+            // `draw_controls` and not here is the drift that painted a
+            // control at x = -34.5 once already, and
+            // `the_strip_reserves_room_for_every_control_it_draws` is what
+            // now measures the two against each other.
+            let controls_width = theme::HEADER_BUTTON_HEIGHT * HEADER_CONTROLS as f32
+                + HEADER_GAP * (HEADER_CONTROLS - 1) as f32;
             let layout = header_layout(content_width, controls_width);
 
             // The three pieces of the strip, as closures, because the two
@@ -2522,11 +2579,58 @@ pub fn draw_detail_read(
                     });
                 });
             };
-            // **Right-to-left, so what reads left-to-right is ★, "Fill in
-            // app", ⋮.** The caller supplies a `Ui` already in that layout
-            // and already carrying `HEADER_GAP` spacing; this only fills it.
+            // **Right-to-left, so what reads left-to-right is ★, ✉, ⋮, ✕.**
+            // The caller supplies a `Ui` already in that layout and already
+            // carrying `HEADER_GAP` spacing; this only fills it.
+            //
+            // This comment used to list `Fill in app` as the middle control.
+            // That button was removed by commit `7da1bba` -- along with
+            // `DetailAction::Fill`, the CTRL+SHIFT+F chord and
+            // `theme::header_primary_button` -- and the comment was not
+            // updated with it, so for some months the strip's own header
+            // described a control the strip did not draw. It is corrected
+            // rather than merely deleted because the count is load-bearing:
+            // see [`HEADER_CONTROLS`], which is what the room reserved above
+            // is computed from.
+            //
+            // **Every one of these four states its chord on hover, or has
+            // none to state.** The user's request was "for all of those --
+            // show keys in tooltip on hover not just a description", which
+            // the rows below this strip have done since `copy_shortcut_chord`
+            // (`"Click to copy · CTRL+B"`). Only ✉ has a chord: ★, ⋮ and ✕
+            // are bound to no key anywhere in this crate, and inventing one
+            // in a tooltip would advertise a binding the code does not have
+            // -- which `COPY_SHORTCUTS`' own doc calls worse than no hint at
+            // all. ✉ reads its chord from `record_ui::SEND_RECORD_SHORTCUT`,
+            // never from a string written here; see that call.
             let mut draw_controls = |ui: &mut egui::Ui| {
-                // **The overflow menu, rightmost.** Edit and Delete both
+                // **The pane's own close, rightmost -- to the right of the
+                // kebab, where the user asked for it**: "Add X button to the
+                // right of card 3 dots ... details card gets closed and only
+                // results shown".
+                //
+                // It reports and does nothing: `vault_window::mod` clears
+                // `selected_id`, which is the state the window already opens
+                // in, so there is no "no detail" layout for the list to fall
+                // back to -- it simply takes the width.
+                //
+                // **Drawn as the quietest mark in the strip and never red**
+                // -- see `theme::close_pane_button`, where that decision is
+                // argued. It is one control away from a Delete that arms on
+                // its first click, and the two must not look like siblings.
+                //
+                // No chord on the hover, because it has none. ESC is not
+                // bound to it: this window's ESC already belongs to whatever
+                // popup or menu egui has open, and taking it would make the
+                // key that dismisses a menu also throw away the selection
+                // underneath.
+                if theme::close_pane_button(ui)
+                    .on_hover_text("Close this panel and show the full list")
+                    .clicked()
+                {
+                    action = DetailAction::ClosePane;
+                }
+                // **The overflow menu.** Edit and Delete both
                 // live in here, at the user's explicit direction: four
                 // worded buttons across this strip did not fit the app's
                 // own minimum window size.
@@ -2570,6 +2674,53 @@ pub fn draw_detail_read(
                         action = DetailAction::Delete;
                     }
                 });
+                // **"Send a record", MOVED HERE off the window titlebar** at
+                // the user's direction: "remove huge button Send a record on
+                // top -- those are global things to the details like email
+                // icon after Fav".
+                //
+                // The user is right and this reverses a placement that was
+                // approved once. The titlebar pill acted on the SELECTED
+                // ITEM from a strip whose every other control is global --
+                // the account menu, the settings gear, the sync status --
+                // and the tell was that it had to grey itself out with
+                // nothing selected and explain why on its hover. A control
+                // that has to say "there is nothing to do me to" is a
+                // control filed under the wrong noun. In this strip there is
+                // always an item, because this strip is only drawn when
+                // there is one, so `theme::send_record_button` has no
+                // disabled state and `record_ui::NO_ITEM_SELECTED` has no
+                // reader on this path.
+                //
+                // **The chord did not move.** CTRL+SHIFT+S is still read in
+                // `vault_window::mod`, and this reports through
+                // `DetailAction::SendRecord` into the same
+                // `send_record_asked` flag that chord sets -- so there is
+                // still exactly ONE line in the frame that opens the
+                // composer, and it is still `permit_record_send`. See that
+                // variant's doc, and
+                // `exactly_one_line_opens_the_record_composer`.
+                //
+                // **The hover reads the chord from
+                // `record_ui::SEND_RECORD_SHORTCUT`**, which is the one
+                // place that chord is spelled for a human -- and
+                // `the_record_chord_is_spelled_the_way_it_is_bound` already
+                // compares that constant against `SEND_RECORD_MODIFIERS` and
+                // `SEND_RECORD_KEY`, the values the key handler actually
+                // matches on. A literal "CTRL+SHIFT+S" typed here would be a
+                // second home for the same fact, and a rebinding would leave
+                // this tooltip lying. Same rule, and the same separator, as
+                // the rows' `"Click to copy · {chord}"`.
+                if theme::send_record_button(ui)
+                    .on_hover_text(format!(
+                        "{} · {}",
+                        record_ui::SEND_RECORD_LABEL,
+                        record_ui::SEND_RECORD_SHORTCUT
+                    ))
+                    .clicked()
+                {
+                    action = DetailAction::SendRecord;
+                }
                 // **The strip's worded "Fill in app" button used to sit
                 // here, and was REMOVED at the user's request**: "Fill in
                 // app button I think we can remove -- I'm not sure what it
@@ -6555,6 +6706,8 @@ mod tests {
             stars: Vec::new(),
             eyes: Vec::new(),
             kebab_dots: Vec::new(),
+            envelopes: Vec::new(),
+            pane_closes: Vec::new(),
             segments: Vec::new(),
             images: Vec::new(),
             shapes: egui::Shape::Noop,
@@ -6572,6 +6725,8 @@ mod tests {
         frame.stars = theme::icon_probe::stars(&all);
         frame.eyes = theme::icon_probe::eyes(&all);
         frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
+        frame.envelopes = theme::icon_probe::envelopes(&all);
+        frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
         frame.segments = theme::icon_probe::line_segments(&all);
         collect_images(&all, &mut frame.images);
         frame.shapes = all;
@@ -6635,6 +6790,25 @@ mod tests {
                 frame.eyes.is_empty(),
                 "the out-of-vault pane draws a reveal eye, so it is rendering rows it \
                  cannot act on"
+            );
+            // **The Send envelope is the important one of these two.** A
+            // record Send publishes an item's secrets to a public link, and
+            // this pane is a row the user has already thrown away or filed
+            // out of sight. When the control was a titlebar pill it was
+            // `can_send_record`, a `bool` derived from `items`, that refused
+            // this case; that bool went with the pill, and what refuses it
+            // now is precisely that this pane is a different function which
+            // draws no envelope. So it is asserted here rather than left to
+            // the shape of the code.
+            assert!(
+                frame.envelopes.is_empty(),
+                "the out-of-vault pane draws the Send envelope, so a trashed or archived \
+                 item can be published to a public link"
+            );
+            assert!(
+                frame.pane_closes.is_empty(),
+                "the out-of-vault pane draws the header's close ✕, which reports a \
+                 `DetailAction` this pane's caller does not handle"
             );
         }
     }
@@ -6973,6 +7147,15 @@ mod tests {
         stars: Vec<theme::icon_probe::Star>,
         eyes: Vec<egui::Rect>,
         kebab_dots: Vec<(egui::Rect, egui::Color32)>,
+        /// The header's "Send a record" envelopes, with the colour each was
+        /// stroked in -- which is the only way `send_record_button`'s hover
+        /// state is visible here, since it paints no fill and no string.
+        envelopes: Vec<(egui::Rect, egui::Color32)>,
+        /// The header's close ✕ marks, with their colour. **The colour is
+        /// the assertion** for this one: the whole reason it is drawn the way
+        /// it is, is that it must not read as the Delete sitting one control
+        /// to its left.
+        pane_closes: Vec<(egui::Rect, egui::Color32)>,
         segments: Vec<egui::Rect>,
         /// Every textured rect -- the matched app's icon is the only one this
         /// pane can paint. See [`collect_images`].
@@ -7105,6 +7288,34 @@ mod tests {
                 .iter()
                 .skip(1)
                 .fold(self.kebab_dots[0].0, |a, (b, _)| a.union(*b))
+        }
+
+        /// The header's "Send a record" envelope, with its stroke colour.
+        /// Exactly one, for [`Frame::star`]'s reason.
+        fn envelope(&self) -> (egui::Rect, egui::Color32) {
+            assert_eq!(
+                self.envelopes.len(),
+                1,
+                "expected exactly one Send envelope in the header, found {}; the pane \
+                 painted: {:?}",
+                self.envelopes.len(),
+                self.strings()
+            );
+            self.envelopes[0]
+        }
+
+        /// The header's close ✕, with its stroke colour. Exactly one, for
+        /// [`Frame::star`]'s reason -- and here that also proves the strip's
+        /// ✕ is not being confused with any other ✕ this app strokes.
+        fn pane_close(&self) -> (egui::Rect, egui::Color32) {
+            assert_eq!(
+                self.pane_closes.len(),
+                1,
+                "expected exactly one close ✕ in the header, found {}; the pane painted: {:?}",
+                self.pane_closes.len(),
+                self.strings()
+            );
+            self.pane_closes[0]
         }
 
         /// The colour the kebab's three dots were filled in -- one colour,
@@ -7317,6 +7528,8 @@ mod tests {
                 stars: Vec::new(),
                 eyes: Vec::new(),
                 kebab_dots: Vec::new(),
+                envelopes: Vec::new(),
+                pane_closes: Vec::new(),
                 segments: Vec::new(),
                 images: Vec::new(),
                 shapes: egui::Shape::Noop,
@@ -7338,6 +7551,8 @@ mod tests {
             frame.stars = theme::icon_probe::stars(&all);
             frame.eyes = theme::icon_probe::eyes(&all);
             frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
+            frame.envelopes = theme::icon_probe::envelopes(&all);
+            frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
             frame.segments = theme::icon_probe::line_segments(&all);
             collect_images(&all, &mut frame.images);
             frame.shapes = all;
@@ -11837,6 +12052,16 @@ mod tests {
         // distinguishable from "a star that fits" without this.
         assert_eq!(frame.stars.len(), 1, "no star painted at the minimum width");
         assert_eq!(frame.kebab_dots.len(), 3, "no kebab painted at the minimum width");
+        assert_eq!(
+            frame.envelopes.len(),
+            1,
+            "no Send envelope painted at the minimum width"
+        );
+        assert_eq!(
+            frame.pane_closes.len(),
+            1,
+            "no close ✕ painted at the minimum width"
+        );
     }
 
     /// **A band, not a width.** The defect the test above pins was not a
@@ -11894,7 +12119,9 @@ mod tests {
             let avatar = frame.avatar_tile();
             for (name, rect) in [
                 ("the favourite star", frame.star().rect),
+                ("the Send envelope", frame.envelope().0),
                 ("the kebab", frame.kebab()),
+                ("the close ✕", frame.pane_close().0),
             ] {
                 assert!(
                     bounds.contains_rect(rect),
@@ -11928,18 +12155,22 @@ mod tests {
     ///
     /// Removing the header's "Fill in app" button took a rung off this
     /// ladder: the strip's controls used to be a per-item width with a
-    /// shortcut hint that could be shed, and are now a fixed star + gap +
-    /// kebab. A collapse that far can quietly leave a function with one
-    /// reachable branch, and this is the pane whose controls were once
+    /// shortcut hint that could be shed, and are now [`HEADER_CONTROLS`]
+    /// fixed squares. A collapse that far can quietly leave a function with
+    /// one reachable branch, and this is the pane whose controls were once
     /// painted at x = -34.5 -- so the branch that keeps them off the title at
     /// 298pt is asserted directly rather than inferred from the sweep above.
     ///
     /// The controls' width is spelled the way `draw_detail_read` spells it,
     /// and the content width the way the strip's `Frame` produces it, so this
-    /// cannot pass on numbers the real header does not use.
+    /// cannot pass on numbers the real header does not use. It went from two
+    /// controls to four when the ✉ and the ✕ were added, and the stacking
+    /// threshold moved with it from ~322pt to ~418pt -- which is why the
+    /// sweep above still crosses it: that sweep runs to 560.
     #[test]
     fn the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide_one() {
-        let controls = theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP;
+        let controls = theme::HEADER_BUTTON_HEIGHT * HEADER_CONTROLS as f32
+            + HEADER_GAP * (HEADER_CONTROLS - 1) as f32;
         let content = |pane: f32| pane - f32::from(HEADER_PAD_X) * 2.0;
 
         assert!(
@@ -11950,6 +12181,194 @@ mod tests {
         assert!(
             !header_layout(content(PANE), controls).stacked,
             "the ordinary {PANE}pt pane is stacking, so the unstacked branch is dead"
+        );
+    }
+
+    /// **The strip reserves room for exactly the controls it draws.**
+    ///
+    /// [`HEADER_CONTROLS`] is read before anything is painted, to decide
+    /// whether the strip fits on one line, and `draw_controls` is what
+    /// actually paints. Drift between those two is not hypothetical: it is
+    /// the failure mode that put a control at x = -34.5, entirely off the
+    /// pane, under a title running straight through the buttons.
+    ///
+    /// So the count is not merely shared -- the controls PAINTED are counted
+    /// off the shape tree and compared to it. A fifth control added to
+    /// `draw_controls` and not to the constant reds here, at the pane width
+    /// where the reservation matters most.
+    ///
+    /// Each control is found by its own probe, which is also what makes this
+    /// a count of four *different* marks rather than of four of anything: a
+    /// star found four times would not satisfy it.
+    #[test]
+    fn the_strip_reserves_room_for_every_control_it_draws() {
+        let item = a_login();
+        let mut pane = Pane::wide(MIN_PANE);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        let painted = [
+            ("the favourite star", frame.stars.len()),
+            ("the Send envelope", frame.envelopes.len()),
+            // Three dots, one control -- `Frame::kebab` is what asserts the
+            // count of dots, and it is called here for that assertion.
+            ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
+            ("the close ✕", frame.pane_closes.len()),
+        ];
+        let _ = frame.kebab();
+        for (name, count) in painted {
+            assert_eq!(
+                count, 1,
+                "the header painted {count} of {name}, so the count below is not counting \
+                 four distinct controls"
+            );
+        }
+        assert_eq!(
+            painted.len(),
+            HEADER_CONTROLS,
+            "the strip draws {} controls and reserves room for {HEADER_CONTROLS} -- a \
+             control the reservation does not know about is a control that gets painted \
+             off the pane",
+            painted.len()
+        );
+    }
+
+    /// **The ✕ reports `ClosePane`, and the ✉ reports `SendRecord`.**
+    ///
+    /// Pressed for real, at the position the header actually painted each
+    /// mark, and each asserted to produce its OWN action -- the pair, not one
+    /// at a time, because a `draw_controls` that wired both clicks to the
+    /// same variant would pass either test alone.
+    #[test]
+    fn the_two_new_header_controls_each_report_their_own_action() {
+        let item = a_login();
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let close_at = laid_out.pane_close().0.center();
+        let envelope_at = laid_out.envelope().0.center();
+        assert!(
+            !close_at.any_nan() && !envelope_at.any_nan(),
+            "the header painted no ✕ or no envelope to press"
+        );
+
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.click(&item, &TotpState::NoSecret, close_at).action,
+            DetailAction::ClosePane,
+            "clicking the header's ✕ did not report `ClosePane`, so the control is inert"
+        );
+
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.click(&item, &TotpState::NoSecret, envelope_at).action,
+            DetailAction::SendRecord,
+            "clicking the header's ✉ did not report `SendRecord`, so the record composer \
+             is unreachable from the only control that opens it"
+        );
+    }
+
+    /// **The ✕ does not look like the Delete it sits beside.**
+    ///
+    /// These two controls are 48pt apart -- the kebab is between them, and
+    /// inside that kebab is a Delete that arms on its first click and is
+    /// permanent on its second. A ✕ drawn in [`theme::ERROR`], or at the
+    /// weight of a primary, would be inviting exactly that misclick.
+    ///
+    /// Read off the PAINTED stroke colour and not off the source: the point
+    /// is what a user sees, and a constant comparison would only restate
+    /// that `theme.rs` says so.
+    ///
+    /// The armed frame is the one that matters, and it is why this drives the
+    /// pane twice: an unarmed kebab is grey too, so "the ✕ is not red" is
+    /// trivially true there. With the delete armed the kebab really does turn
+    /// `ERROR` -- asserted here, as the positive control -- and the ✕ beside
+    /// it must not have followed.
+    #[test]
+    fn the_close_mark_is_never_dressed_as_the_delete_beside_it() {
+        let item = a_login();
+
+        for delete_pending in [false, true] {
+            let mut pane = Pane::new();
+            pane.delete_pending = delete_pending;
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let (_, close_colour) = frame.pane_close();
+            assert_ne!(
+                close_colour,
+                theme::ERROR,
+                "with delete_pending={delete_pending} the header's close ✕ is painted in \
+                 the palette's error red, one control away from a Delete that arms on its \
+                 first click"
+            );
+            assert_eq!(
+                close_colour,
+                theme::TEXT_GHOST,
+                "the close ✕ is not resting at the palette's faintest clickable ink, so it \
+                 is louder than the control it must not be mistaken for"
+            );
+        }
+
+        // The positive control: the kebab REALLY does turn red when armed, so
+        // the two assertions above are about a frame in which "red" is a
+        // colour something on this strip is actually wearing.
+        let mut pane = Pane::new();
+        pane.delete_pending = true;
+        let armed = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            armed.kebab_colour(),
+            theme::ERROR,
+            "the kebab does not go red on an armed delete, so \"the ✕ is not red\" above is \
+             a statement about a strip with no red in it"
+        );
+    }
+
+    /// **The ✉'s tooltip carries its chord, and carries it from the ONE place
+    /// that chord is spelled.**
+    ///
+    /// The user asked for this on every header control: "for all of those --
+    /// show keys in tooltip on hover not just a description". Only the ✉ has
+    /// a chord to show -- ★, ⋮ and ✕ are bound to no key -- and it must not
+    /// be typed out here or in the pane. `record_ui::SEND_RECORD_SHORTCUT` is
+    /// the single home for the spelling, and `vault_window::mod`'s
+    /// `the_record_chord_is_spelled_the_way_it_is_bound` is what holds THAT
+    /// constant to the modifiers and key the handler matches on -- so the
+    /// chain from this tooltip to the real binding is closed.
+    ///
+    /// Built from the constants rather than compared against a literal, for
+    /// the reason the row tooltips' own test is: a hard-coded
+    /// `"Send a record · CTRL+SHIFT+S"` here would be a second place the same
+    /// fact is written, and a rebinding would leave this test agreeing with a
+    /// tooltip that had started lying.
+    #[test]
+    fn the_send_envelopes_tooltip_states_its_chord() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let at = laid_out.envelope().0.center();
+
+        let hovered = pane.hover_settled(&item, &TotpState::NoSecret, at);
+        let want = format!(
+            "{} · {}",
+            record_ui::SEND_RECORD_LABEL,
+            record_ui::SEND_RECORD_SHORTCUT
+        );
+        assert!(
+            hovered.painted(&want),
+            "hovering the header's ✉ painted no {want:?} tooltip; the frame painted: {:?}",
+            hovered.strings()
+        );
+        // The chord half specifically, and not merely the sentence: a tooltip
+        // that had lost its chord and kept its words would still contain the
+        // label, and the whole request was the keys.
+        assert!(
+            hovered
+                .strings()
+                .iter()
+                .any(|t| t.contains(record_ui::SEND_RECORD_SHORTCUT)),
+            "the ✉'s tooltip does not state {:?} at all: {:?}",
+            record_ui::SEND_RECORD_SHORTCUT,
+            hovered.strings()
         );
     }
 
