@@ -5,6 +5,7 @@
 
 use crate::app_identity::{self, AppIdentityCache};
 use crate::app_match::{AppMatch, TriggerMode};
+use crate::card_brand::{brand_for_number, CARD_BRANDS};
 use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
 use crate::theme;
 use crate::vault_bridge::{
@@ -42,6 +43,74 @@ pub struct CardDraft {
     /// sharing one, so revealing the number cannot reveal the security code.
     pub reveal_number: bool,
     pub reveal_code: bool,
+    /// Whether the brand on this draft is the user's own choice rather than
+    /// something this form suggested.
+    ///
+    /// **The same mechanism as [`AppMatchDraft::template_touched`]**, and
+    /// deliberately not a second one: a form with two different notions of
+    /// "the user has been here" is a form where the two disagree.
+    ///
+    /// The rule it gates is *suggest only while untouched*. Without it the
+    /// sequence "type a number -> we set Visa -> the user corrects it to
+    /// Mastercard -> the user fixes a typo in the number -> we silently
+    /// restore Visa" is the default behaviour, which is data loss wearing a
+    /// convenience costume.
+    ///
+    /// **Private, with [`Self::pick_brand`] the only way to set it**, for the
+    /// reason [`EditDraft::opened_digest`] is private: a caller that could
+    /// assign it could declare the user's choice to be a guess, or a guess to
+    /// be the user's choice, and either way the guarantee is gone.
+    ///
+    /// [`EditDraft::from_item`] sets it for a card that arrived carrying a
+    /// brand. An inherited brand was chosen by somebody -- in this app, in
+    /// another Bitwarden client, or by the bank's own import -- and
+    /// overwriting it because the user retyped a digit is the same data loss
+    /// one step earlier.
+    brand_touched: bool,
+}
+
+impl CardDraft {
+    /// Replaces the number, then re-runs the brand suggestion.
+    ///
+    /// The old buffer is [`zeroize::Zeroize`]d rather than dropped: a
+    /// reassigned `String` hands its bytes back to the allocator exactly as
+    /// it received them, and these are card digits.
+    pub fn set_number(&mut self, number: &str) {
+        use zeroize::Zeroize as _;
+        self.number.zeroize();
+        self.number.push_str(number);
+        self.suggest_brand();
+    }
+
+    /// Records the user's own choice of brand. **The only way to set
+    /// [`Self::brand_touched`]**, which is what makes the choice permanent.
+    pub fn pick_brand(&mut self, brand: &str) {
+        self.brand.clear();
+        self.brand.push_str(brand);
+        self.brand_touched = true;
+    }
+
+    /// Fills the brand in from the number, if the user has not already
+    /// answered that question.
+    ///
+    /// Idempotent and cheap, so the form may call it every frame rather than
+    /// having to detect that the number box changed -- detecting that would
+    /// mean keeping a second copy of the number to compare against, which is
+    /// a second plaintext copy of a card number for the sake of an `if`.
+    ///
+    /// **An unrecognised prefix leaves the field alone rather than clearing
+    /// it.** A partially typed number passes through prefixes matching
+    /// nothing, and a brand that flickers empty while the user types reads as
+    /// broken.
+    pub fn suggest_brand(&mut self) {
+        if self.brand_touched {
+            return;
+        }
+        if let Some(brand) = brand_for_number(&self.number) {
+            self.brand.clear();
+            self.brand.push_str(brand.canonical());
+        }
+    }
 }
 
 /// The identity-specific half of a draft (`type: 4`). One `String` per
@@ -1148,15 +1217,22 @@ impl EditDraft {
             reveal_password: false,
             totp: drafted(login.and_then(|l| l.totp.as_deref()).map(|t| t.as_str())),
             reveal_totp: false,
-            card: CardDraft {
-                cardholder_name: drafted(card.and_then(|c| c.cardholder_name.as_deref())),
-                brand: drafted(card.and_then(|c| c.brand.as_deref())),
-                number: drafted(card.and_then(|c| c.number.as_deref()).map(|n| n.as_str())),
-                exp_month: drafted(card.and_then(|c| c.exp_month.as_deref())),
-                exp_year: drafted(card.and_then(|c| c.exp_year.as_deref())),
-                code: drafted(card.and_then(|c| c.code.as_deref()).map(|c| c.as_str())),
-                reveal_number: false,
-                reveal_code: false,
+            card: {
+                let brand = drafted(card.and_then(|c| c.brand.as_deref()));
+                CardDraft {
+                    cardholder_name: drafted(card.and_then(|c| c.cardholder_name.as_deref())),
+                    // An inherited brand counts as already chosen -- see
+                    // `CardDraft::brand_touched`. Computed from the string
+                    // itself rather than passed in, so there is one rule.
+                    brand_touched: !brand.trim().is_empty(),
+                    brand,
+                    number: drafted(card.and_then(|c| c.number.as_deref()).map(|n| n.as_str())),
+                    exp_month: drafted(card.and_then(|c| c.exp_month.as_deref())),
+                    exp_year: drafted(card.and_then(|c| c.exp_year.as_deref())),
+                    code: drafted(card.and_then(|c| c.code.as_deref()).map(|c| c.as_str())),
+                    reveal_number: false,
+                    reveal_code: false,
+                }
             },
             identity: IdentityDraft {
                 title: drafted(identity.and_then(|i| i.title.as_deref())),
@@ -1455,6 +1531,13 @@ impl EditDraft {
             code,
             reveal_number: _,
             reveal_code: _,
+            // Not content: `brand` above IS the content, and whether the
+            // string got there by a suggestion or by a click is a fact about
+            // how the form behaves from here on rather than about the item.
+            // A draft that became dirty by the user opening the brand
+            // dropdown and picking what was already showing would be a form
+            // asking about a change that is not one.
+            brand_touched: _,
         } = card;
         let SshKeyDraft { private_key, public_key, key_fingerprint, reveal_private_key: _ } =
             ssh_key;
@@ -1990,6 +2073,17 @@ pub const TOTP_HINT: &str =
 /// treatment and same wording pattern as [`FIELDS_CREATE_NOTICE`]; offering
 /// it needs a `vault_bridge` change.
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+
+/// What the brand dropdown shows when the card has no brand at all.
+///
+/// Not an empty combo box: a control whose closed state is blank reads as one
+/// that failed to load rather than one nobody has answered.
+pub const BRAND_UNSET: &str = "Not set";
+
+/// Wide enough for the longest row the dropdown offers -- "American Express"
+/// -- so no brand is drawn elided in the box that is supposed to name it.
+const BRAND_COMBO_WIDTH: f32 = 160.0;
+
 
 // ---------------------------------------------------------------------------
 // The edit form's custom-fields block.
@@ -4068,11 +4162,46 @@ pub fn draw_detail_edit(
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Brand");
-                    theme::text_field(ui, &mut card.brand, false);
+                    // A dropdown over `CARD_BRANDS` rather than a text box,
+                    // and the rows are derived from the enumeration rather
+                    // than written out here: a second hand-written list is
+                    // the "two enumerations that must agree" defect, and the
+                    // one that drifts would offer a spelling no other
+                    // Bitwarden client draws card art for.
+                    //
+                    // `selected_text` is the draft's own string, not a
+                    // resolved `CardBrand`, so a brand this build does not
+                    // know -- one a newer client wrote -- is still SHOWN
+                    // rather than silently reading as blank.
+                    egui::ComboBox::from_id_salt("card-brand")
+                        .selected_text(if card.brand.is_empty() {
+                            BRAND_UNSET
+                        } else {
+                            card.brand.as_str()
+                        })
+                        .width(BRAND_COMBO_WIDTH)
+                        .show_ui(ui, |ui| {
+                            for brand in CARD_BRANDS {
+                                let canonical = brand.canonical();
+                                let chosen = card.brand == canonical;
+                                if ui.selectable_label(chosen, canonical).clicked() {
+                                    // Through `pick_brand`, never by
+                                    // assigning `brand`: this is the click
+                                    // that makes the choice permanent.
+                                    card.pick_brand(canonical);
+                                }
+                            }
+                        });
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Number");
                     theme::password_field(ui, &mut card.number, &mut card.reveal_number);
+                    // Every frame, unconditionally. `suggest_brand` is
+                    // idempotent and returns immediately once the user has
+                    // picked, so there is nothing to gate it on -- and gating
+                    // it on "the number changed" would mean keeping a second
+                    // plaintext copy of the number to compare against.
+                    card.suggest_brand();
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Expiry month");
@@ -12491,5 +12620,141 @@ mod draft_dirtiness_tests {
             "the wipe erased a PLAIN custom field -- it is a blanket clear wearing a list's \
              name, and the next secret added to the form will not be on that list"
         );
+    }
+}
+
+/// The edit form's brand suggestion, and the rule that it never overwrites a
+/// choice.
+#[cfg(test)]
+mod card_brand_form_tests {
+    use super::*;
+    use crate::card_brand::CardBrand;
+
+    /// A card draft as the create form hands one over: no brand, no number,
+    /// nothing chosen.
+    fn card_draft() -> CardDraft {
+        CardDraft::default()
+    }
+
+    #[test]
+    fn a_hand_picked_brand_survives_a_later_edit_to_the_number() {
+        // Without this: type number -> we set Visa -> user corrects to
+        // Mastercard -> user fixes a typo in the number -> we silently
+        // restore Visa. Data loss wearing a convenience costume.
+        let mut draft = card_draft();
+        draft.set_number("4111111111111111");
+        assert_eq!(draft.brand, "Visa", "control: the suggestion works at all");
+        draft.pick_brand("Mastercard");
+        draft.set_number("4111111111111112");
+        assert_eq!(draft.brand, "Mastercard", "the user's pick was overwritten");
+    }
+
+    #[test]
+    fn an_untouched_brand_keeps_following_the_number() {
+        // The other half of the rule, asserted positively: the pick is what
+        // freezes the field, so a draft nobody picked on must still track.
+        // Without this, "the pick survives" would also pass on a form whose
+        // suggestion never ran a second time at all.
+        let mut draft = card_draft();
+        draft.set_number("4111111111111111");
+        assert_eq!(draft.brand, "Visa");
+        draft.set_number("378282246310005");
+        assert_eq!(draft.brand, "American Express", "an unpicked brand stopped following");
+    }
+
+    #[test]
+    fn an_unrecognised_prefix_leaves_the_brand_alone_rather_than_clearing_it() {
+        // A partially typed number passes through prefixes matching nothing,
+        // and a brand that flickers empty while typing reads as broken.
+        let mut draft = card_draft();
+        draft.set_number("4111");
+        assert_eq!(draft.brand, "Visa");
+        draft.set_number("9");
+        assert_eq!(draft.brand, "Visa", "an unrecognised prefix cleared the brand");
+        draft.set_number("");
+        assert_eq!(draft.brand, "Visa", "clearing the number cleared the brand");
+        // Control: the field is not simply frozen -- a recognised prefix
+        // still moves it, so the two cases above are about recognition.
+        draft.set_number("6011111111111117");
+        assert_eq!(draft.brand, "Discover");
+    }
+
+    #[test]
+    fn a_brand_that_arrived_on_the_item_is_treated_as_already_chosen() {
+        // Somebody chose it -- here, in another Bitwarden client, or in an
+        // import -- and overwriting it because the user retyped a digit is
+        // the same data loss one step earlier.
+        let mut item = crate::vault_bridge::VaultItem {
+            id: "card-1".into(),
+            name: "Ledgerline Debit".into(),
+            fields: Vec::new(),
+            login: None,
+            card: Some(CardData {
+                brand: Some("Mastercard".into()),
+                number: Some(Zeroizing::new("5555555555554444".into())),
+                ..CardData::default()
+            }),
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(3),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        let mut draft = EditDraft::from_item(&item);
+        draft.card.set_number("4111111111111111");
+        assert_eq!(draft.card.brand, "Mastercard", "an inherited brand was overwritten");
+
+        // The control, and it is the reason this is not vacuous: the SAME
+        // path with no brand on the item does suggest, so "inherited" is
+        // what decides it rather than "came from an item".
+        item.card.as_mut().unwrap().brand = None;
+        let mut blank = EditDraft::from_item(&item);
+        blank.card.set_number("4111111111111111");
+        assert_eq!(blank.card.brand, "Visa", "a card with no brand got no suggestion");
+    }
+
+    #[test]
+    fn every_suggestion_is_a_spelling_the_dropdown_also_offers() {
+        // Interoperability, not tidiness: `brand` is shared with every other
+        // Bitwarden client and the web vault draws its own card art from that
+        // string, so "MC" gives a card that renders here and blank
+        // everywhere else. Driven from the enumeration, so a brand added
+        // later cannot be half-wired.
+        let offered: Vec<&str> = CARD_BRANDS.iter().map(|b| b.canonical()).collect();
+        for brand in CARD_BRANDS {
+            let number = match brand {
+                CardBrand::Visa => "4111111111111111",
+                CardBrand::Mastercard => "5555555555554444",
+                CardBrand::AmericanExpress => "378282246310005",
+                CardBrand::Discover => "6011111111111117",
+                CardBrand::Jcb => "3530111333300000",
+                CardBrand::DinersClub => "30569309025904",
+                CardBrand::UnionPay => "6200000000000005",
+            };
+            let mut draft = card_draft();
+            draft.set_number(number);
+            assert_eq!(draft.brand, brand.canonical(), "{brand:?} suggested the wrong spelling");
+            assert!(
+                offered.contains(&draft.brand.as_str()),
+                "{brand:?} suggests {:?}, which the dropdown does not offer",
+                draft.brand
+            );
+        }
+    }
+
+    #[test]
+    fn picking_a_brand_changes_the_draft_but_re_picking_the_same_one_does_not() {
+        // `brand_touched` is view state and `brand` is content -- see
+        // `EditDraft::content_digest`. Paired both ways: a real change to the
+        // brand IS dirty, and a click that lands on the value already showing
+        // is not.
+        let mut draft = EditDraft::empty_of(ItemKind::Card);
+        assert!(!draft.is_dirty(), "a blank card form opened dirty");
+        draft.card.pick_brand("");
+        assert!(!draft.is_dirty(), "merely touching the dropdown made the form dirty");
+        draft.card.pick_brand("Visa");
+        assert!(draft.is_dirty(), "choosing a brand did not register as a change");
     }
 }
