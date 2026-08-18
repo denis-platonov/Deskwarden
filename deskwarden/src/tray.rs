@@ -595,6 +595,91 @@ fn set_tooltip(tray: &AppTray, text: String) {
 mod tests {
     use super::*;
     use crate::accounts::Account;
+    use tray_icon::menu::ContextMenu;
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuStringW, HMENU, MF_BYPOSITION};
+
+    /// The label Windows itself holds for the item at `position` of `menu`.
+    ///
+    /// **`MenuItem::text()` must never be called from this file, and this
+    /// exists so that it does not have to be.** muda 0.15.3 reads a menu
+    /// item's label like this (`platform_impl/windows/mod.rs`):
+    ///
+    /// ```text
+    /// info.cch += 1;
+    /// info.dwTypeData = Vec::with_capacity(info.cch as usize).as_mut_ptr();
+    /// GetMenuItemInfoW(*hmenu, self.internal_id(), false.into(), &mut info);
+    /// let text = decode_wide(info.dwTypeData);
+    /// ```
+    ///
+    /// That `Vec` is a temporary. It is dropped -- and its buffer handed back
+    /// to the allocator -- at the semicolon, *before* `GetMenuItemInfoW`
+    /// writes the label into it and before `decode_wide` reads it back. It is
+    /// a use-after-free whose window is one Win32 call wide. On a quiet thread
+    /// the freed block is still intact and the label comes back right, which
+    /// is why this looks like a working API; under `cargo test`, with a couple
+    /// of thousand tests allocating on other threads, another thread
+    /// occasionally takes that block first and `text()` answers with something
+    /// that is not the label.
+    ///
+    /// Measured, not supposed: 6 failures in 200 runs of `tray::` at
+    /// `--test-threads=16` on `1d0f98d`, every one of them a row that the line
+    /// immediately above had just found by the same call -- i.e. two reads of
+    /// one unchanged item disagreeing. That is the whole of the "these two
+    /// tests are flaky" report.
+    ///
+    /// So labels are read by POSITION, out of the menu handle, into a buffer
+    /// that is alive for the call. muda's `add_menu_item` appends to `hmenu`
+    /// and `hpopupmenu` in the same order it pushes into `children`, so
+    /// position `i` here is `menu.items()[i]`.
+    fn label_at(menu: &Submenu, position: usize) -> String {
+        let hmenu = HMENU(menu.hpopupmenu() as *mut std::ffi::c_void);
+        let position = u32::try_from(position).expect("a menu position");
+        // `None` asks for the length; a separator answers 0 and has no label.
+        let len = unsafe { GetMenuStringW(hmenu, position, None, MF_BYPOSITION) };
+        assert!(len >= 0, "there is no item at position {position} of the menu");
+        if len == 0 {
+            return String::new();
+        }
+        // `len + 1`, because the copy is NUL-terminated and `cchmax` counts
+        // the terminator. The buffer is a named binding, so it outlives the
+        // call that fills it -- which is the entire difference from `text()`.
+        let mut buf = vec![0u16; len as usize + 1];
+        let copied = unsafe { GetMenuStringW(hmenu, position, Some(&mut buf), MF_BYPOSITION) };
+        assert_eq!(copied, len, "the label at position {position} was copied short");
+        String::from_utf16_lossy(&buf[..copied as usize])
+    }
+
+    /// Every row of `menu`, in order, with separators spelled out.
+    fn labels(menu: &Submenu) -> Vec<String> {
+        menu.items()
+            .iter()
+            .enumerate()
+            .map(|(i, item)| match item.as_menuitem() {
+                Some(_) => label_at(menu, i),
+                None => "<separator>".to_string(),
+            })
+            .collect()
+    }
+
+    /// The position of the one row labelled `text`, or a panic naming what was
+    /// there instead -- which is the report a `find` returning `None` owes.
+    fn row(menu: &Submenu, text: &str) -> usize {
+        let labels = labels(menu);
+        labels
+            .iter()
+            .position(|l| l == text)
+            .unwrap_or_else(|| panic!("no item labelled {text:?}; the menu holds {labels:?}"))
+    }
+
+    /// `text`'s row, as a `MenuItem`. `is_enabled` reads `MIIM_STATE` and takes
+    /// no buffer, so it is sound to call; only `text()` is not.
+    fn item_at(menu: &Submenu, position: usize) -> MenuItem {
+        menu.items()
+            .into_iter()
+            .nth(position)
+            .and_then(|item| item.as_menuitem().cloned())
+            .unwrap_or_else(|| panic!("position {position} is not a menu item"))
+    }
 
     // Two ids, spelled out rather than generated, so the assertions below name
     // a specific account and not "whichever one came back".
@@ -843,15 +928,7 @@ mod tests {
         let plan = accounts_menu_plan(Some(&two_accounts()));
         let menu = build_accounts_submenu(&submenu, &plan);
 
-        let labels: Vec<String> = submenu
-            .items()
-            .iter()
-            .map(|item| {
-                item.as_menuitem()
-                    .map(MenuItem::text)
-                    .unwrap_or_else(|| "<separator>".to_string())
-            })
-            .collect();
+        let labels = labels(&submenu);
         assert!(
             labels.iter().any(|l| l.contains("one@example.com")),
             "the submenu never says which account you are on: {labels:?}"
@@ -870,21 +947,13 @@ mod tests {
         );
 
         // ...and the ids the caller will get back name those same items.
-        let switch_row = submenu
-            .items()
-            .into_iter()
-            .find(|item| item.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com"))
-            .expect("the switch row was just asserted to be there");
+        let switch_row = item_at(&submenu, row(&submenu, "two@example.com"));
         assert_eq!(
             menu.account_for_menu_id(switch_row.id()),
             Some(&id(B)),
             "clicking the row labelled `two@example.com` would not switch to that account"
         );
-        let add_row = submenu
-            .items()
-            .into_iter()
-            .find(|item| item.as_menuitem().map(MenuItem::text).as_deref() == Some(ADD_ACCOUNT))
-            .expect("the add row was just asserted to be there");
+        let add_row = item_at(&submenu, row(&submenu, ADD_ACCOUNT));
         assert!(menu.is_add(add_row.id()));
         assert_eq!(
             menu.account_for_menu_id(add_row.id()),
@@ -900,16 +969,7 @@ mod tests {
     fn the_header_and_the_notice_are_disabled_and_the_switch_rows_are_not() {
         let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
         build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&two_accounts())));
-        let enabled = |text: &str| {
-            submenu
-                .items()
-                .into_iter()
-                .find_map(|item| {
-                    let item = item.as_menuitem()?;
-                    (item.text() == text).then(|| item.is_enabled())
-                })
-                .unwrap_or_else(|| panic!("no item labelled {text:?}"))
-        };
+        let enabled = |text: &str| item_at(&submenu, row(&submenu, text)).is_enabled();
         assert!(
             !enabled("Signed in: one@example.com"),
             "the account you are already on is offered as a switch target"
@@ -921,14 +981,7 @@ mod tests {
 
         let lone = Submenu::new(ACCOUNTS_SUBMENU, true);
         build_accounts_submenu(&lone, &accounts_menu_plan(Some(&one_account())));
-        let notice = lone
-            .items()
-            .into_iter()
-            .find_map(|item| {
-                let item = item.as_menuitem()?;
-                (item.text() == "No other accounts yet").then(|| item.is_enabled())
-            })
-            .expect("the lone-account notice was not built");
+        let notice = item_at(&lone, row(&lone, "No other accounts yet")).is_enabled();
         assert!(!notice, "the explanatory notice invites a click it cannot serve");
     }
 
@@ -944,14 +997,7 @@ mod tests {
         let before = submenu.items().len();
         assert!(before > 2, "control: the first build really put rows in");
         let stale = first
-            .account_for_menu_id(
-                submenu
-                    .items()
-                    .iter()
-                    .find(|i| i.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com"))
-                    .expect("the first build's switch row")
-                    .id(),
-            )
+            .account_for_menu_id(item_at(&submenu, row(&submenu, "two@example.com")).id())
             .cloned()
             .expect("the first build mapped that row to an account");
         assert_eq!(stale, id(B));
@@ -959,10 +1005,7 @@ mod tests {
         // The user removed B and the app rebuilt.
         let second = build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&one_account())));
         assert!(
-            !submenu
-                .items()
-                .iter()
-                .any(|i| i.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com")),
+            !labels(&submenu).iter().any(|l| l == "two@example.com"),
             "the removed account is still a clickable row in the submenu"
         );
         assert!(
@@ -1018,10 +1061,13 @@ mod tests {
     /// no call site can choose it again and the compiler enforces it.
     #[test]
     fn releasing_the_sync_item_leaves_it_labelled_idle_not_busy() {
-        let item = MenuItem::new("Sync", true, None);
+        // In a menu, as the real one is: an item that is in no menu answers
+        // `text()` out of its own field, which would make this a test of a
+        // `String` rather than of what the user's menu says.
+        let (menu, item) = sync_item_in_a_menu();
 
         sync_item_to_in_progress(&item);
-        assert_eq!(item.text(), "Syncing...");
+        assert_eq!(label_at(&menu, 0), "Syncing...");
         assert!(!item.is_enabled());
 
         sync_item_to_idle(&item);
@@ -1030,7 +1076,7 @@ mod tests {
             "the whole point of the release is that the item is clickable again"
         );
         assert_eq!(
-            item.text(),
+            label_at(&menu, 0),
             "Sync",
             "an enabled item still reading \"Syncing...\" tells the user not to click the one \
              affordance the stand-down message names"
@@ -1042,12 +1088,21 @@ mod tests {
     /// rather than something in flight.
     #[test]
     fn the_failed_sync_label_is_enabled_and_says_what_to_do() {
-        let item = MenuItem::new("Sync", true, None);
+        let (menu, item) = sync_item_in_a_menu();
         sync_item_to_in_progress(&item);
         sync_item_to_failed(&item);
 
         assert!(item.is_enabled());
-        assert_eq!(item.text(), "Sync failed - click to retry");
+        assert_eq!(label_at(&menu, 0), "Sync failed - click to retry");
+    }
+
+    /// A "Sync" item that really is a row of a menu, so its label can be read
+    /// from the menu rather than from the item's own copy of it.
+    fn sync_item_in_a_menu() -> (Submenu, MenuItem) {
+        let menu = Submenu::new("Deskwarden", true);
+        let item = MenuItem::new("Sync", true, None);
+        menu.append(&item).expect("a fresh submenu accepts an item");
+        (menu, item)
     }
 
     #[test]
@@ -1064,5 +1119,36 @@ mod tests {
             "the icon resource embedded by build.rs could not be loaded by ordinal \
              {APP_ICON_RESOURCE_ID}"
         );
+    }
+
+    /// **No code in this file may read a menu label through muda.**
+    ///
+    /// The fix for the intermittent failures documented on [`label_at`] was
+    /// not to rewrite one assertion: it was to take the unsound call out of
+    /// this file entirely. That only stays true if the next test written here
+    /// cannot reach for it again -- and it is the obvious thing to reach for,
+    /// because it reads like an accessor and it works nine hundred and
+    /// ninety-odd times out of a thousand. So the ban is checked rather than
+    /// remembered.
+    ///
+    /// The needles are split so that this test is not itself an instance of
+    /// what it forbids.
+    #[test]
+    fn no_label_in_this_file_is_read_through_mudas_unsound_text() {
+        let source = include_str!("tray.rs");
+        for needle in [concat!(".text", "()"), concat!("MenuItem", "::text)")] {
+            let offenders: Vec<(usize, &str)> = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(needle))
+                .map(|(n, line)| (n + 1, line.trim()))
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "{needle:?} is a use-after-free in muda 0.15.3 and returns a corrupted label \
+                 under a parallel test run -- see `label_at`, which reads the same label \
+                 soundly and by position. Offending lines: {offenders:?}"
+            );
+        }
     }
 }
