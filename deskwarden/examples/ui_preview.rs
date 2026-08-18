@@ -307,6 +307,12 @@ fn main() -> eframe::Result {
         }),
     );
 
+    // **The run's own error comes first.** Counting before propagating it
+    // turned a real eframe failure into "wrote 0 PNG(s)", which says nothing
+    // about why -- measured on a CI runner, where this masked the actual
+    // cause for a whole run.
+    outcome?;
+
     // **The walk checks its own arithmetic, so CI does not have to.**
     //
     // The workflow used to assert a hardcoded PNG count. It said nine
@@ -331,7 +337,7 @@ fn main() -> eframe::Result {
             ALL.len()
         );
     }
-    outcome
+    Ok(())
 }
 
 /// How many settled frames a surface gets before it is captured.
