@@ -58,6 +58,11 @@ pub mod preflight_host;
 pub mod prefs_ui;
 pub mod qr;
 pub mod record;
+/// The 6b dimmed full-screen surface a QR code is dragged out of. **At the
+/// crate root and not under `vault_window`**, which carries a guard requiring
+/// every UI module there to have a production caller; this one has none until
+/// the picker is wired to it, exactly as `screen_capture` below has none yet.
+pub mod region_overlay;
 pub mod reprompt;
 pub mod scratch_window;
 /// Copies one rectangle of the screen into a self-wiping buffer of pixels.
