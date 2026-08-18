@@ -1023,15 +1023,33 @@ fn identity_groups(identity: &IdentityData) -> IdentityGroups {
         .collect()
 }
 
-/// The metadata strip's text: "Updated 3d ago · Filled N times ·
-/// Strength: X". `updated_days_ago` is `None` when the item carries no
-/// parseable `revisionDate` (shows "Updated recently" rather than
+/// The metadata strip's text: "Updated 3d ago · Password set 1y 35d ago ·
+/// Filled N times · Strength: X". `updated_days_ago` is `None` when the item
+/// carries no parseable `revisionDate` (shows "Updated recently" rather than
 /// fabricating a number).
 ///
-/// This is the *login* strip. [`metadata_line_for`] is what the pane calls;
-/// this stays as it was so a login's strip is provably byte-identical to what
-/// it rendered before kinds existed.
-pub fn metadata_line(updated_days_ago: Option<i64>, fill_count: u32, password: &str) -> String {
+/// **`password_age_days` is `None` far more often than the others, and then
+/// the segment is not there at all** -- no separator, no placeholder word.
+/// See [`password_age_date`] for which items can answer and which cannot;
+/// the point of the whole segment is that an unanswerable item says nothing
+/// rather than something reassuring.
+///
+/// # Why the age sits SECOND and not last
+///
+/// "Updated" and "Password set" are the two dates on this strip and they are
+/// the pair a reader has to compare: an item updated today whose password was
+/// set four years ago is the exact case the strip used to hide, and it only
+/// reads as a contrast if the two numbers are adjacent. Pushed to the end it
+/// would sit behind a fill count and a strength word, which is where a reader
+/// stops.
+///
+/// This is the *login* strip. [`metadata_line_for`] is what the pane calls.
+pub fn metadata_line(
+    updated_days_ago: Option<i64>,
+    fill_count: u32,
+    password: &str,
+    password_age_days: Option<i64>,
+) -> String {
     let updated = updated_text(updated_days_ago);
     let filled = if fill_count == 1 {
         "Filled 1 time".to_string()
@@ -1039,7 +1057,101 @@ pub fn metadata_line(updated_days_ago: Option<i64>, fill_count: u32, password: &
         format!("Filled {fill_count} times")
     };
     let strength = password_strength::rate(password).label();
-    format!("{updated} \u{b7} {filled} \u{b7} Strength: {strength}")
+    // The separator belongs to the segment, so an absent age leaves no
+    // orphaned "\u{b7}" behind it. `String::new()` is the whole "say nothing"
+    // path -- see `password_age_text`.
+    let age = match password_age_text(password_age_days) {
+        Some(text) => format!(" \u{b7} {text}"),
+        None => String::new(),
+    };
+    format!("{updated}{age} \u{b7} {filled} \u{b7} Strength: {strength}")
+}
+
+/// **Which date on the item is the age of the password the user is looking
+/// at** -- returned as the raw string, so this function is pure and knows no
+/// clock. [`days_since`] turns it into a number afterwards.
+///
+/// `history` is the `lastUsedDate` of each [`PasswordHistoryEntry`], in the
+/// order `vault_bridge::password_history` hands them back, which is the order
+/// `bw` sends: **newest first**.
+///
+/// # The three candidates, and why two of them are wrong
+///
+/// * **`revisionDate` is not it.** It moves when *anything* on the item
+///   changes -- a rename, an added note, a new URI, or this app writing a
+///   fill count back. An item whose password has not moved in four years can
+///   carry a `revisionDate` of this morning, so a strip built on it would
+///   report a four-year-old password as fresh. That is the failure this
+///   segment exists to end, so it cannot be built on the field that causes
+///   it.
+/// * **The OLDEST history entry is not it either.** That is when the *first*
+///   password the item ever had stopped being used, which for an item with
+///   five entries is four passwords ago.
+/// * **The newest history entry is it.** Bitwarden writes one entry each time
+///   the password changes, and its `lastUsedDate` is when that password
+///   *stopped* being current -- which is the same instant the password on
+///   screen right now *started* being current. That is the question, exactly.
+///
+/// # The item nobody has ever changed
+///
+/// Its history is empty, and this falls back to `creationDate` -- the item's
+/// password is as old as the item, because it is the password the item was
+/// created with. Measured on the user's live vault, `creationDate` is one of
+/// the keys `bw serve` puts on every item (see `vault_bridge`'s captured key
+/// set), so this is the common case rather than the exotic one.
+///
+/// **The one thing this must never do is fall back to `revisionDate` here.**
+/// A never-changed password on a recently-renamed item would then read
+/// "Password set today", which is a lie the user would act on -- and a
+/// feature that lies about the one item most likely to need attention is
+/// worse than no feature. When `creationDate` is absent or unparseable the
+/// answer is `None` and the strip says nothing.
+///
+/// # A history whose newest entry has no date
+///
+/// `None`, and deliberately not "reach past it to the next entry". The next
+/// entry is strictly older, so using it would report the password as older
+/// than it is -- a different wrong number, not a safer one. An entry with a
+/// password and no date is a shape `vault_bridge` keeps on purpose (the
+/// secret is still real and still worth showing as a row); it just cannot
+/// date the current password, and neither can anything else on the item.
+fn password_age_date<'a>(
+    history: &[Option<&'a str>],
+    creation_date: Option<&'a str>,
+) -> Option<&'a str> {
+    match history.first() {
+        Some(newest) => *newest,
+        None => creation_date,
+    }
+}
+
+/// How old the current password is, in words -- or `None`, which the strip
+/// renders as no segment at all.
+///
+/// **This is a fact, not a warning.** No colour of its own, no threshold, no
+/// "your password is old": the palette reserves red for secrets and amber for
+/// caution, and an age is neither. It is painted in [`theme::TEXT_FAINT`]
+/// with the rest of the strip because it is the same kind of thing as
+/// "Filled 41 times". The reader decides what four years means to them.
+///
+/// The wording is "Password set", one phrasing for both cases, rather than
+/// "changed" for an item with history and "created" for one without. Both are
+/// true of both: the password on screen was set at that moment, whether it
+/// replaced another one or arrived with the item. A strip that switched verbs
+/// would be leaking which of the two branches [`password_age_date`] took, and
+/// that is not a distinction the reader asked about.
+///
+/// `Some(n) if n <= 0` is "today" rather than "0d ago", the same floor
+/// [`updated_text`] and [`history_label`] impose and for the same reason.
+/// [`relative_time::ago_days`] above it, never `relative_time::ago` --
+/// [`days_since`] reads only the `YYYY-MM-DD` prefix, so a day is the finest
+/// resolution the data carries and an hour here would be invented.
+fn password_age_text(age_days: Option<i64>) -> Option<String> {
+    match age_days {
+        Some(n) if n <= 0 => Some("Password set today".to_string()),
+        Some(n) => Some(format!("Password set {}", relative_time::ago_days(n as u64))),
+        None => None,
+    }
 }
 
 /// When this item was last changed, in words.
@@ -1078,14 +1190,20 @@ fn updated_text(updated_days_ago: Option<i64>) -> String {
 /// under it -- the same "every item is a login" claim the subtitle was
 /// making, one line further down, and with the added insult of rating the
 /// strength of a password that does not exist.
+///
+/// A password's age is a login fact by the same argument and rides the same
+/// gate: a card's `passwordHistory` is empty and its `creationDate` is the
+/// card's, so an ungated strip would have dated a password that does not
+/// exist -- the identical insult one clause up.
 pub fn metadata_line_for(
     kind: ItemKind,
     updated_days_ago: Option<i64>,
     fill_count: u32,
     password: &str,
+    password_age_days: Option<i64>,
 ) -> String {
     if kind_offers_fill(kind) {
-        metadata_line(updated_days_ago, fill_count, password)
+        metadata_line(updated_days_ago, fill_count, password, password_age_days)
     } else {
         updated_text(updated_days_ago)
     }
@@ -3337,6 +3455,22 @@ pub fn draw_detail_read(
         .get("revisionDate")
         .and_then(|v| v.as_str())
         .and_then(days_since);
+    // **A different date from the one above, and that is the whole point.**
+    // `revisionDate` is when the ITEM changed; this is when the PASSWORD
+    // changed. `history` is the same vector the PREVIOUS PASSWORDS card was
+    // built from a few lines up, so the strip's number and those rows cannot
+    // disagree about what `bw` sent. See `password_age_date` for why the
+    // newest entry is the answer and why `creationDate` -- never
+    // `revisionDate` -- is the fallback for a password nobody has changed.
+    let history_dates: Vec<Option<&str>> = history
+        .iter()
+        .map(|entry| entry.last_used_date.as_deref())
+        .collect();
+    let password_age_days = password_age_date(
+        &history_dates,
+        item.other.get("creationDate").and_then(|v| v.as_str()),
+    )
+    .and_then(days_since);
     // The design's last tile: a card like the others, `padding: 13px 16px;
     // font-size: 12px; color: #7d7979`. It used to be a bare line of ghost text
     // on the pane's grey -- the one part of the body that sat on no surface at
@@ -3354,9 +3488,15 @@ pub fn draw_detail_read(
         .stroke(Stroke::new(1.0, theme::HAIRLINE))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let strip = RichText::new(metadata_line_for(kind, updated_days_ago, fill_count, password))
-                .size(ROW_LABEL_SIZE)
-                .color(theme::TEXT_FAINT);
+            let strip = RichText::new(metadata_line_for(
+                kind,
+                updated_days_ago,
+                fill_count,
+                password,
+                password_age_days,
+            ))
+            .size(ROW_LABEL_SIZE)
+            .color(theme::TEXT_FAINT);
             match segment {
                 // **The untouched path**, and deliberately the same call this
                 // card made before the badge existed rather than the pair
@@ -8661,10 +8801,15 @@ mod tests {
     /// Fill count and password strength are login facts. A secure note with
     /// "Filled 0 times \u{b7} Strength: Weak" under it is the same "everything
     /// is a login" claim as the subtitle was, one line further down.
+    ///
+    /// **A password's AGE rides the same gate**, and is checked here rather
+    /// than in a test of its own so the three login facts cannot drift apart:
+    /// a non-zero age is passed in, so a kind that leaked it would print a
+    /// real phrase rather than nothing and be caught.
     #[test]
     fn only_logins_claim_a_fill_count_and_a_password_strength() {
         for kind in EVERY_KIND {
-            let line = metadata_line_for(kind, Some(3), 0, "");
+            let line = metadata_line_for(kind, Some(3), 0, "", Some(400));
             assert!(line.contains("Updated 3d ago"), "{kind:?}: {line}");
             assert_eq!(
                 line.contains("Filled"),
@@ -8676,6 +8821,11 @@ mod tests {
                 kind_offers_fill(kind),
                 "{kind:?}: {line}"
             );
+            assert_eq!(
+                line.contains("Password set"),
+                kind_offers_fill(kind),
+                "{kind:?}: {line}"
+            );
         }
     }
 
@@ -8684,8 +8834,8 @@ mod tests {
     #[test]
     fn a_logins_metadata_strip_is_unchanged() {
         assert_eq!(
-            metadata_line_for(ItemKind::Login, Some(3), 41, "Tr0ub4dor&3xtraLong!"),
-            metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!")
+            metadata_line_for(ItemKind::Login, Some(3), 41, "Tr0ub4dor&3xtraLong!", Some(400)),
+            metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!", Some(400))
         );
     }
 
@@ -12299,14 +12449,19 @@ mod tests {
         assert_eq!(groups[0].1, vec![("Address 3", "Flat 3".to_string())]);
     }
 
+    /// Re-pinned with an explicit `None` age rather than loosened: these three
+    /// strings are the strip for an item that **cannot** date its password,
+    /// and they are byte-for-byte what they were before the segment existed.
+    /// That is the property worth pinning -- an absent age adds no separator,
+    /// no gap and no placeholder word.
     #[test]
     fn metadata_line_pluralizes_fill_count() {
         assert_eq!(
-            metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!"),
+            metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!", None),
             "Updated 3d ago \u{b7} Filled 41 times \u{b7} Strength: Strong"
         );
         assert_eq!(
-            metadata_line(Some(1), 1, "weak"),
+            metadata_line(Some(1), 1, "weak", None),
             "Updated 1d ago \u{b7} Filled 1 time \u{b7} Strength: Weak"
         );
     }
@@ -12314,7 +12469,7 @@ mod tests {
     #[test]
     fn metadata_line_handles_missing_update_date() {
         assert_eq!(
-            metadata_line(None, 0, ""),
+            metadata_line(None, 0, "", None),
             "Updated recently \u{b7} Filled 0 times \u{b7} Strength: Weak"
         );
     }
@@ -12322,9 +12477,139 @@ mod tests {
     #[test]
     fn metadata_line_handles_today() {
         assert_eq!(
-            metadata_line(Some(0), 5, "abc"),
+            metadata_line(Some(0), 5, "abc", None),
             "Updated today \u{b7} Filled 5 times \u{b7} Strength: Weak"
         );
+    }
+
+    /// The strip WITH an age, pinned whole -- the segment's position between
+    /// the two dates included, since that placement is the argument for the
+    /// whole feature (see [`metadata_line`]).
+    ///
+    /// The second case is the one the feature exists for and the one the old
+    /// strip could not tell apart from the first: an item touched today whose
+    /// password has not moved in over three years.
+    #[test]
+    fn the_strip_carries_the_passwords_own_age_between_the_two_dates() {
+        assert_eq!(
+            metadata_line(Some(3), 41, "Tr0ub4dor&3xtraLong!", Some(400)),
+            "Updated 3d ago \u{b7} Password set 1y 35d ago \u{b7} Filled 41 times \
+             \u{b7} Strength: Strong"
+        );
+        assert_eq!(
+            metadata_line(Some(0), 41, "Tr0ub4dor&3xtraLong!", Some(1200)),
+            "Updated today \u{b7} Password set 3y 105d ago \u{b7} Filled 41 times \
+             \u{b7} Strength: Strong"
+        );
+    }
+
+    /// A password set today is named, not counted -- the same floor
+    /// `updated_text` and `history_label` impose.
+    #[test]
+    fn a_password_set_today_is_named_rather_than_counted() {
+        assert_eq!(password_age_text(Some(0)), Some("Password set today".into()));
+        assert_eq!(password_age_text(Some(-4)), Some("Password set today".into()));
+    }
+
+    /// **The absent case says nothing at all** -- not "recently", not
+    /// "unknown". `updated_text` can fall back to a word because the item
+    /// certainly was updated at some point; nothing here knows the password
+    /// ever was.
+    #[test]
+    fn an_undatable_password_prints_no_segment() {
+        assert_eq!(password_age_text(None), None);
+        assert!(!metadata_line(Some(3), 1, "abc", None).contains("Password"));
+    }
+
+    /// The unit is a day, because `days_since` reads only `YYYY-MM-DD`. An
+    /// hour here would be invented precision, so the wording is
+    /// `relative_time::ago_days`'s and is checked to be exactly that.
+    #[test]
+    fn the_age_is_worded_in_days_never_hours() {
+        for days in [1_i64, 2, 45, 364, 365, 366, 1000] {
+            assert_eq!(
+                password_age_text(Some(days)),
+                Some(format!("Password set {}", relative_time::ago_days(days as u64)))
+            );
+            assert!(
+                !password_age_text(Some(days)).unwrap().contains('h'),
+                "{days} invented an hour"
+            );
+        }
+    }
+
+    // -- which date is the password's age -----------------------------
+
+    const CREATED: &str = "2019-03-04T05:06:07.000Z";
+    const NEWEST: &str = "2024-11-12T00:00:00.000Z";
+    const OLDER: &str = "2021-06-01T00:00:00.000Z";
+    const OLDEST: &str = "2020-01-01T00:00:00.000Z";
+
+    /// **Never changed**: no history, so the password is as old as the item
+    /// and `creationDate` is the honest answer.
+    #[test]
+    fn a_password_nobody_ever_changed_is_as_old_as_the_item() {
+        assert_eq!(password_age_date(&[], Some(CREATED)), Some(CREATED));
+    }
+
+    /// **Never changed and no creation date**: nothing to say, and saying
+    /// nothing is the requirement. The failure this forbids is the strip
+    /// reaching for `revisionDate` and announcing "Password set today" over a
+    /// password nobody has touched since the item was made -- so the test
+    /// also asserts the whole strip stays silent rather than only that the
+    /// date is `None`.
+    #[test]
+    fn a_never_changed_password_with_no_creation_date_says_nothing() {
+        assert_eq!(password_age_date(&[], None), None);
+        let age = password_age_date(&[], None).and_then(days_since);
+        let strip = metadata_line(Some(0), 3, "abc", age);
+        assert!(!strip.contains("Password set"), "{strip}");
+        assert!(strip.contains("Updated today"), "{strip}");
+    }
+
+    /// **Changed once**: one entry, and its `lastUsedDate` is when the
+    /// password on screen replaced it. `creationDate` is present and must
+    /// lose -- it is older, and using it would overstate the age by years.
+    #[test]
+    fn a_password_changed_once_is_dated_by_that_change_not_by_creation() {
+        assert_eq!(
+            password_age_date(&[Some(NEWEST)], Some(CREATED)),
+            Some(NEWEST)
+        );
+    }
+
+    /// **Changed many times**: `bw` sends newest first, and only the newest
+    /// entry describes the current password. Picking the oldest would date
+    /// the password four changes ago.
+    #[test]
+    fn a_password_changed_many_times_is_dated_by_the_newest_entry() {
+        let history = [Some(NEWEST), Some(OLDER), Some(OLDEST)];
+        assert_eq!(password_age_date(&history, Some(CREATED)), Some(NEWEST));
+    }
+
+    /// **A malformed date is carried through, not laundered.**
+    /// `password_age_date` is a pure pick and does not parse; `days_since`
+    /// then rejects it and the strip prints no segment. Checked end to end,
+    /// because "the pick returned a string" is not the property that matters
+    /// -- "the user sees no number" is.
+    #[test]
+    fn a_malformed_date_ends_in_no_segment_rather_than_a_wrong_number() {
+        assert_eq!(days_since("not-a-date"), None);
+        let picked = password_age_date(&[Some("not-a-date")], Some(CREATED));
+        assert_eq!(picked, Some("not-a-date"));
+        assert_eq!(password_age_text(picked.and_then(days_since)), None);
+    }
+
+    /// **An entry with no date does not let the pick reach past it.** The
+    /// next entry is strictly older, so using it would report the password as
+    /// older than it is -- a different wrong number, not a safer one. And
+    /// `creationDate` must not rescue it either: the password provably is not
+    /// the one the item was created with, because the history says it
+    /// changed.
+    #[test]
+    fn a_dateless_newest_entry_does_not_fall_back_to_anything_older() {
+        assert_eq!(password_age_date(&[None, Some(OLDER)], Some(CREATED)), None);
+        assert_eq!(password_age_date(&[None], Some(CREATED)), None);
     }
 
     // -----------------------------------------------------------------
@@ -20121,11 +20406,15 @@ mod breach_badge_tests {
 
     /// The strip these tests expect beside the badge: `fill_count` is 3 in
     /// the harness below and the fixture carries no `revisionDate`, so
-    /// `metadata_line_for` is `metadata_line(None, 3, PASSWORD)`. Named
-    /// through the production function, never written out, so a reworded
-    /// strip moves this with it instead of failing here.
+    /// `metadata_line_for` is `metadata_line(None, 3, PASSWORD, None)`. The
+    /// last `None` is why the geometry constants below did not move when the
+    /// password-age segment landed: this fixture carries no `passwordHistory`
+    /// and no `creationDate` either, so it cannot date its password and
+    /// prints no segment. Named through the production function, never
+    /// written out, so a reworded strip moves this with it instead of
+    /// failing here.
     fn strip_text() -> String {
-        metadata_line(None, 3, PASSWORD)
+        metadata_line(None, 3, PASSWORD, None)
     }
 
     /// An item of `kind` carrying a login block with `password` in it.
@@ -20383,6 +20672,117 @@ mod breach_badge_tests {
         painted
     }
 
+    /// The same fixture with a `creationDate` on it, so its password HAS a
+    /// datable age: a login created in 2019 whose password nobody has ever
+    /// changed. That is the item the age segment was built for and the one
+    /// the old strip could not distinguish from a fresh one.
+    fn an_item_that_can_date_its_password() -> VaultItem {
+        let mut item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        item.other.insert(
+            "creationDate".to_string(),
+            serde_json::Value::String("2019-03-04T05:06:07.000Z".to_string()),
+        );
+        item
+    }
+
+    /// **Does a fourth fact fit? Measured, not assumed.**
+    ///
+    /// The strip is drawn through `horizontal_wrapped` and the card is sized
+    /// to it, so "does not fit" here does not mean glyphs outside the card --
+    /// it means the card grows a row taller. Both widths are checked: the
+    /// 900pt pane, where the strip has room, and `NARROW`, the detail
+    /// column's minimum, where the strip already wrapped to two rows before
+    /// this segment existed (`BASELINE_CARD_NARROW` is 54pt against 41pt
+    /// wide).
+    ///
+    /// The assertion is that the segment is INSIDE the card at both widths
+    /// and that the wide card is still one row. The narrow card's height is
+    /// pinned to whatever it measures so a future rewording that costs
+    /// another row cannot land silently.
+    #[test]
+    fn the_password_age_segment_stays_inside_the_card_at_both_widths() {
+        let item = an_item_that_can_date_its_password();
+        for (width, label) in [(PANE, "wide"), (NARROW, "narrow")] {
+            let frame = painted(&item, false, BreachStatus::Safe, width, false);
+            let strip = frame.only("Password set");
+            let card = frame.card_around(strip);
+            assert!(
+                card.contains_rect(strip.ink),
+                "{label}: the strip's ink {:?} left the card {card:?}",
+                strip.ink
+            );
+            assert!(
+                !strip.rendered.is_empty(),
+                "{label}: the strip laid out no glyphs at all"
+            );
+            assert!(
+                strip.text.contains("Password set"),
+                "{label}: {}",
+                strip.text
+            );
+        }
+    }
+
+    /// The metadata card at the detail column's minimum width **with** the
+    /// age segment on it, measured. `BASELINE_CARD_NARROW` is the same card
+    /// without it. The difference between the two is the whole cost of this
+    /// feature at the worst width the app can be put in: 54pt -> 67pt, one
+    /// wrapped row of the strip's own 13pt line height. Three rows, not two.
+    /// Nothing leaves the card -- `horizontal_wrapped` reflows and the card
+    /// is sized to what it reflowed to -- and the pane scrolls, so the cost
+    /// is a taller tile at the narrowest width the window can be dragged to
+    /// and nothing at all at the width it opens at.
+    const NARROW_CARD_WITH_AGE: (f32, f32) = (251.0, 67.0);
+
+    /// **What the fourth fact costs the card**, both widths, pinned.
+    ///
+    /// Wide: the card is still `BASELINE_CARD`'s single row -- 852x41 -- so
+    /// at any width a user is likely to read this pane at, the segment fits
+    /// the strip and nothing moved.
+    ///
+    /// Narrow: the detail column's minimum. Recorded rather than argued: if
+    /// this ever exceeds three rows the segment has stopped fitting and
+    /// belongs on its own line under the strip instead.
+    #[test]
+    fn the_age_segment_costs_no_row_at_full_width() {
+        let item = an_item_that_can_date_its_password();
+        let wide = painted(&item, false, BreachStatus::Safe, PANE, false);
+        let card = wide.card_around(wide.only("Password set"));
+        assert_eq!(
+            (card.width(), card.height()),
+            BASELINE_CARD,
+            "the age segment pushed the metadata card off its single row at {PANE}pt"
+        );
+
+        let narrow = painted(&item, false, BreachStatus::Safe, NARROW, false);
+        let narrow_card = narrow.card_around(narrow.only("Password set"));
+        assert_eq!(
+            (narrow_card.width(), narrow_card.height()),
+            NARROW_CARD_WITH_AGE,
+            "the age segment changed what the strip costs at the column's minimum width"
+        );
+    }
+
+    /// **And an item that cannot date its password did not move at all.**
+    /// The pair above is only worth having if the segment is genuinely
+    /// absent, not merely empty-looking, when there is no date -- an empty
+    /// run still allocates.
+    #[test]
+    fn an_item_with_no_dates_paints_no_age_run() {
+        let frame = painted(
+            &an_item_of(ItemKind::Login, Some(PASSWORD)),
+            false,
+            BreachStatus::Safe,
+            NARROW,
+            false,
+        );
+        assert!(
+            frame.matching("Password set").is_empty(),
+            "a dateless item painted an age: {:?}",
+            frame.runs.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+    }
+
     /// The metadata card's WIDTH and HEIGHT on the unchanged tree, measured
     /// on `a506592` (the commit before this badge existed) for this exact
     /// fixture: a login with `PASSWORD`, `fill_count` 3, no `revisionDate`,
@@ -20407,7 +20807,7 @@ mod breach_badge_tests {
         // Byte-identical, compared against `metadata_line`'s own output --
         // not against a copy of the wording written out here.
         let strip = off.only(&strip_text());
-        assert_eq!(strip.text, metadata_line(None, 3, PASSWORD));
+        assert_eq!(strip.text, metadata_line(None, 3, PASSWORD, None));
         assert_eq!(strip.color, theme::TEXT_FAINT);
         assert!(strip.color.a() > 0, "the strip is painted at alpha 0");
 
