@@ -105,22 +105,34 @@ will say what it actually does before it does it.
   copied. This is not a setting: there is no version of "keep my passwords in
   `Win+V`" worth offering.
 
-  **A copied secret is taken back off the clipboard.** It is cleared 45
-  seconds after you copy it, and immediately when you lock the vault, when
-  the vault is locked for you after idling, when you switch, add or remove an
-  account, and when you quit Deskwarden from the tray. Each of those checks
-  first that what is on the clipboard is still what Deskwarden put there — if
-  you have copied anything else since, from any program, Deskwarden leaves it
-  alone. Closing the vault window on its own does *not* clear it, because
-  closing it in order to paste somewhere is the ordinary thing to do; the 45
-  seconds still apply.
+  **A copied secret is taken back off the clipboard, and this part you
+  control.** Out of the box it is cleared one minute after you copy it, and
+  immediately when you lock the vault (by hand, from the tray, after idling,
+  or because the session expired), when you switch, add or remove an account,
+  and when you quit Deskwarden from the tray or it shuts down to install an
+  update.
+
+  All four are settings — Preferences → *Clipboard*. One switch turns the
+  whole thing off; three more govern the vault-locks, account-changes and
+  quits cases individually; and the interval can be set to anything from half
+  a minute to an hour. They all ship **on**, at one minute. Turning any of
+  them off is a real reduction in what Deskwarden does for you, and it is
+  offered because the cost of getting the trade wrong falls on your own
+  paste, not on anyone else.
+
+  Whatever those settings say, each clear checks first that what is on the
+  clipboard is still what Deskwarden put there — if you have copied anything
+  else since, from any program, Deskwarden leaves it alone. That check is not
+  a setting and cannot be turned off. Closing the vault window on its own
+  does *not* clear it, because closing it in order to paste somewhere is the
+  ordinary thing to do; the timer still applies.
 
   **What is not fixed:** for as long as the value is on the clipboard, any
   other program on your machine can read it. That is a property of Windows
   rather than of Deskwarden, and it is why the autofill path types instead.
   Clearing on quit also only covers a quit that actually happens — if
   Deskwarden is killed or the machine loses power while a secret is on the
-  clipboard, it stays there.
+  clipboard, it stays there, and no setting can change that.
 - No secret is written to a log file. Types that carry key material have
   hand-written debug output that refuses to print it.
 
@@ -146,19 +158,33 @@ It collects no personal information from anyone, of any age.
   reason given above: the disclosure is an IP address, and the cost of the
   other default is a user who is never told about a security fix and has no
   symptom to notice.
+- **Clearing a copied secret is on by default and every part of it can be
+  changed** — Preferences → *Clipboard*. A master switch, one switch each for
+  clearing when the vault locks, when the account changes and when Deskwarden
+  quits, and the interval, which accepts a decimal number of minutes anywhere
+  from `0.5` (thirty seconds) to `60`. Thirty seconds is the shortest on
+  purpose: below it the clipboard tends to expire before a slow sign-in page
+  is ready, which teaches you to copy twice and is worse than not clearing at
+  all. There is no "never" in the interval — that is what the master switch
+  is for, and a setting that means "off" should say so.
 - **Clipboard history exclusion is not a choice, deliberately.** Keeping a
   copied password out of `Win+V` and off your other devices has no setting
   and cannot be turned off, because there is no reason anyone would want the
-  other behaviour. It is listed here so that "everything is switchable" is
-  not read as a promise this section does not make.
+  other behaviour. It is unaffected by every switch in the paragraph above:
+  those govern whether the value is taken back *afterwards*, not whether
+  Windows was allowed to keep a copy of it in the first place. It is listed
+  here so that "everything is switchable" is not read as a promise this
+  section does not make.
 - **Everything else is local**, and deleting `%APPDATA%\Deskwarden` removes
   it.
 
 **Every network request this application makes on its own is something you
 can switch off**, and each of the three has its own row on Preferences →
 General. That is a statement about network requests specifically, not about
-every behaviour — the clipboard rules above are not requests and are not
-optional. The vault server is the exception, and only in the sense that
+every behaviour: some of what is described above is optional and some is not,
+and the clipboard section is both — when a copied secret is taken back is
+yours to set, while keeping it out of `Win+V` in the first place is not.
+The vault server is the exception, and only in the sense that
 Deskwarden never contacts it: that is `bw`, which you installed and signed
 in to.
 
