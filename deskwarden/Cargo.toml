@@ -71,6 +71,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     # CF_UNICODETEXT and the CLIPBOARD_FORMAT newtype it is expressed in.
     "Win32_System_Ole",
+    # WTSRegisterSessionNotification, so this process is told when the
+    # workstation is locked (Win+L) or the session is switched away from and
+    # can lock the vault at that moment instead of waiting out the idle timer
+    # (src/away_lock.rs). The WTS_SESSION_* codes it matches on live here too.
+    # No window is created for it: the registration goes on the hidden helper
+    # window the tray icon already owns.
+    "Win32_System_RemoteDesktop",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

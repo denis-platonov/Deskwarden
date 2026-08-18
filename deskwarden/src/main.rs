@@ -1230,6 +1230,20 @@ fn main() {
     // removal and switch, and rebuilding mints new `MenuId`s that the tray has
     // to remember.
     let mut tray = tray::build_tray();
+    // **Workstation-lock notifications, on a window that already exists.**
+    //
+    // Deliberately AFTER `build_tray`: `away_lock` creates no window of its
+    // own and instead registers on one of the hidden `WS_EX_TOOLWINDOW`
+    // helpers this thread already owns (see its module doc for why a
+    // message-only window would have been the wrong answer -- broadcasts,
+    // and therefore `WM_POWERBROADCAST`, do not reach one). Before this line
+    // there is at most the hotkey manager's; after it there are two, and
+    // either will do.
+    //
+    // Held for the life of the process purely so its `Drop` unregisters.
+    // `None` -- no helper window, or the registration refused -- is logged in
+    // there and costs the Win+L half of the feature, nothing else.
+    let _session_notifications = deskwarden::away_lock::register_on_this_process();
     // **The teardown's tray labels, applied on the first thread that can.**
     // Empty unless the startup window locked; see `startup_tray_effects`. A
     // dropped `SyncFailed` here is a tray icon that comes up claiming a
@@ -1468,7 +1482,22 @@ fn main() {
     }
 
     loop {
-        pump_windows_messages();
+        // **The pump is where a workstation lock is noticed**, because both
+        // messages land in this thread's queue and this call is what drains
+        // it. See `app::pump_windows_messages` and `away_lock`'s module doc:
+        // no window was created for this and no window procedure was hooked.
+        if let Some(away) = pump_windows_messages() {
+            lock_after_walking_away(
+                &mut estate,
+                away,
+                &job,
+                &schedule,
+                &tray,
+                &backend_op_rx,
+                &config_dir,
+                first_run_account.as_ref(),
+            );
+        }
 
         if let Some(event) = pending_menu_events.pop_front().or_else(tray::next_menu_event) {
             if event.id == tray.quit_id {
@@ -5282,6 +5311,101 @@ enum ResettleOutcome {
     BackendNotStarted,
 }
 
+/// **Locking the vault because Windows said the user walked away.**
+///
+/// The decision is not here. `away_lock::away_event` said *what happened* and
+/// `away_lock::locks_the_vault` says *whether it locks*; both are pure and
+/// both are tested. This function is the effect, and it is deliberately made
+/// of nothing new:
+///
+///  * [`deskwarden::clipboard::clear_if_still_ours_for`], under the `Lock`
+///    trigger -- the same single door every other lock in this app goes
+///    through, and the only way in (there is no ungoverned form of it to reach
+///    for by mistake). `vault_window`'s
+///    `ends_a_copied_secrets_life` classifies a *window result* and then calls
+///    exactly this; there is no window result here, so the classification is
+///    `locks_the_vault` instead, and the call it leads to is the same one.
+///    **It is first, before the resettle**, for the reason the whole feature
+///    exists: a lock that left a password on the clipboard of a machine the
+///    user has just walked away from would have locked the front door with the
+///    key still in it, and `resettle_session` blocks on a master-password
+///    prompt that can stand there for hours.
+///  * `resettle_session` -- the one teardown-and-repopulate sequence, shared
+///    whole with the vault window's Lock button and with an account switch. A
+///    second lock path written inline here would be a second thing to keep
+///    right; there is not one.
+///
+/// The `authenticate` closure is the lock/re-auth one, spelled exactly as
+/// `VaultOps::resettle_after_lost_session` spells it: the master-password
+/// prompt for the account this app is already on. So the user comes back to a
+/// locked Windows session, unlocks it, and finds Deskwarden asking for the
+/// master password -- which is what "the vault is locked" looks like in this
+/// app.
+///
+/// **Harmless in every other state.** `locks_the_vault` is asked first and is
+/// given `!token.is_empty()`, so an already-locked vault, a launch that never
+/// got a session, and a startup that stood autofill down all leave with
+/// nothing done. A vault WINDOW being open cannot reach here at all: that
+/// window runs its own nested loop and this one is not being pumped while it
+/// is up -- and its own idle auto-lock is what covers the user there.
+#[allow(clippy::too_many_arguments)]
+fn lock_after_walking_away(
+    est: &mut SessionEstate,
+    away: deskwarden::away_lock::AwayEvent,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &[Duration],
+    tray: &tray::AppTray,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    config_dir: &Path,
+    first_run_account: Option<&accounts::AccountId>,
+) {
+    if !deskwarden::away_lock::locks_the_vault(
+        away,
+        est.settings.auto_lock(),
+        !est.token.is_empty(),
+    ) {
+        log::debug!(
+            "Windows reported {away:?}, and nothing is being locked: auto-lock is \
+             {:?} and the session token is {}",
+            est.settings.auto_lock(),
+            if est.token.is_empty() { "empty" } else { "present" }
+        );
+        return;
+    }
+    log::info!("Windows reported {away:?}; locking the vault rather than waiting out the idle timeout");
+    deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
+    // Field-level borrow splitting, for the reason `run_vault_loop` gives
+    // where it does the same: the closure below wants `store` and
+    // `active_account` while five other fields are held `&mut`.
+    let SessionEstate {
+        cache,
+        engine,
+        child,
+        token,
+        details,
+        task_in_progress,
+        store,
+        active_account,
+        ..
+    } = est;
+    resettle_session(
+        cache,
+        engine,
+        child,
+        job,
+        schedule,
+        tray,
+        backend_op_rx,
+        task_in_progress,
+        details,
+        token,
+        || {
+            let login = login_context(config_dir, active_account.as_ref(), first_run_account);
+            Some(reauthenticate(store, login))
+        },
+    );
+}
+
 /// The one teardown-and-repopulate sequence in this crate: drain whatever
 /// backend operation is in flight, stop `bw serve`, clear the cache,
 /// authenticate, start a fresh backend, wait for it to answer, repopulate,
@@ -7667,6 +7791,12 @@ mod tests {
     /// trigger.** A quit that passed `Lock` would be governed by the wrong
     /// pill: a user who had turned off "when the vault locks" and left "when
     /// I quit" on would find quitting no longer cleared.
+    ///
+    /// The third call in this file is `lock_after_walking_away`'s, and it is
+    /// counted here rather than exempted: it is the whole reason the Win+L
+    /// lock is not a parallel path. It names `Lock`, and the `Quit` count
+    /// below is what pins that the two shutdown paths did not quietly become
+    /// three by inheriting it.
     #[test]
     fn both_shutdown_paths_clear_the_clipboard_as_a_quit() {
         let source = include_str!("main.rs");
@@ -7674,13 +7804,24 @@ mod tests {
             source
                 .matches(concat!("clipboard::clear_if_still_ours_", "for("))
                 .count(),
-            2,
-            "expected the tray Quit and the shutdown-for-update paths, and no others"
+            3,
+            "expected the tray Quit, the shutdown-for-update path and the walked-away lock, and \
+             no others"
         );
         assert_eq!(
             source.matches(concat!("clipboard::ClearTrigger::Qu", "it")).count(),
             2,
             "a shutdown path is clearing under some trigger other than `Quit`"
+        );
+        // **The walked-away lock clears under `Lock`, the same trigger the
+        // vault window's own lock uses.** A workstation lock that cleared
+        // under `Quit` -- or not at all -- would leave a password on the
+        // clipboard of a machine the user had just locked, which is precisely
+        // the case that feature exists for.
+        assert_eq!(
+            source.matches(concat!("clipboard::ClearTrigger::Lo", "ck")).count(),
+            1,
+            "the lock that runs when the user walks away no longer clears the clipboard as a lock"
         );
         // Control: the unconditional entry point this replaced is gone, so
         // there is no call site left that the preferences page cannot govern.
