@@ -293,9 +293,18 @@ const CLIPBOARD_ENTRY_ABOVE_CEILING: &str =
     "60 minutes is the longest. To stop clearing altogether, use the switch at the top.";
 const CLIPBOARD_ENTRY_BETWEEN_STEPS: &str = "One decimal place — 1.5, not 1.25.";
 
-const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
+/// **One switch, two ways of leaving.** This governs the idle timeout below
+/// *and* `deskwarden::away_lock` -- locking Windows (Win+L), switching user,
+/// and the machine going to sleep. There is deliberately no second preference
+/// for those: a user who turns this off has said not to lock the vault behind
+/// their back, and Win+L is behind their back in the most literal sense
+/// available. The label says "step away" rather than "idle" because the
+/// timeout is now the weaker of the two things it turns on.
+const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when you step away";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
-    "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
+    "Locks after the idle time below, and immediately when you lock Windows, switch user, or the \
+     machine sleeps. Off means the vault stays unlocked until you lock it yourself or quit \
+     Deskwarden.";
 
 const AUTO_LOCK_LABEL: &str = "Lock the vault after";
 const AUTO_LOCK_DESCRIPTION: &str = "Minutes of no activity before the vault window locks itself. \
@@ -2168,7 +2177,7 @@ mod tests {
     fn general_paints_every_setting_that_actually_exists() {
         let painted = paint(Section::General);
         assert!(painted.contains("Keep the Bitwarden backend running"));
-        assert!(painted.contains("Lock the vault when idle"));
+        assert!(painted.contains("Lock the vault when you step away"));
         assert!(painted.contains(AUTO_LOCK_ENABLED_DESCRIPTION), "got {:?}", painted.strings());
         assert!(painted.contains("Lock the vault after"));
         // The descriptions too: a row whose right-hand control squeezes the

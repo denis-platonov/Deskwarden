@@ -2089,7 +2089,7 @@ mod runner_tests {
         op: impl FnOnce() -> Result<(), SendError>,
     ) -> (Vec<String>, Vec<(String, Option<String>)>) {
         crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
-            r"C:\deskwarden-testirstw.exe",
+            r"C:\deskwarden-test\first\bw.exe",
         ));
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
         let outcome = op();

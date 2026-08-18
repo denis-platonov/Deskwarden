@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 46] = [
+        const OPENS_NO_WINDOW: [&str; 47] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1044,6 +1044,15 @@ mod tests {
             // process, and is the whole point -- see `app_mutex`'s own docs
             // for why setup asks rather than force-closing.
             "app_mutex",
+            // **Registers on a window; creates none.** Its whole design is
+            // that a second hidden window would have been the wrong answer:
+            // `WM_POWERBROADCAST` is broadcast only to top-level windows, so a
+            // message-only one would miss half the feature, and this process
+            // already owns two `WS_EX_TOOLWINDOW` helpers (the tray's and the
+            // hotkey manager's) that receive both messages. It calls no
+            // `CreateWindowExW` and hooks no window procedure -- the messages
+            // are read out of the queue `main`'s pump already drains.
+            "away_lock",
             "backend_policy",
             // A test-only brace matcher over source text. It is
             // `#[cfg(test)]` at its declaration and draws nothing.

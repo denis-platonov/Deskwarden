@@ -4381,7 +4381,7 @@ mod source_pins {
         // that does not exist and never will: nothing is executed, because
         // the probe below refuses every spawn before `CreateProcess`.
         crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
-            r"C:\deskwarden-testirstw.exe",
+            r"C:\deskwarden-test\first\bw.exe",
         ));
 
         let expected_job = super::super::send_fetch_thread::sends_job().map(|j| std::ptr::from_ref(j) as usize);
@@ -8276,7 +8276,7 @@ mod frame_promptness {
         // that does not exist and never will: nothing is executed, because
         // the probe below refuses every spawn before `CreateProcess`.
         crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
-            r"C:\deskwarden-testirstw.exe",
+            r"C:\deskwarden-test\first\bw.exe",
         ));
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
         let refused = crate::send::cli_send_list(None, None, &arrived);

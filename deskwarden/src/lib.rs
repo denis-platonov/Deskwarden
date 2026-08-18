@@ -18,6 +18,11 @@ pub mod app_match;
 /// setup asks the user to close Deskwarden rather than force-closing it.
 pub mod app_mutex;
 pub mod app_window;
+/// Locking the vault when Windows says the user walked away -- Win+L, a
+/// session switch, or a suspend. It creates NO window: the notifications are
+/// registered on the helper window the tray already owns, and are classified
+/// in the message pump `main` already runs.
+pub mod away_lock;
 pub mod backend_policy;
 /// The one brace matcher every below-the-cut source walk uses.
 /// Test-only at the declaration, so nothing in it can ship.

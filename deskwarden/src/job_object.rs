@@ -2043,7 +2043,18 @@ mod tests {
             // an order of magnitude more: the default `img` feature pulls in
             // `image` and its format decoders, none of which this app needs.
             // 6328 -> 7547 bytes, all of it the new entry and its comment.
-            (7547, 0xbc77_ea4e_4b9a_931d_u64),
+            //
+            // Re-pinned for a FEATURE edit, not a dependency move: ONE feature
+            // was added to the `windows` dependency that was already here --
+            // `Win32_System_RemoteDesktop` -- for `src/away_lock.rs`, which
+            // calls `WTSRegisterSessionNotification` so the vault locks the
+            // moment the user presses Win+L instead of waiting out the idle
+            // timer. **No dependency moved**: no name was added, removed or
+            // re-pointed, no `[patch]`/`[replace]` table was introduced, no
+            // path or fork appeared, and `[build-dependencies]` still reads
+            // exactly `winresource = "0.1"`. 7547 -> 8005 bytes, all of it the
+            // feature name and the comment above it.
+            (8005, 0x4c86_8f50_808b_ed82_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

@@ -145,14 +145,35 @@ fn clamp_to_monitor(hwnd: isize, x: f32, y: f32, rows: usize) -> (f32, f32) {
 /// messages dispatched here, which is harmless: we own the thread and create
 /// no other long-lived windows on it (the egui windows run their own nested
 /// loops and block this one while they're up).
-pub fn pump_windows_messages() {
+///
+/// **It also reports whether the user walked away**, which is the whole reason
+/// `away_lock` needed no window and no window procedure of its own. Both
+/// messages it cares about (`WM_WTSSESSION_CHANGE` after
+/// `WTSRegisterSessionNotification`, and the broadcast `WM_POWERBROADCAST`)
+/// are addressed to a window on THIS thread, so they land in this very queue
+/// and pass through this loop before being dispatched. Subclassing a
+/// dependency's hidden window to see them -- and fighting `muda`'s own menu
+/// subclass for the privilege -- would have been a second way of reading a
+/// queue already being read here.
+///
+/// The messages are still translated and dispatched exactly as before:
+/// observing one is not consuming it, and `DefWindowProcW` on the tray's
+/// window is what Windows expects to see them.
+///
+/// The FIRST away event in a drain is the one reported; a drain that saw both
+/// a lock and a suspend has one answer to give and they lead to the same lock.
+#[must_use = "a dropped away event is a vault that stays unlocked after Win+L"]
+pub fn pump_windows_messages() -> Option<crate::away_lock::AwayEvent> {
     let mut msg = MSG::default();
+    let mut away = None;
     unsafe {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
+            away = away.or_else(|| crate::away_lock::away_event(msg.message, msg.wParam.0));
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    away
 }
 
 /// Extracts the credentials to type for a vault item, from the `login` object
