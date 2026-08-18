@@ -876,6 +876,33 @@ pub fn build_frame(
     // the per-selection state below (`mode`, `reveal`, the TOTP
     // cache) -- see the reset block after the item-list panel further down.
     let mut last_selected_id: Option<String> = selected_id.clone();
+    // **Whether `selected_id` being `None` is a CHOICE.**
+    //
+    // The detail header's ✕ clears the selection, and clearing it is the
+    // whole of what "close the detail pane" means here -- with nothing
+    // selected the pane is not drawn and the item list takes the window,
+    // which is the state this window opens in.
+    //
+    // The flag exists because `None` alone cannot say which of two things
+    // happened. `apply_vault_load_result` reads `None` as "the initial load,
+    // nothing has been chosen yet -- select the first item", and that is
+    // correct for a cold start and wrong for a dismissal: without this, the
+    // next `bw sync`, or any refresh, would silently reopen the pane on an
+    // item the user had just closed. This distinguishes them, and it is the
+    // ONLY reader of that distinction -- the per-selection reset block below
+    // is keyed on `selected_id != last_selected_id`, which is true for a
+    // dismissal exactly as it is for a click, so `mode`/`reveal`/`totp_state`
+    // are cleared either way and no revealed password survives the ✕.
+    //
+    // `last_selected_id` itself was checked and does NOT restore a
+    // selection: it is only ever compared against and then overwritten with
+    // `selected_id`, never assigned back to it, so the ✕ is not undone by
+    // the next frame.
+    //
+    // Cleared the moment anything is selected again, in that same reset
+    // block, so it cannot suppress the first-item selection on a load that
+    // lands after the user has picked a row and closed nothing.
+    let mut detail_dismissed = false;
     let mut mode = DetailMode::Read;
     // Every masked value the read pane can reveal -- a login's password, a
     // card's number and its security code. It lives HERE, in `run`'s
@@ -1366,6 +1393,7 @@ pub fn build_frame(
                 &mut vault_loading,
                 &mut vault_load_error,
                 &mut selected_id,
+                detail_dismissed,
                 &mut sync_status,
                 &mut totp_state,
             );
@@ -1679,37 +1707,31 @@ pub fn build_frame(
         // `apply_export_action`, because a `match` arm is a thing a guard arm
         // can silently disable and a call at a pinned brace depth is not.
         let mut account_action: Option<AccountAction> = None;
-        // **"Send a record" was ASKED FOR**, by the titlebar pill or by the
-        // chord, and nothing has been decided about it yet.
+        // **"Send a record" was ASKED FOR**, by the detail header's ✉ or by
+        // the chord, and nothing has been decided about it yet.
         //
         // A request and not an open, for `AccountAction::Export`'s reason one
         // step further on: the two doors are in two different places in this
-        // frame -- one inside the chrome closure, one after it, where the
+        // frame -- one in the detail pane's header, one out here where the
         // keyboard is read -- and gating each at its own door would be two
         // gating positions for one exposure. Both write this flag, and the
         // single block below is the only thing that turns it into a composer.
         // That is what makes `permit_record_send` one question rather than
         // two, and it is the arrangement `ac7a722` established for the reveal,
         // the copy rows and the row menu.
+        //
+        // **`can_send_record` used to be derived here** -- "is the selected
+        // row an item of the live vault?" -- for the titlebar pill's
+        // `add_enabled`. It went with that pill. The question it answered is
+        // now answered structurally instead: the ✉ is drawn by
+        // `draw_detail_read`, which `vault_window::mod` only reaches for an
+        // item resolved out of the live list, so there is no frame in which
+        // the control exists and there is nothing to send. The out-of-vault
+        // pane -- a row selected under Trash or Archive -- is
+        // `draw_out_of_vault_read`, a different function that draws no
+        // controls at all, so "send the thing I threw away" is still refused,
+        // and now by the pane's own shape rather than by a greyed button.
         let mut send_record_asked = false;
-        // Whether there is anything to send: is the selected row an item of
-        // the live vault?
-        //
-        // **A `bool` and not the item**, so this holds no borrow of `items`
-        // across the chrome closure -- the composer re-resolves the id when it
-        // opens and again when Create is pressed, which is also what makes it
-        // correct if the vault is re-read in between.
-        //
-        // **Deliberately not `list_for`**, which the detail pane below uses to
-        // resolve a selection made under Trash or Archive. A record Send
-        // publishes an item's secrets to a public link; a deleted item is one
-        // the user has already said they are done with, and "send the thing I
-        // threw away" is not a request this app needs to serve. The control
-        // simply stays grey there, with `record_ui::NO_ITEM_SELECTED` as its
-        // stated reason.
-        let can_send_record = selected_id
-            .as_ref()
-            .is_some_and(|id| items.iter().any(|i| &i.id == id));
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
         match draw_window_chrome_with_extra(
@@ -1857,36 +1879,32 @@ pub fn build_frame(
                     // shadow.
                     Some(AccountAction::Export) | None => {}
                 }
-                // **The way into the record composer** -- design 5b's
-                // `Send a record  CTRL+⇧+S` pill, in the header 5b draws it
-                // in, added after the avatar so that this right-to-left strip
-                // puts it on the avatar's LEFT, which is where 5b has it.
+                // **The `Send a record  CTRL+⇧+S` pill USED TO SIT HERE**,
+                // where design 5b draws it, and it was removed at the user's
+                // direction: "remove huge button Send a record on top --
+                // those are global things to the details like email icon
+                // after Fav".
                 //
-                // It RECORDS and does not open: see `send_record_asked`. The
-                // chord below writes the same flag, so the pill and the
-                // keyboard cannot end up two different amounts of gated.
+                // The user is right, and this reverses a placement that was
+                // approved once. Everything else in this titlebar acts on the
+                // *window* or the *account* -- the sync pill, the avatar, the
+                // account menu, the settings gear. This one acted on the
+                // selected ITEM, and the tell was that it needed
+                // `add_enabled(can_send_record, ..)` plus
+                // `record_ui::NO_ITEM_SELECTED` on its disabled hover to say
+                // so: a control that must explain "there is nothing for me to
+                // act on" is a control filed under the wrong noun.
                 //
-                // Grey rather than absent with nothing selected, with the
-                // reason on the hover -- `record_ui::NO_ITEM_SELECTED`. A
-                // disabled control with no explanation is a control the user
-                // reads as broken, which is the rule the export form's own
-                // greyed-out Create button already follows.
-                if ui
-                    .add_enabled(
-                        can_send_record,
-                        egui::Button::new(
-                            egui::RichText::new(record_ui::SEND_RECORD_LABEL)
-                                .size(12.0)
-                                .color(theme::INK),
-                        )
-                        .shortcut_text(record_ui::SEND_RECORD_SHORTCUT)
-                        .min_size(egui::vec2(0.0, 28.0)),
-                    )
-                    .on_disabled_hover_text(record_ui::NO_ITEM_SELECTED)
-                    .clicked()
-                {
-                    send_record_asked = true;
-                }
+                // It is now `theme::send_record_button` in the detail pane's
+                // own header strip, beside the star -- where there is always
+                // an item, so it has no disabled state and needs no
+                // explanation. `can_send_record` went with it.
+                //
+                // **Nothing about the gating moved.** That control reports
+                // `DetailAction::SendRecord`, which sets the same
+                // `send_record_asked` flag this button set and the chord
+                // below still sets, and `permit_record_send` is still the one
+                // line in the frame that turns it into a composer.
                 // Manual sync: this app has nowhere that auto-syncs on a timer
                 // (see `main()`'s own single startup-time `bw sync` -- everything
                 // after that only re-reads whatever's already local). A change
@@ -1965,29 +1983,6 @@ pub fn build_frame(
         });
         if send_record_chord {
             send_record_asked = true;
-        }
-        // **THE ONE GATING POSITION for the record composer.** Both doors --
-        // the titlebar pill and the chord -- arrive here as
-        // `send_record_asked`, and this is the only line in the frame that
-        // writes `record_send`. A door added later that opens the composer
-        // without coming through here is a door around the re-prompt, and
-        // `exactly_one_line_opens_the_record_composer` is what refuses it.
-        //
-        // The item is re-resolved rather than carried from `can_send_record`,
-        // which is a `bool` precisely so that nothing holds a borrow of
-        // `items` this far into the frame.
-        if send_record_asked {
-            if let Some(item) = selected_id
-                .as_ref()
-                .and_then(|id| items.iter().find(|i| &i.id == id))
-            {
-                record_send = permit_record_send(
-                    ui.ctx(),
-                    item,
-                    &reprompt_gate,
-                    &mut reprompt_proof,
-                );
-            }
         }
         if ctrl_k {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
@@ -2540,6 +2535,23 @@ pub fn build_frame(
             // A delete armed on the previous item shouldn't silently carry
             // over and be confirmable against the newly selected one.
             item_delete_pending = None;
+            // **A selection made is a dismissal undone.** Clicking any row
+            // reopens the pane -- which needs nothing from this flag, since
+            // `selected_id` is `Some` again -- but a stale `true` left here
+            // would go on suppressing `apply_vault_load_result`'s
+            // first-item selection for the rest of the session, so a later
+            // sync that dropped the selected item would leave the window on
+            // no item at all with nothing having been closed. Keyed on
+            // "something is selected now" rather than on the ✕, because that
+            // is the condition being recorded.
+            //
+            // In this block and not beside the ✕ so it also catches the
+            // other ways a selection arrives -- a row click, a right-click,
+            // `Create`'s "select what was just made" -- none of which know
+            // this flag exists.
+            if selected_id.is_some() {
+                detail_dismissed = false;
+            }
             last_selected_id = selected_id.clone();
         }
 
@@ -3439,6 +3451,42 @@ pub fn build_frame(
                                         ),
                                     }
                                 }
+                                // **The header's ✕: clear the selection, and
+                                // that is the entire mechanism.** With
+                                // nothing selected the `Read` arm is not
+                                // reached at all and the item list takes the
+                                // window -- which is the state this window
+                                // opens in, so there is no "no detail"
+                                // layout to write. Clicking any row selects
+                                // again, which already works.
+                                //
+                                // **`detail_dismissed` is the load-bearing
+                                // half**, and without it this control
+                                // half-lands: `apply_vault_load_result`
+                                // treats `selected_id == None` as "the
+                                // initial load, select the first item", so
+                                // the next Sync -- or any refresh -- would
+                                // reopen the pane on an item the user had
+                                // just closed. The flag is what tells a
+                                // deliberate dismissal from never having
+                                // chosen; see its declaration.
+                                DetailAction::ClosePane => {
+                                    selected_id = None;
+                                    detail_dismissed = true;
+                                }
+                                // **The moved "Send a record" control.** It
+                                // sets the SAME flag the titlebar pill set
+                                // and the chord still sets, so it arrives at
+                                // `permit_record_send` -- the one gating
+                                // position -- rather than opening anything
+                                // here. An arm that called the composer
+                                // directly would be a door around the
+                                // re-prompt, and
+                                // `exactly_one_line_opens_the_record_composer`
+                                // is what refuses it.
+                                DetailAction::SendRecord => {
+                                    send_record_asked = true;
+                                }
                                 // As with the sidebar's folder ×,
                                 // `confirm_click` gates this on a confirming
                                 // second click -- see its doc comment. Only
@@ -3852,6 +3900,48 @@ pub fn build_frame(
                 },
                 FolderEditAction::Cancel => folder_edit = None,
                 FolderEditAction::None => {}
+            }
+        }
+
+        // **THE ONE GATING POSITION for the record composer.** Both doors --
+        // the detail header's ✉ and the CTRL+SHIFT+S chord -- arrive here as
+        // `send_record_asked`, and this is the only line in the frame that
+        // writes `record_send`. A door added later that opens the composer
+        // without coming through here is a door around the re-prompt, and
+        // `exactly_one_line_opens_the_record_composer` is what refuses it.
+        //
+        // **It MOVED down the frame when the button did, and had to.** The
+        // chord is read up where the rest of the keyboard is, before anything
+        // is drawn; the ✉ is a click on a control inside the detail pane, so
+        // it is not known until that pane has been drawn, several hundred
+        // lines below. A gate left at its old position would have seen the
+        // chord and never the button -- `send_record_asked` is frame-local,
+        // so the flag the pane set would have been dropped at the end of the
+        // frame and the ✉ would simply have done nothing. Moved rather than
+        // duplicated, because two gating positions for one exposure is the
+        // exact shape this block exists to refuse; it now sits after every
+        // door and immediately before the composer it opens.
+        //
+        // The item is re-resolved out of `items` rather than carried from the
+        // pane, so nothing holds a borrow this far into the frame -- and so
+        // that a vault re-read between the click and here publishes what the
+        // window is holding now. Resolved out of `items` and NOT `list_for`,
+        // which is what keeps a row selected under Trash or Archive
+        // unsendable: a record Send publishes an item's secrets to a public
+        // link, and "send the thing I threw away" is not a request this app
+        // serves. That pane draws no ✉ either (see `draw_out_of_vault_read`),
+        // so the two agree.
+        if send_record_asked {
+            if let Some(item) = selected_id
+                .as_ref()
+                .and_then(|id| items.iter().find(|i| &i.id == id))
+            {
+                record_send = permit_record_send(
+                    ui.ctx(),
+                    item,
+                    &reprompt_gate,
+                    &mut reprompt_proof,
+                );
             }
         }
 
@@ -4614,6 +4704,18 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::Delete
         | DetailAction::ToggleFavorite(_)
         | DetailAction::RemoveAppMatch
+        // Closing the pane HIDES the item; there is nothing here to prove a
+        // master password for.
+        | DetailAction::ClosePane
+        // **And `SendRecord` is on this side deliberately, which looks wrong
+        // and is not.** A record Send absolutely exposes a secret -- it
+        // publishes one to a link. But this variant does not *do* that: it
+        // only sets `send_record_asked`, and the exposure happens at
+        // `permit_record_send`, which asks this same gate its own question
+        // with the item's own `reprompt_protected` flag. Answering `true`
+        // here would put TWO Hello prompts between the click and the
+        // composer for one act.
+        | DetailAction::SendRecord
         | DetailAction::OpenApp(_) => false,
     }
 }
@@ -7941,6 +8043,17 @@ fn apply_vault_load_result(
     // produced nothing to paint (review 29's Minor 3).
     vault_load_error: &mut Option<String>,
     selected_id: &mut Option<String>,
+    // **Whether `*selected_id == None` is the user's choice**, from `run`'s
+    // own `detail_dismissed` -- see its declaration for why `None` alone
+    // cannot answer that.
+    //
+    // A parameter and not a re-derivation: this function is the ONLY reader
+    // of the distinction, and the flag it reads is written in exactly two
+    // places up in `run` (the ✕ sets it, the selection-change reset clears
+    // it). Passing it makes the auto-select a decision a test can drive from
+    // both sides, which `a_dismissed_detail_pane_is_not_reopened_by_a_reload`
+    // does.
+    detail_dismissed: bool,
     sync_status: &mut Option<Result<(), String>>,
     totp_state: &mut TotpState,
 ) {
@@ -7990,7 +8103,18 @@ fn apply_vault_load_result(
                 // last_selected_id` true next frame, so the existing
                 // per-selection reset block recomputes `fill_count` and
                 // friends normally rather than needing its own copy here.
-                None => *selected_id = items.first().map(|i| i.id.clone()),
+                //
+                // **Unless the user CLOSED the pane**, in which case `None`
+                // is the state they asked for and re-selecting the first
+                // item here would reopen it behind their back on the next
+                // sync. This is the line the detail header's ✕ would
+                // otherwise half-land against: the click would appear to do
+                // nothing at all the moment anything refreshed the vault.
+                None => {
+                    if !detail_dismissed {
+                        *selected_id = items.first().map(|i| i.id.clone());
+                    }
+                }
                 // A reload where the selected item no longer exists (deleted
                 // on another device, say): drop the stale id. Left alone,
                 // `selected_id` would keep pointing at the vanished item and
@@ -13227,6 +13351,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13261,6 +13386,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13297,6 +13423,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13323,6 +13450,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13331,6 +13459,77 @@ mod apply_vault_load_result_tests {
         assert!(!vault_loading);
         assert_eq!(selected_id, Some("a".to_string()), "the first item is selected once nothing was selected yet");
         assert_eq!(sync_status, None, "a load with no preceding sync claim must not invent one");
+    }
+
+    /// **A detail pane the user CLOSED stays closed across a reload.**
+    ///
+    /// This is the line the header's ✕ half-lands against, and it is not
+    /// obvious from the ✕'s own code: that control does nothing but set
+    /// `selected_id = None`, and the frame it happens in looks perfect. Then
+    /// the next `bw sync` -- or the forced reload after any write, or a
+    /// refresh from another device -- lands here, reads `None` as "the
+    /// initial load, nothing has been chosen yet", and re-selects the first
+    /// item. The pane reappears, and the ✕ reads as a control that does not
+    /// work.
+    ///
+    /// **Both directions in one test, deliberately.** "Dismissed stays
+    /// closed" alone is satisfied by an `apply_vault_load_result` that never
+    /// auto-selects at all -- which would break the cold start this window
+    /// depends on, and break it silently, since the window would simply open
+    /// on no item. So the same call is driven with the flag clear and
+    /// required to select, in the same test, from the same fixture.
+    #[test]
+    fn a_dismissed_detail_pane_is_not_reopened_by_a_reload() {
+        // Nothing differs between these two but `detail_dismissed`: same
+        // items, same `None` selection, same landed snapshot.
+        let selected_after = |detail_dismissed: bool| {
+            let mut items = Vec::new();
+            let mut folders = Vec::new();
+            let mut vault_loading = true;
+            let mut vault_load_error = None;
+            let mut selected_id: Option<String> = None;
+            let mut sync_status = None;
+            let mut totp_state = TotpState::NoSecret;
+
+            apply_vault_load_result(
+                1,
+                1,
+                Ok(VaultSnapshot {
+                    items: vec![item("a"), item("b")],
+                    folders: Vec::new(),
+                }),
+                &mut items,
+                &mut folders,
+                &mut vault_loading,
+                &mut vault_load_error,
+                &mut selected_id,
+                detail_dismissed,
+                &mut sync_status,
+                &mut totp_state,
+            );
+            // The reload itself must still have landed either way -- a
+            // function that dropped the whole snapshot would satisfy the
+            // "stays closed" half by doing nothing at all.
+            assert_eq!(
+                ids(&items),
+                vec!["a", "b"],
+                "with detail_dismissed={detail_dismissed} the snapshot was not applied, so \
+                 the selection assertion is about a load that did not happen"
+            );
+            selected_id
+        };
+
+        assert_eq!(
+            selected_after(false),
+            Some("a".to_string()),
+            "a cold start no longer selects its first item, so this window opens on nothing"
+        );
+        assert_eq!(
+            selected_after(true),
+            None,
+            "a reload re-selected the first item after the user closed the detail pane, so \
+             the header's ✕ appears to do nothing the moment anything syncs"
+        );
     }
 
     /// Review 14's Important, part b. `NoCodeReported` deliberately stops
@@ -13358,6 +13557,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13402,6 +13602,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13436,6 +13637,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13465,6 +13667,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13497,6 +13700,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13539,6 +13743,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -13578,6 +13783,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut vault_load_error,
             &mut selected_id,
+            false,
             &mut sync_status,
             &mut totp_state,
         );
@@ -24153,6 +24359,63 @@ mod send_delete_wiring {
         matrix_labels(output).iter().filter(|(t, _)| t == needle).count()
     }
 
+    /// This frame's whole shape tree, for the controls that paint no string
+    /// and so cannot be found by [`matrix_locate`].
+    ///
+    /// **One tree, not one probe per clipped shape.** A mark can be split
+    /// across clip rects, and `theme::icon_probe`'s pairing rules (the
+    /// envelope's flap inside its body, the ✕'s two arms consecutive) are
+    /// stated over a single walk. Same rule, for the same reason, as
+    /// `detail.rs`'s `Pane::frame`.
+    fn matrix_shapes(output: &egui::FullOutput) -> egui::Shape {
+        egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect())
+    }
+
+    /// Where the detail header's **"Send a record" envelope** is, to press it.
+    ///
+    /// A shape lookup and not a text one, because that control paints no
+    /// text: it used to be a titlebar pill reading `Send a record`, and the
+    /// reachability test below found it by that string until the user had it
+    /// moved into this strip.
+    ///
+    /// **Exactly one, or a panic naming the state.** "The first envelope" is
+    /// the lookup that silently starts pressing a different control the day a
+    /// second one is added, and it would leave the test it feeds unable to
+    /// tell "the control is gone" from "there are two".
+    fn matrix_locate_envelope(state: ReachableState, output: &egui::FullOutput) -> egui::Pos2 {
+        let found = crate::theme::icon_probe::envelopes(&matrix_shapes(output));
+        assert_eq!(
+            found.len(),
+            1,
+            "in state {state:?} the window painted {} \"Send a record\" envelopes, not one, \
+             so this test cannot say which control it is pressing. What was painted: {:?}",
+            found.len(),
+            matrix_texts(output)
+        );
+        found[0].0.center()
+    }
+
+    /// Where the detail header's **close ✕** is, to press it. See
+    /// [`matrix_locate_envelope`] for why this is a shape lookup and why it
+    /// insists on exactly one -- and here that insistence does extra work,
+    /// since the vault titlebar paints a window-close ✕ in this very frame.
+    /// `icon_probe::pane_close_marks` matches on `theme`'s own
+    /// `PANE_CLOSE_ARM` alone, so a count of one is also the evidence that
+    /// the two marks are still telling themselves apart.
+    fn matrix_locate_pane_close(state: ReachableState, output: &egui::FullOutput) -> egui::Pos2 {
+        let found = crate::theme::icon_probe::pane_close_marks(&matrix_shapes(output));
+        assert_eq!(
+            found.len(),
+            1,
+            "in state {state:?} the window painted {} detail-pane close marks, not one -- \
+             either the pane is not drawing one, or the titlebar's window-close is being \
+             found as it. What was painted: {:?}",
+            found.len(),
+            matrix_texts(output)
+        );
+        found[0].0.center()
+    }
+
     fn matrix_locate(state: ReachableState, output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
         matrix_find(output, needle)
             .map(|r| r.center())
@@ -24799,6 +25062,135 @@ mod send_delete_wiring {
         matrix_frame(ctx, frame_fn)
     }
 
+    /// **THE HEADER'S ✕ REALLY HIDES THE DETAIL PANE, ON A REAL WINDOW.**
+    ///
+    /// The whole mechanism is `selected_id = None`, and that is exactly why
+    /// this has to be driven end to end rather than asserted on the arm: the
+    /// arm is two lines and obviously correct, and the control can still be
+    /// inert -- the pane could re-select from `last_selected_id`, or a load
+    /// result could re-select the first item, and the ✕ would look like a
+    /// button that does nothing. (`last_selected_id` was checked and does not
+    /// restore; `apply_vault_load_result` DID, which is what
+    /// `a_dismissed_detail_pane_is_not_reopened_by_a_reload` now holds.)
+    ///
+    /// **What "the pane is gone" is asserted as.** Not the absence of a
+    /// string -- the item's own name is painted by its ROW in the list as
+    /// well as by the pane's title, so "the name is gone" would be asserting
+    /// the list had vanished too, which is the opposite of what this control
+    /// is for. Instead: the header strip's own controls, each found by its
+    /// own shape probe, must all be gone, and the item's row must still be
+    /// there. A pane that drew nothing but kept the strip would fail; so
+    /// would a ✕ that closed the whole window.
+    ///
+    /// **And it comes back.** The final step clicks the row again, because a
+    /// ✕ that permanently unselects is not "hide the details" -- and the
+    /// re-selection path is `draw_item_list`'s, which knows nothing about the
+    /// dismissal flag this control sets.
+    ///
+    /// **No `bw`, no dialog, no network** -- the same harness, and the same
+    /// stubbed seams, as the test below.
+    #[test]
+    fn the_headers_close_really_hides_the_detail_pane() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-close-pane-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::stubbed(
+                frame_sync,
+                frame_load,
+                frame_send_list,
+                Some(scratch.join("settings.json")),
+            ),
+        );
+
+        let state = ReachableState::Fresh;
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        let _ = matrix_frame(&ctx, &mut frame_fn);
+        let open = matrix_frame(&ctx, &mut frame_fn);
+
+        // The control exists, and the strip it belongs to is up. Located
+        // and not bound: the press below re-locates on a later frame.
+        matrix_locate_pane_close(state, &open);
+        assert_eq!(
+            crate::theme::icon_probe::stars(&matrix_shapes(&open)).len(),
+            1,
+            "control: the detail pane's header strip is not on screen before anything is \
+             pressed, so closing it below would prove nothing. What was painted: {:?}",
+            matrix_texts(&open)
+        );
+        matrix_locate(state, &open, FRAME_ITEM_NAME);
+
+        // Press it.
+        let close_at = matrix_locate_pane_close(state, &open);
+        let closed = matrix_click(&ctx, &mut frame_fn, close_at);
+        let shapes = matrix_shapes(&closed);
+        assert!(
+            crate::theme::icon_probe::stars(&shapes).is_empty(),
+            "pressing the header's ✕ left the favourite star on screen, so the detail pane \
+             is still showing. What was painted: {:?}",
+            matrix_texts(&closed)
+        );
+        assert!(
+            crate::theme::icon_probe::envelopes(&shapes).is_empty(),
+            "pressing the header's ✕ left the Send envelope on screen, so the detail pane \
+             is still showing"
+        );
+        assert!(
+            crate::theme::icon_probe::pane_close_marks(&shapes).is_empty(),
+            "pressing the header's ✕ left a second ✕ on screen, so the pane redrew itself \
+             -- the selection is being restored from somewhere"
+        );
+        // And the LIST is still there. This is the half that says the pane
+        // was hidden rather than the window emptied or closed.
+        assert!(
+            matrix_find(&closed, FRAME_ITEM_NAME).is_some(),
+            "closing the detail pane also took the item list with it. What was painted: {:?}",
+            matrix_texts(&closed)
+        );
+
+        // And clicking the row brings it back -- otherwise this is not
+        // "hide the details", it is "lose them".
+        let row_at = matrix_locate(state, &closed, FRAME_ITEM_NAME);
+        let reopened = matrix_click(&ctx, &mut frame_fn, row_at);
+        assert_eq!(
+            crate::theme::icon_probe::stars(&matrix_shapes(&reopened)).len(),
+            1,
+            "clicking the row after closing the pane did not bring it back, so the ✕ is a \
+             one-way door. What was painted: {:?}",
+            matrix_texts(&reopened)
+        );
+    }
+
     /// **THE COMPOSER IS REACHABLE, ON A REAL WINDOW, THE WAY A USER REACHES
     /// IT** -- and this is the test whose absence let 1400 finished lines
     /// ship unreachable.
@@ -24806,29 +25198,40 @@ mod send_delete_wiring {
     /// `record_ui` had complete unit tests and a green suite the whole time it
     /// had no caller: its pure functions were right, its forms painted, and
     /// nothing anywhere pressed a control that led to them. So what is driven
-    /// here is the chain and not the surface -- the real titlebar is rendered,
-    /// the real pill in it is found by the text it paints, the real item row
-    /// is clicked to give the pill something to open against, and the composer
-    /// is required to appear by ITS heading. Every link is a real widget in a
-    /// real frame; delete the pill, delete the modal block, or leave the pill
-    /// reporting nothing, and this reds.
+    /// here is the chain and not the surface -- the real window is rendered,
+    /// the real control in it is found, the real item row is clicked to give
+    /// it something to open against, and the composer is required to appear
+    /// by ITS heading. Every link is a real widget in a real frame; delete
+    /// the control, delete the modal block, or leave the control reporting
+    /// nothing, and this reds.
     ///
-    /// **What it does not cover**, said out loud rather than left to be
-    /// assumed: the pill's greyed state. This harness's window opens with an
-    /// item already selected and there is no gesture in it that deselects, so
-    /// "pressing the pill with nothing chosen does nothing" is not a state
-    /// this fixture can build. The control is `add_enabled(can_send_record,
-    /// ..)` and the gating block is `if let Some(item) = ...`, so the dead
-    /// case is refused twice over in the source; it is simply not measured
-    /// here, and claiming otherwise would be the kind of test that passes
-    /// because its fixture cannot fail.
+    /// **The control MOVED, and this test moved with it.** It was a titlebar
+    /// pill reading `Send a record`, found here by that string. The user had
+    /// it moved into the detail pane's header strip as an envelope, and an
+    /// envelope paints no string -- so it is now found by
+    /// [`matrix_locate_envelope`], which is a shape probe. That is a real
+    /// weakening of what this test can see, and it is paid for: the probe
+    /// insists on EXACTLY ONE envelope, so "the control vanished" and "there
+    /// are now two of them" both red here rather than one of them silently
+    /// selecting the other.
+    ///
+    /// **What it does not cover** has CHANGED with the move, and is worth
+    /// saying rather than leaving as a stale paragraph. The old note here
+    /// recorded that the pill's greyed state was unmeasured, because this
+    /// fixture opens with an item selected and had no gesture that deselects.
+    /// There is no greyed state any more -- the strip is only drawn for an
+    /// item resolved out of the live vault, so the control cannot exist with
+    /// nothing to send. And the fixture now DOES have a deselecting gesture,
+    /// the header's own ✕; what it does with it is
+    /// `the_headers_close_really_hides_the_detail_pane`'s business, next
+    /// door, rather than this test's.
     ///
     /// **No `bw`, no dialog, no network.** The harness gate is
     /// `RepromptGate::allowing_for_test`, so no Windows Hello prompt is
     /// reachable from here; that the re-prompt really stands in this path is
     /// `reprompt_gating_tests`' business, driven directly.
     #[test]
-    fn the_titlebar_pill_really_opens_the_record_composer() {
+    fn the_detail_headers_envelope_really_opens_the_record_composer() {
         let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         FRAME_REVOKES.lock().expect("not poisoned").clear();
         *FRAME_TX.lock().expect("not poisoned") = None;
@@ -24883,20 +25286,23 @@ mod send_delete_wiring {
         //    and not bound: the press below re-locates it on a later frame,
         //    and reusing a position read four frames earlier is how a click
         //    test ends up pressing whatever has since moved under it.
-        matrix_locate(state, &output, record_ui::SEND_RECORD_LABEL);
+        matrix_locate_envelope(state, &output);
         assert!(
             matrix_find(&output, record_ui::EXPORT_HEADING).is_none(),
             "control: the composer is already on screen with nothing pressed, so pressing \
-             the pill below would prove nothing"
+             the envelope below would prove nothing"
         );
 
         // 2. Choose the record -- design 5a's order, picked and then narrowed.
         //
         //    Clicked rather than assumed. This window opens with its first
         //    item already selected (the detail pane is showing it), so the
-        //    click is a re-selection and not the thing that makes the pill
-        //    live; what it buys is that the item the composer opens against
-        //    below is the row this test pressed, by name.
+        //    click is a re-selection; what it buys is that the item the
+        //    composer opens against below is the row this test pressed, by
+        //    name. It is also what puts the header strip -- and therefore
+        //    the envelope -- on screen at all, which is the sense in which
+        //    this step is now load-bearing and was not when the control was
+        //    in the titlebar.
         let row_at = matrix_locate(state, &output, FRAME_ITEM_NAME);
         let selected = matrix_click(&ctx, &mut frame_fn, row_at);
         assert!(
@@ -24905,13 +25311,13 @@ mod send_delete_wiring {
              proves nothing"
         );
 
-        // 3. And the pill opens it, against that item.
-        let pill_at = matrix_locate(state, &selected, record_ui::SEND_RECORD_LABEL);
-        let opened = matrix_click(&ctx, &mut frame_fn, pill_at);
+        // 3. And the envelope opens it, against that item.
+        let envelope_at = matrix_locate_envelope(state, &selected);
+        let opened = matrix_click(&ctx, &mut frame_fn, envelope_at);
         assert!(
             matrix_find(&opened, record_ui::EXPORT_HEADING).is_some(),
-            "pressing {:?} with {FRAME_ITEM_NAME:?} selected painted no composer, so the \
-             surface is still unreachable. What was painted: {:?}",
+            "pressing the {:?} envelope with {FRAME_ITEM_NAME:?} selected painted no \
+             composer, so the surface is still unreachable. What was painted: {:?}",
             record_ui::SEND_RECORD_LABEL,
             matrix_texts(&opened)
         );

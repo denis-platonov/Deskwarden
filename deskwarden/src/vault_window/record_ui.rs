@@ -710,25 +710,38 @@ pub fn draw_import_form(
 // The way in
 // ---------------------------------------------------------------------------
 
-/// The label on the titlebar control that opens the export composer.
+/// What the control that opens the export composer is CALLED.
 ///
-/// Design §5b draws exactly this pair — a `Send a record` pill carrying
-/// `CTRL+⇧+S` — in the window header. The chord rides the control for the rule
-/// every binding in this app already follows: a chord with nothing on screen
-/// naming it is a chord nobody finds.
+/// Design §5b drew it as a `Send a record` pill in the window titlebar,
+/// carrying `CTRL+⇧+S`. That pill is gone at the user's direction, and the
+/// judgement was right: it acted on the SELECTED ITEM from a strip whose
+/// every other control is global. The control is now
+/// `theme::send_record_button`, an envelope in the detail pane's own header
+/// strip, so this string is its hover rather than its face.
+///
+/// Still a named constant, and still paired with the chord below on that
+/// hover, for the rule every binding in this app follows: a chord with
+/// nothing on screen naming it is a chord nobody finds.
 pub const SEND_RECORD_LABEL: &str = "Send a record";
 
-/// See [`SEND_RECORD_LABEL`]. Spelled the way `detail.rs`'s copy chords are.
+/// See [`SEND_RECORD_LABEL`]. Spelled the way `detail.rs`'s copy chords are,
+/// and — like them — **the only place this chord is spelled for a human**.
+/// `the_record_chord_is_spelled_the_way_it_is_bound` compares it against
+/// `SEND_RECORD_MODIFIERS` and `SEND_RECORD_KEY`, the values the key handler
+/// actually matches on, so the hover cannot advertise a binding the code does
+/// not have.
 pub const SEND_RECORD_SHORTCUT: &str = "CTRL+SHIFT+S";
 
-/// Why the control is grey.
-///
-/// **A reason and not a hidden button.** The composer narrows a record the
-/// user picked, so with nothing picked there is nothing to narrow — and a
-/// control that comes and goes with the selection is a control the user reads
-/// as broken. Design §5a's own words for this state are its `Record` /
-/// `Change` row: the record is chosen first and then narrowed.
-pub const NO_ITEM_SELECTED: &str = "Select an item in the list to send it.";
+// `NO_ITEM_SELECTED` — "Select an item in the list to send it." — was the
+// titlebar pill's disabled hover, and it is DELETED with that pill rather
+// than parked: a lib crate raises no dead-code warning for a `pub` item, so
+// it would have sat here indefinitely as a doc comment describing a state
+// that can no longer occur. The state is gone, not merely unexplained: the
+// control now lives in the detail pane's header strip, which `vault_window`
+// only draws for an item resolved out of the live vault — so there is no
+// frame in which the control exists and there is nothing to send, and it
+// needs no disabled state at all. Same reasoning `theme.rs` recorded when
+// the header's "Fill in app" button took `header_primary_button` with it.
 
 /// The composer's per-open state: **which item it was opened against**, and
 /// the ticks.
