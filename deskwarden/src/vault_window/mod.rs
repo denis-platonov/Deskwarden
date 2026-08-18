@@ -4472,6 +4472,28 @@ pub fn build_frame(
                         }
                     }
                 }
+                // **The image route opens from here, and HERE is the point.**
+                //
+                // `IFileOpenDialog::Show` is modal and pumps its own message
+                // loop, so it must not be called from inside a draw closure --
+                // that would re-enter egui's. This line is in the action
+                // handler, after `draw_add_modal` has returned, which is the
+                // same place and the same reason as `EditAction::PickAppFile`
+                // above. The frame is held for as long as the user is in the
+                // dialog, exactly as it is for the app-path dialog and for the
+                // export's save dialog; that is what a modal shell dialog is,
+                // and it is the established shape in this window rather than a
+                // new one.
+                //
+                // The decode happens in `totp_add`, so nothing about a picture
+                // of a seed lives in this file.
+                totp_add::TotpAddAction::OpenImage => {
+                    let picked = crate::file_picker::pick_qr_image();
+                    totp_add::apply_image_pick(
+                        state,
+                        picked.as_ref().map(std::path::Path::new),
+                    );
+                }
                 totp_add::TotpAddAction::None => {}
             }
             if close {

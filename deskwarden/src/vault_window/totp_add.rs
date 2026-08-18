@@ -404,6 +404,131 @@ impl PickerRefusal {
 }
 
 // ---------------------------------------------------------------------------
+// The image-file route
+// ---------------------------------------------------------------------------
+
+/// The one call the image route makes into something it does not own.
+///
+/// [`crate::region_overlay::RegionSeams`]'s shape, and its reason: behind a
+/// seam every arm of [`decode_image_with`] is reachable from a test that
+/// builds its bytes arithmetically, and that test can **look at the pixels**
+/// the PNG half produced rather than trust that it produced any.
+#[derive(Clone, Copy)]
+pub struct ImageSeams {
+    /// [`crate::qr::decode_qr`] in production.
+    pub decode: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
+}
+
+impl ImageSeams {
+    /// The real one. A test asserts this is [`crate::qr::decode_qr`] **by
+    /// address**, so a seam quietly re-pointed at a stub fails rather than
+    /// passing.
+    pub fn production() -> Self {
+        ImageSeams { decode: crate::qr::decode_qr }
+    }
+}
+
+/// A PNG's pixels as straight RGBA8, rows top to bottom, no padding -- what
+/// [`crate::qr::decode_qr`] and `GetDIBits` both speak.
+///
+/// **Not [`crate::favicon::decode_rgba`]**, which is this crate's other PNG
+/// reader. That one resamples every image down to 64 pixels on its longest
+/// edge for the item list, and 64 pixels is smaller than a QR code's module
+/// grid: it would hand back a picture of a code that no decoder could read.
+///
+/// Both buffers are [`Zeroizing`], because a picture of a QR code is a picture
+/// of a seed.
+fn png_to_rgba(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, usize), PickerRefusal> {
+    let mut decoder = png::Decoder::new(bytes);
+    // The same normalisation `favicon` uses: indexed and sub-8-bit sources are
+    // expanded during the decode, so the match below never sees them.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(|_| PickerRefusal::NotAnImage)?;
+
+    // **Bounded before anything is allocated.** The header is attacker-chosen
+    // -- it is a file -- and `output_buffer_size` is derived from it. The
+    // bound is `qr`'s own, so a picture refused here is exactly a picture the
+    // decoder would have refused anyway.
+    let (declared_width, declared_height) = {
+        let info = reader.info();
+        (info.width as usize, info.height as usize)
+    };
+    if declared_width == 0 || declared_height == 0 {
+        return Err(PickerRefusal::NotAnImage);
+    }
+    match declared_width.checked_mul(declared_height) {
+        Some(pixels) if pixels <= crate::qr::MAX_PIXELS => {}
+        _ => return Err(PickerRefusal::NotAnImage),
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);
+    let frame = reader.next_frame(&mut buf).map_err(|_| PickerRefusal::NotAnImage)?;
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let used = frame.buffer_size().min(buf.len());
+    let source = &buf[..used];
+
+    let mut rgba = Zeroizing::new(Vec::with_capacity(width.saturating_mul(height) * 4));
+    match frame.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(source),
+        png::ColorType::Rgb => {
+            for px in source.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for grey in source {
+                rgba.extend_from_slice(&[*grey, *grey, *grey, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in source.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        // Unreachable: `normalize_to_color8` expands indexed frames during the
+        // decode, exactly as `favicon::decode_rgba` documents. Kept only so
+        // this match stays exhaustive.
+        png::ColorType::Indexed => return Err(PickerRefusal::NotAnImage),
+    }
+    if rgba.len() < width * height * 4 {
+        // A truncated frame: `next_frame` can succeed on a file whose last
+        // rows are missing. A short buffer handed to the decoder answers
+        // `None`, which would be reported as "no code in that image" rather
+        // than as the broken file it is.
+        return Err(PickerRefusal::NotAnImage);
+    }
+    Ok((rgba, width, height))
+}
+
+/// **A PNG's bytes to the string its QR carries**, through `seams`.
+///
+/// Nothing leaves this function but the decoded string: the pixels are a
+/// [`Zeroizing`] local that dies here, which is [`PRIVACY_LINE`]'s second
+/// clause on this route.
+pub fn decode_image_with(
+    seams: &ImageSeams,
+    bytes: &[u8],
+) -> Result<Zeroizing<String>, PickerRefusal> {
+    let (rgba, width, height) = png_to_rgba(bytes)?;
+    (seams.decode)(&rgba, width, height).ok_or(PickerRefusal::NoCode(CodeSource::Image))
+}
+
+/// [`decode_image_with`] against the real decoder.
+pub fn decode_image(bytes: &[u8]) -> Result<Zeroizing<String>, PickerRefusal> {
+    decode_image_with(&ImageSeams::production(), bytes)
+}
+
+/// Reads the file the user pointed at, and decodes it.
+///
+/// The **only** line in this feature that touches the filesystem, and it only
+/// reads. The bytes are a [`Zeroizing`] for `png_to_rgba`'s reason; nothing is
+/// written, copied out, or logged.
+pub fn read_image_file(path: &std::path::Path) -> Result<Zeroizing<String>, PickerRefusal> {
+    let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| PickerRefusal::Unreadable)?);
+    decode_image(&bytes)
+}
+
+// ---------------------------------------------------------------------------
 // Reading the field
 // ---------------------------------------------------------------------------
 
@@ -909,6 +1034,24 @@ pub fn apply_region_outcome(state: &mut TotpAdd, outcome: Outcome) {
     }
 }
 
+/// **What the file dialog came back with, applied to the form.**
+///
+/// `None` is a cancelled dialog and leaves no refusal, for
+/// [`apply_region_outcome`]'s reason.
+pub fn apply_image_pick(state: &mut TotpAdd, picked: Option<&std::path::Path>) {
+    let Some(path) = picked else {
+        state.refusal = None;
+        return;
+    };
+    match read_image_file(path) {
+        Ok(text) => state.accept_decoded(text),
+        Err(why) => {
+            state.stage = Stage::Picker;
+            state.refusal = Some(why);
+        }
+    }
+}
+
 /// What one frame of the form reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TotpAddAction {
@@ -927,6 +1070,12 @@ pub enum TotpAddAction {
     /// `egui::Context`, and because the overlay has to be driven by the
     /// window's own frame loop -- see `vault_window::mod`'s block.
     ScanRegion,
+    /// **Open the shell's file dialog.** Reported rather than done, for a
+    /// harder reason than the above: `IFileOpenDialog::Show` is modal and
+    /// pumps its own message loop, so it must be called from the action
+    /// handler after this frame's draw closures have returned, exactly where
+    /// `EditAction::PickAppFile` is called from.
+    OpenImage,
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1144,11 +1293,10 @@ pub struct PickerFrame {
 pub fn action_for(route: Route) -> TotpAddAction {
     match route {
         Route::ScanRegion => TotpAddAction::ScanRegion,
-        // `ImageFile` is drawn and reports nothing yet: its dialog, its decode
-        // and its refusals are Task 7, which lands next. `ByHand` and `Webcam`
-        // are handled in the picker itself -- one is a stage change, the other
-        // is deferred.
-        Route::ImageFile | Route::ByHand | Route::Webcam => TotpAddAction::None,
+        Route::ImageFile => TotpAddAction::OpenImage,
+        // Handled in the picker itself: it is a stage change and not something
+        // the caller has to do.
+        Route::ByHand | Route::Webcam => TotpAddAction::None,
     }
 }
 
@@ -2007,14 +2155,15 @@ mod tests {
             assert!(!row.subtitle.trim().is_empty(), "{} has no line under it", row.title);
         }
         // **PNG, and not the design's "PNG, JPG".** The dialog's filter says
-        // A row promising a format the decoder cannot read is a promise
-        // broken one click later; Task 7 holds the dialog's filter to this
-        // same answer.
+        // the same, and the two are held to each other from `file_picker`'s
+        // own test. A row promising a format the decoder cannot read is a
+        // promise broken one click later.
         assert!(
             ROUTES[1].subtitle.contains("PNG") && !ROUTES[1].subtitle.contains("JPG"),
             "the image row offers a format this app cannot decode: {}",
             ROUTES[1].subtitle
         );
+        assert_eq!(crate::file_picker::IMAGE_EXTENSION, "png");
     }
 
     /// **The webcam row is present and disabled; every other row is not.**
@@ -2101,10 +2250,17 @@ mod tests {
                 );
             }
         }
-        // No filesystem call at all: the region route has no business with
-        // one, and Task 7 will add exactly one read.
+        // Exactly one filesystem call in the whole feature, and it is a read.
         let totp = &sources.iter().find(|(n, _)| *n == "totp_add.rs").unwrap().1;
-        assert_eq!(totp.matches("std::fs::").count(), 0, "the picker grew a filesystem call");
+        assert_eq!(
+            totp.matches("std::fs::").count(),
+            1,
+            "the image route grew a second filesystem call"
+        );
+        assert!(
+            totp.contains("std::fs::read(path)"),
+            "the one filesystem call is not the read this feature is allowed"
+        );
         // Positive control on the negatives above: the search really does
         // find things in these files, so "no writer anywhere" is a statement
         // about writers and not about an empty haystack.
@@ -2119,10 +2275,22 @@ mod tests {
     /// *"The captured pixels are discarded once the secret is read"*. On the
     /// region route those pixels are `screen_capture::Rgba`, which wipes on
     /// drop and is dropped inside `read_region_with`. On the image route they
-    /// will be Task 7's own, and are held there.
+    /// are this file's own buffers, which is the half this file can be held
+    /// to directly: both are [`Zeroizing`], and neither is returned.
     #[test]
-    fn the_captured_pixels_are_wiped_and_never_handed_out() {
+    fn the_image_routes_own_buffers_are_wiped_and_never_handed_out() {
         let sources = scan_route_sources();
+        let totp = &sources.iter().find(|(n, _)| *n == "totp_add.rs").unwrap().1;
+        assert!(totp.contains("let bytes = Zeroizing::new(std::fs::read(path)"));
+        assert!(totp
+            .contains("let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);"));
+        assert!(totp.contains("let mut rgba = Zeroizing::new(Vec::with_capacity("));
+        // And nothing hands pixels back out: the one thing that leaves the
+        // image route is a string.
+        assert!(
+            totp.contains(") -> Result<Zeroizing<String>, PickerRefusal> {"),
+            "`decode_image_with`'s answer changed; it must be a string and never pixels"
+        );
         // The region route's half, in the module that owns it.
         let overlay = &sources.iter().find(|(n, _)| *n == "region_overlay.rs").unwrap().1;
         assert!(
@@ -2227,6 +2395,182 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The image-file route
+    // -----------------------------------------------------------------
+
+    /// Encodes `rgba` as an RGBA8 PNG. `favicon`'s test helper, because the
+    /// two need exactly the same thing.
+    fn rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(rgba).expect("png pixel data");
+        }
+        out
+    }
+
+    /// The same, as 8-bit greyscale -- the shape a screenshot tool saving a
+    /// black-and-white QR really does produce, and the arm of `png_to_rgba`
+    /// that has to expand one channel into four.
+    fn grey_png(width: u32, height: u32, grey: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(grey).expect("png pixel data");
+        }
+        out
+    }
+
+    /// What the seam below was handed, so a test can assert about the pixels
+    /// the PNG half produced rather than trust that it produced any.
+    static SEEN: std::sync::Mutex<Option<(Vec<u8>, usize, usize)>> =
+        std::sync::Mutex::new(None);
+    /// What the seam below answers.
+    static ANSWER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    /// One test at a time may use the two statics above.
+    static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn recording_decode(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<String>> {
+        *SEEN.lock().unwrap() = Some((rgba.to_vec(), width, height));
+        ANSWER.lock().unwrap().clone().map(Zeroizing::new)
+    }
+
+    /// Runs `body` with the recording seam armed to answer `answer`, and hands
+    /// back what the seam was shown.
+    fn with_recording_seam<T>(
+        answer: Option<&str>,
+        body: impl FnOnce(&ImageSeams) -> T,
+    ) -> (T, Option<(Vec<u8>, usize, usize)>) {
+        let _held = SEAM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *SEEN.lock().unwrap() = None;
+        *ANSWER.lock().unwrap() = answer.map(str::to_string);
+        let seams = ImageSeams { decode: recording_decode };
+        let out = body(&seams);
+        let seen = SEEN.lock().unwrap().clone();
+        (out, seen)
+    }
+
+    /// **A PNG arrives at the decoder as the pixels it was made from.**
+    ///
+    /// This is the half of the image route that is this file's own -- the
+    /// decode itself is `qr`'s, and is tested there against a real QR code.
+    /// What can go wrong here is a row order, a channel order or a stride,
+    /// and none of those would be visible from a test that only asked whether
+    /// a decode succeeded.
+    #[test]
+    fn a_png_reaches_the_decoder_as_the_exact_pixels_it_was_made_from() {
+        // A gradient, so a transposed or reversed buffer is not the same
+        // buffer. 7x5 is deliberately neither square nor a multiple of four.
+        let source: Vec<u8> = (0..7 * 5 * 4).map(|i| (i % 251) as u8).collect();
+        let png = rgba_png(7, 5, &source);
+        let (out, seen) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |seams| {
+                decode_image_with(seams, &png)
+            });
+        assert!(out.is_ok(), "a well-formed PNG was refused: {:?}", out.err());
+        let (rgba, width, height) = seen.expect("the decoder was never called");
+        assert_eq!((width, height), (7, 5), "the dimensions were not carried through");
+        assert_eq!(rgba, source, "the pixels handed to the decoder are not the ones in the file");
+    }
+
+    #[test]
+    fn a_greyscale_png_is_expanded_to_opaque_rgba() {
+        // The arm a black-and-white screenshot takes. Without it a QR saved
+        // as greyscale would reach the decoder at a quarter of the size it
+        // claimed, and be reported as "no code in that image".
+        let grey: Vec<u8> = vec![0x00, 0x40, 0x80, 0xff, 0x11, 0x22];
+        let png = grey_png(3, 2, &grey);
+        let (out, seen) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |s| {
+                decode_image_with(s, &png)
+            });
+        assert!(out.is_ok(), "a greyscale PNG was refused: {:?}", out.err());
+        let (rgba, width, height) = seen.expect("the decoder was never called");
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(rgba.len(), 3 * 2 * 4, "the expansion produced the wrong number of bytes");
+        let expected: Vec<u8> = grey.iter().flat_map(|g| [*g, *g, *g, 255u8]).collect();
+        assert_eq!(rgba, expected, "greyscale was not expanded to opaque RGBA");
+    }
+
+    /// **A picture with no QR in it is the named "no code" refusal**, and a
+    /// picture with one is not.
+    #[test]
+    fn an_image_with_no_code_is_refused_by_name_and_one_with_a_code_is_not() {
+        let blank = rgba_png(8, 8, &vec![0xffu8; 8 * 8 * 4]);
+        let (refused, _) = with_recording_seam(None, |s| decode_image_with(s, &blank));
+        assert_eq!(
+            refused.err(),
+            Some(PickerRefusal::NoCode(CodeSource::Image)),
+            "a picture with no code did not produce the refusal that names why"
+        );
+
+        // The control: the SAME bytes through a seam that finds something do
+        // decode, so the refusal above is about the decoder's answer and not
+        // about the PNG being unreadable.
+        let (found, _) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |s| {
+                decode_image_with(s, &blank)
+            });
+        assert_eq!(
+            found.expect("the control decodes").as_str(),
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_png_is_refused_as_a_file_and_not_as_a_missing_code() {
+        for (what, bytes) in [
+            ("empty", Vec::new()),
+            ("text", b"this is not a picture at all".to_vec()),
+            ("a truncated png", rgba_png(8, 8, &vec![0u8; 8 * 8 * 4])[..20].to_vec()),
+        ] {
+            let (out, seen) =
+                with_recording_seam(Some("ignored"), |s| decode_image_with(s, &bytes));
+            assert_eq!(
+                out.err(),
+                Some(PickerRefusal::NotAnImage),
+                "{what} was not refused as a file"
+            );
+            assert!(seen.is_none(), "{what} reached the QR decoder");
+        }
+        // Control: a real one is NOT refused, so the three above are about the
+        // bytes rather than about `png_to_rgba` refusing everything.
+        let good = rgba_png(8, 8, &vec![0u8; 8 * 8 * 4]);
+        let (out, seen) = with_recording_seam(Some("ok"), |s| decode_image_with(s, &good));
+        assert!(out.is_ok());
+        assert!(seen.is_some());
+    }
+
+    /// **The production seam is the real decoder, by address.**
+    ///
+    /// Without this, every test above could be passing against a stub while
+    /// the shipping path called something else entirely.
+    #[test]
+    fn the_image_route_decodes_through_the_real_qr_reader() {
+        let real: fn(&[u8], usize, usize) -> Option<Zeroizing<String>> = crate::qr::decode_qr;
+        assert!(
+            std::ptr::fn_addr_eq(ImageSeams::production().decode, real),
+            "the image route's production seam is not `qr::decode_qr`"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_is_its_own_refusal() {
+        // A path under the OS temp directory that this test does not create.
+        // Nothing is written, and nothing under the app's own data directory
+        // is touched.
+        let missing = std::env::temp_dir().join("deskwarden-no-such-qr-image-9f3a1c.png");
+        assert!(!missing.exists(), "the fixture path unexpectedly exists");
+        assert_eq!(read_image_file(&missing).err(), Some(PickerRefusal::Unreadable));
+    }
+
+    // -----------------------------------------------------------------
     // What the two scanned routes do to the form
     // -----------------------------------------------------------------
 
@@ -2271,6 +2615,20 @@ mod tests {
         apply_region_outcome(&mut state, Outcome::Cancelled);
         assert_eq!(state.stage, Stage::Picker);
         assert_eq!(state.refusal, None, "cancelling was reported as a failure");
+    }
+
+    #[test]
+    fn a_cancelled_file_dialog_says_nothing_and_a_bad_file_says_what() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.refusal = Some(PickerRefusal::NotAnImage);
+        apply_image_pick(&mut state, None);
+        assert_eq!(state.refusal, None, "a cancelled dialog left a refusal on screen");
+        assert_eq!(state.stage, Stage::Picker);
+
+        let missing = std::env::temp_dir().join("deskwarden-no-such-qr-image-2b7e40.png");
+        apply_image_pick(&mut state, Some(&missing));
+        assert_eq!(state.refusal, Some(PickerRefusal::Unreadable));
+        assert_eq!(state.stage, Stage::Picker);
     }
 
     /// **A hostile QR is refused by exactly the sentence a hostile paste is.**
@@ -2476,6 +2834,36 @@ mod tests {
                 TotpAddAction::ScanRegion,
                 "{route:?} also asked for the region overlay, so the assertion above says \
                  nothing about which row was pressed"
+            );
+        }
+    }
+
+    /// **Pressing "Open an image file" is what opens the shell's dialog.**
+    #[test]
+    fn pressing_the_image_row_asks_for_the_file_dialog_and_no_other_row_does() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let image_at = laid_out.row(Route::ImageFile).center();
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let _ = picker.idle(&mut state);
+        assert_eq!(
+            picker.click(&mut state, image_at).action,
+            TotpAddAction::OpenImage,
+            "clicking 6a's second row did not ask for the file dialog"
+        );
+
+        for route in [Route::ScanRegion, Route::ByHand, Route::Webcam] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            let picker = Picker::new();
+            let laid_out = picker.idle(&mut state);
+            let at = laid_out.row(route).center();
+            assert_ne!(
+                picker.click(&mut state, at).action,
+                TotpAddAction::OpenImage,
+                "{route:?} also asked for the file dialog"
             );
         }
     }
@@ -2701,6 +3089,8 @@ mod tests {
             "crate::region_overlay::RegionOverlay::open(",
             "crate::screen_capture::monitor_bounds()",
             "totp_add::apply_region_outcome(state, outcome)",
+            "crate::file_picker::pick_qr_image()",
+            "totp_add::apply_image_pick(",
             "overlay.show(ui.ctx())",
         ] {
             assert!(code.contains(needle), "`{needle}` is not in the vault window's frame");
