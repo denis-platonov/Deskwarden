@@ -28,7 +28,7 @@ use crate::app_match::AppMatch;
 #[cfg(test)]
 use crate::app_match::TriggerMode;
 use crate::breach::{breach_phrase, BreachCache, BreachStatus};
-use crate::card_brand::{brand_for_number, code_mask_for, mask_for, CardBrand};
+use crate::card_brand::{brand_for_number, code_mask_for, grouped_for, mask_for, CardBrand};
 use crate::card_mark;
 use crate::password_strength;
 use crate::theme;
@@ -5444,6 +5444,21 @@ struct MaskedFace<'a> {
     /// about *card numbers* and it is made by the caller; the row still knows
     /// only "the string to show while hidden".
     mask: Option<&'a str>,
+    /// **What is painted once the value is revealed**, when that is not the
+    /// stored string verbatim. `None` paints `value`, which is what every row
+    /// but the card number wants.
+    ///
+    /// The card number wants otherwise for one reason: a revealed number is
+    /// read against the plastic in the user's hand, and sixteen digits in an
+    /// unbroken run cannot be. It arrives grouped by `card_brand::grouped_for`
+    /// -- the same function the `mask` beside it was grouped by, so clicking
+    /// the eye changes which characters are dots and nothing else about where
+    /// the spaces fall.
+    ///
+    /// **Display only, exactly as `mask` is.** The row still copies `value`;
+    /// see the `on_copy` note at the foot of [`masked_row`], and
+    /// `the_clipboard_gets_the_number_without_the_spaces_it_is_shown_with`.
+    revealed_as: Option<&'a str>,
     /// A mark painted immediately before the value, on the same line -- the
     /// card's network badge. `None` draws nothing, never a placeholder.
     lead: Option<egui::TextureHandle>,
@@ -5508,7 +5523,7 @@ fn masked_row(
     on_copy: DetailAction,
     face: MaskedFace<'_>,
 ) {
-    let MaskedFace { hint, mask, lead } = face;
+    let MaskedFace { hint, mask, revealed_as, lead } = face;
     // **Nothing to hide, so nothing to draw** -- see [`masked_row_visible`].
     // The return is BEFORE any allocation, so the row leaves no band, no
     // hairline slot and no eye behind it.
@@ -5524,10 +5539,14 @@ fn masked_row(
     }
     // **The mask is the caller's when it has one**, and the bullet run only
     // when it has not. See [`MaskedFace::mask`].
-    let shown = match (*revealed, mask) {
-        (true, _) => value.to_string(),
-        (false, Some(mask)) => mask.to_string(),
-        (false, None) => "•".repeat(MASKED_BULLETS),
+    // **Both faces are the caller's when it has them**, and the row's defaults
+    // otherwise. See [`MaskedFace::mask`] and [`MaskedFace::revealed_as`]:
+    // neither is the value the row copies.
+    let shown = match (*revealed, mask, revealed_as) {
+        (true, _, Some(face)) => face.to_string(),
+        (true, _, None) => value.to_string(),
+        (false, Some(mask), _) => mask.to_string(),
+        (false, None, _) => "•".repeat(MASKED_BULLETS),
     };
     // What everything on this row's value line *other than the digits* costs:
     // the eye, plus the chord this row paints beside it when it has one, plus
@@ -5676,6 +5695,14 @@ fn card_rows(
         // the baseline are `paint_digits`'s, untouched, so the three digit
         // runs stay one seam. See `card_brand::mask_for`.
         let masked = mask_for(v, brand);
+        // **And the revealed form, grouped by the same function.** Revealing
+        // the number is how a person checks it against the card in their hand;
+        // an unbroken sixteen-digit run is exactly what cannot be checked, and
+        // a mask in fours over a number in an unbroken run is the two
+        // disagreeing in the one place the user is looking. `grouped_for` is
+        // `mask_for`'s twin over a body of the same length, so the spaces
+        // cannot drift.
+        let revealed = grouped_for(v, brand);
         masked_row(
             ui,
             NUMBER_LABEL,
@@ -5686,6 +5713,7 @@ fn card_rows(
             MaskedFace {
                 hint: Some(CopyShortcut::CardNumber),
                 mask: Some(&masked),
+                revealed_as: Some(&revealed),
                 // **Nothing at all for a brand this app cannot name**, and
                 // nothing for a named brand with no mark. Never a placeholder.
                 lead: brand.and_then(|b| brand_mark_texture(ui.ctx(), b)),
@@ -5749,6 +5777,11 @@ fn card_rows(
                     MaskedFace {
                         hint: Some(CopyShortcut::CardCode),
                         mask: Some(&masked),
+                        // **No grouping, unlike the number above.** A security
+                        // code is three or four digits; there is nothing to
+                        // break up and a space in it would be a space the user
+                        // would try to type.
+                        revealed_as: None,
                         lead: None,
                     },
                 );
@@ -5847,7 +5880,43 @@ fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) ->
 /// Withheld from the LEFT half's contents by [`card_face_line_fits`] and by
 /// [`card_face_line`]'s `trailing`; the two have to agree, or a value the fit
 /// test called safe wraps or runs into its neighbour anyway.
+///
+/// **A floor, not the gap itself.** See [`half_gutter`]: what the line really
+/// leaves between the two runs is whatever the pane's width affords, and this
+/// is only what it may never fall below. The distinction is the whole repair
+/// for "Expires and Code ... too close and when stretch -- only code does it":
+/// a gap that GROWS costs the shared line nothing, while a larger fixed one
+/// costs it entirely -- 16pt here pushes the shipped 638pt pane back onto two
+/// separate rows, losing by about 4pt.
 const HALF_GUTTER: f32 = CONTROL_GAP;
+
+/// **The clear space between the expiry's chord hint and the code's label, at
+/// this width.**
+///
+/// The user, of the shared line: "Expires and Code on the same line are too
+/// close and when stretch -- only code does it". Both halves grow with the
+/// pane, but the expiry's chord hint was right-aligned against the midpoint
+/// from the left while the code's label sits against it from the right, so the
+/// only thing between the two runs was the fixed [`HALF_GUTTER`] -- 8pt at
+/// every width, at 298pt and at 1200pt alike. The code's *value* gained wrap
+/// room as the pane grew, which is exactly why the user saw one side respond
+/// and not the gap.
+///
+/// So the left half is **left-packed**: its ink ends where its content ends,
+/// and everything between there and the midpoint is gap. `HALF_GUTTER` stays
+/// as the floor for the narrowest pane, which is also what
+/// [`card_face_line_fits`] tested against -- so a line the fit test admitted
+/// has at least that much here, and usually more.
+///
+/// Reads the same expression [`card_face_line_fits`] built its `left` from,
+/// for the reason that function's doc gives: the width the fit test reserves
+/// and the width the paint subtracts have to be one expression or a value the
+/// line called safe wraps anyway.
+fn half_gutter(ui: &egui::Ui, expiry: &str, half: f32) -> f32 {
+    let content =
+        ROW_LABEL_WIDTH + ROW_GAP + digits_width(ui, expiry) + expiry_half_controls(ui);
+    (half - content).max(HALF_GUTTER)
+}
 
 /// What sits to the right of the expiry on the shared line: its chord hint,
 /// and the gap before it.
@@ -5890,8 +5959,12 @@ fn card_face_line(
     let (expiry, left_width) = expiry;
     let (code, right_width) = code;
     let (brand, action) = brand_and_action;
+    // **Whatever the width affords, floored at [`HALF_GUTTER`].** See
+    // [`half_gutter`]; computed once and used for both the room the expiry
+    // wraps at and the space its tile keeps clear, so the two cannot disagree.
+    let left_gutter = half_gutter(ui, expiry, left_width);
     let left_room =
-        (left_width - HALF_GUTTER - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
+        (left_width - left_gutter - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
     let right_room =
         (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls(ui)).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
@@ -5908,9 +5981,12 @@ fn card_face_line(
                         width: left_width,
                         label_width: ROW_LABEL_WIDTH,
                         hint: Some(CopyShortcut::CardExpiry),
-                        // The clear space before the code's label. See
-                        // [`HALF_GUTTER`].
-                        trailing: HALF_GUTTER,
+                        // The clear space before the code's label -- the
+                        // pane's width less this half's content, never below
+                        // [`HALF_GUTTER`]. See [`half_gutter`]. The TILE is
+                        // still the full half, so the two hit areas still meet
+                        // at the midpoint; only the ink moves.
+                        trailing: left_gutter,
                     },
                     |ui| paint_digits(ui, expiry, left_room),
                     |_ui| {},
@@ -8118,6 +8194,19 @@ mod tests {
         item
     }
 
+    /// The number [`a_full_card`] stores, character for character. **What the
+    /// clipboard must receive** -- no spaces: a card number pasted with spaces
+    /// is rejected by many payment forms.
+    const STORED_NUMBER: &str = "4242424242424242";
+
+    /// The same number **as the pane paints it once revealed**: grouped by
+    /// `card_brand::grouped_for`, exactly as the mask above it is grouped.
+    ///
+    /// Named once rather than written out at each of the guards that reveal a
+    /// number, so a later change to the grouping reds in one place and is
+    /// re-pinned deliberately instead of six times by hand.
+    const REVEALED_NUMBER: &str = "4242 4242 4242 4242";
+
     #[test]
     fn the_card_pane_paints_every_populated_row() {
         let texts = painted(&a_full_card(), &TotpState::NoSecret);
@@ -8210,10 +8299,20 @@ mod tests {
             totp_secret: false,
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
+        // **Re-pinned to the grouped form, not loosened.** A revealed number
+        // now paints in the network's own groups, which is the whole point of
+        // revealing it -- so the string this looks for is
+        // [`REVEALED_NUMBER`]. The stored run is asserted ABSENT below rather
+        // than dropped from the test: an ungrouped sixteen-digit run on screen
+        // is the reported bug, and this is where it would come back.
         assert!(
-            contains(&texts, "4242424242424242"),
+            contains(&texts, REVEALED_NUMBER),
             "a revealed card number did not paint, so the pane ignores the caller's \
              reveal state: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, STORED_NUMBER),
+            "the revealed number painted as one unbroken run: {texts:?}"
         );
         assert!(contains(&texts, "123"), "a revealed security code did not paint: {texts:?}");
     }
@@ -8270,7 +8369,7 @@ mod tests {
         let after = pane.idle(&item, &TotpState::NoSecret);
         let texts: Vec<String> = after.texts.iter().map(|(t, _)| t.clone()).collect();
         assert!(
-            contains(&texts, "4242424242424242"),
+            contains(&texts, REVEALED_NUMBER),
             "the frame after the reveal click painted the number masked again -- the \
              toggle did not outlive the frame it happened in: {texts:?}"
         );
@@ -10591,7 +10690,7 @@ mod tests {
             },
         );
         assert!(
-            contains(&number_only, "4242424242424242"),
+            contains(&number_only, REVEALED_NUMBER),
             "card_number: true did not reveal the number: {number_only:?}"
         );
         assert!(
@@ -10620,11 +10719,16 @@ mod tests {
         // four by design (§4), so a substring check on those digits would fail
         // against a correctly masked row -- and, worse, would have passed
         // vacuously if the mask ever stopped showing them.
-        assert!(
-            !contains(&code_only, "4242424242424242"),
-            "revealing the SECURITY CODE also unmasked the number -- the two rows are \
-             reading the same flag: {code_only:?}"
-        );
+        // **Both spellings, or this assertion stopped being able to fail.**
+        // The revealed number is grouped now, so a check for the unbroken run
+        // alone would pass against a number that HAD been unmasked.
+        for leaked in [STORED_NUMBER, REVEALED_NUMBER] {
+            assert!(
+                !contains(&code_only, leaked),
+                "revealing the SECURITY CODE also unmasked the number ({leaked:?}) -- the \
+                 two rows are reading the same flag: {code_only:?}"
+            );
+        }
         // The positive control that gives that its force: the number's row is
         // on screen and masked, so the absence above is about the mask rather
         // than about a row that failed to draw.
@@ -10745,13 +10849,107 @@ mod tests {
                 totp_secret: false,
             },
         );
-        for value in [fields.number.expect("number"), fields.code.expect("code")] {
-            assert!(
-                texts.iter().any(|t| *t == value),
-                "the pane painted something other than what card_fields returned for \
-                 {value:?}: {texts:?}"
-            );
-        }
+        // The security code is painted verbatim: three digits need no
+        // grouping, so "what card_fields returned" is literally what is on
+        // screen.
+        let code = fields.code.expect("code");
+        assert!(
+            texts.iter().any(|t| **t == *code),
+            "the pane painted something other than what card_fields returned for \
+             {code:?}: {texts:?}"
+        );
+        // **The number is the one row where painted and stored differ, and the
+        // difference is spaces and only spaces.** Asserting equality would now
+        // be asserting the bug back in, so the assertion is on the DIGITS: the
+        // pane may regroup what `card_fields` returned and may do nothing else
+        // to it -- no dropped digit, no substituted one, no truncation.
+        let number = fields.number.expect("number");
+        let painted = texts
+            .iter()
+            .find(|t| t.chars().filter(char::is_ascii_digit).eq(number.chars()))
+            .unwrap_or_else(|| {
+                panic!("no run on the pane carries the number's digits: {texts:?}")
+            });
+        assert_eq!(
+            painted.replace(' ', ""),
+            *number,
+            "the pane's number differs from card_fields' by more than spacing"
+        );
+        // And it really is regrouped rather than trivially equal, or the two
+        // assertions above would hold just as well on the defect.
+        assert!(
+            painted.contains(' '),
+            "the revealed number painted as one unbroken run: {painted:?}"
+        );
+    }
+
+    /// **The clipboard gets the number WITHOUT the spaces it is shown with.**
+    ///
+    /// The revealed number is grouped now (`card_brand::grouped_for`), and
+    /// grouping is the change most likely to leak into the copy path: a card
+    /// number pasted as `4242 4242 4242 4242` is rejected by many payment
+    /// forms, and the row that copies it is the same row that paints it.
+    ///
+    /// `masked_row`'s doc has always said the mask is a display concern and
+    /// the row copies the real value; this asserts the same of the revealed
+    /// face. Both directions, at once:
+    ///
+    /// * the row **paints** spaces -- so this is not passing because the
+    ///   grouping quietly stopped happening;
+    /// * what `vault_window::mod`'s `CopyCardNumber` arm puts on the clipboard
+    ///   -- `card_fields(..).number`, which is the expression that handler
+    ///   really evaluates -- **has none**, and is the stored digits exactly.
+    #[test]
+    fn the_clipboard_gets_the_number_without_the_spaces_it_is_shown_with() {
+        let item = a_full_card();
+        let card = item.card.as_ref().expect("a_full_card has card data");
+
+        // The value the copy handler hands to `clipboard::copy_secret`.
+        let copied = card_fields(card).number.expect("number");
+        assert_eq!(
+            &*copied, STORED_NUMBER,
+            "the copy path's value is not the stored number"
+        );
+        assert!(
+            !copied.contains(' '),
+            "the clipboard would receive {copied:?} -- a card number with spaces, which \
+             many payment forms reject"
+        );
+
+        // And the row really is painting the grouped form at the same time,
+        // so the two are provably different strings rather than trivially the
+        // same one.
+        let painted = painted_with_reveal(
+            &item,
+            &TotpState::NoSecret,
+            RevealState { card_number: true, ..RevealState::default() },
+        );
+        assert!(
+            contains(&painted, REVEALED_NUMBER),
+            "the number is not being painted grouped, so this test is not guarding the \
+             case it names: {painted:?}"
+        );
+        assert_ne!(
+            REVEALED_NUMBER, &*copied,
+            "the painted and copied forms are the same string, so 'copy is unaffected' \
+             asserts nothing"
+        );
+
+        // End to end: a click on the revealed row still reports the action
+        // whose handler reads `card_fields`, rather than one carrying the
+        // painted text along with it.
+        let mut pane = Pane::new();
+        pane.reveal.card_number = true;
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let row = laid_out.rect_of(NUMBER_LABEL);
+        let clicked = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyCardNumber,
+            "a revealed number's row reported {:?} -- if it ever carries its own text, \
+             that text is the spaced one",
+            clicked.action
+        );
     }
 
     /// A `type: 3` with no `card` object is an *empty card*, not an unknown
@@ -11136,11 +11334,16 @@ mod tests {
             "ssh_private_key: true did not reveal the private key: {texts:?}"
         );
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, ssh_only);
-        assert!(
-            !contains(&texts, "4242424242424242"),
-            "revealing the SSH PRIVATE KEY also unmasked the card number -- the rows are \
-             reading the same flag: {texts:?}"
-        );
+        // Both spellings, for the reason given in
+        // `each_card_secret_is_revealed_only_by_its_own_flag`: the revealed
+        // number is grouped, so the unbroken run alone can no longer fail.
+        for leaked in [STORED_NUMBER, REVEALED_NUMBER] {
+            assert!(
+                !contains(&texts, leaked),
+                "revealing the SSH PRIVATE KEY also unmasked the card number ({leaked:?}) \
+                 -- the rows are reading the same flag: {texts:?}"
+            );
+        }
         assert!(
             !contains(&texts, "123"),
             "revealing the SSH PRIVATE KEY also unmasked the security code: {texts:?}"
@@ -11156,7 +11359,7 @@ mod tests {
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, card_only);
         assert!(
-            contains(&texts, "4242424242424242"),
+            contains(&texts, REVEALED_NUMBER),
             "card_number: true did not reveal the number: {texts:?}"
         );
         let texts = painted_with_reveal(&an_ssh_key_item(), &TotpState::NoSecret, card_only);
@@ -13869,6 +14072,103 @@ mod tests {
         }
     }
 
+    /// The clear space between the two COLUMNS of the shared line, in pixels
+    /// -- from the right edge of the last ink in the left half to the left
+    /// edge of the code's label.
+    ///
+    /// **Ink, not rects.** The expiry's chord hint is laid out `right_to_left`
+    /// and so its `rect_of` box sits its own width off to the right of its
+    /// glyphs; see [`Frame::ink_of`], which is why the gap this measures is a
+    /// gap a reader would actually see rather than one only egui knows about.
+    fn shared_line_gap(width: f32) -> f32 {
+        let item = a_full_card();
+        let mut pane = Pane::wide(width);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let chord = laid_out.ink_of(copy_shortcut_chord(CopyShortcut::CardExpiry));
+        let code_label = laid_out.ink_of(CODE_LABEL);
+        // **The two runs are on ONE line, or this measures nothing.** The
+        // expiry and the code fall back to separate rows when they do not fit
+        // (`card_face_line_fits` returning `None` is a real answer), and a
+        // horizontal gap between two runs on different rows is a number with
+        // no meaning. Asserted rather than assumed, because the widths this is
+        // called at are exactly the widths where the fallback lives.
+        //
+        // The tolerance is half a row band, not a pixel: the chord hint and
+        // the label are different faces at different sizes, so their ink
+        // centres sit about 2pt apart even when they share a line. Anything
+        // that fell back to separate rows is a whole [`ROW_CONTENT_HEIGHT`]
+        // away and cannot hide inside this.
+        let dy = (chord.center().y - code_label.center().y).abs();
+        assert!(
+            dy < ROW_CONTENT_HEIGHT / 2.0,
+            "at {width}pt the expiry and the code are {dy}pt apart vertically -- the \
+             shared line fell back to two rows, so there is no gap here to measure"
+        );
+        assert!(
+            code_label.left() > chord.right(),
+            "the expiry's chord and the code's label overlap at {width}pt: \
+             chord ends at {}, label starts at {}",
+            chord.right(),
+            code_label.left()
+        );
+        code_label.left() - chord.right()
+    }
+
+    /// **The gap between `Expires` and `Code` grows with the pane.**
+    ///
+    /// The user: "Expires and Code on the same line are too close and when
+    /// stretch -- only code does it -- so more space needed in between at
+    /// least." Both halves grow, but the expiry's chord hint used to be
+    /// right-aligned against the midpoint while the code's label sits against
+    /// it from the other side, so the space between those two runs was
+    /// [`HALF_GUTTER`] -- 8pt at 640pt and 8pt at 1400pt. Only the code's
+    /// value gained room, which is exactly the asymmetry the report names.
+    ///
+    /// **The assertion has to be at two widths and it has to be a comparison.**
+    /// A single-width check passes against the defect: 8pt is a real gap, it
+    /// is simply a gap that never responds. What was wrong was the
+    /// *derivative*, so that is what is asserted.
+    #[test]
+    fn the_shared_lines_two_columns_move_apart_as_the_pane_widens() {
+        // **The shipped pane, and one over twice as wide.** 638pt is the width
+        // [`HALF_GUTTER`]'s doc measures against -- the pane a user actually
+        // gets -- and it is the narrowest of interest here: below it the two
+        // fall back to separate rows and there is no shared line to space out.
+        // `shared_line_gap` asserts that fallback has not happened rather than
+        // trusting it, which is how the first draft of this test was caught
+        // measuring two runs on different rows.
+        let narrow = shared_line_gap(SHIPPED_PANE);
+        let wide = shared_line_gap(SHIPPED_PANE * 2.0);
+        assert!(
+            wide > narrow + 100.0,
+            "the gap between Expires and Code is {narrow}pt on the narrowest pane and \
+             {wide}pt on a pane over twice as wide -- it is not responding to the width \
+             at all, which is the whole of the report"
+        );
+        // **And the floor still holds at the narrowest pane**, which is the
+        // half of `HALF_GUTTER`'s doc that must survive: the two runs are
+        // never edge to edge, and the constant was not widened (16pt there
+        // costs the shipped 638pt pane the shared line entirely).
+        assert!(
+            narrow >= HALF_GUTTER,
+            "the narrowest pane leaves only {narrow}pt between the two columns, under \
+             the {HALF_GUTTER}pt floor"
+        );
+        // The control: this measurement can SEE a gap that does not move.
+        // `Code`'s own left edge really does travel with the pane, so a
+        // helper that returned a constant would be failing for a different
+        // reason than the one above claims.
+        assert!(
+            wide > narrow,
+            "the gap did not grow at all, so the comparison above is vacuous"
+        );
+    }
+
+    /// The detail pane's width in the app as shipped -- the number
+    /// [`HALF_GUTTER`]'s doc reasons about when it says a 16pt gutter costs
+    /// this pane the shared line by about 4pt.
+    const SHIPPED_PANE: f32 = 638.0;
+
     // ------------------------------------------- the card's three DIGIT rows
 
     /// Every reveal flag up, so the number and the security code paint their
@@ -13979,7 +14279,7 @@ mod tests {
     fn the_cards_three_digit_rows_are_one_typography() {
         let item = a_full_card();
         let painted = painted_ink(&item, ALL_REVEALED);
-        for value in ["4242424242424242", "04/23", "123"] {
+        for value in [REVEALED_NUMBER, "04/23", "123"] {
             let (font, tracking, ..) = one_run(&painted, value);
             assert_eq!(
                 font,
@@ -14067,7 +14367,11 @@ mod tests {
         // two.
         let rows = [
             (CARDHOLDER_LABEL, "John Doe"),
-            (NUMBER_LABEL, "4242424242424242"),
+            // The grouped form: what the pane really paints once revealed, and
+            // so the run whose ink this measures. The spaces do not change the
+            // face or the baseline -- which is exactly what this re-pin has to
+            // keep being able to prove.
+            (NUMBER_LABEL, REVEALED_NUMBER),
             (EXPIRY_LABEL, "04"),
             (CODE_LABEL, "123"),
         ];

@@ -180,6 +180,40 @@ pub fn mask_for(number: &str, brand: Option<CardBrand>) -> String {
         })
         .collect();
 
+    grouped(&body, brand)
+}
+
+/// The number as the card prints it, every digit legible:
+/// `4111 1111 1111 1111`, or `3782 822463 10005` for an Amex.
+///
+/// **The revealed twin of [`mask_for`], and deliberately its twin.** Revealing
+/// a number exists so a person can check it against the plastic in their hand,
+/// and a sixteen-digit run is exactly what cannot be checked. Both forms are
+/// grouped by [`grouped`] over a body of the same length, so the spaces land
+/// in the same places by construction rather than by two graders agreeing --
+/// see `the_mask_and_the_revealed_number_break_in_the_same_places`.
+///
+/// **Digits only, exactly as the mask counts digits only.** A number stored as
+/// `4111-1111-1111-1111` masks to twelve dots and four digits, so revealing it
+/// has to show those same sixteen digits and not the user's dashes; letting
+/// the two disagree about which characters are digits is the whole defect.
+/// The value copied to the clipboard is untouched by this -- the mask and this
+/// are both display, and `masked_row` copies the stored string.
+///
+/// A number too short for the mask to reveal anything still shows here in
+/// full: revealing is an explicit act, so what is stored is what is shown, and
+/// three digits group as one group of three rather than being padded.
+pub fn grouped_for(number: &str, brand: Option<CardBrand>) -> String {
+    let body: Vec<char> = digits_of(number).chars().collect();
+    grouped(&body, brand)
+}
+
+/// Space out `body` at the brand's group boundaries.
+///
+/// **The one grouper.** Its callers differ only in what they put in `body` --
+/// bullets with the last four kept, or every digit -- and never in how long
+/// `body` is, which is what makes the two forms line up.
+fn grouped(body: &[char], brand: Option<CardBrand>) -> String {
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     for (i, c) in body.iter().enumerate() {
         if group_starts_at(i, body.len(), brand) && !out.is_empty() {
@@ -393,6 +427,115 @@ mod tests {
         let masked = mask_for("4111 1111 1111 1111", Some(CardBrand::Visa));
         assert_eq!(masked, "•••• •••• •••• 1111");
         assert_eq!(masked.chars().filter(|c| *c == BULLET).count(), 12);
+    }
+
+    /// The positions of the spaces in `s`, which is the only thing the mask
+    /// and the revealed number have to agree about.
+    fn space_positions(s: &str) -> Vec<usize> {
+        s.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == ' ')
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn the_mask_and_the_revealed_number_break_in_the_same_places() {
+        // **The property, not a table.** The reported bug was a revealed
+        // number with no spaces at all under a mask that had them; the danger
+        // in fixing it is a SECOND grouper that agrees on a Visa and drifts on
+        // an Amex. So the assertion is the invariant itself, over every brand
+        // and over the lengths that break the brand's own grouping.
+        let numbers = [
+            "4111111111111111",
+            "5555555555554444",
+            "378282246310005",
+            "30569309025904",
+            "6011111111111117",
+            "3530111333300000",
+            "6200000000000005",
+            // Lengths no grouping claims, which take the fours-from-the-right
+            // fallback -- the case a second grouper is most likely to get
+            // wrong.
+            "1234567890123",
+            "12345678901234567890",
+            "12345",
+            "1234",
+            "123",
+            "1",
+            "",
+        ];
+        for n in numbers {
+            for brand in CARD_BRANDS.map(Some).into_iter().chain([None]) {
+                let masked = mask_for(n, brand);
+                let revealed = grouped_for(n, brand);
+                assert_eq!(
+                    space_positions(&masked),
+                    space_positions(&revealed),
+                    "{n:?} as {brand:?}: mask {masked:?} vs revealed {revealed:?}"
+                );
+                // And the same total width, so the row cannot jump when the
+                // eye is clicked.
+                assert_eq!(masked.chars().count(), revealed.chars().count(), "{n:?}");
+            }
+        }
+        // Control: the helper can SEE a disagreement. Without this the
+        // assertion above passes just as well on two functions that both
+        // return the empty string.
+        assert_ne!(
+            space_positions(&mask_for("4111111111111111", Some(CardBrand::Visa))),
+            space_positions("4111111111111111"),
+            "the ungrouped form is what the bug looked like and must not match"
+        );
+        assert_eq!(
+            space_positions(&mask_for("4111111111111111", Some(CardBrand::Visa))),
+            vec![4, 9, 14]
+        );
+    }
+
+    #[test]
+    fn a_revealed_number_reads_in_its_networks_own_groups() {
+        assert_eq!(
+            grouped_for("4111111111111111", Some(CardBrand::Visa)),
+            "4111 1111 1111 1111"
+        );
+        // Fifteen digits in 4-6-5, the same shape the mask draws.
+        assert_eq!(
+            grouped_for("378282246310005", Some(CardBrand::AmericanExpress)),
+            "3782 822463 10005"
+        );
+        assert_eq!(
+            grouped_for("30569309025904", Some(CardBrand::DinersClub)),
+            "3056 930902 5904"
+        );
+    }
+
+    #[test]
+    fn revealing_normalises_to_the_digits_the_mask_counted() {
+        // The stored string is whatever `bw` round-trips, dashes and all. The
+        // mask counts digits; so must the revealed form, or the two disagree
+        // about which characters exist and the spaces cannot line up.
+        assert_eq!(
+            grouped_for("4111-1111-1111-1111", Some(CardBrand::Visa)),
+            "4111 1111 1111 1111"
+        );
+        assert_eq!(
+            grouped_for("4111 1111 1111 1111", Some(CardBrand::Visa)),
+            "4111 1111 1111 1111"
+        );
+        // Not merely "spaces survive": a non-digit is dropped, never kept.
+        assert!(!grouped_for("4111-1111-1111-1111", Some(CardBrand::Visa)).contains('-'));
+    }
+
+    #[test]
+    fn a_number_too_short_to_mask_still_reveals_what_is_stored() {
+        // The mask deliberately reveals nothing below four digits; revealing
+        // is the user's explicit act, so it shows the fragment -- grouped as
+        // the one short group it is, not padded and not panicking.
+        assert_eq!(grouped_for("123", Some(CardBrand::Visa)), "123");
+        assert_eq!(grouped_for("1", None), "1");
+        assert_eq!(grouped_for("", None), "");
+        assert_eq!(grouped_for("12345", Some(CardBrand::Visa)), "1 2345");
     }
 
     #[test]

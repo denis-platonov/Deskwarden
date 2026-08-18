@@ -109,6 +109,16 @@ enum Surface {
     /// shared expiry/security-code line. The surface whose edit path was
     /// gated off for a fortnight without a test noticing.
     CardDetail,
+    /// The same card **with its number revealed** -- the state a user puts the
+    /// pane into in order to read the number against the card in their hand.
+    ///
+    /// A surface of its own because it is the only place the number's digit
+    /// grouping can be seen at all: masked, the grouping is a shape made of
+    /// dots, and a reviewer looking at `detail_card` cannot tell whether
+    /// revealing keeps the groups or runs the digits together. It ran them
+    /// together for a release -- "when Bank number masked it has spaces but
+    /// when open -- doesn't" -- and no rendered surface showed it.
+    CardDetailRevealed,
     /// The edit form with the discard confirmation over it.
     DiscardConfirm,
     /// The record composer -- the Send export form and its seed warning.
@@ -167,6 +177,7 @@ const ALL: &[Surface] = &[
     Surface::LoginSignin,
     Surface::LoginDetail,
     Surface::CardDetail,
+    Surface::CardDetailRevealed,
     Surface::DiscardConfirm,
     Surface::RecordComposer,
     Surface::PreflightAllowed,
@@ -185,6 +196,7 @@ impl Surface {
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
             Surface::CardDetail => "detail_card",
+            Surface::CardDetailRevealed => "detail_card_revealed",
             Surface::DiscardConfirm => "edit_discard_confirm",
             Surface::RecordComposer => "record_composer",
             Surface::PreflightAllowed => "preflight_allowed",
@@ -212,6 +224,7 @@ impl Surface {
             Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
             Surface::LoginDetail
             | Surface::CardDetail
+            | Surface::CardDetailRevealed
             | Surface::DiscardConfirm
             | Surface::RecordComposer => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
@@ -434,8 +447,11 @@ impl eframe::App for Preview {
             Surface::Overlay => self.draw_overlay(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false),
             Surface::LoginSignin => self.draw_login(root, &ctx, true),
-            Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(false)),
-            Surface::CardDetail => self.draw_pane(root, PaneKind::Detail(true)),
+            Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
+            Surface::CardDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Card)),
+            Surface::CardDetailRevealed => {
+                self.draw_pane(root, PaneKind::Detail(DetailShot::CardRevealed))
+            }
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
@@ -485,14 +501,33 @@ impl eframe::App for Preview {
 
 /// Which of the in-window panes `draw_pane` is drawing.
 enum PaneKind {
-    /// The read pane; `true` for the card fixture, `false` for the login one.
-    Detail(bool),
+    /// The read pane, in one of its three shots.
+    Detail(DetailShot),
     /// The edit form with its discard confirmation up.
     Discard,
     /// The Send record composer.
     Composer,
     /// The preflight; `true` for the allowed state, `false` for the refusal.
     Preflight(bool),
+}
+
+/// Which fixture the read pane is drawn from, and in what reveal state.
+///
+/// A three-way enum rather than the pair of bools it would otherwise have
+/// become: `Detail(true, false)` at a call site names neither of the things it
+/// decides, and the reveal flag is the whole reason the third shot exists.
+#[derive(Clone, Copy)]
+enum DetailShot {
+    /// The login fixture, masked -- `detail_login`.
+    Login,
+    /// The card fixture as it opens: number and code masked -- `detail_card`.
+    Card,
+    /// The card fixture with the NUMBER revealed and the security code still
+    /// masked -- `detail_card_revealed`. The code stays hidden because that is
+    /// the state a user reading their number is really in (the two rows have
+    /// separate flags), and because a CVV in a checked-in PNG is worth
+    /// avoiding even from a fixture.
+    CardRevealed,
 }
 
 impl Preview {
@@ -610,8 +645,18 @@ impl Preview {
         egui::CentralPanel::default()
             .frame(pane_frame())
             .show(root, |ui| match kind {
-                PaneKind::Detail(card) => {
+                PaneKind::Detail(shot) => {
+                    let card = !matches!(shot, DetailShot::Login);
                     let item = if card { &fixtures.card } else { &fixtures.login };
+                    // **Set, never toggled.** One `Fixtures` is shared by the
+                    // whole `--all` walk, so a reveal flag left standing would
+                    // change a later surface depending on the order the walk
+                    // happened to run in. Assigning the whole state makes each
+                    // shot independent of the ones before it.
+                    fixtures.reveal = RevealState {
+                        card_number: matches!(shot, DetailShot::CardRevealed),
+                        ..RevealState::default()
+                    };
                     // A card has no one-time-code row to have a state for; the
                     // login fixture shows a live code, which is the state that
                     // row spends most of its life in.
