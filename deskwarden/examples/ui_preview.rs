@@ -737,6 +737,11 @@ impl Preview {
                         ui,
                         item,
                         Some("Work"),
+                        // The preview has no vault behind it, so the kebab's
+                        // "Move to folder" submenu says "No folders yet" --
+                        // which is a real state of that submenu and the
+                        // honest one to show without a folder list.
+                        &[],
                         if card { 0 } else { 42 },
                         totp,
                         false,

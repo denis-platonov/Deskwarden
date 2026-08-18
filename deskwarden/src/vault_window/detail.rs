@@ -35,7 +35,8 @@ use crate::card_mark;
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
-    password_history, CardData, IdentityData, ItemKind, PasswordHistoryEntry, SshKeyData, VaultItem,
+    password_history, CardData, Folder, IdentityData, ItemKind, PasswordHistoryEntry, SshKeyData,
+    VaultItem,
 };
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 /// [`totp_key_of`] has to allocate to hand back a decoded key, and the seed is
@@ -479,6 +480,81 @@ pub enum DetailAction {
     /// `delete_pending` (see that param's doc comment) for which label/state
     /// to show.
     Delete,
+    /// A destination in the kebab's **Move to folder** submenu was chosen,
+    /// carrying that folder's **id**.
+    ///
+    /// **Always a real, assignable folder, and never "no folder".** The
+    /// destinations come from `item_list::move_menu` -- the same function that
+    /// builds the item row's submenu, called rather than copied -- so the two
+    /// surfaces cannot come to offer different lists. That function's doc
+    /// carries the evidence for the missing "No folder": `bw serve` (CLI
+    /// 2026.7.0) cannot un-file an item by any spelling, so an entry for it
+    /// would be a control that reports success and does nothing. This is the
+    /// same withholding `EditDraft::may_unfile` already performs in the edit
+    /// form, for the same recorded experiment.
+    ///
+    /// Carrying the id and not the whole move because the effect is
+    /// `vault_window::mod`'s `move_item_into_folder` -- the function the
+    /// sidebar's drag-and-drop drop already lands in, which owns the
+    /// optimistic write, the revert on failure and the inline message. A
+    /// second effect path here would be a second place "a failed move leaves
+    /// the item where it was" could stop being true.
+    ///
+    /// On the **not-exposing** side of `detail_action_exposes_secrets`, and
+    /// deliberately: a move reveals nothing. It reads no secret, paints no
+    /// secret and puts nothing on the clipboard -- it changes which container
+    /// the item is filed in. `row_command_exposes_secrets` already answers
+    /// `false` for `RowCommand::MoveToFolder`, the identical operation reached
+    /// from the item row, and answering differently here would mean the same
+    /// act cost a master password from one menu and not from the other.
+    ///
+    /// Not confirmed, also deliberately. Delete arms on its first click
+    /// because it is not undoable; a move is undone by moving back, and the
+    /// destination list makes the item's current folder visible while the user
+    /// is choosing, so there is nothing a confirmation would tell them.
+    MoveToFolder(String),
+    /// The kebab's **Clone** was clicked: the user wants a second item like
+    /// this one.
+    ///
+    /// **It REPORTS and does not create.** `vault_window::mod` answers it by
+    /// seeding an `EditDraft` from the item, renaming it, and opening the
+    /// ordinary create form on it -- the same form "+ New" opens and the same
+    /// `cache.create_item` behind its Save. Nothing is written until the user
+    /// presses that Save.
+    ///
+    /// **That indirection IS the fidelity decision, and it is the one
+    /// Bitwarden's own clients make.** A clone that POSTed silently would go
+    /// through `NewItem`, whose `to_payload` emits only `name`, `type`,
+    /// `folderId`, an optional `notes` and the kind's own object -- so it
+    /// would drop the item's custom fields, its URIs, its app-match binding,
+    /// its `passwordHistory`, a login's TOTP seed (`NewItem::Login` has no
+    /// `totp` at all) and, worst, its `reprompt` flag. A "Clone" that quietly
+    /// turns a master-password-protected item into an unprotected one is the
+    /// opposite of what that flag is for.
+    ///
+    /// The faithful-and-silent alternative -- `POST /object/item` carrying a
+    /// whole `VaultItem` -- was rejected because that shape has never been
+    /// observed against this backend. `create_item` has only ever POSTed
+    /// `to_payload`'s keys, and a POST body carrying another item's `id` and
+    /// `key` is precisely the kind of guess this crate does not make (see
+    /// `without_deleted_date`, which drops a key rather than send it and hope).
+    ///
+    /// Opening the form instead converts every one of those losses from a
+    /// silent drop into a *disclosure*: what the create form cannot carry is
+    /// visibly not in the form the user is looking at when they press Save,
+    /// and the login form already says so in as many words
+    /// (`detail_edit::TOTP_CREATE_NOTICE`). That is the same argument the
+    /// import decision made, and it is why this variant carries nothing --
+    /// the caller re-resolves the selected item and builds the draft.
+    ///
+    /// On the **exposing** side of `detail_action_exposes_secrets`, for
+    /// [`Self::Edit`]'s reason exactly and not a weaker one: what this opens
+    /// is a form holding this item's password in a draft, with its own reveal
+    /// control. Letting an unproven user open it would be a door around every
+    /// masked row on the read pane -- and a wider one than Edit's, because
+    /// the draft it opens is destined for a NEW item that the `reprompt` flag
+    /// will not follow.
+    Clone,
     /// The header's ✕ was clicked: the user wants the detail pane GONE and
     /// the item list to take the window.
     ///
@@ -644,6 +720,30 @@ pub fn kind_offers_edit(kind: ItemKind) -> bool {
         ItemKind::SshKey | ItemKind::Unknown(_) => false,
     }
 }
+
+/// Whether the kebab offers **Clone** for this kind.
+///
+/// A clone here is a *pre-filled create*: `vault_window::mod` seeds an
+/// `EditDraft` from the item with `EditDraft::from_item`, renames it, and puts
+/// the pane into `DetailMode::Create` with the form open. So a kind may only
+/// be cloned when BOTH halves of that round trip work -- the draft can be
+/// filled from an existing item of that kind, and the filled draft has a
+/// create payload.
+///
+/// That is the intersection of [`kind_offers_edit`] and
+/// [`is_creatable`](super::detail_edit::is_creatable), and it is written as
+/// the intersection rather than as its own list so that neither predicate can
+/// be widened later without this one following. **`SshKey` is exactly why the
+/// intersection is not redundant**: it is creatable but not editable, because
+/// `EditDraft::from_item` leaves an existing key's `SshKeyDraft` blank (there
+/// is no form that fills one on an edit -- see `form_body`'s
+/// `UneditableNotice` arm). A clone built from that draft would POST an SSH
+/// key with three empty strings where the private key should be: an item that
+/// looks like a copy in the list and contains nothing. `Unknown` fails both.
+pub fn kind_offers_clone(kind: ItemKind) -> bool {
+    kind_offers_edit(kind) && super::detail_edit::is_creatable(kind)
+}
+
 
 /// The item's note body, or `None` when there is nothing worth a card.
 ///
@@ -2529,6 +2629,20 @@ pub fn draw_detail_read(
     // every reason there might not be one. A NAME, never an id: see
     // [`header_subtitle`].
     folder: Option<&str>,
+    // The window's folder list, for the kebab's **Move to folder** submenu --
+    // and only for that.
+    //
+    // **In ADDITION to `folder` above, not instead of it.** The two answer
+    // different questions: `folder` is the resolved NAME of where this item
+    // lives, which the header subtitle paints, and this is the set of places
+    // it could be moved to. Deriving the subtitle from this list here would
+    // move `sidebar::folder_name`'s lookup -- and every reason there might not
+    // be a name -- into a second place.
+    //
+    // Passed whole rather than pre-built into a menu, because the menu is
+    // `item_list::move_menu`'s to build (see `DetailAction::MoveToFolder`) and
+    // that function takes the item and the folders.
+    folders: &[Folder],
     fill_count: u32,
     totp: &TotpState,
     // Whether *this* item currently has a delete armed (its first click
@@ -2883,6 +2997,76 @@ pub fn draw_detail_read(
                         action = DetailAction::Edit;
                         ui.close();
                     }
+                    // **Clone, next to Edit** -- the two entries that open the
+                    // same form, kept adjacent.
+                    //
+                    // The wording is the user's clue about what it does
+                    // *next*: it opens a form rather than creating anything,
+                    // and the hover says so. Bitwarden's own clients word and
+                    // behave this the same way; see `DetailAction::Clone` for
+                    // why opening the form is the fidelity decision and not a
+                    // shortcut around one.
+                    //
+                    // Gated by `kind_offers_clone`, which is the intersection
+                    // of "can be read into a draft" and "has a create
+                    // payload" -- an SSH key satisfies only the second, and
+                    // cloning one would POST an empty key.
+                    if kind_offers_clone(kind) {
+                        let clone = ui.button("Clone");
+                        if clone
+                            .on_hover_text(
+                                "Open a new item pre-filled from this one. Nothing is saved \
+                                 until you press Save.",
+                            )
+                            .clicked()
+                        {
+                            action = DetailAction::Clone;
+                            ui.close();
+                        }
+                    }
+                    // **Move to folder, drawn from the item row's own
+                    // `move_menu` and `menu_command`** -- called, not
+                    // reimplemented. Which folders are on offer, that the
+                    // item's current folder is present but greyed with a
+                    // reason, and that a vault with no folders says so
+                    // instead of opening an empty box, are all decisions
+                    // that function already made and already has tests for.
+                    // See `DetailAction::MoveToFolder` for why there is no
+                    // "No folder" entry: this backend cannot un-file.
+                    //
+                    // **Above Delete and below Edit**, matching the item
+                    // row's menu order exactly -- the two menus act on the
+                    // same item and a user who learned one should not have
+                    // to relearn the other.
+                    //
+                    // Drawn for every kind, like Delete and unlike Edit: an
+                    // item's folder is not a property of its type, and
+                    // `move_menu` files a card or an SSH key exactly as it
+                    // files a login.
+                    ui.menu_button(super::item_list::MOVE_TO_FOLDER_LABEL, |ui| {
+                        match super::item_list::move_menu(item, folders) {
+                            super::item_list::MoveMenu::Targets(targets) => {
+                                for target in &targets {
+                                    if super::item_list::menu_command(ui, target) {
+                                        // `move_menu` promises this is
+                                        // always a `MoveToFolder`; the
+                                        // `if let` rather than an `unwrap`
+                                        // keeps that a promise this file
+                                        // does not have to enforce with a
+                                        // panic.
+                                        if let super::item_list::RowCommand::MoveToFolder(id) =
+                                            &target.command
+                                        {
+                                            action = DetailAction::MoveToFolder(id.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            super::item_list::MoveMenu::Empty(note) => {
+                                ui.add_enabled(false, egui::Button::new(note));
+                            }
+                        }
+                    });
                     // **Still two clicks, and the menu stays open between
                     // them.** Burying Delete does not remove the reason
                     // `vault_window::mod`'s `confirm_click` gates it: one
@@ -7078,13 +7262,15 @@ mod tests {
 
         let mut reveal = reveal;
         let output = ctx.run_ui(input(), |ui| {
-            // No folder: this harness reads the pane's BODY, and every one of
-            // its callers would have to gain a folder to keep saying what it
-            // says. The header's own subtitle has `Pane`, which carries one.
+            // No folder, and no folder LIST: this harness reads the pane's
+            // BODY, and every one of its callers would have to gain both to
+            // keep saying what it says. The header's own subtitle -- and the
+            // kebab's move submenu -- have `Pane`, which carries both.
             draw_detail_read(
                 ui,
                 item,
                 None,
+                &[],
                 3,
                 totp,
                 delete_pending,
@@ -7455,6 +7641,7 @@ mod tests {
                 ui,
                 item,
                 None,
+                &[],
                 3,
                 totp,
                 false,
@@ -7532,6 +7719,11 @@ mod tests {
         /// The folder name the window would have resolved for this item --
         /// `None` unless a test sets it, which is the vault's usual case.
         folder: Option<String>,
+        /// The vault's folders, as the window would pass them -- what the
+        /// kebab's "Move to folder" submenu is built from. Empty unless a
+        /// test sets it, which is the state that makes the submenu say "No
+        /// folders yet"; see [`Pane::with_folders`].
+        folders: Vec<Folder>,
         /// The window's `AppIdentityCache`, carried across frames exactly as
         /// `vault_window::mod`'s `run` carries it. Empty unless a test seeds
         /// it (see [`Pane::knows_app`]): nothing in this suite names a path
@@ -7893,6 +8085,7 @@ mod tests {
                 reveal: RevealState::default(),
                 delete_pending: false,
                 folder: None,
+                folders: Vec::new(),
                 apps: crate::app_identity::AppIdentityCache::default(),
                 reveal_totp_seed: false,
             }
@@ -7956,6 +8149,7 @@ mod tests {
                         ui,
                         item,
                         self.folder.as_deref(),
+                        &self.folders,
                         3,
                         totp,
                         self.delete_pending,
@@ -8061,6 +8255,35 @@ mod tests {
             let kebab = closed.kebab().center();
             let _ = self.click(item, totp, kebab);
             self.idle(item, totp)
+        }
+
+        /// Opens the kebab, then opens its **Move to folder** submenu, and
+        /// returns the frame the destinations paint on.
+        ///
+        /// Two real clicks on two real controls, at the positions the pane
+        /// actually painted them -- not a call into `move_menu`. A test that
+        /// asked that function for its list would pass just as happily
+        /// against a kebab that never drew the submenu at all, which is the
+        /// blindness this suite has been caught by before.
+        ///
+        /// It asserts the submenu opened, because "clicked the label and
+        /// nothing happened" and "clicked the label and the submenu is
+        /// empty" paint the same absence of destinations, and only the
+        /// second is a real answer.
+        fn open_move_submenu(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
+            let open = self.open_kebab(item, totp);
+            let entry = open.rect_of(crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            let _ = self.click(item, totp, entry.center());
+            self.idle(item, totp)
+        }
+    }
+
+    /// A folder as the window holds one.
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            other: serde_json::Map::new(),
         }
     }
 
@@ -8527,6 +8750,261 @@ mod tests {
             "clicking the menu's Edit reported {:?}",
             clicked.action
         );
+    }
+
+    /// **The kebab has no "Change type", and this pins the refusal so it is
+    /// met before it is undone.**
+    ///
+    /// It was asked for alongside Move to folder and Clone, and it is a
+    /// documented no rather than a gap.
+    ///
+    /// *The data has nowhere to go.* A login's `login` object and a card's
+    /// `card` object are different shapes; turning one into the other leaves
+    /// a username, a password, a TOTP seed and a URI list homeless. The only
+    /// total answers are to drop them -- silent data loss behind a menu entry
+    /// that sounds like a formatting change -- or to keep them, which makes
+    /// an item carrying two type objects. `EditDraft::apply_to` already
+    /// refuses the second in as many words, and that refusal is load-bearing:
+    /// an item with both objects is malformed to every other Bitwarden
+    /// client, so this app would be corrupting a vault it shares.
+    ///
+    /// *And interoperability settles it.* **Bitwarden's own web vault cannot
+    /// change an item's type either** -- it is one of the oldest standing
+    /// requests on their community forum ("Change 'type' of items"),
+    /// repeatedly asked for and never shipped, and their answer is the one
+    /// this app gives: make a new item of the wanted type and delete the old.
+    /// So a Change type here would not be catching up with the other clients;
+    /// it would be inventing a write none of them perform, against a server
+    /// whose behaviour on it has never been probed.
+    ///
+    /// The honest route already exists and is two clicks: **Clone** opens a
+    /// create form pre-filled from the item, the "+ New" type menu picks the
+    /// wanted kind, and the original is deleted afterwards. That writes only
+    /// shapes this crate has verified, and it shows the user what survives
+    /// instead of deciding it for them.
+    ///
+    /// Reopen this only with a capture, the way `may_unfile` records the
+    /// un-filing limitation: a controlled run against `bw serve`, and a
+    /// written decision about the orphaned fields, before any code.
+    #[test]
+    fn the_kebab_offers_no_way_to_change_an_items_type() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        // The pairing: the menu really opened, so the absences below are
+        // absences in a drawn menu rather than an absence of a menu.
+        assert!(
+            open.painted("Clone") && open.painted("Delete"),
+            "the kebab menu did not open, so finding no type-change entry in it proves \
+             nothing: {:?}",
+            open.strings()
+        );
+        for spelling in ["Change type", "Change Type", "Convert", "Convert to"] {
+            assert!(
+                !open.painted(spelling),
+                "the kebab offers {spelling:?}. A login's `login` object and a card's \
+                 `card` object are different shapes: the change either drops the fields \
+                 with nowhere to go, or writes an item carrying two type objects that \
+                 every other Bitwarden client reads as malformed. Bitwarden's own web \
+                 vault does not offer this either. Clone plus Delete is the supported \
+                 route. Painted: {:?}",
+                open.strings()
+            );
+        }
+    }
+
+    /// Clone is reachable, and reachable only through the kebab -- pressed at
+    /// the coordinates the pane painted, and read back as the action the pane
+    /// reported.
+    #[test]
+    fn clicking_clone_in_the_kebab_menu_asks_the_caller_to_clone() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let entry = open.rect_of("Clone");
+        let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::Clone,
+            "clicking the menu's Clone reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **An SSH key's kebab carries no Clone, and that is the point of
+    /// `kind_offers_clone` being an intersection rather than a list.**
+    ///
+    /// `is_creatable` says yes -- `NewItem::ssh_key` POSTs the three key
+    /// fields -- but `EditDraft::from_item` leaves an existing key's draft
+    /// blank, because no form fills one on an edit. A Clone here would create
+    /// an SSH key with three empty strings where the private key should be:
+    /// something that looks like a copy in the list and contains nothing.
+    ///
+    /// Paired with a kind that DOES offer it, so this cannot pass against a
+    /// kebab that lost the entry altogether.
+    #[test]
+    fn every_kinds_kebab_offers_clone_exactly_when_the_copy_would_carry_something() {
+        let mut offered = 0;
+        let mut withheld = 0;
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            let painted = open.painted("Clone");
+            assert_eq!(
+                painted,
+                kind_offers_clone(kind),
+                "{kind:?}'s kebab disagrees with `kind_offers_clone`; it painted: {:?}",
+                open.strings()
+            );
+            if painted {
+                offered += 1;
+                // Not decoration: the entry really reports, for every kind
+                // that draws it.
+                let entry = open.rect_of("Clone");
+                let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+                assert_eq!(
+                    clicked.action,
+                    DetailAction::Clone,
+                    "{kind:?}'s Clone entry is decoration -- clicking it reported {:?}",
+                    clicked.action
+                );
+            } else {
+                withheld += 1;
+            }
+        }
+        // **Both counts, so this cannot pass against a predicate that
+        // collapsed to a constant.** An SSH key is the kind that must be
+        // withheld: `is_creatable` says yes, but `EditDraft::from_item`
+        // leaves an existing key's draft blank, so the copy would be an SSH
+        // key with three empty strings where the private key should be.
+        assert!(
+            offered > 0 && withheld > 0,
+            "every kind answered the same way ({offered} offered, {withheld} withheld), so \
+             this test would pass against `kind_offers_clone` hardcoded either way"
+        );
+    }
+
+    /// **The whole point of the feature, proven by pressing it.**
+    ///
+    /// Two real clicks -- the kebab, then the "Work" line in its submenu --
+    /// at the coordinates the pane actually painted, and then the action the
+    /// pane *reported*. A test that called `move_menu` and asserted its
+    /// contents would pass against a kebab with no submenu in it at all.
+    ///
+    /// The id and not the name is what comes back, and that is asserted
+    /// rather than assumed: `vault_window::mod` hands this straight to
+    /// `move_item_into_folder`, which is a folder-id API, and a variant
+    /// carrying "Work" would fail there and nowhere else.
+    #[test]
+    fn choosing_a_folder_in_the_kebabs_move_submenu_reports_that_move() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        pane.folders = vec![folder("f1", "Personal"), folder("f2", "Work")];
+
+        let submenu = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        assert!(
+            submenu.painted("Work"),
+            "the move submenu did not open, so clicking into it proves nothing: {:?}",
+            submenu.strings()
+        );
+
+        let target = submenu.rect_of("Work");
+        let clicked = pane.click(&item, &TotpState::NoSecret, target.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::MoveToFolder("f2".to_string()),
+            "choosing Work in the kebab's move submenu reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **The folder the item is already in is shown and not offered.**
+    ///
+    /// Both halves, because either alone is satisfiable by a bug: a submenu
+    /// that dropped the current folder would pass "clicking it does nothing",
+    /// and one that offered it live would pass "it is listed". The rule is
+    /// `move_menu`'s and this asserts it survives the trip through the
+    /// kebab's own rendering.
+    #[test]
+    fn the_kebabs_move_submenu_shows_the_items_own_folder_but_will_not_move_it_there() {
+        let mut item = a_login();
+        item.folder_id = Some("f1".to_string());
+        let mut pane = Pane::new();
+        pane.folders = vec![folder("f1", "Personal"), folder("f2", "Work")];
+
+        let submenu = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        assert!(
+            submenu.painted("Personal"),
+            "the item's own folder is missing from the submenu, so the list reshuffles \
+             from item to item: {:?}",
+            submenu.strings()
+        );
+
+        let here = submenu.rect_of("Personal");
+        let clicked = pane.click(&item, &TotpState::NoSecret, here.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::None,
+            "the kebab offered to move the item into the folder it is already in, which is \
+             a write that achieves nothing; it reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// A vault with no folders says so rather than opening an empty box,
+    /// which reads as a submenu that failed to load. `move_menu`'s
+    /// `MoveMenu::Empty` decision, reaching the screen.
+    #[test]
+    fn the_kebabs_move_submenu_says_so_when_the_vault_has_no_folders() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        // `folders` left empty -- the state a fresh vault is in.
+        let submenu = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        assert!(
+            submenu.painted("No folders yet"),
+            "a vault with no folders opened a silent, empty submenu: {:?}",
+            submenu.strings()
+        );
+    }
+
+    /// **There is no way to un-file an item from here, and that is the
+    /// feature.**
+    ///
+    /// `bw serve` (CLI 2026.7.0) cannot clear an item's folder by any
+    /// spelling -- `.superpowers/sdd/put-semantics-capture.md` records the
+    /// controlled run, in which a name change in the very same PUT applied
+    /// while `folderId: null` did not. An entry for it would report success
+    /// and do nothing, and the next sync would put the item back: exactly the
+    /// silent lie `EditDraft::may_unfile` already withholds in the edit form.
+    ///
+    /// Pinned as a test rather than left to the comment, because "Move to
+    /// folder" is the obvious place for someone to add "No folder" back
+    /// without ever meeting that capture.
+    #[test]
+    fn the_kebabs_move_submenu_offers_no_way_to_unfile_an_item() {
+        let mut item = a_login();
+        item.folder_id = Some("f1".to_string());
+        let mut pane = Pane::new();
+        pane.folders = vec![folder("f1", "Personal")];
+
+        let submenu = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        // The pairing: the submenu really did open, so the absence below is
+        // an absence in a drawn list rather than an absence of a list.
+        assert!(
+            submenu.painted("Personal"),
+            "the move submenu did not open, so finding no 'No folder' in it proves \
+             nothing: {:?}",
+            submenu.strings()
+        );
+        for spelling in ["No folder", "No Folder", "None", "Unfiled"] {
+            assert!(
+                !submenu.painted(spelling),
+                "the move submenu offers {spelling:?}, but this backend cannot un-file an \
+                 item -- the write succeeds and does nothing: {:?}",
+                submenu.strings()
+            );
+        }
     }
 
     /// **Delete still takes two clicks, and the menu still says so.**
@@ -18844,6 +19322,7 @@ mod read_pane_scroll_tests {
                         ui,
                         item,
                         None,
+                        &[],
                         3,
                         &TotpState::NoSecret,
                         false,
@@ -20640,6 +21119,7 @@ mod breach_badge_tests {
                     ui,
                     item,
                     None,
+                    &[],
                     3,
                     &TotpState::NoSecret,
                     false,
