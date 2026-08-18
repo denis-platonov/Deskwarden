@@ -56,11 +56,20 @@ pub enum ItemListAction {
 /// What choosing an entry in an item row's right-click menu asks
 /// `vault_window::mod` to do.
 ///
-/// Its own enum rather than `detail::DetailAction`, which it overlaps on six
-/// entries. The menu also has to express "move this item into that folder",
-/// a control the detail pane does not have; growing `DetailAction` a variant
-/// the read pane can never produce would make that enum's own exhaustive
-/// match at the call site carry a dead arm.
+/// Its own enum rather than `detail::DetailAction`, which it overlaps on
+/// several entries. This menu still has to express things the detail pane
+/// cannot -- Archive, Unarchive, Restore and Purge, all of which act on items
+/// that are not in the live vault the pane draws -- so folding the two enums
+/// together would give `DetailAction`'s exhaustive match at the call site
+/// arms the read pane can never produce.
+///
+/// **"Move this item into that folder" used to be on that list and no longer
+/// is**: the detail pane's kebab now offers the same move, reporting
+/// `DetailAction::MoveToFolder`. The two enums each keep their own variant,
+/// but only one *destination list* exists -- both menus call [`move_menu`],
+/// and both effects land in `vault_window::mod`'s `move_item_into_folder`.
+/// Two enums naming the same operation is cheap; two implementations of it
+/// would not be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowCommand {
     CopyUsername,
@@ -355,7 +364,24 @@ fn enabled_command(label: &str, command: RowCommand) -> MenuEntry {
 /// writes `folderId: ""`, which strands the item out of every sidebar row,
 /// and one definition of "virtual" is what keeps this menu and the edit
 /// form's dropdown from drifting apart.
-fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
+///
+/// **`pub(super)` so the detail pane's kebab builds its "Move to folder" from
+/// this exact function rather than from its own copy.** The two surfaces offer
+/// the same operation on the same item, and what shapes the list -- which
+/// folders are assignable, and that the item's own folder stays present but
+/// greyed -- are decisions, not rendering. A second implementation of them in
+/// `detail.rs` is the drift this crate keeps losing to, and it would be
+/// invisible: both menus would look right, and only an item in a folder the
+/// backend had stopped reporting would show the two disagreeing.
+///
+/// Note what is **not** here and cannot be: a "No folder" destination.
+/// `bw serve` (CLI 2026.7.0) cannot un-file an item at all --
+/// `.superpowers/sdd/put-semantics-capture.md` records the controlled run, in
+/// which omitting `folderId`, sending `null`, sending `""` and PUTting a fully
+/// round-tripped object all left the folder unchanged while a name change in
+/// the very same request applied. See `EditDraft::may_unfile`, which withholds
+/// the same option in the edit form for the same reason.
+pub(super) fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
     let assignable = assignable_folders(folders);
     if assignable.is_empty() {
         return MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS);
@@ -1950,7 +1976,11 @@ fn drag_ghost(ui: &egui::Ui, name: &str) {
 /// A disabled entry states its reason on hover; that is the entire point of
 /// greying it rather than dropping it (see [`MenuCommand::enabled`]), so the
 /// two are set together here and cannot be drawn apart.
-fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
+///
+/// `pub(super)` for [`move_menu`]'s reason: the detail pane's kebab draws the
+/// same [`MenuCommand`]s and must grey them, and state their reason, exactly
+/// as this does.
+pub(super) fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
     let button = ui.add_enabled(entry.enabled, egui::Button::new(entry.label.as_str()));
     let button = match entry.disabled_reason {
         Some(reason) => button.on_disabled_hover_text(reason),

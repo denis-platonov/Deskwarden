@@ -3260,6 +3260,7 @@ pub fn build_frame(
                                 ui,
                                 item,
                                 sidebar::folder_name(&folders, item.folder_id.as_deref()),
+                                &folders,
                                 fill_count,
                                 &totp_state,
                                 delete_pending,
@@ -3540,6 +3541,35 @@ pub fn build_frame(
                                 DetailAction::ClosePane => {
                                     selected_id = None;
                                     detail_dismissed = true;
+                                }
+                                // **The kebab's Move to folder, landing in the
+                                // SAME function the sidebar's drag-and-drop
+                                // drop lands in.** `move_item_into_folder`
+                                // owns the optimistic write, the revert when
+                                // the write is refused, the re-auth flag and
+                                // the wording of the failure; a second arm
+                                // that called `cache.move_item_to_folder`
+                                // itself would be a second place for "a failed
+                                // move leaves the item where it was" to stop
+                                // being true, and it is the kind of arm that
+                                // looks right because the happy path is
+                                // identical.
+                                //
+                                // The failure surfaces through `move_error` --
+                                // the same inline band a failed drop uses --
+                                // rather than a dialog, because it is the same
+                                // failure of the same operation and the user
+                                // has already been taught where that message
+                                // appears.
+                                DetailAction::MoveToFolder(folder_id) => {
+                                    move_error = move_item_into_folder(
+                                        ui.ctx(),
+                                        &cache,
+                                        &needs_reauth_for_closure,
+                                        &mut items,
+                                        &item.id,
+                                        &folder_id,
+                                    );
                                 }
                                 // **The moved "Send a record" control.** It
                                 // sets the SAME flag the titlebar pill set
@@ -5007,6 +5037,16 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::OpenWebsite(_)
         | DetailAction::Delete
         | DetailAction::ToggleFavorite(_)
+        // **A move reveals nothing**, so there is nothing here to prove a
+        // master password for. It reads no secret out of the item, paints
+        // none, and puts none on the clipboard -- it changes which container
+        // the item is filed under. This is the same answer
+        // `row_command_exposes_secrets` already gives
+        // `RowCommand::MoveToFolder` for the identical operation reached from
+        // an item row, and it has to be: one act costing a master password
+        // from the kebab and not from the right-click menu would make the
+        // gate look arbitrary and teach the user to find the cheaper door.
+        | DetailAction::MoveToFolder(_)
         | DetailAction::RemoveAppMatch
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
@@ -8224,6 +8264,11 @@ fn draw_read_arm(
     // out of the folder list this window is already holding -- the pane paints
     // it in the header subtitle and never sees an id.
     folder: Option<&str>,
+    // The window's folder list, forwarded whole for the kebab's "Move to
+    // folder" submenu -- see `draw_detail_read`'s own parameter, where the
+    // reason it is passed *alongside* the resolved `folder` name rather than
+    // instead of it is argued.
+    folders: &[Folder],
     fill_count: u32,
     totp_state: &TotpState,
     delete_pending: bool,
@@ -8249,6 +8294,7 @@ fn draw_read_arm(
         ui,
         item,
         folder,
+        folders,
         fill_count,
         totp_state,
         delete_pending,
@@ -15049,6 +15095,10 @@ mod draw_read_arm_tests {
                 ui,
                 item,
                 folder,
+                // No folder list: this harness exists to drive the read
+                // pane's chords and its header, and an empty list is what
+                // the kebab's move submenu already has a test of its own for.
+                &[],
                 3,
                 &TotpState::NoSecret,
                 false,
