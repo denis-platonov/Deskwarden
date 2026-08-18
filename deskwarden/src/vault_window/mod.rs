@@ -16,6 +16,7 @@ pub mod send_ui;
 pub mod sidebar;
 
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
+use crate::clipboard::ClearTrigger;
 use crate::fill_stats::FillStats;
 use crate::login_ui::{
     draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics, CloseControl,
@@ -4018,13 +4019,20 @@ pub fn run(
     // belonging to whoever is running `cargo test`. `run` is an eframe
     // application no test in this crate can call, which makes it the right
     // side of that line.
-    if ends_a_copied_secrets_life(&result) {
-        crate::clipboard::clear_if_still_ours();
+    if let Some(trigger) = ends_a_copied_secrets_life(&result) {
+        crate::clipboard::clear_if_still_ours_for(trigger);
     }
     result
 }
 
-/// **Whether the way this window ended means a copied secret's life is over.**
+/// **Whether the way this window ended means a copied secret's life is over,
+/// and if so under which of the user's switches.**
+///
+/// `Option<ClearTrigger>` rather than `bool` since the clipboard section
+/// exists: "does this end it?" and "which preference governs it?" are the same
+/// question asked once, so a result that ends a secret's life *without* naming
+/// the switch that permits it cannot be constructed. The old `bool` is exactly
+/// `.is_some()`, and every test that asserted on it still does.
 ///
 /// Locking is the case this exists for. A password sitting on the clipboard is
 /// exactly what locking the vault is supposed to put out of reach, and a lock
@@ -4040,15 +4048,22 @@ pub fn run(
 /// closes -- it goes on living in the tray -- and closing the window is a
 /// perfectly ordinary thing to do *in order to* get at the application you
 /// meant to paste into. Clearing here would break the most common successful
-/// use of the feature to protect against a case that the 45-second timer
-/// already covers a few moments later. The other five are moments where the
-/// user has said they are finished; a close is not one, it is usually a
-/// user getting on with it.
+/// use of the feature to protect against a case that the timer already covers
+/// a few moments later. The other five are moments where the user has said
+/// they are finished; a close is not one, it is usually a user getting on with
+/// it.
 ///
-/// Whatever this answers, [`crate::clipboard::clear_if_still_ours`] still
-/// refuses to touch a clipboard that has moved on since.
+/// **A lock outranks an account change when a result carries both**, and the
+/// order is not arbitrary: the two lead to the same call, so the only thing
+/// the choice decides is *which switch the user has to have left on* for it to
+/// happen. Locking is the stronger statement of the two -- the vault is shut,
+/// not merely swapped -- so it is the one that gets to answer.
+///
+/// Whatever this answers, [`crate::clipboard::clear_if_still_ours_for`] still
+/// refuses to touch a clipboard that has moved on since, and still consults
+/// the user's switch for the trigger named here.
 #[must_use]
-fn ends_a_copied_secrets_life(result: &VaultWindowResult) -> bool {
+fn ends_a_copied_secrets_life(result: &VaultWindowResult) -> Option<ClearTrigger> {
     let VaultWindowResult {
         locked,
         needs_reauth,
@@ -4061,7 +4076,13 @@ fn ends_a_copied_secrets_life(result: &VaultWindowResult) -> bool {
         edited_settings: _,
         account_details: _,
     } = result;
-    *locked || *needs_reauth || switch_to.is_some() || *add_account || *remove_account
+    if *locked || *needs_reauth {
+        return Some(ClearTrigger::Lock);
+    }
+    if switch_to.is_some() || *add_account || *remove_account {
+        return Some(ClearTrigger::AccountChange);
+    }
+    None
 }
 
 /// If `e` is `VaultError::Unauthorized`, flags the window to close and
@@ -26972,11 +26993,21 @@ mod clipboard_end_of_life {
     /// being absorbed by the others.
     #[test]
     fn locking_switching_and_leaving_an_account_all_end_a_copied_secrets_life() {
-        let cases: [(&str, VaultWindowResult); 5] = [
-            ("a manual or idle lock", VaultWindowResult { locked: true, ..plain_close() }),
+        // **Each case names the trigger it must answer with**, not merely
+        // that it answers something: the trigger is which of the user's
+        // switches governs the clear, so a lock that reported
+        // `AccountChange` would be governed by the wrong pill and this test
+        // would be the only thing that noticed.
+        let cases: [(&str, VaultWindowResult, ClearTrigger); 5] = [
+            (
+                "a manual or idle lock",
+                VaultWindowResult { locked: true, ..plain_close() },
+                ClearTrigger::Lock,
+            ),
             (
                 "the session being invalidated elsewhere",
                 VaultWindowResult { needs_reauth: true, ..plain_close() },
+                ClearTrigger::Lock,
             ),
             (
                 "switching to another account",
@@ -26984,19 +27015,30 @@ mod clipboard_end_of_life {
                     switch_to: Some(crate::accounts::AccountId::generate()),
                     ..plain_close()
                 },
+                ClearTrigger::AccountChange,
             ),
-            ("adding an account", VaultWindowResult { add_account: true, ..plain_close() }),
-            ("removing an account", VaultWindowResult { remove_account: true, ..plain_close() }),
+            (
+                "adding an account",
+                VaultWindowResult { add_account: true, ..plain_close() },
+                ClearTrigger::AccountChange,
+            ),
+            (
+                "removing an account",
+                VaultWindowResult { remove_account: true, ..plain_close() },
+                ClearTrigger::AccountChange,
+            ),
         ];
-        for (what, result) in &cases {
-            assert!(
+        for (what, result, trigger) in &cases {
+            assert_eq!(
                 ends_a_copied_secrets_life(result),
-                "{what} left a copied password on the clipboard"
+                Some(*trigger),
+                "{what} left a copied password on the clipboard, or named the wrong switch"
             );
         }
-        // Control: the projection is not simply true for everything.
-        assert!(
-            !ends_a_copied_secrets_life(&plain_close()),
+        // Control: the projection is not simply `Some` for everything.
+        assert_eq!(
+            ends_a_copied_secrets_life(&plain_close()),
+            None,
             "control: a plain close answers the same as a lock, so every case above is vacuous"
         );
     }
@@ -27010,28 +27052,60 @@ mod clipboard_end_of_life {
     /// path. The timer covers the walk-away case a few moments later.
     #[test]
     fn merely_closing_the_window_leaves_the_clipboard_alone() {
-        assert!(
-            !ends_a_copied_secrets_life(&plain_close()),
+        assert_eq!(
+            ends_a_copied_secrets_life(&plain_close()),
+            None,
             "closing the vault window wiped the password the user closed it in order to paste"
         );
-        assert!(
-            !ends_a_copied_secrets_life(&VaultWindowResult {
+        assert_eq!(
+            ends_a_copied_secrets_life(&VaultWindowResult {
                 edited_settings: Some(crate::settings::Settings::default()),
                 ..plain_close()
             }),
+            None,
             "opening Preferences and closing the window wiped the clipboard; a preference \
              change says nothing at all about the session"
         );
         // ...and a lock reported alongside the very same preference edit
         // still clears, so the field above is being ignored rather than
         // suppressing the decision.
-        assert!(
+        assert_eq!(
             ends_a_copied_secrets_life(&VaultWindowResult {
                 locked: true,
                 edited_settings: Some(crate::settings::Settings::default()),
                 ..plain_close()
             }),
+            Some(ClearTrigger::Lock),
             "control: a preference edit alongside a lock cancelled the lock's clear"
+        );
+    }
+
+    /// **A result carrying both a lock and an account change answers `Lock`.**
+    ///
+    /// The two lead to the same call, so the only thing the precedence decides
+    /// is which of the user's switches has to be on for the clear to happen --
+    /// and the function's doc says the stronger statement wins. Without this
+    /// the ordering inside the function is an accident of which `if` was
+    /// written first.
+    #[test]
+    fn a_lock_outranks_an_account_change_when_a_result_carries_both() {
+        assert_eq!(
+            ends_a_copied_secrets_life(&VaultWindowResult {
+                locked: true,
+                add_account: true,
+                ..plain_close()
+            }),
+            Some(ClearTrigger::Lock)
+        );
+        // The pair: with the lock taken away the very same result answers
+        // `AccountChange`, so the assertion above is about precedence rather
+        // than about `add_account` being ignored altogether.
+        assert_eq!(
+            ends_a_copied_secrets_life(&VaultWindowResult {
+                add_account: true,
+                ..plain_close()
+            }),
+            Some(ClearTrigger::AccountChange)
         );
     }
 }

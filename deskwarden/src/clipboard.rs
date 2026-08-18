@@ -62,6 +62,8 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::settings::{ClearInterval, ClipboardClearing};
+
 /// Prevents **every** format in this clipboard operation from entering
 /// clipboard history or syncing to other devices. Any data at all under this
 /// format is enough; [`plan`] writes a zero `DWORD` so all four entries have
@@ -170,7 +172,7 @@ fn deny(name: &'static str) -> ClipEntry {
 /// it landed.
 pub fn copy_secret(text: &str) {
     match win32::put_secret(text) {
-        Ok(sequence) => arm(sequence, Instant::now()),
+        Ok(sequence) => arm(sequence, Instant::now(), configured().timer),
         Err(error) => log::warn!("clipboard: the copy did not land ({error})"),
     }
 }
@@ -179,9 +181,17 @@ pub fn copy_secret(text: &str) {
 // Taking it back off again
 // ---------------------------------------------------------------------------
 
-/// How long a copied secret is left on the clipboard before it is taken back.
+/// How long a copied secret is left on the clipboard before it is taken back,
+/// **when nobody has said otherwise** -- the value in force before
+/// [`configure`] has been called, and the one the preferences window's "Reset
+/// to default" comes back to.
 ///
-/// **45 seconds, and the number is an argument rather than a habit.**
+/// **One minute, and the number is an argument rather than a habit.** It was
+/// 45 seconds and fixed; it is now the default of
+/// [`Settings::clear_clipboard_minutes`](crate::settings::Settings::clear_clipboard_minutes),
+/// a value the user can change, and it went up to a round minute on the way
+/// because that control's unit is minutes and 45 seconds is not expressible in
+/// it.
 ///
 /// The floor is set by what the user is actually doing: copy a password, alt-tab
 /// to a browser, wait for a sign-in page that is still loading, click the field,
@@ -189,23 +199,128 @@ pub fn copy_secret(text: &str) {
 /// slow, a 2FA step that appears first, or a user who is not looking at the
 /// screen all eat it -- and a password manager whose clipboard expires before
 /// the paste has trained the user to copy twice, which is worse than not
-/// clearing at all.
+/// clearing at all. That paragraph now also lives on
+/// `settings::MIN_CLIPBOARD_MINUTES`, because it is the argument for the floor
+/// of the range the user picks from and not only for this one number.
 ///
 /// The ceiling is set by what the delay is *for*: the realistic exposure is the
 /// user walking away, or a program that reads the clipboard on a poll. Past a
 /// minute or two the value of clearing is mostly gone, and "clear it eventually"
 /// is not a security property anyone can rely on.
+/// `settings::MAX_CLIPBOARD_MINUTES` is where that argument had to be weighed
+/// against a user's own judgement, and says why the range nevertheless runs to
+/// an hour.
 ///
 /// Bitwarden's own desktop default is **Never**, and that is deliberately not
 /// copied: it is the subject of repeated requests to change it, and "never" is
-/// a default that only looks safe because nothing visibly breaks.
+/// a default that only looks safe because nothing visibly breaks. "Never" is
+/// reachable here --
+/// [`Settings::clear_clipboard`](crate::settings::Settings::clear_clipboard)
+/// off -- but it is a switch the user throws, not the state they are handed.
 ///
 /// **This is the weakest of the four things that end a copied secret's life**,
 /// and it is listed last on purpose. Lock, account switch and app exit are
 /// moments where the user has *said* they are done; the timer is a guess. The
 /// suppression formats in [`plan`] matter more than either, because they stop
-/// the copy being retained at all rather than racing to catch up with it.
-pub const CLEAR_AFTER: Duration = Duration::from_secs(45);
+/// the copy being retained at all rather than racing to catch up with it --
+/// and they, unlike these four, have no switch and never will.
+pub const DEFAULT_CLEAR_AFTER: ClearInterval = ClearInterval::from_seconds(60);
+
+/// **Which of the four things that end a copied secret's life are live**, as
+/// this module currently understands it.
+///
+/// Written once at startup and again whenever the preferences window returns
+/// (both through [`configure`]); read by [`copy_secret`] and by
+/// [`clear_if_still_ours_for`]. A `Mutex` for the same reason [`ARMED`] is: a
+/// copy made from the vault window has to be clearable from the tray and from
+/// a thread neither of them owns.
+///
+/// It starts at the *defaults* rather than at "everything off", so a copy made
+/// in the window between process start and [`configure`] is still taken back.
+/// The alternative -- an `Option` meaning "not configured yet" -- would fail by
+/// silently not clearing, which is the wrong direction for this default to
+/// fall.
+static CLEARING: Mutex<ClipboardClearing> = Mutex::new(ClipboardClearing {
+    timer: Some(DEFAULT_CLEAR_AFTER),
+    on_lock: true,
+    on_account_change: true,
+    on_quit: true,
+});
+
+/// Install the user's clipboard-clearing preferences.
+///
+/// Called at startup and every time the preferences window returns. Takes an
+/// already-decided [`ClipboardClearing`] rather than a `Settings`, so the
+/// master switch is folded in exactly once -- in
+/// [`settings::clipboard_clearing`](crate::settings::clipboard_clearing),
+/// which is pure -- rather than being re-derived here, where no test could
+/// reach it.
+///
+/// **For the timer, this affects copies made from now on.** A secret already
+/// armed keeps the deadline it was armed with: there is no per-copy timer
+/// state to revise (see [`arm`]), and revising a live deadline downwards would
+/// take a value out from under a paste the user is part-way through. The three
+/// triggers are read at the moment they fire, so unticking one takes effect
+/// immediately -- which is what a user who has just turned off "when I quit"
+/// expects.
+pub fn configure(clearing: ClipboardClearing) {
+    *CLEARING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = clearing;
+}
+
+/// What this module is currently working to.
+///
+/// Public so the wiring can be asserted on -- "the preferences the user saved
+/// are the preferences the clipboard is using" is otherwise only observable by
+/// watching a real clipboard, which no test in this crate may do.
+#[must_use]
+pub fn configured() -> ClipboardClearing {
+    *CLEARING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One of the three moments -- other than the timer -- at which a copied
+/// secret's life may end.
+///
+/// An enum rather than three functions, so [`trigger_is_live`] is the one pure
+/// function every caller goes through, and so a fourth moment is a `match`
+/// that will not compile until someone has said which preference governs it.
+///
+/// **There is no `Logout`, deliberately.** This app has no logout distinct
+/// from locking: the Lock button, the tray, the idle timer and a session
+/// invalidated elsewhere (`needs_reauth`) all end in the same place, and they
+/// are all [`ClearTrigger::Lock`]. A switch labelled "when I log out" would
+/// either duplicate that one or promise something the app does not do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearTrigger {
+    /// The vault locked -- by hand, from the tray, after idling, or because
+    /// the session was invalidated elsewhere.
+    Lock,
+    /// The user switched, added or removed an account.
+    AccountChange,
+    /// Deskwarden is quitting, from the tray or to install an update.
+    Quit,
+}
+
+/// **Whether `trigger` clears anything, given these preferences.** Pure, so
+/// "which triggers are live" is a question a test constructs the answer to
+/// rather than one it observes by watching a clipboard.
+///
+/// The master switch is *not* re-checked here, and that is not an omission:
+/// [`settings::clipboard_clearing`](crate::settings::clipboard_clearing) has
+/// already folded it into all three flags, so a [`ClipboardClearing`] with the
+/// master off answers `false` for every trigger. Checking it again would be a
+/// second place for the two to disagree.
+#[must_use]
+pub const fn trigger_is_live(clearing: ClipboardClearing, trigger: ClearTrigger) -> bool {
+    match trigger {
+        ClearTrigger::Lock => clearing.on_lock,
+        ClearTrigger::AccountChange => clearing.on_account_change,
+        ClearTrigger::Quit => clearing.on_quit,
+    }
+}
 
 /// What this app last put on the clipboard, as the two facts needed to decide
 /// whether to take it back: *when* it may go, and *how to tell it is still
@@ -277,7 +392,7 @@ pub fn verdict(
 /// Whether [`verdict`] is allowed to say "not yet".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Deadline {
-    /// The timer: wait out [`CLEAR_AFTER`].
+    /// The timer: wait out whatever interval the copy was armed with.
     Respected,
     /// Lock, account switch, app exit: the user is done, so there is nothing
     /// to wait for.
@@ -298,8 +413,16 @@ static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
 /// or finds a third copy's sequence number ([`Verdict::NotOurs`], give up).
 /// There is no way for the first timer to wipe the second value early, because
 /// there is no per-copy timer state for it to hold.
-fn arm(sequence: u32, now: Instant) {
-    let due = now + CLEAR_AFTER;
+///
+/// **`after` is `None` when the user has turned clearing off**, and then this
+/// arms nothing at all: no record and no waiter. That is stronger than arming
+/// a record with no deadline, and deliberately so -- with no record there is
+/// nothing a later lock, account change or quit could act on even if one of
+/// their flags were somehow still set, so "off" is off at the one place the
+/// value is remembered rather than at each of the four places it is consulted.
+fn arm(sequence: u32, now: Instant, after: Option<ClearInterval>) {
+    let Some(after) = after else { return };
+    let due = now + after.duration();
     *lock_armed() = Some(Armed { sequence, due });
     std::thread::spawn(move || wait_and_clear(due));
 }
@@ -320,12 +443,26 @@ fn wait_and_clear(mut until: Instant) {
     }
 }
 
-/// **Clear the clipboard, if and only if what is on it is still ours.**
+/// **Clear the clipboard for `trigger`, if the user has that trigger on and if
+/// what is on the clipboard is still ours.**
 ///
-/// This is what lock, account switch and app exit call. It waives the 45-second
-/// deadline and nothing else: a paragraph the user copied out of a document
-/// thirty seconds ago is still theirs and is still left alone.
-pub fn clear_if_still_ours() {
+/// This is what lock, account change and quit call, and it is the only way in:
+/// there is no unconditional `clear_if_still_ours` for a call site to reach for
+/// by mistake, because a caller that did not have to name its trigger would be
+/// a caller the preferences page could not govern.
+///
+/// Two gates, in this order and for different reasons. [`trigger_is_live`] is
+/// the user's preference and can be turned off. The `NotOurs` check inside
+/// [`verdict`] is not a preference and cannot: a paragraph the user copied out
+/// of a document thirty seconds ago is still theirs and is still left alone,
+/// whatever any switch says.
+///
+/// The deadline is waived, exactly as before -- these three are moments where
+/// the user has said they are finished, so there is nothing left to wait for.
+pub fn clear_if_still_ours_for(trigger: ClearTrigger) {
+    if !trigger_is_live(configured(), trigger) {
+        return;
+    }
     let _ = take_if(Deadline::Waived);
 }
 
@@ -611,7 +748,7 @@ mod tests {
     /// Two `Armed`s from one clock, so "our value is still there" and
     /// "something else was copied" differ in exactly the one field under test.
     fn armed_at(now: Instant, sequence: u32) -> Armed {
-        Armed { sequence, due: now + CLEAR_AFTER }
+        Armed { sequence, due: now + DEFAULT_CLEAR_AFTER.duration() }
     }
 
     /// **The property that makes this correct rather than merely present**,
@@ -620,7 +757,7 @@ mod tests {
     fn the_timer_clears_our_own_value_and_leaves_anything_else_alone() {
         let now = Instant::now();
         let ours = armed_at(now, 7);
-        let fired = now + CLEAR_AFTER;
+        let fired = now + DEFAULT_CLEAR_AFTER.duration();
 
         assert_eq!(
             verdict(Some(ours), fired, 7, Deadline::Respected),
@@ -649,12 +786,12 @@ mod tests {
         let ours = armed_at(now, 7);
         assert_eq!(
             verdict(Some(ours), now, 7, Deadline::Respected),
-            Verdict::TooEarly(CLEAR_AFTER),
+            Verdict::TooEarly(DEFAULT_CLEAR_AFTER.duration()),
             "the whole interval was not left at the instant of the copy"
         );
         assert_eq!(
             verdict(Some(ours), now + Duration::from_secs(40), 7, Deadline::Respected),
-            Verdict::TooEarly(Duration::from_secs(5)),
+            Verdict::TooEarly(Duration::from_secs(20)),
         );
         // One nanosecond either side of the deadline, so "clears at the
         // deadline" is a boundary rather than an approximation.
@@ -691,7 +828,7 @@ mod tests {
         // different, so `Waived` is doing work rather than being ignored.
         assert_eq!(
             verdict(Some(ours), now, 7, Deadline::Respected),
-            Verdict::TooEarly(CLEAR_AFTER),
+            Verdict::TooEarly(DEFAULT_CLEAR_AFTER.duration()),
             "control: `Waived` and `Respected` are the same answer, so the flag is dead"
         );
     }
@@ -726,10 +863,11 @@ mod tests {
     fn a_second_copy_moves_the_deadline_the_first_waiter_will_be_judged_against() {
         let first_copy = Instant::now();
         let second_copy = first_copy + Duration::from_secs(30);
-        // The first copy's waiter wakes 45s after the FIRST copy...
-        let first_waiter_wakes = first_copy + CLEAR_AFTER;
+        // The first copy's waiter wakes one interval after the FIRST copy...
+        let first_waiter_wakes = first_copy + DEFAULT_CLEAR_AFTER.duration();
         // ...but by then the record describes the second copy.
-        let after_recopy = Armed { sequence: 9, due: second_copy + CLEAR_AFTER };
+        let after_recopy =
+            Armed { sequence: 9, due: second_copy + DEFAULT_CLEAR_AFTER.duration() };
         assert_eq!(
             verdict(Some(after_recopy), first_waiter_wakes, 9, Deadline::Respected),
             Verdict::TooEarly(Duration::from_secs(30)),
@@ -744,18 +882,23 @@ mod tests {
         );
     }
 
-    /// **`CLEAR_AFTER` is inside the range this was argued in**, so moving it
-    /// to something indefensible is a decision someone has to take
+    /// **`DEFAULT_CLEAR_AFTER` is inside the range this was argued in**, so
+    /// moving it to something indefensible is a decision someone has to take
     /// deliberately rather than a constant that drifted.
+    ///
+    /// It is a *default* now rather than the only value, so the bounds of the
+    /// range the user may pick from are pinned separately in `settings`. This
+    /// one still has to be a sane place to start from, which is what this
+    /// says.
     #[test]
     fn the_interval_is_long_enough_to_paste_and_short_enough_to_matter() {
         assert!(
-            CLEAR_AFTER >= Duration::from_secs(30),
+            DEFAULT_CLEAR_AFTER.duration() >= Duration::from_secs(30),
             "under 30s the clipboard expires before a slow sign-in form is ready, which \
              trains the user to copy twice"
         );
         assert!(
-            CLEAR_AFTER <= Duration::from_secs(90),
+            DEFAULT_CLEAR_AFTER.duration() <= Duration::from_secs(90),
             "past 90s the delay has stopped being a control and is just a pause"
         );
     }
@@ -783,5 +926,118 @@ mod tests {
             "control: format names are withheld too, so a log could not show which formats \
              were set: {rendered}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Which triggers are live -- pure, and constructed rather than staged
+    // ------------------------------------------------------------------
+
+    /// **Each of the three switches governs its own trigger and no other.**
+    ///
+    /// `trigger_is_live` is the gate `clear_if_still_ours_for` stands behind,
+    /// so a wiring mistake here is a lock that consults the quit pill. The
+    /// clearings are built by hand rather than out of a `Settings`, because
+    /// this function's contract is over the value and not over the file.
+    #[test]
+    fn each_switch_governs_its_own_trigger_and_no_other() {
+        let all_off = ClipboardClearing {
+            timer: Some(DEFAULT_CLEAR_AFTER),
+            on_lock: false,
+            on_account_change: false,
+            on_quit: false,
+        };
+        let cases: [(ClearTrigger, ClipboardClearing); 3] = [
+            (ClearTrigger::Lock, ClipboardClearing { on_lock: true, ..all_off }),
+            (
+                ClearTrigger::AccountChange,
+                ClipboardClearing { on_account_change: true, ..all_off },
+            ),
+            (ClearTrigger::Quit, ClipboardClearing { on_quit: true, ..all_off }),
+        ];
+        for (live, clearing) in &cases {
+            for trigger in [ClearTrigger::Lock, ClearTrigger::AccountChange, ClearTrigger::Quit] {
+                assert_eq!(
+                    trigger_is_live(*clearing, trigger),
+                    trigger == *live,
+                    "with only {live:?} switched on, {trigger:?} answered the wrong way"
+                );
+            }
+        }
+    }
+
+    /// **A clearing with the master switch off makes every trigger dead**,
+    /// which is what lets `trigger_is_live` not re-check the master switch.
+    ///
+    /// Built through `settings::clipboard_clearing`, because that is where the
+    /// folding happens and this is the claim that it happened.
+    #[test]
+    fn the_master_switch_off_makes_every_trigger_dead() {
+        let off = crate::settings::clipboard_clearing(false, true, true, true, 60);
+        for trigger in [ClearTrigger::Lock, ClearTrigger::AccountChange, ClearTrigger::Quit] {
+            assert!(!trigger_is_live(off, trigger), "{trigger:?} survived the master switch");
+        }
+        // The pair: the same three arguments with the master switch on make
+        // all three live, so the assertion above is about the master switch
+        // and not about a value that is dead whatever it is built from.
+        let on = crate::settings::clipboard_clearing(true, true, true, true, 60);
+        for trigger in [ClearTrigger::Lock, ClearTrigger::AccountChange, ClearTrigger::Quit] {
+            assert!(trigger_is_live(on, trigger), "{trigger:?}");
+        }
+    }
+
+    /// **An interval of `None` arms nothing at all** -- no record, so there is
+    /// nothing for a later trigger to act on even if one were somehow live.
+    ///
+    /// Driven through `arm` itself rather than through `copy_secret`, which
+    /// would reach the real Windows clipboard. `arm` writes only the shared
+    /// record, which is this crate's own memory.
+    #[test]
+    fn with_clearing_switched_off_a_copy_arms_no_record_and_no_waiter() {
+        let now = Instant::now();
+        *lock_armed() = None;
+        arm(4242, now, None);
+        assert_eq!(*lock_armed(), None, "a copy armed a record while clearing was switched off");
+        // The pair: the identical call WITH an interval does arm one, so the
+        // assertion above is about the `None` and not about `arm` being inert.
+        arm(4242, now, Some(DEFAULT_CLEAR_AFTER));
+        assert_eq!(
+            *lock_armed(),
+            Some(Armed { sequence: 4242, due: now + DEFAULT_CLEAR_AFTER.duration() })
+        );
+        // ...and the deadline is the interval it was handed, not the default,
+        // so the argument is used rather than ignored.
+        let long = crate::settings::ClearInterval::from_seconds(300);
+        arm(4242, now, Some(long));
+        assert_eq!(lock_armed().unwrap().due, now + Duration::from_secs(300));
+        *lock_armed() = None;
+    }
+
+    /// **What `configure` installs is what `configured` reports**, so a
+    /// preference the user saved is a preference this module is working to.
+    ///
+    /// The one seam between `settings` and this module that no other test can
+    /// see: everything else here is pure, and the real proof that the wiring
+    /// exists is that `main.rs` calls `configure` -- which
+    /// `every_place_a_preference_edit_lands_reinstalls_the_clipboard_policy`
+    /// pins from the other side.
+    #[test]
+    fn what_is_configured_is_what_is_reported() {
+        let restore = configured();
+        let off = crate::settings::clipboard_clearing(false, true, true, true, 60);
+        configure(off);
+        assert_eq!(configured(), off);
+        assert_eq!(configured().timer, None, "the installed copy still has a timer");
+
+        let odd = crate::settings::clipboard_clearing(true, true, false, true, 300);
+        configure(odd);
+        assert_eq!(configured(), odd);
+        assert!(configured().on_lock);
+        assert!(!configured().on_account_change, "the middle switch did not survive");
+        assert_eq!(
+            configured().timer.map(|t| t.seconds()),
+            Some(300),
+            "the interval did not survive"
+        );
+        configure(restore);
     }
 }

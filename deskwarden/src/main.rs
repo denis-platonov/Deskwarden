@@ -272,6 +272,16 @@ fn main() {
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
 
+    // **The clipboard module is told the user's clearing preferences here,
+    // and again at each of the two places a preference edit lands.** It holds
+    // its own copy because a copy made from the vault window has to be
+    // clearable from the tray and from a waiter thread, none of which can
+    // reach this binding. The copy starts at the defaults (see
+    // `clipboard::CLEARING`), so the window between process start and this
+    // line still clears -- this call is what makes the user's own choice take
+    // effect, not what turns clearing on.
+    deskwarden::clipboard::configure(settings.clipboard_clearing());
+
     // ------------------------------------------------------------------
     // Which account is this launch?
     //
@@ -1424,8 +1434,8 @@ fn main() {
                 // gives.** The clipboard outlives this process: a password
                 // copied a moment ago would otherwise still be pasteable long
                 // after the user believes Deskwarden is gone, and the
-                // 45-second timer that would have taken it back dies with the
-                // thread waiting it out. `clear_if_still_ours` refuses to
+                // timer that would have taken it back dies with the
+                // thread waiting it out. `clear_if_still_ours_for` refuses to
                 // touch a clipboard that has moved on since, so quitting
                 // cannot cost the user something they copied from elsewhere.
                 //
@@ -1435,7 +1445,9 @@ fn main() {
                 // that -- which is the other half of why the copy is written
                 // with the formats that keep it out of `Win+V` in the first
                 // place.
-                deskwarden::clipboard::clear_if_still_ours();
+                deskwarden::clipboard::clear_if_still_ours_for(
+                    deskwarden::clipboard::ClearTrigger::Quit,
+                );
                 if let Some(child) = estate.child.as_mut() {
                     bw_serve::stop_bw_serve(child);
                 }
@@ -1495,6 +1507,12 @@ fn main() {
                     if let Err(e) = estate.settings.persist_preferences(&settings_path) {
                         log::warn!("could not save settings: {e}");
                     }
+                    // Re-installed from the same struct that was just
+                    // persisted, so the clipboard is working to what the file
+                    // says rather than to what it was told at startup. Inside
+                    // the `edited != settings` branch on purpose: a visit to
+                    // Preferences that changed nothing has nothing to install.
+                    deskwarden::clipboard::configure(estate.settings.clipboard_clearing());
                 }
                 // The vault window is not the only blocking one, and this is
                 // the other one the TRAY can open: repeat clicks on
@@ -2245,7 +2263,9 @@ fn main() {
                     // same caveat as the Quit handler above. The installer
                     // relaunches this binary, so the waiting thread is
                     // certainly gone.
-                    deskwarden::clipboard::clear_if_still_ours();
+                    deskwarden::clipboard::clear_if_still_ours_for(
+                        deskwarden::clipboard::ClearTrigger::Quit,
+                    );
                     if let Some(child) = estate.child.as_mut() {
                         bw_serve::stop_bw_serve(child);
                     }
@@ -5001,6 +5021,12 @@ fn run_vault_loop(
                 if let Err(e) = est.settings.persist_preferences(deps.settings_path) {
                     log::warn!("could not save settings: {e}");
                 }
+                // The second of the two places a preference edit lands --
+                // the gear inside the vault window -- and it owes the
+                // clipboard the same re-install the tray's handler does.
+                // Missing it here would mean a clipboard setting changed from
+                // the vault window took effect only on the next launch.
+                deskwarden::clipboard::configure(est.settings.clipboard_clearing());
             }
         }
 
@@ -7506,6 +7532,85 @@ mod tests {
                 .count(),
             2,
             "the setting is no longer read from `estate.settings` at both call sites"
+        );
+    }
+
+    /// **Every place a preference edit lands re-installs the clipboard
+    /// policy, and startup installs it once.**
+    ///
+    /// The clipboard module holds its own copy of the user's clearing
+    /// preferences, because a copy made from the vault window has to be
+    /// clearable from the tray and from a waiter thread. That copy is only as
+    /// current as the last `configure` call, so a preference edit that landed
+    /// without one would be a setting that took effect on the next launch --
+    /// the exact "the switch does nothing" defect this codebase keeps
+    /// re-fixing, with the delay making it harder to notice rather than
+    /// easier.
+    ///
+    /// Source-level because none of the three sites is reachable from a test:
+    /// two are inside `run_tray_loop`, and the third is inside the vault
+    /// window's follow-up. Counted rather than merely found, so a site that
+    /// loses its call reds this instead of shipping.
+    #[test]
+    fn every_place_a_preference_edit_lands_reinstalls_the_clipboard_policy() {
+        let source = include_str!("main.rs");
+        let call = concat!("clipboard::config", "ure(");
+        assert_eq!(
+            source.matches(call).count(),
+            3,
+            "expected three `configure` calls -- startup, the tray's Preferences handler, and \
+             the vault window's `edited_settings` -- and found {}. A missing one is a clipboard \
+             preference that only takes effect on the next launch",
+            source.matches(call).count()
+        );
+        // The two edit sites take the value off the struct that was just
+        // persisted, not off a copy loaded at startup: installing a stale
+        // struct would be worse than not installing at all, because it would
+        // look wired.
+        assert_eq!(
+            source.matches(concat!("estate.settings.clipboard_clear", "ing()")).count(),
+            1,
+            "the tray's Preferences handler no longer installs the settings it just saved"
+        );
+        assert_eq!(
+            source.matches(concat!("est.settings.clipboard_clear", "ing()")).count(),
+            1,
+            "the vault window's follow-up no longer installs the settings it just saved"
+        );
+        // And startup installs the file it just loaded.
+        assert_eq!(
+            source.matches(concat!("settings.clipboard_clear", "ing()")).count(),
+            3,
+            "control: the three installs no longer read the value from a `Settings` at all"
+        );
+    }
+
+    /// **Both quit paths clear the clipboard, and both name the quit
+    /// trigger.** A quit that passed `Lock` would be governed by the wrong
+    /// pill: a user who had turned off "when the vault locks" and left "when
+    /// I quit" on would find quitting no longer cleared.
+    #[test]
+    fn both_shutdown_paths_clear_the_clipboard_as_a_quit() {
+        let source = include_str!("main.rs");
+        assert_eq!(
+            source
+                .matches(concat!("clipboard::clear_if_still_ours_", "for("))
+                .count(),
+            2,
+            "expected the tray Quit and the shutdown-for-update paths, and no others"
+        );
+        assert_eq!(
+            source.matches(concat!("clipboard::ClearTrigger::Qu", "it")).count(),
+            2,
+            "a shutdown path is clearing under some trigger other than `Quit`"
+        );
+        // Control: the unconditional entry point this replaced is gone, so
+        // there is no call site left that the preferences page cannot govern.
+        assert!(
+            !source.contains(concat!("clear_if_still_ours(", ")")),
+            "an ungoverned no-argument clear call is back in main.rs -- every call site \r
+             must name the trigger it clears under, or the preferences page cannot \r
+             govern it"
         );
     }
 

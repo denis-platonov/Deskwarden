@@ -120,6 +120,436 @@ pub const fn clamp_auto_lock_minutes(minutes: u64) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Clearing a copied secret off the clipboard
+// ---------------------------------------------------------------------------
+
+/// **The interval is stored, and reasoned about, in whole seconds.** The
+/// preferences window is the only place it is ever a decimal number of
+/// minutes.
+///
+/// That split is deliberate and it is the reason none of the constants below
+/// is a float. `settings.json` holding `0.1` would hold a rounding artefact --
+/// one tenth is not representable in binary floating point -- and a float
+/// reaching `clipboard::verdict` would put approximate comparison in the one
+/// place this app does exact integer arithmetic over an `Instant`. The user
+/// types minutes; the file and the logic hold seconds.
+///
+/// What [`Settings::clear_clipboard_seconds`] starts at: **60 seconds, one
+/// minute**. It moved here from `clipboard::DEFAULT_CLEAR_AFTER`, which was a
+/// fixed 45, and went *up* to a round minute on the way, because a number the
+/// user can see and type should be one they can say out loud.
+const DEFAULT_CLIPBOARD_SECONDS: u64 = 60;
+
+/// Floor on [`Settings::clear_clipboard_seconds`]: **30 seconds**, which the
+/// preferences window offers as `0.5` minutes.
+///
+/// **The reasoning is the one already written on
+/// `clipboard::DEFAULT_CLEAR_AFTER`, and it is now doing double duty.** The
+/// floor is set by what the user is actually doing: copy a password, alt-tab
+/// to a browser, wait for a sign-in page that is still loading, click the
+/// field, paste. Thirty seconds is survivable but not comfortable -- a slow
+/// page, a 2FA step that appears before the password field, or a user who is
+/// not looking at the screen all eat it -- and **a password manager whose
+/// clipboard expires before the paste has trained the user to copy twice,
+/// which is worse than not clearing at all.** Thirty seconds *is* that floor,
+/// so `0.5` is the smallest value the field accepts and there is nothing below
+/// it worth offering.
+///
+/// **Below it is refused rather than silently clamped**, and the copy names
+/// the reason: see [`parse_clipboard_minutes`] and
+/// [`ClipboardEntry::BelowFloor`]. A control that accepted `0.1` and quietly
+/// used 30 seconds would be displaying a number that is not the number in
+/// effect, which is the defect [`clamp_auto_lock_minutes`] exists to prevent
+/// one field over.
+const MIN_CLIPBOARD_SECONDS: u64 = 30;
+
+/// Ceiling on [`Settings::clear_clipboard_seconds`]: **3600 seconds, one
+/// hour**.
+///
+/// **A ceiling exists at all because a very long interval makes the control
+/// meaningless.** The exposure this timer addresses is the user walking away,
+/// or a program that reads the clipboard on a poll. Past an hour, "it will be
+/// cleared eventually" is not a security property anyone can rely on, and a
+/// field that ran to `u64::MAX` would let a user set a number that reads as
+/// protection and is not.
+///
+/// **One hour, rather than the "a minute or two" `clipboard::
+/// DEFAULT_CLEAR_AFTER`'s own reasoning argues for, and the difference is who
+/// is choosing.** That paragraph was picking a *default* imposed on everybody;
+/// this is the far end of a range a user has to walk to deliberately. Someone
+/// who keeps a terminal open and pastes into it every so often has a real
+/// reason to want longer than two minutes, and refusing them would push them
+/// onto [`Settings::clear_clipboard`] -- i.e. onto *never* -- which is strictly
+/// worse than an hour.
+///
+/// **"Never" is deliberately not spelled as a very large number.** It is
+/// [`Settings::clear_clipboard`], a switch that says so. A range ending in a
+/// sentinel that means "off" is exactly the arrangement `auto_lock_minutes: 0`
+/// used to be, and [`MIN_AUTO_LOCK_MINUTES`]'s doc is the note explaining why
+/// that was undone rather than repeated.
+const MAX_CLIPBOARD_SECONDS: u64 = 3600;
+
+/// The resolution of the interval: **six seconds, one tenth of a minute**.
+///
+/// **This is what makes minutes and seconds round-trip exactly, and that is
+/// the whole reason for it rather than a taste for round numbers.** The field
+/// shows minutes and the file holds seconds, so every stored value has to be
+/// writable as a terminating decimal number of minutes -- otherwise the
+/// control would display `1.31` for a stored 79 seconds and store 78.6 when
+/// the user pressed nothing. A tenth of a minute is exactly six seconds, so
+/// every multiple of six is exactly `n/10` minutes and every one-decimal entry
+/// is exactly a whole number of seconds. The displayed value and the stored
+/// value cannot disagree.
+///
+/// **A value between steps is refused, not snapped** --
+/// [`ClipboardEntry::BetweenSteps`], with copy that says the field takes one
+/// decimal place. Snapping would be a silent round the user cannot see, which
+/// is the thing this file keeps refusing to do; and the refusal leaves the
+/// previous value in place, so nothing is lost by typing `1.25` and being told
+/// so.
+///
+/// The one exception is a hand-edited `settings.json`, which
+/// [`clamp_clipboard_seconds`] snaps to the nearest step rather than refusing,
+/// because a settings file has nobody to tell. That direction is documented on
+/// the clamp itself.
+const CLIPBOARD_SECONDS_STEP: u64 = 6;
+
+/// **A clipboard-clearing interval that cannot be zero, negative, or outside
+/// the offered range.**
+///
+/// A newtype over whole seconds with a private field, and the point of it is
+/// the constructor: [`ClearInterval::from_seconds`] is the only way to make
+/// one and it runs [`clamp_clipboard_seconds`], so no value below
+/// [`MIN_CLIPBOARD_SECONDS`] exists to be handed to
+/// `clipboard::arm`. Zero would mean *clear it instantly* -- the value gone
+/// before the user can paste it -- and that is a footgun made unreachable
+/// here rather than a case a branch downstream remembers to check. Negative is
+/// unrepresentable in `u64` and so is not a case at all; the parser
+/// ([`parse_clipboard_minutes`]) has no sign in its grammar for the same
+/// reason, so a `-1` is refused as "not a number" rather than as a range
+/// error.
+///
+/// Seconds rather than a `Duration` in the field, so that `Eq` is exact and
+/// the serialized form is an integer; [`Self::duration`] is the conversion,
+/// and it is the only one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClearInterval(u64);
+
+impl ClearInterval {
+    /// The one constructor, clamping on the way in.
+    #[must_use]
+    pub const fn from_seconds(seconds: u64) -> Self {
+        Self(clamp_clipboard_seconds(seconds))
+    }
+
+    /// Whole seconds -- what is persisted and what `clipboard` reasons in.
+    #[must_use]
+    pub const fn seconds(self) -> u64 {
+        self.0
+    }
+
+    /// The same value as a `Duration`, for `clipboard::arm`'s deadline
+    /// arithmetic.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        Duration::from_secs(self.0)
+    }
+
+    /// The same value as the preferences window shows it: **minutes, with at
+    /// most one decimal place, and no trailing `.0`.**
+    ///
+    /// Exact by construction rather than by rounding -- see
+    /// [`CLIPBOARD_SECONDS_STEP`]. `30 -> "0.5"`, `60 -> "1"`, `90 -> "1.5"`,
+    /// `3600 -> "60"`. The inverse of [`parse_clipboard_minutes`], and
+    /// `every_offered_interval_round_trips_through_the_field` pins that the two
+    /// are inverses across the whole range rather than at a handful of sampled
+    /// points.
+    ///
+    /// A `.` and never a `,`, even though the parser accepts both: the app has
+    /// no locale of its own to consult, and picking the wrong one to *display*
+    /// would be worse than accepting either on the way in.
+    #[must_use]
+    pub fn as_minutes_text(self) -> String {
+        let tenths = self.0 / CLIPBOARD_SECONDS_STEP;
+        if tenths.is_multiple_of(10) {
+            (tenths / 10).to_string()
+        } else {
+            format!("{}.{}", tenths / 10, tenths % 10)
+        }
+    }
+}
+
+/// Which of the four things that take a copied secret back off the clipboard
+/// are live, and after how long the timer fires -- as a value, decided once.
+///
+/// **This is the whole of the clipboard section's meaning, and it is a pure
+/// function of five stored fields.** Nothing downstream re-derives "is the
+/// master switch on?" for itself: the master switch is applied *here*, by
+/// [`clipboard_clearing`], and every consumer reads a field that already has
+/// it folded in. That is what makes "which triggers are live" a question a
+/// test can construct an answer to without driving a window or touching a
+/// clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardClearing {
+    /// How long after a copy the timer takes it back, or `None` when the
+    /// master switch is off.
+    ///
+    /// `Option` rather than a zero duration for [`AutoLock`]'s reason: zero is
+    /// "clear it instantly", which is the opposite of "never clear it", and
+    /// they are the two states most worth not confusing. [`ClearInterval`]
+    /// rather than a bare `Duration` so that the *inner* value cannot be zero
+    /// either -- see that type.
+    pub timer: Option<ClearInterval>,
+    /// Clear when the vault locks -- by hand, from the tray, or after idling.
+    /// `needs_reauth` (the session invalidated elsewhere) rides on this one:
+    /// it is the same event arriving from the other direction, and the app has
+    /// no separate logout of its own.
+    pub on_lock: bool,
+    /// Clear when the user switches, adds or removes an account.
+    pub on_account_change: bool,
+    /// Clear when Deskwarden quits from the tray, or shuts down to install an
+    /// update.
+    pub on_quit: bool,
+}
+
+impl ClipboardClearing {
+    /// Whether the interval control means anything -- which is exactly whether
+    /// the timer is live.
+    ///
+    /// Named rather than left as `timer.is_some()` at the call site because it
+    /// is the preferences window's enable/disable question, and the point of
+    /// the doc on [`ClipboardClearing`] is that that question is answered in
+    /// this module and not in `prefs_ui`.
+    #[must_use]
+    pub const fn interval_is_live(self) -> bool {
+        self.timer.is_some()
+    }
+
+    /// Whether *anything at all* still takes a copied secret back.
+    ///
+    /// Deliberately not the same as [`Self::interval_is_live`]: a user can
+    /// leave the master switch on and turn all three triggers off, in which
+    /// case only the timer is left. The one state where this is `false` is the
+    /// master switch being off, and the preferences window says so in words
+    /// rather than leaving the reader to add four pills up.
+    #[must_use]
+    pub const fn clears_at_all(self) -> bool {
+        self.timer.is_some() || self.on_lock || self.on_account_change || self.on_quit
+    }
+}
+
+/// **The clipboard-clearing decision, as a pure function of the five stored
+/// fields.**
+///
+/// Public and separate from [`Settings::clipboard_clearing`] for the reason
+/// [`auto_lock_policy`] is separate from [`Settings::auto_lock`]: this is the
+/// answer to "what will these values really do?", and it must be reachable
+/// without constructing a `Settings`, opening a window, or owning a clipboard.
+///
+/// * `master == false` is *nothing clears*, whatever the other four say. The
+///   three trigger flags and the minutes are not consulted, not zeroed and not
+///   forgotten -- the preferences window greys them rather than hiding them,
+///   so they come straight back when the master switch is turned on again.
+/// * `master == true` passes each trigger through untouched and puts the
+///   clamped seconds on the timer, through [`ClearInterval::from_seconds`] --
+///   which is the only constructor and does the clamping, so this function
+///   cannot produce a zero-length timer even if handed a zero.
+#[must_use]
+pub const fn clipboard_clearing(
+    master: bool,
+    on_lock: bool,
+    on_account_change: bool,
+    on_quit: bool,
+    seconds: u64,
+) -> ClipboardClearing {
+    if master {
+        ClipboardClearing {
+            timer: Some(ClearInterval::from_seconds(seconds)),
+            on_lock,
+            on_account_change,
+            on_quit,
+        }
+    } else {
+        ClipboardClearing {
+            timer: None,
+            on_lock: false,
+            on_account_change: false,
+            on_quit: false,
+        }
+    }
+}
+
+/// The interval that will *actually* be used for a stored
+/// `clear_clipboard_seconds`: [`MIN_CLIPBOARD_SECONDS`],
+/// [`MAX_CLIPBOARD_SECONDS`] and [`CLIPBOARD_SECONDS_STEP`] applied, and
+/// nothing else.
+///
+/// Public and pure, and the sole constructor of [`ClearInterval`] runs it, so
+/// the number the preferences window shows and the number `clipboard` waits
+/// out are the same number by construction. A control that displayed `9000`
+/// while the clipboard cleared after an hour is the silent-override defect
+/// [`clamp_auto_lock_minutes`] exists to prevent, one field over.
+///
+/// **A ceiling and a step as well as a floor, unlike
+/// [`clamp_auto_lock_minutes`]**, and each asymmetry is deliberate: see
+/// [`MAX_CLIPBOARD_SECONDS`] and [`CLIPBOARD_SECONDS_STEP`].
+///
+/// **This is the clamp for values that arrive from `settings.json`, and it
+/// snaps rather than refuses.** A hand-written `clear_clipboard_seconds: 14400`
+/// is read as 3600, and a hand-written `79` as 78; both are rewritten in that
+/// form the first time the preferences window is opened, so the file then says
+/// what the app is doing. That is the opposite of what
+/// [`parse_clipboard_minutes`] does with the same out-of-step value, and the
+/// difference is that a *typed* entry has a user in front of it to be told,
+/// while a file does not. Nearest step, ties downward, because between two
+/// equally-close intervals the shorter is the one that clears sooner.
+#[must_use]
+pub const fn clamp_clipboard_seconds(seconds: u64) -> u64 {
+    if seconds < MIN_CLIPBOARD_SECONDS {
+        return MIN_CLIPBOARD_SECONDS;
+    }
+    if seconds > MAX_CLIPBOARD_SECONDS {
+        return MAX_CLIPBOARD_SECONDS;
+    }
+    // Nearest multiple of the step, ties downward. Both bounds are themselves
+    // multiples of the step, so this can never leave the range.
+    let below = seconds - seconds % CLIPBOARD_SECONDS_STEP;
+    if seconds - below > CLIPBOARD_SECONDS_STEP / 2 {
+        below + CLIPBOARD_SECONDS_STEP
+    } else {
+        below
+    }
+}
+
+/// What one entry in the preferences window's interval field means.
+///
+/// A four-way answer rather than an `Option`, because three of the four are
+/// **refusals the user has to be told the reason for**, and a control that
+/// rejects `0.1`, `1.25` and `soon` identically teaches nothing. The
+/// preferences row turns each refusal into its own sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardEntry {
+    /// A number in range and on a step. Carries the interval it means; there
+    /// is no separate seconds value to get out of step with it.
+    Accepted(ClearInterval),
+    /// Not a number this field's grammar recognises at all -- empty, `soon`,
+    /// `-1`, `1e3`, `1.2.3`, or two decimal separators.
+    NotANumber,
+    /// A number, but below [`MIN_CLIPBOARD_SECONDS`] -- i.e. under half a
+    /// minute. Refused rather than clamped; see that constant.
+    BelowFloor,
+    /// A number, but above [`MAX_CLIPBOARD_SECONDS`] -- i.e. over an hour.
+    AboveCeiling,
+    /// A number in range but not on a [`CLIPBOARD_SECONDS_STEP`] boundary --
+    /// more than one decimal place, like `1.25`. Refused rather than snapped;
+    /// see that constant.
+    BetweenSteps,
+}
+
+/// **Parse what the user typed into the interval field: minutes, possibly
+/// fractional, into whole seconds.**
+///
+/// Pure, and separate from the widget for the reason every other decision in
+/// this file is: this is the fiddly part, and it must be testable by calling
+/// it with a string rather than by typing into a window.
+///
+/// # What it accepts
+///
+/// * `1`, `2`, `60` -- whole minutes.
+/// * `0.5`, `1.5`, `.5` -- a leading zero is optional.
+/// * `0,5`, `1,5` -- **a comma is a decimal separator too.** This is a Windows
+///   application and a large part of Europe types a comma; a field that
+///   silently refused `0,5` would read as broken rather than as strict. Only
+///   one separator, of either kind, in one entry.
+/// * Surrounding whitespace, which is trimmed.
+/// * A trailing `.0` or `,0`, and any number of trailing zeros -- `1.50` is
+///   `1.5`. Trailing zeros carry no information, so refusing them would be
+///   pedantry rather than protection.
+///
+/// # What it refuses, and why each is its own answer
+///
+/// * No sign is in the grammar, so `-1` is [`ClipboardEntry::NotANumber`]
+///   rather than a range error. That is what makes a negative interval
+///   unreachable rather than merely checked for: there is no path from a
+///   string to a negative number to test.
+/// * `0`, `0.1`, `0.4` are [`ClipboardEntry::BelowFloor`] -- under 30 seconds.
+///   Zero included, so an instant-clear interval is unreachable from the field
+///   as well as from [`ClearInterval`].
+/// * `61`, `120` are [`ClipboardEntry::AboveCeiling`].
+/// * `1.25`, `0.55` are [`ClipboardEntry::BetweenSteps`] -- in range, but the
+///   field's resolution is one decimal place.
+///
+/// # Arithmetic
+///
+/// Integer throughout, never `f64`. The whole and fractional parts are parsed
+/// as separate digit strings and combined as
+/// `whole * 60 + tenths * CLIPBOARD_SECONDS_STEP`, so `0.5` is exactly 30 and
+/// not 29.999999999999996. Anything past the first fractional digit must be
+/// zero, which is what makes [`ClipboardEntry::BetweenSteps`] detectable
+/// exactly rather than by comparing floats.
+#[must_use]
+pub fn parse_clipboard_minutes(text: &str) -> ClipboardEntry {
+    let text = text.trim();
+    if text.is_empty() {
+        return ClipboardEntry::NotANumber;
+    }
+    // One separator, of either kind. `split` rather than `splitn` so that
+    // "1.2.3" produces three parts and is refused rather than silently read
+    // as "1.2".
+    let parts: Vec<&str> = text.split(['.', ',']).collect();
+    let (whole_text, frac_text) = match parts.as_slice() {
+        [whole] => (*whole, ""),
+        [whole, frac] => (*whole, *frac),
+        _ => return ClipboardEntry::NotANumber,
+    };
+    // "" is allowed on the left (".5") but only when there is something on
+    // the right; "1." is likewise fine, but "." alone is not a number.
+    if whole_text.is_empty() && frac_text.is_empty() {
+        return ClipboardEntry::NotANumber;
+    }
+    if !whole_text.bytes().all(|b| b.is_ascii_digit())
+        || !frac_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return ClipboardEntry::NotANumber;
+    }
+    let Ok(whole) = (if whole_text.is_empty() { "0" } else { whole_text }).parse::<u64>() else {
+        // Only reachable for a run of digits too long for a `u64`, which is
+        // certainly above the ceiling -- but it is reported as "not a number"
+        // rather than guessed at, because this branch cannot tell the
+        // difference between a very large entry and a pasted line of digits.
+        return ClipboardEntry::NotANumber;
+    };
+    let mut digits = frac_text.bytes();
+    let tenths = u64::from(digits.next().map_or(0, |b| b - b'0'));
+    // Everything past the first decimal place must be zero. This is where
+    // `1.25` is caught, and it is caught exactly: no rounding is involved,
+    // only "is there a non-zero digit here".
+    if digits.any(|b| b != b'0') {
+        return ClipboardEntry::BetweenSteps;
+    }
+    // `checked_mul`/`checked_add` rather than saturating: a value that
+    // overflows is unambiguously above the ceiling, and saying so is better
+    // than saturating to `u64::MAX` and then reporting the same thing one
+    // branch later.
+    let Some(seconds) = whole
+        .checked_mul(60)
+        .and_then(|s| s.checked_add(tenths * CLIPBOARD_SECONDS_STEP))
+    else {
+        return ClipboardEntry::AboveCeiling;
+    };
+    if seconds < MIN_CLIPBOARD_SECONDS {
+        return ClipboardEntry::BelowFloor;
+    }
+    if seconds > MAX_CLIPBOARD_SECONDS {
+        return ClipboardEntry::AboveCeiling;
+    }
+    // In range and, by construction, a multiple of the step -- so
+    // `from_seconds`'s clamp is a no-op here and the value the user typed is
+    // the value that is stored.
+    ClipboardEntry::Accepted(ClearInterval::from_seconds(seconds))
+}
+
 /// Smallest inner size the vault window may ever be given, in egui points.
 ///
 /// The vault window's three panes are two fixed-width columns (212 + 390)
@@ -463,6 +893,81 @@ pub struct Settings {
     /// preferences window greys its stepper out rather than clearing it), so
     /// turning the toggle back on restores the number the user last chose.
     pub auto_lock_minutes: u64,
+    /// **The master switch over taking a copied secret back off the
+    /// clipboard.**
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as) is the behaviour that has always existed. `false`
+    /// means nothing clears: no timer, and no lock, account change or quit
+    /// clears either. It governs the other four fields below through
+    /// [`clipboard_clearing`], which is the only place that folding happens.
+    ///
+    /// **This is not the clipboard-history exclusion and must not be confused
+    /// with it.** The formats that keep a copied password out of `Win+V` and
+    /// off the user's other devices are unconditional, have no setting, and
+    /// are argued for at the top of `clipboard.rs`. This switch governs only
+    /// the *second* half of that module -- taking the value back afterwards --
+    /// which is a convenience/safety trade the user is entitled to make,
+    /// because the cost of getting it wrong falls on their own paste.
+    ///
+    /// On by default, and not a close call: a user who has never opened this
+    /// page gets the protection.
+    pub clear_clipboard: bool,
+    /// Whether locking the vault clears a copied secret.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as). Covers all three ways the vault locks -- the Lock
+    /// button, the tray, and the idle timer -- and also `needs_reauth`, the
+    /// session being invalidated elsewhere, because that is the same event
+    /// arriving from the other direction and the app has **no separate logout
+    /// path** for a switch of its own to govern.
+    ///
+    /// Has no effect while [`Self::clear_clipboard`] is off.
+    pub clear_clipboard_on_lock: bool,
+    /// Whether switching, adding or removing an account clears a copied
+    /// secret.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as). All three mean the user has moved to a different
+    /// vault, and a credential from the one they left has no business
+    /// surviving the move.
+    ///
+    /// Has no effect while [`Self::clear_clipboard`] is off.
+    pub clear_clipboard_on_account_change: bool,
+    /// Whether quitting Deskwarden clears a copied secret.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as). Covers a quit from the tray and a shutdown to install
+    /// an update; it cannot cover a crash, a Task Manager kill or a power cut,
+    /// and `PRIVACY.md` says so rather than implying otherwise.
+    ///
+    /// Has no effect while [`Self::clear_clipboard`] is off.
+    pub clear_clipboard_on_quit: bool,
+    /// **Seconds** after a copy before the timer takes it back, when
+    /// [`Self::clear_clipboard`].
+    ///
+    /// [`DEFAULT_CLIPBOARD_SECONDS`] -- 60, one minute -- is the default and
+    /// what an older `settings.json` without this field parses as. That is a
+    /// **change in behaviour on upgrade**, from the fixed 45 seconds
+    /// `clipboard::DEFAULT_CLEAR_AFTER` used to be, and it is a deliberate one
+    /// in the direction of more time to paste rather than less; see
+    /// [`MIN_CLIPBOARD_SECONDS`].
+    ///
+    /// **Seconds on disk, minutes on screen.** The preferences window offers
+    /// this as a decimal number of minutes -- `0.5` is 30 seconds -- and the
+    /// conversion happens only there, in [`parse_clipboard_minutes`] and
+    /// [`ClearInterval::as_minutes_text`]. The persisted value is an integer
+    /// so that `settings.json` cannot hold a floating-point rounding artefact
+    /// and `clipboard::verdict` cannot end up comparing floats; see
+    /// [`DEFAULT_CLIPBOARD_SECONDS`].
+    ///
+    /// Clamped into [`MIN_CLIPBOARD_SECONDS`]`..=`[`MAX_CLIPBOARD_SECONDS`],
+    /// and onto a [`CLIPBOARD_SECONDS_STEP`] boundary, by
+    /// [`clamp_clipboard_seconds`] -- which [`ClearInterval::from_seconds`],
+    /// the only constructor, runs. Retained while the master switch is off
+    /// (the preferences window greys its field out rather than clearing it),
+    /// so turning it back on restores the number the user last chose.
+    pub clear_clipboard_seconds: u64,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
     ///
@@ -549,6 +1054,11 @@ impl Default for Settings {
             reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
+            clear_clipboard: true,
+            clear_clipboard_on_lock: true,
+            clear_clipboard_on_account_change: true,
+            clear_clipboard_on_quit: true,
+            clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
@@ -673,6 +1183,11 @@ impl Settings {
             reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
+            clear_clipboard,
+            clear_clipboard_on_lock,
+            clear_clipboard_on_account_change,
+            clear_clipboard_on_quit,
+            clear_clipboard_seconds,
             vault_window: _,
             accounts: _,
             active_account: _,
@@ -690,6 +1205,11 @@ impl Settings {
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
+        on_disk.clear_clipboard = *clear_clipboard;
+        on_disk.clear_clipboard_on_lock = *clear_clipboard_on_lock;
+        on_disk.clear_clipboard_on_account_change = *clear_clipboard_on_account_change;
+        on_disk.clear_clipboard_on_quit = *clear_clipboard_on_quit;
+        on_disk.clear_clipboard_seconds = *clear_clipboard_seconds;
         on_disk.save(path)
     }
 
@@ -738,6 +1258,45 @@ impl Settings {
     /// of the reasoning is in [`auto_lock_policy`]; this is only the lookup.
     pub fn auto_lock(&self) -> AutoLock {
         auto_lock_policy(self.auto_lock_enabled, self.auto_lock_minutes)
+    }
+
+    /// What this settings file means for a copied secret's life. All of the
+    /// reasoning is in [`clipboard_clearing`]; this is only the lookup.
+    #[must_use]
+    pub fn clipboard_clearing(&self) -> ClipboardClearing {
+        clipboard_clearing(
+            self.clear_clipboard,
+            self.clear_clipboard_on_lock,
+            self.clear_clipboard_on_account_change,
+            self.clear_clipboard_on_quit,
+            self.clear_clipboard_seconds,
+        )
+    }
+
+    /// **Every field the clipboard section owns, back at its default, and
+    /// nothing else touched.**
+    ///
+    /// This is what the section's "Reset to default" button does, and it is a
+    /// pure function so that "scoped to this section only" is a property a
+    /// test can assert rather than a claim about a click handler. The five
+    /// fields are spelled out and copied from `Self::default()`; every other
+    /// field comes from `self`, so a preference on any other page cannot be
+    /// reverted by this button.
+    ///
+    /// There is deliberately no confirmation dialog in front of it: the button
+    /// changes five visible values on the page the user is already looking at,
+    /// and setting them back is the same five clicks that got them there.
+    #[must_use]
+    pub fn with_default_clipboard_clearing(&self) -> Self {
+        let defaults = Self::default();
+        Self {
+            clear_clipboard: defaults.clear_clipboard,
+            clear_clipboard_on_lock: defaults.clear_clipboard_on_lock,
+            clear_clipboard_on_account_change: defaults.clear_clipboard_on_account_change,
+            clear_clipboard_on_quit: defaults.clear_clipboard_on_quit,
+            clear_clipboard_seconds: defaults.clear_clipboard_seconds,
+            ..self.clone()
+        }
     }
 }
 
@@ -874,6 +1433,16 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            // Every one the OPPOSITE of its own default, for the reason the
+            // fields above give: a writer that dropped one would round-trip to
+            // the default and look identical to one that kept it. The
+            // interval is 150 seconds -- 2.5 minutes, on a step and not the
+            // default -- so a writer that dropped it would come back as 60.
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 150,
             vault_window: None,
             // Listed rather than `..Settings::default()` so this test keeps
             // failing to compile when a field is added -- the same forcing
@@ -1046,6 +1615,16 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
+            // Every one the OPPOSITE of its own default, for the reason the
+            // fields above give: a writer that dropped one would round-trip to
+            // the default and look identical to one that kept it. The
+            // interval is 150 seconds -- 2.5 minutes, on a step and not the
+            // default -- so a writer that dropped it would come back as 60.
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 150,
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
@@ -1542,6 +2121,16 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            // Every one the OPPOSITE of its own default, for the reason the
+            // fields above give: a writer that dropped one would round-trip to
+            // the default and look identical to one that kept it. The
+            // interval is 150 seconds -- 2.5 minutes, on a step and not the
+            // default -- so a writer that dropped it would come back as 60.
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 150,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),
             active_account: None,
@@ -2243,6 +2832,489 @@ mod tests {
         let loaded = Settings::load(&path);
         assert_eq!(loaded.accounts.len(), 1);
         assert!(!loaded.keep_backend_running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ------------------------------------------------------------------
+    // Clearing a copied secret off the clipboard
+    // ------------------------------------------------------------------
+
+    /// **Every one of the five fields is on by default**, so a user who has
+    /// never opened the page gets the protection. Spelled out one at a time
+    /// rather than compared against a constructed struct: a test that built
+    /// its expectation out of `Settings::default()` would pass whatever the
+    /// defaults were.
+    #[test]
+    fn clipboard_clearing_is_entirely_on_by_default() {
+        let s = Settings::default();
+        assert!(s.clear_clipboard, "the master switch");
+        assert!(s.clear_clipboard_on_lock);
+        assert!(s.clear_clipboard_on_account_change);
+        assert!(s.clear_clipboard_on_quit);
+        assert_eq!(s.clear_clipboard_seconds, 60, "one minute, in seconds");
+        // ...and the derived value agrees with the five fields, so the
+        // defaults above are not merely stored but in effect.
+        assert_eq!(
+            s.clipboard_clearing(),
+            ClipboardClearing {
+                timer: Some(ClearInterval::from_seconds(60)),
+                on_lock: true,
+                on_account_change: true,
+                on_quit: true,
+            }
+        );
+    }
+
+    /// **An older `settings.json` without any of the five keys loads as all
+    /// on and one minute** -- the upgrade path, and the direction it must not
+    /// break. A file predating this section describes a user who was getting
+    /// clearing at 45 seconds; reading it as "off" would silently withdraw a
+    /// protection they never asked to lose.
+    #[test]
+    fn an_older_settings_file_without_the_clipboard_keys_loads_as_all_on() {
+        let path = temp_path("clipboard-absent");
+        let older =
+            br#"{"keep_backend_running": false, "check_breaches": true, "auto_lock_minutes": 9}"#;
+        // The premise: the keys really are absent, so this is testing the
+        // absence and not a file that happens to say `true`.
+        for key in [
+            "clear_clipboard",
+            "clear_clipboard_on_lock",
+            "clear_clipboard_on_account_change",
+            "clear_clipboard_on_quit",
+            "clear_clipboard_seconds",
+        ] {
+            assert!(
+                !std::str::from_utf8(older).unwrap().contains(key),
+                "{key} is in the fixture, so this proves nothing about its absence"
+            );
+        }
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        assert!(loaded.clear_clipboard);
+        assert!(loaded.clear_clipboard_on_lock);
+        assert!(loaded.clear_clipboard_on_account_change);
+        assert!(loaded.clear_clipboard_on_quit);
+        assert_eq!(loaded.clear_clipboard_seconds, 60);
+        // The keys that ARE in the file still landed, so the file was really
+        // parsed rather than falling back to `Settings::default()` wholesale.
+        assert!(!loaded.keep_backend_running);
+        assert!(loaded.check_breaches);
+        assert_eq!(loaded.auto_lock_minutes, 9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The master switch off means nothing clears at all** -- not the timer,
+    /// and not one of the three triggers, whatever their own fields say.
+    ///
+    /// This is the enable/disable logic the preferences window paints, tested
+    /// as a pure function of the settings rather than by driving a window.
+    #[test]
+    fn the_master_switch_off_silences_every_trigger_and_the_timer() {
+        let off = Settings {
+            clear_clipboard: false,
+            // All three children left ON, so the assertions below are about
+            // the master switch overriding them rather than about them being
+            // off already.
+            clear_clipboard_on_lock: true,
+            clear_clipboard_on_account_change: true,
+            clear_clipboard_on_quit: true,
+            clear_clipboard_seconds: 120,
+            ..Settings::default()
+        };
+        let clearing = off.clipboard_clearing();
+        assert_eq!(clearing.timer, None, "the timer survived the master switch");
+        assert!(!clearing.on_lock);
+        assert!(!clearing.on_account_change);
+        assert!(!clearing.on_quit);
+        assert!(!clearing.interval_is_live(), "the interval control is still enabled");
+        assert!(!clearing.clears_at_all());
+
+        // The pair: the identical settings with the master switch ON have all
+        // four live, so every assertion above is about the master switch and
+        // not about a struct that is inert whatever it is handed.
+        let on = Settings { clear_clipboard: true, ..off.clone() };
+        let clearing = on.clipboard_clearing();
+        assert_eq!(clearing.timer, Some(ClearInterval::from_seconds(120)));
+        assert!(clearing.on_lock);
+        assert!(clearing.on_account_change);
+        assert!(clearing.on_quit);
+        assert!(clearing.interval_is_live());
+        assert!(clearing.clears_at_all());
+        // And the retained fields are retained: turning the master switch off
+        // did not zero the children on the way, so turning it back on gives
+        // the user the values they chose.
+        assert!(off.clear_clipboard_on_lock);
+        assert_eq!(off.clear_clipboard_seconds, 120);
+    }
+
+    /// **Each trigger switch governs its own trigger and no other**, so a
+    /// wiring mistake that pointed two of them at one field cannot pass.
+    #[test]
+    fn each_trigger_switch_governs_exactly_one_trigger() {
+        let cases: [(&str, Settings, bool, bool, bool); 3] = [
+            (
+                "only lock",
+                Settings {
+                    clear_clipboard_on_account_change: false,
+                    clear_clipboard_on_quit: false,
+                    ..Settings::default()
+                },
+                true,
+                false,
+                false,
+            ),
+            (
+                "only account change",
+                Settings {
+                    clear_clipboard_on_lock: false,
+                    clear_clipboard_on_quit: false,
+                    ..Settings::default()
+                },
+                false,
+                true,
+                false,
+            ),
+            (
+                "only quit",
+                Settings {
+                    clear_clipboard_on_lock: false,
+                    clear_clipboard_on_account_change: false,
+                    ..Settings::default()
+                },
+                false,
+                false,
+                true,
+            ),
+        ];
+        for (what, settings, lock, account, quit) in &cases {
+            let clearing = settings.clipboard_clearing();
+            assert_eq!(clearing.on_lock, *lock, "{what}: on_lock");
+            assert_eq!(clearing.on_account_change, *account, "{what}: on_account_change");
+            assert_eq!(clearing.on_quit, *quit, "{what}: on_quit");
+            // The timer is untouched by any of the three: they are the
+            // triggers, not the clock.
+            assert!(clearing.interval_is_live(), "{what}: a trigger switch silenced the timer");
+            assert!(clearing.clears_at_all(), "{what}");
+        }
+    }
+
+    /// **All three triggers off is still not "nothing clears"** -- the timer
+    /// remains, and `clears_at_all` says so. That distinction is the reason
+    /// the method exists separately from `interval_is_live`.
+    #[test]
+    fn with_every_trigger_off_the_timer_still_clears() {
+        let s = Settings {
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            ..Settings::default()
+        };
+        let clearing = s.clipboard_clearing();
+        assert!(clearing.clears_at_all(), "the timer is still a thing that clears");
+        assert!(clearing.interval_is_live());
+        // The pair: the ONLY state in which nothing clears is the master
+        // switch being off.
+        let none = Settings { clear_clipboard: false, ..s };
+        assert!(!none.clipboard_clearing().clears_at_all());
+    }
+
+    /// **The clamp's three jobs, at absolute values rather than re-derived
+    /// from the constants.** A test that recomputed its expectation from
+    /// `MIN_CLIPBOARD_SECONDS` would still pass if that constant moved.
+    #[test]
+    fn the_interval_clamp_applies_a_floor_a_ceiling_and_a_step() {
+        // Floor.
+        assert_eq!(clamp_clipboard_seconds(0), 30, "an instant clear is unreachable");
+        assert_eq!(clamp_clipboard_seconds(1), 30);
+        assert_eq!(clamp_clipboard_seconds(29), 30);
+        // Ceiling.
+        assert_eq!(clamp_clipboard_seconds(3601), 3600);
+        assert_eq!(clamp_clipboard_seconds(u64::MAX), 3600);
+        // Step: nearest multiple of six, ties downward.
+        assert_eq!(clamp_clipboard_seconds(30), 30, "already on a step");
+        assert_eq!(clamp_clipboard_seconds(60), 60);
+        assert_eq!(clamp_clipboard_seconds(79), 78);
+        assert_eq!(clamp_clipboard_seconds(80), 78);
+        assert_eq!(clamp_clipboard_seconds(81), 78, "the tie goes to the shorter interval");
+        assert_eq!(clamp_clipboard_seconds(82), 84);
+        // And the result is always in range and on a step, for every value
+        // across the range plus the extremes -- the property, not samples.
+        for seconds in (0..4000).chain([u64::MAX]) {
+            let got = clamp_clipboard_seconds(seconds);
+            assert!((30..=3600).contains(&got), "{seconds} clamped out of range to {got}");
+            assert_eq!(got % 6, 0, "{seconds} clamped to {got}, which is not on a step");
+        }
+    }
+
+    /// **A `ClearInterval` can never be zero, whatever it is built from.**
+    /// The type is what makes an instant clear unreachable rather than a case
+    /// something downstream remembers to check, so this is the pin on that
+    /// claim.
+    #[test]
+    fn no_interval_can_be_built_that_would_clear_instantly() {
+        for seconds in (0..200).chain([u64::MAX, 3600, 3601]) {
+            let interval = ClearInterval::from_seconds(seconds);
+            assert!(
+                interval.seconds() >= 30,
+                "from_seconds({seconds}) produced {}s, which is under the floor",
+                interval.seconds()
+            );
+            assert!(!interval.duration().is_zero());
+        }
+        // ...and `clipboard_clearing` cannot produce one either, since it is
+        // the only other route to a timer.
+        for seconds in [0, 1, 29] {
+            assert_eq!(
+                clipboard_clearing(true, true, true, true, seconds).timer,
+                Some(ClearInterval::from_seconds(30))
+            );
+        }
+    }
+
+    /// **The forms the interval field accepts**, each named.
+    #[test]
+    fn the_interval_field_accepts_whole_and_fractional_minutes() {
+        let cases: [(&str, u64); 12] = [
+            ("1", 60),
+            ("2", 120),
+            ("60", 3600),
+            ("0.5", 30),
+            (".5", 30),
+            ("1.5", 90),
+            ("2.5", 150),
+            // A comma, because this is a Windows app and much of Europe types
+            // one. Both separators, both with and without the leading zero.
+            ("0,5", 30),
+            (",5", 30),
+            ("1,5", 90),
+            // Whitespace is trimmed; trailing zeros carry no information.
+            ("  1.5  ", 90),
+            ("1.50", 90),
+        ];
+        for (text, seconds) in &cases {
+            assert_eq!(
+                parse_clipboard_minutes(text),
+                ClipboardEntry::Accepted(ClearInterval::from_seconds(*seconds)),
+                "{text:?} should be {seconds} seconds"
+            );
+        }
+    }
+
+    /// **Each refusal is its own answer, because each needs its own
+    /// sentence.** A parser that returned one "no" for `soon`, `0.1` and
+    /// `1.25` would leave the row unable to say why.
+    #[test]
+    fn the_interval_field_refuses_each_bad_entry_for_its_own_reason() {
+        let cases: [(&str, ClipboardEntry); 14] = [
+            ("", ClipboardEntry::NotANumber),
+            ("   ", ClipboardEntry::NotANumber),
+            ("soon", ClipboardEntry::NotANumber),
+            (".", ClipboardEntry::NotANumber),
+            ("1.2.3", ClipboardEntry::NotANumber),
+            ("1,2,3", ClipboardEntry::NotANumber),
+            ("1.2,3", ClipboardEntry::NotANumber),
+            // No sign in the grammar, which is what makes a negative interval
+            // unreachable rather than merely rejected by a range check.
+            ("-1", ClipboardEntry::NotANumber),
+            ("1e3", ClipboardEntry::NotANumber),
+            // Below the floor, zero included.
+            ("0", ClipboardEntry::BelowFloor),
+            ("0.1", ClipboardEntry::BelowFloor),
+            ("0.4", ClipboardEntry::BelowFloor),
+            // Above the ceiling.
+            ("61", ClipboardEntry::AboveCeiling),
+            ("99999999999999999999999999", ClipboardEntry::NotANumber),
+        ];
+        for (text, expected) in &cases {
+            assert_eq!(parse_clipboard_minutes(text), *expected, "{text:?}");
+        }
+        // Between steps: in range, but more than one decimal place. Refused
+        // rather than snapped, so nothing is rounded where the user cannot
+        // see it.
+        for text in ["1.25", "0.55", "2.34", "1.05"] {
+            assert_eq!(
+                parse_clipboard_minutes(text),
+                ClipboardEntry::BetweenSteps,
+                "{text:?} was accepted, or refused for the wrong reason"
+            );
+        }
+        // The control: the very same shapes one decimal place shorter are
+        // accepted, so `BetweenSteps` is about the resolution and not about
+        // decimals in general.
+        assert!(matches!(parse_clipboard_minutes("1.2"), ClipboardEntry::Accepted(_)));
+        assert!(matches!(parse_clipboard_minutes("2.3"), ClipboardEntry::Accepted(_)));
+    }
+
+    /// **Minutes and seconds round-trip exactly, in both directions, across
+    /// the whole offered range** -- not at sampled points.
+    ///
+    /// This is what `CLIPBOARD_SECONDS_STEP` exists for: the displayed value
+    /// and the stored value cannot disagree, because every stored value is
+    /// exactly `n/10` minutes and every accepted entry is exactly a whole
+    /// number of seconds.
+    #[test]
+    fn every_offered_interval_round_trips_through_the_field() {
+        let mut seen = 0;
+        let mut seconds = 30;
+        while seconds <= 3600 {
+            let interval = ClearInterval::from_seconds(seconds);
+            let text = interval.as_minutes_text();
+            assert_eq!(
+                parse_clipboard_minutes(&text),
+                ClipboardEntry::Accepted(interval),
+                "{seconds}s displayed as {text:?}, which did not parse back to itself"
+            );
+            seen += 1;
+            seconds += 6;
+        }
+        assert_eq!(seen, 596, "the range is not the one this test thinks it walked");
+    }
+
+    /// The display forms, spelled out, so `as_minutes_text` cannot start
+    /// printing `1.0` or `0.50` without a test noticing.
+    #[test]
+    fn the_interval_is_shown_as_minutes_without_a_pointless_decimal() {
+        assert_eq!(ClearInterval::from_seconds(30).as_minutes_text(), "0.5");
+        assert_eq!(ClearInterval::from_seconds(60).as_minutes_text(), "1");
+        assert_eq!(ClearInterval::from_seconds(90).as_minutes_text(), "1.5");
+        assert_eq!(ClearInterval::from_seconds(150).as_minutes_text(), "2.5");
+        assert_eq!(ClearInterval::from_seconds(3600).as_minutes_text(), "60");
+        // A `.` and never a `,`, even though the parser accepts both.
+        assert!(!ClearInterval::from_seconds(30).as_minutes_text().contains(','));
+    }
+
+    /// **"Reset to default" resets this section and nothing else.**
+    ///
+    /// The scope is the whole point of the button, so it is tested as a pure
+    /// function: every clipboard field comes back, and every other preference
+    /// -- including ones that are themselves non-default -- is left exactly
+    /// where the user put it.
+    #[test]
+    fn resetting_the_clipboard_section_leaves_every_other_preference_alone() {
+        let edited = Settings {
+            // The section, all five away from their defaults.
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 300,
+            // Everything else, also away from its default, so a reset that
+            // reached too far is visible here rather than hidden by a field
+            // that happened to be at its default already.
+            keep_backend_running: false,
+            prompt_on_match: false,
+            check_breaches: true,
+            fetch_icons: false,
+            check_for_updates: false,
+            reveal_totp_seed: true,
+            auto_lock_enabled: false,
+            auto_lock_minutes: 42,
+            vault_window: Some(WindowGeometry { x: 1, y: 2, width: 1200, height: 800 }),
+            ..Settings::default()
+        };
+        let reset = edited.with_default_clipboard_clearing();
+
+        // The section came back.
+        assert!(reset.clear_clipboard);
+        assert!(reset.clear_clipboard_on_lock);
+        assert!(reset.clear_clipboard_on_account_change);
+        assert!(reset.clear_clipboard_on_quit);
+        assert_eq!(reset.clear_clipboard_seconds, 60);
+
+        // And nothing else moved.
+        assert!(!reset.keep_backend_running);
+        assert!(!reset.prompt_on_match);
+        assert!(reset.check_breaches);
+        assert!(!reset.fetch_icons);
+        assert!(!reset.check_for_updates);
+        assert!(reset.reveal_totp_seed);
+        assert!(!reset.auto_lock_enabled);
+        assert_eq!(reset.auto_lock_minutes, 42);
+        assert_eq!(reset.vault_window, edited.vault_window);
+
+        // The blunt version of the same claim, so a field added later and
+        // wrongly reset is caught without anyone remembering to list it here:
+        // the reset differs from the original in exactly the five fields.
+        assert_eq!(
+            reset,
+            Settings {
+                clear_clipboard: true,
+                clear_clipboard_on_lock: true,
+                clear_clipboard_on_account_change: true,
+                clear_clipboard_on_quit: true,
+                clear_clipboard_seconds: 60,
+                ..edited.clone()
+            }
+        );
+
+        // The control: resetting an already-default section changes nothing
+        // at all, so the assertions above are about the five fields rather
+        // than about the function rebuilding the struct.
+        let untouched = Settings::default();
+        assert_eq!(untouched.with_default_clipboard_clearing(), untouched);
+    }
+
+    /// **`persist_preferences` writes all five, and reads all five back.**
+    /// The same shape as the guards on every other preference: the
+    /// destructuring in `persist_preferences` is exhaustive, but binding a
+    /// field and never assigning `on_disk`'s compiles.
+    #[test]
+    fn the_clipboard_preferences_survive_a_save_and_a_reload() {
+        let path = temp_path("clipboard-persist");
+        assert!(Settings::load(&path).clear_clipboard, "the premise: it starts on");
+        Settings {
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 300,
+            ..Settings::default()
+        }
+        .persist_preferences(&path)
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.clear_clipboard, "the master switch was not written");
+        assert!(!loaded.clear_clipboard_on_lock, "the lock trigger was not written");
+        assert!(
+            !loaded.clear_clipboard_on_account_change,
+            "the account-change trigger was not written"
+        );
+        assert!(!loaded.clear_clipboard_on_quit, "the quit trigger was not written");
+        assert_eq!(loaded.clear_clipboard_seconds, 300, "the interval was not written");
+
+        // The other direction, so the writer is not simply writing `false`
+        // and `300` over everything.
+        Settings::default().persist_preferences(&path).unwrap();
+        let back = Settings::load(&path);
+        assert!(back.clear_clipboard);
+        assert!(back.clear_clipboard_on_lock);
+        assert!(back.clear_clipboard_on_account_change);
+        assert!(back.clear_clipboard_on_quit);
+        assert_eq!(back.clear_clipboard_seconds, 60);
+
+        // The key names really are in the file, so the round trip above went
+        // through disk rather than through a default that happens to match.
+        Settings { clear_clipboard_seconds: 300, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for key in [
+            "clear_clipboard",
+            "clear_clipboard_on_lock",
+            "clear_clipboard_on_account_change",
+            "clear_clipboard_on_quit",
+            "clear_clipboard_seconds",
+        ] {
+            assert!(text.contains(key), "{key} is not in the file at all: {text}");
+        }
+        // An integer on disk, never a float: `settings.json` must not acquire
+        // a floating-point rounding artefact, which is the whole reason the
+        // stored unit is seconds.
+        assert!(
+            text.contains("\"clear_clipboard_seconds\": 300"),
+            "the interval is not stored as a whole number of seconds: {text}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
