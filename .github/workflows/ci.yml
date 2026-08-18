@@ -94,14 +94,19 @@ jobs:
   # AND EXPLICITLY NOT A PIXEL-DIFF GATE. A golden-image comparison over an
   # anti-aliased egui surface reds on a font-rendering change, on a driver
   # update, on a runner-image bump. A gate that reds for reasons nobody caused
-  # gets `continue-on-error`'d and then deleted, and the pictures go with it.
-  # The two assertions below are the only ones this job makes, and both are
-  # about whether the *walk* ran, never about what a pixel is:
+  # gets `continue-on-error`'d and then deleted, and the pictures go with
+  # it.
+  #
+  # The only assertions here are about whether the *walk ran*, never about
+  # what a pixel is:
   #
   #   * `if-no-files-found: error` -- an upload of nothing must not be green.
-  #   * the count check -- nine surfaces went in, nine PNGs come out. This is
-  #     what catches "the walk stopped after the third surface", which is a
-  #     failure that leaves a perfectly valid, perfectly useless artifact.
+  #   * the walk counts its own output against `ALL` and panics if they
+  #     disagree, which catches "the walk stopped after the third surface" --
+  #     a failure that otherwise leaves a perfectly valid, perfectly useless
+  #     artifact. That check lives in the example, beside the list it counts,
+  #     because it used to live here as a literal and went stale the first
+  #     time somebody added a surface.
   #
   # A SEPARATE JOB, not steps bolted onto `test`. It runs in parallel with the
   # other two, so it adds nothing to the wall clock, and a flake in a window
@@ -132,21 +137,19 @@ jobs:
         working-directory: deskwarden
         run: cargo run --example ui_preview -- --all
 
-      - name: Check the walk finished
+      # The walk asserts its own count now -- see the tail of
+      # examples/ui_preview.rs. This step only lists what came out, so a
+      # reader of the log can see it without downloading the artifact.
+      #
+      # It used to assert `expected=9` here. `ALL` grew to eleven surfaces
+      # and this number did not, so the job went red over a count nobody
+      # had to change when adding a surface. A number obliged to agree with
+      # a list, kept in a different file from the list, is the defect this
+      # crate keeps losing to; the count now lives beside the surfaces.
+      - name: List what the walk produced
         shell: bash
         working-directory: deskwarden
-        run: |
-          set -euo pipefail
-          expected=9
-          found=$(ls target/ui_preview/*.png 2>/dev/null | wc -l | tr -d ' ')
-          echo "rendered $found PNG(s):"
-          ls -l target/ui_preview || true
-          if [ "$found" -ne "$expected" ]; then
-            echo "::error::the preview walk produced $found PNG(s), not $expected. Either a \
-          surface was added to \`Surface\` in examples/ui_preview.rs without this number \
-          following it, or the walk stopped part way and the artifact below is missing surfaces."
-            exit 1
-          fi
+        run: ls -l target/ui_preview
 
       - uses: actions/upload-artifact@v4
         with:

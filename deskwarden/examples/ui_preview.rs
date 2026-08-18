@@ -284,7 +284,10 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_overlay.png")
     };
 
-    eframe::run_native(
+    // Cloned before the closure takes it: the count check below outlives
+    // the run.
+    let out_dir = out.clone();
+    let outcome = eframe::run_native(
         "Deskwarden preview",
         options,
         Box::new(move |_cc| {
@@ -302,7 +305,33 @@ fn main() -> eframe::Result {
                 fixtures: Fixtures::new(),
             }))
         }),
-    )
+    );
+
+    // **The walk checks its own arithmetic, so CI does not have to.**
+    //
+    // The workflow used to assert a hardcoded PNG count. It said nine
+    // while `ALL` held eleven, and the screenshots job was red over a
+    // number nobody had to touch when a surface was added -- two
+    // enumerations obliged to agree, which is the defect this crate keeps
+    // losing to. The count now lives where the surfaces do.
+    if all {
+        let written = std::fs::read_dir(&out_dir)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            written,
+            ALL.len(),
+            "the preview walk wrote {} PNG(s) into {} for {} surface(s) -- a walk that stops part way leaves a perfectly valid, perfectly useless artifact",
+            written,
+            out_dir.display(),
+            ALL.len()
+        );
+    }
+    outcome
 }
 
 /// How many settled frames a surface gets before it is captured.
