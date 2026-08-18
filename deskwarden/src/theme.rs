@@ -1301,6 +1301,68 @@ pub const ENVELOPE_VERTICES: usize = 4;
 /// is the live guard on that, not this comment.
 pub const ENVELOPE_FLAP_VERTICES: usize = 3;
 
+/// Vertices in the folder mark's single closed outline: the tab's two top
+/// corners, the shoulder where the tab steps down onto the body, and the
+/// body's three remaining corners.
+///
+/// **Six, and nothing else in this crate strokes a six-point closed path** --
+/// the star is [`STAR_VERTICES`], the eye [`EYE_VERTICES`], the envelope's
+/// two paths [`ENVELOPE_VERTICES`] and [`ENVELOPE_FLAP_VERTICES`], and no
+/// module outside this file emits an `egui::Shape::Path` at all. That is what
+/// lets [`icon_probe::folder_marks`] find this mark by point count the way
+/// every other probe in that module finds its own, and `detail.rs`'s
+/// `the_folder_mark_is_the_only_six_point_path_in_the_header` is the live
+/// guard on it rather than this sentence.
+pub const FOLDER_VERTICES: usize = 6;
+
+/// Half the folder mark's width: the outline spans 9px, sized against a 12px
+/// subtitle rather than against the 34px header controls -- this is the only
+/// mark in this file that sits INSIDE a run of text.
+const FOLDER_HALF_WIDTH: f32 = 4.5;
+
+/// Half the folder mark's height, giving a 9x7 outline. Wider than tall, the
+/// proportions of a manila folder; a square would read as a plain box.
+const FOLDER_HALF_HEIGHT: f32 = 3.5;
+
+/// How much of the mark's top edge the tab claims. 4.0 of 9.0 is a little
+/// under half, which is what keeps the tab reading as a tab rather than as a
+/// lid over the whole width.
+const FOLDER_TAB_WIDTH: f32 = 4.0;
+
+/// How far the body's top edge sits below the tab's -- 2.0 of the 7px height,
+/// so the body still has 5px of its own to be a body.
+const FOLDER_TAB_RISE: f32 = 2.0;
+
+/// The horizontal run of the shoulder: the short slant from the tab's
+/// trailing corner down onto the body's top edge. A vertical step here (0.0)
+/// reads as a bite taken out of the corner at this size.
+const FOLDER_TAB_SLANT: f32 = 1.2;
+
+/// Lighter than [`ICON_STROKE`], deliberately rather than by oversight: the
+/// drawn-icon family's 1.3 is measured for marks 17-18px across, and at 9px
+/// the same weight closes the tab's notch up. This mark introduces a run of
+/// [`TEXT_FAINT`] secondary text and must not be louder than the words it
+/// introduces.
+const FOLDER_STROKE: f32 = 1.0;
+
+/// The box [`folder_mark`] allocates for itself. 14 tall is the 12pt
+/// subtitle's own line height, so the mark centres on the text it sits in
+/// instead of making the line taller; 15 wide is the 9px outline plus 3px of
+/// air on each side, which is the mark's ONLY separation from the folder
+/// name -- the caller sets `item_spacing.x` to zero so that the separator run
+/// and the mark do not drift apart, and at 2px the mark and the `W` of `Work`
+/// touched in the rendered header.
+pub const FOLDER_MARK_SIZE: Vec2 = Vec2::new(15.0, 14.0);
+
+/// How far below its box's centre the outline is drawn.
+///
+/// The box is the subtitle's whole line, descender space included, so a mark
+/// centred in it sits visibly high against a run of mostly-x-height letters --
+/// the same optical correction `account_switcher_button` makes for its chevron
+/// and for the same reason. One pixel puts the body's underside on the text's
+/// baseline.
+const FOLDER_MARK_DROP: f32 = 1.0;
+
 /// Half the envelope's width, so the body spans 18px inside the 34px header
 /// button -- the same optical extent as the star's 18px and the kebab's 15.
 const ENVELOPE_HALF_WIDTH: f32 = 9.0;
@@ -1927,6 +1989,68 @@ pub fn pencil_glyph_at(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
         Stroke::NONE,
     ));
     response.on_hover_text("Edit folder")
+}
+
+/// A small folder outline, painted inline in a run of text: a tab on the
+/// left, a shoulder, and the body under it.
+///
+/// The detail header's subtitle reads `Card · Work`, and the user's report is
+/// that this is "two words what they mean" -- nothing on the line says which
+/// half is the item's TYPE and which is where it lives. This mark goes
+/// immediately before the folder's name and answers that, in the one way a
+/// second line of text could not without saying more than the design's one
+/// line has room for.
+///
+/// **DRAWN, not typed, and the measurement was taken rather than assumed.**
+/// The four obvious codepoints were put to `has_glyph` against the app's real
+/// font stack before this function existed, and they split in two: 📁 U+1F4C1
+/// and 📂 U+1F4C2 resolve nowhere at all -- tofu boxes in the header of every
+/// foldered item, exactly what design 4d's ⇥ and ⏎ turned out to be -- while
+/// 🗀 U+1F5C0 and 🗁 U+1F5C1 DO resolve, out of egui's bundled emoji fallback,
+/// at ★'s own advance. The second pair is the one that would have shipped, and
+/// it is refused for the reason [`star_toggle`] and [`send_record_button`]
+/// already give: a mark from a face nobody here chose has a weight and an
+/// optical size nobody here set. See
+/// [`the_folder_codepoints_are_not_carried_by_this_apps_own_typeface`], which
+/// holds both halves.
+///
+/// The colour is the caller's, and the caller passes the subtitle's own
+/// [`TEXT_FAINT`]: the mark introduces secondary text and is not a control,
+/// so it has no hover state and no ink of its own to assert over the words.
+///
+/// Sized against the text rather than against the header controls -- see
+/// [`FOLDER_MARK_SIZE`] -- and stroked lighter than the rest of the family
+/// for the same reason ([`FOLDER_STROKE`]).
+pub fn folder_mark(ui: &mut Ui, color: Color32) {
+    // `Sense::hover()`, not `click()`: this is punctuation, not a control.
+    // The subtitle around it is a plain label, and a mark that took the
+    // pointing hand would promise a navigation this header does not have.
+    let (rect, _) = ui.allocate_exact_size(FOLDER_MARK_SIZE, Sense::hover());
+    let c = rect.center() + Vec2::new(0.0, FOLDER_MARK_DROP);
+    let (hw, hh) = (FOLDER_HALF_WIDTH, FOLDER_HALF_HEIGHT);
+    let p = |x: f32, y: f32| c + Vec2::new(x, y);
+    // ONE closed path of exactly [`FOLDER_VERTICES`] points, stroked with no
+    // fill -- the envelope's body states the general form of this rule: a
+    // `Shape::Rect` plus a separate tab would be indistinguishable from every
+    // card fill behind it to `icon_probe`, and two loose paths would be two
+    // more things every "exactly one X" assertion in `detail.rs` has to
+    // exclude.
+    ui.painter().add(egui::Shape::Path(egui::epaint::PathShape {
+        points: vec![
+            p(-hw, -hh),                                          // tab, top left
+            p(-hw + FOLDER_TAB_WIDTH, -hh),                       // tab, top right
+            p(-hw + FOLDER_TAB_WIDTH + FOLDER_TAB_SLANT, -hh + FOLDER_TAB_RISE), // shoulder
+            p(hw, -hh + FOLDER_TAB_RISE),                         // body, top right
+            p(hw, hh),                                            // body, bottom right
+            p(-hw, hh),                                           // body, bottom left
+        ],
+        closed: true,
+        // Load-bearing and not a default restated, exactly as on the
+        // envelope's flap: `icon_probe::folder_marks` walks UNFILLED closed
+        // paths, and a fill here would take this mark out of its own probe.
+        fill: Color32::TRANSPARENT,
+        stroke: Stroke::new(FOLDER_STROKE, color).into(),
+    }));
 }
 
 /// The footer keyboard-hint strip: `(key, action)` pairs in faint text, per
@@ -2746,6 +2870,108 @@ mod tests {
         // The positive control for the equal-advance argument, the same one
         // the test above uses: this stack really does measure a proportional
         // face proportionally, so four equal advances mean something.
+        assert_ne!(
+            width("A"),
+            width("W"),
+            "'A' and 'W' advance identically, so the equal-advance argument above is \
+             about the measurement, not about the face"
+        );
+    }
+
+    /// **The same measurement for the subtitle's folder mark**, taken before
+    /// [`folder_mark`] was written rather than assumed from the star's or the
+    /// chevron's answer -- **and the answer is not one answer.**
+    ///
+    /// The crate had already been bitten once by a codepoint nobody measured:
+    /// design 4d's ⇥ and ⏎ resolved in neither shipped face and would have
+    /// rendered as empty rectangles. So the codepoints a folder mark would
+    /// reach for were asked directly, and the four split into two groups:
+    ///
+    /// * **U+1F4C1 FILE FOLDER and U+1F4C2 OPEN FILE FOLDER do not resolve at
+    ///   all** -- the U+22EE/U+25BE position, the worse of the two. As text
+    ///   they are tofu boxes beside every foldered item's name. Their advance
+    ///   is the replacement box's, which is neither the app's own letters' nor
+    ///   the emoji face's.
+    /// * **U+1F5C0 FOLDER and U+1F5C1 OPEN FOLDER DO resolve**, out of egui's
+    ///   bundled emoji fallback -- the ★/👁 position. They advance at exactly
+    ///   ★'s width, which is the tell: a face nobody here chose, laying out
+    ///   two folder pictographs and an unrelated star to one identical em.
+    ///
+    /// Neither group is usable, and the second is the interesting one because
+    /// it would have shipped. A 12px subtitle set in [`TEXT_FAINT`] would get
+    /// a mark at that fallback's own weight and optical size, beside a header
+    /// whose every other measurement comes from the design -- the argument
+    /// [`send_record_button`] and [`star_toggle`] already make, now with a
+    /// measurement behind it for this mark rather than by analogy. So
+    /// [`folder_mark`] strokes an outline.
+    #[test]
+    fn the_folder_codepoints_are_not_carried_by_this_apps_own_typeface() {
+        let ctx = ctx_with_fonts();
+        // The subtitle's own 12pt, not the 13pt the two tests above use: a
+        // measurement taken at a size this mark is never drawn at would be a
+        // measurement of something else.
+        let font = FontId::new(12.0, FontFamily::Proportional);
+        let width = |s: &str| {
+            ctx.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), INK))
+                .size()
+                .x
+        };
+
+        for absent in ['\u{1F4C1}', '\u{1F4C2}'] {
+            assert!(
+                !ctx.fonts_mut(|f| f.has_glyph(&font, absent)),
+                "U+{:04X} now resolves; it was recorded as a tofu box in this app's own \
+                 stack, which is half the case for drawing the folder mark",
+                absent as u32
+            );
+        }
+        // The positive control for those two: `has_glyph` is not simply
+        // answering "no" to everything, and the fonts really did load. The
+        // same control the kebab's and the chevron's assertions carry.
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font, 'A')),
+            "the font set resolves no 'A' either, so the assertions above prove nothing"
+        );
+        // And the two that DO resolve, recorded rather than glossed: the
+        // reason this mark is drawn is not "no folder codepoint exists", it is
+        // that the ones that exist come from a face this app never chose.
+        for present in ['\u{1F5C0}', '\u{1F5C1}'] {
+            assert!(
+                ctx.fonts_mut(|f| f.has_glyph(&font, present)),
+                "U+{:04X} no longer resolves; it did when the folder mark was drawn, and \
+                 that -- not its absence -- is what this test records",
+                present as u32
+            );
+            // Out of the EMOJI fallback, which is the whole objection. ★ is
+            // already known to come from there (see the star's own test), and
+            // a proportional text face does not give a star and a folder one
+            // identical advance.
+            assert_eq!(
+                width(&present.to_string()),
+                width("\u{2605}"),
+                "U+{:04X} no longer advances like ★, so it may now come from a real text \
+                 face -- re-measure before trusting the drawn mark's justification",
+                present as u32
+            );
+        }
+        // The two that do not resolve share the REPLACEMENT box's advance, and
+        // it is not the emoji face's: this is the measurement agreeing with
+        // `has_glyph` rather than merely being asked alongside it.
+        assert_eq!(
+            width("\u{1F4C1}"),
+            width("\u{1F4C2}"),
+            "📁 and 📂 no longer share one advance, so at least one of them is now a real \
+             glyph rather than the replacement box"
+        );
+        assert_ne!(
+            width("\u{1F4C1}"),
+            width("\u{2605}"),
+            "📁 now advances like ★, which DOES resolve -- so the two groups this test \
+             separates have collapsed into one"
+        );
+        // The positive control for those advance arguments, the same one the
+        // two tests above use: this stack really does measure a proportional
+        // face proportionally, so equal advances mean something.
         assert_ne!(
             width("A"),
             width("W"),
@@ -3691,6 +3917,23 @@ pub mod icon_probe {
                 (body.0.union(flap), color)
             })
             .collect()
+    }
+
+    /// The subtitle's folder mark, as its outline's bounding box and the
+    /// colour it was stroked in.
+    ///
+    /// Matched on [`FOLDER_VERTICES`] alone, which is enough here in a way it
+    /// would not be for the envelope's four-point body: six is a point count
+    /// nothing else in this crate paints, and `detail.rs` guards that over a
+    /// whole rendered header rather than trusting the claim.
+    ///
+    /// The colour is reported because it is the only way a test can see that
+    /// this mark rests at [`TEXT_FAINT`] -- it paints no fill and no string,
+    /// the same blindness [`envelopes`] was written around.
+    pub fn folder_marks(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        walk_open_paths(shape, FOLDER_VERTICES, &mut out);
+        out
     }
 
     /// Like [`walk_paths`], but only closed paths that are **not filled** --

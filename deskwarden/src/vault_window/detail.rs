@@ -75,6 +75,11 @@ const HEADER_CONTROLS: usize = 4;
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
 const TITLE_GAP: f32 = 3.0;
+/// `font-size: 12px` on the subtitle under it. A constant rather than a
+/// literal since the folder mark split that line into two labels: two runs of
+/// one sentence set at two sizes is a slip nothing else would catch, and
+/// `theme::FOLDER_MARK_SIZE`'s height is measured against this number.
+const SUBTITLE_SIZE: f32 = 12.0;
 /// **The floor under the item title, and the thing the rest of the strip
 /// gives way to.** Not from the design: 2b draws this pane at one width and
 /// says nothing about what happens below it.
@@ -2216,10 +2221,30 @@ fn copy_shortcut_action(
 /// Pure, and separate from the closure that draws it, for this file's standing
 /// reason: a decision reachable only from inside an eframe closure is a
 /// decision that will not be tested.
-fn header_subtitle(kind: ItemKind, folder: Option<&str>) -> String {
+///
+/// **Returned SPLIT, at the point the folder mark goes**: everything up to and
+/// including the separator, then the folder's name when there is one.
+///
+/// The user, of `Card · Work`: *"For foldered items also show folder icon left
+/// to folder name in subtitle, otherwise not clear two words what they mean."*
+/// Two bare words with nothing saying which is the item's TYPE and which is
+/// where it lives -- and a line the design gives one row cannot say it in more
+/// words. `theme::folder_mark` says it in a mark instead, and a mark has to be
+/// painted BETWEEN two runs of text, which a single `String` could not express.
+///
+/// The split is what changed; the reading order is not. The pane paints these
+/// two runs adjacent with nothing between them but the mark, so the line still
+/// reads exactly `<kind> · <folder>` -- `the_header_paints_the_folder_beside_
+/// the_kind_under_the_item_name` reads it back off the rendered frame rather
+/// than trusting this sentence.
+///
+/// **`None` is the whole of the unfoldered case.** An item with no folder
+/// keeps the bare kind label and gains no mark: the mark introduces a folder
+/// name, and there is no name to introduce.
+fn header_subtitle_parts(kind: ItemKind, folder: Option<&str>) -> (String, Option<&str>) {
     match folder {
-        Some(name) => format!("{} · {name}", kind.label()),
-        None => kind.label(),
+        Some(name) => (format!("{} · ", kind.label()), Some(name)),
+        None => (kind.label(), None),
     }
 }
 
@@ -2571,11 +2596,39 @@ pub fn draw_detail_read(
                         title.wrap =
                             egui::text::TextWrapping::truncate_at_width(ui.available_width());
                         ui.label(title);
-                        ui.label(
-                            RichText::new(header_subtitle(kind, folder))
-                                .size(12.0)
-                                .color(theme::TEXT_FAINT),
-                        );
+                        // The subtitle, in the two runs [`header_subtitle_parts`]
+                        // splits it into with the folder mark painted between
+                        // them. An unfoldered item has no second run and no
+                        // mark, so this is one label again -- exactly what it
+                        // was before the mark existed.
+                        //
+                        // `item_spacing.x = 0`: the separator run already ends
+                        // in its own space and the mark's box carries 3px of
+                        // air on each side (`theme::FOLDER_MARK_SIZE`), so
+                        // egui's default 8pt between widgets would open two
+                        // gaps this line did not ask for and push the name
+                        // away from the mark that introduces it.
+                        let (lead, name) = header_subtitle_parts(kind, folder);
+                        let faint = |text: String| {
+                            RichText::new(text).size(SUBTITLE_SIZE).color(theme::TEXT_FAINT)
+                        };
+                        match name {
+                            None => {
+                                ui.label(faint(lead));
+                            }
+                            Some(name) => {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.label(faint(lead));
+                                    // TEXT_FAINT, the subtitle's own ink: the
+                                    // mark introduces this secondary text and
+                                    // must not be louder than the words it
+                                    // introduces.
+                                    theme::folder_mark(ui, theme::TEXT_FAINT);
+                                    ui.label(faint(name.to_string()));
+                                });
+                            }
+                        }
                     });
                 });
             };
@@ -4924,10 +4977,32 @@ fn half_tile(
                 value(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = CONTROL_GAP;
-                    // The chord first, so it ends up FURTHEST right -- the
-                    // control group packs right-to-left, and this is the same
-                    // ordering rule (and the same reason) [`copy_row`] states.
-                    shortcut_hint(ui, hint);
+                    // **No printed chord here, unlike every full-width row on
+                    // this pane.** `hint` is still read -- it is what names
+                    // the chord in this tile's tooltip, through
+                    // [`copy_row_tooltip`] below -- but the twelve monospace
+                    // characters are not painted on the line.
+                    //
+                    // The user, of the shared line: "Expires and Code on the
+                    // same line are too close". The gap between the two halves
+                    // grows with the pane now, but at the shipped 638pt width
+                    // it afforded only 12pt, and the reason was visible in the
+                    // rendered `detail_card.png`: `CTRL+SHIFT+E` was printed
+                    // between the expiry's value and the word `Code`. The
+                    // chord hints are the longest runs on this line, and this
+                    // line has the least room of any on the pane.
+                    //
+                    // **Only here.** A full-width row keeps its printed hint:
+                    // it has the room, and a printed chord is real
+                    // discoverability that a tooltip does not give a user who
+                    // never hovers. What the header controls did -- move the
+                    // chord into the tooltip -- is done here for the reason
+                    // they did it, on the one line that cannot afford it.
+                    //
+                    // The chords themselves are untouched: `copy_shortcut_action`
+                    // still answers CTRL+SHIFT+E and CTRL+SHIFT+C, and
+                    // `the_shared_lines_chords_still_copy_without_their_printed_hints`
+                    // is what stops this becoming a silent feature removal.
                     controls(ui);
                 });
             },
@@ -4967,9 +5042,10 @@ struct Half<'a> {
     /// the line for it to line up with.
     label_width: f32,
     hint: Option<CopyShortcut>,
-    /// Space kept clear inside the tile's RIGHT edge, which its contents --
-    /// the chord hint above all, since that is what packs furthest right --
-    /// stop short of.
+    /// Space kept clear inside the tile's RIGHT edge, which its contents
+    /// stop short of. On the left half that is the expiry's value, which is
+    /// what packs furthest right there now that the chord hint has moved into
+    /// the tooltip.
     ///
     /// Not the same thing as making the tile narrower. The tile is the hit
     /// area and the hover tint, and the shared line's promise -- pinned by
@@ -6005,28 +6081,44 @@ fn label_run_width(ui: &egui::Ui, label: &str) -> f32 {
 fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) -> Option<(f32, f32)> {
     let content = row_content_width(ui);
     let half = content / 2.0;
-    let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural + expiry_half_controls(ui);
-    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls(ui);
+    // Nothing to the expiry's right at all now that its chord hint is gone
+    // from this line -- see `half_tile`. The term is not zeroed, it is
+    // absent, so a chord hint added back here without being paid for in the
+    // fit would not compile past this line.
+    let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural;
+    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls();
     // **The left half's CONTENTS have to stop a gutter short of the
-    // midpoint.** The expiry's chord hint is right-aligned inside its half
-    // and the code's label is left-aligned inside its own, so halves whose
+    // midpoint.** The expiry's last run is right-aligned inside its half and
+    // the code's label is left-aligned inside its own, so halves whose
     // contents both ran to the midpoint put those two runs edge to edge and
-    // painted `CTRL+SHIFT+ECode` -- one word, on a line whose whole job is to
-    // read as two columns. The halves themselves still meet at the midpoint
+    // painted `04/23Code` -- one word, on a line whose whole job is to read as
+    // two columns. It used to paint `CTRL+SHIFT+ECode`, which is the same
+    // failure with a longer left run; the hint is gone from this line now (see
+    // [`half_tile`]) and the gutter is not. The halves themselves still meet at the midpoint
     // (they are hit areas, and the line has no dead pixels); only the room
     // the left one lays ink in is short of it, which is [`Half::trailing`].
     (left <= half - HALF_GUTTER && right <= content - half).then_some((half, content - half))
 }
 
-/// The clear space between the expiry's chord hint and the code's label --
+/// The clear space between the expiry's value and the code's label --
 /// [`CONTROL_GAP`], the gap this pane already puts between two adjacent
 /// controls, because that is what these two runs are next to each other.
 ///
+/// It was measured between the expiry's CHORD HINT and that label until the
+/// hint was dropped from this line into the tile's tooltip (see [`half_tile`]).
+/// The floor is unchanged; what changed is that the left half no longer pays
+/// for a chord, and the measured clear space at the shipped 638pt pane went
+/// from 12pt to 87pt.
+///
 /// **Not [`ROW_GAP`]**, which is the wider gap between a label and its value.
-/// The difference is not cosmetic: the fit test spends this out of the left
-/// half, and 16pt there is enough to push the shipped 638pt pane back onto
-/// two separate rows -- the shared line loses by about 4pt. The line the
-/// design asks for, with the two runs readably apart, is what 8pt buys.
+/// That difference used to be decisive: the fit test spends this out of the
+/// left half, and 16pt there was enough to push the shipped 638pt pane back
+/// onto two separate rows, the shared line losing by about 4pt. **It is no
+/// longer decisive, and the constant is left at 8 anyway** -- with the two
+/// chord hints off the line the 638pt pane has some 79pt of slack over this
+/// floor, so 16 would fit now. Widening it would buy nothing a reader can see:
+/// [`half_gutter`] already hands the line every pixel the pane affords, and
+/// this number is only what that may never fall below.
 ///
 /// Withheld from the LEFT half's contents by [`card_face_line_fits`] and by
 /// [`card_face_line`]'s `trailing`; the two have to agree, or a value the fit
@@ -6037,16 +6129,17 @@ fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) ->
 /// is only what it may never fall below. The distinction is the whole repair
 /// for "Expires and Code ... too close and when stretch -- only code does it":
 /// a gap that GROWS costs the shared line nothing, while a larger fixed one
-/// costs it entirely -- 16pt here pushes the shipped 638pt pane back onto two
-/// separate rows, losing by about 4pt.
+/// cost it entirely -- 16pt here pushed the shipped 638pt pane back onto two
+/// separate rows, losing by about 4pt, until the chord hints came off this
+/// line and gave it 79pt of slack.
 const HALF_GUTTER: f32 = CONTROL_GAP;
 
-/// **The clear space between the expiry's chord hint and the code's label, at
-/// this width.**
+/// **The clear space between the expiry's value and the code's label, at this
+/// width.**
 ///
 /// The user, of the shared line: "Expires and Code on the same line are too
 /// close and when stretch -- only code does it". Both halves grow with the
-/// pane, but the expiry's chord hint was right-aligned against the midpoint
+/// pane, but the expiry's last run was right-aligned against the midpoint
 /// from the left while the code's label sits against it from the right, so the
 /// only thing between the two runs was the fixed [`HALF_GUTTER`] -- 8pt at
 /// every width, at 298pt and at 1200pt alike. The code's *value* gained wrap
@@ -6065,27 +6158,28 @@ const HALF_GUTTER: f32 = CONTROL_GAP;
 /// line called safe wraps anyway.
 fn half_gutter(ui: &egui::Ui, expiry: &str, half: f32) -> f32 {
     let content =
-        ROW_LABEL_WIDTH + ROW_GAP + digits_width(ui, expiry) + expiry_half_controls(ui);
+        ROW_LABEL_WIDTH + ROW_GAP + digits_width(ui, expiry);
     (half - content).max(HALF_GUTTER)
 }
 
-/// What sits to the right of the expiry on the shared line: its chord hint,
-/// and the gap before it.
+/// What sits to the right of the security code on the shared line: its Reveal
+/// eye, and the gap before it.
 ///
 /// A function rather than a number at each site, because the width the fit
 /// test reserves and the width the paint subtracts have to be the same
 /// expression or the value wraps somewhere the line said it would not.
-fn expiry_half_controls(ui: &egui::Ui) -> f32 {
-    CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(CopyShortcut::CardExpiry))
-}
-
-/// The same for the security code: its Reveal eye, its chord hint, and the
-/// gaps. See [`expiry_half_controls`].
-fn code_half_controls(ui: &egui::Ui) -> f32 {
-    theme::EYE_TOGGLE_SIZE
-        + CONTROL_GAP
-        + chord_hint_width(ui, copy_shortcut_chord(CopyShortcut::CardCode))
-        + CONTROL_GAP
+///
+/// **It used to include a chord hint, and there is no `expiry_half_controls`
+/// beside it any more for the same reason**: the printed `CTRL+SHIFT+E` and
+/// `CTRL+SHIFT+C` are gone from this line, so the expiry half now owes
+/// nothing at all to its right and the code half owes only its eye. See
+/// [`half_tile`], where the removal is argued and scoped. The chords are
+/// unchanged; only the printed hints went, into the tiles' tooltips.
+///
+/// It no longer needs a `Ui`, which is the measurable trace of the change: the
+/// only thing here that had to be laid out to be measured was the chord.
+fn code_half_controls() -> f32 {
+    theme::EYE_TOGGLE_SIZE + CONTROL_GAP
 }
 
 /// `Expires 08/29        Code •••` -- **one line, two hit areas.**
@@ -6115,9 +6209,9 @@ fn card_face_line(
     // wraps at and the space its tile keeps clear, so the two cannot disagree.
     let left_gutter = half_gutter(ui, expiry, left_width);
     let left_room =
-        (left_width - left_gutter - ROW_LABEL_WIDTH - ROW_GAP - expiry_half_controls(ui)).max(1.0);
+        (left_width - left_gutter - ROW_LABEL_WIDTH - ROW_GAP).max(1.0);
     let right_room =
-        (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls(ui)).max(1.0);
+        (right_width - label_run_width(ui, CODE_LABEL) - ROW_GAP - code_half_controls()).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
@@ -7699,15 +7793,34 @@ mod tests {
     #[test]
     fn the_header_subtitle_carries_the_folder_after_the_kind_and_nothing_when_there_is_none() {
         for kind in EVERY_KIND {
+            // The two runs REJOINED, which is the reading order the design
+            // asks for and the thing splitting the line for the folder mark
+            // could quietly have broken: a lead that lost its separator, or a
+            // name put before the kind, reads wrong here and nowhere else in
+            // this pure test.
+            let (lead, name) = header_subtitle_parts(kind, Some("Engineering"));
             assert_eq!(
-                header_subtitle(kind, Some("Engineering")),
+                format!("{lead}{}", name.unwrap_or_default()),
                 format!("{} · Engineering", kind.label()),
                 "{kind:?} does not read as the design's `<kind> · <folder>`"
             );
+            // And the split is where the MARK goes -- after the separator,
+            // immediately before the name. A lead that swallowed the folder
+            // name would rejoin correctly above and leave the mark with
+            // nothing to introduce.
             assert_eq!(
-                header_subtitle(kind, None),
-                kind.label(),
-                "{kind:?} with no folder does not still name its kind"
+                name,
+                Some("Engineering"),
+                "{kind:?} does not hand the folder name back as its own run, so the \
+                 folder mark has nothing to sit in front of"
+            );
+
+            let (lead, name) = header_subtitle_parts(kind, None);
+            assert_eq!(lead, kind.label(), "{kind:?} with no folder does not still name its kind");
+            assert_eq!(
+                name, None,
+                "{kind:?} with no folder still offers a second run, so the unfoldered \
+                 header would draw a folder mark"
             );
         }
     }
@@ -7715,9 +7828,17 @@ mod tests {
     /// **And the header really paints it, on the title's own line-under.**
     ///
     /// The decision above is pure; this is the other half. It also holds the
-    /// shape: ONE run, so a folder painted as a second line under the kind --
+    /// shape: ONE LINE, so a folder painted as a second line under the kind --
     /// which is what "show Folder under the title" could equally have meant --
     /// fails here rather than shipping.
+    ///
+    /// **The line is two runs now, and that is exactly what has to be pinned
+    /// rather than assumed.** `theme::folder_mark` is painted between them, so
+    /// the subtitle can no longer be one galley; what makes it still one line
+    /// is that the two runs share a baseline and sit adjacent in reading
+    /// order, which is what the geometry below asks. A "· " lead that had
+    /// wrapped its name onto a row of its own would satisfy every string
+    /// assertion here and fail the baseline one.
     ///
     /// An item whose `folder_id` names a folder that is not in the list never
     /// reaches this function with a name at all: `sidebar::folder_name`
@@ -7729,33 +7850,190 @@ mod tests {
         let mut pane = Pane::new().in_folder("Engineering");
         let frame = pane.idle(&a_login(), &TotpState::NoSecret);
 
-        assert!(
-            frame.painted("Login · Engineering"),
-            "the header painted no `<kind> · <folder>` subtitle; it painted: {:?}",
-            frame.strings()
-        );
-        // Neither half on its own: a bare "Login" beside the combined line
-        // would be the old subtitle still there, and a bare "Engineering"
-        // would be the second line the design does not draw.
-        for stray in ["Login", "Engineering"] {
+        for run in ["Login · ", "Engineering"] {
             assert!(
-                !frame.strings().iter().any(|t| *t == stray),
-                "the header painted {stray:?} as a run of its own, so the subtitle is \
-                 not the design's single line; it painted: {:?}",
+                frame.painted(run),
+                "the header painted no {run:?} run of its subtitle; it painted: {:?}",
                 frame.strings()
             );
         }
+        // Not a bare "Login": that would be the kind's own run having lost the
+        // separator, which is the folder line broken back into two unrelated
+        // words -- the very complaint this pane's mark exists to answer.
+        assert!(
+            !frame.strings().iter().any(|t| *t == "Login"),
+            "the header painted a bare \"Login\" run, so the subtitle's separator is \
+             gone; it painted: {:?}",
+            frame.strings()
+        );
 
         let title = frame.rect_of("Sample");
-        let subtitle = frame.rect_of("Login · Engineering");
+        let kind = frame.rect_of("Login · ");
+        let folder = frame.rect_of("Engineering");
         assert!(
-            (subtitle.left() - title.left()).abs() < 0.5,
-            "the subtitle at {subtitle:?} does not share the title's column ({title:?})"
+            (kind.left() - title.left()).abs() < 0.5,
+            "the subtitle at {kind:?} does not share the title's column ({title:?})"
         );
         assert!(
-            subtitle.top() > title.top(),
-            "the subtitle at {subtitle:?} is not UNDER the title at {title:?}"
+            kind.top() > title.top(),
+            "the subtitle at {kind:?} is not UNDER the title at {title:?}"
         );
+        // ONE LINE: the folder's run sits to the RIGHT of the kind's, on the
+        // same baseline, not under it.
+        assert!(
+            folder.left() > kind.right(),
+            "the folder run at {folder:?} is not to the right of the kind run at \
+             {kind:?}, so the subtitle is not one line"
+        );
+        assert!(
+            (folder.bottom() - kind.bottom()).abs() < 1.0,
+            "the folder run at {folder:?} does not share the kind run's baseline \
+             ({kind:?}), so the subtitle wrapped onto two lines"
+        );
+    }
+
+    /// Every folder mark in a frame, as its outline's box and the colour it
+    /// was stroked in. See `theme::icon_probe::folder_marks`.
+    fn folder_marks(frame: &Frame) -> Vec<(egui::Rect, egui::Color32)> {
+        theme::icon_probe::folder_marks(&frame.shapes)
+    }
+
+    /// **The folder mark, between the separator and the name it introduces.**
+    ///
+    /// The user: *"For foldered items also show folder icon left to folder
+    /// name in subtitle, otherwise not clear two words what they mean."* So
+    /// the mark's position is the requirement, not merely its presence -- a
+    /// mark at the far end of the line, or before the kind, would be painted
+    /// and would answer nothing.
+    ///
+    /// **Drawn, not typed**, which is why this is asked of the shape stream at
+    /// all: the mark paints no string, so no text assertion in this file can
+    /// see it. `theme::the_folder_codepoints_are_not_carried_by_this_apps_own_
+    /// typeface` is the measurement behind that choice -- 📁, 📂 and 🗀 all
+    /// come back absent from the real font stack, so as text this would be a
+    /// tofu box in every foldered item's header.
+    #[test]
+    fn the_folder_mark_sits_between_the_separator_and_the_folder_name() {
+        let mut pane = Pane::new().in_folder("Engineering");
+        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+
+        let marks = folder_marks(&frame);
+        assert_eq!(
+            marks.len(),
+            1,
+            "expected exactly one folder mark in a foldered item's header, found {}",
+            marks.len()
+        );
+        let (mark, color) = marks[0];
+        // `rect_of`, not `ink_of`: both runs are laid out LEFT to right, which
+        // is the case `rect_of` reports exactly -- its documented inaccuracy
+        // is the `halign: Max` of a right-to-left control line, and neither of
+        // these is on one. It is also the only one of the two that can be
+        // compared with a painted shape's box vertically.
+        let kind = frame.rect_of("Login · ");
+        let folder = frame.rect_of("Engineering");
+        assert!(
+            mark.left() >= kind.right() - 1.0 && mark.right() <= folder.left() + 1.0,
+            "the folder mark at {mark:?} is not between the separator ({kind:?}) and the \
+             folder name ({folder:?})"
+        );
+        // Vertically ON the line, not floating above or below it: the mark's
+        // box is the subtitle's line height, so its centre is the run's.
+        assert!(
+            (mark.center().y - folder.center().y).abs() < 3.0,
+            "the folder mark at {mark:?} is not on the folder name's line ({folder:?})"
+        );
+        // **The subtitle's own ink, not louder.** This is the assertion that
+        // is easiest to write blind -- the mark paints no fill and no string,
+        // so `TEXT_FAINT` is visible to a test only through the stroke colour
+        // `icon_probe::folder_marks` reports. The negative half is the proof
+        // the positive one can see anything: INK is what the mark would be
+        // stroked in if it had been given the title's colour by mistake, and
+        // the two are different values.
+        assert_eq!(
+            color,
+            theme::TEXT_FAINT,
+            "the folder mark is stroked in {color:?}, not the subtitle's own TEXT_FAINT"
+        );
+        assert_ne!(
+            theme::TEXT_FAINT,
+            theme::INK,
+            "TEXT_FAINT and INK are the same colour, so the assertion above could not \
+             have failed for a mark painted in the title's ink"
+        );
+    }
+
+    /// **And an item with no folder gets no mark at all.**
+    ///
+    /// The other half of the one above, and the half that would rot silently:
+    /// a mark painted unconditionally sits after a bare `Login` introducing
+    /// nothing, and every assertion in the test above still passes.
+    ///
+    /// The positive control is the foldered frame right beside it, so a probe
+    /// that had stopped finding this mark entirely cannot pass this test by
+    /// finding nothing.
+    #[test]
+    fn an_unfoldered_item_paints_no_folder_mark() {
+        let unfoldered = folder_marks(&Pane::new().idle(&a_login(), &TotpState::NoSecret));
+        assert!(
+            unfoldered.is_empty(),
+            "an item with no folder painted {} folder mark(s) at {unfoldered:?}",
+            unfoldered.len()
+        );
+        let foldered =
+            folder_marks(&Pane::new().in_folder("Engineering").idle(&a_login(), &TotpState::NoSecret));
+        assert_eq!(
+            foldered.len(),
+            1,
+            "the foldered control painted {} marks, so the emptiness above is about the \
+             probe rather than about the folder",
+            foldered.len()
+        );
+    }
+
+    /// **`FOLDER_VERTICES` really is unique in a rendered header.**
+    ///
+    /// `icon_probe::folder_marks` matches a six-point unfilled closed path and
+    /// nothing else. That is a claim about the whole crate's painting, made in
+    /// `theme.rs`'s doc, and this is what holds it: a frame of the real detail
+    /// pane paints the star, the envelope and its flap, the kebab, the pane
+    /// close, the eyes -- every drawn mark this app has -- and exactly one of
+    /// the paths in it has six points.
+    ///
+    /// Asked over the UNFOLDERED frame as well, which is where a collision
+    /// would actually show: `an_unfoldered_item_paints_no_folder_mark` asserts
+    /// emptiness there, and a second six-point path from some other control
+    /// would make that test fail for a reason nobody would guess from its
+    /// name.
+    #[test]
+    fn the_folder_mark_is_the_only_six_point_path_in_the_header() {
+        fn six_point_paths(shape: &egui::Shape, out: &mut usize) {
+            match shape {
+                egui::Shape::Path(p) if p.points.len() == theme::FOLDER_VERTICES => *out += 1,
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        six_point_paths(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (folder, want) in [(None, 0), (Some("Engineering"), 1)] {
+            let mut pane = Pane::new();
+            if let Some(name) = folder {
+                pane = pane.in_folder(name);
+            }
+            let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+            let mut found = 0;
+            six_point_paths(&frame.shapes, &mut found);
+            assert_eq!(
+                found, want,
+                "a frame with folder {folder:?} paints {found} six-point path(s), not \
+                 {want} -- `theme::FOLDER_VERTICES` is no longer a point count only the \
+                 folder mark uses, so `icon_probe::folder_marks` reports marks that are \
+                 not folders"
+            );
+        }
     }
 
     /// An AUTOFILL TARGETS card on a non-login would advertise a capability
@@ -12847,13 +13125,23 @@ mod tests {
     /// row labels are the positive control: "no CTRL+SHIFT+C anywhere" is also
     /// true of a pane that failed to draw the card at all.
     ///
-    /// SEE ALSO [`the_expiry_chord_never_runs_into_the_code_label`], which
-    /// asks the question this one cannot: not whether the chord is painted
-    /// but WHERE.
+    /// **The two full-width rows still PRINT theirs; the shared line's two do
+    /// not.** That split is the change and not an inconsistency left lying
+    /// about: a printed chord is discoverability a tooltip cannot give a user
+    /// who never hovers, so it is kept everywhere there is room for it and
+    /// dropped on the one line there is not -- see [`half_tile`]. What the
+    /// rule really is, and what this test now asserts, is that every chord is
+    /// NAMED somewhere the row itself offers.
+    ///
+    /// SEE ALSO [`the_expiry_never_runs_into_the_code_label`], which asks the
+    /// question this one cannot: not whether the chord is named but where the
+    /// left half's ink stops.
     #[test]
-    fn every_card_chord_is_painted_beside_its_row() {
+    fn every_card_chord_is_named_on_the_row_it_belongs_to() {
+        let item = a_full_card();
+        let totp = TotpState::NoSecret;
         let mut pane = Pane::new();
-        let frame = pane.idle(&a_full_card(), &TotpState::NoSecret);
+        let frame = pane.idle(&item, &totp);
         for label in [NUMBER_LABEL, EXPIRY_LABEL, CODE_LABEL, CARDHOLDER_LABEL] {
             assert!(
                 frame.painted(label),
@@ -12862,36 +13150,119 @@ mod tests {
                 frame.strings()
             );
         }
-        for which in [
-            CopyShortcut::CardNumber,
-            CopyShortcut::CardExpiry,
-            CopyShortcut::CardCode,
-            CopyShortcut::Cardholder,
-        ] {
+        // The full-width rows: printed on the line, as before.
+        for which in [CopyShortcut::CardNumber, CopyShortcut::Cardholder] {
             let chord = copy_shortcut_chord(which);
             assert!(
                 frame.painted(chord),
-                "{which:?}'s {chord} hint is not painted beside its row; the pane \
+                "{which:?}'s {chord} hint is not painted beside its full-width row; the \
+                 pane painted: {:?}",
+                frame.strings()
+            );
+        }
+        // The shared line's two: NOT printed, and named in the tile's own
+        // tooltip. Both halves asserted, because either alone is satisfied by
+        // a mistake -- a chord still printed passes the tooltip check, and a
+        // chord dropped from the tooltip too passes the absence check.
+        for (which, label) in
+            [(CopyShortcut::CardExpiry, EXPIRY_LABEL), (CopyShortcut::CardCode, CODE_LABEL)]
+        {
+            let chord = copy_shortcut_chord(which);
+            assert!(
+                !frame.painted(chord),
+                "{which:?}'s {chord} hint is printed on the shared line again; the pane \
                  painted: {:?}",
                 frame.strings()
+            );
+            let mut pane = Pane::new();
+            let tile = pane.idle(&item, &totp).rect_of(label);
+            let hovered = pane.hover_settled(&item, &totp, tile.center());
+            let want = copy_row_tooltip(Some(which));
+            assert!(
+                hovered.painted(&want),
+                "hovering the {label:?} half painted no {want:?}, so {chord} is now named \
+                 nowhere at all; it painted: {:?}",
+                hovered.strings()
             );
         }
     }
 
-    /// **The expiry's chord badge stays inside the expiry's half.**
+    /// **The chords the shared line stopped printing still copy.**
+    ///
+    /// This is what keeps the change above from being a silent feature
+    /// removal. Only the printed hint moved into the tooltip; the key handling
+    /// is untouched, and a `COPY_SHORTCUTS` entry quietly dropped alongside
+    /// the hint would leave every other test on this pane green.
+    ///
+    /// Driven through the pane's own frame rather than through
+    /// [`copy_shortcut_action`], because the pure function is exactly the
+    /// layer a removal would not have touched: the question is whether a real
+    /// keypress on a real rendered card still reaches the clipboard action.
+    ///
+    /// The negative control is the login beside it: the same two chords report
+    /// nothing on an item with no card, so "the action came back" is about the
+    /// binding and not about a pane that answers everything.
+    #[test]
+    fn the_shared_lines_chords_still_copy_without_their_printed_hints() {
+        let card = a_full_card();
+        for (which, key, want) in [
+            (
+                CopyShortcut::CardExpiry,
+                egui::Key::E,
+                DetailAction::CopyValue("04/23".to_string()),
+            ),
+            (CopyShortcut::CardCode, egui::Key::C, DetailAction::CopyCardCode),
+        ] {
+            let chord = copy_shortcut_chord(which);
+            let mut pane = Pane::new();
+            let frame = pane.idle(&card, &TotpState::NoSecret);
+            // The premise: the hint really is off the line, so this is not a
+            // test of a chord that is still advertised anyway.
+            assert!(
+                !frame.painted(chord),
+                "{chord} is still printed on the shared line, so this test is not about \
+                 an unadvertised chord at all"
+            );
+            assert_eq!(
+                pane.frame(&card, &TotpState::NoSecret, ctrl_shift(key)).action,
+                want,
+                "{chord} no longer copies the card's {which:?} -- the printed hint was \
+                 meant to move into the tooltip, not to take the binding with it"
+            );
+            let login = a_login();
+            let mut pane = Pane::new();
+            let _ = pane.idle(&login, &TotpState::NoSecret);
+            assert_eq!(
+                pane.frame(&login, &TotpState::NoSecret, ctrl_shift(key)).action,
+                DetailAction::None,
+                "{chord} answers on an item with no card too, so the copy above is not \
+                 evidence the binding survived"
+            );
+        }
+    }
+
+    /// **The expiry's ink stays inside the expiry's half.**
     ///
     /// The shared expiry/code line splits the row in two and right-aligns
     /// each half's controls. With the two halves meeting exactly at the
     /// midpoint, the expiry's `CTRL+SHIFT+E` ended on the very pixel the
     /// `Code` label began on and the line rendered as `CTRL+SHIFT+ECode` --
     /// on the shipped 638pt pane, in the app, for as long as the expiry had
-    /// a chord of its own.
+    /// a chord printed on this line.
     ///
-    /// Nothing already here could see it. `every_card_chord_is_painted_beside
-    /// _its_row` asks only whether the chord was painted, the digit-row and
-    /// baseline tests ask about the VALUES, and no test asked where the chord
-    /// sat relative to its neighbour. So this one asserts the geometry, and
-    /// asserts it on the ink rather than on `rect_of` -- see
+    /// **The chord is gone from the line now (see [`half_tile`]) and this test
+    /// is not.** What it guards is the geometry of the seam, and the seam did
+    /// not go anywhere: the left half's LAST INK still packs toward the
+    /// midpoint and the code's label still sits against it from the other
+    /// side. Only the identity of that last ink changed -- it is the expiry's
+    /// value now -- so that is what is measured. Deleting this along with the
+    /// chord would have retired the one test that ever saw the collision, in
+    /// the same commit that moved the run it was watching.
+    ///
+    /// Nothing else here could see it. `every_card_chord_is_named_on_the_row_
+    /// it_belongs_to` asks only whether the chord is named, and the digit-row
+    /// and baseline tests ask about the values' typography rather than about
+    /// where they stop. Asserted on the ink rather than on `rect_of` -- see
     /// [`Frame::ink_of`], without which the halign of a right-aligned run
     /// makes the answer meaningless.
     ///
@@ -12899,7 +13270,7 @@ mod tests {
     /// through the shipped one and beyond: the fit test is a width decision,
     /// and a gutter that only appears on wide panes is not a fix.
     #[test]
-    fn the_expiry_chord_never_runs_into_the_code_label() {
+    fn the_expiry_never_runs_into_the_code_label() {
         let expiry_chord = copy_shortcut_chord(CopyShortcut::CardExpiry);
         // The pane at the shipped window's width (1240 - 212 - 390) among
         // them, which is the width the defect was seen at.
@@ -12918,30 +13289,43 @@ mod tests {
                 continue;
             }
             shared_somewhere = true;
-            let chord = frame.ink_of(expiry_chord);
+            // The premise, and asked only INSIDE this branch: the chord is
+            // dropped from the SHARED LINE and nowhere else. Below the fit
+            // width the expiry and the code fall back to two full-width rows,
+            // and those keep their printed hints -- they have the room, which
+            // is the whole reason the removal is scoped to this line. A
+            // printed hint back on the shared line would slide between the two
+            // columns and the assertions below would go on measuring the value
+            // in front of it.
             assert!(
-                chord.right() < code.left(),
-                "on a {width}pt pane the expiry's {expiry_chord} badge is painted at \
-                 {chord:?}, into the {CODE_LABEL:?} label at {code:?} -- the line \
-                 reads as one word"
+                !frame.painted(expiry_chord),
+                "on a {width}pt pane the shared line prints {expiry_chord} again, so this \
+                 test is measuring the wrong run"
+            );
+            // `a_full_card`'s expiry, which is the left half's last ink now.
+            let value = frame.ink_of("04/23");
+            assert!(
+                value.right() < code.left(),
+                "on a {width}pt pane the expiry's value is painted at {value:?}, into the \
+                 {CODE_LABEL:?} label at {code:?} -- the line reads as one word"
             );
             // Not merely a hair clear of it: two runs a fraction of a point
             // apart still read as one word, which is the defect. The gutter
             // the halves reserve is what has to be there.
             assert!(
-                code.left() - chord.right() >= HALF_GUTTER / 2.0,
-                "on a {width}pt pane only {}pt separate the expiry's {expiry_chord} badge \
-                 at {chord:?} from the {CODE_LABEL:?} label at {code:?}",
-                code.left() - chord.right()
+                code.left() - value.right() >= HALF_GUTTER / 2.0,
+                "on a {width}pt pane only {}pt separate the expiry's value at {value:?} \
+                 from the {CODE_LABEL:?} label at {code:?}",
+                code.left() - value.right()
             );
-            // The badge belongs to the expiry, so it must also be on the
+            // The value belongs to the expiry, so it must also be on the
             // expiry's side of the line rather than merely short of the
             // code's -- otherwise a gutter wide enough to pass the check
-            // above could still have moved the badge into no man's land.
+            // above could still have moved it into no man's land.
             assert!(
-                chord.left() > expiry.right(),
-                "on a {width}pt pane the {expiry_chord} badge at {chord:?} is not to the \
-                 right of its own {EXPIRY_LABEL:?} label at {expiry:?}"
+                value.left() > expiry.right(),
+                "on a {width}pt pane the expiry's value at {value:?} is not to the right \
+                 of its own {EXPIRY_LABEL:?} label at {expiry:?}"
             );
         }
         assert!(
@@ -14495,16 +14879,37 @@ mod tests {
     /// -- from the right edge of the last ink in the left half to the left
     /// edge of the code's label.
     ///
-    /// **Ink, not rects.** The expiry's chord hint is laid out `right_to_left`
-    /// and so its `rect_of` box sits its own width off to the right of its
-    /// glyphs; see [`Frame::ink_of`], which is why the gap this measures is a
-    /// gap a reader would actually see rather than one only egui knows about.
+    /// **Measured from the expiry's VALUE, which is the left half's last ink
+    /// now.** It was measured from the expiry's printed `CTRL+SHIFT+E` until
+    /// that hint was dropped from this line into the tile's tooltip; the run
+    /// it starts at moved, and what it means -- the clear space a reader sees
+    /// between the two columns -- did not. Re-pinned rather than deleted,
+    /// because the derivative it feeds
+    /// (`the_shared_lines_two_columns_move_apart_as_the_pane_widens`) is the
+    /// live guard on the report that produced this line's gutter at all.
+    ///
+    /// **Ink, not rects.** See [`Frame::ink_of`]: the ink is the gap a reader
+    /// would actually see rather than one only egui knows about.
     fn shared_line_gap(width: f32) -> f32 {
         let item = a_full_card();
         let mut pane = Pane::wide(width);
         let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let chord = laid_out.ink_of(copy_shortcut_chord(CopyShortcut::CardExpiry));
+        // The expiry's own digits -- `a_full_card`'s `04/23`. Nothing is
+        // painted to their right on this half any more.
+        let chord = laid_out.ink_of("04/23");
         let code_label = laid_out.ink_of(CODE_LABEL);
+        // The removal this measurement exists to report is not silently
+        // undone: a printed hint back on this line would put ink between these
+        // two runs again, and the gap below would shrink by its width without
+        // anything here saying why.
+        assert!(
+            !laid_out
+                .strings()
+                .contains(&copy_shortcut_chord(CopyShortcut::CardExpiry)),
+            "the shared line prints {:?} again, so this gap is measured from the wrong run; painted: {:?}",
+            copy_shortcut_chord(CopyShortcut::CardExpiry),
+            laid_out.strings()
+        );
         // **The two runs are on ONE line, or this measures nothing.** The
         // expiry and the code fall back to separate rows when they do not fit
         // (`card_face_line_fits` returning `None` is a real answer), and a
@@ -14512,7 +14917,7 @@ mod tests {
         // no meaning. Asserted rather than assumed, because the widths this is
         // called at are exactly the widths where the fallback lives.
         //
-        // The tolerance is half a row band, not a pixel: the chord hint and
+        // The tolerance is half a row band, not a pixel: the digits and
         // the label are different faces at different sizes, so their ink
         // centres sit about 2pt apart even when they share a line. Anything
         // that fell back to separate rows is a whole [`ROW_CONTENT_HEIGHT`]
@@ -14525,8 +14930,8 @@ mod tests {
         );
         assert!(
             code_label.left() > chord.right(),
-            "the expiry's chord and the code's label overlap at {width}pt: \
-             chord ends at {}, label starts at {}",
+            "the expiry's value and the code's label overlap at {width}pt: \
+             value ends at {}, label starts at {}",
             chord.right(),
             code_label.left()
         );
