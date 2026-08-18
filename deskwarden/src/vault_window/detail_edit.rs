@@ -5,6 +5,7 @@
 
 use crate::app_identity::{self, AppIdentityCache};
 use crate::app_match::{AppMatch, TriggerMode};
+use crate::card_brand::{brand_for_number, CARD_BRANDS};
 use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
 use crate::theme;
 use crate::vault_bridge::{
@@ -42,6 +43,134 @@ pub struct CardDraft {
     /// sharing one, so revealing the number cannot reveal the security code.
     pub reveal_number: bool,
     pub reveal_code: bool,
+    /// Whether the brand on this draft is the user's own choice rather than
+    /// something this form suggested.
+    ///
+    /// **The same mechanism as [`AppMatchDraft::template_touched`]**, and
+    /// deliberately not a second one: a form with two different notions of
+    /// "the user has been here" is a form where the two disagree.
+    ///
+    /// The rule it gates is *suggest only while untouched*. Without it the
+    /// sequence "type a number -> we set Visa -> the user corrects it to
+    /// Mastercard -> the user fixes a typo in the number -> we silently
+    /// restore Visa" is the default behaviour, which is data loss wearing a
+    /// convenience costume.
+    ///
+    /// **Private, with [`Self::pick_brand`] the only way to set it**, for the
+    /// reason [`EditDraft::opened_digest`] is private: a caller that could
+    /// assign it could declare the user's choice to be a guess, or a guess to
+    /// be the user's choice, and either way the guarantee is gone.
+    ///
+    /// [`EditDraft::from_item`] sets it for a card that arrived carrying a
+    /// brand. An inherited brand was chosen by somebody -- in this app, in
+    /// another Bitwarden client, or by the bank's own import -- and
+    /// overwriting it because the user retyped a digit is the same data loss
+    /// one step earlier.
+    brand_touched: bool,
+    /// The bank whose icon represents this card, as a domain --
+    /// `favicon::BANK_DOMAIN_FIELD` on the item.
+    ///
+    /// Item-level on the wire (it is a custom field, and a custom field
+    /// belongs to no type object) but drafted **here**, beside the card's own
+    /// fields, because that is where the form draws it and where it means
+    /// anything: `favicon::icon_domain_for` reads it only for a card.
+    ///
+    /// **Set through [`Self::bank_choices`], never typed.** A typo produces a
+    /// silent fetch failure and an unexplained blank tile, with nothing on
+    /// screen to explain why -- so no widget in this form writes this string
+    /// except [`Self::choose_bank`] and the Clear button beside it.
+    pub bank_domain: String,
+    /// The card's billing postcode -- `vault_bridge::BILLING_ZIP_FIELD` on
+    /// the item.
+    ///
+    /// An online card form usually wants three things: the number, the
+    /// security code and the billing postcode, and the postcode was the one
+    /// the vault had nowhere to put. Free text, unlike
+    /// [`Self::bank_domain`]: a postcode has no closed set to pick from, and
+    /// a wrong one fails in front of the user on the payment form rather than
+    /// silently here.
+    pub billing_zip: String,
+    /// The bank picker is open. View state, exactly like
+    /// [`AppMatchDraft::picking`], and excluded from
+    /// [`EditDraft::content_digest`] for the same reason.
+    pub bank_picking: bool,
+    /// The picker's search box. View state, like
+    /// [`AppMatchDraft::window_filter`].
+    pub bank_filter: String,
+    /// The domains the picker offers: every domain the vault's own items
+    /// already resolve to, supplied by [`EditDraft::offer_bank_domains`].
+    ///
+    /// **The vault's own logins, not a shipped list of banks.** A shipped
+    /// list is modelled from memory, is locale-bound, and cannot name a
+    /// user's credit union -- at which point the field becomes unsettable,
+    /// which is worse than free text rather than better. The domains the user
+    /// already has logins for are exactly the institutions they bank with,
+    /// they are already on this machine, and choosing one cannot be a typo.
+    ///
+    /// View state: it is a copy of something the vault window already holds,
+    /// it is not saved, and a form that became dirty because a list was
+    /// filled in behind it would ask about a change that is not one.
+    pub bank_choices: Vec<String>,
+}
+
+impl CardDraft {
+    /// Records the bank the user picked. **The only writer of
+    /// [`Self::bank_domain`] other than the Clear button**, and it closes the
+    /// picker, the way [`AppMatchDraft::choose_window`] does.
+    pub fn choose_bank(&mut self, domain: &str) {
+        self.bank_domain.clear();
+        self.bank_domain.push_str(domain);
+        self.bank_picking = false;
+    }
+
+    /// Forgets the bank. A separate, named act rather than "pick the empty
+    /// string", so the picker has nothing blank in it to click by accident.
+    pub fn clear_bank(&mut self) {
+        self.bank_domain.clear();
+        self.bank_picking = false;
+    }
+
+    /// Replaces the number, then re-runs the brand suggestion.
+    ///
+    /// The old buffer is [`zeroize::Zeroize`]d rather than dropped: a
+    /// reassigned `String` hands its bytes back to the allocator exactly as
+    /// it received them, and these are card digits.
+    pub fn set_number(&mut self, number: &str) {
+        use zeroize::Zeroize as _;
+        self.number.zeroize();
+        self.number.push_str(number);
+        self.suggest_brand();
+    }
+
+    /// Records the user's own choice of brand. **The only way to set
+    /// [`Self::brand_touched`]**, which is what makes the choice permanent.
+    pub fn pick_brand(&mut self, brand: &str) {
+        self.brand.clear();
+        self.brand.push_str(brand);
+        self.brand_touched = true;
+    }
+
+    /// Fills the brand in from the number, if the user has not already
+    /// answered that question.
+    ///
+    /// Idempotent and cheap, so the form may call it every frame rather than
+    /// having to detect that the number box changed -- detecting that would
+    /// mean keeping a second copy of the number to compare against, which is
+    /// a second plaintext copy of a card number for the sake of an `if`.
+    ///
+    /// **An unrecognised prefix leaves the field alone rather than clearing
+    /// it.** A partially typed number passes through prefixes matching
+    /// nothing, and a brand that flickers empty while the user types reads as
+    /// broken.
+    pub fn suggest_brand(&mut self) {
+        if self.brand_touched {
+            return;
+        }
+        if let Some(brand) = brand_for_number(&self.number) {
+            self.brand.clear();
+            self.brand.push_str(brand.canonical());
+        }
+    }
 }
 
 /// The identity-specific half of a draft (`type: 4`). One `String` per
@@ -1148,15 +1277,49 @@ impl EditDraft {
             reveal_password: false,
             totp: drafted(login.and_then(|l| l.totp.as_deref()).map(|t| t.as_str())),
             reveal_totp: false,
-            card: CardDraft {
-                cardholder_name: drafted(card.and_then(|c| c.cardholder_name.as_deref())),
-                brand: drafted(card.and_then(|c| c.brand.as_deref())),
-                number: drafted(card.and_then(|c| c.number.as_deref()).map(|n| n.as_str())),
-                exp_month: drafted(card.and_then(|c| c.exp_month.as_deref())),
-                exp_year: drafted(card.and_then(|c| c.exp_year.as_deref())),
-                code: drafted(card.and_then(|c| c.code.as_deref()).map(|c| c.as_str())),
-                reveal_number: false,
-                reveal_code: false,
+            card: {
+                let brand = drafted(card.and_then(|c| c.brand.as_deref()));
+                CardDraft {
+                    cardholder_name: drafted(card.and_then(|c| c.cardholder_name.as_deref())),
+                    // An inherited brand counts as already chosen -- see
+                    // `CardDraft::brand_touched`. Computed from the string
+                    // itself rather than passed in, so there is one rule.
+                    brand_touched: !brand.trim().is_empty(),
+                    brand,
+                    number: drafted(card.and_then(|c| c.number.as_deref()).map(|n| n.as_str())),
+                    exp_month: drafted(card.and_then(|c| c.exp_month.as_deref())),
+                    exp_year: drafted(card.and_then(|c| c.exp_year.as_deref())),
+                    code: drafted(card.and_then(|c| c.code.as_deref()).map(|c| c.as_str())),
+                    reveal_number: false,
+                    reveal_code: false,
+                    // Read through the SAME reader the icon loader uses, so
+                    // the form and the tile can never disagree about which
+                    // domain this card's icon comes from. `icon_domain_for`
+                    // already trims and rejects blanks.
+                    // Gated on the kind because `icon_domain_for` answers for
+                    // a LOGIN too, with that login's URI -- and a login's
+                    // website is not a bank the user chose for a card. An
+                    // `==` rather than a `match`, so this stays one question
+                    // about one kind rather than an arm per variant that
+                    // `ItemKind`'s own doc would then require to be listed.
+                    bank_domain: if ItemKind::of(item) == ItemKind::Card {
+                        crate::favicon::icon_domain_for(item).unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    billing_zip: item
+                        .fields
+                        .iter()
+                        .find(|f| {
+                            f.name.as_deref() == Some(crate::vault_bridge::BILLING_ZIP_FIELD)
+                        })
+                        .and_then(|f| f.value.as_deref())
+                        .map(|v| v.trim().to_string())
+                        .unwrap_or_default(),
+                    bank_picking: false,
+                    bank_filter: String::new(),
+                    bank_choices: Vec::new(),
+                }
             },
             identity: IdentityDraft {
                 title: drafted(identity.and_then(|i| i.title.as_deref())),
@@ -1455,6 +1618,27 @@ impl EditDraft {
             code,
             reveal_number: _,
             reveal_code: _,
+            // Not content: `brand` above IS the content, and whether the
+            // string got there by a suggestion or by a click is a fact about
+            // how the form behaves from here on rather than about the item.
+            // A draft that became dirty by the user opening the brand
+            // dropdown and picking what was already showing would be a form
+            // asking about a change that is not one.
+            brand_touched: _,
+            // Content, both of them: a bank the user picked and a postcode
+            // they typed are things about the ITEM, they are written back on
+            // Save, and losing them to a Cancel that asked nothing is the
+            // failure the confirmation exists to prevent.
+            bank_domain,
+            billing_zip,
+            // ...and view state, all three: an open picker, what is typed in
+            // its search box, and a list of candidates copied out of the
+            // vault window are things the user does TO THE FORM. A draft that
+            // became dirty because a picker was opened, or because a list was
+            // filled in behind it, could never say "nothing to lose".
+            bank_picking: _,
+            bank_filter: _,
+            bank_choices: _,
         } = card;
         let SshKeyDraft { private_key, public_key, key_fingerprint, reveal_private_key: _ } =
             ssh_key;
@@ -1466,7 +1650,8 @@ impl EditDraft {
             sketch,
             "{kind:?}\u{0}{name}\u{0}{folder_id:?}\u{0}{username}\u{0}{password}\u{0}{totp}\u{0}\
              {cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
-             {code}\u{0}{private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}\
+             {code}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}\
+             {private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}\
              {identity:?}\u{0}{note_body}\u{0}{generator:?}\u{0}"
         );
         match app {
@@ -1656,7 +1841,70 @@ impl EditDraft {
         // own fields where the user put them.
         updated.fields = self.fields.iter().map(FieldDraft::to_field).collect();
 
+        let updated = self.apply_card_fields_to(updated);
         self.apply_app_match_to(item, updated)
+    }
+
+    /// The card's two namespaced custom fields -- the bank domain and the
+    /// billing postcode -- written back into `updated`.
+    ///
+    /// **After the fields walk above, never instead of it.** The walk carries
+    /// these two elements through in the item's own order along with
+    /// everything else; this then replaces the value of each *in place*, so
+    /// the user's fields keep their slots and the server's extra keys on ours
+    /// survive. Both writes go through
+    /// [`crate::vault_bridge::with_card_field`], which is the one producer of
+    /// them -- a `fields.push` here would be a second one and would drop
+    /// those keys on the next write, exactly as `with_app_match`'s doc
+    /// describes.
+    ///
+    /// **Only for a card**, unlike [`Self::apply_app_match_to`]: an app
+    /// binding is meaningful on an item of any type, and a bank icon and a
+    /// billing postcode are not. `from_item` leaves both blank on every other
+    /// kind, so writing them regardless would be harmless today and would
+    /// silently start clearing a field the day something else set one.
+    fn apply_card_fields_to(&self, updated: VaultItem) -> VaultItem {
+        if self.kind != ItemKind::Card {
+            return updated;
+        }
+        let updated = crate::vault_bridge::with_card_field(
+            &updated,
+            crate::favicon::BANK_DOMAIN_FIELD,
+            &self.card.bank_domain,
+        );
+        crate::vault_bridge::with_card_field(
+            &updated,
+            crate::vault_bridge::BILLING_ZIP_FIELD,
+            &self.card.billing_zip,
+        )
+    }
+
+    /// Hands the bank picker the domains it may offer: every domain the
+    /// vault's own items already resolve to, through the same
+    /// `favicon::icon_domain_for` the icon loader asks.
+    ///
+    /// **Called by the vault window, not by this form**, because the item
+    /// list is the window's and `draw_detail_edit` has never had it -- and
+    /// giving it one would change a signature `detail.rs` also calls.
+    ///
+    /// **Lazy on purpose.** It fills the list only once, and only while the
+    /// picker is open, so the common frame -- picker closed, or already
+    /// populated -- walks nothing. The app block's window picker enumerates
+    /// on open for the same reason; this cannot, because it has no callback
+    /// at the moment of the click, so "open and still empty" is the same
+    /// condition one frame later.
+    ///
+    /// Sorted and de-duplicated: several logins share a domain, and a list
+    /// with `chase.com` in it three times is a list that looks broken.
+    pub fn offer_bank_domains(&mut self, items: &[VaultItem]) {
+        if !self.card.bank_picking || !self.card.bank_choices.is_empty() {
+            return;
+        }
+        let mut domains: Vec<String> =
+            items.iter().filter_map(crate::favicon::icon_domain_for).collect();
+        domains.sort();
+        domains.dedup();
+        self.card.bank_choices = domains;
     }
 
     /// The app-binding half of [`Self::apply_to`], split out so the decision
@@ -1990,6 +2238,53 @@ pub const TOTP_HINT: &str =
 /// treatment and same wording pattern as [`FIELDS_CREATE_NOTICE`]; offering
 /// it needs a `vault_bridge` change.
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+
+/// What the brand dropdown shows when the card has no brand at all.
+///
+/// Not an empty combo box: a control whose closed state is blank reads as one
+/// that failed to load rather than one nobody has answered.
+pub const BRAND_UNSET: &str = "Not set";
+
+/// Wide enough for the longest row the dropdown offers -- "American Express"
+/// -- so no brand is drawn elided in the box that is supposed to name it.
+const BRAND_COMBO_WIDTH: f32 = 160.0;
+
+/// The label above the card's bank row.
+///
+/// It says **bank**, not "domain": the user is choosing an institution, and
+/// the domain is how this app happens to find its icon.
+pub const BANK_LABEL: &str = "Bank";
+
+/// What the bank row says when no bank has been chosen.
+pub const BANK_UNSET: &str = "No bank chosen";
+
+/// Why the row is a picker and not a box the user can type in.
+pub const BANK_HINT: &str =
+    "Chosen from the sites already in your vault, so the icon can always be found. Picking one \
+     asks that site for its icon; your card details are never sent.";
+
+/// The picker's own button, and the row that closes it again.
+pub const BANK_CHOOSE: &str = "Choose a bank\u{2026}";
+pub const BANK_CLEAR: &str = "Clear";
+pub const BANK_CLOSE_LIST: &str = "Close list";
+
+/// What the picker says when the vault has offered it nothing.
+///
+/// It names the cause, because "no banks" over a vault full of logins is the
+/// sort of empty state a user reads as a broken control.
+pub const BANK_NO_CHOICES: &str =
+    "No sites in your vault have a web address to take an icon from yet.";
+
+/// The label above the billing postcode box.
+pub const BILLING_ZIP_LABEL: &str = "Billing ZIP / postcode";
+
+/// What the two card custom-field rows say while an item is being
+/// **created**.
+///
+/// [`NewItem`] carries no `fields` at all, so either value typed into a
+/// create form would be silently discarded on Save. Same reason, same
+/// treatment and same wording as [`TOTP_CREATE_NOTICE`].
+pub const CARD_FIELD_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
 
 // ---------------------------------------------------------------------------
 // The edit form's custom-fields block.
@@ -3001,6 +3296,76 @@ fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
     if let Some(index) = chosen {
         let row = app.windows[index].clone();
         app.choose_window(&row);
+    }
+}
+
+/// The card's bank row: what is chosen, the button that opens the picker, and
+/// the picker itself.
+///
+/// **There is no text box here, and that is the whole design.** The domain is
+/// what `favicon::icon_domain_for` hands the fetcher, and a typo in it
+/// produces a silent fetch failure and an unexplained blank tile with nothing
+/// on screen to explain why. Every writer of `CardDraft::bank_domain` in this
+/// function is [`CardDraft::choose_bank`] on a row the vault itself supplied,
+/// or [`CardDraft::clear_bank`].
+///
+/// The choices come from [`EditDraft::offer_bank_domains`], which the vault
+/// window fills in; an empty list is drawn as a sentence naming its cause
+/// rather than as a picker with nothing in it.
+fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
+    ui.horizontal(|ui| {
+        ui.label(if card.bank_domain.is_empty() {
+            RichText::new(BANK_UNSET).color(theme::TEXT_FAINT)
+        } else {
+            RichText::new(card.bank_domain.as_str()).color(theme::INK)
+        });
+        if theme::secondary_button(ui, BANK_CHOOSE).clicked() {
+            card.bank_picking = !card.bank_picking;
+        }
+        // Only when there is something to clear: a Clear beside "No bank
+        // chosen" is a control whose only outcome is nothing happening.
+        if !card.bank_domain.is_empty() && theme::secondary_button(ui, BANK_CLEAR).clicked() {
+            card.clear_bank();
+        }
+    });
+
+    if !card.bank_picking {
+        return;
+    }
+    ui.add_space(6.0);
+    if theme::secondary_button(ui, BANK_CLOSE_LIST).clicked() {
+        card.bank_picking = false;
+    }
+    ui.add_space(6.0);
+    theme::text_field(ui, &mut card.bank_filter, false);
+    ui.add_space(4.0);
+
+    let filter = card.bank_filter.to_lowercase();
+    let mut chosen: Option<usize> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("edit-card-bank-picker")
+        .max_height(180.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for index in 0..card.bank_choices.len() {
+                let domain = &card.bank_choices[index];
+                if !filter.is_empty() && !domain.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                if ui.add(egui::Button::new(domain.as_str()).wrap()).clicked() {
+                    chosen = Some(index);
+                }
+            }
+            if card.bank_choices.is_empty() {
+                ui.label(RichText::new(BANK_NO_CHOICES).size(12.0).color(theme::TEXT_FAINT));
+            }
+        });
+    // After the loop, so the immutable borrow of `bank_choices` is over
+    // before the row is copied into the draft -- the same shape as
+    // `app_window_picker`.
+    if let Some(index) = chosen {
+        let domain = card.bank_choices[index].clone();
+        card.choose_bank(&domain);
     }
 }
 
@@ -4068,11 +4433,46 @@ pub fn draw_detail_edit(
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Brand");
-                    theme::text_field(ui, &mut card.brand, false);
+                    // A dropdown over `CARD_BRANDS` rather than a text box,
+                    // and the rows are derived from the enumeration rather
+                    // than written out here: a second hand-written list is
+                    // the "two enumerations that must agree" defect, and the
+                    // one that drifts would offer a spelling no other
+                    // Bitwarden client draws card art for.
+                    //
+                    // `selected_text` is the draft's own string, not a
+                    // resolved `CardBrand`, so a brand this build does not
+                    // know -- one a newer client wrote -- is still SHOWN
+                    // rather than silently reading as blank.
+                    egui::ComboBox::from_id_salt("card-brand")
+                        .selected_text(if card.brand.is_empty() {
+                            BRAND_UNSET
+                        } else {
+                            card.brand.as_str()
+                        })
+                        .width(BRAND_COMBO_WIDTH)
+                        .show_ui(ui, |ui| {
+                            for brand in CARD_BRANDS {
+                                let canonical = brand.canonical();
+                                let chosen = card.brand == canonical;
+                                if ui.selectable_label(chosen, canonical).clicked() {
+                                    // Through `pick_brand`, never by
+                                    // assigning `brand`: this is the click
+                                    // that makes the choice permanent.
+                                    card.pick_brand(canonical);
+                                }
+                            }
+                        });
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Number");
                     theme::password_field(ui, &mut card.number, &mut card.reveal_number);
+                    // Every frame, unconditionally. `suggest_brand` is
+                    // idempotent and returns immediately once the user has
+                    // picked, so there is nothing to gate it on -- and gating
+                    // it on "the number changed" would mean keeping a second
+                    // plaintext copy of the number to compare against.
+                    card.suggest_brand();
                     ui.add_space(10.0);
 
                     theme::field_label(ui, "Expiry month");
@@ -4085,6 +4485,34 @@ pub fn draw_detail_edit(
 
                     theme::field_label(ui, "Security code");
                     theme::password_field(ui, &mut card.code, &mut card.reveal_code);
+                    ui.add_space(10.0);
+
+                    // The two namespaced custom fields. Withheld on a CREATE
+                    // for the same reason the TOTP seed is (see
+                    // `TOTP_CREATE_NOTICE`): `NewItem` carries no `fields`,
+                    // so anything typed here would be silently discarded on
+                    // Save. A disabled box that says so beats a live box that
+                    // lies.
+                    theme::field_label(ui, BANK_LABEL);
+                    if creating {
+                        theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                    } else {
+                        bank_domain_row(ui, card);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
+                    ui.add_space(10.0);
+
+                    theme::field_label(ui, BILLING_ZIP_LABEL);
+                    if creating {
+                        theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                    } else {
+                        // Free text, unlike the bank: a postcode has no
+                        // closed set to pick from, and a wrong one fails in
+                        // front of the user on the payment form rather than
+                        // silently here.
+                        theme::text_field(ui, &mut card.billing_zip, false);
+                    }
                     ui.add_space(10.0);
                 }
                 FormBody::Identity => {
@@ -12491,5 +12919,398 @@ mod draft_dirtiness_tests {
             "the wipe erased a PLAIN custom field -- it is a blanket clear wearing a list's \
              name, and the next secret added to the form will not be on that list"
         );
+    }
+}
+
+/// The edit form's brand suggestion, and the rule that it never overwrites a
+/// choice.
+#[cfg(test)]
+mod card_brand_form_tests {
+    use super::*;
+    use crate::card_brand::CardBrand;
+
+    /// A card draft as the create form hands one over: no brand, no number,
+    /// nothing chosen.
+    fn card_draft() -> CardDraft {
+        CardDraft::default()
+    }
+
+    #[test]
+    fn a_hand_picked_brand_survives_a_later_edit_to_the_number() {
+        // Without this: type number -> we set Visa -> user corrects to
+        // Mastercard -> user fixes a typo in the number -> we silently
+        // restore Visa. Data loss wearing a convenience costume.
+        let mut draft = card_draft();
+        draft.set_number("4111111111111111");
+        assert_eq!(draft.brand, "Visa", "control: the suggestion works at all");
+        draft.pick_brand("Mastercard");
+        draft.set_number("4111111111111112");
+        assert_eq!(draft.brand, "Mastercard", "the user's pick was overwritten");
+    }
+
+    #[test]
+    fn an_untouched_brand_keeps_following_the_number() {
+        // The other half of the rule, asserted positively: the pick is what
+        // freezes the field, so a draft nobody picked on must still track.
+        // Without this, "the pick survives" would also pass on a form whose
+        // suggestion never ran a second time at all.
+        let mut draft = card_draft();
+        draft.set_number("4111111111111111");
+        assert_eq!(draft.brand, "Visa");
+        draft.set_number("378282246310005");
+        assert_eq!(draft.brand, "American Express", "an unpicked brand stopped following");
+    }
+
+    #[test]
+    fn an_unrecognised_prefix_leaves_the_brand_alone_rather_than_clearing_it() {
+        // A partially typed number passes through prefixes matching nothing,
+        // and a brand that flickers empty while typing reads as broken.
+        let mut draft = card_draft();
+        draft.set_number("4111");
+        assert_eq!(draft.brand, "Visa");
+        draft.set_number("9");
+        assert_eq!(draft.brand, "Visa", "an unrecognised prefix cleared the brand");
+        draft.set_number("");
+        assert_eq!(draft.brand, "Visa", "clearing the number cleared the brand");
+        // Control: the field is not simply frozen -- a recognised prefix
+        // still moves it, so the two cases above are about recognition.
+        draft.set_number("6011111111111117");
+        assert_eq!(draft.brand, "Discover");
+    }
+
+    #[test]
+    fn a_brand_that_arrived_on_the_item_is_treated_as_already_chosen() {
+        // Somebody chose it -- here, in another Bitwarden client, or in an
+        // import -- and overwriting it because the user retyped a digit is
+        // the same data loss one step earlier.
+        let mut item = crate::vault_bridge::VaultItem {
+            id: "card-1".into(),
+            name: "Ledgerline Debit".into(),
+            fields: Vec::new(),
+            login: None,
+            card: Some(CardData {
+                brand: Some("Mastercard".into()),
+                number: Some(Zeroizing::new("5555555555554444".into())),
+                ..CardData::default()
+            }),
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(3),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        let mut draft = EditDraft::from_item(&item);
+        draft.card.set_number("4111111111111111");
+        assert_eq!(draft.card.brand, "Mastercard", "an inherited brand was overwritten");
+
+        // The control, and it is the reason this is not vacuous: the SAME
+        // path with no brand on the item does suggest, so "inherited" is
+        // what decides it rather than "came from an item".
+        item.card.as_mut().unwrap().brand = None;
+        let mut blank = EditDraft::from_item(&item);
+        blank.card.set_number("4111111111111111");
+        assert_eq!(blank.card.brand, "Visa", "a card with no brand got no suggestion");
+    }
+
+    #[test]
+    fn every_suggestion_is_a_spelling_the_dropdown_also_offers() {
+        // Interoperability, not tidiness: `brand` is shared with every other
+        // Bitwarden client and the web vault draws its own card art from that
+        // string, so "MC" gives a card that renders here and blank
+        // everywhere else. Driven from the enumeration, so a brand added
+        // later cannot be half-wired.
+        let offered: Vec<&str> = CARD_BRANDS.iter().map(|b| b.canonical()).collect();
+        for brand in CARD_BRANDS {
+            let number = match brand {
+                CardBrand::Visa => "4111111111111111",
+                CardBrand::Mastercard => "5555555555554444",
+                CardBrand::AmericanExpress => "378282246310005",
+                CardBrand::Discover => "6011111111111117",
+                CardBrand::Jcb => "3530111333300000",
+                CardBrand::DinersClub => "30569309025904",
+                CardBrand::UnionPay => "6200000000000005",
+            };
+            let mut draft = card_draft();
+            draft.set_number(number);
+            assert_eq!(draft.brand, brand.canonical(), "{brand:?} suggested the wrong spelling");
+            assert!(
+                offered.contains(&draft.brand.as_str()),
+                "{brand:?} suggests {:?}, which the dropdown does not offer",
+                draft.brand
+            );
+        }
+    }
+
+    #[test]
+    fn picking_a_brand_changes_the_draft_but_re_picking_the_same_one_does_not() {
+        // `brand_touched` is view state and `brand` is content -- see
+        // `EditDraft::content_digest`. Paired both ways: a real change to the
+        // brand IS dirty, and a click that lands on the value already showing
+        // is not.
+        let mut draft = EditDraft::empty_of(ItemKind::Card);
+        assert!(!draft.is_dirty(), "a blank card form opened dirty");
+        draft.card.pick_brand("");
+        assert!(!draft.is_dirty(), "merely touching the dropdown made the form dirty");
+        draft.card.pick_brand("Visa");
+        assert!(draft.is_dirty(), "choosing a brand did not register as a change");
+    }
+}
+
+/// The card's bank domain and billing postcode: how they are read, how they
+/// are written, and what the picker will and will not accept.
+#[cfg(test)]
+mod card_custom_field_tests {
+    use super::*;
+    use crate::favicon::BANK_DOMAIN_FIELD;
+    use crate::vault_bridge::{VaultField, BILLING_ZIP_FIELD};
+
+    fn field(name: &str, value: &str) -> VaultField {
+        // Built from JSON rather than a struct literal, so the extra keys
+        // `bw` normalises onto a field (`type`, `linkedId`) are really on the
+        // fixture -- which is what makes "they were preserved" a claim about
+        // preservation rather than about an item that had none.
+        serde_json::from_str(&format!(
+            r#"{{"name":{},"value":{},"type":0,"linkedId":null}}"#,
+            serde_json::json!(name),
+            serde_json::json!(value)
+        ))
+        .expect("the fixture is valid field JSON")
+    }
+
+    /// A saved card carrying the user's own custom field, this app's bank
+    /// domain, and a billing postcode.
+    fn card_item() -> VaultItem {
+        VaultItem {
+            id: "card-1".into(),
+            name: "Ledgerline Debit".into(),
+            fields: vec![
+                field("Branch", "north"),
+                field(BANK_DOMAIN_FIELD, "old-bank.example"),
+                field(BILLING_ZIP_FIELD, "OLD 1AA"),
+            ],
+            login: None,
+            card: Some(CardData {
+                brand: Some("Visa".into()),
+                number: Some(Zeroizing::new("4111111111111111".into())),
+                ..CardData::default()
+            }),
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(3),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn field_value<'a>(item: &'a VaultItem, name: &str) -> Option<&'a str> {
+        item.fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some(name))
+            .and_then(|f| f.value.as_deref())
+            .map(|v| v.as_str())
+    }
+
+    #[test]
+    fn both_card_fields_arrive_in_the_form_and_go_back_out_again() {
+        let item = card_item();
+        let mut draft = EditDraft::from_item(&item);
+        // In. Read through `icon_domain_for`, the same reader the icon loader
+        // asks, so the form and the tile cannot disagree.
+        assert_eq!(draft.card.bank_domain, "old-bank.example");
+        assert_eq!(draft.card.billing_zip, "OLD 1AA");
+
+        // Out.
+        draft.card.choose_bank("new-bank.example");
+        draft.card.billing_zip = "SW1A 1AA".into();
+        let saved = draft.apply_to(&item);
+        assert_eq!(field_value(&saved, BANK_DOMAIN_FIELD), Some("new-bank.example"));
+        assert_eq!(field_value(&saved, BILLING_ZIP_FIELD), Some("SW1A 1AA"));
+        assert_eq!(
+            crate::favicon::icon_domain_for(&saved).as_deref(),
+            Some("new-bank.example"),
+            "the saved card's icon still comes from the old bank"
+        );
+    }
+
+    #[test]
+    fn saving_a_card_keeps_the_other_fields_extra_keys_and_their_order() {
+        let item = card_item();
+
+        // **The live control.** Every field on the fixture really does carry
+        // keys beyond name and value, so the assertion below is about
+        // preservation and not vacuously true of a field that had none.
+        let before = serde_json::to_value(&item).unwrap();
+        let before_fields = before["fields"].as_array().unwrap();
+        for f in before_fields {
+            let keys: Vec<&String> = f.as_object().unwrap().keys().collect();
+            assert!(
+                keys.contains(&&"type".to_string()) && keys.contains(&&"linkedId".to_string()),
+                "the fixture field {f} has no extra keys, so preserving them proves nothing"
+            );
+        }
+
+        let mut draft = EditDraft::from_item(&item);
+        draft.card.choose_bank("new-bank.example");
+        let saved = draft.apply_to(&item);
+        let after = serde_json::to_value(&saved).unwrap();
+        let after_fields = after["fields"].as_array().unwrap();
+
+        assert_eq!(
+            after_fields.iter().map(|f| &f["name"]).collect::<Vec<_>>(),
+            before_fields.iter().map(|f| &f["name"]).collect::<Vec<_>>(),
+            "saving reordered or dropped the card's custom fields"
+        );
+        assert_eq!(after_fields[0], before_fields[0], "the user's own field was rewritten");
+        // The one field that WAS rebuilt: new value, same extra keys.
+        assert_eq!(after_fields[1]["value"], serde_json::json!("new-bank.example"));
+        assert_eq!(after_fields[1]["type"], serde_json::json!(0));
+        assert_eq!(after_fields[1]["linkedId"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn clearing_the_bank_removes_the_field_rather_than_blanking_it() {
+        let item = card_item();
+        let mut draft = EditDraft::from_item(&item);
+        draft.card.clear_bank();
+        let saved = draft.apply_to(&item);
+        assert_eq!(field_value(&saved, BANK_DOMAIN_FIELD), None);
+        assert_eq!(crate::favicon::icon_domain_for(&saved), None);
+        // Control: the postcode beside it is untouched, so the clear removed
+        // one field rather than the app's fields.
+        assert_eq!(field_value(&saved, BILLING_ZIP_FIELD), Some("OLD 1AA"));
+    }
+
+    #[test]
+    fn a_login_never_gains_a_bank_domain_or_a_billing_zip() {
+        // `icon_domain_for` answers for a login too -- with that login's own
+        // website, which is not a bank anybody chose for a card. Both halves
+        // asserted: the draft does not pick it up, and the save does not
+        // write it.
+        let login = VaultItem {
+            id: "login-1".into(),
+            name: "Ledgerline".into(),
+            fields: Vec::new(),
+            login: Some(LoginData {
+                uris: vec![UriEntry {
+                    uri: Some("https://ledgerline.example/login".into()),
+                    other: serde_json::Map::new(),
+                }],
+                ..LoginData::default()
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        // Control: this login DOES resolve to a domain, so the blank below is
+        // about the gate and not about an item with nothing to find.
+        assert_eq!(
+            crate::favicon::icon_domain_for(&login).as_deref(),
+            Some("ledgerline.example")
+        );
+
+        let mut draft = EditDraft::from_item(&login);
+        assert_eq!(draft.card.bank_domain, "", "a login's website became a card's bank");
+        // ...and even a draft somebody filled in anyway writes nothing,
+        // because the write is gated on the kind.
+        draft.card.choose_bank("somewhere.example");
+        draft.card.billing_zip = "SW1A 1AA".into();
+        let saved = draft.apply_to(&login);
+        assert!(saved.fields.is_empty(), "a login gained the card's custom fields");
+    }
+
+    #[test]
+    fn the_picker_offers_the_vaults_own_domains_sorted_and_deduplicated() {
+        let site = |id: &str, uri: &str| VaultItem {
+            id: id.into(),
+            name: id.into(),
+            fields: Vec::new(),
+            login: Some(LoginData {
+                uris: vec![UriEntry { uri: Some(uri.into()), other: serde_json::Map::new() }],
+                ..LoginData::default()
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        let items = vec![
+            site("a", "https://zeta.example/login"),
+            site("b", "https://alpha.example/"),
+            // The same bank twice: several logins share a domain, and a list
+            // with one entry three times looks broken.
+            site("c", "https://alpha.example/settings"),
+            // No web address at all -- contributes nothing rather than a
+            // blank row.
+            site("d", "not a url"),
+        ];
+
+        let mut draft = EditDraft::from_item(&card_item());
+        // **Lazy, and this is the pairing.** A closed picker asks the vault
+        // for nothing...
+        draft.offer_bank_domains(&items);
+        assert!(draft.card.bank_choices.is_empty(), "a shut picker went looking for domains");
+        // ...and an open one gets exactly the vault's own domains.
+        draft.card.bank_picking = true;
+        draft.offer_bank_domains(&items);
+        assert_eq!(draft.card.bank_choices, vec!["alpha.example", "zeta.example"]);
+    }
+
+    #[test]
+    fn choosing_a_bank_takes_the_offered_row_and_closes_the_picker() {
+        // The picker is the only way in, so a choice must be a row the vault
+        // supplied -- never a string the user assembled.
+        let mut draft = EditDraft::from_item(&card_item());
+        draft.card.bank_picking = true;
+        draft.card.bank_choices = vec!["alpha.example".into(), "zeta.example".into()];
+
+        let row = draft.card.bank_choices[1].clone();
+        draft.card.choose_bank(&row);
+        assert_eq!(draft.card.bank_domain, "zeta.example");
+        assert!(!draft.card.bank_picking, "choosing a row left the picker open");
+
+        draft.card.bank_picking = true;
+        draft.card.clear_bank();
+        assert_eq!(draft.card.bank_domain, "");
+        assert!(!draft.card.bank_picking, "clearing left the picker open");
+    }
+
+    #[test]
+    fn the_two_values_are_content_and_the_picker_around_them_is_not() {
+        // See `EditDraft::content_digest`. Paired in both directions: a
+        // confirmation that fires when there is nothing to lose teaches the
+        // user to click through it, and one that stays silent when there is
+        // loses the data.
+        let item = card_item();
+        let mut draft = EditDraft::from_item(&item);
+        assert!(!draft.is_dirty(), "an edit form opened dirty");
+
+        draft.card.bank_picking = true;
+        draft.card.bank_filter = "alph".into();
+        draft.card.bank_choices = vec!["alpha.example".into()];
+        assert!(
+            !draft.is_dirty(),
+            "opening the bank picker, typing in its search box or filling its list counted as \
+             editing the item"
+        );
+
+        draft.card.choose_bank("alpha.example");
+        assert!(draft.is_dirty(), "choosing a bank did not register as a change");
+
+        let mut zip = EditDraft::from_item(&item);
+        zip.card.billing_zip.push('X');
+        assert!(zip.is_dirty(), "editing the billing postcode did not register as a change");
     }
 }

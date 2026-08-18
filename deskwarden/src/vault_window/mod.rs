@@ -3234,6 +3234,14 @@ pub fn build_frame(
                     // user had looked away from.
                     DetailMode::Edit(draft) => {
                         detail::forget_copy_toast(ui.ctx());
+                        // The card form's bank picker offers domains the
+                        // vault already has, and this is the only scope that
+                        // holds the item list -- `draw_detail_edit` has never
+                        // taken one, and giving it one would change a
+                        // signature `detail.rs` also calls. The method is
+                        // lazy (see `EditDraft::offer_bank_domains`), so a
+                        // frame with the picker shut walks nothing.
+                        draft.offer_bank_domains(&items);
                         match draw_detail_edit(ui, draft, &folders, false, &mut app_identities, selected_item.as_ref(), &totp_state) {
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
