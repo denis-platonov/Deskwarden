@@ -2206,10 +2206,26 @@ mod tests {
     /// somewhere it is not an index. The walk is positively controlled twice:
     /// it must have reached `breach.rs`, and `breach.rs` must contain the
     /// needle. A walk that visits zero files passes green otherwise.
+    ///
+    /// **`otpauth.rs` may write the NAME and still may not use the CRATE.**
+    /// The rule this test exists for is "no second implementation of SHA-1 in
+    /// this crate", and the two needles are not equally good evidence of one.
+    /// `otpauth.rs` parses an `otpauth://` URI, whose `algorithm` parameter is
+    /// literally the string `SHA1`; the enum variant that records which of the
+    /// three RFC 6238 algorithms a card asked for is a **label being carried
+    /// from a QR code to the vault**, and this crate computes no HMAC at any
+    /// point -- Bitwarden does that. So the type-name half is skipped for that
+    /// one file, with the carve-out named here rather than the needle
+    /// loosened, and the CRATE-path half still applies to it: `otpauth.rs`
+    /// naming `sha1::` would be a real second implementation, and is still a
+    /// failure. Pinned by
+    /// [`the_sha1_carve_out_is_only_the_name_and_only_that_file`].
     #[test]
     fn sha1_is_confined_to_the_breach_module() {
         const TYPE_NAME: &str = concat!("Sha", "1");
         const CRATE_PATH: &str = concat!("sha", "1::");
+        /// The one file allowed to write the type name; see this test's docs.
+        const NAME_ONLY_EXEMPT: &str = "otpauth.rs";
 
         let files = crate_source_files();
         assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
@@ -2228,6 +2244,9 @@ mod tests {
                 continue;
             }
             for needle in [TYPE_NAME, CRATE_PATH] {
+                if needle == TYPE_NAME && path == NAME_ONLY_EXEMPT {
+                    continue;
+                }
                 if text.contains(needle) {
                     offenders.push(format!("{path}: {needle}"));
                 }
@@ -2237,6 +2256,46 @@ mod tests {
             offenders.is_empty(),
             "SHA-1 escaped the breach module: {offenders:?}. Here it is Have I Been Pwned's \
              index; anywhere else it would be a security primitive, and it is not one"
+        );
+    }
+
+    /// **Controls on the one carve-out above**, so it is a hole of exactly the
+    /// shape it says it is and not a hole in the guard.
+    ///
+    /// Without these, `NAME_ONLY_EXEMPT` could be pointed at a file that does
+    /// not exist (leaving the reader believing something is exempted that is
+    /// not), or quietly widened to the crate-path needle, and the suite would
+    /// stay green either way.
+    #[test]
+    fn the_sha1_carve_out_is_only_the_name_and_only_that_file() {
+        const TYPE_NAME: &str = concat!("Sha", "1");
+        const CRATE_PATH: &str = concat!("sha", "1::");
+        const NAME_ONLY_EXEMPT: &str = "otpauth.rs";
+
+        let files = crate_source_files();
+        let exempt = files
+            .iter()
+            .find(|(path, _)| path == NAME_ONLY_EXEMPT)
+            .expect("the carve-out names a file that is not in this crate");
+
+        // 1. The carve-out is LOAD-BEARING: the file really does write the
+        //    name, so the guard above would fail without it. A carve-out for
+        //    a file that no longer needs one is a hole nobody is watching.
+        assert!(
+            exempt.1.contains(TYPE_NAME),
+            "{NAME_ONLY_EXEMPT} no longer writes {TYPE_NAME:?}, so the carve-out in \
+             `sha1_is_confined_to_the_breach_module` is an open hole with no reason left. \
+             Delete it."
+        );
+
+        // 2. And it is NOT a carve-out for the crate. The exempted file must
+        //    still be clean of `sha1::`, which is the needle that would mean a
+        //    real second implementation.
+        assert!(
+            !exempt.1.contains(CRATE_PATH),
+            "{NAME_ONLY_EXEMPT} names {CRATE_PATH:?}. The carve-out is for the algorithm's \
+             NAME being carried from a QR code to the vault, not for a second SHA-1 in this \
+             crate"
         );
     }
 

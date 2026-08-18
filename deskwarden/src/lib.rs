@@ -49,6 +49,8 @@ pub mod loading_ui;
 pub mod logging;
 pub mod login_ui;
 pub mod match_engine;
+/// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
+pub mod otpauth;
 pub mod overlay_ui;
 pub mod password_strength;
 pub mod picker_ui;
