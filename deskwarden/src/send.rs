@@ -1108,6 +1108,38 @@ pub(crate) fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, 
     parse_send_list(&raw.stdout)
 }
 
+/// Fetches one Send's contents from its link: build the invocation, hand
+/// **that** invocation to the runner, hand the body back.
+///
+/// **Private, unlike its three neighbours**, and that is the deliberate
+/// difference. `create_send`, `list_sends` and `delete_send` are reachable
+/// from outside because something outside drives them against a substituted
+/// [`SendRunner`]; nothing outside this module needs to drive a receive that
+/// way, because the whole of what a caller wants is [`cli_send_receive`], and
+/// this module's own tests are the ones that substitute a runner here. Keeping
+/// it private is one door fewer in the wall
+/// `vault_window::send_ui::source_pins::the_public_surface_of_the_send_module_is_exactly_these_items`
+/// pins.
+///
+/// **The body is [`Zeroizing`].** What comes back is somebody's whole record
+/// -- a password, possibly a sealed seed -- and `RawOutput::stdout` is a plain
+/// `String` that would otherwise be dropped without being wiped.
+///
+/// Nothing is parsed here. `bw send receive` prints the Send's text and this
+/// module has no opinion about what that text means; `record::payload::read_json`
+/// is the strict reader that decides, and it lives with the record.
+fn receive_send<R: SendRunner>(
+    runner: &R,
+    url: &str,
+    password: Option<&str>,
+) -> Result<Zeroizing<String>, SendError> {
+    let raw = runner.run(&receive_invocation(url, password))?;
+    if raw.exit_code != Some(0) {
+        return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
+    }
+    Ok(Zeroizing::new(raw.stdout))
+}
+
 /// Revokes one Send. **Nothing is parsed back**: `bw send delete` prints a
 /// human sentence, and the only question worth asking is whether it exited 0.
 pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError> {
@@ -1680,6 +1712,45 @@ pub fn cli_send_create(
         session,
         now,
     )
+}
+
+/// **The one `pub` route out of this module into a real `bw send receive`
+/// child**, and the fourth of the family [`cli_send_list`], [`cli_send_delete`]
+/// and [`cli_send_create`] belong to.
+///
+/// Everything [`cli_send_list`]'s doc says about the privacy wall applies here
+/// unchanged and is not repeated. **Adding this door was not optional**, for
+/// [`cli_send_create`]'s reason exactly: [`receive_send`] needs a
+/// [`SendRunner`], there is no `pub` implementation of that trait in this
+/// crate, and the alternative to one new door was making the runner nameable
+/// from outside -- which is the wall itself.
+///
+/// **No session, and that is the one way this differs from its three
+/// siblings.** Fetching a Send is anonymous: the link is the credential. So
+/// the runner is built with [`CliSendRunner::new`] rather than
+/// `with_session`, and `BW_SESSION` -- which unlocks the entire vault -- is
+/// never handed to a child that has no use for it. [`receive_invocation`]
+/// makes the same decision on the invocation's own side.
+///
+/// **The share password does not go in argv, and the URL does.** Both are
+/// [`receive_invocation`]'s decisions and its doc carries the measurement:
+/// `bw send receive` offers no stdin route for the password, so it travels in
+/// an environment variable whose NAME is all that reaches argv; the URL has
+/// nowhere else to go, which is why this is the one invocation whose whole
+/// argument vector its `Debug` elides.
+///
+/// **It blocks for up to [`SEND_TIMEOUT`], and it must never be called from
+/// the eframe frame closure.** The seal that holds that is
+/// `vault_window::send_create_wiring::every_mention_of_the_blocking_receive_is_sealed_inside_its_own_module`,
+/// which counts this name over every `.rs` file under `src` and requires every
+/// mention outside `send.rs` to be inside `mod send_receive_thread`.
+pub fn cli_send_receive(
+    job: Option<&crate::job_object::KillOnCloseJob>,
+    data_dir: Option<&Path>,
+    url: &str,
+    password: Option<&str>,
+) -> Result<Zeroizing<String>, SendError> {
+    receive_send(&CliSendRunner::new(job, data_dir), url, password)
 }
 
 // ---------------------------------------------------------------------------
@@ -2955,8 +3026,13 @@ mod runner_tests {
         // file, and leaving it on `cli_send_list`'s body would have spent the
         // 4000-byte allowance below on the new function's doc comment rather
         // than measuring what the allowance is for.
+        // Repointed a third time when `cli_send_receive` was added below
+        // `cli_send_create`, for the same reason and by the same rule: the
+        // anchor is the LAST production item in the file, and every function
+        // appended below it spends the 4000-byte allowance on prose the
+        // allowance is not meant to measure. This one is the receive's body.
         const LAST_PRODUCTION_ITEM: &str =
-            concat!("delete_sen", "d(&CliSendRunner::with_session(job, data_dir, session), id)");
+            concat!("receive_sen", "d(&CliSendRunner::new(job, data_dir), url, password)");
         assert_eq!(
             lf.matches(LAST_PRODUCTION_ITEM).count(),
             1,
@@ -3704,6 +3780,108 @@ mod tests {
         assert_eq!(body["maxAccessCount"], 4);
         assert_eq!(body["text"]["hidden"], true);
         assert_eq!(body["deletionDate"], "2026-09-10T00:43:17.148Z");
+    }
+
+    // -- 5b. receive_send, the fetch half ---------------------------------
+
+    /// **`receive_send` runs [`receive_invocation`]'s invocation, not one of
+    /// its own**, and hands back exactly what the child printed.
+    ///
+    /// [`create_send_runs_the_invocation_it_was_given_rather_than_one_of_its_own`]'s
+    /// shape and its reason: the whole of what this module promises about a
+    /// receive -- no session token, the password out of argv, the URL elided
+    /// from `Debug` -- is a promise about the value `receive_invocation`
+    /// builds, and a function that rebuilt it would keep every one of those
+    /// tests green while running something else.
+    #[test]
+    fn receive_send_runs_the_invocation_it_was_given_and_returns_the_body() {
+        const URL: &str = "https://send.bitwarden.com/#invented-access-id/invented-key";
+        const SHARE: &str = "an-invented-share-password";
+        let runner = FakeRunner::answering(RawOutput {
+            exit_code: Some(0),
+            stdout: "{\"name\":\"SAP Production\"}".to_string(),
+            stderr: String::new(),
+        });
+
+        let body = receive_send(&runner, URL, Some(SHARE)).expect("the fake exits 0");
+        assert_eq!(
+            &*body, "{\"name\":\"SAP Production\"}",
+            "the fetched body was altered on the way back; nothing here parses it and \
+             nothing here may trim it"
+        );
+
+        let seen = runner.seen.borrow();
+        assert_eq!(seen.len(), 1, "the runner was called {} times, not once", seen.len());
+        let expected = receive_invocation(URL, Some(SHARE));
+        assert!(
+            seen[0] == expected,
+            "`receive_send` ran an invocation of its own making.\n  ran:      {:?}\n  \
+             expected: {:?}",
+            seen[0].args(),
+            expected.args()
+        );
+        // And the invocation that really ran carries none of this module's
+        // three receive promises by accident: the equality above would hold
+        // for two identically-wrong values only if `receive_invocation` were
+        // wrong too, so the three are read off the value that reached the
+        // runner rather than off a second copy.
+        assert!(
+            seen[0].session_token().is_none(),
+            "a receive was handed BW_SESSION, which unlocks the whole vault, to fetch a \
+             link that is its own credential"
+        );
+        assert!(
+            !seen[0].args().iter().any(|a| a == SHARE),
+            "the share password reached argv, where any process on the machine reads it: \
+             {:?}",
+            seen[0].args()
+        );
+        assert!(
+            seen[0].args().iter().any(|a| a == URL),
+            "the URL did not reach argv, and there is nowhere else `bw` reads it from"
+        );
+    }
+
+    /// **A non-zero exit is a classified failure, not an empty body.**
+    ///
+    /// The arm matters more here than in the create's case: a receive that
+    /// answered `Ok("")` for a refused link would hand the import surface an
+    /// empty payload, and `read_json` would then report a malformed record --
+    /// naming the wrong reason to the user, which is precisely what
+    /// `RecordRefusal`'s per-reason sentences exist to avoid.
+    #[test]
+    fn a_receive_that_exits_non_zero_is_a_failure_and_not_an_empty_body() {
+        let runner = FakeRunner::answering(RawOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "Not found.".to_string(),
+        });
+        let failed = receive_send(&runner, "https://send.example.invalid/#nope", None)
+            .expect_err("a non-zero exit is not a success");
+        assert!(
+            !failed.user_message().is_empty(),
+            "a failed receive has no sentence to show the user"
+        );
+    }
+
+    /// **No password means no `--passwordenv` and no environment variable**,
+    /// read off the value that reaches the runner rather than off the builder.
+    #[test]
+    fn a_receive_with_no_share_password_names_no_environment_variable() {
+        let runner = FakeRunner::answering(RawOutput {
+            exit_code: Some(0),
+            stdout: "{}".to_string(),
+            stderr: String::new(),
+        });
+        let _ = receive_send(&runner, "https://send.example.invalid/#id/key", None);
+        let seen = runner.seen.borrow();
+        assert!(
+            !seen[0].args().iter().any(|a| a == "--passwordenv"),
+            "a receive with no share password still pointed `bw` at an environment \
+             variable, which is unset -- so the flag either fails the run or reads \
+             somebody else's value: {:?}",
+            seen[0].args()
+        );
     }
 
     #[test]

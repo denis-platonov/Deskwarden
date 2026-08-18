@@ -5338,8 +5338,26 @@ mod source_pins {
             // points -- the definitions and the three pinned constructions,
             // and no fourth.
             (concat!("CliSendRunner", "::with_session"), 3, false),
-            (concat!("CliSendRunner", ""), 6, false),
-            (concat!("CliSendRunner", "::new"), 0, false),
+            // **Moved by one AGAIN when `cli_send_receive` landed**, and this
+            // time on the OTHER constructor, which is the whole of what makes
+            // the move worth recording rather than a number that drifted: a
+            // receive is anonymous -- the link is the credential -- so
+            // `cli_send_receive` builds `CliSendRunner::new(job, data_dir)`
+            // and hands the child no `BW_SESSION` at all. Seven is now
+            // `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`,
+            // `impl SendRunner for CliSendRunner<'_>` and the FOUR entry
+            // points, and no fifth.
+            (concat!("CliSendRunner", ""), 7, false),
+            // **One, and it was zero until the receive landed.** This row used
+            // to be the whole of what refused the measured `warm_cache`
+            // survivor -- a blocking `bw send list` built from the constructor
+            // nothing in production used. It is not zero any more, so it no
+            // longer refuses that shape by itself; what refuses it now is that
+            // this row and the `CliSendRunner` row above must BOTH hold, and
+            // the survivor spelled one more of each than the file accounts
+            // for. The single production use is `cli_send_receive`'s, and a
+            // second one is a second sessionless blocking child.
+            (concat!("CliSendRunner", "::new"), 1, false),
             // The revoke's two, on the same terms as `list_sends` and
             // `list_invocation` above. `delete_send` is its definition plus
             // the one call in `cli_send_delete`; `delete_invocation` is its
@@ -5369,6 +5387,29 @@ mod source_pins {
             // `cli_send_create`.
             (concat!("create_", "send"), 2, false),
             (concat!("plan_to_", "invocation"), 2, false),
+            // **The receive's three, on the same terms as the three families
+            // above**, and they are counted HERE rather than sealed here: the
+            // seal for the receive is
+            // `vault_window::send_create_wiring::every_mention_of_the_blocking_receive_is_sealed_inside_its_own_module`,
+            // which holds `mod send_receive_thread` the way this test holds
+            // `mod send_fetch_thread`. What these rows add is the half that
+            // seal cannot see, which is the half `send.rs` itself is the most
+            // natural place to write: a SECOND blocking `bw send receive`
+            // written inside the privacy boundary.
+            //
+            // `cli_send_receive` is its definition alone -- every call to it
+            // is outside this module. `receive_send` is its definition plus
+            // the one call in `cli_send_receive`. `receive_invocation` is its
+            // definition plus the one use in `receive_send`, and it is the
+            // receive's exact counterpart of `list_invocation`:
+            // `runner.run(&receive_invocation(..))` is a whole blocking fetch
+            // that spells neither of the other two -- and unlike
+            // `list_invocation` this builder is `pub`, so the count is the
+            // only thing standing between it and a second runner built beside
+            // it.
+            (concat!("cli_send_", "receive"), 1, false),
+            (concat!("receive_", "send"), 2, false),
+            (concat!("receive_", "invocation"), 2, false),
         ] {
             assert_eq!(
                 send_rs.matches(needle).count(),
@@ -5688,6 +5729,24 @@ mod source_pins {
         // from outside -- which is the wall itself. It carries the same three
         // parameters the other two do, plus the plan and the clock.
         "send.rs: pub fn cli_send_create(",
+        // **Added by the record import's wiring, deliberately, and it is the
+        // only item that work adds to this wall.** `receive_send` -- the
+        // generic half beside `create_send`, `list_sends` and `delete_send` --
+        // is deliberately PRIVATE, so it is not on this list at all: nothing
+        // outside `crate::send` needs to drive a receive against a substituted
+        // runner, and this module's own tests are the ones that do. That left
+        // exactly the choice the three rows above it record: one `pub` entry
+        // point that builds the private runner itself, or making
+        // `CliSendRunner` nameable from outside -- which is the wall itself.
+        //
+        // **It takes no session, and it is the only one of the four that does
+        // not.** Fetching a Send is anonymous -- the link is the credential --
+        // so this door builds its runner with `CliSendRunner::new` rather than
+        // `with_session`, and `BW_SESSION`, which unlocks the whole vault, is
+        // never handed to a child that has no use for it. That is why the
+        // `CliSendRunner::new` row in the seal above moves from 0 to 1 with
+        // this commit while `CliSendRunner::with_session` does not move at all.
+        "send.rs: pub fn cli_send_receive(",
     ];
 
     /// **Nothing waits on the Sends channel from the frame's own thread.**
