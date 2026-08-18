@@ -983,7 +983,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 45] = [
+        const OPENS_NO_WINDOW: [&str; 46] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1071,6 +1071,19 @@ mod tests {
             // gate over one call into `hello`, which is on this list for
             // exactly the same reason.
             "reprompt",
+            // **Judgement call, recorded rather than assumed**, and a
+            // different one from `file_picker`'s and `reprompt`'s above: this
+            // module opens nothing at all, not even somebody else's window.
+            // It calls `GetDC(None)` and `BitBlt` -- it READS the screen
+            // rather than painting on it, and a device context is not a
+            // window: it has no HWND, no title, nothing for `raise_window`
+            // to match on and nothing that could steal the foreground. The
+            // dimmed full-screen surface the user drags on IS a window, and
+            // it is `vault_window::region_overlay`, a later step and not this
+            // module -- which is the whole point of the split: the part that
+            // shows something and the part that touches the OS are separate
+            // files so that this one can stay windowless.
+            "screen_capture",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.
