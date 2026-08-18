@@ -744,6 +744,7 @@ pub fn kind_offers_clone(kind: ItemKind) -> bool {
     kind_offers_edit(kind) && super::detail_edit::is_creatable(kind)
 }
 
+
 /// The item's note body, or `None` when there is nothing worth a card.
 ///
 /// Empty and whitespace-only are *absent*: rendering the card for either
@@ -8749,6 +8750,67 @@ mod tests {
             "clicking the menu's Edit reported {:?}",
             clicked.action
         );
+    }
+
+    /// **The kebab has no "Change type", and this pins the refusal so it is
+    /// met before it is undone.**
+    ///
+    /// It was asked for alongside Move to folder and Clone, and it is a
+    /// documented no rather than a gap.
+    ///
+    /// *The data has nowhere to go.* A login's `login` object and a card's
+    /// `card` object are different shapes; turning one into the other leaves
+    /// a username, a password, a TOTP seed and a URI list homeless. The only
+    /// total answers are to drop them -- silent data loss behind a menu entry
+    /// that sounds like a formatting change -- or to keep them, which makes
+    /// an item carrying two type objects. `EditDraft::apply_to` already
+    /// refuses the second in as many words, and that refusal is load-bearing:
+    /// an item with both objects is malformed to every other Bitwarden
+    /// client, so this app would be corrupting a vault it shares.
+    ///
+    /// *And interoperability settles it.* **Bitwarden's own web vault cannot
+    /// change an item's type either** -- it is one of the oldest standing
+    /// requests on their community forum ("Change 'type' of items"),
+    /// repeatedly asked for and never shipped, and their answer is the one
+    /// this app gives: make a new item of the wanted type and delete the old.
+    /// So a Change type here would not be catching up with the other clients;
+    /// it would be inventing a write none of them perform, against a server
+    /// whose behaviour on it has never been probed.
+    ///
+    /// The honest route already exists and is two clicks: **Clone** opens a
+    /// create form pre-filled from the item, the "+ New" type menu picks the
+    /// wanted kind, and the original is deleted afterwards. That writes only
+    /// shapes this crate has verified, and it shows the user what survives
+    /// instead of deciding it for them.
+    ///
+    /// Reopen this only with a capture, the way `may_unfile` records the
+    /// un-filing limitation: a controlled run against `bw serve`, and a
+    /// written decision about the orphaned fields, before any code.
+    #[test]
+    fn the_kebab_offers_no_way_to_change_an_items_type() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        // The pairing: the menu really opened, so the absences below are
+        // absences in a drawn menu rather than an absence of a menu.
+        assert!(
+            open.painted("Clone") && open.painted("Delete"),
+            "the kebab menu did not open, so finding no type-change entry in it proves \
+             nothing: {:?}",
+            open.strings()
+        );
+        for spelling in ["Change type", "Change Type", "Convert", "Convert to"] {
+            assert!(
+                !open.painted(spelling),
+                "the kebab offers {spelling:?}. A login's `login` object and a card's \
+                 `card` object are different shapes: the change either drops the fields \
+                 with nowhere to go, or writes an item carrying two type objects that \
+                 every other Bitwarden client reads as malformed. Bitwarden's own web \
+                 vault does not offer this either. Clone plus Delete is the supported \
+                 route. Painted: {:?}",
+                open.strings()
+            );
+        }
     }
 
     /// Clone is reachable, and reachable only through the kebab -- pressed at
