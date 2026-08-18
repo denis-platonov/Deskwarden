@@ -12,6 +12,7 @@ pub mod item_list;
 pub mod preflight;
 pub mod record_ui;
 pub mod rehearsal;
+pub mod relative_time;
 pub mod send_ui;
 pub mod sidebar;
 
@@ -178,7 +179,7 @@ const TOTP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// This is NOT a frame rate: egui repaints on input regardless. It is the
 /// deadline by which a window that nobody is touching must run a frame anyway,
 /// and everything in `run`'s closure that is time-driven rather than
-/// input-driven depends on it -- the AUTO-LOCK check, the "Synced N min ago"
+/// input-driven depends on it -- the AUTO-LOCK check, the "Synced 20h 15m ago"
 /// pill, and the drains of the four background channels (`sync_rx`,
 /// `vault_rx`, `favicon_rx`, `totp_rx`), none of which can be noticed on a
 /// frame that never runs. Requested UNCONDITIONALLY at the top of the frame
@@ -629,10 +630,12 @@ pub fn build_frame(
     let remove_account_for_closure = remove_account.clone();
     let mut sync_status: Option<Result<(), String>> = None;
     // When the most recent successful sync completed, for the toolbar's
-    // sync pill ("Synced N min ago" per design spec 4.8) -- set below
-    // whenever `sync_status` transitions to `Ok(())`. A per-session value on
-    // purpose: it resets to "just now" every time this window's own
-    // auto-sync-on-open fires, so nothing here needs to survive a restart.
+    // sync pill (design spec 4.8) -- set below whenever `sync_status`
+    // transitions to `Ok(())`. A per-session value on purpose: nothing here
+    // needs to survive a restart, since this window's own auto-sync-on-open
+    // fires at the start of every session. That is NOT a bound on how large
+    // this can grow, and `synced_ago_text` used to assume it was -- a window
+    // left open across a working day reached twenty hours inside one session.
     let mut last_sync_at: Option<Instant> = None;
 
     // Outcome of a click-triggered manual sync. Backgrounded for the same
@@ -1880,7 +1883,7 @@ pub fn build_frame(
                 // after that only re-reads whatever's already local). A change
                 // made on another device otherwise wouldn't show up here until
                 // the whole app restarts, so the sync status readout itself is
-                // also the sync button -- clicking "● Synced 1 min ago" (design
+                // also the sync button -- clicking "● Synced 2m ago" (design
                 // 4.8's pill) starts a fresh sync rather than needing a separate
                 // "Sync" button beside it. Blue for success (there's no
                 // dedicated "success" green in this app's palette -- see
@@ -8811,18 +8814,30 @@ fn account_menu(
 }
 
 /// The toolbar sync pill's relative-time wording for a successful sync:
-/// "just now" for under a minute, "N min ago" beyond that. Matches
-/// `detail.rs`'s `metadata_line` relative-time pattern ("Updated N days
-/// ago"), one unit down -- minutes rather than days, since `last_sync_at` is
-/// a per-session value that resets to "just now" on every auto-sync-on-open
-/// this window already does, so hour/day granularity would never actually
-/// be reached.
+/// "just now" for under a minute, [`relative_time::ago`] beyond that.
+///
+/// **The floor is this caller's choice, and the reason is the pill.** A
+/// sync that finished nine seconds ago is, to the person reading a toolbar,
+/// simply synced; "9s ago" would also repaint a new digit every second on a
+/// surface nobody is watching for that. Above a minute the shared formatter
+/// takes over, which is where the two-unit ladder matters: `elapsed` is
+/// unbounded here.
+///
+/// **What this comment used to say, and why it was wrong.** It claimed
+/// hour and day granularity "would never actually be reached", because
+/// `last_sync_at` is per-session and resets on every auto-sync-on-open this
+/// window does. That premise described the short sessions it was written
+/// against, not the program: nothing forces a session to be short, and a
+/// window left open across a working day reported **"Syncing 1200 minutes
+/// ago"** -- twenty hours, counted in minutes, exactly the reading the
+/// comment argued was unreachable. A per-session value has no ceiling; only
+/// a habit of closing the window did, and a habit is not an invariant. The
+/// wording no longer depends on one.
 fn synced_ago_text(elapsed: Duration) -> String {
-    let minutes = elapsed.as_secs() / 60;
-    if minutes == 0 {
+    if elapsed.as_secs() < 60 {
         "just now".to_string()
     } else {
-        format!("{minutes} min ago")
+        relative_time::ago(elapsed)
     }
 }
 
@@ -10019,9 +10034,28 @@ mod synced_ago_text_tests {
     }
 
     #[test]
-    fn a_minute_or_more_reads_n_min_ago() {
-        assert_eq!(synced_ago_text(Duration::from_secs(60)), "1 min ago");
-        assert_eq!(synced_ago_text(Duration::from_secs(125)), "2 min ago");
+    fn a_minute_or_more_reads_in_the_shared_wording() {
+        assert_eq!(synced_ago_text(Duration::from_secs(60)), "1m ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(125)), "2m ago");
+    }
+
+    /// The defect: a window left open across a working day read "Syncing
+    /// 1200 minutes ago". Twenty hours has to roll into hours, and the
+    /// ceiling above that has to exist too.
+    #[test]
+    fn a_long_session_rolls_up_instead_of_counting_minutes_forever() {
+        assert_eq!(synced_ago_text(Duration::from_secs(1200 * 60)), "20h ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(20 * 3600 + 15 * 60)), "20h 15m ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(3 * 86_400 + 4 * 3600)), "3d 4h ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(400 * 86_400)), "1y 35d ago");
+    }
+
+    /// The floor is this caller's, not the formatter's: the shared function
+    /// would happily say "59s ago", and the pill deliberately does not.
+    #[test]
+    fn the_just_now_floor_is_imposed_here_and_not_by_the_formatter() {
+        assert_eq!(super::relative_time::ago(Duration::from_secs(59)), "59s ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(59)), "just now");
     }
 }
 
@@ -13583,7 +13617,7 @@ mod sync_pill_tests {
     #[test]
     fn a_clean_success_still_reads_as_one() {
         let (dot, label) = sync_pill(false, Some(&Ok(())), None, Duration::from_secs(120));
-        assert_eq!(label, "Synced 2 min ago");
+        assert_eq!(label, "Synced 2m ago");
         assert_eq!(dot, theme::BLUE);
     }
 
