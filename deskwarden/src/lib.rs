@@ -60,6 +60,10 @@ pub mod qr;
 pub mod record;
 pub mod reprompt;
 pub mod scratch_window;
+/// Copies one rectangle of the screen into a self-wiping buffer of pixels.
+/// The only OS-touching part of "scan a region of my screen"; everything
+/// downstream of it is a pure function.
+pub mod screen_capture;
 pub mod send;
 pub mod session_store;
 pub mod settings;
