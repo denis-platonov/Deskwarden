@@ -63,7 +63,7 @@ use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
-use deskwarden::{app_identity::AppIdentityCache, overlay_ui, theme};
+use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
@@ -97,6 +97,16 @@ enum Surface {
     /// and an unmasked control, which is the state that must never grow a
     /// send button.
     PreflightRefused,
+    /// The preferences window's Clipboard page, everything switched on --
+    /// four live pills, the interval field, the always-on note and the reset
+    /// button. The page 3e does not contain, so there is no drawing to
+    /// compare it against and a screenshot is the only review there is.
+    PrefsClipboard,
+    /// The same page with the master switch OFF: three greyed pills and a
+    /// greyed field, still present rather than hidden. Its own surface
+    /// because "looks disabled" is precisely the claim a picture can check
+    /// and a `contains` assertion cannot.
+    PrefsClipboardOff,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -110,6 +120,13 @@ const PANE_WIDTH: f32 = 1240.0 - 212.0 - 390.0;
 /// Tall enough that no pane below scrolls, so a screenshot is the whole
 /// surface rather than the top of it. The shipped window is 740 high.
 const PANE_HEIGHT: f32 = 740.0;
+
+/// The preferences window's body: its 1000x780 outer size less the 40pt
+/// chrome bar `draw_window_chrome` paints above `draw_prefs_body`. Spelled out
+/// rather than imported for the same reason [`PANE_WIDTH`] is -- an example is
+/// a separate crate and `WINDOW_SIZE` is private to `prefs_ui`.
+const PREFS_BODY_WIDTH: f32 = 1000.0;
+const PREFS_BODY_HEIGHT: f32 = 780.0 - 40.0;
 
 /// The detail pane's own frame, copied from the `CentralPanel` in
 /// `vault_window::mod` that hosts it: `theme::CANVAS` and
@@ -131,6 +148,8 @@ const ALL: &[Surface] = &[
     Surface::RecordComposer,
     Surface::PreflightAllowed,
     Surface::PreflightRefused,
+    Surface::PrefsClipboard,
+    Surface::PrefsClipboardOff,
 ];
 
 impl Surface {
@@ -147,6 +166,8 @@ impl Surface {
             Surface::RecordComposer => "record_composer",
             Surface::PreflightAllowed => "preflight_allowed",
             Surface::PreflightRefused => "preflight_refused",
+            Surface::PrefsClipboard => "prefs_clipboard",
+            Surface::PrefsClipboardOff => "prefs_clipboard_off",
         }
     }
 
@@ -174,6 +195,12 @@ impl Surface {
                 deskwarden::preflight_host::PREFLIGHT_WIDTH,
                 deskwarden::preflight_host::PREFLIGHT_HEIGHT,
             ),
+            // The shipped window is 1000x780 with a 40px chrome bar on top;
+            // this draws the BODY, which is what `draw_prefs_body` is, so the
+            // page lays out against exactly the width it has in the app.
+            Surface::PrefsClipboard | Surface::PrefsClipboardOff => {
+                egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT)
+            }
         }
     }
 
@@ -349,6 +376,8 @@ impl eframe::App for Preview {
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
+            Surface::PrefsClipboard => self.draw_prefs(root, true),
+            Surface::PrefsClipboardOff => self.draw_prefs(root, false),
         }
 
         if self.screenshot && !self.done {
@@ -487,6 +516,26 @@ impl Preview {
         if resized {
             self.frames = 0;
         }
+    }
+
+    /// The preferences window's Clipboard page.
+    ///
+    /// Draws `prefs_ui::draw_prefs_body` -- the real nav-plus-content shell,
+    /// not a reconstruction of it -- on the window's own background, so the
+    /// PNG shows the page exactly as the app draws it. The `PrefsState` is
+    /// rebuilt each frame rather than held: nothing on this page needs to
+    /// survive between frames for a screenshot, and a held state would make
+    /// the two surfaces share the interval field's text buffer.
+    fn draw_prefs(&mut self, root: &mut egui::Ui, master_on: bool) {
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings {
+            clear_clipboard: master_on,
+            ..deskwarden::settings::Settings::default()
+        });
+        state.show(prefs_ui::Section::Clipboard);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
     }
 
     /// The surfaces that live *inside* the vault window rather than in one of

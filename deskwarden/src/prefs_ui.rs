@@ -31,7 +31,9 @@
 //!    see [`ACCOUNT_STATUS`] for why that one cannot be shown here at all yet.
 
 use crate::login_ui::{draw_window_chrome, round_window_corners, ChromeAction};
-use crate::settings::{clamp_auto_lock_minutes, Settings};
+use crate::settings::{
+    clamp_auto_lock_minutes, parse_clipboard_minutes, ClearInterval, ClipboardEntry, Settings,
+};
 use crate::theme;
 use eframe::egui::{
     self, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke,
@@ -111,6 +113,11 @@ const STEPPER_RADIUS: u8 = 7;
 /// memory under its id, and an id derived from layout position would lose them
 /// the moment anything above the row changed height.
 const STEPPER_FIELD_ID: &str = "prefs-auto-lock-minutes";
+/// The clipboard interval's own stable id, for the same reason.
+const INTERVAL_FIELD_ID: &str = "prefs-clipboard-interval";
+/// The Reset button, wide enough for its word at 12px semibold with the
+/// breathing room 3e gives its own "+ Add app".
+const RESET_BUTTON_WIDTH: f32 = 72.0;
 
 // ---------------------------------------------------------------------------
 // Copy
@@ -192,6 +199,100 @@ const UPDATE_CHECK_DESCRIPTION: &str = "On by default. Deskwarden asks GitHub wh
      Deskwarden has been released. The request says nothing about you or your vault. Off means \
      you will not be told about fixes, including security ones, until you look yourself.";
 
+
+// --- Clipboard ------------------------------------------------------------
+
+const CLIPBOARD_MASTER_LABEL: &str = "Take copied secrets back off the clipboard";
+/// **The master switch's copy has to say what OFF means, because off is the
+/// state that withdraws a protection.** Turning this off is a real reduction
+/// in what the app does, freely chosen -- exactly like
+/// `AUTO_LOCK_ENABLED_DESCRIPTION` -- so the sentence says so plainly rather
+/// than describing the feature and leaving the cost to be inferred.
+///
+/// It also has to say what does **not** change, because that is the thing a
+/// reader will otherwise assume this pill governs: the formats that keep a
+/// copied password out of `Win+V` and off the user's other devices are
+/// unconditional and are not on this page as a control. See
+/// `CLIPBOARD_HISTORY_NOTE`, the row that says so in its own words.
+const CLIPBOARD_MASTER_DESCRIPTION: &str = "On by default. Off means a secret you copy stays on \
+     the clipboard until something else replaces it — no timer, and none of the three below. \
+     Keeping copies out of clipboard history is separate and stays on either way.";
+
+const CLIPBOARD_ON_LOCK_LABEL: &str = "Clear when the vault locks";
+/// Names all four ways the vault locks, because a user who locks by idling
+/// should not have to guess whether the Lock button is the only one meant.
+/// The fourth -- the session being invalidated elsewhere -- is described
+/// rather than named, since "needs_reauth" is not a word on any screen.
+const CLIPBOARD_ON_LOCK_DESCRIPTION: &str = "Locking by hand, from the tray, after idling, or \
+     because the session expired. Deskwarden has no separate sign-out: this switch covers all \
+     of them.";
+
+const CLIPBOARD_ON_ACCOUNT_LABEL: &str = "Clear when the account changes";
+const CLIPBOARD_ON_ACCOUNT_DESCRIPTION: &str = "Switching to another account, adding one, or \
+     removing one. A credential from the vault you have just left does not follow you to the \
+     next one.";
+
+const CLIPBOARD_ON_QUIT_LABEL: &str = "Clear when Deskwarden quits";
+/// **Says what it cannot cover**, because a switch called "when Deskwarden
+/// quits" reads as a promise about every way the process can end, and three of
+/// those ways no in-process arrangement can catch. `PRIVACY.md` makes the same
+/// admission; a page that made the stronger claim would be the one disagreeing
+/// with it.
+const CLIPBOARD_ON_QUIT_DESCRIPTION: &str = "Quitting from the tray, and shutting down to install \
+     an update. A crash, a Task Manager kill or a power cut cannot be caught, and leave the copy \
+     where it is.";
+
+const CLIPBOARD_INTERVAL_LABEL: &str = "Clear after";
+/// **States the unit, the range and the resolution**, because all three are
+/// things a user would otherwise discover by being refused. The floor is
+/// stated on screen and not only enforced, exactly as `AUTO_LOCK_DESCRIPTION`
+/// states its own.
+const CLIPBOARD_INTERVAL_DESCRIPTION: &str = "Minutes before a copied secret is taken back. \
+     Decimals are fine — 0.5 is thirty seconds, which is the shortest Deskwarden will use, and \
+     60 minutes the longest. One decimal place.";
+
+/// The row that exists to say a thing is **not** a setting.
+///
+/// It is a plain text row with no control, like About's account line, and that
+/// is the point: a disabled toggle would read as a feature that is present and
+/// broken, and leaving it off the page entirely would let "everything on this
+/// page is switchable" be read as a promise about the whole module. The
+/// argument for it being unconditional is in `clipboard.rs`'s own header and
+/// in `PRIVACY.md`; this is the one-sentence version, on the page where
+/// somebody would go looking for the switch.
+const CLIPBOARD_HISTORY_LABEL: &str = "Clipboard history and sync are always excluded";
+const CLIPBOARD_HISTORY_NOTE: &str = "A secret you copy is kept out of Windows clipboard history \
+     (Win+V) and is never synced to your other devices. This has no setting and is not affected \
+     by anything above — there is no version of it worth turning off.";
+
+const CLIPBOARD_RESET_LABEL: &str = "Reset to default";
+/// Says the scope, because "reset to default" on a page inside a preferences
+/// window is otherwise ambiguous between this page and the app. It also says
+/// what the defaults *are*, so the button's effect is legible before it is
+/// pressed rather than only after.
+const CLIPBOARD_RESET_DESCRIPTION: &str = "Puts the five settings on this page back to how they \
+     ship — everything on, one minute. Nothing on any other page is touched, and there is no \
+     confirmation because setting them again is the same five clicks.";
+const CLIPBOARD_RESET_BUTTON: &str = "Reset";
+
+/// What the interval field says when it refuses an entry.
+///
+/// One sentence per refusal, rather than one shared "invalid": the whole
+/// reason `settings::ClipboardEntry` has four variants is that `soon`, `0.1`,
+/// `90` and `1.25` are wrong in four different ways and a user who typed one
+/// of them needs to be told which.
+///
+/// The refused entry is **not** applied, so the value in effect is still the
+/// one shown a moment ago -- which is why every one of these says what the
+/// field wants rather than only what it got.
+const CLIPBOARD_ENTRY_NOT_A_NUMBER: &str = "Type a number of minutes, like 1 or 0.5.";
+const CLIPBOARD_ENTRY_BELOW_FLOOR: &str =
+    "0.5 minutes (thirty seconds) is the shortest — below that the clipboard expires before a \
+     slow sign-in page is ready.";
+const CLIPBOARD_ENTRY_ABOVE_CEILING: &str =
+    "60 minutes is the longest. To stop clearing altogether, use the switch at the top.";
+const CLIPBOARD_ENTRY_BETWEEN_STEPS: &str = "One decimal place — 1.5, not 1.25.";
+
 const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
     "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
@@ -234,25 +335,40 @@ const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account
 // Sections
 // ---------------------------------------------------------------------------
 
-/// The seven pages 3e's nav lists, in its order.
+/// The eight pages the nav lists, in its order.
+///
+/// **Clipboard is the one page 3e does not contain.** 3e lists seven sections
+/// and none of them is about the clipboard, because 3e was drawn before this
+/// app took a copied secret back off it. It is a page of its own rather than a
+/// group on an existing one, for two reasons. It carries five controls, which
+/// is more than any neighbour-group on General and would bury them under the
+/// seven rows already there. And Security is a [`draw_not_yet`] page whose
+/// entire content is a sentence saying nothing on it is configurable, so
+/// putting five live controls there would mean inventing a Security page 3e
+/// also does not contain -- the same work, with the section named wrongly.
+///
+/// It sits **directly after Security**, which is where a reader looking for
+/// "what happens to my password after I copy it" looks second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     General,
     Autofill,
     NativeApps,
     Security,
+    Clipboard,
     Shortcuts,
     SyncAndAccount,
     About,
 }
 
 impl Section {
-    /// 3e's nav, top to bottom.
-    pub const ALL: [Section; 7] = [
+    /// The nav, top to bottom.
+    pub const ALL: [Section; 8] = [
         Section::General,
         Section::Autofill,
         Section::NativeApps,
         Section::Security,
+        Section::Clipboard,
         Section::Shortcuts,
         Section::SyncAndAccount,
         Section::About,
@@ -266,6 +382,7 @@ impl Section {
             Section::Autofill => "Autofill",
             Section::NativeApps => "Native apps",
             Section::Security => "Security",
+            Section::Clipboard => "Clipboard",
             Section::Shortcuts => "Shortcuts",
             Section::SyncAndAccount => "Sync & account",
             Section::About => "About",
@@ -282,6 +399,11 @@ impl Section {
             }
             Section::NativeApps => "The applications Deskwarden fills credentials into.",
             Section::Security => "What Deskwarden asks for before it reveals or fills a secret.",
+            // Says *taken back*, not "cleared", and names the copy rather than
+            // the clipboard: the page is about the second half of
+            // `clipboard.rs` and not about the history exclusion, which has no
+            // switch and appears on this page only as a line saying so.
+            Section::Clipboard => "When a secret you have copied is taken back off the clipboard.",
             Section::Shortcuts => "The keys that reach Deskwarden from anywhere.",
             Section::SyncAndAccount => "The Bitwarden account this vault comes from.",
             Section::About => "Which build of Deskwarden this is.",
@@ -303,6 +425,23 @@ pub struct PrefsState {
     /// way to "45". It is reconciled back to the committed value the moment the
     /// field loses focus (see [`minutes_stepper`]).
     auto_lock_text: String,
+    /// The same thing for the clipboard interval, and for the same reason:
+    /// mid-edit the field may be empty, or `"0."` on the way to `"0.5"`.
+    ///
+    /// Separate from [`Self::auto_lock_text`] rather than shared, because the
+    /// two fields are on different pages and both keep their own committed
+    /// value; one buffer would mean typing into one and finding the other had
+    /// moved.
+    clipboard_interval_text: String,
+    /// Why the last entry into the interval field was refused, or `None` if
+    /// nothing has been refused since.
+    ///
+    /// **Kept in state rather than recomputed each frame** because it is about
+    /// an *event* -- the moment the field lost focus with something
+    /// unacceptable in it -- and not about the current text. Recomputing it
+    /// would put the message on screen while the user was still typing `0.` on
+    /// the way to `0.5`, which is scolding them for not having finished.
+    clipboard_entry_error: Option<&'static str>,
 }
 
 impl PrefsState {
@@ -319,13 +458,33 @@ impl PrefsState {
     /// opening Preferences on such a file makes `edited != settings` true in
     /// `main.rs` and writes the corrected value back, which is the right
     /// outcome: the file then says what the app is doing.
+    /// The clipboard interval is clamped up front for the same reason and with
+    /// the same cost: a hand-edited `clear_clipboard_seconds: 14400` would
+    /// otherwise be displayed as four hours while the app cleared after one,
+    /// and this window would be showing a number that is not the number in
+    /// effect. Opening Preferences on such a file writes the corrected value
+    /// back, which is the right outcome -- the file then says what the app is
+    /// doing.
     pub fn new(settings: Settings) -> Self {
         let minutes = clamp_auto_lock_minutes(settings.auto_lock_minutes);
+        let interval = ClearInterval::from_seconds(settings.clear_clipboard_seconds);
         Self {
-            settings: Settings { auto_lock_minutes: minutes, ..settings },
+            settings: Settings {
+                auto_lock_minutes: minutes,
+                clear_clipboard_seconds: interval.seconds(),
+                ..settings
+            },
             section: Section::General,
             auto_lock_text: minutes.to_string(),
+            clipboard_interval_text: interval.as_minutes_text(),
+            clipboard_entry_error: None,
         }
+    }
+
+    /// Which page is open. Used by the screenshot job (`examples/ui_preview`),
+    /// which has to be able to open a page nobody has clicked on.
+    pub fn show(&mut self, section: Section) {
+        self.section = section;
     }
 }
 
@@ -556,7 +715,14 @@ fn step_button(ui: &mut Ui, rect: Rect, glyph: &str, enabled: bool) -> bool {
 
 /// Nav column and content pane. Split out of [`run`] so the tests can drive
 /// real frames of it without opening a window.
-fn draw_prefs_body(ui: &mut Ui, state: &mut PrefsState) {
+///
+/// **Public for the screenshot job** (`examples/ui_preview`), which is a
+/// separate crate and has to be able to draw a page of this window without
+/// opening one. A settings page nobody has looked at is exactly what that job
+/// exists to catch, and six tests in this crate have been found structurally
+/// blind to what they appeared to check -- a picture is the honest oracle for
+/// layout.
+pub fn draw_prefs_body(ui: &mut Ui, state: &mut PrefsState) {
     let full = ui.max_rect();
     let nav = Rect::from_min_max(full.min, Pos2::new(full.min.x + NAV_WIDTH, full.max.y));
     let content = Rect::from_min_max(Pos2::new(nav.max.x, full.min.y), full.max);
@@ -661,6 +827,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             ui,
             "Auto-lock is on the General page. Nothing else here is configurable yet.",
         ),
+        Section::Clipboard => draw_clipboard(ui, state),
         Section::Shortcuts => draw_shortcuts(ui),
         Section::SyncAndAccount => draw_not_yet(
             ui,
@@ -910,6 +1077,368 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.check_for_updates,
         );
     });
+}
+
+
+/// A [`toggle_row`] that can be switched off, for a child of a master switch.
+///
+/// **Disabled means disabled, not merely painted grey.** The pill senses no
+/// click, sets no hover cursor, and is drawn at
+/// [`theme::toggle_pill_disabled`]'s greyed treatment; the row's text is
+/// ghosted so the whole row reads as inert rather than only its control. That
+/// is the pair `minutes_stepper` already keeps together and the pair this
+/// codebase keeps having to reunite -- "looks disabled" and "is disabled".
+///
+/// **The row is greyed, never hidden.** A child that vanished when its master
+/// switch went off would reflow the card on every click, would hide the value
+/// it is about to restore, and -- worst of the three -- would teach the user
+/// nothing about what the master switch just did. Three rows going grey says
+/// "these are what I turned off"; three rows disappearing says nothing at all.
+///
+/// The returned value is unchanged when `enabled` is false, so an off master
+/// switch cannot have its children edited out from under it by a stray click.
+fn child_toggle_row(
+    ui: &mut Ui,
+    label: &str,
+    description: &str,
+    value: bool,
+    enabled: bool,
+) -> bool {
+    if enabled {
+        return toggle_row(ui, label, description, value);
+    }
+    control_row_ghosted(ui, label, description, |ui| {
+        let (rect, _) = ui.allocate_exact_size(TOGGLE_SIZE, Sense::hover());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            theme::toggle_pill_disabled(ui, value);
+        });
+    });
+    value
+}
+
+/// [`control_row`] with the text column ghosted -- the disabled twin, sharing
+/// its layout exactly rather than approximating it.
+fn control_row_ghosted(
+    ui: &mut Ui,
+    label: &str,
+    description: &str,
+    control: impl FnOnce(&mut Ui),
+) {
+    card_row(ui, |ui| {
+        let text_width = (ui.available_width() - CONTROL_COLUMN_WIDTH - ROW_GAP).max(1.0);
+        let origin = ui.cursor().min;
+        let text = ui.allocate_ui_with_layout(
+            Vec2::new(text_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(text_width);
+                row_text_ghosted(ui, label, description);
+            },
+        );
+        let height = text.response.rect.height().max(CONTROL_MIN_HEIGHT);
+        let control_rect = Rect::from_min_size(
+            Pos2::new(origin.x + text_width + ROW_GAP, origin.y),
+            Vec2::new(CONTROL_COLUMN_WIDTH, height),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(control_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            control,
+        );
+    });
+}
+
+/// [`row_text`] in the greyed treatment: `TEXT_GHOST` for both lines, which is
+/// the grey `minutes_stepper` already uses for its disabled digits and
+/// `step_button` for its disabled glyphs. No new colour is introduced.
+fn row_text_ghosted(ui: &mut Ui, label: &str, description: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        ui.label(theme::semibold(label, 14.0).color(theme::TEXT_GHOST));
+        ui.label(
+            RichText::new(description)
+                .size(12.0)
+                .color(theme::TEXT_GHOST),
+        );
+    });
+}
+
+/// A row with no control at all: a statement, not a setting.
+///
+/// Used for `CLIPBOARD_HISTORY_NOTE`, and shaped exactly like About's account
+/// line -- the same `card_row` plus `row_text`, no trailing column. A row with
+/// an empty right-hand column would read as a field that failed to load, and a
+/// *disabled* toggle would read as a feature that is present and broken. It is
+/// neither: it is a thing that is always on and always will be.
+fn note_row(ui: &mut Ui, label: &str, note: &str) {
+    card_row(ui, |ui| row_text(ui, label, note));
+}
+
+fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
+    // **The whole page's enable state is one value, read once**, and it comes
+    // from `settings::clipboard_clearing` -- the same pure function the
+    // clipboard module is configured from. There is no second opinion here
+    // about what the master switch means: if this page and that module could
+    // disagree, the page would be the thing lying.
+    let live = state.settings.clipboard_clearing();
+    let children_enabled = state.settings.clear_clipboard;
+    debug_assert_eq!(
+        children_enabled,
+        live.interval_is_live(),
+        "the page and `clipboard_clearing` disagree about the master switch"
+    );
+
+    card(ui, |ui| {
+        // The master switch first, and always live: it is the one control on
+        // this page nothing else can grey out.
+        state.settings.clear_clipboard = toggle_row(
+            ui,
+            CLIPBOARD_MASTER_LABEL,
+            CLIPBOARD_MASTER_DESCRIPTION,
+            state.settings.clear_clipboard,
+        );
+        row_separator(ui);
+        // The three triggers, in the order they appear in a session: the
+        // vault locks, the account changes, the app quits. Not in order of
+        // how likely they are to be turned off, which nobody knows.
+        state.settings.clear_clipboard_on_lock = child_toggle_row(
+            ui,
+            CLIPBOARD_ON_LOCK_LABEL,
+            CLIPBOARD_ON_LOCK_DESCRIPTION,
+            state.settings.clear_clipboard_on_lock,
+            children_enabled,
+        );
+        row_separator(ui);
+        state.settings.clear_clipboard_on_account_change = child_toggle_row(
+            ui,
+            CLIPBOARD_ON_ACCOUNT_LABEL,
+            CLIPBOARD_ON_ACCOUNT_DESCRIPTION,
+            state.settings.clear_clipboard_on_account_change,
+            children_enabled,
+        );
+        row_separator(ui);
+        state.settings.clear_clipboard_on_quit = child_toggle_row(
+            ui,
+            CLIPBOARD_ON_QUIT_LABEL,
+            CLIPBOARD_ON_QUIT_DESCRIPTION,
+            state.settings.clear_clipboard_on_quit,
+            children_enabled,
+        );
+        row_separator(ui);
+        // The interval last of the four, because it is the weakest of them --
+        // the three above are moments the user has *said* they are finished,
+        // and this one is a guess. `clipboard.rs`'s own doc ranks them the
+        // same way and for the same reason.
+        interval_row(ui, state, children_enabled);
+    });
+
+    // **A second card, not a fifth row.** The reset button acts on the card
+    // above rather than sitting in it, and a row inside it would read as a
+    // fifth setting -- one that is somehow always on. The note about clipboard
+    // history joins it because it is the other thing on this page that is not
+    // a setting.
+    card(ui, |ui| {
+        note_row(ui, CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_NOTE);
+        row_separator(ui);
+        // Always live, including while the master switch is off: "put this
+        // page back" is exactly what a user who has switched everything off
+        // and changed their mind wants, and a reset button that greyed out
+        // with the thing it resets would be unreachable from the state you
+        // most want to leave.
+        control_row(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_DESCRIPTION, |ui| {
+            if reset_button(ui) {
+                // The whole of the button's behaviour is one pure function on
+                // `Settings`, so "this resets the section and nothing else" is
+                // a property a test constructs rather than one it observes by
+                // clicking. See `Settings::with_default_clipboard_clearing`.
+                state.settings = state.settings.with_default_clipboard_clearing();
+                // The field's buffer and any refusal message follow the value,
+                // or the row would keep showing the number the user just
+                // reset away from.
+                state.clipboard_interval_text =
+                    ClearInterval::from_seconds(state.settings.clear_clipboard_seconds)
+                        .as_minutes_text();
+                state.clipboard_entry_error = None;
+            }
+        });
+    });
+}
+
+/// The interval row: the field, and under it whatever the last refused entry
+/// has to be told to the user.
+///
+/// The message is drawn *inside* the row's text column rather than as a row of
+/// its own, so it appears attached to the field it is about and the card does
+/// not change height by a whole row when an entry is refused.
+fn interval_row(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
+    let description = state
+        .clipboard_entry_error
+        .map_or(CLIPBOARD_INTERVAL_DESCRIPTION, |error| error);
+    // Two calls rather than a function pointer chosen up front: the two row
+    // helpers take a closure, and a `let row = if .. { control_row } else
+    // { control_row_ghosted }` cannot be given a type general enough over
+    // the closure's lifetime.
+    if enabled {
+        control_row(ui, CLIPBOARD_INTERVAL_LABEL, description, |ui| {
+            interval_field(ui, state, true);
+        });
+    } else {
+        control_row_ghosted(ui, CLIPBOARD_INTERVAL_LABEL, description, |ui| {
+            interval_field(ui, state, false);
+        });
+    }
+}
+
+/// The text field itself, in the same box `minutes_stepper` paints -- but
+/// without the `-`/`+` cells.
+///
+/// **No stepper here, and that is a decision rather than an omission.** The
+/// auto-lock control steps in whole minutes and its range is unbounded above,
+/// so `-`/`+` is the natural way to move it. This range is 0.5 to 60 in tenths
+/// of a minute: 596 steps, which no one is going to press their way across,
+/// and a `+` from 0.5 would land on 0.6, a value almost nobody wants. Typing
+/// is the operation this field is for, so typing is the whole of it.
+fn interval_field(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(STEPPER_VALUE_WIDTH + STEPPER_STEP_WIDTH, STEPPER_HEIGHT),
+        Sense::hover(),
+    );
+    // The same two greys `minutes_stepper` uses for its disabled state, so the
+    // two numeric controls in this window are disabled in the same visual
+    // language. No new colour.
+    let (fill, border) = if enabled {
+        (theme::CARD, theme::BORDER_STRONG)
+    } else {
+        (theme::CANVAS, theme::HAIRLINE)
+    };
+    ui.painter().rect(
+        outer,
+        CornerRadius::same(STEPPER_RADIUS),
+        fill,
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
+
+    let committed = ClearInterval::from_seconds(state.settings.clear_clipboard_seconds);
+    if !enabled {
+        // A painted galley, not a read-only `TextEdit`, for the reason
+        // `minutes_stepper` gives at length: egui's read-only text edit still
+        // takes focus, still shows a caret and still accepts a click, which is
+        // precisely the "greyed out but secretly live" state this must not be.
+        // There is no widget here at all.
+        let galley = ui.painter().layout_no_wrap(
+            committed.as_minutes_text(),
+            FontId::new(12.0, FontFamily::Proportional),
+            theme::TEXT_GHOST,
+        );
+        ui.painter().galley(
+            Pos2::new(
+                outer.center().x - galley.size().x / 2.0,
+                outer.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            theme::TEXT_GHOST,
+        );
+        // Kept in step with the committed value while the control is off, so
+        // turning the master switch back on hands the live field the number
+        // that has been on screen all along rather than a stale fragment.
+        state.clipboard_interval_text = committed.as_minutes_text();
+        return;
+    }
+
+    // Placed by hand from the same `layout_no_wrap` measurement the greyed
+    // branch uses, so the two branches agree BY CONSTRUCTION rather than by
+    // coincidence -- see `minutes_stepper`, where the 6pt disagreement between
+    // a centred `TextEdit` and a centred galley was the bug report.
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(
+            state.clipboard_interval_text.clone(),
+            FontId::new(12.0, FontFamily::Proportional),
+            theme::INK,
+        )
+        .size()
+        .x;
+    let inner = outer.shrink(4.0);
+    let entry = ui.put(
+        Rect::from_min_max(
+            Pos2::new(outer.center().x - text_width / 2.0, inner.min.y),
+            inner.max,
+        ),
+        egui::TextEdit::singleline(&mut state.clipboard_interval_text)
+            .id(egui::Id::new(INTERVAL_FIELD_ID))
+            .frame(egui::Frame::new())
+            .font(FontId::new(12.0, FontFamily::Proportional))
+            .horizontal_align(egui::Align::Min)
+            .vertical_align(egui::Align::Center)
+            .margin(Margin::ZERO),
+    );
+
+    // **Committed on losing focus, and only then.** Judging every keystroke
+    // would refuse `0.` on the way to `0.5` and refuse an empty field the
+    // moment the user selected all and started again.
+    if entry.lost_focus() {
+        match parse_clipboard_minutes(&state.clipboard_interval_text) {
+            ClipboardEntry::Accepted(interval) => {
+                state.settings.clear_clipboard_seconds = interval.seconds();
+                state.clipboard_entry_error = None;
+                // Normalised, so `1,5` and `1.50` come back as `1.5` -- the
+                // field then shows the value in the form the app stores it,
+                // and the two cannot appear to disagree.
+                state.clipboard_interval_text = interval.as_minutes_text();
+            }
+            // **A refusal leaves the committed value exactly where it was**
+            // and puts the reason under the field. The text is deliberately
+            // NOT reverted: the user is looking at what they typed while
+            // reading why it was not taken, and silently replacing it would
+            // hide the thing being explained.
+            ClipboardEntry::NotANumber => {
+                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_NOT_A_NUMBER);
+            }
+            ClipboardEntry::BelowFloor => {
+                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_BELOW_FLOOR);
+            }
+            ClipboardEntry::AboveCeiling => {
+                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_ABOVE_CEILING);
+            }
+            ClipboardEntry::BetweenSteps => {
+                state.clipboard_entry_error = Some(CLIPBOARD_ENTRY_BETWEEN_STEPS);
+            }
+        }
+    }
+}
+
+/// The Reset button: 3e's segmented-control box at button size, with the
+/// label centred in it. Built from 3e's own parts, like the stepper, since
+/// 3e's only button of this shape is its "+ Add app".
+fn reset_button(ui: &mut Ui) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(RESET_BUTTON_WIDTH, STEPPER_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        if response.hovered() { theme::CANVAS } else { theme::CARD },
+        Stroke::new(1.0, theme::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        CLIPBOARD_RESET_BUTTON.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::TEXT_SECONDARY,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT_SECONDARY,
+    );
+    response.clicked()
 }
 
 fn draw_shortcuts(ui: &mut Ui) {
@@ -1388,6 +1917,25 @@ mod tests {
             first.clone()
         }
 
+        /// The one painted run of exactly this text **in the nav column**.
+        ///
+        /// Needed because the open section's label is painted twice -- once
+        /// as its nav row and once as the content pane's heading, which use
+        /// the same word deliberately -- so `ink_of` refuses it. The nav is
+        /// everything left of `NAV_WIDTH`, which is a layout constant rather
+        /// than a guess at where the column ends.
+        fn nav_ink_of(&self, needle: &str) -> TextInk {
+            let mut found = self
+                .ink
+                .iter()
+                .filter(|i| i.source == needle && i.rect.max.x < NAV_WIDTH);
+            let first = found.next().unwrap_or_else(|| {
+                panic!("{needle:?} was never painted in the nav; got {:?}", self.strings())
+            });
+            assert!(found.next().is_none(), "{needle:?} was painted twice in the nav");
+            first.clone()
+        }
+
         fn count_filled(&self, fill: egui::Color32) -> usize {
             self.rects.iter().filter(|r| r.fill == fill).count()
         }
@@ -1525,22 +2073,48 @@ mod tests {
     #[test]
     fn every_nav_section_design_3e_lists_is_painted() {
         let painted = paint(Section::General);
-        // The seven labels, spelled out rather than looped over `Section::ALL`:
-        // a test that re-derives its expectation from the enum under test
-        // would still pass if a section were renamed, removed, or added.
-        for label in [
+        // The eight labels, spelled out rather than looped over
+        // `Section::ALL`: a test that re-derives its expectation from the
+        // enum under test would still pass if a section were renamed,
+        // removed, or added.
+        //
+        // **In order, and with the length asserted.** This used to be a bag
+        // of `contains` calls, which is a shape that cannot notice a section
+        // being ADDED -- adding Clipboard passed it untouched. Order matters
+        // because the nav is a reading order and Clipboard belongs after
+        // Security; the length matters because it is the half a `contains`
+        // loop is structurally blind to.
+        let expected = [
             "General",
             "Autofill",
             "Native apps",
             "Security",
+            "Clipboard",
             "Shortcuts",
             "Sync & account",
             "About",
-        ] {
+        ];
+        for label in expected {
             assert!(
                 painted.contains(label),
                 "nav row {label:?} was not painted; got {:?}",
                 painted.strings()
+            );
+        }
+        assert_eq!(
+            Section::ALL.len(),
+            expected.len(),
+            "a section was added or removed without this list being re-pinned"
+        );
+        // Top to bottom, by the painted y of each label's ink.
+        for pair in expected.windows(2) {
+            let above = painted.nav_ink_of(pair[0]).rect;
+            let below = painted.nav_ink_of(pair[1]).rect;
+            assert!(
+                above.top() < below.top(),
+                "the nav lists {:?} above {:?}, which is not the reading order",
+                pair[1],
+                pair[0]
             );
         }
     }
@@ -2439,6 +3013,381 @@ mod tests {
         let minus = first.rect_of("-").center();
         frame(&ctx, &mut state, &click(minus));
         assert_eq!(state.settings.auto_lock_minutes, 1);
+    }
+
+
+    // -- Clipboard ---------------------------------------------------------
+
+    /// One clipboard preference, read off a `Settings`. A named type because
+    /// the tables below hold arrays of these and the inline form is a
+    /// `clippy::type_complexity` warning rather than something anyone reads.
+    type ReadClipboardField = fn(&Settings) -> bool;
+
+    /// A clipboard page over given settings, and the state that drew it, so a
+    /// test can click and then read the value back.
+    fn clipboard_state(settings: Settings) -> PrefsState {
+        let mut state = PrefsState::new(settings);
+        state.show(Section::Clipboard);
+        state
+    }
+
+    #[test]
+    fn the_clipboard_page_paints_every_control_and_its_reasoning() {
+        let painted = paint(Section::Clipboard);
+        for text in [
+            CLIPBOARD_MASTER_LABEL,
+            CLIPBOARD_MASTER_DESCRIPTION,
+            CLIPBOARD_ON_LOCK_LABEL,
+            CLIPBOARD_ON_LOCK_DESCRIPTION,
+            CLIPBOARD_ON_ACCOUNT_LABEL,
+            CLIPBOARD_ON_ACCOUNT_DESCRIPTION,
+            CLIPBOARD_ON_QUIT_LABEL,
+            CLIPBOARD_ON_QUIT_DESCRIPTION,
+            CLIPBOARD_INTERVAL_LABEL,
+            CLIPBOARD_INTERVAL_DESCRIPTION,
+            CLIPBOARD_HISTORY_LABEL,
+            CLIPBOARD_HISTORY_NOTE,
+            CLIPBOARD_RESET_LABEL,
+            CLIPBOARD_RESET_DESCRIPTION,
+            CLIPBOARD_RESET_BUTTON,
+        ] {
+            assert!(
+                painted.contains(text),
+                "{text:?} was not painted; got {:?}",
+                painted.strings()
+            );
+        }
+        // The default interval, in minutes, is on screen -- so the field shows
+        // the value in effect rather than an empty box.
+        assert!(painted.contains("1"), "got {:?}", painted.strings());
+
+        // Four pills and no more: the master switch and the three triggers.
+        // The interval is a field and the reset is a button, so neither may
+        // paint a pill.
+        assert_eq!(
+            painted.count_of_size(TOGGLE_SIZE),
+            4,
+            "the clipboard card no longer paints exactly four pills"
+        );
+    }
+
+    /// **The copy has to say the three things a reader would otherwise have to
+    /// guess**, so these are pinned as claims rather than left to whoever next
+    /// edits a string.
+    #[test]
+    fn the_clipboard_copy_states_the_floor_the_ceiling_and_what_is_not_switchable() {
+        assert!(
+            CLIPBOARD_INTERVAL_DESCRIPTION.contains("0.5")
+                && CLIPBOARD_INTERVAL_DESCRIPTION.contains("thirty seconds"),
+            "the floor has to be stated on screen, in both forms, not only enforced"
+        );
+        assert!(
+            CLIPBOARD_INTERVAL_DESCRIPTION.contains("60 minutes"),
+            "the ceiling has to be stated on screen, or a user meets it by being refused"
+        );
+        assert!(
+            CLIPBOARD_INTERVAL_DESCRIPTION.contains("One decimal place"),
+            "the resolution has to be stated, or `1.25` is refused for an unstated reason"
+        );
+        assert!(
+            CLIPBOARD_MASTER_DESCRIPTION.contains("Off means"),
+            "the master switch's copy has to say what OFF does -- off is the state that \
+             withdraws a protection"
+        );
+        assert!(
+            CLIPBOARD_MASTER_DESCRIPTION.contains("clipboard history")
+                && CLIPBOARD_HISTORY_NOTE.contains("no setting"),
+            "the history exclusion has to be named as always-on in both places, or this page \
+             reads as governing it"
+        );
+        assert!(
+            CLIPBOARD_ON_QUIT_DESCRIPTION.contains("crash")
+                && CLIPBOARD_ON_QUIT_DESCRIPTION.contains("power cut"),
+            "the quit switch has to say what it cannot cover, or it promises more than \
+             PRIVACY.md does"
+        );
+        assert!(
+            CLIPBOARD_ON_LOCK_DESCRIPTION.contains("no separate sign-out"),
+            "the lock switch has to say it is also the logout case, since there is no logout \
+             switch and a reader will look for one"
+        );
+        assert!(
+            CLIPBOARD_RESET_DESCRIPTION.contains("Nothing on any other page"),
+            "the reset button has to state its scope, or `Reset to default` inside a \
+             preferences window is ambiguous between this page and the app"
+        );
+    }
+
+    /// **Each of the four pills is wired to its own field**, top to bottom.
+    /// A pill that is painted but whose value is never written back is
+    /// decoration, and that is this codebase's most-repeated defect.
+    #[test]
+    fn every_clipboard_pill_writes_its_own_setting_back() {
+        // Master, lock, account change, quit -- in the order they are painted.
+        let fields: [(&str, ReadClipboardField); 4] = [
+            ("the master switch", |s| s.clear_clipboard),
+            ("the lock trigger", |s| s.clear_clipboard_on_lock),
+            ("the account-change trigger", |s| s.clear_clipboard_on_account_change),
+            ("the quit trigger", |s| s.clear_clipboard_on_quit),
+        ];
+        // The master switch is index 0 and turning it off greys the other
+        // three, so each index is exercised from a fresh state.
+        for (index, (what, read)) in fields.iter().enumerate() {
+            let ctx = styled_context();
+            let mut state = clipboard_state(Settings::default());
+            let first = frame(&ctx, &mut state, &[]);
+            let pills = first.rects_of_size(TOGGLE_SIZE);
+            assert_eq!(pills.len(), 4, "the clipboard card no longer paints four pills");
+            assert!(read(&state.settings), "{what}: the premise is that it starts on");
+
+            frame(&ctx, &mut state, &click(pills[index].center()));
+            assert!(!read(&state.settings), "{what} was not turned off -- the pill is decoration");
+            // ...and back, so the pill toggles rather than only ever clearing.
+            let after = frame(&ctx, &mut state, &[]);
+            let pills = after.rects_of_size(TOGGLE_SIZE);
+            frame(&ctx, &mut state, &click(pills[index].center()));
+            assert!(read(&state.settings), "{what} could not be turned back on");
+
+            // The control that makes the index meaningful: the OTHER three
+            // fields are untouched by this click, so the pills are not all
+            // wired to one field.
+            let mut state = clipboard_state(Settings::default());
+            let first = frame(&ctx, &mut state, &[]);
+            let pills = first.rects_of_size(TOGGLE_SIZE);
+            frame(&ctx, &mut state, &click(pills[index].center()));
+            for (other_index, (other, other_read)) in fields.iter().enumerate() {
+                if other_index != index {
+                    assert!(
+                        other_read(&state.settings),
+                        "clicking {what} also changed {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The master switch off greys the three triggers and the interval, and
+    /// they do not respond to clicks.** "Looks disabled" and "is disabled" are
+    /// the pair this codebase keeps having to reunite, so both halves are
+    /// asserted.
+    #[test]
+    fn the_master_switch_off_disables_the_children_without_hiding_them() {
+        let ctx = styled_context();
+        let mut state = clipboard_state(Settings { clear_clipboard: false, ..Settings::default() });
+        let painted = frame(&ctx, &mut state, &[]);
+
+        // Still there, all four rows -- greyed, not removed. A row that
+        // vanished would reflow the card and hide the value it is about to
+        // restore.
+        for text in [
+            CLIPBOARD_ON_LOCK_LABEL,
+            CLIPBOARD_ON_ACCOUNT_LABEL,
+            CLIPBOARD_ON_QUIT_LABEL,
+            CLIPBOARD_INTERVAL_LABEL,
+        ] {
+            assert!(painted.contains(text), "{text:?} vanished when the master switch went off");
+        }
+        assert_eq!(
+            painted.count_of_size(TOGGLE_SIZE),
+            4,
+            "a pill was removed rather than disabled"
+        );
+
+        // And they are inert: a click on each child pill changes nothing.
+        let pills = painted.rects_of_size(TOGGLE_SIZE);
+        let children: [(usize, &str, ReadClipboardField); 3] = [
+            (1, "the lock trigger", |s| s.clear_clipboard_on_lock),
+            (2, "the account-change trigger", |s| s.clear_clipboard_on_account_change),
+            (3, "the quit trigger", |s| s.clear_clipboard_on_quit),
+        ];
+        for (index, what, read) in children {
+            frame(&ctx, &mut state, &click(pills[index].center()));
+            assert!(
+                read(&state.settings),
+                "{what} responded to a click while the master switch was off"
+            );
+        }
+
+        // The pair: the master switch itself is NOT disabled, so the page is
+        // not simply inert.
+        frame(&ctx, &mut state, &click(pills[0].center()));
+        assert!(
+            state.settings.clear_clipboard,
+            "the master switch disabled itself, leaving the page unreachable"
+        );
+    }
+
+    /// **Typing a fractional number of minutes commits the right whole number
+    /// of seconds**, and the field then shows the value back in its normal
+    /// form. This is the seam between the parser and the stored value.
+    #[test]
+    fn the_interval_field_commits_what_was_typed_as_seconds() {
+        for (typed, seconds, shown) in [
+            ("0.5", 30_u64, "0.5"),
+            ("1,5", 90, "1.5"),
+            ("2", 120, "2"),
+            ("60", 3600, "60"),
+        ] {
+            let ctx = styled_context();
+            let mut state = clipboard_state(Settings::default());
+            let first = frame(&ctx, &mut state, &[]);
+            let field = first.rect_of("1").center();
+            // Click into it, select all, type, then click away so it commits.
+            frame(&ctx, &mut state, &click(field));
+            state.clipboard_interval_text = typed.to_owned();
+            frame(&ctx, &mut state, &[]);
+            let away = Pos2::new(NAV_WIDTH / 2.0, 4.0);
+            frame(&ctx, &mut state, &click(away));
+
+            assert_eq!(
+                state.settings.clear_clipboard_seconds, seconds,
+                "typing {typed:?} did not commit {seconds} seconds"
+            );
+            assert_eq!(
+                state.clipboard_interval_text, shown,
+                "after committing {typed:?} the field does not show the stored value"
+            );
+            assert_eq!(state.clipboard_entry_error, None, "{typed:?} was refused");
+        }
+    }
+
+    /// **A refused entry leaves the stored value alone and says why**, with a
+    /// different sentence for each way of being wrong.
+    #[test]
+    fn a_refused_interval_entry_keeps_the_old_value_and_names_the_reason() {
+        for (typed, reason) in [
+            ("soon", CLIPBOARD_ENTRY_NOT_A_NUMBER),
+            ("0.1", CLIPBOARD_ENTRY_BELOW_FLOOR),
+            ("90", CLIPBOARD_ENTRY_ABOVE_CEILING),
+            ("1.25", CLIPBOARD_ENTRY_BETWEEN_STEPS),
+        ] {
+            let ctx = styled_context();
+            let mut state = clipboard_state(Settings::default());
+            let first = frame(&ctx, &mut state, &[]);
+            frame(&ctx, &mut state, &click(first.rect_of("1").center()));
+            state.clipboard_interval_text = typed.to_owned();
+            frame(&ctx, &mut state, &[]);
+            frame(&ctx, &mut state, &click(Pos2::new(NAV_WIDTH / 2.0, 4.0)));
+            // The row's text is laid out before the field is drawn, so the
+            // refusal lands one frame after the click that caused it. egui
+            // repaints on a focus change, so this is a frame the user never
+            // sees -- but it is a frame, and the test has to draw it rather
+            // than pretend the message is synchronous.
+            let painted = frame(&ctx, &mut state, &[]);
+
+            assert_eq!(
+                state.settings.clear_clipboard_seconds, 60,
+                "{typed:?} was refused but the stored interval moved anyway"
+            );
+            assert_eq!(state.clipboard_entry_error, Some(reason), "{typed:?}");
+            assert!(
+                painted.contains(reason),
+                "{typed:?} was refused but the reason is not on screen; got {:?}",
+                painted.strings()
+            );
+            // The refused text is left in the field, so the user can see the
+            // thing being explained.
+            assert_eq!(state.clipboard_interval_text, typed);
+        }
+    }
+
+    /// **Reset puts this page back and touches nothing else**, driven through
+    /// a real click so the button is wired rather than merely painted.
+    #[test]
+    fn the_reset_button_restores_this_page_and_no_other_setting() {
+        let ctx = styled_context();
+        let mut state = clipboard_state(Settings {
+            clear_clipboard: false,
+            clear_clipboard_on_lock: false,
+            clear_clipboard_on_account_change: false,
+            clear_clipboard_on_quit: false,
+            clear_clipboard_seconds: 300,
+            // Two settings from other pages, both away from their defaults.
+            check_breaches: true,
+            auto_lock_minutes: 42,
+            ..Settings::default()
+        });
+        let first = frame(&ctx, &mut state, &[]);
+        // The premise, so the assertions below are about the click.
+        assert!(!state.settings.clear_clipboard);
+        assert_eq!(state.settings.clear_clipboard_seconds, 300);
+
+        frame(&ctx, &mut state, &click(first.rect_of(CLIPBOARD_RESET_BUTTON).center()));
+
+        assert!(state.settings.clear_clipboard, "the button is decoration");
+        assert!(state.settings.clear_clipboard_on_lock);
+        assert!(state.settings.clear_clipboard_on_account_change);
+        assert!(state.settings.clear_clipboard_on_quit);
+        assert_eq!(state.settings.clear_clipboard_seconds, 60);
+        // The field's buffer followed the value, or the row would still show
+        // the number the user just reset away from.
+        assert_eq!(state.clipboard_interval_text, "1");
+
+        // Scope: the other pages are untouched.
+        assert!(state.settings.check_breaches, "Reset reached on to the General page");
+        assert_eq!(state.settings.auto_lock_minutes, 42, "Reset reached the auto-lock stepper");
+
+        // ...and the reset really is visible on the next frame, rather than
+        // living only in the struct.
+        let after = frame(&ctx, &mut state, &[]);
+        assert!(after.contains("1"), "got {:?}", after.strings());
+    }
+
+    /// **The Reset button stays live while the master switch is off.** It is
+    /// the way back from the state a user is most likely to want to leave, so
+    /// greying it out with the thing it resets would make that state a
+    /// one-way door.
+    #[test]
+    fn the_reset_button_works_with_the_master_switch_off() {
+        let ctx = styled_context();
+        let mut state = clipboard_state(Settings {
+            clear_clipboard: false,
+            clear_clipboard_seconds: 600,
+            ..Settings::default()
+        });
+        let first = frame(&ctx, &mut state, &[]);
+        frame(&ctx, &mut state, &click(first.rect_of(CLIPBOARD_RESET_BUTTON).center()));
+        assert!(state.settings.clear_clipboard, "Reset was inert while the page was switched off");
+        assert_eq!(state.settings.clear_clipboard_seconds, 60);
+    }
+
+    /// **A hand-edited out-of-range interval is corrected on the way in**, so
+    /// the window never displays a number that is not the number in effect.
+    #[test]
+    fn opening_the_page_on_an_impossible_stored_interval_shows_the_one_in_effect() {
+        // Far above the ceiling, and off a step.
+        let state = clipboard_state(Settings {
+            clear_clipboard_seconds: 14_401,
+            ..Settings::default()
+        });
+        assert_eq!(state.settings.clear_clipboard_seconds, 3600);
+        assert_eq!(state.clipboard_interval_text, "60");
+        // Below the floor.
+        let state = clipboard_state(Settings { clear_clipboard_seconds: 1, ..Settings::default() });
+        assert_eq!(state.settings.clear_clipboard_seconds, 30);
+        assert_eq!(state.clipboard_interval_text, "0.5");
+        // The control: a value already in range and on a step is untouched.
+        let state =
+            clipboard_state(Settings { clear_clipboard_seconds: 150, ..Settings::default() });
+        assert_eq!(state.settings.clear_clipboard_seconds, 150);
+        assert_eq!(state.clipboard_interval_text, "2.5");
+    }
+
+    /// **Clicking the Clipboard nav row opens the Clipboard page**, which is
+    /// what stops the new nav row being decoration.
+    #[test]
+    fn clicking_the_clipboard_nav_row_opens_the_clipboard_page() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert_eq!(state.section, Section::General);
+        let first = frame(&ctx, &mut state, &[]);
+        let after = frame(&ctx, &mut state, &click(first.nav_ink_of("Clipboard").rect.center()));
+        assert_eq!(state.section, Section::Clipboard, "the nav row did not select");
+        assert!(
+            after.contains(CLIPBOARD_MASTER_LABEL),
+            "Clipboard should now be the open page; got {:?}",
+            after.strings()
+        );
     }
 
     // -- sections with nothing behind them ---------------------------------

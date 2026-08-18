@@ -2381,6 +2381,33 @@ pub fn toggle_pill(ui: &mut Ui, on: bool) {
         .circle_filled(Pos2::new(knob_x, rect.center().y), 9.0, Color32::WHITE);
 }
 
+/// [`toggle_pill`]'s greyed twin, for a switch a master switch has turned
+/// off.
+///
+/// **Still shows its own state**, knob and all: the row is disabled, not
+/// meaningless, and the value is the one that comes straight back when the
+/// master switch is turned on again. A pill that flattened to "off" while
+/// disabled would be displaying a value that is not the stored one, which is
+/// the same lie as a control whose number the clamp silently overrides.
+///
+/// Built from the design's own two lighter greys rather than a new colour, the
+/// way `prefs_ui::minutes_stepper`'s disabled box is: [`HAIRLINE`] for the
+/// track, and a knob in [`CANVAS`] instead of white so it stays visible
+/// against it. The design has no disabled variant of this control, so this is
+/// assembled from its parts.
+pub fn toggle_pill_disabled(ui: &mut Ui, on: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), HAIRLINE);
+    let knob_x = if on {
+        rect.max.x - 11.0
+    } else {
+        rect.min.x + 11.0
+    };
+    ui.painter()
+        .circle_filled(Pos2::new(knob_x, rect.center().y), 9.0, CANVAS);
+}
+
 /// A full-width hairline separator in the card hairline color (egui's
 /// default separator is darker than the design's).
 pub fn hairline(ui: &mut Ui) {
