@@ -764,6 +764,214 @@ const ROW_GAP: f32 = 6.0;
 /// The list container's `padding: 10px`.
 const LIST_PADDING: f32 = 10.0;
 
+/// The search field's own id.
+///
+/// `theme::search_field` puts this on the `TextEdit` it builds, and
+/// `vault_window::mod`'s Ctrl+K asks `request_focus` for it by the same name
+/// from outside this file -- so it MUST NOT CHANGE. Written once here rather
+/// than at the two places in this module that need it (the field itself, and
+/// [`nav_key`]'s Home/End gate), so a rename cannot move one and leave the
+/// other reading a dead id that would simply never match.
+/// `ctrl_k_still_focuses_the_search_field_after_the_move` is what says the
+/// field really carries it.
+fn search_field_id() -> egui::Id {
+    egui::Id::new("vault-search")
+}
+
+/// Where the last frame left the list's vertical scroll offset.
+///
+/// Kept in `ctx.data` rather than read back out of egui's own `ScrollArea`
+/// state, whose id is generated for us and is not ours to reconstruct. The
+/// one reader is [`scroll_offset_for_row`]'s "is the row I just selected
+/// already on screen" question, and last frame's offset is exactly the offset
+/// `show_rows` is about to virtualize against on this one.
+fn scroll_offset_id() -> egui::Id {
+    egui::Id::new("vault-item-list-scroll-offset")
+}
+
+/// Every modal in this window, by the id of the SCRIM it draws under itself.
+///
+/// This is the list's half of a rule the window already follows and that a
+/// scrim cannot enforce on its own: a scrim is a full-window click-catcher on
+/// `Order::Foreground`, so it stops the pointer by sitting on a higher layer,
+/// but a key read straight off `ctx.input` never consults a layer at all.
+/// `vault_window::mod`'s `keyboard_shortcuts_enabled` is that same decision for
+/// the window's own Ctrl+K/L/N; this is it for the list's arrow keys, made on
+/// this side of the boundary because `draw_item_list` is not told which modals
+/// its caller has open.
+///
+/// **Scrims, not the modal cards.** The scrim is the thing all seven have and
+/// the thing that MEANS "the window behind this is inert" -- `detail.rs`'s
+/// copy toast is also a `Foreground` area and has no scrim, which is exactly
+/// the difference. `every_modal_scrim_in_the_crate_is_named_here` walks `src/`
+/// and fails if a modal is added with a scrim this list does not name.
+const MODAL_SCRIM_AREAS: &[&str] = &[
+    "detail-edit-discard-scrim",
+    "folder-edit-scrim",
+    "launch-confirm-scrim",
+    "prefs-modal-scrim",
+    "record-import-scrim",
+    "record-send-scrim",
+    "totp-add-scrim",
+];
+
+/// Whether any of [`MODAL_SCRIM_AREAS`] is up.
+///
+/// `Areas::is_visible` is "shown last frame OR already shown this one". The
+/// last-frame half is what makes this work at all: the modals are all drawn
+/// AFTER the three panels, so on the frame a modal first appears this is
+/// asked before that scrim has been shown. That costs one frame, and the
+/// keystroke in it is the click or chord that opened the modal -- never an
+/// arrow key, because the user cannot yet see the thing they would be
+/// arrowing behind.
+fn a_modal_is_up(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| {
+        MODAL_SCRIM_AREAS.iter().any(|name| {
+            m.areas()
+                .is_visible(&egui::LayerId::new(egui::Order::Foreground, egui::Id::new(*name)))
+        })
+    })
+}
+
+/// A keystroke that moves the selection through the item list.
+///
+/// **Enter is deliberately not one of these.** Selecting a row is what opens
+/// it in the detail pane -- that already happened, on the arrow key -- so
+/// Enter would have nothing left to do that the user did not just get. It is
+/// also not free to take: the search field is a `TextEdit` whose `return_key`
+/// is Enter, so a meaning bound here would fire every time somebody finished
+/// typing a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListNavKey {
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// Given the ids of the rows that are on screen -- **in the order they are
+/// drawn**, i.e. after the sidebar filter and the search box, and not the
+/// order of the vault's own vector -- the id selected right now, and a
+/// navigation key: the index of the row that should be selected instead.
+///
+/// `None` only when there is nothing to select. It answers with an INDEX and
+/// not an id because the caller needs the index anyway, to scroll a row that
+/// may not be drawn this frame into view.
+///
+/// **Past either end it STOPS; it does not wrap.** This list is virtualized
+/// because a real vault runs to thousands of rows, and wrapping is the one
+/// move in it with no visual continuity at all -- Up on the first row would
+/// teleport the viewport to row 4999, which reads as the list having jumped
+/// rather than the selection having moved. It is also what every list on this
+/// platform does (Explorer, Outlook, the Start menu), and the failure mode of
+/// stopping is that a key does nothing, which is recoverable, where the
+/// failure mode of wrapping is losing your place.
+///
+/// A selection that is not in `visible` at all -- the sidebar filter or the
+/// search box narrowed it away while the detail pane still shows it -- counts
+/// as no selection, which is what puts Down on the first row and Up on the
+/// last.
+fn next_selection(visible: &[&str], selected: Option<&str>, key: ListNavKey) -> Option<usize> {
+    let last = visible.len().checked_sub(1)?;
+    let current = selected.and_then(|id| visible.iter().position(|row| *row == id));
+    Some(match (key, current) {
+        (ListNavKey::Home, _) => 0,
+        (ListNavKey::End, _) => last,
+        (ListNavKey::Down, None) => 0,
+        (ListNavKey::Up, None) => last,
+        (ListNavKey::Down, Some(i)) => (i + 1).min(last),
+        (ListNavKey::Up, Some(i)) => i.saturating_sub(1),
+    })
+}
+
+/// Which navigation key this frame carries, if the list is allowed to act on
+/// one.
+///
+/// **What egui actually delivers here, and why the search box is safe.** A
+/// `TextEdit` does not take its events out of the queue: it reads
+/// `InputState::filtered_events`, which CLONES the events its `EventFilter`
+/// matches and leaves every one of them in place. So `key_pressed` below sees
+/// Up/Down whether or not the search field has focus, and the field goes on
+/// receiving everything it ever received -- typing is untouched, because
+/// nothing here looks at a text event.
+///
+/// That leaves what the FIELD does with the same keystroke:
+///
+///  * **Up/Down: nothing.** It is a `TextEdit::singleline`, and egui resolves
+///    a vertical arrow in one to `cursor_up_one_row` / `cursor_down_one_row`
+///    on a one-row galley. So the list may take them even while the field has
+///    focus -- which is the whole point of the feature: type to narrow, then
+///    arrow down into what is left without reaching for the mouse.
+///  * **Home/End: a real caret move**, to the start and the end of the typed
+///    query. Those belong to the user, so they are only read here when the
+///    field does NOT have focus.
+///
+/// Nothing is consumed, for the reason `theme::search_field`'s Escape is not
+/// consumed either: the modals run later in the frame than this function
+/// does, and a key taken out of the queue here is a key their own bindings
+/// would never see.
+///
+/// A held modifier disqualifies all four, so a future Ctrl+Home or Shift+Down
+/// cannot fire this as well as itself -- the hazard `vault_window::mod`'s
+/// `matches_exact` chords were written for. Read off the KEY EVENT's own
+/// modifiers rather than off `InputState::modifiers`, which is `detail.rs`'s
+/// `consume_chord` idiom: the latter is the modifier state as of the end of
+/// the frame's input, which is not necessarily what was held when the key
+/// went down. The first qualifying event in the frame wins; two navigation
+/// keys in one frame is a keyboard repeat racing a repaint, and taking one is
+/// the honest answer to it.
+fn nav_key(ctx: &egui::Context) -> Option<ListNavKey> {
+    if a_modal_is_up(ctx) {
+        return None;
+    }
+    let typing = ctx.memory(|m| m.has_focus(search_field_id()));
+    ctx.input(|i| {
+        i.events.iter().find_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if !modifiers.any() => match key {
+                egui::Key::Home if !typing => Some(ListNavKey::Home),
+                egui::Key::End if !typing => Some(ListNavKey::End),
+                egui::Key::ArrowUp => Some(ListNavKey::Up),
+                egui::Key::ArrowDown => Some(ListNavKey::Down),
+                _ => None,
+            },
+            _ => None,
+        })
+    })
+}
+
+/// The scroll offset that puts row `row` on screen, or `None` if it already
+/// is -- a MINIMAL scroll, so a step onto the next row moves the viewport by
+/// one row rather than re-centring the list under the selection.
+///
+/// **This is what keeps keyboard selection working at all.** The list is
+/// `ScrollArea::show_rows`, so a row outside the drawn range is not a widget
+/// this frame: it cannot be asked to scroll itself into view, and a selection
+/// moved onto it would simply vanish. `show_rows` derives its row range from
+/// the offset it is given, so forcing the offset here puts the row in the
+/// drawn range on the SAME frame.
+///
+/// The pitch is `show_rows`' own -- `row_height + item_spacing.y`, which for
+/// this list is [`ROW_TILE_HEIGHT`] plus [`ROW_GAP`]. Reading it off those two
+/// constants rather than writing a number down is what keeps this in register
+/// with the geometry they pin.
+fn scroll_offset_for_row(row: usize, offset: f32, viewport_height: f32) -> Option<f32> {
+    let pitch = ROW_TILE_HEIGHT + ROW_GAP;
+    let top = row as f32 * pitch;
+    let bottom = top + ROW_TILE_HEIGHT;
+    if top < offset {
+        Some(top)
+    } else if bottom > offset + viewport_height {
+        Some(bottom - viewport_height)
+    } else {
+        None
+    }
+}
+
 /// Draws the search box, `+ New` button, and the virtualized item list.
 ///
 /// `visible_ids` is cleared at the top of this call and then filled with the
@@ -919,7 +1127,11 @@ pub fn draw_item_list(
                         // Stable id so `Ctrl+K` (wired in
                         // `vault_window::mod`) can request focus on this
                         // field from outside this function. MUST NOT CHANGE.
-                        egui::Id::new("vault-search"),
+                        // Spelled once, in `search_field_id` -- the arrow-key
+                        // block below has to ask about this same field's
+                        // focus, and two literals would be two things to
+                        // rename.
+                        search_field_id(),
                     );
                 });
             });
@@ -961,6 +1173,34 @@ pub fn draw_item_list(
         .filter(|item| matches_filter(item, filter, &search_lower))
         .collect();
 
+    // **The keyboard half of this pane.** Every chord that acts on an item --
+    // Ctrl+B, Ctrl+U, Ctrl+T and the four card chords -- acts on the SELECTED
+    // one, and until this block there was no way to select without the mouse,
+    // so each of them needed a click first.
+    //
+    // Applied to `filtered`, which is the list AS DISPLAYED: the sidebar's
+    // scope and the search box have already narrowed it and it is in the
+    // on-screen order. Walking `rows` (or `items`) instead would compile and
+    // look right on an unfiltered All view and then step onto items that are
+    // not on screen the moment either control is used.
+    //
+    // What the key means is `next_selection`'s decision, not this block's --
+    // see it for the stop-at-the-ends argument and for why there is no Enter.
+    // Whether a key is even ours to read is `nav_key`'s, which is where the
+    // search field and the modals are answered.
+    let mut scroll_to_row = None;
+    if let Some(key) = nav_key(ui.ctx()) {
+        let ids: Vec<&str> = filtered.iter().map(|item| item.id.as_str()).collect();
+        if let Some(row) = next_selection(&ids, selected_id.as_deref(), key) {
+            *selected_id = Some(ids[row].to_string());
+            // Set even when the selection did not actually change -- End on
+            // the last row is "show me the end of the list", and a row that
+            // is already selected but scrolled off is exactly the case this
+            // has to answer.
+            scroll_to_row = Some(row);
+        }
+    }
+
     // Design 2b's list padding (`padding: 10px`), applied here now that the
     // pane's panel frame has none -- see the header strip's comment above.
     //
@@ -996,6 +1236,11 @@ pub fn draw_item_list(
                 !search_lower.trim().is_empty(),
             ) {
                 draw_list_placeholder(ui, placeholder);
+                // No scroll area ran, so the remembered offset would be last
+                // frame's -- from a scope that is not on screen any more.
+                // Zeroed, so the first arrow key after this list refills
+                // measures against where a fresh list really starts.
+                ui.ctx().data_mut(|d| d.insert_temp(scroll_offset_id(), 0.0_f32));
                 return;
             }
             // **Does this list actually overflow?** Predicted from the row
@@ -1007,7 +1252,21 @@ pub fn draw_item_list(
             // a bar on a list that really can move.
             let content_height = filtered.len() as f32 * ROW_TILE_HEIGHT
                 + filtered.len().saturating_sub(1) as f32 * ROW_GAP;
-            let fits = content_height < ui.available_height();
+            // The scroll area takes all of it (`auto_shrink([false, false])`),
+            // so this one measurement is both the overflow test's denominator
+            // and the viewport a keyboard move has to land its row inside.
+            let viewport_height = ui.available_height();
+            let fits = content_height < viewport_height;
+            // **Forced only on a frame a key moved the selection**, so mouse
+            // scrolling is never fought: on every other frame the builder
+            // below carries no offset at all and egui keeps its own.
+            let forced_offset = scroll_to_row.and_then(|row| {
+                let current = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<f32>(scroll_offset_id()))
+                    .unwrap_or(0.0);
+                scroll_offset_for_row(row, current, viewport_height)
+            });
             // **The bar lives INSIDE the 10pt gutter, and the tiles never
             // move.**
             //
@@ -1065,7 +1324,7 @@ pub fn draw_item_list(
             // the fade costs no layout at all and an idle window simply shows
             // the full 10pt clear on both sides. That is ordinary platform
             // behaviour and the best reading of the state a screenshot catches.
-            egui::ScrollArea::vertical()
+            let mut area = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 // Required by `scrollbar_in_gutter`: egui lays a bar's gutter
                 // out only for a bar it is actually showing, so on
@@ -1081,7 +1340,18 @@ pub fn draw_item_list(
                 // depends on this. What is still true is that egui has to
                 // reserve and handle the lane at all, which is what this asks
                 // for; the fade is left to egui (see just above).
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+            // **Set BEFORE `show_rows`, which is the whole trick.** `show_rows`
+            // computes its row range from the offset the area starts the frame
+            // with, so a forced offset applied here changes which rows are
+            // drawn on THIS frame -- the row the arrow key just selected is a
+            // real widget, painted, on the same frame it was selected. Asking
+            // the row to scroll itself into view instead is the version that
+            // silently does nothing: a row outside the drawn range never runs.
+            if let Some(offset) = forced_offset {
+                area = area.vertical_scroll_offset(offset);
+            }
+            let list = area
                 .show_rows(ui, ROW_TILE_HEIGHT, filtered.len(), |ui, row_range| {
                     for row in row_range {
                         let item = filtered[row];
@@ -1125,6 +1395,13 @@ pub fn draw_item_list(
                         }
                     }
                 });
+            // Remembered for the next frame's `scroll_offset_for_row`. This
+            // is the offset AFTER everything this frame did to it -- the
+            // wheel, a bar drag, or the forced offset just above -- which is
+            // what makes the next keyboard step a step from where the list
+            // actually is.
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(scroll_offset_id(), list.state.offset.y));
         });
 
     action
@@ -6607,5 +6884,554 @@ mod list_placeholder_paint_tests {
             !raw.contains(concat!("notice", ".is_some(),")),
             "control: the band's own \"is anything on screen\" is not what is passed"
         );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_selection_tests {
+    //! **Arrow-key selection**, and the three things about it that a test
+    //! written against a plain `Vec` would miss entirely: that the keys walk
+    //! the list AS DISPLAYED, that a row the virtualizer is not drawing this
+    //! frame still ends up on screen, and that none of it happens behind a
+    //! modal.
+    //!
+    //! The frame tests below drive real frames of `draw_item_list` and read
+    //! back `visible_ids` -- the ids of the rows `show_rows` actually drew --
+    //! because that is the only thing in this file that can tell "the
+    //! selection moved" apart from "the selection moved somewhere nobody can
+    //! see". Each of them first asserts the state it is about to change, so a
+    //! test that could not distinguish the two fails here rather than passing
+    //! quietly.
+    use super::*;
+    use crate::theme;
+
+    const PANE_WIDTH: f32 = 390.0;
+    const PANE_HEIGHT: f32 = 700.0;
+
+    fn an_item(name: &str) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn key(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]
+    }
+
+    /// A modal's scrim, drawn the way every one of them draws it: a
+    /// full-window click-catcher `Area` on `Order::Foreground`. Copied from
+    /// `folder_modal::draw_folder_edit_modal` rather than called, so this
+    /// module needs none of that modal's state -- and named with ITS id, so
+    /// if the id there changes, `every_modal_scrim_in_the_crate_is_named_here`
+    /// is what fails.
+    fn draw_a_modal_scrim(ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("folder-edit-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                ui.allocate_response(screen.size(), egui::Sense::click());
+            });
+    }
+
+    /// A live item pane across frames: the selection and the scroll offset
+    /// both persist, which is the whole point -- a keyboard step is a step
+    /// from wherever the last frame left the list.
+    struct Pane {
+        ctx: egui::Context,
+        items: Vec<VaultItem>,
+        search: String,
+        selected: Option<String>,
+        /// The ids `show_rows` DREW on the last frame -- not the ids that
+        /// matched the filter.
+        drawn: Vec<String>,
+        /// Whether a modal's scrim is drawn over the pane, after it, exactly
+        /// where `vault_window::mod` draws its modals.
+        modal: bool,
+    }
+
+    impl Pane {
+        fn new(items: Vec<VaultItem>) -> Self {
+            let ctx = egui::Context::default();
+            // Two throwaway frames so `theme::apply`'s font set is live --
+            // the same reason the header-strip harness above runs them.
+            let _ = ctx.run_ui(raw(Vec::new()), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(raw(Vec::new()), |_ui| {});
+            let mut pane = Pane {
+                ctx,
+                items,
+                search: String::new(),
+                selected: None,
+                drawn: Vec::new(),
+                modal: false,
+            };
+            pane.frame(Vec::new());
+            pane
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let ctx = self.ctx.clone();
+            let icons = IconCache::default();
+            let mut drawn = Vec::new();
+            let items = &self.items;
+            let search = &mut self.search;
+            let selected = &mut self.selected;
+            let modal = self.modal;
+            let _ = ctx.run_ui(raw(events), |ui| {
+                draw_item_list(
+                    ui,
+                    Some(items),
+                    &[],
+                    &SidebarFilter::All,
+                    search,
+                    selected,
+                    None,
+                    &icons,
+                    &mut drawn,
+                    None,
+                    false,
+                );
+                // AFTER the pane, where the window really draws them -- so the
+                // gate is being tested through the one-frame-late
+                // `is_visible` path it actually runs on, and not through a
+                // scrim conveniently shown first.
+                if modal {
+                    draw_a_modal_scrim(ui.ctx());
+                }
+            });
+            self.drawn = drawn;
+        }
+
+        fn press(&mut self, k: egui::Key) {
+            self.frame(key(k));
+        }
+
+        fn drew(&self, id: &str) -> bool {
+            self.drawn.iter().any(|drawn| drawn == id)
+        }
+    }
+
+    fn three() -> Vec<VaultItem> {
+        vec![an_item("Alpha"), an_item("Bravo"), an_item("Charlie")]
+    }
+
+    // ---- the decision, on its own --------------------------------------
+
+    #[test]
+    fn nothing_to_select_is_not_a_selection() {
+        for key in [ListNavKey::Up, ListNavKey::Down, ListNavKey::Home, ListNavKey::End] {
+            assert_eq!(next_selection(&[], None, key), None, "{key:?}");
+            assert_eq!(next_selection(&[], Some("gone"), key), None, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn with_nothing_selected_down_takes_the_first_and_up_takes_the_last() {
+        let ids = ["a", "b", "c"];
+        assert_eq!(next_selection(&ids, None, ListNavKey::Down), Some(0));
+        assert_eq!(next_selection(&ids, None, ListNavKey::Up), Some(2));
+    }
+
+    #[test]
+    fn the_ends_stop_rather_than_wrap() {
+        // The decision this file makes, and the one a reader is most likely
+        // to expect the other way round -- see `next_selection`'s doc for the
+        // argument. Both ends, so neither direction can quietly grow a wrap.
+        let ids = ["a", "b", "c"];
+        assert_eq!(next_selection(&ids, Some("c"), ListNavKey::Down), Some(2));
+        assert_eq!(next_selection(&ids, Some("a"), ListNavKey::Up), Some(0));
+        // ...and the step that is not at an end really does move, so the two
+        // assertions above are about the ends and not about a function that
+        // never moves anything.
+        assert_eq!(next_selection(&ids, Some("a"), ListNavKey::Down), Some(1));
+        assert_eq!(next_selection(&ids, Some("c"), ListNavKey::Up), Some(1));
+    }
+
+    #[test]
+    fn home_and_end_go_to_the_ends_from_anywhere() {
+        let ids = ["a", "b", "c"];
+        for from in [None, Some("a"), Some("b"), Some("c")] {
+            assert_eq!(next_selection(&ids, from, ListNavKey::Home), Some(0), "{from:?}");
+            assert_eq!(next_selection(&ids, from, ListNavKey::End), Some(2), "{from:?}");
+        }
+    }
+
+    #[test]
+    fn a_selection_that_is_no_longer_on_screen_counts_as_none() {
+        // The detail pane goes on showing an item after the search box has
+        // narrowed it out of the list. Treating that as "selected" would make
+        // Down a no-op with no row highlighted anywhere.
+        let ids = ["a", "b", "c"];
+        assert_eq!(next_selection(&ids, Some("z"), ListNavKey::Down), Some(0));
+        assert_eq!(next_selection(&ids, Some("z"), ListNavKey::Up), Some(2));
+    }
+
+    // ---- the scroll arithmetic -----------------------------------------
+
+    #[test]
+    fn a_row_already_in_the_viewport_is_not_scrolled_to() {
+        // A minimal scroll: no forced offset at all, so a keyboard step
+        // inside the visible window leaves the list exactly where it was.
+        let pitch = ROW_TILE_HEIGHT + ROW_GAP;
+        assert_eq!(scroll_offset_for_row(0, 0.0, 10.0 * pitch), None);
+        assert_eq!(scroll_offset_for_row(5, 0.0, 10.0 * pitch), None);
+    }
+
+    #[test]
+    fn a_row_above_the_viewport_scrolls_its_top_into_view() {
+        let pitch = ROW_TILE_HEIGHT + ROW_GAP;
+        assert_eq!(scroll_offset_for_row(3, 10.0 * pitch, 10.0 * pitch), Some(3.0 * pitch));
+    }
+
+    #[test]
+    fn a_row_below_the_viewport_scrolls_by_exactly_what_it_overhangs() {
+        // The next row down from a full viewport moves the list by ONE pitch
+        // and no more -- the difference between "the list follows the
+        // selection" and "the list jumps".
+        let pitch = ROW_TILE_HEIGHT + ROW_GAP;
+        let viewport = 10.0 * pitch;
+        let offset =
+            scroll_offset_for_row(10, 0.0, viewport).expect("row 10 is below a 10-row viewport");
+        assert_eq!(offset, 10.0 * pitch + ROW_TILE_HEIGHT - viewport);
+        assert!(offset > 0.0 && offset < pitch, "one row's worth, not a jump: {offset}");
+    }
+
+    // ---- real frames ----------------------------------------------------
+
+    #[test]
+    fn down_selects_the_first_row_as_displayed_and_not_the_first_in_the_vault() {
+        // THE OBVIOUS BUG THIS FEATURE HAS. `Bravo` is the second item in the
+        // vector and the ONLY row on screen; a step that walked `items`
+        // instead of the filtered list would select `Alpha`, which is not
+        // drawn at all.
+        let mut pane = Pane::new(three());
+        pane.search = "bravo".to_string();
+        pane.frame(Vec::new());
+        assert_eq!(pane.drawn, vec!["Bravo".to_string()], "the search must leave one row");
+        assert_eq!(pane.selected, None, "nothing is selected before the key");
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(
+            pane.selected.as_deref(),
+            Some("Bravo"),
+            "Down selected an item that is not on screen -- the walk is following the vault's \
+             own vector rather than the list as displayed"
+        );
+    }
+
+    #[test]
+    fn down_then_up_walks_the_displayed_list_and_stops_at_the_top() {
+        let mut pane = Pane::new(three());
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"));
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Bravo"));
+        pane.press(egui::Key::ArrowUp);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"));
+        pane.press(egui::Key::ArrowUp);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"), "Up wrapped off the top of the list");
+    }
+
+    #[test]
+    fn end_puts_the_last_row_on_screen_although_the_virtualizer_was_not_drawing_it() {
+        // **THE REQUIREMENT MOST LIKELY TO HALF-LAND.** `show_rows` only ever
+        // draws the rows in the viewport, so moving the selection to row 199
+        // without moving the scroll offset leaves it selected and invisible
+        // -- and every assertion about `selected_id` alone still passes.
+        //
+        // The pre-assertion is what makes the post-assertion mean anything:
+        // row 199 really is NOT drawn before the key.
+        let items: Vec<VaultItem> = (0..200).map(|i| an_item(&format!("Item {i:03}"))).collect();
+        let mut pane = Pane::new(items);
+        assert!(
+            !pane.drew("Item 199"),
+            "the last row is already drawn without scrolling, so this test cannot see the \
+             difference it exists to check: drawn {:?}",
+            pane.drawn
+        );
+        pane.press(egui::Key::End);
+        assert_eq!(pane.selected.as_deref(), Some("Item 199"));
+        assert!(
+            pane.drew("Item 199"),
+            "End selected the last row and left it off screen -- the scroll offset did not \
+             follow the selection out of the drawn range. Drawn: {:?}",
+            pane.drawn
+        );
+        // ...and back, the other way, which is the same failure mirrored.
+        pane.press(egui::Key::Home);
+        assert_eq!(pane.selected.as_deref(), Some("Item 000"));
+        assert!(pane.drew("Item 000"), "Home left the first row off screen: {:?}", pane.drawn);
+    }
+
+    #[test]
+    fn stepping_down_past_the_bottom_of_the_viewport_brings_the_next_row_in() {
+        // The one-row-at-a-time version of the test above: the selection is
+        // walked down with the Down key alone until it leaves the rows that
+        // were drawn on the first frame, and it is still on screen when it
+        // gets there.
+        let items: Vec<VaultItem> = (0..200).map(|i| an_item(&format!("Item {i:03}"))).collect();
+        let mut pane = Pane::new(items);
+        let first_frame = pane.drawn.clone();
+        assert!(
+            first_frame.len() < 200,
+            "the list must really be virtualized: {}",
+            first_frame.len()
+        );
+        for _ in 0..first_frame.len() + 3 {
+            pane.press(egui::Key::ArrowDown);
+        }
+        let landed = pane.selected.clone().expect("something is selected after Down");
+        assert!(
+            !first_frame.contains(&landed),
+            "the walk never left the rows that were drawn on the first frame, so this proves \
+             nothing about scrolling: landed on {landed}"
+        );
+        assert!(
+            pane.drew(&landed),
+            "the selection walked out of the drawn range and was not scrolled back into it: \
+             selected {landed}, drawn {:?}",
+            pane.drawn
+        );
+    }
+
+    #[test]
+    fn arrow_keys_never_move_the_selection_behind_a_modal() {
+        let mut pane = Pane::new(three());
+        // Control first: with no modal up, this exact key moves it. Without
+        // this the assertions below pass on a build where the key does
+        // nothing at all.
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"));
+
+        pane.modal = true;
+        // The frame the scrim first appears; the gate reads it from the frame
+        // after, which is `is_visible`'s last-frame half.
+        pane.frame(Vec::new());
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(
+            pane.selected.as_deref(),
+            Some("Alpha"),
+            "an arrow key moved the item list's selection while a modal was over it -- the \
+             scrim stops the pointer and never sees a key"
+        );
+        pane.press(egui::Key::End);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"), "End reached the list behind a modal");
+
+        // ...and they come back when the modal goes away, so the gate is a
+        // gate and not a permanent off switch.
+        pane.modal = false;
+        pane.frame(Vec::new());
+        pane.frame(Vec::new());
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Bravo"), "the keys did not come back");
+    }
+
+    #[test]
+    fn the_arrows_reach_the_list_while_the_search_field_has_the_caret() {
+        // The point of the feature: type to narrow, then arrow into what is
+        // left without touching the mouse. Safe because the field is a
+        // `singleline` `TextEdit`, where a vertical arrow is a cursor move
+        // within one row -- i.e. nothing. See `nav_key`.
+        let mut pane = Pane::new(three());
+        let id = search_field_id();
+        pane.ctx.memory_mut(|m| m.request_focus(id));
+        pane.frame(Vec::new());
+        assert!(
+            pane.ctx.memory(|m| m.has_focus(id)),
+            "the search field does not actually have focus, so this test is not testing the \
+             case it is named for"
+        );
+        pane.press(egui::Key::ArrowDown);
+        assert!(
+            pane.ctx.memory(|m| m.has_focus(id)),
+            "the arrow key moved focus off the search field"
+        );
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"));
+    }
+
+    #[test]
+    fn home_and_end_are_left_to_the_caret_while_the_search_field_has_focus() {
+        // The half that is NOT free to take: in a focused text field Home and
+        // End move the caret to the start and the end of what was typed, and
+        // those are the user's.
+        let mut pane = Pane::new(three());
+        let id = search_field_id();
+        pane.ctx.memory_mut(|m| m.request_focus(id));
+        pane.frame(Vec::new());
+        assert!(pane.ctx.memory(|m| m.has_focus(id)), "the field must have focus");
+        pane.press(egui::Key::End);
+        assert_eq!(
+            pane.selected, None,
+            "End moved the list selection while the caret was in the search box"
+        );
+        pane.press(egui::Key::Home);
+        assert_eq!(
+            pane.selected, None,
+            "Home moved the list selection from inside the search box"
+        );
+
+        // ...and it is the FOCUS that gates them, not the keys being dead:
+        // surrender it and the same End lands.
+        pane.ctx.memory_mut(|m| m.surrender_focus(id));
+        pane.frame(Vec::new());
+        pane.press(egui::Key::End);
+        assert_eq!(
+            pane.selected.as_deref(),
+            Some("Charlie"),
+            "End is dead even outside the field"
+        );
+    }
+
+    #[test]
+    fn typing_still_goes_to_the_search_field() {
+        // Nothing here consumes an event, so the field receives everything it
+        // always received. **Not type-ahead**: the search box already is the
+        // type-ahead, and this asserts it still works rather than adding a
+        // second one.
+        let mut pane = Pane::new(three());
+        let id = search_field_id();
+        pane.ctx.memory_mut(|m| m.request_focus(id));
+        pane.frame(Vec::new());
+        pane.frame(vec![egui::Event::Text("bravo".to_string())]);
+        assert_eq!(pane.search, "bravo", "typing no longer reaches the search field");
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Bravo"), "type, then arrow into the result");
+    }
+
+    #[test]
+    fn a_held_modifier_disqualifies_every_one_of_them() {
+        // So a future Ctrl+Home or Shift+Down cannot fire this as well as
+        // itself -- the hazard `vault_window::mod`'s `matches_exact` chords
+        // were written for.
+        let mut pane = Pane::new(three());
+        for k in [egui::Key::ArrowDown, egui::Key::ArrowUp, egui::Key::Home, egui::Key::End] {
+            pane.frame(vec![egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }]);
+            assert_eq!(pane.selected, None, "CTRL+{k:?} moved the selection");
+        }
+        // Control: the same keys with no modifier do move it.
+        pane.press(egui::Key::ArrowDown);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"));
+    }
+
+    #[test]
+    fn enter_is_not_bound_here() {
+        // A deliberate non-feature: arrowing onto a row already shows it in
+        // the detail pane, so Enter has nothing left to do -- and it is the
+        // search field's own `return_key`. Asserted rather than left implicit
+        // so adding a meaning is a decision somebody has to take on purpose.
+        let mut pane = Pane::new(three());
+        pane.press(egui::Key::Enter);
+        assert_eq!(pane.selected, None, "Enter selected something");
+        pane.press(egui::Key::ArrowDown);
+        pane.press(egui::Key::Enter);
+        assert_eq!(pane.selected.as_deref(), Some("Alpha"), "Enter moved the selection");
+    }
+
+    // ---- the modal list stays honest ------------------------------------
+
+    /// Every `.rs` file under `src/`, as (path, contents).
+    ///
+    /// Walks the tree rather than reading a list, so a modal added in a new
+    /// file is scanned without this test changing. The same shape
+    /// `debug_leak_guard` and `send_ui` already use.
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("cannot read a directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_modal_scrim_in_the_crate_is_named_here() {
+        // **The guard the gate rests on.** `MODAL_SCRIM_AREAS` is a list of
+        // strings, so a modal added tomorrow with a scrim this file has never
+        // heard of would leave the arrow keys live behind it -- and nothing
+        // about that fails to compile. This walks `src/` for the id every
+        // scrim is declared with and demands the two sets match exactly.
+        //
+        // Matched on the area DECLARATION rather than on the bare id, so
+        // this file's own `MODAL_SCRIM_AREAS` is not one of the hits. The
+        // needle is assembled by `concat!` for the reason every other
+        // source-reading guard in this crate does it -- and this comment does
+        // not spell it out, because a comment that did would BE a hit: the
+        // walk reads this file too, and the first draft of it failed on a
+        // scrim that only ever existed in the sentence describing the test.
+        let opener = concat!("Area::new(egui", "::Id::new(\"");
+        let mut found: Vec<String> = Vec::new();
+        for (file, source) in crate_sources() {
+            for (index, _) in source.match_indices(opener) {
+                let rest = &source[index + opener.len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let id = &rest[..end];
+                if id.ends_with("-scrim") {
+                    assert!(
+                        MODAL_SCRIM_AREAS.contains(&id),
+                        "`{file}` draws a modal scrim `{id}` that `MODAL_SCRIM_AREAS` does not \
+                         name, so the item list's arrow keys are live behind that modal"
+                    );
+                    found.push(id.to_string());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let mut named: Vec<String> = MODAL_SCRIM_AREAS.iter().map(|s| s.to_string()).collect();
+        named.sort();
+        assert_eq!(
+            found, named,
+            "`MODAL_SCRIM_AREAS` names a scrim no file draws any more -- a stale entry is a gate \
+             that will never fire and a reader's wrong picture of which modals exist"
+        );
+        // The walk really found something, so an empty `found` cannot make
+        // the equality above vacuous on a broken matcher.
+        assert!(found.len() >= 5, "the source walk found only {found:?}");
     }
 }
