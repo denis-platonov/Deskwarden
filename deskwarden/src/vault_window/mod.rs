@@ -976,6 +976,22 @@ pub fn build_frame(
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
     let mut folder_edit: Option<FolderEditState> = None;
+    // **The "Send a record" composer, `Some` while it is on screen** -- see
+    // `record_ui::RecordSend`, which holds the item it was opened against as
+    // well as the ticks.
+    //
+    // It lives HERE, beside `folder_edit`, for the same reason every other
+    // draft in this window does: panes in this window own no state, and a
+    // composer that died with the frame would lose the ticks to every repaint.
+    // Cleared to `None` on Cancel and on a started publish, which drops the
+    // `Zeroizing` passphrase buffer rather than leaving a seed's passphrase
+    // resident behind a closed flag -- `send_ui::SendComposer`'s rule, which
+    // this borrows rather than restates.
+    //
+    // **It is only ever written by one line**, the gating block below, so the
+    // re-prompt cannot be bypassed by a second door -- see
+    // `permit_record_send`.
+    let mut record_send: Option<record_ui::RecordSend> = None;
     // The app launch that has been asked for and has not happened yet. See
     // [`PendingLaunch`]: the Open arm records the request and NOTHING there
     // starts a program, so every launch in this window goes through the one
@@ -1616,6 +1632,37 @@ pub fn build_frame(
         // `apply_export_action`, because a `match` arm is a thing a guard arm
         // can silently disable and a call at a pinned brace depth is not.
         let mut account_action: Option<AccountAction> = None;
+        // **"Send a record" was ASKED FOR**, by the titlebar pill or by the
+        // chord, and nothing has been decided about it yet.
+        //
+        // A request and not an open, for `AccountAction::Export`'s reason one
+        // step further on: the two doors are in two different places in this
+        // frame -- one inside the chrome closure, one after it, where the
+        // keyboard is read -- and gating each at its own door would be two
+        // gating positions for one exposure. Both write this flag, and the
+        // single block below is the only thing that turns it into a composer.
+        // That is what makes `permit_record_send` one question rather than
+        // two, and it is the arrangement `ac7a722` established for the reveal,
+        // the copy rows and the row menu.
+        let mut send_record_asked = false;
+        // Whether there is anything to send: is the selected row an item of
+        // the live vault?
+        //
+        // **A `bool` and not the item**, so this holds no borrow of `items`
+        // across the chrome closure -- the composer re-resolves the id when it
+        // opens and again when Create is pressed, which is also what makes it
+        // correct if the vault is re-read in between.
+        //
+        // **Deliberately not `list_for`**, which the detail pane below uses to
+        // resolve a selection made under Trash or Archive. A record Send
+        // publishes an item's secrets to a public link; a deleted item is one
+        // the user has already said they are done with, and "send the thing I
+        // threw away" is not a request this app needs to serve. The control
+        // simply stays grey there, with `record_ui::NO_ITEM_SELECTED` as its
+        // stated reason.
+        let can_send_record = selected_id
+            .as_ref()
+            .is_some_and(|id| items.iter().any(|i| &i.id == id));
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
         match draw_window_chrome_with_extra(
@@ -1763,6 +1810,36 @@ pub fn build_frame(
                     // shadow.
                     Some(AccountAction::Export) | None => {}
                 }
+                // **The way into the record composer** -- design 5b's
+                // `Send a record  CTRL+⇧+S` pill, in the header 5b draws it
+                // in, added after the avatar so that this right-to-left strip
+                // puts it on the avatar's LEFT, which is where 5b has it.
+                //
+                // It RECORDS and does not open: see `send_record_asked`. The
+                // chord below writes the same flag, so the pill and the
+                // keyboard cannot end up two different amounts of gated.
+                //
+                // Grey rather than absent with nothing selected, with the
+                // reason on the hover -- `record_ui::NO_ITEM_SELECTED`. A
+                // disabled control with no explanation is a control the user
+                // reads as broken, which is the rule the export form's own
+                // greyed-out Create button already follows.
+                if ui
+                    .add_enabled(
+                        can_send_record,
+                        egui::Button::new(
+                            egui::RichText::new(record_ui::SEND_RECORD_LABEL)
+                                .size(12.0)
+                                .color(theme::INK),
+                        )
+                        .shortcut_text(record_ui::SEND_RECORD_SHORTCUT)
+                        .min_size(egui::vec2(0.0, 28.0)),
+                    )
+                    .on_disabled_hover_text(record_ui::NO_ITEM_SELECTED)
+                    .clicked()
+                {
+                    send_record_asked = true;
+                }
                 // Manual sync: this app has nowhere that auto-syncs on a timer
                 // (see `main()`'s own single startup-time `bw sync` -- everything
                 // after that only re-reads whatever's already local). A change
@@ -1813,13 +1890,58 @@ pub fn build_frame(
         // into a new-item form they cannot see. `keyboard_shortcuts_enabled`
         // is the decision, made where a test can reach it.
         let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
-        let (ctrl_k, ctrl_l, ctrl_n) = ui.ctx().input(|i| {
+        let (ctrl_k, ctrl_l, ctrl_n, send_record_chord) = ui.ctx().input(|i| {
             (
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::L),
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::N),
+                // **`matches_exact`, and the three above deliberately are
+                // not.** Those three read `i.modifiers.ctrl`, which is TRUE
+                // WITH SHIFT HELD -- so a fourth chord spelled the same loose
+                // way on K, L or N would fire the older binding underneath it
+                // as well, silently running two commands from one keystroke.
+                // That is the identical hazard `detail.rs`'s `consume_chord`
+                // was written for and its `COPY_SHORTCUTS` table records.
+                //
+                // Two things keep this one clear of it. `matches_exact`
+                // rejects any held modifier the chord did not ask for, so
+                // CTRL+SHIFT+S cannot be dragged in by a loose test of its
+                // own; and `S` is a letter nothing else in this crate binds --
+                // checked, not assumed: `egui::Key::S` appears in no other
+                // expression anywhere under `src`, which is what
+                // `the_record_chord_is_a_key_no_other_binding_takes` asserts
+                // rather than this comment.
+                shortcuts
+                    && i.modifiers.matches_exact(SEND_RECORD_MODIFIERS)
+                    && i.key_pressed(SEND_RECORD_KEY),
             )
         });
+        if send_record_chord {
+            send_record_asked = true;
+        }
+        // **THE ONE GATING POSITION for the record composer.** Both doors --
+        // the titlebar pill and the chord -- arrive here as
+        // `send_record_asked`, and this is the only line in the frame that
+        // writes `record_send`. A door added later that opens the composer
+        // without coming through here is a door around the re-prompt, and
+        // `exactly_one_line_opens_the_record_composer` is what refuses it.
+        //
+        // The item is re-resolved rather than carried from `can_send_record`,
+        // which is a `bool` precisely so that nothing holds a borrow of
+        // `items` this far into the frame.
+        if send_record_asked {
+            if let Some(item) = selected_id
+                .as_ref()
+                .and_then(|id| items.iter().find(|i| &i.id == id))
+            {
+                record_send = permit_record_send(
+                    ui.ctx(),
+                    item,
+                    &reprompt_gate,
+                    &mut reprompt_proof,
+                );
+            }
+        }
         if ctrl_k {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
@@ -3665,6 +3787,84 @@ pub fn build_frame(
             }
         }
 
+        // **The record composer**, drawn here for `folder_edit`'s reason
+        // exactly: last, so the card and its scrim are over the three panels.
+        //
+        // The publish goes through `spawn_send_create` -- the SAME seam the
+        // Sends screen's own composer uses, and the only route in this crate
+        // to a `bw send create`. `record_ui` builds a plan and publishes
+        // nothing itself, which is that file's own stated rule; this is where
+        // the plan meets the one door.
+        //
+        // `send_create.in_flight` is shared with that composer on purpose: at
+        // most one `bw send create` at a time is a property of the window and
+        // not of a screen, and two flags for one child is how the second one
+        // gets started.
+        if let Some(state) = &mut record_send {
+            match record_ui::draw_export_modal(ui.ctx(), state, send_create.in_flight) {
+                record_ui::RecordUiAction::SubmitExport => {
+                    // Re-resolved by id: the vault may have been re-read
+                    // between the open and this press, and the item that
+                    // should be published is the one the window is holding
+                    // now. If it is gone, the composer closes with nothing
+                    // published rather than publishing a stale copy.
+                    let plan = items
+                        .iter()
+                        .find(|i| i.id == state.item_id)
+                        .filter(|_| !send_create.in_flight)
+                        .map(|item| {
+                            // The seed and its passphrase can only leave
+                            // together -- `totp_to_send` has no arm that
+                            // carries one without the other -- so there is no
+                            // ordering here that publishes an unsealed seed.
+                            let seed =
+                                item.login.as_ref().and_then(|l| {
+                                    l.totp.as_ref().map(|t| t.as_str())
+                                });
+                            let record = crate::record::record_from(
+                                item,
+                                &state.draft.selection,
+                                state.draft.totp_to_send(seed),
+                                // No expiry claim on the payload: the importer
+                                // deliberately does not gate on `not_after`,
+                                // and a field that reads as an expiry the
+                                // recipient's app enforces would be a lie.
+                                // The Send's own deletion date is the real
+                                // limit, and `SendPlan` carries that.
+                                None,
+                            );
+                            record_ui::send_plan_from(&record)
+                        });
+                    if let Some(plan) = plan {
+                        send_create.in_flight = true;
+                        send_create.report = None;
+                        spawn_send_create(
+                            ui.ctx().clone(),
+                            send_create_tx.clone(),
+                            session_token.clone(),
+                            plan,
+                        );
+                    }
+                    // **Closed either way, and closed by replacing the whole
+                    // value.** The draft holds a `Zeroizing` passphrase for a
+                    // seed; dropping the composer wipes it, where an `open =
+                    // false` would leave it resident for the life of the
+                    // window. `send_ui::SendUiAction::CancelComposer`'s rule,
+                    // borrowed rather than restated.
+                    record_send = None;
+                }
+                record_ui::RecordUiAction::Cancel => record_send = None,
+                // The import form's three actions are unreachable from this
+                // modal, which draws the export form alone. See
+                // `record_ui::draw_import_form`, which still has no caller:
+                // fetching a link needs a `bw send receive` executor, and
+                // `crate::send` exposes none.
+                record_ui::RecordUiAction::FetchLink
+                | record_ui::RecordUiAction::SubmitImport
+                | record_ui::RecordUiAction::None => {}
+            }
+        }
+
         // The export's answer, drawn here for `folder_edit`'s reason: last, so
         // the card is over the three panels.
         //
@@ -4261,6 +4461,62 @@ fn permit_detail_action(
         crate::reprompt::Outcome::Cannot => {
             detail::note_refused(ctx, crate::reprompt::refusal_text(true));
             DetailAction::None
+        }
+    }
+}
+
+/// The modifiers of the chord that opens the record composer.
+///
+/// A named pair rather than a literal at the read, so that
+/// [`record_ui::SEND_RECORD_SHORTCUT`] -- the string the pill paints -- and
+/// the keys actually bound are one fact a test can compare. That is
+/// `detail.rs`'s `COPY_SHORTCUTS` rule: a control advertising a chord the code
+/// does not bind is worse than no hint at all.
+const SEND_RECORD_MODIFIERS: egui::Modifiers =
+    egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+/// See [`SEND_RECORD_MODIFIERS`].
+const SEND_RECORD_KEY: egui::Key = egui::Key::S;
+
+/// **[`permit_detail_action`]'s sibling for "Send a record", and the reason
+/// the composer is gated at its OPEN rather than at its Create.**
+///
+/// A record Send publishes the item's own secrets to a link anyone holding it
+/// can fetch -- which is more, not less, than the copy rows this gate was
+/// built for -- so it is exactly what the item's re-prompt flag protects. The
+/// gate could not be applied before this commit for one reason and it was not
+/// squeamishness: `record_ui` was never handed an [`crate::accounts::AccountId`],
+/// because it was never handed anything at all. Wiring the entry point is what
+/// supplies the scope, and `reprompt_gate` is already built from the active
+/// account at the top of [`run`].
+///
+/// **At the open**, because that is the exposing moment the user can be asked
+/// about once: the composer's own ticks are a decision about what to publish,
+/// and a proof demanded after the user has spent a minute filling the form is
+/// a proof demanded at the worst moment. Nothing is revealed by the form
+/// itself -- it paints field NAMES -- so the earlier question costs nothing
+/// and covers the publish through [`crate::reprompt::PROOF_LASTS`].
+///
+/// Returns the composer or `None`, so a refusal is a composer that never
+/// exists rather than one drawn and then ignored -- the same shape as a
+/// refused [`DetailAction`] becoming [`DetailAction::None`] before the match.
+fn permit_record_send(
+    ctx: &egui::Context,
+    item: &VaultItem,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> Option<record_ui::RecordSend> {
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || {
+        record_ui::RecordSend::opening(&item.id, &item.name)
+    }) {
+        crate::reprompt::Outcome::Done(composer) => Some(composer),
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            None
         }
     }
 }
@@ -23842,6 +24098,149 @@ mod send_delete_wiring {
         matrix_frame(ctx, frame_fn)
     }
 
+    /// **THE COMPOSER IS REACHABLE, ON A REAL WINDOW, THE WAY A USER REACHES
+    /// IT** -- and this is the test whose absence let 1400 finished lines
+    /// ship unreachable.
+    ///
+    /// `record_ui` had complete unit tests and a green suite the whole time it
+    /// had no caller: its pure functions were right, its forms painted, and
+    /// nothing anywhere pressed a control that led to them. So what is driven
+    /// here is the chain and not the surface -- the real titlebar is rendered,
+    /// the real pill in it is found by the text it paints, the real item row
+    /// is clicked to give the pill something to open against, and the composer
+    /// is required to appear by ITS heading. Every link is a real widget in a
+    /// real frame; delete the pill, delete the modal block, or leave the pill
+    /// reporting nothing, and this reds.
+    ///
+    /// **What it does not cover**, said out loud rather than left to be
+    /// assumed: the pill's greyed state. This harness's window opens with an
+    /// item already selected and there is no gesture in it that deselects, so
+    /// "pressing the pill with nothing chosen does nothing" is not a state
+    /// this fixture can build. The control is `add_enabled(can_send_record,
+    /// ..)` and the gating block is `if let Some(item) = ...`, so the dead
+    /// case is refused twice over in the source; it is simply not measured
+    /// here, and claiming otherwise would be the kind of test that passes
+    /// because its fixture cannot fail.
+    ///
+    /// **No `bw`, no dialog, no network.** The harness gate is
+    /// `RepromptGate::allowing_for_test`, so no Windows Hello prompt is
+    /// reachable from here; that the re-prompt really stands in this path is
+    /// `reprompt_gating_tests`' business, driven directly.
+    #[test]
+    fn the_titlebar_pill_really_opens_the_record_composer() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "deskwarden-record-entry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
+                "http://127.0.0.1:1",
+            ))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            }),
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::with_send_delete(
+                super::frame_env_seam::stubbed(
+                    frame_sync,
+                    frame_load,
+                    frame_send_list,
+                    Some(scratch.join("settings.json")),
+                ),
+                frame_revoke,
+            ),
+        );
+
+        let state = ReachableState::Fresh;
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        let _ = matrix_frame(&ctx, &mut frame_fn);
+        let output = matrix_frame(&ctx, &mut frame_fn);
+
+        // 1. The way in exists at all, before anything is clicked. Located
+        //    and not bound: the press below re-locates it on a later frame,
+        //    and reusing a position read four frames earlier is how a click
+        //    test ends up pressing whatever has since moved under it.
+        matrix_locate(state, &output, record_ui::SEND_RECORD_LABEL);
+        assert!(
+            matrix_find(&output, record_ui::EXPORT_HEADING).is_none(),
+            "control: the composer is already on screen with nothing pressed, so pressing \
+             the pill below would prove nothing"
+        );
+
+        // 2. Choose the record -- design 5a's order, picked and then narrowed.
+        //
+        //    Clicked rather than assumed. This window opens with its first
+        //    item already selected (the detail pane is showing it), so the
+        //    click is a re-selection and not the thing that makes the pill
+        //    live; what it buys is that the item the composer opens against
+        //    below is the row this test pressed, by name.
+        let row_at = matrix_locate(state, &output, FRAME_ITEM_NAME);
+        let selected = matrix_click(&ctx, &mut frame_fn, row_at);
+        assert!(
+            matrix_find(&selected, record_ui::EXPORT_HEADING).is_none(),
+            "control: selecting a row opened the composer on its own, so the press below \
+             proves nothing"
+        );
+
+        // 3. And the pill opens it, against that item.
+        let pill_at = matrix_locate(state, &selected, record_ui::SEND_RECORD_LABEL);
+        let opened = matrix_click(&ctx, &mut frame_fn, pill_at);
+        assert!(
+            matrix_find(&opened, record_ui::EXPORT_HEADING).is_some(),
+            "pressing {:?} with {FRAME_ITEM_NAME:?} selected painted no composer, so the \
+             surface is still unreachable. What was painted: {:?}",
+            record_ui::SEND_RECORD_LABEL,
+            matrix_texts(&opened)
+        );
+        // It is THAT item's composer: the form names the record it will send.
+        assert!(
+            matrix_texts(&opened).iter().any(|t| t == FRAME_ITEM_NAME),
+            "the composer opened without naming the item it was opened against, so the user \
+             cannot tell what they are about to publish: {:?}",
+            matrix_texts(&opened)
+        );
+        // The seed warning is NOT up: the seed is not ticked by default, and
+        // a warning shown unconditionally is a warning nobody reads.
+        assert!(
+            matrix_find(&opened, record_ui::SEED_WARNING).is_none(),
+            "the seed warning is on screen before the seed was ticked"
+        );
+
+        // 5. Cancel closes it, which is what drops the draft and its
+        //    `Zeroizing` passphrase buffer.
+        let cancel_at = matrix_locate(state, &opened, "Cancel");
+        let closed = matrix_click(&ctx, &mut frame_fn, cancel_at);
+        assert!(
+            matrix_find(&closed, record_ui::EXPORT_HEADING).is_none(),
+            "Cancel left the composer open, so the draft it holds is never dropped: {:?}",
+            matrix_texts(&closed)
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     fn drive_the_sends_screen_in(state: ReachableState) {
         FRAME_REVOKES.lock().expect("not poisoned").clear();
         *FRAME_TX.lock().expect("not poisoned") = None;
@@ -27168,6 +27567,270 @@ mod send_create_wiring {
         );
     }
 
+    // ==================================================================
+    // The orphan guard: a surface that exists and cannot be reached
+    // ==================================================================
+
+    /// **Every `vault_window` UI module this file declares, taken from the
+    /// declarations themselves.**
+    ///
+    /// Parsed out of `mod.rs`'s own production half rather than written down
+    /// here, because a hand-written list of module names is the "two
+    /// enumerations that must agree" defect this crate keeps losing to: the
+    /// list would be updated by the commit that adds a module and by no other,
+    /// which is precisely the commit that does not need the guard.
+    fn declared_ui_modules() -> Vec<String> {
+        own_production()
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+            })
+            .filter(|name| !name.contains(' '))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A file's production half with its `//` comments removed.
+    ///
+    /// **The comments have to go.** This crate documents heavily and by name:
+    /// `record_ui` was named in prose in three other files while having zero
+    /// callers anywhere, so a containment test run over raw text would have
+    /// reported it reachable and this guard would have shipped green over the
+    /// exact defect it exists to catch. Measured, not assumed -- see the
+    /// control assertion in
+    /// [`every_declared_ui_module_is_reached_from_production`].
+    fn code_without_comments(text: &str) -> String {
+        production_half(text)
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **A UI MODULE NOBODY CALLS IS A SCREEN THE USER CANNOT REACH, AND IT
+    /// COMPILES AND PASSES ITS OWN TESTS.**
+    ///
+    /// This is the guard for the defect that cost this feature: `record_ui`
+    /// shipped as 1400 lines of finished, unit-tested export and import
+    /// surface with **no caller anywhere in `src`**. Every one of its own
+    /// tests was green -- they test its pure functions, which are correct --
+    /// and `cargo build` was silent, because a `pub` item in a `pub mod` is
+    /// not dead code as far as the compiler is concerned. It was found by
+    /// somebody taking screenshots, which is not a guard.
+    ///
+    /// **It is a planning failure that a test can catch**, and the shape of
+    /// the test is the point: the plan named the surfaces and never named an
+    /// entry point, so what has to be asserted is not "the composer works" but
+    /// "something reaches it".
+    ///
+    /// Two things make this structural rather than a checklist:
+    ///
+    ///  * the module list is [`declared_ui_modules`], read from this file's
+    ///    own `pub mod` lines, so a module added tomorrow is covered by the
+    ///    commit that adds it and not by a later one that remembers to;
+    ///  * the search is [`every_source_file`], the whole of `src`, so
+    ///    "reached" means reached by the shipping program and not by a test
+    ///    or an `examples/` binary. `record_ui` had a caller in
+    ///    `examples/ui_preview.rs` the entire time -- added so the screenshot
+    ///    job could render it -- and that caller is exactly the kind that must
+    ///    not count.
+    #[test]
+    fn every_declared_ui_module_is_reached_from_production() {
+        let modules = declared_ui_modules();
+        assert!(
+            modules.len() >= 8,
+            "control: only {} `pub mod` declarations were parsed out of this file, which is \
+             not `vault_window`'s module list -- the parser has stopped matching and every \
+             assertion below is vacuous: {modules:?}",
+            modules.len()
+        );
+        for expected in ["record_ui", "send_ui", "detail", "sidebar"] {
+            assert!(
+                modules.iter().any(|m| m == expected),
+                "control: {expected:?} is not among the parsed modules {modules:?}"
+            );
+        }
+
+        let files: Vec<(String, String)> = every_source_file()
+            .into_iter()
+            .map(|(path, text)| (path, code_without_comments(&text)))
+            .collect();
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+
+        for module in &modules {
+            let own = format!("vault_window/{module}.rs");
+            assert!(
+                files.iter().any(|(path, _)| path == &own),
+                "control: {own:?} is declared but the crate walk never reached it, so the \
+                 search below would call it unreachable for the wrong reason"
+            );
+            let needle = format!("{module}::");
+            let callers: Vec<&str> = files
+                .iter()
+                .filter(|(path, code)| path != &own && code.contains(&needle))
+                .map(|(path, _)| path.as_str())
+                .collect();
+            assert!(
+                !callers.is_empty(),
+                "`vault_window::{module}` is not named by any production code under `src` \
+                 outside its own file. It compiles, its own tests pass, and NO USER CAN \
+                 REACH IT -- which is exactly the state `record_ui` shipped in. Give it an \
+                 entry point from a surface the user can actually get to, or delete it; do \
+                 not add it to an exemption list here"
+            );
+        }
+    }
+
+    /// The control for [`code_without_comments`], stated as its own test
+    /// because the claim it protects is easy to break silently.
+    ///
+    /// If comment stripping regresses, the guard above still passes for every
+    /// module in the crate -- including a genuinely orphaned one that happens
+    /// to be documented elsewhere -- and nothing else notices.
+    #[test]
+    fn a_module_named_only_in_prose_does_not_count_as_a_caller() {
+        let stripped = code_without_comments(
+            "//! `record_ui::draw_export_form` is the composer.\r\n\
+             /// See [`record_ui::draw_import_form`].\r\n\
+             let x = 1; // record_ui::mentioned_in_a_trailing_comment\r\n",
+        );
+        assert!(
+            !stripped.contains("record_ui::"),
+            "a module named only in a doc comment survived the strip, so the orphan guard \
+             would report a module with no callers at all as reached: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("let x = 1;"),
+            "the strip ate real code as well as the comments: {stripped:?}"
+        );
+    }
+
+    /// **The record composer has exactly one door**, and the re-prompt stands
+    /// in it.
+    ///
+    /// Both halves are needed and neither implies the other. One write means
+    /// there is no second assignment that opens the composer around
+    /// [`super::permit_record_send`]; the gate's own presence means that one
+    /// write is the gated one. A second door added later -- a row menu entry,
+    /// a detail-pane button -- fails this until it comes through the same
+    /// line.
+    #[test]
+    fn exactly_one_line_opens_the_record_composer() {
+        let code = code_without_comments(include_str!("mod.rs"));
+        let opens = code.matches(concat!("record_send = permit_record_", "send(")).count();
+        assert_eq!(
+            opens, 1,
+            "`record_send` is opened from {opens} places, not one. Every door into the \
+             record composer must come through `permit_record_send`, which is where the \
+             master-password re-prompt is asked -- a second assignment is a way to publish \
+             a protected item's secrets with no proof taken"
+        );
+        let clears = code.matches(concat!("record_send = ", "None")).count();
+        assert!(
+            clears >= 2,
+            "the composer is cleared from {clears} places; Cancel and a started publish are \
+             both meant to drop it, and dropping it is what wipes the seed passphrase"
+        );
+    }
+
+    /// **The chord the pill advertises is the chord the code binds**, and it
+    /// is bound EXACTLY.
+    ///
+    /// The exactness is the load-bearing half. `Ctrl+K`, `Ctrl+L` and `Ctrl+N`
+    /// in the block above are matched with a bare `i.modifiers.ctrl`, which is
+    /// **true with shift held** -- so `CTRL+SHIFT+<one of those letters>`
+    /// would fire the older binding underneath the new one, running two
+    /// commands from one keystroke with one of them invisible. That hazard is
+    /// documented on `detail.rs`'s `COPY_SHORTCUTS` table and it has cost real
+    /// time here before.
+    #[test]
+    fn the_record_chord_is_a_key_no_other_binding_takes() {
+        // **Spelled FROM the modifiers the binding really carries**, which is
+        // `detail.rs`'s `every_binding_has_a_chord_that_names_its_own_key`
+        // idiom and not a comparison against a second literal. A chord that
+        // quietly picked up ALT would then be spelled "CTRL+SHIFT+ALT+S" here
+        // and fail against the pill's own string, where an `assert_eq!` on two
+        // written-out constants would just be two constants agreeing.
+        let modifiers = super::SEND_RECORD_MODIFIERS;
+        let mut spelled = String::new();
+        for (held, name) in [
+            (modifiers.ctrl, "CTRL"),
+            (modifiers.shift, "SHIFT"),
+            (modifiers.alt, "ALT"),
+            (modifiers.mac_cmd, "CMD"),
+        ] {
+            if held {
+                if !spelled.is_empty() {
+                    spelled.push('+');
+                }
+                spelled.push_str(name);
+            }
+        }
+        assert_eq!(
+            record_ui::SEND_RECORD_SHORTCUT,
+            format!("{spelled}+{}", super::SEND_RECORD_KEY.name()),
+            "the pill advertises a chord the code does not bind"
+        );
+
+        // The read is exact, not `i.modifiers.ctrl`. Spelled in pieces so this
+        // needle cannot match itself.
+        let code = code_without_comments(include_str!("mod.rs"));
+        assert!(
+            code.contains(concat!("i.modifiers.matches_", "exact(SEND_RECORD_MODIFIERS)")),
+            "the record chord is no longer matched exactly, so a loose CTRL test can fire it \
+             with extra modifiers held -- or let it fire a plain-CTRL binding underneath"
+        );
+
+        // And the key itself is unspent. Every `egui::Key::S` in the crate's
+        // production must be this binding's own constant.
+        //
+        // Whole-name matches only: a plain `contains` counts `Key::Space`,
+        // which `preflight.rs` really does bind, and would have made this
+        // assertion fail for a key nothing is competing for. Measured, not
+        // foreseen.
+        let key = concat!("Key", "::S");
+        fn binds_the_s_key(code: &str, key: &str) -> usize {
+            code.match_indices(key)
+                .filter(|(at, _)| {
+                    code[at + key.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                })
+                .count()
+        }
+        let elsewhere: Vec<String> = every_source_file()
+            .into_iter()
+            .filter(|(path, text)| {
+                path != "vault_window/mod.rs"
+                    && binds_the_s_key(&code_without_comments(text), key) > 0
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "`egui::Key::S` is bound somewhere else in production too: {elsewhere:?}. Two \
+             bindings on one key resolve to whichever is read first and the other silently \
+             never fires -- `detail.rs`'s `no_two_bindings_share_a_chord` for the chords it \
+             can see, stated here for the one it cannot"
+        );
+        assert_eq!(
+            binds_the_s_key(&code, key),
+            1,
+            "`egui::Key::S` is spelled more than once in this file's production, so the \
+             constant is no longer the single place the record chord's key is written"
+        );
+    }
+
     /// **THE DRAFT'S PLAINTEXT IS WIPED WHEN THE COMPOSER LETS GO OF IT.**
     ///
     /// Two readings, and it is the pair that is the claim, because either one
@@ -27817,6 +28480,12 @@ mod reprompt_gating_tests {
         for call in [
             concat!("let action = permit_detail_", "action("),
             concat!("let permitted = permit_row_", "command("),
+            // The third position, added with the record composer's entry
+            // point: `record_send` is assigned from this call and from
+            // nothing else, so the pill and the chord are both gated by it.
+            // `exactly_one_line_opens_the_record_composer` states the other
+            // half -- that nothing else assigns `record_send` at all.
+            concat!("record_send = permit_record_", "send("),
         ] {
             assert_eq!(
                 source.matches(call).count(),
@@ -27829,5 +28498,97 @@ mod reprompt_gating_tests {
         // CONTROL: this reader really read the production region, and would
         // have noticed had it been handed the empty string.
         assert!(source.len() > 100_000, "control: the production region is {} bytes", source.len());
+    }
+
+    // ==================================================================
+    // "Send a record", the third exposing path
+    // ==================================================================
+
+    /// A composer never opened is a record never published, so the test reads
+    /// the `Option` and not a flag.
+    fn opens(gate: &RepromptGate, item: &VaultItem) -> bool {
+        let ctx = egui::Context::default();
+        let mut proof = Proof::default();
+        permit_record_send(&ctx, item, gate, &mut proof).is_some()
+    }
+
+    /// **An ordinary item is not asked about**, and the prover proves it: a
+    /// gate that panics if consulted is how "no prompt appeared" becomes a
+    /// fact rather than the absence of one.
+    #[test]
+    fn an_unprotected_item_opens_the_record_composer_without_being_asked() {
+        assert!(
+            opens(&never_asks(), &plain()),
+            "an item with no re-prompt flag could not be sent at all"
+        );
+    }
+
+    /// **A protected item opens the composer only once the proof is given**,
+    /// and the composer is opened against THAT item -- an entry point that
+    /// composed against the wrong record would pass a bare `is_some`.
+    #[test]
+    fn a_proved_protected_item_opens_the_composer_against_its_own_record() {
+        let ctx = egui::Context::default();
+        let mut proof = Proof::default();
+        let item = protected();
+        let composer = permit_record_send(
+            &ctx,
+            &item,
+            &RepromptGate::with_prover(Some(scope()), allows),
+            &mut proof,
+        )
+        .expect("a proved protected item must be sendable");
+        assert_eq!(composer.item_id, item.id, "the composer opened against another item");
+        assert_eq!(composer.item_name, item.name);
+        assert!(
+            composer.draft.open,
+            "the composer was built closed, so the modal would draw nothing"
+        );
+        // The seed is not a default here either -- `RecordDraft::default`'s
+        // rule, restated at the door because this is the door.
+        assert!(
+            !composer.draft.selection.totp,
+            "the one-time code seed was ticked for the user, which is the one tick a user \
+             must make deliberately"
+        );
+    }
+
+    /// **A CANCELLED PROMPT PUBLISHES NOTHING**, and it does so by there being
+    /// no composer -- not by a composer drawn with its Create button greyed,
+    /// which is a state a later edit can un-grey.
+    ///
+    /// This is the sharpest of the three because a record Send is the widest
+    /// exposure this app has: not a value on the clipboard for forty-five
+    /// seconds, but the item's fields on a public link.
+    #[test]
+    fn a_cancelled_prompt_never_opens_the_record_composer() {
+        assert!(
+            !opens(&RepromptGate::with_prover(Some(scope()), refuses), &protected()),
+            "a cancelled Windows Hello prompt still opened the record composer, so the \
+             protected item's fields are one click from a public link"
+        );
+        // And the unprotected item is unaffected by the same refusing gate,
+        // so the negative above is the flag's doing and not the gate's.
+        assert!(
+            opens(&RepromptGate::with_prover(Some(scope()), refuses), &plain()),
+            "control: the refusing gate blocked an item that has no re-prompt flag, so the \
+             assertion above proves nothing about the flag"
+        );
+    }
+
+    /// **No scope is a refusal, not a pass** -- an account that cannot be
+    /// asked cannot consent, and `RepromptGate::unprovable` is the state a
+    /// machine with no Windows Hello enrollment is in.
+    #[test]
+    fn an_account_that_cannot_prove_cannot_send_a_protected_record() {
+        assert!(
+            !opens(&RepromptGate::unprovable(), &protected()),
+            "an account with no way to prove anything was allowed to publish a protected \
+             item's fields to a link"
+        );
+        assert!(
+            opens(&RepromptGate::unprovable(), &plain()),
+            "control: an unprovable gate blocked an unprotected item too"
+        );
     }
 }

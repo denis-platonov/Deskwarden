@@ -706,6 +706,111 @@ pub fn draw_import_form(
     action
 }
 
+// ---------------------------------------------------------------------------
+// The way in
+// ---------------------------------------------------------------------------
+
+/// The label on the titlebar control that opens the export composer.
+///
+/// Design §5b draws exactly this pair — a `Send a record` pill carrying
+/// `CTRL+⇧+S` — in the window header. The chord rides the control for the rule
+/// every binding in this app already follows: a chord with nothing on screen
+/// naming it is a chord nobody finds.
+pub const SEND_RECORD_LABEL: &str = "Send a record";
+
+/// See [`SEND_RECORD_LABEL`]. Spelled the way `detail.rs`'s copy chords are.
+pub const SEND_RECORD_SHORTCUT: &str = "CTRL+SHIFT+S";
+
+/// Why the control is grey.
+///
+/// **A reason and not a hidden button.** The composer narrows a record the
+/// user picked, so with nothing picked there is nothing to narrow — and a
+/// control that comes and goes with the selection is a control the user reads
+/// as broken. Design §5a's own words for this state are its `Record` /
+/// `Change` row: the record is chosen first and then narrowed.
+pub const NO_ITEM_SELECTED: &str = "Select an item in the list to send it.";
+
+/// The composer's per-open state: **which item it was opened against**, and
+/// the ticks.
+///
+/// The id and the name are both held, and neither is redundant. The id is what
+/// the caller re-resolves the item by when Create is pressed — the vault can
+/// be re-read between the open and the press, so the item the composer was
+/// opened from is not necessarily the one that should be published. The name
+/// is what the form paints, and it is a copy rather than a second lookup so
+/// the heading cannot go blank if the item disappears underneath.
+pub struct RecordSend {
+    /// The chosen item's id. See the struct doc.
+    pub item_id: String,
+    /// The chosen item's name, as painted. See the struct doc.
+    pub item_name: String,
+    /// The ticks and the passphrase.
+    pub draft: RecordDraft,
+}
+
+impl RecordSend {
+    /// Opens the composer against one item.
+    ///
+    /// `open` is set here rather than left to the caller: a `RecordSend` that
+    /// exists at all *is* the composer being on screen, and a second flag the
+    /// caller had to remember to set is the second enumeration this crate
+    /// keeps losing to.
+    pub fn opening(item_id: &str, item_name: &str) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+            item_name: item_name.to_string(),
+            draft: RecordDraft { open: true, ..RecordDraft::default() },
+        }
+    }
+}
+
+/// The composer card's width. Design §5a's composer is a narrow column — the
+/// tick list is the widest control in it — and the seed warning is a paragraph
+/// that has to wrap somewhere.
+const MODAL_WIDTH: f32 = 360.0;
+
+/// [`draw_export_form`] over a dimmed scrim, centred, for `vault_window::mod`
+/// to call from its frame closure.
+///
+/// **A modal and not a pane**, deliberately: the composer is opened against
+/// the item the user has selected in the list, and a screen that replaced the
+/// list — the way the Sends screen does — would take that item off screen at
+/// the moment the user is deciding what to send from it.
+///
+/// Built exactly the way [`super::folder_modal::draw_folder_edit_modal`] is —
+/// a full-window click-catching scrim on the `Foreground` layer, then a
+/// centred card — because that is this window's established modal, and a
+/// second one built differently is two modals that dim, layer and swallow
+/// clicks two ways. Nothing about the form itself moves in here: every
+/// decision it paints is still [`export_problem`]'s and [`warning_is_shown`]'s.
+pub fn draw_export_modal(
+    ctx: &egui::Context,
+    state: &mut RecordSend,
+    in_flight: bool,
+) -> RecordUiAction {
+    egui::Area::new(egui::Id::new("record-send-scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(90),
+            );
+        });
+
+    egui::Area::new(egui::Id::new("record-send-modal"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(MODAL_WIDTH);
+            draw_export_form(ui, &mut state.draft, &state.item_name, in_flight)
+        })
+        .inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
