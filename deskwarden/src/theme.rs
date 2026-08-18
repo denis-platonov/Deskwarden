@@ -1284,6 +1284,43 @@ pub const EYE_VERTICES: usize = EYE_LID_SEGMENTS * 2;
 /// eye's pupil, which is deliberately a different size.
 pub const KEBAB_DOT_RADIUS: f32 = 1.7;
 
+/// Vertices in the envelope's body: a plain rectangle, stroked as a closed
+/// path rather than emitted as an `egui::Shape::Rect` **so that
+/// [`icon_probe`] can find it the way it finds every other mark in this
+/// family** -- by point count. A `Rect` shape would be indistinguishable
+/// from the strip's own white fill and every card behind it.
+pub const ENVELOPE_VERTICES: usize = 4;
+
+/// Vertices in the envelope's flap: the two top corners and the point the
+/// fold meets in the middle.
+///
+/// Three, which is also the point count `icon_probe::stars` walks for a
+/// star's fill triangles -- and it does not collide, because that probe
+/// additionally requires a non-transparent `fill` and this path is stroked
+/// with no fill at all. [`the_envelope_flap_is_not_findable_as_a_star_fill`]
+/// is the live guard on that, not this comment.
+pub const ENVELOPE_FLAP_VERTICES: usize = 3;
+
+/// Half the envelope's width, so the body spans 18px inside the 34px header
+/// button -- the same optical extent as the star's 18px and the kebab's 15.
+const ENVELOPE_HALF_WIDTH: f32 = 9.0;
+
+/// Half the envelope's height. Not half its width: a square envelope reads
+/// as a picture frame. 6.5 puts the body at 18x13, close to a real DL
+/// envelope's proportions.
+const ENVELOPE_HALF_HEIGHT: f32 = 6.5;
+
+/// Half the diagonal extent of the detail pane's close ✕, so its two arms
+/// span 11x11.
+///
+/// **Deliberately none of the other three ✕ sizes in this app.** The vault
+/// titlebar strokes a 9x9 close and [`close_glyph`] a 7x7 one, and
+/// [`icon_probe::pane_close_marks`] tells them apart by extent alone -- so a
+/// ✕ that matched either would report the titlebar's window-close as the
+/// detail pane's, in every frame the whole window is painted in.
+/// [`the_drawn_close_marks_do_not_share_an_extent`] is the live guard.
+const PANE_CLOSE_ARM: f32 = 5.5;
+
 /// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
 const EYE_PUPIL_RADIUS: f32 = 2.4;
 
@@ -1487,6 +1524,98 @@ pub fn kebab_button(ui: &mut Ui, armed: bool) -> Response {
             color,
         );
     }
+    response
+}
+
+/// The detail header's "Send a record" control: an envelope, stroked at the
+/// weight its neighbours are.
+///
+/// **An envelope because the user asked for one** -- "those are global things
+/// to the details like email icon after Fav" -- and because what this opens
+/// composes a link to hand somebody, which is the one thing a mail mark says
+/// without a word. It replaces the titlebar's worded `Send a record` pill:
+/// that pill acted on the SELECTED ITEM from a strip of global controls, and
+/// had to grey itself out with nothing selected to say so. Here there is
+/// always an item, because this strip is only drawn when there is one -- so
+/// the control has no disabled state at all, and needs none.
+///
+/// Square at [`HEADER_BUTTON_HEIGHT`] like the star and the kebab, so all
+/// four controls have the same hit target rather than each being as big as
+/// its own mark.
+///
+/// DRAWN, not typed, for this family's standing reason: ✉ (U+2709) would
+/// come out of egui's bundled fallback with its own weight and optical size
+/// beside three marks measured from the design, if it resolved at all.
+pub fn send_record_button(ui: &mut Ui) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // The kebab's resting grey, not the star's: this is an action, and the
+    // star's fainter TEXT_FAINT is the colour of a toggle that is OFF.
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    let stroke = Stroke::new(ICON_STROKE, color);
+    let c = rect.center();
+    let (hw, hh) = (ENVELOPE_HALF_WIDTH, ENVELOPE_HALF_HEIGHT);
+    let corner = |x: f32, y: f32| c + Vec2::new(x, y);
+    // The body, as a CLOSED PATH of exactly `ENVELOPE_VERTICES` points --
+    // see that constant for why this is not `rect_stroke`.
+    ui.painter().add(egui::Shape::closed_line(
+        vec![
+            corner(-hw, -hh),
+            corner(hw, -hh),
+            corner(hw, hh),
+            corner(-hw, hh),
+        ],
+        stroke,
+    ));
+    // The flap: down from both top corners to the fold in the middle. Closed
+    // over the top edge it shares with the body, so it is one countable path
+    // rather than two loose segments -- `icon_probe::line_segments` already
+    // finds the eye's strike and the titlebar's ✕, and two more entries
+    // there would be two more things every such test has to exclude.
+    //
+    // `fill: TRANSPARENT` is load-bearing and not a default being restated:
+    // `icon_probe::stars` walks three-point paths WITH a fill, so a filled
+    // flap would be reported as a star's fill triangle and every "the header
+    // painted exactly one star" assertion in `detail.rs` would start reading
+    // this mark instead.
+    ui.painter().add(egui::Shape::Path(egui::epaint::PathShape {
+        points: vec![corner(-hw, -hh), corner(0.0, hh * 0.35), corner(hw, -hh)],
+        closed: true,
+        fill: Color32::TRANSPARENT,
+        stroke: stroke.into(),
+    }));
+    response
+}
+
+/// The detail header's close ✕: it clears the selection, so the item list
+/// takes the whole window and the pane is gone until a row is clicked.
+///
+/// **Deliberately the quietest mark in the strip, and never [`ERROR`].** It
+/// sits immediately to the right of the kebab, and inside that kebab is a
+/// Delete that arms on its first click -- so these two controls are one
+/// misclick apart and one of them is permanent. A red ✕, or one drawn at the
+/// weight of a primary, would be inviting exactly that mistake. It rests at
+/// [`TEXT_GHOST`] -- fainter than the kebab's [`TEXT_SECONDARY`] and the
+/// star's [`TEXT_FAINT`], the lightest ink this palette has for something
+/// still meant to be clicked -- and darkens only to [`INK`] on hover. It has
+/// no armed state, because closing a pane is undone by clicking the row
+/// again.
+pub fn close_pane_button(ui: &mut Ui) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() { INK } else { TEXT_GHOST };
+    let stroke = Stroke::new(ICON_STROKE, color);
+    let arm = PANE_CLOSE_ARM;
+    let c = rect.center();
+    let painter = ui.painter();
+    painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
+    painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
     response
 }
 
@@ -2942,6 +3071,14 @@ mod drawn_icon_family_tests {
     fn no_two_drawn_icons_share_a_vertex_count() {
         for (a, a_name, b, b_name) in [
             (EYE_VERTICES, "the eye", STAR_VERTICES, "the star"),
+            (ENVELOPE_VERTICES, "the envelope's body", EYE_VERTICES, "the eye"),
+            (ENVELOPE_VERTICES, "the envelope's body", STAR_VERTICES, "the star"),
+            (
+                ENVELOPE_VERTICES,
+                "the envelope's body",
+                ENVELOPE_FLAP_VERTICES,
+                "the envelope's own flap",
+            ),
         ] {
             assert_ne!(
                 a, b,
@@ -2950,6 +3087,88 @@ mod drawn_icon_family_tests {
                  the other and every probe over them is reporting the wrong mark"
             );
         }
+    }
+
+    /// **The envelope's flap shares the star's fill triangles' point count,
+    /// and must not be findable as one.**
+    ///
+    /// [`no_two_drawn_icons_share_a_vertex_count`] cannot express this pair:
+    /// three IS three, deliberately, and what separates them is the fill.
+    /// So this drives both real controls and asserts each probe finds only
+    /// its own mark -- which is the assertion, not the count.
+    ///
+    /// Paired in both directions on purpose. "The envelope is not a star"
+    /// alone would pass against a `stars` probe that had stopped finding
+    /// anything at all, so the same frames are asserted to still contain the
+    /// star they should.
+    #[test]
+    fn the_envelope_flap_is_not_findable_as_a_star_fill() {
+        let (_, envelope_marks) = control(|ui| send_record_button(ui));
+        let envelope_tree = egui::Shape::Vec(envelope_marks);
+        assert_eq!(
+            icon_probe::envelopes(&envelope_tree).len(),
+            1,
+            "`send_record_button` painted no envelope its own probe can find"
+        );
+        assert!(
+            icon_probe::stars(&envelope_tree).is_empty(),
+            "the envelope is being reported as a star, so every \"the header painted \
+             exactly one star\" assertion in `detail.rs` is now reading this mark"
+        );
+
+        for on in [false, true] {
+            let (_, star_marks) = control(|ui| star_toggle(ui, on));
+            let star_tree = egui::Shape::Vec(star_marks);
+            assert_eq!(
+                icon_probe::stars(&star_tree).len(),
+                1,
+                "`star_toggle({on})` painted no star, so the negative above proves nothing"
+            );
+            assert!(
+                icon_probe::envelopes(&star_tree).is_empty(),
+                "the {on} star is being reported as an envelope"
+            );
+        }
+    }
+
+    /// **This app strokes three different ✕ marks, and `icon_probe` tells
+    /// the detail pane's from the other two by EXTENT alone.**
+    ///
+    /// The vault titlebar's window-close is painted in every frame the whole
+    /// window is, and [`card_header_with_close`]'s dismiss in the overlay's
+    /// -- so a pane close that matched either extent would have
+    /// [`icon_probe::pane_close_marks`] reporting a control that closes the
+    /// WINDOW as the one that closes the pane.
+    ///
+    /// Measured off the painted shapes rather than compared as constants:
+    /// the titlebar's ✕ is not drawn by this module at all, so a constant
+    /// comparison could only restate what this file already says.
+    #[test]
+    fn the_drawn_close_marks_do_not_share_an_extent() {
+        let (_, pane_marks) = control(|ui| close_pane_button(ui));
+        let pane_tree = egui::Shape::Vec(pane_marks);
+        let found = icon_probe::pane_close_marks(&pane_tree);
+        assert_eq!(
+            found.len(),
+            1,
+            "`close_pane_button` painted no ✕ its own probe can find"
+        );
+
+        let (_, dismiss_marks) = control(|ui| close_glyph(ui));
+        let dismiss_tree = egui::Shape::Vec(dismiss_marks);
+        // The positive control: the dismiss ✕ really is two segments, so
+        // "the probe found none of them" is a statement about the extent and
+        // not about an empty frame.
+        assert_eq!(
+            icon_probe::line_segments(&dismiss_tree).len(),
+            2,
+            "`close_glyph` painted no two-armed ✕, so the assertion below proves nothing"
+        );
+        assert!(
+            icon_probe::pane_close_marks(&dismiss_tree).is_empty(),
+            "the card header's dismiss ✕ is being reported as the detail pane's close, \
+             so `PANE_CLOSE_ARM` has collided with `close_glyph`'s own arm"
+        );
     }
 
     /// **The circle counterpart of the test above**, and a live one: three
@@ -3434,6 +3653,114 @@ pub mod icon_probe {
     /// is a separate segment, so the almond is found either way.
     pub fn eyes(shape: &egui::Shape) -> Vec<Rect> {
         closed_paths(shape, EYE_VERTICES)
+    }
+
+    /// The "Send a record" envelopes this shape tree paints, each as the
+    /// union of its body and its flap, with the colour it was stroked in --
+    /// which is the only way `send_record_button`'s hover state is visible to
+    /// a test, since it paints no fill and no string.
+    ///
+    /// **Found by its FLAP and not by its body.** A closed four-point path is
+    /// the least distinctive shape in this module -- anything that ever
+    /// strokes a quadrilateral becomes an envelope to a probe phrased over
+    /// [`ENVELOPE_VERTICES`] alone. The flap's three points plus a
+    /// transparent fill is the pair nothing else in this crate paints, so
+    /// that is the anchor; the body is then the one
+    /// [`ENVELOPE_VERTICES`]-point path enclosing it, and a flap with no body
+    /// around it is a probe that has stopped matching what
+    /// `send_record_button` draws, so it panics rather than reporting half a
+    /// mark -- exactly as [`chevrons`] and [`tune_icons`] do.
+    pub fn envelopes(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut flaps = Vec::new();
+        walk_open_paths(shape, ENVELOPE_FLAP_VERTICES, &mut flaps);
+        let mut bodies = Vec::new();
+        walk_paths(shape, ENVELOPE_VERTICES, &mut bodies);
+        flaps
+            .into_iter()
+            .map(|(flap, color)| {
+                let body = bodies
+                    .iter()
+                    .find(|(b, _)| b.expand(1.0).contains_rect(flap))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "found an envelope flap at {flap:?} with no {ENVELOPE_VERTICES}\
+                             -point body around it -- this probe has stopped matching what \
+                             `send_record_button` draws"
+                        )
+                    });
+                (body.0.union(flap), color)
+            })
+            .collect()
+    }
+
+    /// Like [`walk_paths`], but only closed paths that are **not filled** --
+    /// which is what keeps the envelope's flap clear of the star's fill
+    /// triangles, since those share its point count. See [`envelopes`].
+    fn walk_open_paths(shape: &egui::Shape, vertices: usize, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Path(p)
+                if p.closed
+                    && p.points.len() == vertices
+                    && p.fill == Color32::TRANSPARENT =>
+            {
+                let color = match p.stroke.color {
+                    egui::epaint::ColorMode::Solid(color) => color,
+                    egui::epaint::ColorMode::UV(_) => Color32::TRANSPARENT,
+                };
+                out.push((shape.visual_bounding_rect(), color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_open_paths(shape, vertices, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The detail pane's close ✕, as the union of its two arms, with the
+    /// colour it was stroked in.
+    ///
+    /// **Matched on [`PANE_CLOSE_ARM`], and that is why that number is not
+    /// shared with the app's other two ✕ marks.** The vault titlebar strokes
+    /// a window-close in every frame this pane is painted in, and
+    /// [`line_segments`] finds it, the eye's strike and this identically. So
+    /// this probe measures the extent: only a segment whose bounding box is
+    /// the pane close's own diagonal is one of these.
+    ///
+    /// The pairing is positional -- `close_pane_button` emits its two
+    /// segments back to back -- and an odd count is half a ✕, which is a
+    /// probe that has stopped matching rather than a mark worth reporting.
+    pub fn pane_close_marks(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let span = PANE_CLOSE_ARM * 2.0;
+        let mut arms = Vec::new();
+        walk_segments(shape, span, &mut arms);
+        assert!(
+            arms.len() % 2 == 0,
+            "found {} pane-close arms, which is not a whole number of two-armed ✕ marks \
+             -- this probe has stopped matching what `close_pane_button` draws",
+            arms.len()
+        );
+        arms.chunks(2)
+            .map(|pair| (pair[0].0.union(pair[1].0), pair[0].1))
+            .collect()
+    }
+
+    fn walk_segments(shape: &egui::Shape, span: f32, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::LineSegment { points, stroke } => {
+                let rect = Rect::from_two_pos(points[0], points[1]);
+                if (rect.width() - span).abs() < 0.01 && (rect.height() - span).abs() < 0.01 {
+                    out.push((rect, stroke.color));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_segments(shape, span, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The Preferences tune icons this shape tree paints, each as the union
