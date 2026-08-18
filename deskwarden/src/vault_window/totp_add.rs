@@ -63,6 +63,8 @@
 //! `false`.
 
 use crate::otpauth::{parse_otpauth, to_uri, Algorithm, OtpAuth, OtpRefusal};
+use crate::region_overlay::Outcome;
+use crate::screen_capture::CaptureRefusal;
 use crate::theme;
 use eframe::egui::{self, CornerRadius};
 use zeroize::Zeroizing;
@@ -104,6 +106,20 @@ pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 
 /// The hint in the one field, verbatim from design 6d.
 pub const SECRET_HINT: &str = "Secret key or otpauth:// URI";
+
+/// **What replaces the field when the payload was scanned**, verbatim from
+/// design 6c's own header row.
+///
+/// A scanned payload is a whole `otpauth://` URI with `secret=` in the middle
+/// of it, and 6d's field is a plain `TextEdit` that paints what it holds. Put
+/// one in the other and the confirmation's masked secret row is decoration:
+/// the seed is already on screen, in the clear, two rows above it. So the
+/// scanned routes get 6c's row -- which says what was read without saying what
+/// it was -- and the field is drawn only for what the user is typing
+/// themselves.
+pub const CODE_READ_LABEL: &str = "Code read";
+/// See [`CODE_READ_LABEL`]. What kind of thing it was.
+pub const CODE_READ_KIND: &str = "otpauth://totp";
 
 /// The heading over the confirmation half, verbatim from design 6c.
 pub const CONFIRM_HEADING: &str = "What was extracted";
@@ -176,6 +192,341 @@ pub const PERIOD_CHOICES: [u16; 2] = [30, 60];
 pub const DEFAULT_DIGITS: u8 = 6;
 /// See [`DEFAULT_DIGITS`].
 pub const DEFAULT_PERIOD: u16 = 30;
+
+// ---------------------------------------------------------------------------
+// Design 6a -- the picker
+// ---------------------------------------------------------------------------
+
+/// 6a's heading over the four routes.
+pub const PICKER_HEADING: &str = "How to add it";
+
+/// The label over the item name at the top of the picker, verbatim from 6a.
+pub const ADDING_TO_LABEL: &str = "Adding to";
+
+/// **The privacy line, verbatim from design 6a, and it must stay true of the
+/// code below it.**
+///
+/// Each clause is a claim about a specific piece of this feature:
+///
+/// * *"Decoding happens on this machine"* -- [`crate::qr`] wraps `rqrr`, which
+///   is pure Rust with no I/O and no network at all, and nothing on either
+///   route sends a byte anywhere.
+/// * *"The captured pixels are discarded once the secret is read"* --
+///   [`crate::screen_capture::Rgba`] wipes its buffer on drop and
+///   [`crate::region_overlay::read_region_with`] drops it before it returns;
+///   the image route's own buffers are [`Zeroizing`] and die inside
+///   [`decode_image_with`]. Neither route hands pixels to a caller.
+/// * *"the secret is never written to disk outside the vault"* -- the decoded
+///   string is a [`Zeroizing`] all the way from the decoder to
+///   [`uri_to_write`], nothing on either route opens a file for writing, and
+///   nothing logs it. The image route **reads** a file the user already had;
+///   it creates none.
+///
+/// The one thing this sentence does **not** claim, because it would not be
+/// true: that no copy of the seed's bits ever reaches the allocator. `rqrr`
+/// builds un-wiped intermediates during a decode and [`crate::qr::decode_qr`]
+/// says so in its own documentation. "Discarded once the secret is read" is a
+/// statement about what this app keeps, and that one holds.
+pub const PRIVACY_LINE: &str = "Decoding happens on this machine. The captured pixels are \
+     discarded once the secret is read, and the secret is never written to disk outside the \
+     vault.";
+
+/// The four routes of design 6a, in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// 6b: drag a box on a dimmed desktop.
+    ScanRegion,
+    /// A PNG the user already has.
+    ImageFile,
+    /// 6d: the form that was already here.
+    ByHand,
+    /// Present and dead. See [`WEBCAM_REASON`].
+    Webcam,
+}
+
+/// One row of the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRow {
+    /// What pressing it means.
+    pub route: Route,
+    /// The row's face.
+    pub title: &'static str,
+    /// The line under the title.
+    pub subtitle: &'static str,
+    /// Whether the row does anything. `false` is a **visible** deferral --
+    /// see [`WEBCAM_REASON`].
+    pub enabled: bool,
+}
+
+/// **Why the webcam row is drawn and dead rather than left out.**
+///
+/// It is in design 6a and it is not in this plan. A route the design promises
+/// and the product silently omits reads as a bug: the user looks for it, does
+/// not find it, and cannot tell whether they are looking in the wrong place.
+/// A row that says what it is and why it is off answers that in one glance,
+/// in the place they went looking.
+pub const WEBCAM_REASON: &str = "Not in this version";
+
+/// See [`WEBCAM_REASON`]. The sentence under the dead row -- the honest
+/// reason, not an apology: a webcam needs a capture API, a device picker and a
+/// preview surface, and on a Windows desktop the code is nearly always
+/// already on the screen, which is what the first row is for.
+pub const WEBCAM_DETAIL: &str = "A webcam needs a capture device and a preview of its own. On a \
+     desktop the code is nearly always already on screen \u{2014} scan a region instead.";
+
+/// **Design 6a's four routes, in its order** -- *"ordered by how often they're
+/// the right one on Windows"*.
+///
+/// The `ImageFile` subtitle says **PNG** where 6a says *"PNG, JPG"*, and that
+/// is a deliberate edit rather than an omission: this ships a `png`-crate
+/// decode and no JPEG one, [`crate::file_picker::pick_qr_image`]'s filter says
+/// the same, and a row promising JPG over a dialog that will not show one is a
+/// promise broken one click later. The copy was changed, not the reader's
+/// impression.
+pub const ROUTES: [RouteRow; 4] = [
+    RouteRow {
+        route: Route::ScanRegion,
+        title: "Scan a region of my screen",
+        subtitle: "Drag a box around the QR code in any window",
+        enabled: true,
+    },
+    RouteRow {
+        route: Route::ImageFile,
+        title: "Open an image file",
+        subtitle: "A screenshot or photo of the code \u{b7} PNG",
+        enabled: true,
+    },
+    RouteRow {
+        route: Route::ByHand,
+        title: "Enter the secret by hand",
+        subtitle: "The base32 key the site shows under the code",
+        enabled: true,
+    },
+    RouteRow {
+        route: Route::Webcam,
+        title: "Use a webcam",
+        subtitle: WEBCAM_DETAIL,
+        enabled: false,
+    },
+];
+
+/// What the picker's way back to itself is called, from the two halves that
+/// have one.
+pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
+
+/// The heading while the 6b overlay is up.
+pub const SCANNING_HEADING: &str = "Scanning your screen";
+
+/// Which half of the form is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// 6a. Where every open starts.
+    Picker,
+    /// The 6b overlay is up **on top of this window**. The card underneath
+    /// says so and offers the way out, because the overlay is a separate OS
+    /// window: a user who alt-tabs away from it would otherwise be looking at
+    /// a modal with no visible state at all.
+    Scanning,
+    /// 6d's field and 6c's confirmation. Reached by hand, or by a decode
+    /// landing in [`TotpAdd::typed`].
+    Manual,
+}
+
+/// Where a QR was looked for, for the one refusal whose noun differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeSource {
+    Region,
+    Image,
+}
+
+/// **Every way a route can fail before the field ever sees a string.**
+///
+/// The parser's refusals are [`OtpRefusal`] and render through
+/// [`refusal_sentence`]; these are the ones that happen earlier -- the
+/// capture, the file, the decoder. They are separate because they are
+/// recovered from differently: the user picks a route again rather than
+/// editing a field.
+///
+/// Carries nothing derived from the pixels or from the payload, so no arm of
+/// [`PickerRefusal::sentence`] can print a seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerRefusal {
+    /// The pixels arrived and held no QR code. 6d's *"No code in that
+    /// region"*.
+    NoCode(CodeSource),
+    /// The capture itself refused. The words are [`CaptureRefusal::title`]'s
+    /// and `detail`'s, from design 6d.
+    Capture(CaptureRefusal),
+    /// The file is not a PNG this app can decode.
+    NotAnImage,
+    /// The file could not be opened at all.
+    Unreadable,
+}
+
+/// The clause both [`CodeSource`]s share, so "no code found" is **one**
+/// refusal with one piece of advice rather than two that drift apart.
+const NO_CODE_ADVICE: &str = "Include the code's white margin";
+
+impl PickerRefusal {
+    /// **The refusal as a sentence naming the reason.**
+    ///
+    /// Exhaustive with no catch-all, [`refusal_sentence`]'s rule and for its
+    /// reason: a generic failure teaches the user to retry the thing that will
+    /// not work.
+    ///
+    /// [`Self::NoCode`] is **one variant carrying one piece of advice**; only
+    /// its noun and its second clause follow the route. "Drag again" is not
+    /// something a user of the file dialog can do, and a single shared
+    /// sentence that told them to would be exactly the generic refusal this
+    /// rule exists to prevent.
+    pub fn sentence(&self) -> String {
+        match self {
+            PickerRefusal::NoCode(CodeSource::Region) => format!(
+                "No code in that region. {NO_CODE_ADVICE}, or zoom the page to 150% and drag \
+                 again."
+            ),
+            PickerRefusal::NoCode(CodeSource::Image) => format!(
+                "No code in that image. {NO_CODE_ADVICE}, or open a larger copy of the picture."
+            ),
+            PickerRefusal::Capture(why) => format!("{}. {}", why.title(), why.detail()),
+            PickerRefusal::NotAnImage => {
+                "That file isn't a PNG Deskwarden can read. Save the picture as a PNG and \
+                 choose it again \u{2014} this version reads PNG only."
+                    .to_string()
+            }
+            PickerRefusal::Unreadable => {
+                "That file could not be opened. Check it is still where it was, and that you \
+                 have permission to read it."
+                    .to_string()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The image-file route
+// ---------------------------------------------------------------------------
+
+/// The one call the image route makes into something it does not own.
+///
+/// [`crate::region_overlay::RegionSeams`]'s shape, and its reason: behind a
+/// seam every arm of [`decode_image_with`] is reachable from a test that
+/// builds its bytes arithmetically, and that test can **look at the pixels**
+/// the PNG half produced rather than trust that it produced any.
+#[derive(Clone, Copy)]
+pub struct ImageSeams {
+    /// [`crate::qr::decode_qr`] in production.
+    pub decode: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
+}
+
+impl ImageSeams {
+    /// The real one. A test asserts this is [`crate::qr::decode_qr`] **by
+    /// address**, so a seam quietly re-pointed at a stub fails rather than
+    /// passing.
+    pub fn production() -> Self {
+        ImageSeams { decode: crate::qr::decode_qr }
+    }
+}
+
+/// A PNG's pixels as straight RGBA8, rows top to bottom, no padding -- what
+/// [`crate::qr::decode_qr`] and `GetDIBits` both speak.
+///
+/// **Not [`crate::favicon::decode_rgba`]**, which is this crate's other PNG
+/// reader. That one resamples every image down to 64 pixels on its longest
+/// edge for the item list, and 64 pixels is smaller than a QR code's module
+/// grid: it would hand back a picture of a code that no decoder could read.
+///
+/// Both buffers are [`Zeroizing`], because a picture of a QR code is a picture
+/// of a seed.
+fn png_to_rgba(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, usize), PickerRefusal> {
+    let mut decoder = png::Decoder::new(bytes);
+    // The same normalisation `favicon` uses: indexed and sub-8-bit sources are
+    // expanded during the decode, so the match below never sees them.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(|_| PickerRefusal::NotAnImage)?;
+
+    // **Bounded before anything is allocated.** The header is attacker-chosen
+    // -- it is a file -- and `output_buffer_size` is derived from it. The
+    // bound is `qr`'s own, so a picture refused here is exactly a picture the
+    // decoder would have refused anyway.
+    let (declared_width, declared_height) = {
+        let info = reader.info();
+        (info.width as usize, info.height as usize)
+    };
+    if declared_width == 0 || declared_height == 0 {
+        return Err(PickerRefusal::NotAnImage);
+    }
+    match declared_width.checked_mul(declared_height) {
+        Some(pixels) if pixels <= crate::qr::MAX_PIXELS => {}
+        _ => return Err(PickerRefusal::NotAnImage),
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);
+    let frame = reader.next_frame(&mut buf).map_err(|_| PickerRefusal::NotAnImage)?;
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let used = frame.buffer_size().min(buf.len());
+    let source = &buf[..used];
+
+    let mut rgba = Zeroizing::new(Vec::with_capacity(width.saturating_mul(height) * 4));
+    match frame.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(source),
+        png::ColorType::Rgb => {
+            for px in source.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for grey in source {
+                rgba.extend_from_slice(&[*grey, *grey, *grey, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in source.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        // Unreachable: `normalize_to_color8` expands indexed frames during the
+        // decode, exactly as `favicon::decode_rgba` documents. Kept only so
+        // this match stays exhaustive.
+        png::ColorType::Indexed => return Err(PickerRefusal::NotAnImage),
+    }
+    if rgba.len() < width * height * 4 {
+        // A truncated frame: `next_frame` can succeed on a file whose last
+        // rows are missing. A short buffer handed to the decoder answers
+        // `None`, which would be reported as "no code in that image" rather
+        // than as the broken file it is.
+        return Err(PickerRefusal::NotAnImage);
+    }
+    Ok((rgba, width, height))
+}
+
+/// **A PNG's bytes to the string its QR carries**, through `seams`.
+///
+/// Nothing leaves this function but the decoded string: the pixels are a
+/// [`Zeroizing`] local that dies here, which is [`PRIVACY_LINE`]'s second
+/// clause on this route.
+pub fn decode_image_with(
+    seams: &ImageSeams,
+    bytes: &[u8],
+) -> Result<Zeroizing<String>, PickerRefusal> {
+    let (rgba, width, height) = png_to_rgba(bytes)?;
+    (seams.decode)(&rgba, width, height).ok_or(PickerRefusal::NoCode(CodeSource::Image))
+}
+
+/// [`decode_image_with`] against the real decoder.
+pub fn decode_image(bytes: &[u8]) -> Result<Zeroizing<String>, PickerRefusal> {
+    decode_image_with(&ImageSeams::production(), bytes)
+}
+
+/// Reads the file the user pointed at, and decodes it.
+///
+/// The **only** line in this feature that touches the filesystem, and it only
+/// reads. The bytes are a [`Zeroizing`] for `png_to_rgba`'s reason; nothing is
+/// written, copied out, or logged.
+pub fn read_image_file(path: &std::path::Path) -> Result<Zeroizing<String>, PickerRefusal> {
+    let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| PickerRefusal::Unreadable)?);
+    decode_image(&bytes)
+}
 
 // ---------------------------------------------------------------------------
 // Reading the field
@@ -587,10 +938,22 @@ pub struct TotpAdd {
     /// Whether the secret row is unmasked. **Starts `false`** and is never
     /// persisted anywhere.
     pub revealed: bool,
+    /// Which half of the surface is on screen. **Starts [`Stage::Picker`]**:
+    /// design 6a is the front door, and the by-hand form is one of four
+    /// things behind it.
+    pub stage: Stage,
+    /// The last route-level refusal, painted on the picker. `None` once a
+    /// route is chosen again, so a stale sentence cannot sit under a fresh
+    /// attempt.
+    pub refusal: Option<PickerRefusal>,
+    /// Whether [`Self::typed`] came from a decoder rather than from a
+    /// keyboard. Drives [`CODE_READ_LABEL`] -- see it, because this flag is a
+    /// privacy decision and not a cosmetic one.
+    pub scanned: bool,
 }
 
 impl TotpAdd {
-    /// Opens the form against one item.
+    /// Opens the form against one item, **on the picker**.
     pub fn opening(item_id: &str, item_name: &str, already_has_code: bool) -> Self {
         Self {
             item_id: item_id.to_string(),
@@ -600,6 +963,91 @@ impl TotpAdd {
             digits: DEFAULT_DIGITS,
             period: DEFAULT_PERIOD,
             revealed: false,
+            stage: Stage::Picker,
+            refusal: None,
+            scanned: false,
+        }
+    }
+
+    /// **A decoded payload becomes what is in the field.**
+    ///
+    /// The scanned routes do not get a confirmation card of their own: the
+    /// decoded URI is put in [`Self::typed`], and 6d's field, its validity
+    /// line and 6c's confirmation then say the same things about it that they
+    /// say about a pasted one. That is what makes "the same 6c confirmation"
+    /// true rather than merely intended -- there is one card, drawn by one
+    /// function, from one string.
+    ///
+    /// It also means a hostile QR is refused by exactly the sentence a hostile
+    /// paste is: [`parse_otpauth`] is the only validator either reaches.
+    ///
+    /// [`Self::revealed`] is put back to `false`, because the seed that was on
+    /// screen a moment ago is not this one.
+    pub fn accept_decoded(&mut self, text: Zeroizing<String>) {
+        self.typed = text;
+        self.scanned = true;
+        self.stage = Stage::Manual;
+        self.refusal = None;
+        self.revealed = false;
+    }
+
+    /// Back to 6a, with the field emptied.
+    ///
+    /// **Emptied, not kept**: what is in it is a seed, and a form the user
+    /// stepped away from is not a place to leave one resident. The
+    /// `Zeroizing` is replaced rather than cleared in place so the old
+    /// allocation is wiped on drop.
+    pub fn back_to_picker(&mut self) {
+        self.typed = Zeroizing::new(String::new());
+        self.scanned = false;
+        self.revealed = false;
+        self.stage = Stage::Picker;
+        self.refusal = None;
+    }
+}
+
+/// **What the 6b overlay came back with, applied to the form.**
+///
+/// A free function taking `&mut TotpAdd` rather than a method on the overlay,
+/// for this file's standing rule: the decision is a pure function of the
+/// outcome, so a test can drive all four arms without a window anywhere.
+///
+/// [`Outcome::Cancelled`] leaves **no refusal**. The user pressed Escape; a
+/// sentence explaining that to them is an app narrating their own action back
+/// at them, which is the thing `apply_export_action` already refuses to do for
+/// a dismissed dialog.
+pub fn apply_region_outcome(state: &mut TotpAdd, outcome: Outcome) {
+    match outcome {
+        Outcome::Decoded(text) => state.accept_decoded(text),
+        Outcome::Cancelled => {
+            state.stage = Stage::Picker;
+            state.refusal = None;
+        }
+        Outcome::NoCode => {
+            state.stage = Stage::Picker;
+            state.refusal = Some(PickerRefusal::NoCode(CodeSource::Region));
+        }
+        Outcome::Refused(why) => {
+            state.stage = Stage::Picker;
+            state.refusal = Some(PickerRefusal::Capture(why));
+        }
+    }
+}
+
+/// **What the file dialog came back with, applied to the form.**
+///
+/// `None` is a cancelled dialog and leaves no refusal, for
+/// [`apply_region_outcome`]'s reason.
+pub fn apply_image_pick(state: &mut TotpAdd, picked: Option<&std::path::Path>) {
+    let Some(path) = picked else {
+        state.refusal = None;
+        return;
+    };
+    match read_image_file(path) {
+        Ok(text) => state.accept_decoded(text),
+        Err(why) => {
+            state.stage = Stage::Picker;
+            state.refusal = Some(why);
         }
     }
 }
@@ -617,6 +1065,17 @@ pub enum TotpAddAction {
     Save,
     /// Close without writing anything.
     Cancel,
+    /// **Open design 6b's overlay.** Reported rather than done, because
+    /// opening it needs `screen_capture::monitor_bounds()` and the parent
+    /// `egui::Context`, and because the overlay has to be driven by the
+    /// window's own frame loop -- see `vault_window::mod`'s block.
+    ScanRegion,
+    /// **Open the shell's file dialog.** Reported rather than done, for a
+    /// harder reason than the above: `IFileOpenDialog::Show` is modal and
+    /// pumps its own message loop, so it must be called from the action
+    /// handler after this frame's draw closures have returned, exactly where
+    /// `EditAction::PickAppFile` is called from.
+    OpenImage,
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -652,17 +1111,28 @@ fn field_row(ui: &mut egui::Ui, label: &str, value: &str) {
 /// frame and hands it down.
 pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
     let mut action = TotpAddAction::None;
+    // Deferred to after the card, because `state` is borrowed inside it and
+    // `back_to_picker` replaces the very `Zeroizing` the field is editing.
+    let mut back_to_picker = false;
     card(ui, |ui| {
         ui.label(egui::RichText::new(HEADING).size(14.0).color(theme::INK).strong());
         ui.add_space(2.0);
         note(ui, &state.item_name, theme::TEXT_MUTED);
         ui.add_space(10.0);
 
-        ui.add(
-            egui::TextEdit::singleline(&mut *state.typed)
-                .hint_text(SECRET_HINT)
-                .desired_width(f32::INFINITY),
-        );
+        // **A scanned payload is NOT put in a text field.** See
+        // [`CODE_READ_LABEL`]: a `TextEdit` paints what it holds, and what a
+        // decoder hands over holds `secret=` in the middle of it. The row 6c
+        // draws instead says what was read without saying what it was.
+        if state.scanned {
+            field_row(ui, CODE_READ_LABEL, CODE_READ_KIND);
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut *state.typed)
+                    .hint_text(SECRET_HINT)
+                    .desired_width(f32::INFINITY),
+            );
+        }
 
         let reading = read_field(&state.typed, state.digits, state.period);
         if let Some(line) = validity_line(&reading) {
@@ -760,9 +1230,206 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
             {
                 action = TotpAddAction::Cancel;
             }
+            // **The way back to 6a**, and the reason this form is not a dead
+            // end when the user arrived at it by scanning: a decode that
+            // produced the wrong card, or a seed typed off the wrong line, is
+            // fixed by choosing a route again rather than by cancelling out
+            // of the whole feature and re-opening it.
+            ui.add_space(8.0);
+            if theme::link_label(ui, OTHER_WAYS_LABEL, 11.0).clicked() {
+                back_to_picker = true;
+            }
         });
     });
+    if back_to_picker {
+        state.back_to_picker();
+    }
     action
+}
+
+// ---------------------------------------------------------------------------
+// Design 6a's surface
+// ---------------------------------------------------------------------------
+
+/// The height of one route row.
+const ROW_HEIGHT: f32 = 46.0;
+
+/// The height of the deferred row, which carries two lines rather than one.
+///
+/// Measured against the rendered surface rather than guessed: at
+/// [`MODAL_WIDTH`] [`WEBCAM_DETAIL`] wraps to two lines, and a row sized for
+/// one puts the second on top of whatever is under it. `ui_preview`'s
+/// `totp_add_picker` shot is what this was corrected from.
+const DEAD_ROW_HEIGHT: f32 = 62.0;
+
+/// How tall `row` is drawn.
+fn row_height(row: &RouteRow) -> f32 {
+    if row.enabled {
+        ROW_HEIGHT
+    } else {
+        DEAD_ROW_HEIGHT
+    }
+}
+
+/// One frame of [`draw_picker`].
+///
+/// The rows' rectangles come back with the action, and that is not decoration
+/// either: it is how a test **presses a row** rather than calling the function
+/// the row would have called. `record_ui` shipped unreachable for a day
+/// because every test it had called its draw function directly.
+pub struct PickerFrame {
+    /// What was pressed, if anything.
+    pub action: TotpAddAction,
+    /// Every row drawn this frame, with where it was drawn. In [`ROUTES`]'
+    /// order.
+    pub rows: Vec<(Route, egui::Rect)>,
+}
+
+/// What pressing a route means. A pure function so the routing is a thing a
+/// test can enumerate rather than four arms buried in a click handler.
+///
+/// [`Route::Webcam`] answers [`TotpAddAction::None`] and its row is drawn
+/// disabled, so there are two independent reasons it does nothing.
+pub fn action_for(route: Route) -> TotpAddAction {
+    match route {
+        Route::ScanRegion => TotpAddAction::ScanRegion,
+        Route::ImageFile => TotpAddAction::OpenImage,
+        // Handled in the picker itself: it is a stage change and not something
+        // the caller has to do.
+        Route::ByHand | Route::Webcam => TotpAddAction::None,
+    }
+}
+
+/// One route row: a title, a line under it, and a hit area.
+fn route_row(ui: &mut egui::Ui, row: &RouteRow) -> (egui::Response, egui::Rect) {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, row_height(row)),
+        if row.enabled { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let painter = ui.painter();
+    if row.enabled && response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(6), theme::BLUE_WASH);
+    } else {
+        painter.rect_filled(rect, CornerRadius::same(6), theme::CARD_TINT);
+    }
+    // A dead row is drawn in the muted inks rather than hidden: the fact that
+    // this route exists and is off is the whole content of the row.
+    let (title_ink, sub_ink) = if row.enabled {
+        (theme::INK, theme::TEXT_MUTED)
+    } else {
+        (theme::TEXT_GHOST, theme::TEXT_GHOST)
+    };
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(10.0, 6.0)))
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    inner.horizontal(|ui| {
+        ui.label(egui::RichText::new(row.title).size(12.5).color(title_ink).strong());
+        if !row.enabled {
+            ui.add_space(6.0);
+            note(ui, WEBCAM_REASON, theme::TEXT_GHOST);
+        }
+    });
+    note(&mut inner, row.subtitle, sub_ink);
+    (response, rect)
+}
+
+/// **Design 6a.** Four routes in the design's order, the reason the fourth is
+/// dead, and the privacy line under all of them.
+///
+/// The privacy line is **pinned to the bottom of the card**, below the rows
+/// and above nothing, because that is the last thing read before a route is
+/// chosen and because a claim about what happens to the pixels belongs beside
+/// the button that captures them.
+pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
+    let mut action = TotpAddAction::None;
+    let mut rows = Vec::with_capacity(ROUTES.len());
+    let mut go_manual = false;
+    card(ui, |ui| {
+        ui.label(egui::RichText::new(HEADING).size(14.0).color(theme::INK).strong());
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            note(ui, ADDING_TO_LABEL, theme::TEXT_FAINT);
+            ui.label(egui::RichText::new(&state.item_name).size(11.0).color(theme::TEXT_MUTED));
+        });
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(PICKER_HEADING).size(12.0).color(theme::INK).strong());
+        ui.add_space(6.0);
+
+        for row in &ROUTES {
+            let (response, rect) = route_row(ui, row);
+            rows.push((row.route, rect));
+            if response.clicked() {
+                if row.route == Route::ByHand {
+                    go_manual = true;
+                } else {
+                    action = action_for(row.route);
+                }
+            }
+            ui.add_space(6.0);
+        }
+
+        // The last refusal, if any. Above the privacy line rather than below
+        // it, so the sentence that says what went wrong sits next to the rows
+        // that can be pressed again.
+        if let Some(refusal) = state.refusal {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(refusal.sentence()).size(11.5).color(theme::ERROR));
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(PRIVACY_LINE).size(11.0).color(theme::TEXT_MUTED));
+
+        ui.add_space(10.0);
+        if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("Cancel").size(12.0).color(theme::TEXT_MUTED),
+                )
+                .min_size(egui::vec2(72.0, BUTTON_HEIGHT)),
+            )
+            .clicked()
+        {
+            action = TotpAddAction::Cancel;
+        }
+    });
+    if go_manual {
+        state.stage = Stage::Manual;
+        state.refusal = None;
+    }
+    PickerFrame { action, rows }
+}
+
+/// What the card says while the 6b overlay is up in front of it.
+///
+/// The words are [`crate::region_overlay`]'s own, so this window and that one
+/// cannot come to describe the same gesture differently.
+/// It reports nothing: the only thing that can end this stage from *this*
+/// window is the way back, and the outcome that really ends it arrives from
+/// the overlay through [`apply_region_outcome`]. A Cancel here would be a
+/// second way to close a surface whose other window is still up.
+pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
+    let mut go_back = false;
+    card(ui, |ui| {
+        ui.label(egui::RichText::new(SCANNING_HEADING).size(14.0).color(theme::INK).strong());
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(crate::region_overlay::DRAG_TITLE)
+                .size(12.0)
+                .color(theme::INK),
+        );
+        ui.add_space(2.0);
+        note(ui, crate::region_overlay::DRAG_HINT, theme::TEXT_MUTED);
+        ui.add_space(10.0);
+        if theme::link_label(ui, OTHER_WAYS_LABEL, 11.0).clicked() {
+            go_back = true;
+        }
+    });
+    if go_back {
+        state.back_to_picker();
+    }
 }
 
 /// **Design 6c**, and the half every later route shares.
@@ -853,9 +1520,22 @@ pub fn draw_add_modal(
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.set_max_width(MODAL_WIDTH);
-            draw_add_form(ui, state, now_unix)
+            draw_stage(ui, state, now_unix)
         })
         .inner
+}
+
+/// **The one place that decides which half of this surface is on screen**, so
+/// no caller has to know there are three.
+pub fn draw_stage(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
+    match state.stage {
+        Stage::Picker => draw_picker(ui, state).action,
+        Stage::Scanning => {
+            draw_scanning(ui, state);
+            TotpAddAction::None
+        }
+        Stage::Manual => draw_add_form(ui, state, now_unix),
+    }
 }
 
 #[cfg(test)]
@@ -1417,6 +2097,7 @@ mod tests {
         // The modal is the entry point `vault_window::mod` calls; a scrim that
         // drew nothing inside it would still satisfy every test above.
         let mut state = TotpAdd::opening("id-1", "Git Host", true);
+        state.stage = Stage::Manual;
         state.typed = Zeroizing::new("JBSWY3DPEHPK3PXP".to_string());
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
@@ -1448,5 +2129,974 @@ mod tests {
         assert!(painted.has(HEADING), "the modal painted no form: {:?}", painted.0);
         assert!(painted.has(REPLACE_WARNING), "the modal dropped the warning");
         assert!(painted.has(CONFIRM_HEADING), "the modal dropped the confirmation");
+    }
+
+    // -----------------------------------------------------------------
+    // Design 6a -- the picker's copy
+    // -----------------------------------------------------------------
+
+    /// **The four routes, in the design's order.**
+    ///
+    /// 6a's own words about that order are *"ordered by how often they're the
+    /// right one on Windows"*, so the order is content and not layout.
+    #[test]
+    fn the_picker_offers_the_designs_four_routes_in_its_order() {
+        let order: Vec<Route> = ROUTES.iter().map(|r| r.route).collect();
+        assert_eq!(
+            order,
+            vec![Route::ScanRegion, Route::ImageFile, Route::ByHand, Route::Webcam],
+            "the routes are not in design 6a's order"
+        );
+        assert_eq!(ROUTES[0].title, "Scan a region of my screen");
+        assert_eq!(ROUTES[1].title, "Open an image file");
+        assert_eq!(ROUTES[2].title, "Enter the secret by hand");
+        assert_eq!(ROUTES[3].title, "Use a webcam");
+        for row in &ROUTES {
+            assert!(!row.subtitle.trim().is_empty(), "{} has no line under it", row.title);
+        }
+        // **PNG, and not the design's "PNG, JPG".** The dialog's filter says
+        // the same, and the two are held to each other from `file_picker`'s
+        // own test. A row promising a format the decoder cannot read is a
+        // promise broken one click later.
+        assert!(
+            ROUTES[1].subtitle.contains("PNG") && !ROUTES[1].subtitle.contains("JPG"),
+            "the image row offers a format this app cannot decode: {}",
+            ROUTES[1].subtitle
+        );
+        assert_eq!(crate::file_picker::IMAGE_EXTENSION, "png");
+    }
+
+    /// **The webcam row is present and disabled; every other row is not.**
+    ///
+    /// Both halves matter. A row merely absent from an `enabled` check would
+    /// satisfy an assertion written one way round only.
+    #[test]
+    fn the_webcam_row_is_the_only_one_that_is_deferred_and_it_says_why() {
+        let dead: Vec<Route> = ROUTES.iter().filter(|r| !r.enabled).map(|r| r.route).collect();
+        assert_eq!(dead, vec![Route::Webcam], "the wrong set of routes is disabled");
+        let live: Vec<Route> = ROUTES.iter().filter(|r| r.enabled).map(|r| r.route).collect();
+        assert_eq!(
+            live,
+            vec![Route::ScanRegion, Route::ImageFile, Route::ByHand],
+            "a route this task shipped is drawn dead"
+        );
+        assert_eq!(WEBCAM_REASON, "Not in this version");
+        assert!(
+            WEBCAM_DETAIL.contains("scan a region"),
+            "the deferred row does not point at the route that replaces it: {WEBCAM_DETAIL}"
+        );
+    }
+
+    /// **The privacy line, verbatim from design 6a.**
+    ///
+    /// Pinned by content the way this crate pins every sentence a user is
+    /// held to. A reworded one must be a deliberate edit that reds this --
+    /// and, because of the two tests below it, an edit that has to be
+    /// justified against what the code really does.
+    #[test]
+    fn the_privacy_line_is_the_designs_own_sentence() {
+        assert_eq!(
+            PRIVACY_LINE,
+            "Decoding happens on this machine. The captured pixels are discarded once the \
+             secret is read, and the secret is never written to disk outside the vault."
+        );
+    }
+
+    /// The production halves of every file the two scan routes pass through.
+    ///
+    /// Not the test halves: a needle spelled out in a test below must neither
+    /// satisfy nor defeat a claim about the shipping code.
+    fn scan_route_sources() -> Vec<(&'static str, String)> {
+        [
+            ("totp_add.rs", include_str!("totp_add.rs")),
+            ("region_overlay.rs", include_str!("../region_overlay.rs")),
+            ("screen_capture.rs", include_str!("../screen_capture.rs")),
+            ("qr.rs", include_str!("../qr.rs")),
+        ]
+        .into_iter()
+        .map(|(name, whole)| {
+            let whole = whole.replace("\r\n", "\n");
+            let code = whole.split("#[cfg(test)]").next().unwrap().to_string();
+            assert!(code.len() < whole.len(), "{name} has no test module marker to split on");
+            (name, code)
+        })
+        .collect()
+    }
+
+    /// **The privacy line's third clause, checked against the code.**
+    ///
+    /// *"the secret is never written to disk outside the vault"*. Every file
+    /// the pixels or the payload pass through is scanned for a write. The one
+    /// filesystem call this feature makes is [`read_image_file`]'s
+    /// `std::fs::read` -- a read of a file the user already had.
+    #[test]
+    fn nothing_on_either_route_can_write_the_pixels_or_the_secret_to_disk() {
+        let writers = [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "write_all",
+            "create_dir",
+            "tempfile",
+            "BufWriter",
+        ];
+        let sources = scan_route_sources();
+        for (name, code) in &sources {
+            for needle in writers {
+                assert!(
+                    !code.contains(needle),
+                    "{name} contains `{needle}` -- the pixels are the seed in visual form, and \
+                     the picker's privacy line says they never reach the disk"
+                );
+            }
+        }
+        // Exactly one filesystem call in the whole feature, and it is a read.
+        let totp = &sources.iter().find(|(n, _)| *n == "totp_add.rs").unwrap().1;
+        assert_eq!(
+            totp.matches("std::fs::").count(),
+            1,
+            "the image route grew a second filesystem call"
+        );
+        assert!(
+            totp.contains("std::fs::read(path)"),
+            "the one filesystem call is not the read this feature is allowed"
+        );
+        // Positive control on the negatives above: the search really does
+        // find things in these files, so "no writer anywhere" is a statement
+        // about writers and not about an empty haystack.
+        assert!(
+            sources.iter().all(|(_, code)| code.contains("Zeroizing")),
+            "the source scan found no `Zeroizing` either, so it is reading nothing"
+        );
+    }
+
+    /// **The privacy line's second clause, checked against the code.**
+    ///
+    /// *"The captured pixels are discarded once the secret is read"*. On the
+    /// region route those pixels are `screen_capture::Rgba`, which wipes on
+    /// drop and is dropped inside `read_region_with`. On the image route they
+    /// are this file's own buffers, which is the half this file can be held
+    /// to directly: both are [`Zeroizing`], and neither is returned.
+    #[test]
+    fn the_image_routes_own_buffers_are_wiped_and_never_handed_out() {
+        let sources = scan_route_sources();
+        let totp = &sources.iter().find(|(n, _)| *n == "totp_add.rs").unwrap().1;
+        assert!(totp.contains("let bytes = Zeroizing::new(std::fs::read(path)"));
+        assert!(totp
+            .contains("let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);"));
+        assert!(totp.contains("let mut rgba = Zeroizing::new(Vec::with_capacity("));
+        // And nothing hands pixels back out: the one thing that leaves the
+        // image route is a string.
+        assert!(
+            totp.contains(") -> Result<Zeroizing<String>, PickerRefusal> {"),
+            "`decode_image_with`'s answer changed; it must be a string and never pixels"
+        );
+        // The region route's half, in the module that owns it.
+        let overlay = &sources.iter().find(|(n, _)| *n == "region_overlay.rs").unwrap().1;
+        assert!(
+            overlay.contains("let pixels = match (seams.capture)(rect)"),
+            "`read_region_with` no longer owns the captured buffer, so nothing says when it \
+             is dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The route-level refusals
+    // -----------------------------------------------------------------
+
+    /// Every [`PickerRefusal`] there is, so the loops below cannot silently
+    /// stop covering one.
+    fn every_picker_refusal() -> Vec<PickerRefusal> {
+        let mut all = vec![
+            PickerRefusal::NoCode(CodeSource::Region),
+            PickerRefusal::NoCode(CodeSource::Image),
+            PickerRefusal::NotAnImage,
+            PickerRefusal::Unreadable,
+        ];
+        for why in [
+            CaptureRefusal::Blocked,
+            CaptureRefusal::OffScreen,
+            CaptureRefusal::TooSmall,
+            CaptureRefusal::TooLarge,
+            CaptureRefusal::GdiFailed,
+        ] {
+            all.push(PickerRefusal::Capture(why));
+        }
+        all
+    }
+
+    #[test]
+    fn every_route_refusal_is_its_own_sentence_naming_its_reason() {
+        let sentences: Vec<String> =
+            every_picker_refusal().iter().map(PickerRefusal::sentence).collect();
+        assert_eq!(sentences.len(), 9, "a refusal was added without being covered here");
+        for (i, one) in sentences.iter().enumerate() {
+            assert!(!one.trim().is_empty(), "refusal {i} renders as nothing");
+            assert!(
+                one.ends_with('.') && one.split_whitespace().count() >= 6,
+                "refusal {i} is not a sentence: {one}"
+            );
+            for (j, other) in sentences.iter().enumerate() {
+                assert!(i == j || one != other, "refusals {i} and {j} render the same sentence");
+            }
+        }
+        // Positively: a capture refusal carries the words `screen_capture`
+        // wrote for it, so this surface cannot quietly re-word design 6d's
+        // protected-window case into something softer.
+        assert!(
+            PickerRefusal::Capture(CaptureRefusal::Blocked)
+                .sentence()
+                .starts_with("Screen capture is blocked"),
+            "the blocked-window refusal lost design 6d's headline"
+        );
+        assert!(PickerRefusal::Capture(CaptureRefusal::Blocked)
+            .sentence()
+            .contains("marked protected by its app"));
+    }
+
+    /// **A file with no QR gives the same named refusal as a region with
+    /// none**, which is Task 7's own rule.
+    ///
+    /// The same variant, from the same function, carrying the same advice.
+    /// Only the noun and the second clause follow the route, because "drag
+    /// again" is not an instruction a user of the file dialog can act on --
+    /// and an instruction that cannot be acted on is the generic refusal this
+    /// feature exists to avoid.
+    #[test]
+    fn a_file_with_no_code_and_a_region_with_none_are_one_refusal() {
+        let region = PickerRefusal::NoCode(CodeSource::Region);
+        let image = PickerRefusal::NoCode(CodeSource::Image);
+        assert!(
+            matches!(region, PickerRefusal::NoCode(_))
+                && matches!(image, PickerRefusal::NoCode(_)),
+            "the two routes report different kinds of failure for the same thing"
+        );
+        assert!(region.sentence().starts_with("No code in that "));
+        assert!(image.sentence().starts_with("No code in that "));
+        assert!(region.sentence().contains(NO_CODE_ADVICE));
+        assert!(image.sentence().contains(NO_CODE_ADVICE));
+        // And they are not identical, because one of them would then be
+        // telling the wrong user to do the wrong thing.
+        assert_ne!(region.sentence(), image.sentence());
+        assert!(region.sentence().contains("drag again"));
+        assert!(!image.sentence().contains("drag"));
+    }
+
+    #[test]
+    fn no_route_refusal_can_carry_anything_of_the_payload() {
+        // The variants hold a `CaptureRefusal` and a `CodeSource`, both fixed
+        // sets. This is the assertion that no arm added the payload back for
+        // helpfulness.
+        for refusal in every_picker_refusal() {
+            let sentence = refusal.sentence();
+            assert!(!sentence.contains("JBSW"), "a refusal printed a seed: {sentence}");
+            assert!(!sentence.contains("otpauth"), "a refusal printed a payload: {sentence}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The image-file route
+    // -----------------------------------------------------------------
+
+    /// Encodes `rgba` as an RGBA8 PNG. `favicon`'s test helper, because the
+    /// two need exactly the same thing.
+    fn rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(rgba).expect("png pixel data");
+        }
+        out
+    }
+
+    /// The same, as 8-bit greyscale -- the shape a screenshot tool saving a
+    /// black-and-white QR really does produce, and the arm of `png_to_rgba`
+    /// that has to expand one channel into four.
+    fn grey_png(width: u32, height: u32, grey: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(grey).expect("png pixel data");
+        }
+        out
+    }
+
+    /// What the seam below was handed, so a test can assert about the pixels
+    /// the PNG half produced rather than trust that it produced any.
+    static SEEN: std::sync::Mutex<Option<(Vec<u8>, usize, usize)>> =
+        std::sync::Mutex::new(None);
+    /// What the seam below answers.
+    static ANSWER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    /// One test at a time may use the two statics above.
+    static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn recording_decode(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<String>> {
+        *SEEN.lock().unwrap() = Some((rgba.to_vec(), width, height));
+        ANSWER.lock().unwrap().clone().map(Zeroizing::new)
+    }
+
+    /// Runs `body` with the recording seam armed to answer `answer`, and hands
+    /// back what the seam was shown.
+    fn with_recording_seam<T>(
+        answer: Option<&str>,
+        body: impl FnOnce(&ImageSeams) -> T,
+    ) -> (T, Option<(Vec<u8>, usize, usize)>) {
+        let _held = SEAM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *SEEN.lock().unwrap() = None;
+        *ANSWER.lock().unwrap() = answer.map(str::to_string);
+        let seams = ImageSeams { decode: recording_decode };
+        let out = body(&seams);
+        let seen = SEEN.lock().unwrap().clone();
+        (out, seen)
+    }
+
+    /// **A PNG arrives at the decoder as the pixels it was made from.**
+    ///
+    /// This is the half of the image route that is this file's own -- the
+    /// decode itself is `qr`'s, and is tested there against a real QR code.
+    /// What can go wrong here is a row order, a channel order or a stride,
+    /// and none of those would be visible from a test that only asked whether
+    /// a decode succeeded.
+    #[test]
+    fn a_png_reaches_the_decoder_as_the_exact_pixels_it_was_made_from() {
+        // A gradient, so a transposed or reversed buffer is not the same
+        // buffer. 7x5 is deliberately neither square nor a multiple of four.
+        let source: Vec<u8> = (0..7 * 5 * 4).map(|i| (i % 251) as u8).collect();
+        let png = rgba_png(7, 5, &source);
+        let (out, seen) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |seams| {
+                decode_image_with(seams, &png)
+            });
+        assert!(out.is_ok(), "a well-formed PNG was refused: {:?}", out.err());
+        let (rgba, width, height) = seen.expect("the decoder was never called");
+        assert_eq!((width, height), (7, 5), "the dimensions were not carried through");
+        assert_eq!(rgba, source, "the pixels handed to the decoder are not the ones in the file");
+    }
+
+    #[test]
+    fn a_greyscale_png_is_expanded_to_opaque_rgba() {
+        // The arm a black-and-white screenshot takes. Without it a QR saved
+        // as greyscale would reach the decoder at a quarter of the size it
+        // claimed, and be reported as "no code in that image".
+        let grey: Vec<u8> = vec![0x00, 0x40, 0x80, 0xff, 0x11, 0x22];
+        let png = grey_png(3, 2, &grey);
+        let (out, seen) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |s| {
+                decode_image_with(s, &png)
+            });
+        assert!(out.is_ok(), "a greyscale PNG was refused: {:?}", out.err());
+        let (rgba, width, height) = seen.expect("the decoder was never called");
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(rgba.len(), 3 * 2 * 4, "the expansion produced the wrong number of bytes");
+        let expected: Vec<u8> = grey.iter().flat_map(|g| [*g, *g, *g, 255u8]).collect();
+        assert_eq!(rgba, expected, "greyscale was not expanded to opaque RGBA");
+    }
+
+    /// **A picture with no QR in it is the named "no code" refusal**, and a
+    /// picture with one is not.
+    #[test]
+    fn an_image_with_no_code_is_refused_by_name_and_one_with_a_code_is_not() {
+        let blank = rgba_png(8, 8, &vec![0xffu8; 8 * 8 * 4]);
+        let (refused, _) = with_recording_seam(None, |s| decode_image_with(s, &blank));
+        assert_eq!(
+            refused.err(),
+            Some(PickerRefusal::NoCode(CodeSource::Image)),
+            "a picture with no code did not produce the refusal that names why"
+        );
+
+        // The control: the SAME bytes through a seam that finds something do
+        // decode, so the refusal above is about the decoder's answer and not
+        // about the PNG being unreadable.
+        let (found, _) =
+            with_recording_seam(Some("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"), |s| {
+                decode_image_with(s, &blank)
+            });
+        assert_eq!(
+            found.expect("the control decodes").as_str(),
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_png_is_refused_as_a_file_and_not_as_a_missing_code() {
+        for (what, bytes) in [
+            ("empty", Vec::new()),
+            ("text", b"this is not a picture at all".to_vec()),
+            ("a truncated png", rgba_png(8, 8, &vec![0u8; 8 * 8 * 4])[..20].to_vec()),
+        ] {
+            let (out, seen) =
+                with_recording_seam(Some("ignored"), |s| decode_image_with(s, &bytes));
+            assert_eq!(
+                out.err(),
+                Some(PickerRefusal::NotAnImage),
+                "{what} was not refused as a file"
+            );
+            assert!(seen.is_none(), "{what} reached the QR decoder");
+        }
+        // Control: a real one is NOT refused, so the three above are about the
+        // bytes rather than about `png_to_rgba` refusing everything.
+        let good = rgba_png(8, 8, &vec![0u8; 8 * 8 * 4]);
+        let (out, seen) = with_recording_seam(Some("ok"), |s| decode_image_with(s, &good));
+        assert!(out.is_ok());
+        assert!(seen.is_some());
+    }
+
+    /// **The production seam is the real decoder, by address.**
+    ///
+    /// Without this, every test above could be passing against a stub while
+    /// the shipping path called something else entirely.
+    #[test]
+    fn the_image_route_decodes_through_the_real_qr_reader() {
+        let real: fn(&[u8], usize, usize) -> Option<Zeroizing<String>> = crate::qr::decode_qr;
+        assert!(
+            std::ptr::fn_addr_eq(ImageSeams::production().decode, real),
+            "the image route's production seam is not `qr::decode_qr`"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_is_its_own_refusal() {
+        // A path under the OS temp directory that this test does not create.
+        // Nothing is written, and nothing under the app's own data directory
+        // is touched.
+        let missing = std::env::temp_dir().join("deskwarden-no-such-qr-image-9f3a1c.png");
+        assert!(!missing.exists(), "the fixture path unexpectedly exists");
+        assert_eq!(read_image_file(&missing).err(), Some(PickerRefusal::Unreadable));
+    }
+
+    // -----------------------------------------------------------------
+    // What the two scanned routes do to the form
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_decoded_region_lands_in_the_field_and_opens_the_confirmation() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.revealed = true;
+        apply_region_outcome(&mut state, Outcome::Decoded(Zeroizing::new(UNUSUAL.to_string())));
+
+        assert_eq!(state.stage, Stage::Manual, "a decode did not open the confirmation");
+        assert_eq!(state.typed.as_str(), UNUSUAL, "the decoded URI is not what will be saved");
+        assert_eq!(state.refusal, None);
+        assert!(!state.revealed, "a decode arrived with the previous seed still unmasked");
+
+        // And what it will write is the whole URI with its parameters. The
+        // scanned route and the typed route reaching the same place is the
+        // whole reason there is one field.
+        let written = uri_to_write(&state).expect("a decoded URI is savable");
+        let back = parse_otpauth(&written).expect("what was written parses back");
+        assert_eq!(back.digits, 8);
+        assert_eq!(back.period, 60);
+        assert_eq!(back.algorithm, Algorithm::Sha256);
+    }
+
+    #[test]
+    fn every_other_region_outcome_goes_back_to_the_picker_saying_why() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.stage = Stage::Scanning;
+        apply_region_outcome(&mut state, Outcome::NoCode);
+        assert_eq!(state.stage, Stage::Picker);
+        assert_eq!(state.refusal, Some(PickerRefusal::NoCode(CodeSource::Region)));
+
+        state.stage = Stage::Scanning;
+        apply_region_outcome(&mut state, Outcome::Refused(CaptureRefusal::Blocked));
+        assert_eq!(state.stage, Stage::Picker);
+        assert_eq!(state.refusal, Some(PickerRefusal::Capture(CaptureRefusal::Blocked)));
+
+        // **Escape says nothing.** The user closed a surface they opened;
+        // narrating that back at them is what a dismissed dialog is
+        // deliberately silent about everywhere else in this window.
+        state.stage = Stage::Scanning;
+        apply_region_outcome(&mut state, Outcome::Cancelled);
+        assert_eq!(state.stage, Stage::Picker);
+        assert_eq!(state.refusal, None, "cancelling was reported as a failure");
+    }
+
+    #[test]
+    fn a_cancelled_file_dialog_says_nothing_and_a_bad_file_says_what() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.refusal = Some(PickerRefusal::NotAnImage);
+        apply_image_pick(&mut state, None);
+        assert_eq!(state.refusal, None, "a cancelled dialog left a refusal on screen");
+        assert_eq!(state.stage, Stage::Picker);
+
+        let missing = std::env::temp_dir().join("deskwarden-no-such-qr-image-2b7e40.png");
+        apply_image_pick(&mut state, Some(&missing));
+        assert_eq!(state.refusal, Some(PickerRefusal::Unreadable));
+        assert_eq!(state.stage, Stage::Picker);
+    }
+
+    /// **A hostile QR is refused by exactly the sentence a hostile paste is.**
+    ///
+    /// The payload is whatever was on the user's screen, and anyone who can
+    /// talk them into scanning a code chooses it. There is one validator on
+    /// both routes, so there is one refusal.
+    #[test]
+    fn a_scanned_payload_is_refused_by_the_same_sentence_a_pasted_one_is() {
+        let mut scanned = TotpAdd::opening("id-1", "Git Host", false);
+        apply_region_outcome(
+            &mut scanned,
+            Outcome::Decoded(Zeroizing::new("https://example.com/login".to_string())),
+        );
+        let Reading::Refused(from_scan) =
+            read_field(&scanned.typed, scanned.digits, scanned.period)
+        else {
+            panic!("a plain URL scanned off the screen was accepted as a code");
+        };
+        let Reading::Refused(from_paste) = read_field("https://example.com/login", 6, 30) else {
+            panic!("the control was accepted");
+        };
+        assert_eq!(from_scan, from_paste);
+        assert_eq!(refusal_sentence(&from_scan), refusal_sentence(&from_paste));
+        assert!(refusal_sentence(&from_scan).contains("plain URL"));
+    }
+
+    #[test]
+    fn stepping_back_to_the_picker_takes_the_seed_with_it() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.typed = Zeroizing::new("JBSWY3DPEHPK3PXP".to_string());
+        state.stage = Stage::Manual;
+        state.revealed = true;
+        state.back_to_picker();
+        assert_eq!(state.stage, Stage::Picker);
+        assert!(state.typed.is_empty(), "the field kept a seed the user stepped away from");
+        assert!(!state.revealed, "the reveal survived the step back");
+        assert_eq!(state.refusal, None);
+    }
+
+    // -----------------------------------------------------------------
+    // The picker as a surface -- pressed, not called
+    // -----------------------------------------------------------------
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// **The click harness.**
+    ///
+    /// `record_ui` shipped unreachable for a day because every test it had
+    /// called its draw function directly. So nothing below calls
+    /// [`action_for`]: each test lays the picker out, finds where a row was
+    /// really painted, presses that point, and reads back what the surface
+    /// reported.
+    struct Picker {
+        ctx: egui::Context,
+    }
+
+    /// One frame of [`Picker`].
+    struct PickerRun {
+        action: TotpAddAction,
+        rows: Vec<(Route, egui::Rect)>,
+        painted: Painted,
+    }
+
+    impl PickerRun {
+        fn row(&self, route: Route) -> egui::Rect {
+            self.rows
+                .iter()
+                .find(|(r, _)| *r == route)
+                .unwrap_or_else(|| panic!("{route:?} was not drawn at all"))
+                .1
+        }
+    }
+
+    impl Picker {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            crate::theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Picker { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn frame(&self, state: &mut TotpAdd, events: Vec<egui::Event>) -> PickerRun {
+            let mut reported: Option<PickerFrame> = None;
+            let output = self.ctx.run_ui(Self::input(events), |ui| {
+                ui.set_max_width(MODAL_WIDTH);
+                reported = Some(draw_picker(ui, state));
+            });
+            let reported = reported.expect("run_ui runs the closure once");
+            let mut painted = Painted(Vec::new());
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut painted);
+            }
+            assert!(
+                !painted.0.is_empty(),
+                "the picker painted no text at all, so every assertion over this list would \
+                 pass against nothing"
+            );
+            PickerRun { action: reported.action, rows: reported.rows, painted }
+        }
+
+        fn idle(&self, state: &mut TotpAdd) -> PickerRun {
+            self.frame(state, Vec::new())
+        }
+
+        fn click(&self, state: &mut TotpAdd, at: egui::Pos2) -> PickerRun {
+            self.frame(state, click_at(at))
+        }
+    }
+
+    /// **Design 6a, on screen.**
+    #[test]
+    fn the_picker_paints_all_four_routes_and_the_privacy_line() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let frame = picker.idle(&mut state);
+
+        assert!(frame.painted.has(HEADING), "the card has no heading");
+        assert!(
+            frame.painted.has(ADDING_TO_LABEL),
+            "the picker does not say what it is adding to"
+        );
+        assert!(frame.painted.has("Git Host"), "the item it is adding to is not named");
+        assert!(frame.painted.has(PICKER_HEADING));
+        for row in &ROUTES {
+            assert!(frame.painted.has(row.title), "route {:?} is not on screen", row.route);
+            assert!(
+                frame.painted.has(row.subtitle),
+                "route {:?} has no line under it on screen",
+                row.route
+            );
+        }
+        assert!(
+            frame.painted.has(PRIVACY_LINE),
+            "the privacy line is not on the card: {:?}",
+            frame.painted.0
+        );
+        assert!(frame.painted.has(WEBCAM_REASON), "the dead row does not say it is deferred");
+        // And nothing of 6d is on screen yet: the picker is a picker.
+        assert!(!frame.painted.has(CONFIRM_HEADING));
+        assert_eq!(frame.rows.len(), ROUTES.len(), "a route was drawn without a hit area");
+    }
+
+    /// **Pressing "Scan a region of my screen" is what opens design 6b.**
+    ///
+    /// The whole feature hangs off this one press: the capture, the overlay,
+    /// the decoder and the parser are reachable only through it. So it is
+    /// pressed here rather than called -- and every other row is pressed too,
+    /// because a surface where *everything* reported `ScanRegion` would
+    /// satisfy an assertion written one way round.
+    #[test]
+    fn pressing_the_scan_row_asks_for_the_region_overlay_and_no_other_row_does() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let scan_at = laid_out.row(Route::ScanRegion).center();
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let _ = picker.idle(&mut state);
+        assert_eq!(
+            picker.click(&mut state, scan_at).action,
+            TotpAddAction::ScanRegion,
+            "clicking 6a's first row did not ask for the region overlay, so the whole scan \
+             chain is unreachable from the user interface"
+        );
+
+        for route in [Route::ImageFile, Route::ByHand, Route::Webcam] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            let picker = Picker::new();
+            let laid_out = picker.idle(&mut state);
+            let at = laid_out.row(route).center();
+            assert_ne!(
+                picker.click(&mut state, at).action,
+                TotpAddAction::ScanRegion,
+                "{route:?} also asked for the region overlay, so the assertion above says \
+                 nothing about which row was pressed"
+            );
+        }
+    }
+
+    /// **Pressing "Open an image file" is what opens the shell's dialog.**
+    #[test]
+    fn pressing_the_image_row_asks_for_the_file_dialog_and_no_other_row_does() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let image_at = laid_out.row(Route::ImageFile).center();
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let _ = picker.idle(&mut state);
+        assert_eq!(
+            picker.click(&mut state, image_at).action,
+            TotpAddAction::OpenImage,
+            "clicking 6a's second row did not ask for the file dialog"
+        );
+
+        for route in [Route::ScanRegion, Route::ByHand, Route::Webcam] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            let picker = Picker::new();
+            let laid_out = picker.idle(&mut state);
+            let at = laid_out.row(route).center();
+            assert_ne!(
+                picker.click(&mut state, at).action,
+                TotpAddAction::OpenImage,
+                "{route:?} also asked for the file dialog"
+            );
+        }
+    }
+
+    /// **Pressing "Enter the secret by hand" paints 6d's field.**
+    ///
+    /// Read back off the surface rather than off `state.stage`: a stage that
+    /// changed and a form that never drew would satisfy the second and not
+    /// the first.
+    #[test]
+    fn pressing_the_by_hand_row_paints_the_field() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let at = laid_out.row(Route::ByHand).center();
+        assert!(
+            !laid_out.painted.has(SECRET_HINT),
+            "the field was already on screen, so the assertion below proves nothing"
+        );
+
+        let after = picker.click(&mut state, at);
+        assert_eq!(
+            after.action,
+            TotpAddAction::None,
+            "the by-hand row asked the caller for something to do"
+        );
+        assert_eq!(state.stage, Stage::Manual);
+
+        // The frame after, through the same entry point the window calls.
+        let painted = paint(|ui| {
+            draw_stage(ui, &mut state, 1_700_000_000);
+        });
+        assert!(
+            painted.has(SECRET_HINT),
+            "the by-hand route reported nothing and painted nothing: {:?}",
+            painted.0
+        );
+    }
+
+    /// **The dead row is dead when pressed, and not merely greyed.**
+    #[test]
+    fn pressing_the_webcam_row_does_nothing_at_all() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let at = laid_out.row(Route::Webcam).center();
+
+        let after = picker.click(&mut state, at);
+        assert_eq!(after.action, TotpAddAction::None);
+        assert_eq!(state.stage, Stage::Picker, "the deferred row moved the form somewhere");
+        assert_eq!(state.refusal, None);
+        // Control: the row IS on screen and IS where this pressed, so the
+        // three assertions above are about a dead control rather than about a
+        // click that landed on nothing.
+        assert!(after.painted.has("Use a webcam"));
+        assert!(laid_out.row(Route::Webcam).width() > 1.0);
+    }
+
+    /// **A refusal is painted on the picker, as a sentence.**
+    #[test]
+    fn the_picker_paints_the_last_refusal_and_drops_it_when_a_route_is_chosen() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let clean = picker.idle(&mut state);
+        assert!(!clean.painted.has("No code in that region"));
+
+        state.refusal = Some(PickerRefusal::NoCode(CodeSource::Region));
+        let refused = picker.idle(&mut state);
+        assert!(
+            refused.painted.has(&PickerRefusal::NoCode(CodeSource::Region).sentence()),
+            "the refusal is not on the card: {:?}",
+            refused.painted.0
+        );
+
+        // Choosing a route again clears it: a stale sentence under a fresh
+        // attempt is a sentence about the wrong attempt.
+        let at = refused.row(Route::ByHand).center();
+        let _ = picker.click(&mut state, at);
+        assert_eq!(state.refusal, None);
+    }
+
+    /// **The modal opens on 6a**, which is what makes the other three routes
+    /// reachable at all.
+    #[test]
+    fn the_modal_opens_on_the_picker_and_not_on_the_by_hand_form() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        assert_eq!(state.stage, Stage::Picker, "a fresh form does not open on the picker");
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        // Two frames, and the SECOND is read: an `egui::Area` has no size
+        // until it has been laid out once.
+        let _ = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
+        });
+        let output = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
+        });
+        let mut painted = Painted(Vec::new());
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        assert!(painted.has(PICKER_HEADING), "the modal did not open on 6a: {:?}", painted.0);
+        assert!(painted.has(PRIVACY_LINE), "the modal dropped the privacy line");
+        assert!(painted.has(ROUTES[0].title));
+        assert!(!painted.has(SECRET_HINT), "the modal opened straight into the by-hand form");
+    }
+
+    /// **What the card says while the overlay is up**, in the overlay's own
+    /// words.
+    #[test]
+    fn the_scanning_card_borrows_the_overlays_own_instruction() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.stage = Stage::Scanning;
+        let painted = paint(|ui| {
+            draw_stage(ui, &mut state, BOUNDARY);
+        });
+        assert!(painted.has(SCANNING_HEADING));
+        assert!(
+            painted.has(crate::region_overlay::DRAG_TITLE),
+            "the card and the overlay describe the same gesture differently: {:?}",
+            painted.0
+        );
+        assert!(painted.has(crate::region_overlay::DRAG_HINT));
+        assert!(painted.has(OTHER_WAYS_LABEL), "there is no way out of the scanning stage");
+    }
+
+    /// **A decoded region reaches 6c's card, through the entry point the
+    /// window really calls.**
+    #[test]
+    fn a_scanned_code_is_confirmed_on_the_same_card_a_typed_one_is() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.stage = Stage::Scanning;
+        apply_region_outcome(&mut state, Outcome::Decoded(Zeroizing::new(UNUSUAL.to_string())));
+
+        let painted = paint(|ui| {
+            draw_stage(ui, &mut state, BOUNDARY);
+        });
+        assert!(painted.has(CONFIRM_HEADING), "a scan did not reach 6c: {:?}", painted.0);
+        let expected = code_at(&auth(UNUSUAL), BOUNDARY).expect("decodes");
+        assert!(
+            painted.has(grouped_code(&expected).as_str()),
+            "the live code a scanned seed produces is not on screen"
+        );
+        assert!(painted.has(MATCH_QUESTION));
+
+        // **Masked, exactly as it is for a typed one -- and this is the
+        // assertion the first draft of this surface failed.**
+        //
+        // The decoded URI goes into `typed`, and 6d's field is a `TextEdit`
+        // that paints what it holds. Left that way the seed was on screen in
+        // the clear, two rows above a masked-secret row that was then pure
+        // decoration. So a scanned payload gets 6c's "Code read" row instead
+        // of the field, and the seed appears nowhere until Reveal is pressed.
+        assert!(
+            !painted.has("JBSWY3DPEHPK3PXP"),
+            "a scanned seed was painted in the clear: {:?}",
+            painted.0
+        );
+        assert!(!painted.has("secret="), "the raw URI was painted: {:?}", painted.0);
+        assert!(painted.has("\u{2022}\u{2022}\u{2022}\u{2022}"));
+        assert!(
+            painted.has(CODE_READ_LABEL) && painted.has(CODE_READ_KIND),
+            "the scanned route drew neither the field nor the row that replaces it"
+        );
+        assert!(
+            !painted.has(SECRET_HINT),
+            "the editable field was drawn for a scanned payload"
+        );
+
+        // Control, in the same frame shape: Reveal still works, so the
+        // absence above is masking rather than a card that shows nothing.
+        state.revealed = true;
+        let revealed = paint(|ui| {
+            draw_stage(ui, &mut state, BOUNDARY);
+        });
+        assert!(
+            revealed.has("JBSWY3DPEHPK3PXP"),
+            "Reveal showed nothing, so the masked assertions above prove nothing"
+        );
+    }
+
+    /// **The typed route still gets its field**, so the row above is a
+    /// decision about scanned payloads and not a field that vanished for
+    /// everyone.
+    #[test]
+    fn the_by_hand_route_still_gets_an_editable_field() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.stage = Stage::Manual;
+        assert!(!state.scanned);
+        let painted = paint(|ui| {
+            draw_stage(ui, &mut state, BOUNDARY);
+        });
+        assert!(painted.has(SECRET_HINT), "the by-hand field is gone: {:?}", painted.0);
+        assert!(!painted.has(CODE_READ_LABEL), "the by-hand route drew the scanned row");
+    }
+
+    // -----------------------------------------------------------------
+    // The wiring, pinned at its far end
+    // -----------------------------------------------------------------
+
+    /// **The window really opens the overlay, and really applies its answer.**
+    ///
+    /// Both arms are inside `vault_window::run`'s frame closure, which no
+    /// harness in this crate can call -- the same reason `mod.rs` pins its
+    /// other closure-only decisions by source. The behavioural half is the
+    /// click tests above, which prove the row reports `ScanRegion`; this is
+    /// the far end of that wire.
+    #[test]
+    fn the_vault_window_opens_the_overlay_and_applies_what_it_answers() {
+        let window = include_str!("mod.rs").replace("\r\n", "\n");
+        let code = window.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < window.len(), "the test module marker was not found");
+        for needle in [
+            "crate::region_overlay::RegionOverlay::open(",
+            "crate::screen_capture::monitor_bounds()",
+            "totp_add::apply_region_outcome(state, outcome)",
+            "crate::file_picker::pick_qr_image()",
+            "totp_add::apply_image_pick(",
+            "overlay.show(ui.ctx())",
+        ] {
+            assert!(code.contains(needle), "`{needle}` is not in the vault window's frame");
+        }
+        // Positive control on the split: a needle only ever spelled out below
+        // the marker is not found above it.
+        assert!(!code.contains("the_vault_window_opens_the_overlay_and_applies"));
     }
 }

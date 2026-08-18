@@ -23,17 +23,22 @@
 //! [`crate::app_match::AppMatch::launchable_path`]'s job for the open dialog
 //! and [`crate::vault_export::plan_export`]'s job for the save one.
 //!
-//! # Two siblings, not one parameterised dialog
+//! # Three siblings, not one parameterised dialog
 //!
-//! [`pick_executable`] and [`pick_export_destination`] are separate functions
-//! on purpose. They are different COM classes (`IFileOpenDialog` against
-//! `IFileSaveDialog`), they answer different types, and every visible setting
+//! [`pick_executable`], [`pick_qr_image`] and [`pick_export_destination`] are
+//! separate functions on purpose. Two are `IFileOpenDialog` and one is
+//! `IFileSaveDialog`, they answer different types, and every visible setting
 //! -- title, filters, default extension, suggested name, options -- differs.
-//! A single function taking six arguments to serve two callers would be the
+//! A single function taking six arguments to serve three callers would be the
 //! parameterisation that only reads well from one end of it. What they *do*
 //! share is factored out and shared for real: [`with_com`] owns the apartment
-//! balance for both, and `chosen_path` owns the one correct way to read a
+//! balance for all three, and `chosen_path` owns the one correct way to read a
 //! filesystem path back out of an `IFileDialog`.
+//!
+//! **[`pick_qr_image`] is a third sibling and not a second picker.** Design
+//! 6a's image route needs an open dialog; it gets this module's, through this
+//! module's `with_com` and this module's `chosen_path`, rather than a
+//! second COM apartment balance written next to a form.
 //!
 //! # Blocking
 //!
@@ -121,9 +126,92 @@ unsafe fn show_dialog() -> Option<String> {
     chosen_path(&dialog)
 }
 
+// ---------------------------------------------------------------------------
+// The QR image dialog
+// ---------------------------------------------------------------------------
+
+/// **The name of the one image format this app can read a QR out of.**
+///
+/// Pinned as a constant because it is asserted about from two directions: the
+/// dialog's filter below, and `vault_window::totp_add`'s picker copy, which
+/// tells the user PNG-only *before* they open a dialog that would refuse a
+/// `.jpg`. A filter offering a format the decoder cannot read is a dialog that
+/// hands back a file and then a refusal.
+pub const IMAGE_EXTENSION: &str = "png";
+
+/// Opens the shell's file-open dialog for **design 6a's "Open an image file"**
+/// route and returns the chosen path, or `None` if the user cancelled or the
+/// dialog could not be created. Cancel and failure are the same answer, for
+/// [`pick_executable`]'s reason.
+///
+/// # PNG only, and the filter says so
+///
+/// Design 6a's row reads *"PNG, JPG"*. This ships PNG. The decoder is handed a
+/// bare RGBA buffer and the only thing in this crate's tree that can produce
+/// one from a file is the `png` crate; JPEG would mean `jpeg-decoder` (or the
+/// `image` crate, which `rqrr`'s `default-features = false` deliberately keeps
+/// out -- see `Cargo.toml`). That is a new dependency parsing an untrusted file
+/// format, and it is not added silently here. So the filter is `*.png` alone:
+/// a dialog that let the user settle on a `.jpg` it cannot decode would turn a
+/// missing feature into a refusal the user reads as a bug.
+///
+/// # Blocking
+///
+/// The same rule as its two siblings: `Show` is modal and pumps its own
+/// message loop, so this is called from the **vault window's action handler**,
+/// after the frame's draw closures have returned, and never from inside one.
+pub fn pick_qr_image() -> Option<String> {
+    with_com(|| unsafe { show_image_dialog() })
+}
+
+/// The COM half of [`pick_qr_image`], split out so [`with_com`]'s balance
+/// covers every `?` in it -- `show_dialog`'s reason exactly.
+///
+/// # Safety
+///
+/// The calling thread must have COM initialised.
+unsafe fn show_image_dialog() -> Option<String> {
+    let dialog: IFileOpenDialog =
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+
+    // **One filter and no "All files" row.** The open dialog for a program
+    // keeps one because this app cannot know what the user's program looks
+    // like; here it can -- see [`pick_qr_image`] on why that is PNG.
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: w!("PNG image (*.png)"),
+        pszSpec: w!("*.png"),
+    }];
+    let _ = dialog.SetFileTypes(&filters);
+    let _ = dialog.SetFileTypeIndex(1); // 1-based, not 0-based.
+    let _ = dialog.SetTitle(w!("Choose the image with the QR code"));
+
+    // Read-modify-write, exactly as the save dialog does and for the same
+    // reason `SetOptions` demands it: it *replaces* the set.
+    if let Ok(current) = dialog.GetOptions() {
+        let _ = dialog.SetOptions(image_options(current));
+    }
+
+    dialog.Show(HWND::default()).ok()?;
+    chosen_path(&dialog)
+}
+
+/// What the image dialog's option set becomes, given whatever the shell handed
+/// back from `GetOptions`.
+///
+/// Purely additive, [`save_options`]'s rule. The one bit added is
+/// `FOS_FORCEFILESYSTEM`, and it matters more here than anywhere else in this
+/// module: the answer is about to be handed to `std::fs::read`. Without it the
+/// user can settle on a shell item inside a virtual folder -- a photo in
+/// "Recent", an image in a camera's MTP namespace -- that has no filesystem
+/// path at all, and `SIGDN_FILESYSPATH` then fails *after* the user believed
+/// they had chosen their screenshot.
+fn image_options(current: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
+    current | FOS_FORCEFILESYSTEM
+}
+
 /// Reads the answered item back out of a dialog that has already returned from
-/// `Show`. Shared by both dialogs because the `SIGDN_FILESYSPATH` choice and
-/// the `CoTaskMemFree` below are the same mistake to make twice.
+/// `Show`. Shared by all three dialogs because the `SIGDN_FILESYSPATH` choice
+/// and the `CoTaskMemFree` below are the same mistake to make three times.
 ///
 /// # Safety
 ///
@@ -436,6 +524,80 @@ mod tests {
         assert_eq!(out & FOS_FORCEFILESYSTEM, FOS_FORCEFILESYSTEM);
     }
 
+    /// **The image dialog only ever adds `FOS_FORCEFILESYSTEM`.**
+    ///
+    /// The answer is handed to `std::fs::read`, so a shell item with no
+    /// filesystem path is the failure this bit exists to prevent.
+    #[test]
+    fn the_image_dialog_forces_a_real_filesystem_path() {
+        let out = image_options(FILEOPENDIALOGOPTIONS(0));
+        assert_eq!(
+            out & FOS_FORCEFILESYSTEM,
+            FOS_FORCEFILESYSTEM,
+            "the chosen image is about to be opened by path"
+        );
+        // Additive, never subtractive: whatever the shell had stays on.
+        let shell_had = FOS_NOCHANGEDIR | FOS_OVERWRITEPROMPT;
+        assert_eq!(image_options(shell_had) & shell_had, shell_had);
+        // And it is NOT the save dialog's set: an open dialog that asked
+        // "replace it?" would be a nonsense prompt over a file being read.
+        assert_ne!(
+            image_options(FILEOPENDIALOGOPTIONS(0)),
+            save_options(FILEOPENDIALOGOPTIONS(0)),
+            "the two option sets are the same, so one of them is wrong"
+        );
+    }
+
+    /// **The dialog offers exactly the format the decoder can read.**
+    ///
+    /// Design 6a's row says "PNG, JPG"; this ships PNG, and the filter and
+    /// the picker's copy both have to say so from the same place. A `*.jpg`
+    /// row on a dialog whose decoder is `png` is how a missing feature
+    /// becomes a refusal the user reads as a bug.
+    #[test]
+    fn the_image_dialog_filters_to_the_one_format_this_app_decodes() {
+        // The image dialog's own body, so the executable dialog's "All files"
+        // row cannot satisfy or defeat anything below.
+        let code = code_under_test();
+        let body = code
+            .split("unsafe fn show_image_dialog() -> Option<String> {")
+            .nth(1)
+            .expect("show_image_dialog is in this file")
+            .split("\n}\n")
+            .next()
+            .expect("its body ends")
+            .to_string();
+        assert!(
+            body.contains(r#"pszSpec: w!("*.png")"#),
+            "the image dialog does not filter to PNG at all"
+        );
+        // No *filter* offers anything else. The prose above may name JPEG --
+        // it has to, to say why the format is absent -- so this looks at the
+        // filter syntax and not at the word.
+        assert_eq!(
+            body.matches("pszSpec:").count(),
+            1,
+            "the image dialog offers more than one file type; the decoder reads one"
+        );
+        for spec in ["*.jpg", "*.jpeg", "*.JPG", "*.*"] {
+            assert!(
+                !body.contains(spec),
+                "a filter offers {spec}, which nothing in this crate can decode into RGBA \
+                 for the QR reader"
+            );
+        }
+        assert_eq!(IMAGE_EXTENSION, "png");
+        // Positive control on the negatives above: the split really did find
+        // a body, and the executable dialog's "All files" row -- the thing
+        // being ruled out here -- really is spelled the way it is searched
+        // for, elsewhere in this same file.
+        assert!(!body.trim().is_empty(), "the body split produced nothing");
+        assert!(
+            code.contains(r#"pszSpec: w!("*.*")"#),
+            "the `*.*` needle matches nothing anywhere, so its absence above proves nothing"
+        );
+    }
+
     #[test]
     fn the_option_set_only_ever_gains_bits() {
         let shell_had = FOS_NOCHANGEDIR | FOS_OVERWRITEPROMPT;
@@ -522,12 +684,49 @@ mod tests {
     }
 
     #[test]
-    fn both_dialogs_go_through_the_one_apartment_balance() {
+    fn every_dialog_goes_through_the_one_apartment_balance() {
         let code = code_under_test();
         assert_eq!(code.matches("CoInitializeEx(").count(), 1);
         assert!(code.contains("    with_com(|| unsafe { show_dialog() })\n"));
+        assert!(code.contains("    with_com(|| unsafe { show_image_dialog() })\n"));
         assert!(code.contains(
             "    with_com(|| unsafe { show_save_dialog(suggested_name) }).map(PathBuf::from)\n"
         ));
+        // Three dialogs, three `Show` calls, and no fourth entry point that
+        // skipped the balance above.
+        assert_eq!(
+            code.matches("dialog.Show(HWND::default()).ok()?;").count(),
+            3,
+            "a dialog was added or removed without the apartment balance being re-checked"
+        );
+    }
+
+    /// **The image route reaches the shell through this module's dialog.**
+    ///
+    /// Task 7's rule was "use the existing `file_picker.rs`, do not add a
+    /// second picker". A second picker would be a second `CoCreateInstance`
+    /// somewhere else in the crate, so that is what this counts.
+    #[test]
+    fn the_image_route_adds_no_second_picker_anywhere_in_the_crate() {
+        for (name, source) in [
+            ("vault_window/totp_add.rs", include_str!("vault_window/totp_add.rs")),
+            ("vault_window/mod.rs", include_str!("vault_window/mod.rs")),
+        ] {
+            assert!(
+                !source.contains("CoCreateInstance"),
+                "{name} creates its own COM dialog object rather than calling file_picker \
+                 (the prose there may NAME `IFileOpenDialog`; what it may not do is create \
+                 one)"
+            );
+        }
+        // Positive control: this module really does, so the absences above
+        // are about those files and not about the needle.
+        assert!(code_under_test().contains("CoCreateInstance"));
+        // And the wiring in the other direction: the vault window calls the
+        // one this module exports.
+        assert!(
+            include_str!("vault_window/mod.rs").contains("file_picker::pick_qr_image()"),
+            "nothing opens the image dialog, so the route is unreachable"
+        );
     }
 }
