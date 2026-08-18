@@ -291,7 +291,7 @@ mod tests {
         // first-wins, so whichever test in this binary gets there first wins
         // and the value is irrelevant to all of them.
         crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
-            r"C:\deskwarden-testirstw.exe",
+            r"C:\deskwarden-test\first\bw.exe",
         ));
 
         let expected_job = sync_job().map(|j| std::ptr::from_ref(j) as usize);
