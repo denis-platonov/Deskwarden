@@ -10,13 +10,25 @@
 //! they had just unlocked, because `open_vault_window` ran only from a tray
 //! click or the hotkey.
 //!
-//! # What this is NOT for
+//! # The launch that already has a session
 //!
-//! **A launch with a valid cached session must not gain a window.** That launch
-//! shows nothing today and goes straight to the tray, which is correct and was
-//! not part of the report; `main` keeps its old path for it, spinner window and
-//! all. This runs only on the launch that actually signs in. `loading_ui::
-//! show_while` therefore stays a real window and stays used.
+//! **It used to be excluded from all of this, and that was the second report:**
+//! "On start there is another window Setting up your vault and then actual
+//! window loads - should be same actual window with spinner". That launch never
+//! showed a sign-in card -- there was nothing to sign into -- but it did open
+//! `loading_ui::show_while`'s own 360x220 spinner window while `bw serve` came
+//! up, close it, and leave the vault to arrive later in a window of a different
+//! size somewhere else on the screen. The old note here said that launch "shows
+//! nothing today and goes straight to the tray", which was true of the vault
+//! and false of the window the user was looking at.
+//!
+//! [`run_from_working`] is that launch, in the same machine and the same one
+//! window, entered at the spinner instead of at the card. `loading_ui::
+//! show_while` is still a real window and still used -- by `picker_ui` and by
+//! the post-sign-in recovery, both of which run with no window of their own to
+//! put a spinner in.
+//!
+//! # What this is NOT for
 //!
 //! **The lock/re-auth recovery still closes and reopens.** That recovery is
 //! `main::resettle_session`, and it cannot run from inside a frame closure on a
@@ -531,6 +543,53 @@ pub struct StartupOutcome<P> {
 /// and why both sub-frames are built `pre_styled`: a vault frame raising the
 /// window again would yank forward a window the user may have deliberately
 /// sent behind something while `bw serve` started.
+/// **The viewport every host in this module opens, which is the VAULT
+/// window's.**
+///
+/// A function and not thirty lines inside one host, because two hosts now open
+/// a window that has to arrive where the vault will be: [`run`], whose first
+/// stage is the sign-in card, and [`run_from_working`], whose first stage is
+/// the spinner. Two hand-written copies of this would be two chances for one of
+/// them to open at the login window's size and then jump when the vault frame
+/// replaces the card -- which is the whole of what "one window" means to the
+/// user. It is not a window count: it is nothing moving.
+///
+/// The placement is read the way the vault window reads it, by calling its own
+/// `initial_placement`, so the size and position are the SAME numbers the vault
+/// would have opened with on its own -- including the geometry the user last
+/// dragged this window to. The vault's geometry wins over the spinner's because
+/// the spinner is the transient stage: a window sized for a spinner would have
+/// to grow into the vault, and there is no size at which an item list looks
+/// right in 360x220.
+///
+/// `with_resizable(true)` is inert on its own under `with_decorations(false)` --
+/// the grabbable edges are painted by `login_ui::draw_resize_handles`, which the
+/// vault frame calls and neither the login card nor the spinner does. So the
+/// window is un-resizable while the first stage is up and resizable once the
+/// vault arrives, with no viewport command needed to switch: the affordance is
+/// drawn or it is not.
+fn the_vault_windows_viewport() -> eframe::NativeOptions {
+    let placement = vault_window::initial_placement(
+        crate::settings::default_path()
+            .as_deref()
+            .and_then(|path| crate::settings::Settings::load(path).vault_window),
+        &login_ui::monitor_work_areas(),
+    );
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([placement.width as f32, placement.height as f32])
+        .with_resizable(true)
+        .with_min_inner_size([
+            crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32,
+            crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
+        ])
+        .with_decorations(false)
+        .with_icon(theme::window_icon());
+    if let Some((x, y)) = placement.position {
+        viewport = viewport.with_position([x as f32, y as f32]);
+    }
+    eframe::NativeOptions { viewport, ..Default::default() }
+}
+
 fn run_the_one_window(
     options: eframe::NativeOptions,
     mut draw: impl FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static,
@@ -1071,38 +1130,7 @@ where
     let sign_in_account: Option<(std::path::PathBuf, Account)> =
         account.map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
     let sign_in_first_run = first_run;
-    // **The vault window's placement, read the way the vault window reads it**
-    // -- by calling its own `initial_placement`, exactly as `login_ui` already
-    // does, so this window opens where the vault will be and the vault does
-    // not move when it arrives. That is the whole of "one window" as the user
-    // experiences it: not a window count, but nothing jumping.
-    let placement = vault_window::initial_placement(
-        crate::settings::default_path()
-            .as_deref()
-            .and_then(|path| crate::settings::Settings::load(path).vault_window),
-        &login_ui::monitor_work_areas(),
-    );
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([placement.width as f32, placement.height as f32])
-        // The VAULT window's viewport, not the login window's, because this
-        // window ends up being the vault window. `with_resizable(true)` is
-        // inert on its own under `with_decorations(false)` -- the grabbable
-        // edges are painted by `login_ui::draw_resize_handles`, which the
-        // vault frame calls and the login frame does not. So the window is
-        // un-resizable while the card is up and resizable once the vault
-        // arrives, with no viewport command needed to switch: the affordance
-        // is drawn or it is not.
-        .with_resizable(true)
-        .with_min_inner_size([
-            crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32,
-            crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
-        ])
-        .with_decorations(false)
-        .with_icon(theme::window_icon());
-    if let Some((x, y)) = placement.position {
-        viewport = viewport.with_position([x as f32, y as f32]);
-    }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = the_vault_windows_viewport();
 
     // `pre_styled: true` and `close_on_success: false`: this window's own first
     // frame installs the fonts, rounds the corners and raises it, and a
@@ -2063,6 +2091,292 @@ where
     VaultSessionOutcome { result, stages, relocked }
 }
 
+/// What one run of [`run_from_working`] produced.
+pub struct WarmLaunchOutcome<P> {
+    /// Whatever the caller's `prepare` answered, if it answered before the
+    /// window ended. `None` means it never did: the user closed the spinner,
+    /// the worker died, or [`WORKING_DEADLINE`] fired.
+    ///
+    /// **It may have been emptied.** `build_vault` is handed `&mut P` and is
+    /// expected to move the vault out of it, exactly as [`run`]'s is -- so a
+    /// `Some` here whose vault stage really ran is a husk, and the caller must
+    /// not read items back out of it. See `main`'s use, which probes again
+    /// rather than trusting this on any path where the vault was not shown.
+    pub prepared: Option<P>,
+    /// The vault session's outcome -- lock, re-auth, Preferences, account
+    /// switch, or a plain close. `Some` **only if the vault stage was actually
+    /// entered**, which makes it the one honest answer to "did this launch end
+    /// up showing the user their vault".
+    pub vault: Option<vault_window::VaultWindowResult>,
+    /// Every stage the window actually PAINTED, in order. Same evidence
+    /// [`StartupOutcome::stages`] is.
+    pub stages: Vec<Stage>,
+    /// **Whether the user closed the window while the spinner was up.**
+    ///
+    /// Not a failure and must not be treated as one: it is the escape hatch
+    /// this host deliberately keeps (see the ✕ argument on [`run_from_working`]),
+    /// and the thing it says is "stop showing me a window", not "the backend is
+    /// broken". The caller's response to it is therefore a QUIETER retry than
+    /// its response to a failure -- see `main`'s cached-session arm.
+    pub abandoned: bool,
+}
+
+/// **The third host: a launch that already has a session -- spinner, then
+/// vault, in one window.**
+///
+/// The report: "On start there is another window Setting up your vault and then
+/// actual window loads - should be same actual window with spinner". That
+/// launch is the one with a good cached session, and until this existed it was
+/// the one launch in the app that still showed two windows in sequence: a
+/// 360x220 `loading_ui::show_while` spinner, OS-centred, which appeared for as
+/// long as `bw serve` took to answer (8s in the reporter's own log) and then
+/// vanished, followed later by the vault window somewhere else on screen. Two
+/// windows, two sizes, two positions, and a gap between them.
+///
+/// This is the same machine [`run`] runs, entered one stage later. `run` starts
+/// at [`Stage::SignIn`] because that launch has no session; this one starts at
+/// [`Stage::Working`] because it does. There is no third transition table --
+/// `advance(Working, WorkReady)` is the same edge both hosts take -- and no
+/// third window: [`run_the_one_window`] opens it, at
+/// [`the_vault_windows_viewport`], so the window that shows the spinner IS the
+/// window that shows the item list, at the vault's own size and position from
+/// its very first frame. Nothing moves when the content swaps.
+///
+/// # Its ✕ is LIVE, and that is the difference from [`run`]'s working stage
+///
+/// `run`'s spinner is `CloseControl::Disabled` and refuses Alt+F4 as well,
+/// because closing it strands the sign-in the user just paid for. Nothing here
+/// is owed that: the session came off disk, `bw serve` was started by `main`
+/// BEFORE this window and `main` still holds the `Child`, so a close here
+/// strands no process and loses no typing. The old spinner window could always
+/// be closed (`show_while` passes `CloseControl::Active`), and a merged window
+/// that took that away would be a spinner with no ✕, no tray -- `build_tray`
+/// runs after this returns -- and no way out but Task Manager, for up to
+/// [`WORKING_DEADLINE`]. So the ✕ stays live, Alt+F4 is honoured, and both are
+/// reported as [`WarmLaunchOutcome::abandoned`] rather than as a failure.
+///
+/// # What a failure does
+///
+/// It closes the window, and that is deliberate rather than a shortcut. A
+/// failure here means the vault backend never became usable, and the response
+/// this app has always had for that is `main`'s recovery -- kill `bw serve`,
+/// send the user back through the master password, restart, wait again -- which
+/// opens windows of its own and cannot run from inside a frame closure. So this
+/// host does exactly what [`run`]'s working stage does on the same event: takes
+/// `advance(Working, WorkFailed) == Next::Close`, closes, and leaves the
+/// recovery to the caller, which can tell the two apart because `prepared` is
+/// `Some(Err(..))` for a probe that failed and `None` for one that never
+/// answered at all.
+///
+/// `prepare` runs on a detached worker thread and is the slow part -- the
+/// readiness probe. It may not run on the frame thread, or the window freezes
+/// exactly where it is meant to be showing a spinner. `build_vault` runs on
+/// THIS thread, in the frame that drains the worker: it is the caller's chance
+/// to seed the cache and then `vault_window::build_frame`, and `None` from it
+/// is the failure above.
+///
+/// There is no `teardown` and no `rebuild_vault`, so a lock in this window
+/// closes it and `main` dispatches the lock through `open_vault_window`'s first
+/// pass exactly as it does for [`run`]'s vault outcome. That is one blink on a
+/// path the user asked nothing about, and wiring the in-window teardown here
+/// would mean parking the estate for this launch too -- a great deal of
+/// machinery for a case the report does not mention.
+pub fn run_from_working<P, W, V>(
+    working_message: &'static str,
+    prepare: W,
+    build_vault: V,
+) -> WarmLaunchOutcome<P>
+where
+    P: Send + 'static,
+    W: FnOnce() -> P + Send + 'static,
+    V: FnOnce(
+            &mut P,
+        ) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
+        + 'static,
+{
+    // **Spawned before the window, not on its first frame.** The probe is the
+    // whole wait this window exists to cover, and starting it after eframe has
+    // built an OS window and a font atlas would add that to a wait the user is
+    // already timing with their own patience.
+    let (work_tx, work_rx) = mpsc::channel::<P>();
+    std::thread::spawn(move || {
+        let _ = work_tx.send(prepare());
+    });
+
+    // Read back after the event loop returns, for the reason every window in
+    // this crate uses `Rc<RefCell<_>>`: the update closure is `FnMut + 'static`
+    // and cannot hand anything back, and eframe runs it on this thread, which
+    // is blocked inside `run_ui_native` throughout.
+    let prepared: Rc<RefCell<Option<P>>> = Rc::new(RefCell::new(None));
+    let vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>> =
+        Rc::new(RefCell::new(None));
+    let stages: Rc<RefCell<Vec<Stage>>> = Rc::new(RefCell::new(Vec::new()));
+    let abandoned: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+    let prepared_for_closure = prepared.clone();
+    let vault_handles_for_closure = vault_handles.clone();
+    let stages_for_closure = stages.clone();
+    let abandoned_for_closure = abandoned.clone();
+
+    let mut build_vault = Some(build_vault);
+    let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
+    let mut stage = Stage::Working;
+    // Started here rather than on the first frame: the worker is already
+    // running, so a stopwatch that only starts once eframe has a window would
+    // credit the stage time it has already spent.
+    let working_since = Instant::now();
+    let mut closing = Closing::not_yet();
+
+    run_the_one_window(the_vault_windows_viewport(), move |ui, frame| {
+        // Recorded on the frame the stage is actually PAINTED, deduplicated so
+        // this is a list of stages rather than a list of frames.
+        if stages_for_closure.borrow().last() != Some(&stage) {
+            stages_for_closure.borrow_mut().push(stage);
+            log::info!("warm launch window: showing {stage:?}");
+        }
+
+        match stage {
+            Stage::Working => {
+                // **`CloseControl::Active`, and the one place this host differs
+                // from the other two.** See this function's own doc for why
+                // abandoning is allowed here and refused there.
+                match loading_ui::draw_spinner_body(
+                    ui,
+                    working_message,
+                    login_ui::CloseControl::Active,
+                ) {
+                    login_ui::ChromeAction::Close => {
+                        log::info!(
+                            "the warm launch window was closed while the vault backend was \
+                             still starting; nothing is stranded by that -- `main` owns the \
+                             `bw serve` this window did not start -- so the close is honoured"
+                        );
+                        *abandoned_for_closure.borrow_mut() = true;
+                        close_this_window(ui.ctx(), &mut closing);
+                    }
+                    login_ui::ChromeAction::Minimize => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    login_ui::ChromeAction::None => {}
+                }
+
+                // **Alt+F4 and the system menu, honoured and recorded.**
+                // `refuse_close_while_working` is deliberately NOT called here:
+                // it is the other hosts' answer to a close that would strand a
+                // backend they own, and refusing it here would take away the
+                // escape hatch this stage is required to keep. What it IS worth
+                // doing is noticing, so a close that came in around the chrome
+                // reaches the caller as the same abandonment the ✕ does, and so
+                // the drain below stops on the same frame.
+                //
+                // Through `close_this_window` rather than a bare
+                // `closing.decide()`, which is the one place the flag may be
+                // moved at all (see
+                // `the_refusal_starts_armed_and_is_stood_down_in_exactly_one_place`).
+                // The `ViewportCommand::Close` it also sends is not ceremony to
+                // satisfy that guard: this arm is reached from a
+                // `close_requested` the window has not acted on yet, and asking
+                // for the close it is already reporting is what makes it happen.
+                if !closing.decided() && ui.ctx().input(|i| i.viewport().close_requested()) {
+                    *abandoned_for_closure.borrow_mut() = true;
+                    close_this_window(ui.ctx(), &mut closing);
+                }
+
+                // Not polled once the stage has decided to end -- the same
+                // guard `run`'s working stage keeps, and for the same reason: a
+                // drain after the decision reports a true fact about the
+                // channel as a false story about the run.
+                if !closing.decided() {
+                    match work_rx.try_recv() {
+                        Ok(mut work) => {
+                            let built =
+                                build_vault.take().and_then(|build| build(&mut work));
+                            *prepared_for_closure.borrow_mut() = Some(work);
+                            let event = match built {
+                                Some((vault, handles)) => {
+                                    vault_fn = Some(vault);
+                                    *vault_handles_for_closure.borrow_mut() = Some(handles);
+                                    Event::WorkReady
+                                }
+                                None => Event::WorkFailed,
+                            };
+                            match advance(stage, event) {
+                                Next::Show(next) => stage = next,
+                                Next::Close => {
+                                    log::warn!(
+                                        "the warm launch window has no vault to show; closing \
+                                         so the startup recovery can run"
+                                    );
+                                    close_this_window(ui.ctx(), &mut closing);
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                        Err(err) => match poll_working(err, working_since.elapsed()) {
+                            WorkPoll::KeepWaiting => ui.ctx().request_repaint_after(WORKING_POLL),
+                            WorkPoll::Failed(why) => {
+                                give_up_working(
+                                    ui.ctx(),
+                                    &mut closing,
+                                    why,
+                                    working_since.elapsed(),
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                        },
+                    }
+                }
+            }
+            Stage::Vault => {
+                // The vault window's own frame, in this window. It draws its own
+                // chrome, its own resize handles and its own close, and it
+                // reports lock / re-auth / Preferences / switch through the
+                // handles exactly as it does when a tray click opens it.
+                if let Some(vault_fn) = vault_fn.as_mut() {
+                    vault_fn(ui);
+                }
+            }
+            // **Unreachable, and closed rather than drawn.** No edge of
+            // `advance` reaches `SignIn` except `(Working, TeardownDone)`, and
+            // this host has no teardown to finish -- it never locks in-window.
+            // Drawn as a blank frame this would be a window with nothing in it
+            // and no way to tell why; closed, `main` runs the recovery it runs
+            // for every other way this window can end without a vault.
+            Stage::SignIn => {
+                if !closing.decided() {
+                    log::error!(
+                        "the warm launch window reached the sign-in stage, which it has no card \
+                         for; closing so the startup recovery can run"
+                    );
+                    close_this_window(ui.ctx(), &mut closing);
+                }
+                let _ = frame;
+            }
+        }
+    });
+
+    let stages = stages.borrow().clone();
+    if !stages.contains(&Stage::Vault) {
+        log::warn!(
+            "the warm launch window closed without ever showing the vault; stages were {stages:?}"
+        );
+    }
+    // The vault session ends the way EVERY vault session ends -- `finish`
+    // persists the geometry and reads the outcome cells. Not
+    // `finish_the_locked_session`: that one merges a PRE-LOCK session's cells
+    // with a rebuilt one's, and this host has no lock, so there is only ever
+    // the one set to read. `None` when the vault stage was never entered, which
+    // is the difference between "the user closed their vault" and "the user
+    // never saw it".
+    let vault = vault_handles.borrow().as_ref().map(|handles| handles.finish());
+    // Into a local first: a temporary `RefMut` living inside the struct
+    // expression would still be borrowing after the `Rc` it borrows from is
+    // dropped.
+    let prepared = prepared.borrow_mut().take();
+    let abandoned = *abandoned.borrow();
+    WarmLaunchOutcome { prepared, vault, stages, abandoned }
+}
+
 #[cfg(test)]
 mod transition_tests {
     use super::*;
@@ -2756,7 +3070,7 @@ mod startup_window_tests {
         // eframe-launch site in this file and it is in there -- so
         // the old anchor would land in the shared opener and every guard below
         // would be a statement about eight lines of styling. See
-        // `both_hosts_go_through_the_one_window_opener`, which is what now
+        // `every_host_goes_through_the_one_window_opener`, which is what now
         // holds the fact the old anchor incidentally held.
         let at = production
             .find(concat!("pub fn ", "run<P, W, V, T, B>("))
@@ -3231,7 +3545,8 @@ mod startup_window_tests {
         //    still reach the LAST production item in the file. If the marker
         //    were matched earlier than the real test modules, this anchor
         //    would fall below the cut instead of just above it.
-        const LAST_PRODUCTION_ITEM: &str = concat!("VaultSessionOutcome { result, ", "stages, relocked }");
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("WarmLaunchOutcome { prepared, ", "vault, stages, abandoned }");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,
@@ -3268,7 +3583,7 @@ mod startup_window_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 6,
+            modules, 7,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -4345,7 +4660,15 @@ mod lock_transition_tests {
 mod lock_host_tests {
     use super::startup_window_tests::{code, production};
 
-    /// **One eframe launch, one raise, two hosts.**
+    /// **One eframe launch, one raise, THREE hosts.**
+    ///
+    /// The count below went from two to three when `run_from_working` arrived,
+    /// and a raised number is normally the dishonest edit -- here it is the
+    /// only honest one: the whole claim is that every host in this module hands
+    /// its closure to the one opener rather than opening a window of its own,
+    /// so the number has to be the number of hosts. The two assertions that
+    /// must NOT move are the ones above it -- one eframe launch and one raise
+    /// -- and those are what `foreground.rs` counts independently.
     ///
     /// `foreground.rs` lists this module as opening exactly one window titled
     /// `WINDOW_TITLE` and raising it exactly once, and that file is where the
@@ -4359,7 +4682,7 @@ mod lock_host_tests {
     /// are the sort a doc comment wants to name; this crate has shipped a
     /// guard that matched its own prose before.
     #[test]
-    fn both_hosts_go_through_the_one_window_opener() {
+    fn every_host_goes_through_the_one_window_opener() {
         let production = code(production());
         assert_eq!(
             production.matches(concat!("run_ui_", "native(WINDOW_TITLE,")).count(),
@@ -4375,8 +4698,24 @@ mod lock_host_tests {
         assert_eq!(
             production.matches(concat!("run_the_one_", "window(options, move |ui, frame|")).count(),
             2,
-            "the two hosts do not both hand their closure to the one opener, so one of them \r
-             either draws nothing or opens a window of its own"
+            "the two hosts that take their options as a parameter do not both hand their \r
+             closure to the one opener, so one of them either draws nothing or opens a \r
+             window of its own"
+        );
+        // The third host builds its own options at the call, because it is the
+        // only one whose caller has no vault frame to take them from -- hence a
+        // needle of its own rather than a raised count on the one above, which
+        // would be satisfied by two calls from one host.
+        assert_eq!(
+            production
+                .matches(concat!(
+                    "run_the_one_",
+                    "window(the_vault_windows_viewport(), move |ui, frame|"
+                ))
+                .count(),
+            1,
+            "the warm-launch host does not hand its closure to the one opener, so the launch \r
+             the second report was about either draws nothing or opens a window of its own"
         );
     }
 
@@ -4407,7 +4746,18 @@ mod lock_host_tests {
                 "the vault host is gone entirely -- the lock is back to tearing the window \
                  down and reopening it",
             );
-        let closure = production[at..].to_string();
+        // **Bounded forward at the THIRD host**, not run to the end of
+        // production. `run_from_working` sits below this one and has a
+        // `Stage::Working` arm and a `std::thread::spawn` of its own; left
+        // unbounded, the negative guards here -- "the vault host does NOT start
+        // a thread beside the shared catch" chief among them -- would fail on
+        // code that belongs to a host they are not about, and the positive ones
+        // could be satisfied by it.
+        let rest = &production[at..];
+        let closure = match rest.find(concat!("pub fn run_from_", "working<P, W, V>(")) {
+            Some(end) => rest[..end].to_string(),
+            None => rest.to_string(),
+        };
         assert!(
             closure.len() > 3_000,
             "the vault host sliced down to {} bytes, which is not the whole of it -- every \
@@ -5578,5 +5928,180 @@ mod lock_host_tests {
                  the fact the retraction is decided from"
             );
         }
+    }
+}
+
+/// **The warm-launch host's own wiring**, pinned by source position for the
+/// reason the other two are: `eframe::Frame` has no public constructor, so no
+/// test can call the frame closure at all.
+///
+/// What is under test here is the half of this feature that is a DECISION
+/// rather than a transition -- the transitions are `advance`'s and are already
+/// asserted directly. The decisions are: which window it opens (the vault's,
+/// so nothing moves when the spinner is replaced), whether it can be left (yes,
+/// unlike the other two hosts), and what it does when there is no vault to show
+/// (close, so `main`'s recovery is still the thing that runs).
+#[cfg(test)]
+mod warm_launch_host_tests {
+    use super::startup_window_tests::{code, production};
+    use super::*;
+
+    /// The warm-launch host from its head to the end of production code,
+    /// comments stripped -- and it IS the end of production: this host is the
+    /// last item in the file, which the production-cut control also pins.
+    fn host() -> String {
+        let production = code(production());
+        let at = production
+            .find(concat!("pub fn run_from_", "working<P, W, V>("))
+            .expect(
+                "the warm-launch host is gone entirely -- the launch that already has a \
+                 session is back to a separate spinner window, which is the report",
+            );
+        let host = production[at..].to_string();
+        assert!(
+            host.len() > 2_000,
+            "the warm-launch host sliced down to {} bytes, which is not the whole of it -- \
+             every guard below would then be a statement about a region that stops short of \
+             the code it names",
+            host.len()
+        );
+        host
+    }
+
+    /// **The window it opens is the VAULT's, not a spinner-sized one of its
+    /// own.**
+    ///
+    /// This is the whole of "no flash, no jump, no re-centre": the OS window is
+    /// created once, at `vault_window::initial_placement`'s size and position,
+    /// and the swap from spinner to item list changes only what is painted
+    /// inside it. A host that built its own `ViewportBuilder` -- at
+    /// `loading_ui`'s own window size, say, which is what the window it
+    /// replaces was -- would be back to a window that has to grow and re-centre
+    /// when the vault arrives, which is what the user sees as two windows
+    /// however many there really are.
+    #[test]
+    fn the_warm_launch_window_opens_at_the_vault_windows_own_geometry() {
+        let host = host();
+        assert!(
+            host.contains(concat!("the_vault_windows_", "viewport()")),
+            "the warm-launch host no longer opens at the vault window's geometry, so the \
+             window jumps or re-centres when the spinner is replaced by the item list: {host}"
+        );
+        assert!(
+            !host.contains(concat!("Viewport", "Builder::default()")),
+            "the warm-launch host builds a viewport of its own, so the window it opens is no \
+             longer provably the one the vault would have opened: {host}"
+        );
+        // The shared builder really is shared, rather than a function only this
+        // host calls -- which is what makes "the same geometry" a fact about
+        // both windows and not a coincidence between two copies.
+        assert_eq!(
+            code(production()).matches(concat!("the_vault_windows_", "viewport()")).count(),
+            3,
+            "the vault window's viewport is not built in one place and used by both hosts \
+             that open a window which becomes the vault -- one definition, two calls"
+        );
+    }
+
+    /// **A stuck startup can be abandoned, and that is deliberate.**
+    ///
+    /// `run`'s working stage is `CloseControl::Disabled` and refuses Alt+F4 as
+    /// well, because closing it throws away a sign-in the user has just typed
+    /// and strands the `bw serve` its own worker started. Neither is true here:
+    /// the session came off disk and `main` owns the backend. The window this
+    /// host replaces could always be closed, and merging it into a window that
+    /// could not would be a spinner with no close control, no tray -- the tray
+    /// is built after this returns -- and no way out but Task Manager for up to
+    /// `WORKING_DEADLINE`. Two windows would be better than that.
+    #[test]
+    fn the_warm_launch_spinner_can_be_closed() {
+        let host = host();
+        assert!(
+            host.contains(concat!("CloseControl::", "Active")),
+            "the warm-launch spinner's close control is no longer live, so a startup that \
+             wedges leaves a spinner with nothing to close it, no tray, and no way out but \
+             Task Manager: {host}"
+        );
+        assert!(
+            !host.contains(concat!("CloseControl::", "Disabled")),
+            "the warm-launch spinner ghosts its own close control, which is the other host's \
+             answer to a close that would strand something -- nothing here is owed that: \
+             {host}"
+        );
+        assert!(
+            !host.contains(concat!("refuse_close_while_", "working(")),
+            "the warm-launch host refuses closes that do not go through the chrome, so Alt+F4 \
+             is swallowed too and the escape hatch above is only half there: {host}"
+        );
+        // And a close is REPORTED, not silently indistinguishable from a
+        // failure: the caller answers the two differently -- a quiet retry for
+        // one, kill-and-reauthenticate for the other.
+        assert_eq!(
+            host.matches(concat!("abandoned_for_closure.borrow_", "mut() = true")).count(),
+            2,
+            "the two ways out of this stage -- the chrome's close control and Alt+F4 -- are \
+             not both reported as an abandonment, so one of them reaches `main` looking like \
+             a broken backend and costs the user their master password: {host}"
+        );
+    }
+
+    /// **No vault to show closes the window, and the recovery is `main`'s.**
+    ///
+    /// The failure has to be reachable from this stage at all -- that is the
+    /// half a transition table cannot answer -- and what it must NOT do is stay
+    /// on the spinner. `main`'s recovery kills `bw serve`, sends the user back
+    /// through the master password and starts over; it opens windows of its own
+    /// and cannot run inside a frame closure, so the window has to end first.
+    #[test]
+    fn the_warm_launch_host_ends_the_stage_when_there_is_no_vault() {
+        let host = host();
+        assert!(
+            host.contains(concat!("give_up_", "working(")),
+            "the warm-launch host has no watchdog, so a worker that dies or never answers \
+             leaves the spinner up until the process is killed: {host}"
+        );
+        assert!(
+            host.contains(concat!("close_this_", "window(")),
+            "the warm-launch host never closes its own window, so nothing hands control back \
+             to the startup recovery: {host}"
+        );
+        assert!(
+            host.contains(concat!("Event::Work", "Failed")),
+            "the warm-launch host never reaches the failed event, so a `build_vault` that \
+             answers `None` shows an empty vault stage instead: {host}"
+        );
+        // The event really does leave the window, rather than being a value
+        // nothing acts on. Asserted through `advance` -- the one table -- so
+        // this is the same edge `run`'s working stage takes.
+        assert_eq!(
+            advance(Stage::Working, Event::WorkFailed),
+            Next::Close,
+            "the failed event no longer leaves the working stage, so both hosts sit on a \
+             spinner after the work has already failed"
+        );
+    }
+
+    /// **Both stages are actually drawn**, which is the claim a transition
+    /// table cannot make: this crate has shipped a correct machine whose vault
+    /// stage painted nothing more than once.
+    #[test]
+    fn the_warm_launch_host_draws_both_of_its_stages() {
+        let host = host();
+        assert!(
+            host.contains(concat!("draw_spinner_", "body(")),
+            "the warm-launch host's working stage draws no spinner, so the eight seconds the \
+             report is about are an empty window: {host}"
+        );
+        assert!(
+            host.contains(concat!("vault_fn", "(ui)")),
+            "the warm-launch host's vault stage never calls the vault frame, so the window \
+             the spinner hands over to is blank: {host}"
+        );
+        assert!(
+            host.contains(concat!("handles.", "finish()")),
+            "the warm-launch vault session does not end through `finish`, so its geometry is \
+             never written and everything it reported -- a lock, a switch, a gear visit -- is \
+             dropped: {host}"
+        );
     }
 }
