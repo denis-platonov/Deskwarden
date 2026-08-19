@@ -8,7 +8,15 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.8.2 - 2026-08-19
+
+> The manual pre-release checklist was not run for this version. The
+> overlay's password-field probe is a cross-process call measured at a
+> median of 27ms and a p90 of 133ms, whose cost falls on the application
+> you switch to rather than on Deskwarden, and it has not been exercised
+> outside the test suite. If focusing an application that asks for a
+> password feels slower than it did, that is the likely cause; please open
+> an issue.
 
 ### The overlay says something when nothing matches
 
