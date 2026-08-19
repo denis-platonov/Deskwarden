@@ -6173,20 +6173,29 @@ mod source_pins {
     /// The Sends screen replaces the item list rather than being drawn beside
     /// it, and the item list is not asked to render Sends.
     ///
-    /// **This pins the coverage, not the gate.** Counting `if !show_sends {`
-    /// alone says only that the gate exists somewhere; a second, ungated
+    /// **This pins the coverage, not the gate.** Counting the gate alone
+    /// says only that it exists somewhere; a second, ungated
     /// `draw_item_list` leaves that count at one and puts the item list back
     /// on the Sends screen. So the gate's own block is sliced out -- to the
     /// next `}` at the gate's indentation -- and the item list panel and its
     /// draw call are required to be inside *it*, and to exist nowhere else.
+    ///
+    /// **The gate is `!show_sends && !on_health`**, because the item-list
+    /// column now has a second screen that takes it over: the Password
+    /// health report (`vault_window::password_health`). Nothing here was
+    /// weakened to let it in -- that screen draws its own panel under its own
+    /// id, so the `Panel::left("vault-item-list")` count below still says
+    /// "the item list is drawn exactly once" and the block slice still says
+    /// "and that once is under this gate". `password_health` carries the
+    /// mirror of this test for its own pane.
     #[test]
     fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate = concat!("        if !show_", "sends {\r\n");
+        let gate = concat!("        if !show_", "sends && !on_health {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,
-            "{gate:?} is not in production exactly once -- the Sends screen has been given a \
+            "{gate:?} is not in production exactly once -- the item list has been given a \
              second gate, or the gate has moved out of the frame closure's top level"
         );
         let start = production.find(gate).expect("gate");
