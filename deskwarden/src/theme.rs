@@ -697,23 +697,37 @@ pub fn initials(name: &str) -> String {
 
 /// How far a favicon is inset inside its [`avatar_tile`], per side.
 ///
-/// A JUDGEMENT CALL: the design document has no favicon example anywhere, so
-/// there is no value to read off it. It is set against the MONOGRAM, which is
-/// the thing a favicon sits beside in a list and has to weigh the same as.
-/// [`avatar`] draws its letters at `size * 0.38` -- ~12pt of ink centred in a
-/// 32pt tile -- so a monogram's ink covers roughly a third of the tile, while
-/// an edge-to-edge favicon covers all of it. 4pt a side puts the artwork in a
-/// 24pt box: still clearly the largest thing in the row (a favicon is detail,
-/// not a letterform, and shrinking it further starts costing legibility) but
-/// no longer heavier than every monogram next to it. That was the report.
+/// A JUDGEMENT CALL, and one now made against reports from BOTH SIDES. The
+/// design document has no favicon example anywhere, so there is no value to
+/// read off it.
+///
+/// * **"the favicon fills its tile edge-to-edge and feels too big"** is what
+///   moved this off zero. The reference is the MONOGRAM, which is what a
+///   favicon sits beside in a list and has to weigh the same as: [`avatar`]
+///   draws its letters at `size * 0.38` -- ~12pt of ink centred in a 32pt tile
+///   -- so a monogram's ink covers roughly a third of the tile, while an
+///   edge-to-edge favicon covers all of it.
+/// * **"icon is not fully taking the rounded rectangle"** is the answer 4pt
+///   got, and it is the same user looking at the same row. 4pt put the artwork
+///   in a 24pt box inside a 32pt one; against a filled, bordered tile that
+///   reads as an icon floating in a frame rather than a tile with an icon in
+///   it.
+///
+/// 2pt a side is deliberately BETWEEN the two: a 28pt image in a 32pt box.
+/// Not flush -- the tile is drawn filled and bordered exactly as the
+/// monogram's is, and artwork against a bordered edge is what the first report
+/// was about -- but the remaining gap is a hairline rather than a moat. Zero is
+/// not available to whoever tunes this next: zero is the first report,
+/// re-shipped. `a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_
+/// to_edge` holds both ends.
 ///
 /// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
 /// resamples every icon to a 64px longest edge, a number chosen for a 32pt
 /// draw at 200% scaling. Nothing in the code links that constant to this one.
-/// 64 still covers a 24pt draw comfortably (48 physical px at 200%), so this
+/// 64 still covers a 28pt draw comfortably (56 physical px at 200%), so this
 /// inset is safe, but a tile that ever grows past 32pt needs `decode_rgba`'s
 /// constant raised with it.
-pub const AVATAR_ICON_INSET: f32 = 4.0;
+pub const AVATAR_ICON_INSET: f32 = 2.0;
 
 /// The avatar tile's BOX -- allocated, filled, bordered and rounded -- with
 /// nothing drawn in it, returning the rect so the caller can place its own

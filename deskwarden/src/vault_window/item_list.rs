@@ -1670,9 +1670,10 @@ fn item_row(
                         // carries the reasoning for the value.
                         let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
                         let art = tile.shrink(theme::AVATAR_ICON_INSET);
-                        // Concentric with the tile: an 8px outer radius with a
-                        // 4px inset leaves 4px inside, so the two curves stay
-                        // parallel instead of the inner one looking too sharp.
+                        // Concentric with the tile: the radius is taken from
+                        // the INSET box's own width by the same ratio the tile
+                        // uses, so the two curves stay parallel instead of the
+                        // inner one looking too sharp -- at any inset.
                         egui::Image::new((tex.id(), tex.size_vec2()))
                             .corner_radius(theme::avatar_corner_radius(art.width()))
                             .paint_at(ui, art);
@@ -3993,15 +3994,28 @@ mod row_tile_tests {
 
     #[test]
     fn a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_to_edge() {
-        // THE REPORT: "the favicon fills its tile edge-to-edge and feels too
-        // big". The monogram fallback draws a bordered 32px tile with its
-        // letters INSIDE it; a favicon drawn at the full 32 fills that same
-        // box completely and reads heavier than every monogram beside it.
+        // TWO REPORTS, one from each side of this number, and the test exists
+        // to keep the value between them rather than at either end:
+        //
+        // 1. "the favicon fills its tile edge-to-edge and feels too big". The
+        //    monogram fallback draws a bordered 32px tile with its letters
+        //    INSIDE it; a favicon drawn at the full 32 fills that same box
+        //    completely and reads heavier than every monogram beside it. That
+        //    is what moved `theme::AVATAR_ICON_INSET` off zero, to 4.
+        // 2. "icon is not fully taking the rounded rectangle". 4pt a side left
+        //    a 24pt image in a 32pt tile -- three quarters of it -- which
+        //    against a filled, bordered box reads as an icon adrift in a frame.
+        //
+        // The inset is 2 now: a 28pt image in a 32pt tile, which is neither
+        // report. `theme::AVATAR_ICON_INSET` carries the full reasoning.
         //
         // Two things are asserted, and the first is what makes the second mean
         // anything: the 32px TILE is still drawn (filled and bordered, exactly
         // as the monogram's is), and the image sits strictly inside it, inset
-        // by `theme::AVATAR_ICON_INSET` on every side.
+        // by `theme::AVATAR_ICON_INSET` on every side. The final assertion is
+        // the one that answers report 1 whatever the constant is later tuned
+        // to -- strictly inside, so a future zero reds here rather than
+        // shipping.
         let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
         let tile = square(&p, AVATAR_SIZE);
         assert_eq!(

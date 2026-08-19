@@ -8,6 +8,17 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### The vault window's list and rail
+
+- **A favicon now nearly fills its tile.** It was inset 4pt a side inside a
+  32pt tile — a 24pt icon in a bordered box, which read as an icon adrift in a
+  frame ("icon is not fully taking the rounded rectangle"). The inset is 2pt
+  now: 28pt of icon in the same 32pt tile. It is deliberately not zero — the
+  opposite report, "the favicon fills its tile edge-to-edge and feels too big",
+  is what put an inset there in the first place.
+
 ## 0.8.3 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version either. In
