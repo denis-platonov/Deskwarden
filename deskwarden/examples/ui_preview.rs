@@ -61,6 +61,8 @@ use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
+use deskwarden::vault_window::item_list;
+use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
@@ -223,6 +225,33 @@ enum Surface {
     /// The old flow's failure went to a tray tooltip, visible only to someone
     /// already hovering a 16px icon.
     PrefsAboutFailed,
+    /// **The vault window's item list**, at the exact width the window gives
+    /// it, with a card of every network this app can name in it.
+    ///
+    /// The surface this example was missing, and the one two of the list's
+    /// three reported defects live on: how big a favicon looks inside its
+    /// tile, and whether a card's network badge can be READ. Neither is a
+    /// question a rect assertion answers -- `paint_tests` can say the image
+    /// is inset by exactly `theme::AVATAR_ICON_INSET` and say nothing at all
+    /// about whether the result looks like an icon in a tile or an icon
+    /// adrift in a frame.
+    ///
+    /// Every brand in `card_brand::CARD_BRANDS` is on it, on purpose: the
+    /// badges have to be tellable apart from each other, and one card in a
+    /// picture cannot show that.
+    VaultList,
+    /// **The vault window's rail**, at the exact width the window gives it.
+    ///
+    /// The surface the rail's own grouping is decided on: whether the three
+    /// kinds of row it holds -- cuts of the vault, folders, and the rail's two
+    /// SCREENS -- read as three groups or as one long run with two lines
+    /// through it. That is a question about how a column looks, and no
+    /// assertion about the order of painted rects answers it.
+    ///
+    /// The screens sit below the folders now, so the shot has to reach the
+    /// bottom of the rail: it is drawn at the shipped window's own height with
+    /// a folder list short enough to leave them on screen.
+    VaultRail,
     /// **Design 4d's rehearsal window, finished.** The twelfth surface, and
     /// the one this example exists for: this window shipped as a raw Win32
     /// dialog with none of the app's theme, tokens or type, and no screenshot
@@ -252,6 +281,15 @@ enum Surface {
 /// `vault_window::mod` and an example is a separate crate. If that window is
 /// ever resized, this is the number that has to follow it.
 const PANE_WIDTH: f32 = 1240.0 - 212.0 - 390.0;
+
+/// The item list panel's exact width in the shipped vault window, i.e.
+/// `vault_window::mod`'s `LIST_WIDTH`. Spelled out here for the reason
+/// [`PANE_WIDTH`] is spelled out.
+const LIST_WIDTH: f32 = 390.0;
+
+/// The rail's exact width in the shipped vault window, i.e.
+/// `vault_window::mod`'s `SIDEBAR_WIDTH`.
+const SIDEBAR_WIDTH: f32 = 212.0;
 
 /// Tall enough that no pane below scrolls, so a screenshot is the whole
 /// surface rather than the top of it. The shipped window is 740 high.
@@ -299,6 +337,8 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutUpdateAvailable,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
+    Surface::VaultList,
+    Surface::VaultRail,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
 ];
@@ -332,6 +372,8 @@ impl Surface {
             Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
+            Surface::VaultList => "vault_item_list",
+            Surface::VaultRail => "vault_rail",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
         }
@@ -390,6 +432,17 @@ impl Surface {
             | Surface::PrefsAboutUpdateAvailable
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
+            // The list panel's exact shipped width, spelled out for the same
+            // reason [`PANE_WIDTH`] is: `vault_window::mod`'s `LIST_WIDTH` is
+            // `pub(crate)` and an example is a separate crate. A list drawn
+            // narrow elides its titles and drops its chips, which is a picture
+            // of a layout nobody ships.
+            Surface::VaultList => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
+            // reason as the two above, and the shipped window's own height --
+            // the rail is measured against the window's floor, so a preview
+            // drawn taller would hide exactly the overflow it is here to show.
+            Surface::VaultRail => egui::vec2(SIDEBAR_WIDTH, PANE_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -418,6 +471,8 @@ fn main() -> eframe::Result {
     let screenshot = all || arg("--screenshot");
     let signin = arg("--signin");
     let login = signin || arg("--login");
+    let list = arg("--list");
+    let rail = arg("--rail");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -427,6 +482,10 @@ fn main() -> eframe::Result {
         vec![Surface::LoginSignin]
     } else if login {
         vec![Surface::LoginUnlock]
+    } else if list {
+        vec![Surface::VaultList]
+    } else if rail {
+        vec![Surface::VaultRail]
     } else {
         vec![Surface::Overlay]
     };
@@ -459,6 +518,10 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_signin.png")
     } else if login {
         target_dir().join("ui_preview_login.png")
+    } else if list {
+        target_dir().join("ui_preview_vault_item_list.png")
+    } else if rail {
+        target_dir().join("ui_preview_vault_rail.png")
     } else {
         target_dir().join("ui_preview_overlay.png")
     };
@@ -500,6 +563,19 @@ fn main() -> eframe::Result {
                 screenshot,
                 done: false,
                 frames: 0,
+                icons: None,
+                list_search: String::new(),
+                // The first row, so the shot carries the selected treatment
+                // (blue border, blue wash behind the tile) as well as the
+                // ordinary one -- see `draw_vault_list`.
+                list_selected: Some("list-0001".to_string()),
+                list_visible: Vec::new(),
+                // An ordinary item row selected, so the shot carries the
+                // selected treatment and neither screen is up -- the state the
+                // window is in almost all of the time.
+                rail_selected: SidebarFilter::Logins,
+                rail_sends: false,
+                rail_health: false,
                 window_height: 0.0,
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -577,6 +653,18 @@ struct Preview {
     done: bool,
     /// Frames drawn since this surface's geometry last moved.
     frames: u32,
+    /// The item-list shot's own state. Built on the first frame that needs it
+    /// and then held: `load_texture` allocates a new texture on every call, so
+    /// rebuilding the cache per frame would upload nine images a frame for the
+    /// twelve warm-up frames.
+    icons: Option<item_list::IconCache>,
+    list_search: String,
+    list_selected: Option<String>,
+    list_visible: Vec<String>,
+    /// The rail shot's own selection state.
+    rail_selected: SidebarFilter,
+    rail_sends: bool,
+    rail_health: bool,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
@@ -671,6 +759,8 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutUpdateAvailable
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
+            Surface::VaultList => self.draw_vault_list(root),
+            Surface::VaultRail => self.draw_vault_rail(root),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
         }
@@ -1045,6 +1135,70 @@ impl Preview {
         );
     }
 
+    /// The vault window's item list, drawn through `draw_item_list` itself on
+    /// the same `theme::CANVAS` panel `vault_window::mod` hosts it in.
+    ///
+    /// The action is dropped: every one of them wants a vault behind it, and a
+    /// preview must never reach one. The search buffer and the selection are
+    /// the preview's own state so the shot shows a row in its SELECTED
+    /// treatment -- which is the state the tile's border, fill and shadow all
+    /// change in, and therefore the one a favicon has to look right against.
+    fn draw_vault_list(&mut self, root: &mut egui::Ui) {
+        let icons = self.icons.get_or_insert_with(|| {
+            preview_icons(root.ctx(), &self.fixtures.list, &["Ledgerline", "Ledgerline corporate card"])
+        });
+        let fixtures = &self.fixtures;
+        let (search, selected, visible) =
+            (&mut self.list_search, &mut self.list_selected, &mut self.list_visible);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(root, |ui| {
+                let _ = item_list::draw_item_list(
+                    ui,
+                    Some(&fixtures.list),
+                    &fixtures.folders,
+                    &SidebarFilter::All,
+                    search,
+                    selected,
+                    None,
+                    icons,
+                    visible,
+                    None,
+                    false,
+                );
+            });
+    }
+
+    /// The vault window's rail, drawn through `draw_sidebar` itself in the same
+    /// `theme::CARD` panel frame `vault_window::mod` hosts it in -- margins
+    /// included, because the rail's insets are measured against them.
+    ///
+    /// Four folder rows: enough that the FOLDERS group reads as a group, few
+    /// enough that the two screen rows below them are in the picture.
+    fn draw_vault_rail(&mut self, root: &mut egui::Ui) {
+        let fixtures = &self.fixtures;
+        let (selected, sends, health) =
+            (&mut self.rail_selected, &mut self.rail_sends, &mut self.rail_health);
+        egui::CentralPanel::default()
+            // Design 4.8's own frame, copied from the `Panel::left` in
+            // `vault_window::mod`: `theme::CARD` with `padding: 14px 10px`.
+            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
+            .show(root, |ui| {
+                let _ = sidebar::draw_sidebar(
+                    ui,
+                    sidebar::VaultLists {
+                        sends: Some(3),
+                        health_findings: 4,
+                        ..sidebar::VaultLists::live_only(&fixtures.list)
+                    },
+                    &fixtures.rail_folders,
+                    selected,
+                    sidebar::Screens { sends, health },
+                    "Locks in 11:42",
+                );
+            });
+    }
+
     /// The surfaces that live *inside* the vault window rather than in one of
     /// their own, drawn on the window's own canvas so the PNG shows them
     /// against the background they actually sit on.
@@ -1147,6 +1301,10 @@ impl Preview {
 struct Fixtures {
     login: VaultItem,
     card: VaultItem,
+    /// The item list's rows -- see [`LIST_JSON`].
+    list: Vec<VaultItem>,
+    /// More folders than the rail's height fits -- see `draw_vault_rail`.
+    rail_folders: Vec<Folder>,
     folders: Vec<Folder>,
     totp: TotpState,
     reveal: RevealState,
@@ -1166,6 +1324,23 @@ impl Fixtures {
     fn new() -> Self {
         let login = item(LOGIN_JSON);
         let card = item(CARD_JSON);
+        let list = items(LIST_JSON);
+        // **The fixture is checked against the enumeration, not against a
+        // number written here twice.** The list shot exists to show every
+        // network's badge beside every other one; a brand added to
+        // `CARD_BRANDS` and not to `LIST_JSON` would leave a badge nobody ever
+        // looks at, which is exactly the failure this whole example is for.
+        let networked: std::collections::BTreeSet<_> = list
+            .iter()
+            .filter_map(|i| item_list::card_network(i).map(|b| b.canonical()))
+            .collect();
+        assert_eq!(
+            networked.len(),
+            deskwarden::card_brand::CARD_BRANDS.len(),
+            "the item-list fixture shows {} of the {} card networks: {networked:?}",
+            networked.len(),
+            deskwarden::card_brand::CARD_BRANDS.len()
+        );
         let mut draft = EditDraft::from_item(&login);
         // Dirty, because the confirmation only exists for a dirty draft --
         // showing it over a pristine form would be a picture of a state the
@@ -1232,6 +1407,32 @@ impl Fixtures {
             draft,
             login,
             card,
+            list,
+            // Three named folders plus `bw serve`'s virtual "No Folder" bucket.
+            // Chosen so the WHOLE rail fits the shot: the point of this surface
+            // is whether the three groups read as three, and a picture whose
+            // bottom group is off the bottom edge cannot answer that. That the
+            // rail scrolls when a vault has more is pinned by
+            // `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter`,
+            // which is a claim about reachability rather than about looks.
+            rail_folders: [
+                "Engineering",
+                "Personal",
+                "Shared with me",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Folder {
+                id: format!("rf-{i}"),
+                name: (*name).to_string(),
+                other: Default::default(),
+            })
+            .chain(std::iter::once(Folder {
+                id: String::new(),
+                name: "No Folder".into(),
+                other: Default::default(),
+            }))
+            .collect(),
             totp,
         }
     }
@@ -1261,6 +1462,62 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
     }
 }
 
+/// A stand-in favicon, built rather than downloaded.
+///
+/// **No network, and no bundled third-party artwork.** What the favicon shot
+/// has to show is the RELATIONSHIP between a piece of edge-to-edge artwork and
+/// the tile it sits in, and any image whose colour runs to all four edges
+/// answers that. This one is a filled ground with a lighter ring on it -- the
+/// shape of a great many real site icons -- at the 64px longest edge
+/// `favicon::decode_rgba` resamples every real icon to, so the tile is asked
+/// to scale exactly what it is asked to scale in the app.
+fn stand_in_favicon(ctx: &egui::Context, name: &str, ground: egui::Color32) -> egui::TextureHandle {
+    const PX: usize = 64;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; PX * PX];
+    let centre = (PX as f32 - 1.0) / 2.0;
+    for y in 0..PX {
+        for x in 0..PX {
+            let d = ((x as f32 - centre).powi(2) + (y as f32 - centre).powi(2)).sqrt();
+            // A ring at roughly half the radius, which is the only detail on
+            // it: enough to see the artwork scale, not so much that the eye
+            // starts reviewing the drawing instead of the tile.
+            pixels[y * PX + x] = if (14.0..20.0).contains(&d) {
+                egui::Color32::from_rgb(0xff, 0xff, 0xff)
+            } else {
+                ground
+            };
+        }
+    }
+    ctx.load_texture(
+        format!("preview-favicon-{name}"),
+        egui::ColorImage { size: [PX, PX], pixels, source_size: egui::vec2(PX as f32, PX as f32) },
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+/// The icon cache the list preview draws against: a stand-in favicon on the
+/// named items and nothing on the rest, so ONE picture holds all three of the
+/// row's leading treatments -- favicon in a tile, monogram fallback, and (on a
+/// card) the network badge over each of them.
+fn preview_icons(
+    ctx: &egui::Context,
+    items: &[VaultItem],
+    with_icons: &[&str],
+) -> item_list::IconCache {
+    let mut cache = item_list::IconCache::default();
+    for (n, item) in items.iter().filter(|i| with_icons.contains(&i.name.as_str())).enumerate() {
+        let ground = if n % 2 == 0 {
+            egui::Color32::from_rgb(0x1f, 0x6f, 0x5c)
+        } else {
+            egui::Color32::from_rgb(0x8a, 0x2f, 0x3c)
+        };
+        cache
+            .textures
+            .insert(item.id.clone(), stand_in_favicon(ctx, &item.id, ground));
+    }
+    cache
+}
+
 /// A fixture item, in the wire shape `bw serve` returns.
 ///
 /// Parsed rather than built field by field, for the reason the wire tests are
@@ -1269,6 +1526,11 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
 /// real thing is worse than no fixture.
 fn item(json: &str) -> VaultItem {
     serde_json::from_str(json).expect("the preview's fixture item must parse as a VaultItem")
+}
+
+/// A whole fixture list, parsed for the same reason [`item`] is.
+fn items(json: &str) -> Vec<VaultItem> {
+    serde_json::from_str(json).expect("the preview's fixture list must parse as VaultItems")
 }
 
 const LOGIN_JSON: &str = r#"{
@@ -1302,6 +1564,68 @@ const CARD_JSON: &str = r#"{
     "code": "417"
   }
 }"#;
+
+/// The item list's rows: one card per network, plus the two login shapes.
+///
+/// **Every brand in `card_brand::CARD_BRANDS`, once.** The network badge's
+/// whole job is to say WHICH network, so the only useful picture of it is one
+/// with all of them side by side -- a single Visa row proves nothing about
+/// whether Visa can be told from Discover at 12pt. `Fixtures::new` checks the
+/// count against the enumeration, so a network added later cannot quietly go
+/// unphotographed.
+///
+/// The brands are stored on the items rather than left to be inferred from the
+/// digits: `item_list::card_network` prefers a stored brand, which is the path
+/// a real vault takes, and the numbers here are the published test numbers
+/// anyway.
+const LIST_JSON: &str = r#"[
+  {
+    "id": "list-0001", "type": 1, "name": "Ledgerline", "folderId": "f-work",
+    "favorite": true,
+    "login": { "username": "a.novak@ledgerline.com", "password": "x",
+      "uris": [{ "uri": "https://app.ledgerline.eu/signin" }] }
+  },
+  {
+    "id": "list-0002", "type": 1, "name": "Northwind Mail",
+    "login": { "username": "anna@northwind.example", "password": "x" }
+  },
+  {
+    "id": "list-0003", "type": 3, "name": "Ledgerline corporate card",
+    "folderId": "f-work",
+    "card": { "brand": "Visa", "number": "4111111111111111", "expMonth": "11",
+      "expYear": "2029" }
+  },
+  {
+    "id": "list-0004", "type": 3, "name": "Household card",
+    "card": { "brand": "Mastercard", "number": "5555555555554444",
+      "expMonth": "02", "expYear": "2028" }
+  },
+  {
+    "id": "list-0005", "type": 3, "name": "Travel card",
+    "card": { "brand": "American Express", "number": "378282246310005",
+      "expMonth": "07", "expYear": "2027" }
+  },
+  {
+    "id": "list-0006", "type": 3, "name": "Rewards card",
+    "card": { "brand": "Discover", "number": "6011111111111117",
+      "expMonth": "01", "expYear": "2030" }
+  },
+  {
+    "id": "list-0007", "type": 3, "name": "Osaka office card",
+    "card": { "brand": "JCB", "number": "3530111333300000", "expMonth": "09",
+      "expYear": "2026" }
+  },
+  {
+    "id": "list-0008", "type": 3, "name": "Entertainment card",
+    "card": { "brand": "Diners Club", "number": "30569309025904",
+      "expMonth": "05", "expYear": "2029" }
+  },
+  {
+    "id": "list-0009", "type": 3, "name": "Shenzhen supplier card",
+    "card": { "brand": "UnionPay", "number": "6200000000000005",
+      "expMonth": "12", "expYear": "2028" }
+  }
+]"#;
 
 /// The two preflight states.
 ///

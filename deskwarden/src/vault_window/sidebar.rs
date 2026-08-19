@@ -436,10 +436,12 @@ pub const SENDS_ROW_LABEL: &str = "Sends";
 /// highlights Cards. Here it is [`Self::clear`] and [`Self::select`], and a
 /// row that calls neither does not compile into a working row at all.
 ///
-/// They are not folded into `SidebarFilter` as variants for the reason the
-/// Sends row's own comment gives: that type is what `item_list` matches on to
-/// choose its empty-state nouns and its per-row scoping, so a variant there
-/// would force these screens through the item pane.
+/// They are not folded into `SidebarFilter` as variants for the reason
+/// [`screen_rows`] gives: that type is what `item_list` matches on to choose
+/// its empty-state nouns and its per-row scoping, so a variant there would
+/// force these screens through the item pane. The rail draws them in a group
+/// of their own, below the folders and behind their own divider, which is that
+/// same distinction made visible.
 pub struct Screens<'a> {
     pub sends: &'a mut bool,
     pub health: &'a mut bool,
@@ -596,261 +598,264 @@ pub fn draw_sidebar(
 
     ui.vertical(|ui| {
         ui.set_width(ui.available_width());
-        // Zeroed for this whole block: egui inserts `item_spacing` between
-        // every pair of sequential widgets automatically, including
-        // `add_space` calls, so leaving the ambient 8px default in place
-        // here would silently add 8px on top of every explicit gap this
-        // function writes below (an explicit 14px gap would render as
-        // 22px). Every gap in this sidebar is deliberate and spelled out
-        // below instead -- `ROW_GAP` is re-applied just around each row
-        // loop, where a uniform inter-row gap actually is wanted.
-        ui.spacing_mut().item_spacing.y = 0.0;
+        // **THE RAIL SCROLLS, and until this it did not.** Everything above
+        // the countdown is one column in a fixed-height panel with no
+        // `ScrollArea` anywhere, so whatever ran past the bottom was simply
+        // culled: a vault with a folder for every letter of the alphabet put
+        // the last folders off the window with no way to reach them.
+        //
+        // That was survivable while the two screen rows sat up among the type
+        // rows. It stopped being survivable the moment they moved below the
+        // folders, because the folder list is the one part of this rail whose
+        // length the user controls -- so Sends and Password health became the
+        // FIRST things a long folder list would push out of reach. Measured:
+        // twenty-six folders in an 800pt rail put the Sends row at y=1381.
+        // `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter` is
+        // that measurement, kept.
+        //
+        // The bar is egui's floating default rather than
+        // `theme::scrollbar_in_gutter`: that helper reserves a lane by
+        // narrowing the content, and every row inset, the glyph column and the
+        // countdown's own x are pinned against this panel's current width. A
+        // floating bar allocates no width, so nothing in the rail moves.
+        //
+        // `max_height` leaves the countdown its band, and `auto_shrink` is off
+        // vertically so the band stays put whether the rows overflow or not --
+        // a countdown that floated up under a short list and sat at the foot of
+        // a long one would be two different layouts.
+        let countdown_band = countdown_band_height(ui, lock_countdown);
+        egui::ScrollArea::vertical()
+            .id_salt("vault-rail")
+            .max_height((ui.available_height() - countdown_band).max(0.0))
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+            // Zeroed for this whole block: egui inserts `item_spacing` between
+            // every pair of sequential widgets automatically, including
+            // `add_space` calls, so leaving the ambient 8px default in place
+            // here would silently add 8px on top of every explicit gap this
+            // function writes below (an explicit 14px gap would render as
+            // 22px). Every gap in this sidebar is deliberate and spelled out
+            // below instead -- `ROW_GAP` is re-applied just around each row
+            // loop, where a uniform inter-row gap actually is wanted.
+            ui.spacing_mut().item_spacing.y = 0.0;
 
-        section_label(ui, "VAULT");
-        ui.add_space(SECTION_LABEL_INSET);
-        ui.spacing_mut().item_spacing.y = ROW_GAP;
-        for (label, filter) in [
-            ("All items", SidebarFilter::All),
-            ("Favorites", SidebarFilter::Favorites),
-            // Directly after Favorites, by the user's explicit instruction
-            // ("it is our main feature"). Design 2b has no such row -- it
-            // predates app matching -- so the placement is theirs and the
-            // styling is the neighbouring rows'.
-            ("Apps", SidebarFilter::Apps),
-            ("Logins", SidebarFilter::Logins),
-            ("Passkeys", SidebarFilter::Passkeys),
-            ("Cards", SidebarFilter::Cards),
-            ("Identities", SidebarFilter::Identities),
-            ("Secure notes", SidebarFilter::SecureNotes),
-            ("SSH keys", SidebarFilter::SshKeys),
-        ] {
-            item_row(ui, label, filter, lists, selected, &mut screens);
-        }
-        // **Not a `SidebarFilter`.** Every other row in this rail names a cut
-        // of an item list; this one selects a different screen entirely, made
-        // of `crate::send::SendSummary`s that are not `VaultItem`s and have
-        // no id in common with any of them. Giving it a `SidebarFilter`
-        // variant would put it in the type `item_list` matches on to choose
-        // its empty-state nouns and its per-row scoping, i.e. it would force
-        // Sends through the item pane -- which is the one thing the design
-        // says must not happen.
-        //
-        // Placed below the type rows and above Archive/Trash: the rows above
-        // are cuts of the live vault, the two below are vault items put away,
-        // and this is neither. Not muted -- the two below are greyed because
-        // they are outside the working vault, and Sends is a live feature the
-        // user acts in.
-        //
-        // Its badge is `lists.sends`, which is `None` for a fetch that FAILED
-        // as well as for one that has not happened, so it draws
-        // `UNKNOWN_COUNT` rather than a `0` that would read as "nothing of
-        // yours is published". See `send_ui::SendFetch::badge_count`.
-        {
-            let width = ui.available_width();
-            let on = screens.is(Screen::Sends);
-            if sidebar_row(ui, SENDS_ROW_LABEL, lists.sends, on, false, width).clicked() {
-                screens.select(Screen::Sends);
+            section_label(ui, "VAULT");
+            ui.add_space(SECTION_LABEL_INSET);
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            for (label, filter) in [
+                ("All items", SidebarFilter::All),
+                ("Favorites", SidebarFilter::Favorites),
+                // Directly after Favorites, by the user's explicit instruction
+                // ("it is our main feature"). Design 2b has no such row -- it
+                // predates app matching -- so the placement is theirs and the
+                // styling is the neighbouring rows'.
+                ("Apps", SidebarFilter::Apps),
+                ("Logins", SidebarFilter::Logins),
+                ("Passkeys", SidebarFilter::Passkeys),
+                ("Cards", SidebarFilter::Cards),
+                ("Identities", SidebarFilter::Identities),
+                ("Secure notes", SidebarFilter::SecureNotes),
+                ("SSH keys", SidebarFilter::SshKeys),
+            ] {
+                item_row(ui, label, filter, lists, selected, &mut screens);
             }
-        }
-        // **Password health, directly under Sends**, and for the same reason
-        // it sits there: these two rows are the rail's screens, and the rows
-        // above them are cuts of the live vault. Not muted -- it is a live
-        // feature over the working vault, not a put-away bucket.
-        //
-        // Its badge is the number of DISTINCT items with a finding against
-        // them, which is a fact this app always has (it is computed from the
-        // snapshot already in hand, with no query behind it), so unlike
-        // Sends it is never `None` and never draws `UNKNOWN_COUNT`. A `0`
-        // here is a true and useful answer: nothing is wrong.
-        {
-            let width = ui.available_width();
-            let on = screens.is(Screen::Health);
-            let label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
-            if sidebar_row(ui, label, Some(lists.health_findings), on, false, width).clicked() {
-                screens.select(Screen::Health);
+            // Design 2b's order for the last two: Archive above Trash. Last in
+            // the VAULT section because they are the section's own outer edge --
+            // still cuts of vault items, but of items put away rather than items
+            // in use, which is what the muted treatment says.
+            for (label, filter) in [
+                ("Archive", SidebarFilter::Archive),
+                ("Trash", SidebarFilter::Trash),
+            ] {
+                item_row(ui, label, filter, lists, selected, &mut screens);
             }
-        }
-        // Design 2b's order for the last two: Archive above Trash. Below the
-        // Sends row, which is where the two kinds of "not the working vault"
-        // part company -- these are vault items put away, Sends are not vault
-        // items at all.
-        for (label, filter) in [
-            ("Archive", SidebarFilter::Archive),
-            ("Trash", SidebarFilter::Trash),
-        ] {
-            item_row(ui, label, filter, lists, selected, &mut screens);
-        }
-        ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
 
-        // Divider (design: `height: 1px; background: #eae7e7; margin: 14px
-        // 8px`) -- 14px above and below, inset 8px from each side rather
-        // than spanning the panel's full width.
-        ui.add_space(14.0);
-        inset_hairline(ui, 8.0);
-        ui.add_space(14.0);
+            // Divider (design: `height: 1px; background: #eae7e7; margin: 14px
+            // 8px`) -- 14px above and below, inset 8px from each side rather
+            // than spanning the panel's full width.
+            //
+            // **The first of two, and they are the same divider on purpose.**
+            // This rail holds three kinds of row and they are now three groups:
+            // cuts of the vault above, folders (which are also cuts of the vault,
+            // by a dimension the user owns) here, and the rail's own SCREENS
+            // below. Two hairlines drawn by two different helpers, or at two
+            // different spacings, would read as two different kinds of boundary;
+            // [`screen_rows`] calls this same pair of `add_space`s around this
+            // same `inset_hairline`.
+            ui.add_space(14.0);
+            inset_hairline(ui, 8.0);
+            ui.add_space(14.0);
 
-        // The FOLDERS header carries a trailing "+" (new folder). Both are
-        // placed against one explicitly-allocated header rect rather than a
-        // `ui.horizontal` + nested `right_to_left`, for the same reason
-        // `sidebar_row` paints directly: nested layout containers each
-        // re-advance the parent cursor by their own content height, which
-        // is what made these rows overlap.
-        let header_rect = section_label(ui, "FOLDERS");
-        // ONE right edge for ONE glyph column, read off the header's
-        // full-width band and reused by every folder row's pencil below --
-        // `section_label` allocates all of `ui.available_width()`, which is
-        // the same width the rows then divide up, so this is the same edge
-        // the pencil lane is measured from. Deriving both from it is what
-        // keeps the "+" and the pencils on one column; see
-        // `glyph_column_center_x`.
-        let glyph_column_x = glyph_column_center_x(header_rect.right());
-        let plus_rect = egui::Rect::from_center_size(
-            egui::Pos2::new(glyph_column_x, header_rect.center().y),
-            egui::Vec2::splat(18.0),
-        );
-        let plus = ui.interact(plus_rect, ui.id().with("new-folder"), egui::Sense::click());
-        if plus.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        ui.painter().text(
-            plus_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "+",
-            egui::FontId::new(15.0, egui::FontFamily::Proportional),
-            if plus.hovered() { theme::INK } else { theme::TEXT_GHOST },
-        );
-        if plus.clicked() {
-            action = SidebarAction::NewFolder;
-        }
-        ui.add_space(SECTION_LABEL_INSET);
-        ui.spacing_mut().item_spacing.y = ROW_GAP;
-        // What is being dragged over this window right now, if anything, and
-        // what each folder row would do with it. Both read ONCE, before the
-        // loop: `drop_outcomes` returns one verdict per folder in this exact
-        // order, and it is the single place that decision is made -- see its
-        // doc for why it cannot live inside the loop.
-        let dragged = egui::DragAndDrop::payload::<crate::vault_window::item_list::DraggedItem>(
-            ui.ctx(),
-        );
-        let outcomes = dragged.as_ref().map(|item| drop_outcomes(folders, item));
-        for (index, folder) in folders.iter().enumerate() {
-            // The virtual "No Folder" bucket gets the filter that says what
-            // it means. Building `Folder(folder.id.clone())` here for *every*
-            // row is what gave that row `Folder("")`, a filter for a folder
-            // whose id is the empty string -- which no item has. See
-            // `SidebarFilter::Unfiled`.
-            let filter = if is_virtual_folder(folder) {
-                SidebarFilter::Unfiled
-            } else {
-                SidebarFilter::Folder(folder.id.clone())
-            };
-            // Every FOLDERS row reads the live vault, so this count is always
-            // knowable -- `badge_for` is used anyway, so there is one path
-            // from a filter to its badge rather than two.
-            let count = badge_for(&filter, lists);
-            // Reserve the edit icon's width *before* the row claims the
-            // rest of the available width -- see `FOLDER_EDIT_BUTTON_WIDTH`.
-            let row_width = (ui.available_width() - FOLDER_EDIT_BUTTON_WIDTH).max(0.0);
-            let response = sidebar_row(
-                ui,
-                &folder.name,
-                count,
-                *selected == filter && !screens.any(),
-                is_muted(&filter),
-                row_width,
+            // The FOLDERS header carries a trailing "+" (new folder). Both are
+            // placed against one explicitly-allocated header rect rather than a
+            // `ui.horizontal` + nested `right_to_left`, for the same reason
+            // `sidebar_row` paints directly: nested layout containers each
+            // re-advance the parent cursor by their own content height, which
+            // is what made these rows overlap.
+            let header_rect = section_label(ui, "FOLDERS");
+            // ONE right edge for ONE glyph column, read off the header's
+            // full-width band and reused by every folder row's pencil below --
+            // `section_label` allocates all of `ui.available_width()`, which is
+            // the same width the rows then divide up, so this is the same edge
+            // the pencil lane is measured from. Deriving both from it is what
+            // keeps the "+" and the pencils on one column; see
+            // `glyph_column_center_x`.
+            let glyph_column_x = glyph_column_center_x(header_rect.right());
+            let plus_rect = egui::Rect::from_center_size(
+                egui::Pos2::new(glyph_column_x, header_rect.center().y),
+                egui::Vec2::splat(18.0),
             );
-            if response.clicked() {
-                *selected = filter.clone();
-                screens.clear();
+            let plus = ui.interact(plus_rect, ui.id().with("new-folder"), egui::Sense::click());
+            if plus.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            // The drop half of the row. Painted AFTER `sidebar_row` and as an
-            // OUTLINE rather than a fill, deliberately: the row has already
-            // painted its own label and count, and a filled wash here would
-            // cover them. Nothing is allocated -- the outline goes onto the
-            // rect the row already claimed -- so this cannot change the
-            // sidebar's row pitch.
-            if let Some(outcome) = outcomes.as_ref().map(|o| &o[index]) {
-                let (color, width) = match outcome {
-                    // Every folder that would take the item says so for the
-                    // whole drag, not only under the pointer: a target the
-                    // user has to guess at is a target they will drop next
-                    // to. The one under the pointer is drawn heavier.
-                    DropOutcome::Accept => {
-                        (theme::BLUE, if response.contains_pointer() { 2.0 } else { 1.0 })
-                    }
-                    // REFUSED, VISIBLY -- not inert. A row that looked
-                    // identical to its neighbours and quietly swallowed the
-                    // gesture is the silent no-op this window keeps having to
-                    // un-write; see `CANNOT_UNFILE`.
-                    DropOutcome::Refuse(_) => {
-                        (theme::ERROR, if response.contains_pointer() { 2.0 } else { 1.0 })
-                    }
+            ui.painter().text(
+                plus_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "+",
+                egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                if plus.hovered() { theme::INK } else { theme::TEXT_GHOST },
+            );
+            if plus.clicked() {
+                action = SidebarAction::NewFolder;
+            }
+            ui.add_space(SECTION_LABEL_INSET);
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            // What is being dragged over this window right now, if anything, and
+            // what each folder row would do with it. Both read ONCE, before the
+            // loop: `drop_outcomes` returns one verdict per folder in this exact
+            // order, and it is the single place that decision is made -- see its
+            // doc for why it cannot live inside the loop.
+            let dragged = egui::DragAndDrop::payload::<crate::vault_window::item_list::DraggedItem>(
+                ui.ctx(),
+            );
+            let outcomes = dragged.as_ref().map(|item| drop_outcomes(folders, item));
+            for (index, folder) in folders.iter().enumerate() {
+                // The virtual "No Folder" bucket gets the filter that says what
+                // it means. Building `Folder(folder.id.clone())` here for *every*
+                // row is what gave that row `Folder("")`, a filter for a folder
+                // whose id is the empty string -- which no item has. See
+                // `SidebarFilter::Unfiled`.
+                let filter = if is_virtual_folder(folder) {
+                    SidebarFilter::Unfiled
+                } else {
+                    SidebarFilter::Folder(folder.id.clone())
                 };
-                ui.painter().rect_stroke(
-                    response.rect,
-                    CornerRadius::same(8),
-                    egui::Stroke::new(width, color),
-                    egui::StrokeKind::Inside,
+                // Every FOLDERS row reads the live vault, so this count is always
+                // knowable -- `badge_for` is used anyway, so there is one path
+                // from a filter to its badge rather than two.
+                let count = badge_for(&filter, lists);
+                // Reserve the edit icon's width *before* the row claims the
+                // rest of the available width -- see `FOLDER_EDIT_BUTTON_WIDTH`.
+                let row_width = (ui.available_width() - FOLDER_EDIT_BUTTON_WIDTH).max(0.0);
+                let response = sidebar_row(
+                    ui,
+                    &folder.name,
+                    count,
+                    *selected == filter && !screens.any(),
+                    is_muted(&filter),
+                    row_width,
                 );
-                if response.contains_pointer() {
-                    ui.ctx().set_cursor_icon(match outcome {
-                        DropOutcome::Accept => egui::CursorIcon::Grabbing,
-                        DropOutcome::Refuse(_) => egui::CursorIcon::NotAllowed,
-                    });
+                if response.clicked() {
+                    *selected = filter.clone();
+                    screens.clear();
+                }
+                // The drop half of the row. Painted AFTER `sidebar_row` and as an
+                // OUTLINE rather than a fill, deliberately: the row has already
+                // painted its own label and count, and a filled wash here would
+                // cover them. Nothing is allocated -- the outline goes onto the
+                // rect the row already claimed -- so this cannot change the
+                // sidebar's row pitch.
+                if let Some(outcome) = outcomes.as_ref().map(|o| &o[index]) {
+                    let (color, width) = match outcome {
+                        // Every folder that would take the item says so for the
+                        // whole drag, not only under the pointer: a target the
+                        // user has to guess at is a target they will drop next
+                        // to. The one under the pointer is drawn heavier.
+                        DropOutcome::Accept => {
+                            (theme::BLUE, if response.contains_pointer() { 2.0 } else { 1.0 })
+                        }
+                        // REFUSED, VISIBLY -- not inert. A row that looked
+                        // identical to its neighbours and quietly swallowed the
+                        // gesture is the silent no-op this window keeps having to
+                        // un-write; see `CANNOT_UNFILE`.
+                        DropOutcome::Refuse(_) => {
+                            (theme::ERROR, if response.contains_pointer() { 2.0 } else { 1.0 })
+                        }
+                    };
+                    ui.painter().rect_stroke(
+                        response.rect,
+                        CornerRadius::same(8),
+                        egui::Stroke::new(width, color),
+                        egui::StrokeKind::Inside,
+                    );
+                    if response.contains_pointer() {
+                        ui.ctx().set_cursor_icon(match outcome {
+                            DropOutcome::Accept => egui::CursorIcon::Grabbing,
+                            DropOutcome::Refuse(_) => egui::CursorIcon::NotAllowed,
+                        });
+                    }
+                }
+                // Consumed on EVERY folder row, accepting or not: the gesture
+                // ended here, and leaving the payload on the clipboard for a
+                // refused drop would let it be picked up by whatever the pointer
+                // crossed next.
+                if let Some(item) =
+                    response.dnd_release_payload::<crate::vault_window::item_list::DraggedItem>()
+                {
+                    // Re-read rather than reused from `outcomes` above, which was
+                    // computed from the payload as it stood at the top of this
+                    // function; they agree, and that is exactly why neither has to
+                    // be trusted to.
+                    action = match drop_outcomes(folders, &item)[index] {
+                        DropOutcome::Accept => SidebarAction::MoveItemToFolder {
+                            item_id: item.id.clone(),
+                            folder_id: folder.id.clone(),
+                        },
+                        DropOutcome::Refuse(reason) => SidebarAction::RefusedMove(reason),
+                    };
+                }
+                // Vertically, the row's own returned rect (same span, same
+                // height) -- not a nested `ui.horizontal`, which is what caused
+                // this row to be taller (and differently spaced) than the plain
+                // VAULT rows above. Horizontally, the shared glyph column, so
+                // the pencil and the header's "+" cannot drift apart again.
+                let edit_rect = egui::Rect::from_center_size(
+                    egui::Pos2::new(glyph_column_x, response.rect.center().y),
+                    egui::Vec2::new(FOLDER_EDIT_BUTTON_WIDTH, response.rect.height()),
+                );
+                // `bw serve` reports a virtual "No Folder" bucket -- the items
+                // that are in no folder at all -- as a folder with an *empty
+                // id*. It is a view, not a real folder: there is nothing on the
+                // server to rename or delete, and `DELETE /object/folder/` with
+                // no id matches nothing. It stays listed (clicking it filters
+                // to unfiled items, which is useful), but offering an edit
+                // affordance on it promises an action that cannot exist.
+                if !is_virtual_folder(folder) {
+                    let edit_id = egui::Id::new(("folder-edit", folder.id.as_str()));
+                    if theme::pencil_glyph_at(ui, edit_rect, edit_id).clicked() {
+                        action = SidebarAction::EditFolder(folder.id.clone());
+                    }
                 }
             }
-            // Consumed on EVERY folder row, accepting or not: the gesture
-            // ended here, and leaving the payload on the clipboard for a
-            // refused drop would let it be picked up by whatever the pointer
-            // crossed next.
-            if let Some(item) =
-                response.dnd_release_payload::<crate::vault_window::item_list::DraggedItem>()
-            {
-                // Re-read rather than reused from `outcomes` above, which was
-                // computed from the payload as it stood at the top of this
-                // function; they agree, and that is exactly why neither has to
-                // be trusted to.
-                action = match drop_outcomes(folders, &item)[index] {
-                    DropOutcome::Accept => SidebarAction::MoveItemToFolder {
-                        item_id: item.id.clone(),
-                        folder_id: folder.id.clone(),
-                    },
-                    DropOutcome::Refuse(reason) => SidebarAction::RefusedMove(reason),
-                };
-            }
-            // Vertically, the row's own returned rect (same span, same
-            // height) -- not a nested `ui.horizontal`, which is what caused
-            // this row to be taller (and differently spaced) than the plain
-            // VAULT rows above. Horizontally, the shared glyph column, so
-            // the pencil and the header's "+" cannot drift apart again.
-            let edit_rect = egui::Rect::from_center_size(
-                egui::Pos2::new(glyph_column_x, response.rect.center().y),
-                egui::Vec2::new(FOLDER_EDIT_BUTTON_WIDTH, response.rect.height()),
-            );
-            // `bw serve` reports a virtual "No Folder" bucket -- the items
-            // that are in no folder at all -- as a folder with an *empty
-            // id*. It is a view, not a real folder: there is nothing on the
-            // server to rename or delete, and `DELETE /object/folder/` with
-            // no id matches nothing. It stays listed (clicking it filters
-            // to unfiled items, which is useful), but offering an edit
-            // affordance on it promises an action that cannot exist.
-            if !is_virtual_folder(folder) {
-                let edit_id = egui::Id::new(("folder-edit", folder.id.as_str()));
-                if theme::pencil_glyph_at(ui, edit_rect, edit_id).clicked() {
-                    action = SidebarAction::EditFolder(folder.id.clone());
-                }
-            }
-        }
-        ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
 
+            screen_rows(ui, lists, &mut screens);
+        });
+
+        // The countdown, in the band the scroll area above left for it. Laid
+        // bottom-up so it sits on the rail's floor rather than immediately
+        // under the rows, which is where a short vault would otherwise leave
+        // it.
+        //
+        // `COUNTDOWN_PAD_BELOW` is the bottom half of the design's `padding:
+        // 10px` on the countdown div -- the same 10px on all four sides that
+        // `countdown_label` takes its horizontal inset from. Not folded into
+        // `ROW_INSET_X`: that constant names a *horizontal* text inset, and the
+        // two only coincide because this one element's padding is uniform.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            // The bottom half of the design's `padding: 10px` on the
-            // countdown div -- the same 10px on all four sides that
-            // `countdown_label` takes its horizontal inset from. Left as a
-            // literal rather than folded into `ROW_INSET_X`: that constant
-            // names a *horizontal* text inset, and the two only coincide
-            // because this one element's padding happens to be uniform.
-            ui.add_space(10.0);
+            ui.add_space(COUNTDOWN_PAD_BELOW);
             countdown_label(ui, lock_countdown);
         });
     });
@@ -968,11 +973,7 @@ fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 /// precisely how the countdown came to sit 10px left of every label above
 /// it.
 fn countdown_label(ui: &mut egui::Ui, text: &str) {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
-        theme::TEXT_GHOST,
-    );
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), countdown_font(), theme::TEXT_GHOST);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), galley.size().y),
         egui::Sense::hover(),
@@ -982,6 +983,96 @@ fn countdown_label(ui: &mut egui::Ui, text: &str) {
         galley,
         theme::TEXT_GHOST,
     );
+}
+
+/// The rail's own SCREENS -- Sends and Password health -- behind a divider of
+/// their own, below the folders.
+///
+/// **THE REPORT: "Let's add another separator after actual Vault items
+/// (folders) and have Sends and Password health separately."** These two rows
+/// used to sit inside the run of VAULT rows, between the type rows and
+/// Archive/Trash, and that placement contradicted the reason they exist as
+/// flags rather than as [`SidebarFilter`] variants. Every row above the first
+/// hairline names a CUT OF THE VAULT -- a predicate over `VaultItem`s -- and
+/// every folder row below it does too. These two name a different SCREEN:
+/// Sends are `crate::send::SendSummary`s that are not `VaultItem`s and share
+/// no id with any of them, and password reuse is a property of a PAIR of
+/// items, which no per-item `scope_contains` can answer. Giving either a
+/// `SidebarFilter` variant would put it in the type `item_list` matches on to
+/// choose its empty-state nouns and its per-row scoping, i.e. it would force
+/// them through the item pane -- the one thing the design says must not
+/// happen. The rail now draws that distinction instead of arguing it in a
+/// comment while rendering the opposite.
+///
+/// **The invariant is untouched by the move.** [`Screens::select`] is still
+/// the only way in and [`Screens::clear`] still runs on every item and folder
+/// row, so "at most one screen, and any item row clears them" holds from down
+/// here exactly as it held from up there -- see
+/// `the_screen_rows_still_clear_from_below_the_folders`.
+///
+/// The divider is [`inset_hairline`] at the same 14px above and below the
+/// FOLDERS one uses, because it is meant to read as the same kind of
+/// boundary; see the call site above.
+///
+/// Neither row is muted. Archive and Trash are greyed because they are outside
+/// the working vault; these are live features the user acts in.
+fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_>) {
+    ui.add_space(14.0);
+    inset_hairline(ui, 8.0);
+    ui.add_space(14.0);
+    ui.spacing_mut().item_spacing.y = ROW_GAP;
+    // Its badge is `lists.sends`, which is `None` for a fetch that FAILED as
+    // well as for one that has not happened, so it draws `UNKNOWN_COUNT`
+    // rather than a `0` that would read as "nothing of yours is published".
+    // See `send_ui::SendFetch::badge_count`.
+    {
+        let width = ui.available_width();
+        let on = screens.is(Screen::Sends);
+        if sidebar_row(ui, SENDS_ROW_LABEL, lists.sends, on, false, width).clicked() {
+            screens.select(Screen::Sends);
+        }
+    }
+    // Password health's badge is the number of DISTINCT items with a finding
+    // against them, which is a fact this app always has (it is computed from
+    // the snapshot already in hand, with no query behind it), so unlike Sends
+    // it is never `None` and never draws `UNKNOWN_COUNT`. A `0` here is a true
+    // and useful answer: nothing is wrong.
+    {
+        let width = ui.available_width();
+        let on = screens.is(Screen::Health);
+        let label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+        if sidebar_row(ui, label, Some(lists.health_findings), on, false, width).clicked() {
+            screens.select(Screen::Health);
+        }
+    }
+    ui.spacing_mut().item_spacing.y = 0.0;
+}
+
+/// The countdown's type. One function rather than a `FontId` written at each
+/// of the two places that need it -- the label itself and
+/// [`countdown_band_height`], which measures a line of it -- because a
+/// measurement taken in a different font from the one drawn is a reservation
+/// that does not fit what goes in it.
+fn countdown_font() -> egui::FontId {
+    egui::FontId::new(11.0, egui::FontFamily::Proportional)
+}
+
+/// The air below the countdown: the bottom half of design 4.8's `padding:
+/// 10px` on the countdown div.
+const COUNTDOWN_PAD_BELOW: f32 = 10.0;
+
+/// How much of the rail's height the countdown band takes, and therefore how
+/// much the scrolling region above it must leave alone.
+///
+/// Measured from the text that will actually be drawn rather than assumed from
+/// the font size: a line's height is the font's ascent plus descent plus line
+/// gap, which is not 11.
+fn countdown_band_height(ui: &egui::Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), countdown_font(), theme::TEXT_GHOST)
+        .size()
+        .y
+        + COUNTDOWN_PAD_BELOW
 }
 
 /// A hairline inset `inset` from both sides of the available width.
@@ -1959,6 +2050,33 @@ mod tests {
         lists: VaultLists<'_>,
         folders: &[Folder],
     ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
+        let (rects, paths, _, bounds) = painted_sidebar_parts(lock_countdown, lists, folders);
+        (rects, paths, bounds)
+    }
+
+    /// One painted frame of the rail: its text rows and their boxes, the
+    /// bounding box of every polygon it drew, its dividers, and the rail's own
+    /// bounds. Named because four parallel vectors in a return type is a shape
+    /// no reader can hold, not because the tuple was wrong.
+    type PaintedRail =
+        (Vec<(String, egui::Rect)>, Vec<egui::Rect>, Vec<egui::Rect>, egui::Rect);
+
+    /// [`painted_sidebar_lists`] with the DIVIDERS as well: every hairline the
+    /// rail painted, in painted order, top to bottom.
+    ///
+    /// Split out rather than copied, because the alternative is a second
+    /// harness that runs the sidebar a second way -- and two harnesses obliged
+    /// to agree about what "the sidebar" is are exactly this crate's recurring
+    /// defect. Every existing caller keeps its three-tuple; only the divider
+    /// tests ask for the fourth.
+    ///
+    /// A divider is identified by what it IS rather than by counting shapes:
+    /// a `theme::HAIRLINE`-filled rect exactly `inset_hairline`'s 1pt tall.
+    fn painted_sidebar_parts(
+        lock_countdown: &str,
+        lists: VaultLists<'_>,
+        folders: &[Folder],
+    ) -> PaintedRail {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1990,11 +2108,34 @@ mod tests {
 
         let mut rects = Vec::new();
         let mut paths = Vec::new();
+        let mut hairlines = Vec::new();
         for clipped in &output.shapes {
             collect_text_rects(&clipped.shape, &mut rects);
             collect_path_rects(&clipped.shape, &mut paths);
+            collect_hairline_rects(&clipped.shape, &mut hairlines);
         }
-        (rects, paths, bounds)
+        hairlines.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        (rects, paths, hairlines, bounds)
+    }
+
+    /// Every `inset_hairline` in `shape`: a `theme::HAIRLINE` fill, 1pt tall,
+    /// no stroke. Named by its appearance rather than by position, so a test
+    /// that says "the second divider" is talking about a divider and not about
+    /// whatever egui happened to paint second.
+    fn collect_hairline_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect)
+                if rect.fill == theme::HAIRLINE && (rect.rect.height() - 1.0).abs() < 0.01 =>
+            {
+                out.push(rect.rect);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_hairline_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The pencil is two polygons (body + nib), each with its own bounding
@@ -2150,12 +2291,11 @@ mod tests {
                 "Identities",
                 "Secure notes",
                 "SSH keys",
-                // The Sends row sits between the type rows and the two
-                // put-away rows; see `draw_sidebar`.
-                "Sends",
-                // Directly under Sends: the rail's two SCREEN rows sit
-                // together, above the two put-away rows. See `draw_sidebar`.
-                "Password health",
+                // Archive and Trash close the section, and NOTHING sits
+                // between them and SSH keys any more: Sends and Password
+                // health moved out of this run entirely and into their own
+                // group below the folders. See `screen_rows`, and
+                // `the_rails_two_screens_sit_below_the_folders_behind_their_own_divider`.
                 "Archive",
                 "Trash",
             ]
@@ -2576,6 +2716,269 @@ mod tests {
         assert_eq!(filter, SidebarFilter::Folder("f1".into()));
     }
 
+    /// **THE REPORT: "Let's add another separator after actual Vault items
+    /// (folders) and have Sends and Password health separately."**
+    ///
+    /// The two screen rows used to sit inside the run of VAULT rows, between
+    /// SSH keys and Archive -- i.e. among the cuts of the item list, which is
+    /// the one thing they are not. This asserts the grouping the report asked
+    /// for, from painted output: FOLDERS, then every folder row, then a
+    /// divider, then the two screens, in that order down the panel.
+    ///
+    /// The two dividers are asserted to be the SAME divider -- same helper,
+    /// same inset, same 14px of air above -- because a second boundary drawn
+    /// differently reads as a different kind of boundary. That is the whole
+    /// content of "another separator".
+    #[test]
+    fn the_rails_two_screens_sit_below_the_folders_behind_their_own_divider() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let (painted, _, hairlines, _) = painted_sidebar_parts(
+            "Locks in 11:42",
+            VaultLists::live_only(&live),
+            &folders,
+        );
+        let top_of = |needle: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| rect.top())
+                .unwrap_or_else(|| panic!("the sidebar painted no {needle:?}: {painted:?}"))
+        };
+        let health = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+
+        assert_eq!(
+            hairlines.len(),
+            2,
+            "the rail should draw exactly two dividers -- above FOLDERS and above the screens \
+             -- but drew {}: {hairlines:?}",
+            hairlines.len()
+        );
+        let [above_folders, above_screens] = [hairlines[0], hairlines[1]];
+
+        // The order down the panel, end to end.
+        let order = [
+            ("Trash", top_of("Trash")),
+            ("the FOLDERS divider", above_folders.top()),
+            ("FOLDERS", top_of("FOLDERS")),
+            ("Engineering", top_of("Engineering")),
+            ("No Folder", top_of("No Folder")),
+            ("the screens divider", above_screens.top()),
+            (SENDS_ROW_LABEL, top_of(SENDS_ROW_LABEL)),
+            (health, top_of(health)),
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1,
+                "{} is painted at y={} and {} at y={} -- the rail is not in the order \
+                 VAULT / folders / screens",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
+
+        // The same divider, twice: `inset_hairline(ui, 8.0)` both times, so
+        // the two span exactly the same x.
+        assert!(
+            (above_folders.left() - above_screens.left()).abs() < 0.01
+                && (above_folders.right() - above_screens.right()).abs() < 0.01,
+            "the two dividers are inset differently: {above_folders:?} and {above_screens:?}"
+        );
+        // ...and the same 14px of air above each, measured from the bottom of
+        // the last row before it. Both rows are `sidebar_row`s, so their label
+        // boxes sit the same distance inside their bands and the two gaps are
+        // comparable.
+        let folders_gap = above_folders.top() - painted
+            .iter()
+            .find(|(text, _)| text == "Trash")
+            .expect("Trash")
+            .1
+            .bottom();
+        let screens_gap = above_screens.top() - painted
+            .iter()
+            .find(|(text, _)| text == "No Folder")
+            .expect("No Folder")
+            .1
+            .bottom();
+        assert!(
+            (folders_gap - screens_gap).abs() < 0.51,
+            "the FOLDERS divider has {folders_gap}pt above it and the screens divider \
+             {screens_gap}pt -- they are meant to be the same 14px boundary"
+        );
+    }
+
+    /// **The move's own risk, and the reason this test exists at all.** The
+    /// rail was a plain column in a fixed-height panel with NO `ScrollArea`
+    /// anywhere: whatever ran past the bottom was simply unreachable. That was
+    /// survivable while the two screen rows sat up among the type rows, and it
+    /// stopped being survivable the moment they moved below the folders --
+    /// the folder list is the one part of this rail whose length the user
+    /// controls, so Sends and Password health became the first things a long
+    /// folder list would push out of reach.
+    ///
+    /// A vault with a folder for every letter of the alphabet, at the shipped
+    /// rail's own height. **Both halves are asserted, and the first is what
+    /// makes the second mean anything**: the rows really are pushed past the
+    /// bottom edge by this many folders (so this is not a test of a vault that
+    /// happens to fit), and scrolling really does bring them back.
+    #[test]
+    fn the_screen_rows_survive_a_vault_with_a_folder_for_every_letter() {
+        let live = three_unfiled_and_two_filed();
+        let folders: Vec<Folder> = ('a'..='z')
+            .map(|c| Folder {
+                id: format!("f-{c}"),
+                name: format!("Folder {}", c.to_ascii_uppercase()),
+                other: serde_json::Map::new(),
+            })
+            .collect();
+        let health = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+
+        // Unscrolled: off the bottom. If this ever stops being true the test
+        // below has stopped exercising anything -- the rail would simply fit.
+        let (resting, bounds) = scrolled_rail(&live, &folders, 0.0);
+        let sends_at_rest = row_top(&resting, SENDS_ROW_LABEL);
+        assert!(
+            sends_at_rest > bounds.bottom(),
+            "{} folders no longer overflow the rail (Sends rests at y={sends_at_rest}, floor \\
+             y={}), so this test is not measuring what it is named for",
+            folders.len(),
+            bounds.bottom()
+        );
+
+        // Scrolled to the bottom: both rows are inside the rail, which is what
+        // "reachable" means for a row nobody can drag a window taller for.
+        let (scrolled, bounds) = scrolled_rail(&live, &folders, -4000.0);
+        for label in [SENDS_ROW_LABEL, health] {
+            let rect = scrolled
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{label:?} was not painted at all: {scrolled:?}"));
+            assert!(
+                bounds.contains_rect(rect),
+                "{label:?} is at {rect:?} after scrolling the rail to its end, still outside \\
+                 the rail's own {bounds:?} -- the screens are unreachable with {} folders",
+                folders.len()
+            );
+        }
+    }
+
+    fn row_top(painted: &[(String, egui::Rect)], needle: &str) -> f32 {
+        painted
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect.top())
+            .unwrap_or_else(|| panic!("the sidebar painted no {needle:?}: {painted:?}"))
+    }
+
+    /// The rail after `delta` points of wheel scrolling, with the pointer over
+    /// it -- which is what egui requires before a scroll event reaches a
+    /// scroll area at all.
+    ///
+    /// Several frames, because a scroll offset applied on one frame is laid out
+    /// on the next, and the clamp to the content's end takes another.
+    fn scrolled_rail(
+        live: &[VaultItem],
+        folders: &[Folder],
+        delta: f32,
+    ) -> (Vec<(String, egui::Rect)>, egui::Rect) {
+        const HEIGHT: f32 = 800.0;
+        let ctx = egui::Context::default();
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(crate::vault_window::SIDEBAR_WIDTH, HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(), |_ui| {});
+        theme::apply(&ctx);
+
+        let mut selected = SidebarFilter::All;
+        let (mut sends, mut health) = (false, false);
+        let mut bounds = egui::Rect::NOTHING;
+        let mut output = None;
+        for frame in 0..4 {
+            let mut raw = base();
+            if frame > 0 {
+                raw.events.push(egui::Event::PointerMoved(egui::Pos2::new(
+                    crate::vault_window::SIDEBAR_WIDTH / 2.0,
+                    HEIGHT / 2.0,
+                )));
+                raw.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    modifiers: Default::default(),
+                    phase: egui::TouchPhase::Move,
+                });
+            }
+            output = Some(ctx.run_ui(raw, |ui| {
+                bounds = ui.max_rect();
+                draw_sidebar(
+                    ui,
+                    VaultLists::live_only(live),
+                    folders,
+                    &mut selected,
+                    Screens { sends: &mut sends, health: &mut health },
+                    "Locks in 11:42",
+                );
+            }));
+        }
+        let mut rects = Vec::new();
+        for clipped in &output.expect("four frames were run").shapes {
+            collect_text_rects(&clipped.shape, &mut rects);
+        }
+        (rects, bounds)
+    }
+
+    /// **The invariant, asserted from the rows' NEW HOME.** `Screens` promises
+    /// at most one screen is live and that selecting any item row clears them
+    /// all; moving the two rows out of the VAULT run and below the folders
+    /// moved the only two places that call `Screens::select`, so this is that
+    /// promise re-measured from down there.
+    ///
+    /// Both flags, in both directions, because the failure this guards is a
+    /// window painting one screen while the rail highlights something else --
+    /// and a helper that can only see the Sends flag would have covered half of
+    /// it.
+    #[test]
+    fn the_screen_rows_still_hold_their_invariant_from_below_the_folders() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let health_label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+
+        // Password health selects itself and nothing else.
+        let (filter, sends, health) =
+            press_row_screens(health_label, SidebarFilter::Logins, false, false, &live, &folders);
+        assert!(health, "the Password health row did not select its screen");
+        assert!(!sends, "selecting Password health left the Sends screen up as well");
+        assert_eq!(filter, SidebarFilter::Logins, "it changed the item filter");
+
+        // At most one: pressing Sends while Password health is up clears it.
+        let (_, sends, health) = press_row_screens(
+            SENDS_ROW_LABEL,
+            SidebarFilter::Logins,
+            false,
+            true,
+            &live,
+            &folders,
+        );
+        assert!(sends && !health, "both screens were live at once (sends={sends}, health={health})");
+
+        // ...and any item row clears them. A FOLDER row, specifically: it is
+        // the loop the two rows now sit directly beneath, and it is a separate
+        // click handler from the type rows -- a separate chance to forget.
+        let (filter, sends, health) =
+            press_row_screens("Engineering", SidebarFilter::Logins, true, true, &live, &folders);
+        assert!(
+            !sends && !health,
+            "a folder row was clicked and a screen stayed up (sends={sends}, health={health})"
+        );
+        assert_eq!(filter, SidebarFilter::Folder("f1".into()));
+    }
+
     /// Presses the sidebar row whose label is `label` and reports the two
     /// selections afterwards.
     ///
@@ -2588,6 +2991,23 @@ mod tests {
         live: &[VaultItem],
         folders: &[Folder],
     ) -> (SidebarFilter, bool) {
+        let (filter, sends, _) = press_row_screens(label, filter, sends, false, live, folders);
+        (filter, sends)
+    }
+
+    /// [`press_row`] with the Password health flag as well, in and out.
+    ///
+    /// The two screens are one invariant -- at most one of them, and any item
+    /// row clears BOTH -- so a helper that can only see one of the flags can
+    /// only ever test half of it.
+    fn press_row_screens(
+        label: &str,
+        filter: SidebarFilter,
+        sends: bool,
+        health: bool,
+        live: &[VaultItem],
+        folders: &[Folder],
+    ) -> (SidebarFilter, bool, bool) {
         const HEIGHT: f32 = 900.0;
         let ctx = egui::Context::default();
         let base = || egui::RawInput {
@@ -2603,6 +3023,7 @@ mod tests {
 
         let mut selected = filter;
         let mut sends_selected = sends;
+        let mut health_selected = health;
         let mut run = |raw: egui::RawInput| {
             ctx.run_ui(raw, |ui| {
                 draw_sidebar(
@@ -2610,7 +3031,7 @@ mod tests {
                     VaultLists::live_only(live),
                     folders,
                     &mut selected,
-                    Screens { sends: &mut sends_selected, health: &mut false },
+                    Screens { sends: &mut sends_selected, health: &mut health_selected },
                     "Locks in 11:42",
                 );
             })
@@ -2647,7 +3068,7 @@ mod tests {
             }],
             ..base()
         });
-        (selected, sends_selected)
+        (selected, sends_selected, health_selected)
     }
 
     fn collect_labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {

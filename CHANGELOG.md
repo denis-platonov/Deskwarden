@@ -77,6 +77,47 @@ The difference is that something now checks it. Code signing is still the
 goal, and is still waiting on a certificate; when it arrives the signature
 check comes back **in addition to** this one, not instead of it. See
 [docs/code-signing-policy.md](docs/code-signing-policy.md).
+### A card's Expires / Code line
+
+- **Clicking anywhere on the line copies its half.** The Expires and Code
+  halves only responded to a strip through the middle of the row — the row's
+  own padding, above and below them and at either end, copied nothing and lit
+  nothing ("Expires\Code - only part in the middle gets it copied and
+  highlighted"). Both halves are now the full band, exactly as the Number row
+  above them has always been.
+- **The Code label is inset inside its half** by the same padding the Expires
+  label has inside the line, so the two read as a matched pair. The hit area
+  still starts at the seam: the padding moved the ink, not the tile.
+
+### The vault window's list and rail
+
+- **A card's network badge says the network's name.** It used to be a
+  geometric placeholder — a play triangle for Visa, a diamond for Mastercard,
+  two bars for American Express, all on the same blue square — which named
+  nothing ("VISA icon supposed to be visa and not some Play sign") and did not
+  tell the seven networks apart either. The badge is now the network set in
+  type: **VISA**, **MC**, **AMEX**, **DISC**, **JCB**, **DC**, **UP**, in the
+  list and on the card's detail pane.
+  - Words rather than logos deliberately: the network marks are registered
+    trademarks whose guidelines restrict them to licensed issuers and
+    merchants, and this is an MIT-licensed community project. Naming the
+    network your own card is on is a statement of fact.
+  - Diners Club and UnionPay get two-letter forms because the badge is drawn
+    inside the row's 32pt tile and a longer word there is an unreadable smear.
+- **A favicon now fills its tile.** It was inset 4pt a side inside a 32pt tile
+  — a 24pt icon in a bordered box, which read as an icon adrift in a frame
+  ("icon is not fully taking the rounded rectangle"). The icon takes the whole
+  32pt tile now, clipped to the tile's own rounded corners so no corner
+  overhangs the curve, with the tile's 1px border drawn back over the top so a
+  pale icon still has the same edge every monogram beside it has.
+- **Sends and Password health are their own group at the foot of the rail**,
+  below the folders and behind a second separator of the same kind as the one
+  above FOLDERS. They used to sit in the middle of the VAULT rows, which are
+  cuts of the item list — something neither of them is.
+- **The rail scrolls.** It never did: a vault with more folders than the window
+  is tall simply had the last ones off the bottom with no way to reach them,
+  and the two rows above would have joined them there. The auto-lock countdown
+  stays pinned to the floor.
 
 ## 0.8.3 - 2026-08-19
 
