@@ -979,35 +979,6 @@ fn card_brand_of(fields: &CardFields) -> Option<CardBrand> {
         .or_else(|| fields.number.as_deref().and_then(brand_for_number))
 }
 
-/// The texture for a network's mark, decoded once and kept in egui's own
-/// per-context store.
-///
-/// **Memoised deliberately.** `Context::load_texture` allocates a new texture
-/// every call, and this is reached from inside the pane's draw closure -- so
-/// an unmemoised version would upload a 48x48 image to the GPU on every frame
-/// the user has a card selected, and leak one texture per frame until the
-/// handles dropped. Keyed on the mark's own file stem rather than on the enum,
-/// so two brands could never share an entry silently.
-///
-/// `None` for a brand with no mark and for bytes that will not decode. Both
-/// draw nothing; neither draws a placeholder, which is the rule the whole
-/// badge follows (see `card_mark`'s module note).
-fn brand_mark_texture(ctx: &egui::Context, brand: CardBrand) -> Option<egui::TextureHandle> {
-    let mark = card_mark::mark_for(brand)?;
-    let id = egui::Id::new(("deskwarden-card-mark", mark.key));
-    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return Some(texture);
-    }
-    let (width, height, rgba) = crate::favicon::decode_rgba(mark.png)?;
-    let texture = ctx.load_texture(
-        format!("card-mark-{}", mark.key),
-        egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba),
-        egui::TextureOptions::default(),
-    );
-    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
-    Some(texture)
-}
-
 /// Every value the SSH key pane shows, emptiness-suppressed once.
 ///
 /// The same shape as [`CardFields`], and it exists for the same two findings.
@@ -4729,16 +4700,20 @@ pub struct ResolvedApp<'a> {
 const APP_ICON_SIZE: f32 = 18.0;
 const APP_ICON_GAP: f32 = 8.0;
 
-/// How big the card's network mark is drawn on the detail pane, and the gap
+/// How tall the card's network mark is drawn on the detail pane, and the gap
 /// between it and the digits.
 ///
 /// The same 18pt and 8pt the matched app's icon uses, and deliberately so
-/// rather than by coincidence: both are "a small square identifying the row,
+/// rather than by coincidence: both are "a small thing identifying the row,
 /// immediately before the row's value", and two different sizes for that would
-/// be two answers to one question. The asset is generated at
-/// `card_mark::MARK_DETAIL_PX` (48) and scaled down here, which resamples;
-/// scaling up would show the generator's own pixels.
-const BRAND_MARK_SIZE: f32 = 18.0;
+/// be two answers to one question.
+///
+/// Read off `card_mark` rather than written here, because the mark is a WORD
+/// now and its width follows its height -- a height chosen locally would be a
+/// width nobody measured. Only the height is fixed: `AMEX` is wider than `MC`,
+/// and forcing both into one box would either letterbox one or squeeze the
+/// other.
+const BRAND_MARK_SIZE: f32 = card_mark::MARK_DETAIL_HEIGHT;
 const BRAND_MARK_GAP: f32 = 8.0;
 
 /// The `App` row: the icon, the app's real name, and -- when there is
@@ -6160,7 +6135,11 @@ struct MaskedFace<'a> {
     revealed_as: Option<&'a str>,
     /// A mark painted immediately before the value, on the same line -- the
     /// card's network badge. `None` draws nothing, never a placeholder.
-    lead: Option<egui::TextureHandle>,
+    ///
+    /// The BRAND, not a picture of one: the mark is drawn from it by
+    /// `card_mark`, so this row cannot be handed a mark that belongs to a
+    /// different network than the digits beside it.
+    lead: Option<CardBrand>,
 }
 
 /// A secret row: monospace, bullets until revealed, with Reveal and Copy.
@@ -6258,7 +6237,9 @@ fn masked_row(
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
         })
-        + if lead.is_some() { BRAND_MARK_SIZE + BRAND_MARK_GAP } else { 0.0 };
+        + lead.map_or(0.0, |brand| {
+            card_mark::mark_width(ui, brand, BRAND_MARK_SIZE) + BRAND_MARK_GAP
+        });
     // Laid out unwrapped, which is the question being asked: how wide does
     // this value WANT to be?
     let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
@@ -6274,13 +6255,25 @@ fn masked_row(
         //
         // The mark, when there is one, is painted first and on the same line,
         // exactly as `app_name_row` paints the matched app's icon before its
-        // name. It is a `TextureHandle`, so a brand with no mark and an item
-        // with no brand are the same case here: nothing is drawn.
+        // name. `None` -- an item with no brand, or a brand this app cannot
+        // name -- draws nothing at all, never a placeholder.
+        //
+        // Its box is ALLOCATED before it is painted, at the width `card_mark`
+        // measured, so the digits that follow start after it rather than under
+        // it; `controls_width` above reserved exactly this.
         |ui| {
-            if let Some(texture) = &lead {
-                ui.add(
-                    egui::Image::new(texture)
-                        .fit_to_exact_size(egui::vec2(BRAND_MARK_SIZE, BRAND_MARK_SIZE)),
+            if let Some(brand) = lead {
+                let width = card_mark::mark_width(ui, brand, BRAND_MARK_SIZE);
+                let (box_, _) = ui.allocate_exact_size(
+                    egui::vec2(width, BRAND_MARK_SIZE),
+                    egui::Sense::hover(),
+                );
+                card_mark::paint_mark(
+                    ui,
+                    brand,
+                    BRAND_MARK_SIZE,
+                    egui::Align2::CENTER_CENTER,
+                    box_.center(),
                 );
                 ui.add_space(BRAND_MARK_GAP);
             }
@@ -6415,7 +6408,7 @@ fn card_rows(
                 revealed_as: Some(&revealed),
                 // **Nothing at all for a brand this app cannot name**, and
                 // nothing for a named brand with no mark. Never a placeholder.
-                lead: brand.and_then(|b| brand_mark_texture(ui.ctx(), b)),
+                lead: brand,
             },
         );
     }
@@ -8305,17 +8298,16 @@ mod tests {
     /// the probe does not go blind if egui changes which of the two it emits;
     /// every caller pairs an emptiness claim with a positive control that
     /// would catch a probe that found nothing either way.
+    /// The pane's texts, plus every NETWORK MARK it painted.
+    ///
+    /// A mark is a `theme::BLUE` ground with a word on it, so that is what this
+    /// looks for -- not "a textured rect", which is what it looked for while
+    /// the marks were PNGs. The pane paints no other blue ground on the rows
+    /// this is used against.
     fn painted_with_marks(item: &VaultItem) -> (Vec<String>, Vec<egui::Rect>) {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
             match shape {
-                egui::Shape::Mesh(mesh) => out.push(mesh.calc_bounds()),
-                egui::Shape::Rect(rect)
-                    if rect.brush.as_ref().is_some_and(|brush| {
-                        brush.fill_texture_id != egui::TextureId::default()
-                    }) =>
-                {
-                    out.push(rect.rect);
-                }
+                egui::Shape::Rect(rect) if rect.fill == theme::BLUE => out.push(rect.rect),
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
                         walk(shape, out);
@@ -12629,9 +12621,16 @@ mod tests {
             visa.len()
         );
         assert_eq!(
-            visa[0].width(),
+            visa[0].height(),
             BRAND_MARK_SIZE,
-            "the network mark is not drawn at the pane's own mark size"
+            "the network mark is not drawn at the pane's own mark height"
+        );
+        // The WORD, which is the whole point of the mark: the pane no longer
+        // draws the brand as a text row, so this mark is the only thing on the
+        // pane that says which network the card is on.
+        assert!(
+            contains(&painted(&a_full_card(), &TotpState::NoSecret), CardBrand::Visa.wordmark()),
+            "the mark did not paint the network's own word"
         );
     }
 

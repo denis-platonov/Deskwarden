@@ -717,57 +717,53 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
 const AVATAR_SIZE: f32 = 32.0;
 
-/// The network badge's side, in points, inside the list tile.
+/// The network badge's height, in points, inside the list tile.
 ///
-/// [`card_mark::MARK_BADGE_PX`] and not a number of this module's own: that
-/// constant is the size the seven marks were drawn for and told apart at by
-/// eye, so enlarging the badge here to make a mark clearer would be showing
-/// the user a picture nobody has checked. If a mark is illegible at this
-/// size, the answer is a better mark, not a bigger badge.
-const NETWORK_BADGE_SIZE: f32 = card_mark::MARK_BADGE_PX as f32;
+/// [`card_mark::MARK_BADGE_HEIGHT`] and not a number of this module's own:
+/// that constant is the height the wordmarks were sized and measured to fit
+/// this very tile at, so raising it here to make a word clearer would be
+/// widening a badge past the tile it is drawn inside.
+const NETWORK_BADGE_HEIGHT: f32 = card_mark::MARK_BADGE_HEIGHT;
 
-/// The texture for one network mark, decoded once per context.
+/// The height the mark is drawn at when it is the tile's ONLY content -- a
+/// card whose issuer this app has no icon for.
 ///
-/// Cached in the context's own temp store rather than in [`IconCache`]: that
-/// map is keyed by item id and filled by the background favicon loader, while
-/// these seven images are compiled into the binary and identical for every
-/// row. Keyed by the mark's file stem, which
-/// `a_marks_file_name_is_derived_from_the_brands_own_spelling` already holds
-/// distinct per brand, so two networks cannot collide on one cache entry.
-fn network_mark_texture(
-    ctx: &egui::Context,
-    mark: &card_mark::NetworkMark,
-) -> Option<egui::TextureHandle> {
-    let key = egui::Id::new(("deskwarden-card-mark", mark.key));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
-        return Some(tex);
-    }
-    let (w, h, rgba) = crate::favicon::decode_rgba(mark.png)?;
-    let tex = ctx.load_texture(
-        format!("card-mark-{}", mark.key),
-        egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
-        egui::TextureOptions::LINEAR,
-    );
-    ctx.data_mut(|d| d.insert_temp(key, tex.clone()));
-    Some(tex)
-}
+/// **The same height as the corner badge, and that is a measurement rather
+/// than a preference.** A mark alone in the tile has the whole tile to itself,
+/// so the obvious move is to draw it bigger -- but the constraint that binds
+/// is WIDTH, not height, and it is the same 32pt tile either way. `AMEX` is
+/// 30pt wide at 13pt tall; at 14 it is 33 and hangs off the row.
+///
+/// One height for every network as well, rather than the tallest each could
+/// manage on its own: seven marks at seven sizes down one list is a list that
+/// looks broken.
+/// `every_networks_mark_fits_the_tile_when_it_is_the_only_thing_in_it` holds
+/// this for all seven, `AMEX` included.
+const NETWORK_MARK_ALONE_HEIGHT: f32 = NETWORK_BADGE_HEIGHT;
+
 
 /// Paints the network badge into the lower-right corner of `tile`.
 ///
-/// **Inside the tile, never beside it.** The badge takes the last
-/// [`NETWORK_BADGE_SIZE`] points of a box that is already allocated, so it
-/// costs the row no width and no height and every layout guard over
-/// `ROW_TILE_HEIGHT` stays exactly as true as it was. It overlaps the bank
-/// icon's inset artwork on purpose -- that is the arrangement of the physical
-/// card, and it is why the pairing reads without a legend.
-fn paint_network_badge(ui: &egui::Ui, tile: egui::Rect, tex: &egui::TextureHandle) {
-    let badge = egui::Rect::from_min_max(
-        tile.max - egui::vec2(NETWORK_BADGE_SIZE, NETWORK_BADGE_SIZE),
+/// **Inside the tile, never beside it.** The badge is anchored to a corner of
+/// a box that is already allocated, so it costs the row no width and no height
+/// and every layout guard over `ROW_TILE_HEIGHT` stays exactly as true as it
+/// was. It overlaps the bank icon's artwork on purpose -- that is the
+/// arrangement of the physical card, and it is why the pairing reads without a
+/// legend.
+///
+/// **The tile is the badge's whole width budget**, which is what caps
+/// `CardBrand::wordmark` at four characters. `card_mark`'s
+/// `a_wordmark_fits_the_list_tile_at_badge_height` measures every brand
+/// against that; `the_network_badge_stays_inside_the_row_tile` is this side of
+/// the same claim, from painted output.
+fn paint_network_badge(ui: &egui::Ui, tile: egui::Rect, brand: CardBrand) -> egui::Rect {
+    card_mark::paint_mark(
+        ui,
+        brand,
+        NETWORK_BADGE_HEIGHT,
+        egui::Align2::RIGHT_BOTTOM,
         tile.max,
-    );
-    egui::Image::new((tex.id(), tex.size_vec2()))
-        .corner_radius(theme::avatar_corner_radius(NETWORK_BADGE_SIZE))
-        .paint_at(ui, badge);
+    )
 }
 
 /// Design 2b's row box, in full: `padding: 10px 12px` around a 32px avatar,
@@ -1654,10 +1650,8 @@ fn item_row(
                 // the monogram every other row already falls back to when the
                 // brand is one we cannot name (or the item is not a card at
                 // all). `None` here is exactly today's rendering.
-                let badge = card_network(item)
-                    .and_then(card_mark::mark_for)
-                    .and_then(|mark| network_mark_texture(ui.ctx(), mark));
-                match (icon, badge.as_ref()) {
+                let badge = card_network(item);
+                match (icon, badge) {
                     (Some(tex), badge) => {
                         // The SAME box the monogram fallback draws -- filled,
                         // bordered, 8px radius -- with the artwork FILLING it,
@@ -1669,20 +1663,24 @@ fn item_row(
                         // tile.
                         let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
                         theme::avatar_image(ui, tile, tex, selected);
-                        if let Some(badge) = badge {
-                            paint_network_badge(ui, tile, badge);
+                        if let Some(brand) = badge {
+                            paint_network_badge(ui, tile, brand);
                         }
                     }
                     // No bank domain on the card, so nothing identifies the
-                    // issuer -- but the network still does, and it is drawn at
-                    // the icon's own size rather than shrunk into a corner it
-                    // would be sharing with nothing.
-                    (None, Some(badge)) => {
-                        // The same tile and the same full-bleed rule as the
-                        // favicon above, through the same function: two ways
-                        // of filling one tile is how the two would drift.
+                    // issuer -- but the network still does, and with the tile
+                    // otherwise empty the mark is drawn CENTRED in it at
+                    // [`NETWORK_MARK_ALONE_HEIGHT`] rather than tucked into a
+                    // corner it would be sharing with nothing.
+                    (None, Some(brand)) => {
                         let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
-                        theme::avatar_image(ui, tile, badge, selected);
+                        card_mark::paint_mark(
+                            ui,
+                            brand,
+                            NETWORK_MARK_ALONE_HEIGHT,
+                            egui::Align2::CENTER_CENTER,
+                            tile.center(),
+                        );
                     }
                     (None, None) => {
                         theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected)
@@ -4135,16 +4133,6 @@ mod row_tile_tests {
         p.rects.iter().filter(|r| r.brush.is_some()).cloned().collect()
     }
 
-    /// WHICH image a textured rect is drawing.
-    ///
-    /// The reason the badge tests below are about the badge and not merely
-    /// about "a rect was painted": two rects with different texture ids are
-    /// two different pictures, and `paint_with_icons`'s favicon is a texture
-    /// this module never creates.
-    fn brush_id(r: &RectShape) -> egui::TextureId {
-        r.brush.as_ref().expect("an untextured rect has no image").fill_texture_id
-    }
-
     /// Every 32px avatar tile a frame painted, top to bottom.
     ///
     /// De-duplicated because `theme::avatar_tile` paints its fill and its
@@ -4164,24 +4152,46 @@ mod row_tile_tests {
         v
     }
 
-    /// The textured rects painted inside `tile`, top to bottom.
-    fn images_in(p: &Painted, tile: egui::Rect) -> Vec<RectShape> {
-        let mut v: Vec<RectShape> =
-            textured(p).into_iter().filter(|r| tile.contains_rect(r.rect)).collect();
-        v.sort_by(|a, b| a.rect.top().total_cmp(&b.rect.top()));
+    /// Every network mark painted inside `tile`, with the word on it: a
+    /// `theme::BLUE` ground, and whichever painted text sits inside that
+    /// ground. Top to bottom.
+    ///
+    /// **Identified by what a mark IS, not by where it landed.** The marks
+    /// used to be textures and were found by being textured; they are drawn
+    /// type on a drawn ground now, and a test that looked for "a small rect in
+    /// the corner" would pass for any small rect in the corner.
+    fn marks_in(p: &Painted, tile: egui::Rect) -> Vec<(egui::Rect, String)> {
+        let mut v: Vec<(egui::Rect, String)> = p
+            .rects
+            .iter()
+            .filter(|r| r.fill == theme::BLUE && tile.contains_rect(r.rect))
+            .map(|r| {
+                let word = p
+                    .texts
+                    .iter()
+                    .find(|(_, rect, _)| r.rect.contains_rect(*rect))
+                    .map(|(t, _, _)| t.clone())
+                    .unwrap_or_else(|| {
+                        panic!("a mark ground was painted at {:?} with no word on it", r.rect)
+                    });
+                (r.rect, word)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.top().total_cmp(&b.0.top()));
         v
     }
 
-    /// **Texture ids are only comparable WITHIN one frame.** Each
-    /// `egui::Context` numbers its own textures from zero, so every test
-    /// below that compares two images paints both of them in a single frame.
     #[test]
-    fn a_networks_mark_is_a_different_picture_per_network() {
-        // FIRST, because the badge tests lean on it: a texture id really does
-        // track the brand. Without this, "the badge's image is the Visa mark"
-        // could be a statement about one texture this module hands out for
-        // everything, and those tests would be blind in exactly the way
-        // `glyph_ink` was blind to a displaced baseline.
+    fn a_networks_mark_is_the_networks_own_word() {
+        // FIRST, because every badge test below leans on it: the mark really
+        // does track the brand, and it says the brand's NAME.
+        //
+        // THE REPORT this replaced: "VISA icon supposed to be visa and not
+        // some Play sign". The marks were seven abstract glyphs on one blue
+        // square -- a wedge for Visa, a diamond for Mastercard -- which named
+        // no network and did not tell each other apart either. The old version
+        // of this test asserted only that two networks were DIFFERENT
+        // pictures, which those placeholders satisfied perfectly.
         let p = paint(
             &[
                 card_branded("Visa One", "Visa"),
@@ -4192,125 +4202,105 @@ mod row_tile_tests {
         );
         let tiles = avatar_tiles(&p);
         assert_eq!(tiles.len(), 3, "three card rows, three tiles");
-        let mark = |i: usize| {
-            let drawn = images_in(&p, tiles[i]);
-            assert_eq!(drawn.len(), 1, "row {i} painted {} images, expected 1", drawn.len());
-            brush_id(&drawn[0])
+        let word = |i: usize| {
+            let marks = marks_in(&p, tiles[i]);
+            assert_eq!(marks.len(), 1, "row {i} painted {} marks, expected 1", marks.len());
+            marks[0].1.clone()
         };
+        // The actual claim, and it is about legible content rather than about
+        // two ids differing: each row says its own network.
+        assert_eq!(word(0), CardBrand::Visa.wordmark());
+        assert_eq!(word(1), CardBrand::Mastercard.wordmark());
         assert_ne!(
-            mark(0),
-            mark(1),
-            "Visa and Mastercard painted the same image, so a texture id cannot tell two \
-             networks apart"
+            word(0),
+            word(1),
+            "Visa and Mastercard drew the same word, so the mark names no network"
         );
-        // ...and the same network twice is the same picture (spelled either
-        // way), so the inequality above is about the brand and not about a
-        // texture freshly allocated per row.
-        assert_eq!(mark(0), mark(2));
+        // ...and the same network spelled either way is the same word, so the
+        // inequality is about the brand and not about a per-row accident.
+        assert_eq!(word(0), word(2));
     }
 
     #[test]
     fn a_card_with_a_bank_icon_wears_its_network_badge_in_the_tiles_lower_right() {
         // Rung 1, the most specific: the issuer's own icon, with the network
         // in the corner the plastic puts it in.
-        //
-        // The SECOND row is the oracle, and it is in this frame rather than a
-        // frame of its own because texture ids are per-context: it is the same
-        // network with no bank icon, so whatever it paints across its whole
-        // tile is that network's mark by construction. The badge is then
-        // identified by being that same picture -- not merely by being
-        // something drawn in a corner, which the bank icon drawn twice would
-        // also satisfy.
-        let p = paint_with_icons(
-            &[card_branded("BoA Credit", "Visa"), card_branded("Loose Visa", "Visa")],
-            None,
-            &["BoA Credit"],
+        let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
+        let tile = square(&p, AVATAR_SIZE).rect;
+        let marks = marks_in(&p, tile);
+        assert_eq!(marks.len(), 1, "expected exactly the badge inside the tile: {marks:?}");
+        let (badge, word) = marks[0].clone();
+        assert_eq!(word, CardBrand::Visa.wordmark(), "the corner badge names the wrong network");
+
+        // The favicon is still there and still fills the tile, so this really
+        // is the COMPOSED rung and not the badge-alone one.
+        assert!(
+            textured(&p).iter().any(|r| r.rect == tile),
+            "no full-tile favicon was painted, so nothing was composed: {:?}",
+            textured(&p).iter().map(|r| r.rect).collect::<Vec<_>>()
         );
-        let tiles = avatar_tiles(&p);
-        assert_eq!(tiles.len(), 2, "two card rows, two tiles");
-        let (composed, oracle) = (tiles[0], tiles[1]);
-        let visa_mark = {
-            let drawn = images_in(&p, oracle);
-            assert_eq!(drawn.len(), 1, "the bank-less row paints the mark and nothing else");
-            brush_id(&drawn[0])
-        };
-        let drawn = images_in(&p, composed);
-        assert_eq!(
-            drawn.len(),
-            2,
-            "expected the bank icon AND the badge; the tile's images were: {:?}",
-            drawn.iter().map(|r| r.rect).collect::<Vec<_>>()
-        );
-        let icon = drawn
-            .iter()
-            .find(|r| r.rect == composed)
-            .expect("the bank icon is still drawn at the full size of its tile");
-        let badge = drawn
-            .iter()
-            .find(|r| (r.rect.width() - NETWORK_BADGE_SIZE).abs() < 0.01)
-            .unwrap_or_else(|| {
-                panic!(
-                    "nothing {NETWORK_BADGE_SIZE}pt wide was painted, so no badge was drawn; \
-                     the tile's images were: {:?}",
-                    drawn.iter().map(|r| r.rect).collect::<Vec<_>>()
-                )
-            });
-        assert_eq!(brush_id(badge), visa_mark, "the corner image is not the Visa mark");
-        assert_ne!(
-            brush_id(badge),
-            brush_id(icon),
-            "the badge and the bank icon are the same picture, so nothing was composed"
-        );
-        // Lower RIGHT, and flush into the tile's own corner.
-        let expected = egui::Rect::from_min_max(
-            composed.max - egui::vec2(NETWORK_BADGE_SIZE, NETWORK_BADGE_SIZE),
-            composed.max,
+
+        // Lower RIGHT, flush into the tile's own corner, at the badge height.
+        assert!(
+            (badge.right() - tile.right()).abs() < 0.01
+                && (badge.bottom() - tile.bottom()).abs() < 0.01,
+            "the badge at {badge:?} is not flush in the lower right of the {tile:?} tile"
         );
         assert!(
-            (badge.rect.min - expected.min).length() < 0.01
-                && (badge.rect.max - expected.max).length() < 0.01,
-            "the badge was painted at {:?}, expected {expected:?} in the lower right of the \
-             {composed:?} tile",
-            badge.rect
+            (badge.height() - NETWORK_BADGE_HEIGHT).abs() < 0.01,
+            "the badge is {}pt tall, expected {NETWORK_BADGE_HEIGHT}",
+            badge.height()
+        );
+        // The constraint the four-character wordmark cap exists to satisfy --
+        // see `CardBrand::wordmark` and `card_mark`'s own width measurement.
+        assert!(
+            tile.contains_rect(badge),
+            "the badge at {badge:?} escapes the {tile:?} tile it is drawn inside"
         );
     }
 
     #[test]
-    fn a_card_with_no_bank_domain_draws_its_network_mark_at_the_tiles_full_size() {
+    fn a_card_with_no_bank_domain_draws_its_network_mark_centred_in_the_tile() {
         // Rung 2, one step less specific and still not a blank: no issuer to
-        // name, so the network takes the whole tile rather than a corner it
-        // would be sharing with nothing.
-        //
-        // Two networks in one frame, so "the mark" is asserted to be a
-        // network's own picture and not just "an image": if the tile drew
-        // some single shared placeholder, the two ids would agree.
+        // name, so the network gets the middle of the tile at a bigger size
+        // rather than a corner it would be sharing with nothing.
         let p = paint(
             &[card_branded("BoA Credit", "Visa"), card_branded("MC Credit", "Mastercard")],
             None,
         );
         let tiles = avatar_tiles(&p);
         assert_eq!(tiles.len(), 2);
-        let drawn: Vec<RectShape> =
-            tiles.iter().map(|t| {
-                let imgs = images_in(&p, *t);
-                assert_eq!(imgs.len(), 1, "exactly the mark, and no second image, belongs here");
-                imgs.into_iter().next().unwrap()
-            }).collect();
-        assert_ne!(
-            brush_id(&drawn[0]),
-            brush_id(&drawn[1]),
-            "both cards drew the same picture, so this rung is not painting the NETWORK"
-        );
-        for (tile, img) in tiles.iter().zip(&drawn) {
-            assert_eq!(
-                img.rect,
-                *tile,
-                "the mark must fill the tile, not sit in a corner of it"
+        let marks: Vec<(egui::Rect, String)> = tiles
+            .iter()
+            .map(|t| {
+                let m = marks_in(&p, *t);
+                assert_eq!(m.len(), 1, "exactly the mark, and nothing else, belongs here");
+                m.into_iter().next().unwrap()
+            })
+            .collect();
+        assert_eq!(marks[0].1, CardBrand::Visa.wordmark());
+        assert_eq!(marks[1].1, CardBrand::Mastercard.wordmark());
+        for (tile, (mark, word)) in tiles.iter().zip(&marks) {
+            assert!(
+                (mark.center().x - tile.center().x).abs() < 0.51
+                    && (mark.center().y - tile.center().y).abs() < 0.51,
+                "{word:?} was painted at {mark:?}, which is not centred in its {tile:?} tile"
             );
             assert!(
-                img.rect.width() > NETWORK_BADGE_SIZE,
-                "drawn at {}pt, which is the corner-badge size -- this rung is the full-size one",
-                img.rect.width()
+                (mark.height() - NETWORK_MARK_ALONE_HEIGHT).abs() < 0.01,
+                "{word:?} is {}pt tall, expected {NETWORK_MARK_ALONE_HEIGHT}",
+                mark.height()
+            );
+            // NOT bigger than the corner badge, deliberately: the tile is
+            // 32pt wide in both rungs and `AMEX` at 14pt tall is 33pt wide.
+            // See `NETWORK_MARK_ALONE_HEIGHT`.
+            assert!(
+                (mark.height() - NETWORK_BADGE_HEIGHT).abs() < 0.01,
+                "the two rungs have drifted to two mark sizes"
+            );
+            assert!(
+                tile.contains_rect(*mark),
+                "{word:?} at {mark:?} does not fit its {tile:?} tile"
             );
         }
         // And the rung below is genuinely NOT what happened.
@@ -4319,6 +4309,29 @@ mod row_tile_tests {
             "the monogram was drawn as well; painted: {:?}",
             p.texts
         );
+    }
+
+    /// Every network's mark fits the tile at the height the badge-alone rung
+    /// draws it -- `AMEX`, the widest, included.
+    ///
+    /// `card_mark` measures the same thing at the CORNER badge's height, which
+    /// is the smaller of the two and therefore not this claim. A mark that
+    /// escapes its tile here is a mark drawn over the row's title.
+    #[test]
+    fn every_networks_mark_fits_the_tile_when_it_is_the_only_thing_in_it() {
+        for brand in crate::card_brand::CARD_BRANDS {
+            let p = paint(&[card_branded("No Bank", brand.canonical())], None);
+            let tile = square(&p, AVATAR_SIZE).rect;
+            let marks = marks_in(&p, tile);
+            assert_eq!(
+                marks.len(),
+                1,
+                "{brand:?} painted {} marks inside its tile -- a mark that escaped the tile is \
+                 invisible to `marks_in` and shows up here as zero",
+                marks.len()
+            );
+            assert_eq!(marks[0].1, brand.wordmark());
+        }
     }
 
     #[test]
@@ -4337,14 +4350,16 @@ mod row_tile_tests {
             "the monogram must still be drawn; painted: {:?}",
             p.texts
         );
+        let tile = square(&p, AVATAR_SIZE).rect;
         assert!(
-            textured(&p).is_empty(),
-            "an unrecognised brand painted an image: {:?}",
-            textured(&p).iter().map(|r| r.rect).collect::<Vec<_>>()
+            marks_in(&p, tile).is_empty(),
+            "an unrecognised brand painted a mark: {:?}",
+            marks_in(&p, tile)
         );
         // Control: the same fixture with a nameable brand DOES paint one, so
         // the emptiness above is about the brand and not about this harness.
-        assert_eq!(textured(&paint(&[card_branded("Bank Coin", "Visa")], None)).len(), 1);
+        let named = paint(&[card_branded("Bank Coin", "Visa")], None);
+        assert_eq!(marks_in(&named, square(&named, AVATAR_SIZE).rect).len(), 1);
     }
 
     #[test]
@@ -4360,16 +4375,13 @@ mod row_tile_tests {
             "a badged card's row is {}pt tall, expected {ROW_TILE_HEIGHT}",
             row.rect.height()
         );
-        let tile = square(&p, AVATAR_SIZE);
-        let badge = textured(&p)
-            .into_iter()
-            .find(|r| (r.rect.width() - NETWORK_BADGE_SIZE).abs() < 0.01)
-            .expect("the badge is drawn");
+        let tile = square(&p, AVATAR_SIZE).rect;
+        let marks = marks_in(&p, tile);
+        assert_eq!(marks.len(), 1, "the badge is drawn: {marks:?}");
         assert!(
-            tile.rect.contains_rect(badge.rect),
-            "the badge at {:?} escapes the {:?} tile",
-            badge.rect,
-            tile.rect
+            tile.contains_rect(marks[0].0),
+            "the badge at {:?} escapes the {tile:?} tile",
+            marks[0].0
         );
     }
 

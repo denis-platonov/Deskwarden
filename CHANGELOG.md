@@ -12,6 +12,19 @@ things can still change between minor versions.
 
 ### The vault window's list and rail
 
+- **A card's network badge says the network's name.** It used to be a
+  geometric placeholder — a play triangle for Visa, a diamond for Mastercard,
+  two bars for American Express, all on the same blue square — which named
+  nothing ("VISA icon supposed to be visa and not some Play sign") and did not
+  tell the seven networks apart either. The badge is now the network set in
+  type: **VISA**, **MC**, **AMEX**, **DISC**, **JCB**, **DC**, **UP**, in the
+  list and on the card's detail pane.
+  - Words rather than logos deliberately: the network marks are registered
+    trademarks whose guidelines restrict them to licensed issuers and
+    merchants, and this is an MIT-licensed community project. Naming the
+    network your own card is on is a statement of fact.
+  - Diners Club and UnionPay get two-letter forms because the badge is drawn
+    inside the row's 32pt tile and a longer word there is an unreadable smear.
 - **A favicon now fills its tile.** It was inset 4pt a side inside a 32pt tile
   — a 24pt icon in a bordered box, which read as an icon adrift in a frame
   ("icon is not fully taking the rounded rectangle"). The icon takes the whole

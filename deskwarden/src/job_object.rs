@@ -2386,19 +2386,10 @@ mod tests {
                 "assets/fonts/Archivo-SemiBold.ttf",
                 "assets/fonts/OFL.txt",
                 "assets/generate-icon.py",
-                // The generator for the drawn network marks, and its output:
-                // one 48px RGBA PNG per card network, `include_bytes!`-ed by
-                // `card_mark.rs`. Generated from source geometry with the
-                // standard library, exactly as `generate-icon.py` generates
-                // the application icon -- no opaque brand binary enters here.
-                "assets/generate-marks.py",
-                "assets/marks/american_express.png",
-                "assets/marks/diners_club.png",
-                "assets/marks/discover.png",
-                "assets/marks/jcb.png",
-                "assets/marks/mastercard.png",
-                "assets/marks/unionpay.png",
-                "assets/marks/visa.png",
+                // NO `assets/marks/`, and no generator for one. The card
+                // networks' marks used to be seven generated PNGs; they are
+                // drawn type now (`card_mark.rs`), so there is no image to
+                // ship, generate or keep in step with the brand table.
                 "deny.toml",
                 "installer/README.md",
                 "installer/bootstrap-bw.ps1",
