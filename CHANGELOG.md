@@ -10,6 +10,18 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### A card's Expires / Code line
+
+- **Clicking anywhere on the line copies its half.** The Expires and Code
+  halves only responded to a strip through the middle of the row — the row's
+  own padding, above and below them and at either end, copied nothing and lit
+  nothing ("Expires\Code - only part in the middle gets it copied and
+  highlighted"). Both halves are now the full band, exactly as the Number row
+  above them has always been.
+- **The Code label is inset inside its half** by the same padding the Expires
+  label has inside the line, so the two read as a matched pair. The hit area
+  still starts at the seam: the padding moved the ink, not the tile.
+
 ### The vault window's list and rail
 
 - **A card's network badge says the network's name.** It used to be a
