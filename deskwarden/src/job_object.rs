@@ -1368,8 +1368,16 @@ mod tests {
         ("injector/mod.rs", 1),
         ("injector/sequence.rs", 1),
         ("login_ui.rs", 10),
-        ("main.rs", 12),
+        // Eleven, not twelve: the download-and-apply thread the tray's "Update
+        // available" item used to start is gone with the item, and with the
+        // rest of that flow, to `update_panel.rs` below.
+        ("main.rs", 11),
         ("picker_ui.rs", 2),
+        // Two: the About page's check, and its download-and-verify. Neither
+        // can be a tick in a frame loop -- both are seconds-to-minutes of
+        // network -- and neither can belong to `main`'s loop, which is not
+        // running while the preferences window that started them is open.
+        ("update_panel.rs", 2),
         ("updater.rs", 3),
         ("vault_window/mod.rs", 8),
     ];

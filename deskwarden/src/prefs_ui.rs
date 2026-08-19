@@ -340,6 +340,84 @@ const FILL_HOTKEY_DESCRIPTION: &str =
 /// a decorative line.
 const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account.";
 
+// --- About: the update flow -----------------------------------------------
+//
+// **This is where the tray's update item went.** That item was created as
+// `MenuItem::new("Update available", false, None)` -- the words present from
+// startup, the *enabling* the only thing the check ever did -- so a session
+// with no update (which is nearly every session) showed a permanent claim that
+// one existed, on a control that then refused to be clicked. It is deleted.
+//
+// What replaced it is here, on the page a user comes to for exactly this
+// question, and it can say all four things the tray could say none of: not
+// checked yet, checked and current, checked and here is what is new, and here
+// is how far the download has got. The mechanism is `update_panel`, which owns
+// its own thread and channel because `run` below blocks and `main.rs`'s loop is
+// not running while this page is on screen.
+
+const UPDATE_SECTION_LABEL: &str = "Updates";
+const UPDATE_CHECK_BUTTON: &str = "Check for updates";
+const UPDATE_CHECKING_BUTTON: &str = "Checking...";
+const UPDATE_DOWNLOAD_BUTTON: &str = "Download";
+const UPDATE_DOWNLOADING_BUTTON: &str = "Downloading...";
+const UPDATE_RESTART_BUTTON: &str = "Restart to install";
+const UPDATE_RETRY_BUTTON: &str = "Try again";
+
+const UPDATE_IDLE_DESCRIPTION: &str =
+    "Ask GitHub whether a newer Deskwarden has been released. Nothing is downloaded until you \
+     ask for it.";
+const UPDATE_CHECKING_DESCRIPTION: &str = "Asking GitHub for the latest release.";
+const UPDATE_UP_TO_DATE_DESCRIPTION: &str = "This is the latest release.";
+const UPDATE_READY_DESCRIPTION: &str =
+    "Downloaded and signature-checked. Deskwarden will close, install, and start again.";
+const UPDATE_UNAVAILABLE_DESCRIPTION: &str =
+    "This build cannot check for updates. Please report it -- it is a defect, not a setting.";
+
+/// Shown under the button when `Settings::check_for_updates` is off.
+///
+/// **The button still works, and this row is why that is honest.** The setting
+/// governs the check Deskwarden makes *by itself*; a click here is the user
+/// making the request. Saying so on the page is the difference between a
+/// button that appears to ignore a preference and one that is explicit about
+/// which preference it is not governed by. `PRIVACY.md` carries the same
+/// claim.
+const UPDATE_AUTOMATIC_OFF_NOTE: &str =
+    "Automatic checks are off on the General page. This button still asks, because you asked it \
+     to.";
+
+const UPDATE_NOTES_LABEL: &str = "What is new";
+/// Shown in place of the notes when the release has none. A release with an
+/// empty body is normal; an empty box is not distinguishable from a box that
+/// failed to load.
+const UPDATE_NOTES_EMPTY: &str = "This release came with no notes.";
+
+/// The notes region's height.
+///
+/// Fixed, with the region scrolling inside it. **This is a requirement, not a
+/// style choice.** A GitHub release body is written by whoever cut the release
+/// and can be any length; a region that grew to fit one would push the buttons
+/// below the bottom edge of a window that is not resizable. This crate has
+/// shipped a layout that put a control out of reach before. The character
+/// bound in `updater::release_notes_for_display` is the second half of the
+/// same guarantee, covering layout cost rather than reach.
+const UPDATE_NOTES_HEIGHT: f32 = 128.0;
+
+/// The notes scrollbar's width and the gap either side of it. Named, because
+/// the region's content width is this much less than the row's and the two
+/// numbers have to be the same ones -- a mismatch shows as this card being a
+/// few points wider than the Version card directly above it.
+const UPDATE_NOTES_BAR_WIDTH: f32 = 6.0;
+const UPDATE_NOTES_BAR_MARGIN: f32 = 4.0;
+
+/// The progress bar's height and corner, matched to the stepper's radius so
+/// the page keeps one vocabulary of shapes.
+const UPDATE_BAR_HEIGHT: f32 = 8.0;
+const UPDATE_BAR_RADIUS: u8 = 4;
+
+/// Wide enough for the longest label above without truncating it, since a
+/// button whose text is cut is a button whose action is a guess.
+const UPDATE_BUTTON_WIDTH: f32 = 150.0;
+
 // ---------------------------------------------------------------------------
 // Sections
 // ---------------------------------------------------------------------------
@@ -451,6 +529,16 @@ pub struct PrefsState {
     /// would put the message on screen while the user was still typing `0.` on
     /// the way to `0.5`, which is scolding them for not having finished.
     clipboard_entry_error: Option<&'static str>,
+    /// The About page's update flow: its stage, and the receiver its worker
+    /// threads report on.
+    ///
+    /// **It lives on the state rather than in the draw**, because it is the
+    /// one thing on this page that must survive a frame. A check takes seconds
+    /// and a download takes minutes; a panel rebuilt each frame would drop its
+    /// receiver every 16ms and never see an answer. That is also why the
+    /// screenshot example holds its `PrefsState` for the update surfaces where
+    /// it rebuilds it for the clipboard ones.
+    update: crate::update_panel::UpdatePanel,
 }
 
 impl PrefsState {
@@ -487,6 +575,7 @@ impl PrefsState {
             auto_lock_text: minutes.to_string(),
             clipboard_interval_text: interval.as_minutes_text(),
             clipboard_entry_error: None,
+            update: crate::update_panel::UpdatePanel::default(),
         }
     }
 
@@ -494,6 +583,19 @@ impl PrefsState {
     /// which has to be able to open a page nobody has clicked on.
     pub fn show(&mut self, section: Section) {
         self.section = section;
+    }
+
+    /// Parks the update flow in a given stage, for the same reason
+    /// [`show`](Self::show) exists: `examples/ui_preview` has to draw states
+    /// nobody can click their way to in a screenshot run -- a found release, a
+    /// download in flight, a failure -- and must reach none of them by
+    /// touching the network.
+    ///
+    /// The panel it installs is wired to nothing (see
+    /// `update_panel::UpdatePanel::parked`), so a preview cannot start work
+    /// even by accident.
+    pub fn show_update_stage(&mut self, stage: crate::update_panel::UpdateStage) {
+        self.update = crate::update_panel::UpdatePanel::parked(stage);
     }
 }
 
@@ -842,7 +944,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             ui,
             "Signing in, syncing and locking are all done from the vault window.",
         ),
-        Section::About => draw_about(ui),
+        Section::About => draw_about(ui, state),
     }
 }
 
@@ -1461,7 +1563,7 @@ fn draw_shortcuts(ui: &mut Ui) {
     });
 }
 
-fn draw_about(ui: &mut Ui) {
+fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         value_row(
             ui,
@@ -1475,6 +1577,277 @@ fn draw_about(ui: &mut Ui) {
         // as a field that failed to load.
         card_row(ui, |ui| row_text(ui, "Bitwarden account", ACCOUNT_STATUS));
     });
+
+    draw_update_card(ui, state);
+}
+
+/// The update flow, as a card of its own below the version card.
+///
+/// **Every frame starts by draining the worker channel.** This is the whole
+/// answer to "how does a page inside a blocking event loop hear back from a
+/// background thread": it does not need `main.rs`'s loop, because it has its
+/// own frames and `pump` never blocks in one.
+fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
+    use crate::update_panel::UpdateStage;
+
+    state.update.pump();
+    if state.update.is_busy() {
+        // egui repaints on input. A download nobody is typing over would
+        // otherwise advance its bar only when the mouse moved, which is a
+        // progress bar that reports the user rather than the transfer.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    card(ui, |ui| {
+        // The stage is cloned out before drawing, so the buttons below are
+        // free to replace it without borrowing `state.update` across the
+        // closure that draws from it.
+        let stage = state.update.stage().clone();
+
+        let (description, button) = match &stage {
+            UpdateStage::Idle => (UPDATE_IDLE_DESCRIPTION.to_string(), Some(UPDATE_CHECK_BUTTON)),
+            UpdateStage::Checking => (UPDATE_CHECKING_DESCRIPTION.to_string(), None),
+            UpdateStage::UpToDate => {
+                (UPDATE_UP_TO_DATE_DESCRIPTION.to_string(), Some(UPDATE_CHECK_BUTTON))
+            }
+            UpdateStage::Available(r) => {
+                (format!("Version {} is available.", r.version), Some(UPDATE_DOWNLOAD_BUTTON))
+            }
+            UpdateStage::Downloading { release, .. } => {
+                (format!("Downloading version {}.", release.version), None)
+            }
+            UpdateStage::Ready(r) => {
+                (format!("Version {} is ready. {UPDATE_READY_DESCRIPTION}", r.version), Some(UPDATE_RESTART_BUTTON))
+            }
+            // The message comes from `updater` and is the reason as that
+            // module saw it. Shown rather than reduced to "something went
+            // wrong": this app has no console, and the failures here are
+            // overwhelmingly network ones the user can act on.
+            // The retry is offered whichever half failed. What it retries
+            // differs -- see the click handler below -- but "try again" is
+            // the right word for both, and a failure with no way forward is
+            // a dead end on the only page that has one.
+            UpdateStage::Failed { message, .. } => {
+                (format!("Update failed: {message}"), Some(UPDATE_RETRY_BUTTON))
+            }
+            UpdateStage::Unavailable => (UPDATE_UNAVAILABLE_DESCRIPTION.to_string(), None),
+        };
+
+        // The busy stages still draw a button, disabled and labelled with what
+        // is happening, rather than drawing nothing: a row whose control
+        // vanishes mid-action reflows the card under the cursor.
+        let busy_label = match &stage {
+            UpdateStage::Checking => Some(UPDATE_CHECKING_BUTTON),
+            UpdateStage::Downloading { .. } => Some(UPDATE_DOWNLOADING_BUTTON),
+            _ => None,
+        };
+
+        let mut clicked = false;
+        control_row(ui, UPDATE_SECTION_LABEL, &description, |ui| {
+            if let Some(label) = busy_label {
+                let _ = update_button(ui, label, false);
+            } else if let Some(label) = button {
+                clicked = update_button(ui, label, true);
+            }
+        });
+
+        if clicked {
+            match &stage {
+                UpdateStage::Idle | UpdateStage::UpToDate => state.update.begin_check(),
+                UpdateStage::Available(_) => state.update.begin_download(),
+                UpdateStage::Ready(_) => state.update.install_now(),
+                // Retry means "retry the thing that failed". A failure that
+                // still remembers a release failed at the download, so the
+                // download is what is retried; one that does not failed at the
+                // check, and there is nothing to fetch yet.
+                UpdateStage::Failed { release: Some(_), .. } => state.update.begin_download(),
+                UpdateStage::Failed { release: None, .. } => state.update.begin_check(),
+                UpdateStage::Checking
+                | UpdateStage::Downloading { .. }
+                | UpdateStage::Unavailable => {}
+            }
+        }
+
+        // Named only when it is off, and only on the stages where the button
+        // is the thing being explained. Repeating it under a progress bar
+        // would be explaining a decision the user already made.
+        if !state.settings.check_for_updates
+            && matches!(stage, UpdateStage::Idle | UpdateStage::UpToDate)
+        {
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.label(
+                    RichText::new(UPDATE_AUTOMATIC_OFF_NOTE)
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+        }
+
+        if let UpdateStage::Downloading { done, total, .. } = &stage {
+            row_separator(ui);
+            card_row(ui, |ui| progress_bar(ui, *done, *total));
+        }
+
+        // The notes follow the release through the download and the restart
+        // prompt, not just the moment it is found: a user who has started a
+        // download is still entitled to read what they are installing.
+        let notes_for = match &stage {
+            UpdateStage::Available(r) | UpdateStage::Ready(r) => Some(r),
+            UpdateStage::Downloading { release, .. } => Some(release),
+            _ => None,
+        };
+        if let Some(release) = notes_for {
+            row_separator(ui);
+            card_row(ui, |ui| release_notes(ui, &release.body));
+        }
+    });
+}
+
+/// The notes region: a heading, then the release body as **plain text** inside
+/// a fixed-height scroll area.
+///
+/// Three things this deliberately does not do, all for the same reason -- the
+/// string arrived over the network and is data:
+///
+/// * It does not parse markdown, so `#`, `*` and `[..](..)` paint as the
+///   characters they are.
+/// * It does not extract links or make anything clickable. Nothing on this
+///   page can navigate anywhere a release author chose.
+/// * It does not size itself to its content. The height is
+///   [`UPDATE_NOTES_HEIGHT`] whatever arrives, and the overflow scrolls, so
+///   no release body can push the buttons above it off a window that cannot
+///   be resized.
+///
+/// The string has already been through `updater::release_notes_for_display`,
+/// which strips control and invisible-formatting characters and bounds the
+/// length. Called here rather than at parse time so the untouched body stays
+/// on `ReleaseInfo` -- there is exactly one place that decides what is safe to
+/// paint, and this is its only caller.
+fn release_notes(ui: &mut Ui, body: &str) {
+    let shown = crate::updater::release_notes_for_display(body);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        ui.label(theme::semibold(UPDATE_NOTES_LABEL, 14.0).color(theme::INK));
+        if shown.is_empty() {
+            ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).color(theme::TEXT_FAINT));
+            return;
+        }
+        let width = ui.available_width();
+        // egui's default scrollbar floats over the content and is painted in
+        // its own light grey, which on this card's white is very nearly
+        // nothing. Pinned open at a real width and given the page's own
+        // border colour, so the cue that there is more to read is a cue
+        // someone can see.
+        ui.spacing_mut().scroll.floating = false;
+        ui.spacing_mut().scroll.bar_width = UPDATE_NOTES_BAR_WIDTH;
+        ui.spacing_mut().scroll.bar_inner_margin = UPDATE_NOTES_BAR_MARGIN;
+        ui.spacing_mut().scroll.bar_outer_margin = 0.0;
+        ui.visuals_mut().widgets.inactive.bg_fill = theme::BORDER_STRONG;
+        ui.visuals_mut().widgets.hovered.bg_fill = theme::TEXT_SECONDARY;
+        ui.visuals_mut().widgets.active.bg_fill = theme::TEXT_SECONDARY;
+        ui.visuals_mut().extreme_bg_color = theme::CANVAS;
+        egui::ScrollArea::vertical()
+            .max_height(UPDATE_NOTES_HEIGHT)
+            .auto_shrink([false, true])
+            // **Always visible, never on hover.** Long notes are clipped at
+            // `UPDATE_NOTES_HEIGHT`, and clipped text with no scrollbar reads
+            // as text that failed to load rather than as text that continues.
+            // egui's default hides the bar until the pointer is inside the
+            // region, which puts the only cue that there is more to read
+            // behind an action nobody takes without the cue.
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                // The bar is not floating, so it takes width from the row
+                // rather than sitting over it. Subtracted here rather than
+                // left to egui, which would otherwise let the region grow
+                // wider than the card and leave this card's right edge a few
+                // points past the Version card's directly above it.
+                ui.set_width(width - UPDATE_NOTES_BAR_WIDTH - UPDATE_NOTES_BAR_MARGIN * 2.0);
+                // `Label::wrap`, not a `TextEdit` and not rich text: one
+                // galley of plain characters, wrapped to the card.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(shown).size(12.0).color(theme::TEXT_MUTED),
+                    )
+                    .wrap(),
+                );
+            });
+    });
+}
+
+/// The download's progress: a bar and a byte count.
+///
+/// The bar is drawn only when the server declared a length. Without one there
+/// is no fraction to show, and an indeterminate bar animating under a number
+/// that is already moving says less than the number alone.
+fn progress_bar(ui: &mut Ui, done: u64, total: Option<u64>) {
+    use crate::update_panel::{download_fraction, download_label};
+
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        if let Some(fraction) = download_fraction(done, total) {
+            let (rect, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), UPDATE_BAR_HEIGHT),
+                Sense::hover(),
+            );
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(UPDATE_BAR_RADIUS), theme::CANVAS);
+            let filled = Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() * fraction, rect.height()),
+            );
+            ui.painter().rect_filled(
+                filled,
+                CornerRadius::same(UPDATE_BAR_RADIUS),
+                theme::TEXT_SECONDARY,
+            );
+        }
+        ui.label(
+            RichText::new(download_label(done, total))
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    });
+}
+
+/// The update card's button: [`reset_button`]'s box at [`UPDATE_BUTTON_WIDTH`],
+/// with a disabled appearance for the stages where it names what is happening
+/// rather than offering an action.
+///
+/// A disabled button here neither hovers, nor takes a click, nor shows the
+/// pointing hand -- the three things that made the old tray item read as
+/// clickable when it was not.
+fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(UPDATE_BUTTON_WIDTH, STEPPER_HEIGHT), sense);
+    let hovered = enabled && response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        if hovered { theme::CANVAS } else { theme::CARD },
+        Stroke::new(1.0, if enabled { theme::BORDER_STRONG } else { theme::HAIRLINE }),
+        StrokeKind::Inside,
+    );
+    let colour = if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        colour,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        colour,
+    );
+    enabled && response.clicked()
 }
 
 /// The honest state of a section 3e specifies but nothing implements.
@@ -3514,6 +3887,260 @@ mod tests {
             painted.strings()
         );
         assert!(painted.contains(ACCOUNT_STATUS));
+    }
+
+    // -- About: the update card --------------------------------------------
+    //
+    // One frame of the real `draw_prefs_body` per stage, read back through
+    // what egui painted. Nothing here can reach the network: no
+    // `update_panel::UpdateEnv` is installed in a test process (the panel's
+    // own suite asserts that), and every stage below is parked rather than
+    // arrived at.
+
+    /// One frame of About with the update panel parked in `stage`.
+    fn paint_about(stage: crate::update_panel::UpdateStage, settings: Settings) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(settings);
+        state.section = Section::About;
+        state.show_update_stage(stage);
+        frame(&ctx, &mut state, &[])
+    }
+
+    fn a_release() -> crate::updater::ReleaseInfo {
+        crate::updater::ReleaseInfo {
+            version: semver::Version::parse("9.9.9").unwrap(),
+            installer_download_url: "https://example.invalid/x-installer.exe".to_string(),
+            body: "Fixed the thing".to_string(),
+        }
+    }
+
+    /// **The state the tray could not express.**
+    ///
+    /// The control this page replaced was `MenuItem::new("Update available",
+    /// false, None)`: the words present from startup, only the enabling
+    /// waiting on the check. So the answer to "am I up to date" was a
+    /// permanent claim that you were not, on an item that would not open. The
+    /// page has to say the opposite, in words, and offer a live button beside
+    /// it.
+    #[test]
+    fn about_says_you_are_current_and_still_offers_the_check() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::UpToDate,
+            Settings::default(),
+        );
+
+        assert!(painted.contains(UPDATE_SECTION_LABEL));
+        assert!(
+            painted.contains(UPDATE_UP_TO_DATE_DESCRIPTION),
+            "the page must SAY there is no update, not merely fail to claim one: {:?}",
+            painted.strings()
+        );
+        assert!(painted.contains(UPDATE_CHECK_BUTTON), "got {:?}", painted.strings());
+        assert!(
+            !painted.strings().iter().any(|t| t.contains(concat!("Update", " available"))),
+            "the tray's words are back on the page: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// A found release shows its version, its notes, and the way to get it.
+    #[test]
+    fn about_shows_the_release_notes_beside_the_download() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+
+        assert!(painted.contains("Version 9.9.9 is available."), "got {:?}", painted.strings());
+        assert!(painted.contains(UPDATE_NOTES_LABEL));
+        assert!(painted.contains("Fixed the thing"), "got {:?}", painted.strings());
+        assert!(painted.contains(UPDATE_DOWNLOAD_BUTTON));
+    }
+
+    /// **Release notes are painted as text, not interpreted.**
+    ///
+    /// The body is chosen by whoever cut the release. This asserts on the
+    /// rendered galley -- `TextInk::rendered` is what egui actually laid out
+    /// -- so a future change that started parsing markdown, or turned a URL
+    /// into a link, would show up as the literal characters no longer being
+    /// there.
+    #[test]
+    fn release_notes_are_painted_as_the_literal_characters_they_are() {
+        let hostile = "<b>bold?</b> [link](https://evil.example) # heading?";
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: hostile.to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        assert!(
+            painted.ink.iter().any(|i| i.rendered.contains(hostile)),
+            "the notes were transformed on their way to the screen; they must be painted \
+             verbatim and interpreted as nothing. Painted: {:?}",
+            painted.ink.iter().map(|i| i.rendered.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A release body cannot push the buttons off the page.**
+    ///
+    /// The window is 1000x780 and not resizable, so a notes region that grew
+    /// to fit its content would put the Download button below the bottom
+    /// edge with no way to reach it -- a defect this crate has shipped
+    /// before. The region is fixed and scrolls, which is checked here the
+    /// only way it can be: by giving it a body far longer than the window and
+    /// asserting that nothing the page paints leaves the window.
+    #[test]
+    fn a_release_body_longer_than_the_window_does_not_push_anything_off_it() {
+        let enormous = (0..400)
+            .map(|n| format!("line {n} of a release note nobody bounded"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: enormous,
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        let button = painted.rect_of(UPDATE_DOWNLOAD_BUTTON);
+        assert!(
+            button.max.y <= BODY_SIZE.y,
+            "the download button was pushed to y={} on a {}-point page that cannot scroll or \
+             resize",
+            button.max.y,
+            BODY_SIZE.y
+        );
+        assert!(
+            painted.texts.iter().all(|(_, r)| r.min.y <= BODY_SIZE.y),
+            "the page painted content below its own bottom edge"
+        );
+    }
+
+    /// The progress bar and its byte count, which are the whole reason the
+    /// download reports here rather than into a tray tooltip.
+    #[test]
+    fn a_download_in_flight_reports_its_progress_on_the_page() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Downloading {
+                release: a_release(),
+                done: 3_355_443,
+                total: Some(6_291_456),
+            },
+            Settings::default(),
+        );
+
+        assert!(painted.contains("Downloading version 9.9.9."), "got {:?}", painted.strings());
+        assert!(painted.contains("3.2 MB of 6.0 MB"), "got {:?}", painted.strings());
+        assert!(
+            painted.contains(UPDATE_DOWNLOADING_BUTTON),
+            "the button must stay put and say what is happening rather than vanishing and \
+             reflowing the card under the cursor: {:?}",
+            painted.strings()
+        );
+    }
+
+    #[test]
+    fn a_finished_download_offers_the_restart_rather_than_taking_it() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Ready(a_release()),
+            Settings::default(),
+        );
+
+        assert!(painted.contains(UPDATE_RESTART_BUTTON), "got {:?}", painted.strings());
+        assert!(
+            painted.strings().iter().any(|t| t.contains(UPDATE_READY_DESCRIPTION)),
+            "the restart prompt must say what the restart will do: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// A failure says why, on the page, with the way forward beside it. The
+    /// old flow put this in a tray tooltip -- visible only to someone already
+    /// resting a pointer on a 16px icon.
+    #[test]
+    fn a_failure_says_why_on_the_page_and_offers_the_retry() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Failed {
+                message: "failed to reach GitHub releases API".to_string(),
+                release: Some(a_release()),
+            },
+            Settings::default(),
+        );
+
+        assert!(
+            painted.contains("Update failed: failed to reach GitHub releases API"),
+            "got {:?}",
+            painted.strings()
+        );
+        assert!(painted.contains(UPDATE_RETRY_BUTTON));
+    }
+
+    /// **The manual button is not governed by the automatic setting, and the
+    /// page says so where the button is.**
+    ///
+    /// `Settings::check_for_updates` is about Deskwarden contacting GitHub on
+    /// its own; a click here is the user asking it to. Leaving that unsaid
+    /// would make the button look like it was ignoring a preference. The same
+    /// claim is in `PRIVACY.md`, which is the other half of this decision --
+    /// a policy that described fewer requests than the software makes is a
+    /// defect this repository has had to fix once already.
+    #[test]
+    fn with_automatic_checks_off_the_button_stays_and_the_page_explains_why() {
+        let off = Settings { check_for_updates: false, ..Settings::default() };
+        let painted = paint_about(crate::update_panel::UpdateStage::UpToDate, off);
+
+        assert!(
+            painted.contains(UPDATE_CHECK_BUTTON),
+            "the button must still be offered: an explicit click is the user initiating the \
+             request. Painted: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.contains(UPDATE_AUTOMATIC_OFF_NOTE),
+            "with automatic checks off, the page must say why the button still works: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// The note is about the button, so it appears only where the button is
+    /// the thing needing explaining. Under a progress bar it would be
+    /// explaining a decision the user has already made.
+    #[test]
+    fn the_automatic_checks_note_is_absent_when_it_would_explain_nothing() {
+        let on = paint_about(crate::update_panel::UpdateStage::UpToDate, Settings::default());
+        assert!(!on.contains(UPDATE_AUTOMATIC_OFF_NOTE), "shown with the setting ON");
+
+        let off = Settings { check_for_updates: false, ..Settings::default() };
+        let downloading = paint_about(
+            crate::update_panel::UpdateStage::Downloading {
+                release: a_release(),
+                done: 1,
+                total: Some(2),
+            },
+            off,
+        );
+        assert!(
+            !downloading.contains(UPDATE_AUTOMATIC_OFF_NOTE),
+            "shown under a download already in flight"
+        );
+    }
+
+    /// A release with no notes is a real and ordinary state. An empty box
+    /// would be indistinguishable from a box that failed to load.
+    #[test]
+    fn a_release_with_no_notes_says_so_rather_than_showing_an_empty_box() {
+        let painted = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: String::new(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        assert!(painted.contains(UPDATE_NOTES_EMPTY), "got {:?}", painted.strings());
     }
 
     // -- the numeric control, as pure functions ----------------------------

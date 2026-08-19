@@ -181,6 +181,30 @@ enum Surface {
     /// because "looks disabled" is precisely the claim a picture can check
     /// and a `contains` assertion cannot.
     PrefsClipboardOff,
+    /// **The About page's update card, checked and current.** The state the
+    /// tray item this replaced could not express at all: that item was created
+    /// as a disabled `MenuItem::new("Update available", ..)`, so "there is no
+    /// update" was rendered as a permanent claim that there was one. That this
+    /// picture exists, and reads "This is the latest release", is the review.
+    ///
+    /// Drawn with automatic checks OFF as well, so the note saying the button
+    /// still works is in the picture rather than only in a string constant.
+    PrefsAboutNoUpdate,
+    /// The same card with a release found: the version, the download button,
+    /// and the release notes below. The notes fixture is deliberately longer
+    /// than its region, so the PNG shows the region *scrolling* rather than
+    /// growing -- the layout claim that matters, this window being unresizable
+    /// and this crate having pushed a control out of reach before.
+    PrefsAboutUpdateAvailable,
+    /// Mid-download: the progress bar, the byte count, and the notes still
+    /// readable underneath. Its own surface because "is the bar there and does
+    /// the card still fit" is exactly what a picture answers and an assertion
+    /// does not.
+    PrefsAboutDownloading,
+    /// A failed download, with the reason on the page and a retry beside it.
+    /// The old flow's failure went to a tray tooltip, visible only to someone
+    /// already hovering a 16px icon.
+    PrefsAboutFailed,
     /// **Design 4d's rehearsal window, finished.** The twelfth surface, and
     /// the one this example exists for: this window shipped as a raw Win32
     /// dialog with none of the app's theme, tokens or type, and no screenshot
@@ -238,6 +262,10 @@ const ALL: &[Surface] = &[
     Surface::PreflightRefused,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
+    Surface::PrefsAboutNoUpdate,
+    Surface::PrefsAboutUpdateAvailable,
+    Surface::PrefsAboutDownloading,
+    Surface::PrefsAboutFailed,
     Surface::Rehearsal,
 ];
 
@@ -263,6 +291,10 @@ impl Surface {
             Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
+            Surface::PrefsAboutNoUpdate => "prefs_about_no_update",
+            Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
+            Surface::PrefsAboutDownloading => "prefs_about_downloading",
+            Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::Rehearsal => "rehearsal",
         }
     }
@@ -306,9 +338,12 @@ impl Surface {
             // The shipped window is 1000x780 with a 40px chrome bar on top;
             // this draws the BODY, which is what `draw_prefs_body` is, so the
             // page lays out against exactly the width it has in the app.
-            Surface::PrefsClipboard | Surface::PrefsClipboardOff => {
-                egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT)
-            }
+            Surface::PrefsClipboard
+            | Surface::PrefsClipboardOff
+            | Surface::PrefsAboutNoUpdate
+            | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutDownloading
+            | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -548,6 +583,10 @@ impl eframe::App for Preview {
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
+            Surface::PrefsAboutNoUpdate
+            | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutDownloading
+            | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
         }
 
@@ -772,6 +811,83 @@ impl Preview {
             ..deskwarden::settings::Settings::default()
         });
         state.show(prefs_ui::Section::Clipboard);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
+    }
+
+    /// The About page's update card, in each of the four states worth looking
+    /// at.
+    ///
+    /// **Nothing here can reach the network, and that is structural rather
+    /// than careful.** The panel is parked in a stage
+    /// (`prefs_ui::PrefsState::show_update_stage`) with no receiver behind it,
+    /// and the flow refuses to start any work at all without a process-wide
+    /// `update_panel::UpdateEnv` -- which only `main.rs` installs and this
+    /// example does not. So a preview run makes no request and spawns no
+    /// thread even if a frame's button were somehow clicked.
+    ///
+    /// The state is rebuilt each frame, as `draw_prefs` rebuilds its own:
+    /// there is nothing here to carry between frames, because every stage
+    /// these surfaces show is stated outright rather than arrived at.
+    fn draw_prefs_about(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::update_panel::UpdateStage;
+        use deskwarden::updater::ReleaseInfo;
+
+        // Longer than `UPDATE_NOTES_HEIGHT` can show on purpose, so the
+        // screenshots answer "does the region scroll or does it grow" -- the
+        // one thing about this card that a too-long release body could break,
+        // on a window with no scrollbar of its own and no resize.
+        let release = ReleaseInfo {
+            version: semver::Version::parse("0.9.0").unwrap(),
+            installer_download_url: "https://example.invalid/deskwarden-0.9.0-installer.exe"
+                .to_string(),
+            body: concat!(
+                "Added\n",
+                "- The update flow moved out of the tray and onto this page.\n",
+                "- Release notes are shown before anything is downloaded.\n",
+                "- The download reports its progress where you started it.\n",
+                "\n",
+                "Fixed\n",
+                "- The tray no longer claims an update exists when none does.\n",
+                "- A failed update says why, on a page rather than in a tooltip.\n",
+                "\n",
+                "Notes\n",
+                "- This text comes from the GitHub release body and is rendered\n",
+                "  as plain text. Nothing in it is a link, and nothing in it is\n",
+                "  markup: <b>this stays literal</b>, and so does [this](url).\n",
+                "- It is deliberately long here so this screenshot shows the\n",
+                "  region scrolling rather than pushing the buttons off the\n",
+                "  page.\n",
+            )
+            .to_string(),
+        };
+
+        let stage = match surface {
+            Surface::PrefsAboutUpdateAvailable => UpdateStage::Available(release),
+            Surface::PrefsAboutDownloading => UpdateStage::Downloading {
+                release,
+                done: 2_400_000,
+                total: Some(6_291_456),
+            },
+            Surface::PrefsAboutFailed => UpdateStage::Failed {
+                message: "failed to download installer: connection closed".to_string(),
+                release: Some(release),
+            },
+            _ => UpdateStage::UpToDate,
+        };
+
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings {
+            // Off, so the "this button still asks, because you asked it to"
+            // note is in the no-update picture. It is the visible half of the
+            // decision that the manual check is not governed by the automatic
+            // one, and a decision only a picture can show being communicated.
+            check_for_updates: false,
+            ..deskwarden::settings::Settings::default()
+        });
+        state.show(prefs_ui::Section::About);
+        state.show_update_stage(stage);
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));

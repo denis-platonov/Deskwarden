@@ -80,6 +80,7 @@ pub mod settings;
 pub mod signature;
 pub mod theme;
 pub mod tray;
+pub mod update_panel;
 pub mod updater;
 pub mod vault_bridge;
 pub mod vault_cache;
