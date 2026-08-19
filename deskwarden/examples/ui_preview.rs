@@ -116,6 +116,15 @@ enum Surface {
     /// at.
     OverlayNoMatch,
     OverlayLocked,
+    /// The autofill overlay's save-a-new-login form (design 3c): four rows and
+    /// three answers, reached from `OverlayNoMatch`'s *New login* button.
+    ///
+    /// **By far the tallest state the overlay has**, and the one this list
+    /// most needs: a frameless, always-on-top window of a hardcoded height
+    /// with no `ScrollArea` anywhere, so a row or a button past the bottom
+    /// edge is unreachable, and the geometry tests can only say the card fits
+    /// -- not whether it reads as a form somebody would fill in.
+    OverlaySaveLogin,
     /// The login window with a vault that exists and is locked.
     LoginUnlock,
     /// The login window with no account yet -- server dropdown and the Hello
@@ -215,6 +224,7 @@ const ALL: &[Surface] = &[
     Surface::Overlay,
     Surface::OverlayNoMatch,
     Surface::OverlayLocked,
+    Surface::OverlaySaveLogin,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -239,6 +249,7 @@ impl Surface {
             Surface::Overlay => "overlay",
             Surface::OverlayNoMatch => "overlay_no_match",
             Surface::OverlayLocked => "overlay_locked",
+            Surface::OverlaySaveLogin => "overlay_save_login",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -273,6 +284,13 @@ impl Surface {
             Surface::Overlay | Surface::OverlayNoMatch | Surface::OverlayLocked => {
                 egui::vec2(396.0, 164.0)
             }
+            // Read off the module rather than written out: 3c is the one
+            // overlay state that is NOT 164pt tall, and a preview rendered at
+            // the wrong height is a picture of a layout nobody ships.
+            Surface::OverlaySaveLogin => egui::vec2(
+                overlay_ui::OVERLAY_WIDTH,
+                overlay_ui::overlay_height(overlay_ui::SAVE_LOGIN_ROWS),
+            ),
             Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
             Surface::LoginDetail
             | Surface::CardDetail
@@ -370,6 +388,10 @@ fn main() -> eframe::Result {
                 directory: all,
                 out,
                 form: LoginForm::default(),
+                // The app name a real 3c card would have been pre-filled with,
+                // and nothing else: the other three rows are what this app can
+                // actually know about the window, which is nothing.
+                save_login: overlay_ui::SaveLoginForm::new("Atlas Licence"),
                 screenshot,
                 done: false,
                 frames: 0,
@@ -431,6 +453,9 @@ struct Preview {
     out: PathBuf,
     /// Form state for the login preview (typing works; Continue doesn't).
     form: LoginForm,
+    /// Form state for design 3c (typing works; Save doesn't -- there is no
+    /// vault behind this example).
+    save_login: overlay_ui::SaveLoginForm,
     /// Capture and exit, rather than sit there being looked at.
     screenshot: bool,
     /// Every surface has been captured and `Close` has been asked for. The
@@ -507,6 +532,7 @@ impl eframe::App for Preview {
             Surface::Overlay => self.draw_overlay(root, &ctx),
             Surface::OverlayNoMatch => self.draw_overlay_no_match(root, &ctx),
             Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
+            Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false),
             Surface::LoginSignin => self.draw_login(root, &ctx, true),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
@@ -636,6 +662,25 @@ impl Preview {
         egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
             if overlay_ui::draw_locked_card(ui, "Atlas Licence")
                 == overlay_ui::OverlayAction::Dismiss
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+
+    /// Design 3c, drawn by the shipped function for the same reason 3a and 3b
+    /// are.
+    ///
+    /// The form is drawn **blank apart from the App row**, which is the state
+    /// the user is really shown: exactly one of the four rows can be
+    /// pre-filled, because `injector::ui_automation` has no username reader
+    /// and a password field's contents are not read. A preview that typed
+    /// plausible values into the other two would be a picture of a capture
+    /// this app does not make.
+    fn draw_overlay_save_login(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
+            if overlay_ui::draw_save_login_card(ui, &mut self.save_login)
+                != overlay_ui::SaveLoginAction::None
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

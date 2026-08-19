@@ -2902,7 +2902,11 @@ struct NoMatchEnv<'a> {
     /// frameless always-on-top window, which no test in this crate may do --
     /// and which, un-seamed, would make the two no-match dispatch tests below
     /// hang on a window nobody can close.
-    show: fn(&window_watch::ForegroundEvent),
+    ///
+    /// It takes the cache now, because 3a's *New login* button leads to design
+    /// 3c and 3c ends in `VaultCache::create_item` -- see `app::handle_no_match`
+    /// for what that widening does and does not buy.
+    show: fn(&VaultCache, &window_watch::ForegroundEvent),
     /// Asked to put design 3b on screen: the same window, focused while the
     /// vault cannot be read. Its own `fn` pointer rather than a flag on
     /// `show`, for the reason `PromptPresenter::show_locked` gives -- and so
@@ -2953,7 +2957,7 @@ const REAL_PASSWORD_FIELD_PROBE: fn(isize) -> HasPasswordField = real_password_f
 /// `REAL_PASSWORD_FIELD_PROBE` above and `app::REAL_OVERLAY` in the library.
 /// `handle_no_match` takes only the window, so there is no argument here for a
 /// mutation to hide in.
-const REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = handle_no_match;
+const REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = handle_no_match;
 
 /// The production 3b card, named and not called -- the same shape, and the
 /// same reason, as [`REAL_NO_MATCH_CARD`] directly above.
@@ -3071,7 +3075,17 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
         Matched::No => field_probe.ask(event.hwnd),
     };
 
-    match deskwarden::app::disposition(matched, field, vault) {
+    // The fourth input: whether the user pressed *Never for this app* on
+    // design 3c's card for THIS window. Computed per-window by
+    // `app::never_for_app` -- `disposition` is never handed the list, so it
+    // cannot be the function that silences a different app than the one it
+    // was asked about.
+    let never = deskwarden::app::never_for_app(
+        &deskwarden::app::never_apps(),
+        deskwarden::app::window_label(&event.exe_name, &event.title),
+    );
+
+    match deskwarden::app::disposition(matched, field, vault, never) {
         Open::Match(item_id) => {
             log::info!(
                 "matched {} to vault item {item_id} ({:?})",
@@ -3109,7 +3123,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // one opens a frameless always-on-top window, which no test in
             // this crate may do -- and which, called directly on this line,
             // would make those tests hang rather than fail.
-            (field_probe.show)(event);
+            (field_probe.show)(cache, event);
         }
         Open::Locked => {
             log::info!(
@@ -20769,7 +20783,7 @@ mod tests {
         /// frameless always-on-top window. A test that reached it would not
         /// fail -- it would HANG, on a window with no title bar in a run with
         /// no user.
-        fn record_no_match(window: &window_watch::ForegroundEvent) {
+        fn record_no_match(_cache: &VaultCache, window: &window_watch::ForegroundEvent) {
             NO_MATCH_SHOWN.with(|s| {
                 // The EVENT, not a label computed here: the label is
                 // `no_match_arm`'s to compute, and a recorder that computed it
@@ -20844,7 +20858,7 @@ mod tests {
             // needle would match its own declaration, and a needle with a
             // newline in it passes on an LF checkout and fails on a CRLF one.
             let no_match_const =
-                concat!("REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_no_match;");
+                concat!("REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = ", "handle_no_match;");
             let locked_const =
                 concat!("REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
             let no_match_field = concat!("show: ", "REAL_NO_MATCH_CARD,");
@@ -20852,7 +20866,7 @@ mod tests {
 
             // The counter is shown to notice each swap before it is trusted.
             let swapped_const =
-                concat!("REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
+                concat!("REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = ", "handle_locked;");
             assert_eq!(swapped_const.matches(no_match_const).count(), 0);
             let swapped_field = concat!("show: ", "REAL_LOCKED_CARD,");
             assert_eq!(swapped_field.matches(no_match_field).count(), 0);

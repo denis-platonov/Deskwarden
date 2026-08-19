@@ -1106,6 +1106,103 @@ pub fn vault_availability(populated: bool) -> VaultAvailability {
     }
 }
 
+/// Whether the user has said *Never for this app* about the window in hand.
+///
+/// **The fourth input to [`disposition`]**, and it is an input rather than a
+/// check somewhere downstream because a "never" that still shows the card is
+/// not a never. The control it feeds is per-app, so it is computed for *this*
+/// window by [`never_for_app`] and passed in; `disposition` itself never sees
+/// a list and so cannot silence the wrong app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeverForApp {
+    /// This app is on the list: the overlay's unmatched states stay shut.
+    Yes,
+    /// It is not.
+    No,
+}
+
+/// [`NeverForApp`] for `app`, from
+/// [`crate::settings::Settings::never_save_for_apps`].
+///
+/// **A pure function over the list, and the place "a different app is
+/// unaffected" is checked.** The whole risk of a per-app silence is that it is
+/// not per-app: a substring match, a normalisation that collapses two names, or
+/// a list read with the wrong index, and one *Never* silences the overlay
+/// everywhere. `a_never_for_one_app_leaves_every_other_app_alone` is the test
+/// that holds it, and the comparison here is whole-string equality --
+/// deliberately not `contains`, not a prefix, not a path fragment.
+///
+/// It is **ASCII-case-insensitive**, because the string is
+/// [`window_label`]'s answer: Windows hands the same executable back as
+/// `Tracker.exe` and `tracker.exe` depending on how it was launched, and a user
+/// who silenced one has silenced the app rather than a spelling. It is not
+/// Unicode-case-folded: the fold is locale-dependent, and a folding that
+/// silenced a *different* app is worse than one that failed to silence the
+/// same one twice.
+pub fn never_for_app(never: &[String], app: &str) -> NeverForApp {
+    if never.iter().any(|a| a.eq_ignore_ascii_case(app)) {
+        NeverForApp::Yes
+    } else {
+        NeverForApp::No
+    }
+}
+
+/// The apps this process has been told *Never* about.
+///
+/// Seeded once from `settings.json` and appended to by
+/// [`remember_never_for_app`], because `main` holds a `Settings` loaded at
+/// startup and never refreshed -- so a *Never* chosen at 10am would otherwise
+/// not take effect until the app was restarted, which is the one behaviour
+/// this control must not have.
+///
+/// **Nothing in this crate's tests touches it.** Every decision it feeds is a
+/// pure function over a slice ([`never_for_app`]) or over a closure
+/// ([`route_save_answer`]); this is the process-wide *cache* in front of those,
+/// and reading it lazily loads `settings.json` from `%APPDATA%`, which no test
+/// may do.
+static NEVER_APPS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// [`NEVER_APPS`], loading it from `settings.json` the first time.
+///
+/// Unreachable from a test by design; see [`NEVER_APPS`].
+pub fn never_apps() -> Vec<String> {
+    let mut held = NEVER_APPS.lock().unwrap_or_else(|e| e.into_inner());
+    held.get_or_insert_with(|| {
+        crate::settings::default_path()
+            .map(|p| crate::settings::Settings::load(&p).never_save_for_apps)
+            .unwrap_or_default()
+    })
+    .clone()
+}
+
+/// Records `app` as one the user never wants to be asked about again -- in
+/// this process, and on disk.
+///
+/// **Both halves, and in that order.** The in-memory half is what makes the
+/// *next* foreground event silent; the disk half is what makes the one after
+/// the next restart silent. Writing only the file would leave the card
+/// appearing for the rest of the session immediately after the user pressed
+/// the control that says it will not.
+///
+/// A failed write is logged and not otherwise acted on: the user's answer
+/// still holds for this session, which is strictly better than dropping it,
+/// and there is no surface on a frameless always-on-top card to report a
+/// settings-file failure on.
+fn remember_never_for_app(app: &str) {
+    {
+        let mut held = NEVER_APPS.lock().unwrap_or_else(|e| e.into_inner());
+        let list = held.get_or_insert_with(Vec::new);
+        if !list.iter().any(|a| a.eq_ignore_ascii_case(app)) {
+            list.push(app.to_string());
+        }
+    }
+    if let Some(path) = crate::settings::default_path() {
+        if let Err(e) = crate::settings::Settings::persist_never_save_for_app(&path, app) {
+            log::warn!("could not record `never for {app}` in {}: {e}", path.display());
+        }
+    }
+}
+
 /// What focusing this window should put on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Open<'a> {
@@ -1165,10 +1262,52 @@ pub enum Open<'a> {
 /// not also have run. Had the fix been to stay silent when locked, the probe
 /// would have had to be skipped rather than paid and discarded -- see
 /// `main::process_foreground_event`, which is where that lives.
+///
+/// # `never` is the fourth input, and it suppresses 3a **and** 3b
+///
+/// *Never for this app* (design 3c) is the only thing on any of these cards
+/// that outlives the card. It is an input to this function rather than a check
+/// further downstream for the plainest of reasons: **a "never" that still
+/// shows the card is not a "never"**. Anything short of this arm leaves the
+/// window opening and closing itself again, which is the behaviour the user
+/// just asked to stop.
+///
+/// **It suppresses [`Open::Locked`] too, and that was a decision.** The
+/// argument for exempting 3b is that 3b is a statement about *Deskwarden*, not
+/// about the app -- the user said "do not offer to save this app", not "do not
+/// tell me you are locked". The argument against it, which wins, is what the
+/// user actually experiences: 3b appears on **exactly the same trigger** as 3a
+/// -- an unmatched window with a password field -- so an exemption means the
+/// silenced app starts popping a card up again the moment the vault locks, and
+/// goes quiet again when it unlocks. From the user's chair that is not a
+/// different message, it is the same window they turned off, coming back on a
+/// schedule they cannot see, for a reason the card does not explain. A control
+/// with that behaviour is one users learn not to trust.
+///
+/// And the exemption would buy nothing: while locked this app can neither fill
+/// (the engine is empty, so `Matched::Yes` is unreachable) nor save (3c ends in
+/// a write to an unlocked vault), and 3b offers no unlock of its own -- it is
+/// purely a notification. Suppressing a notification for an app the user
+/// silenced costs them nothing they had.
+///
+/// **What `never` deliberately does NOT suppress is [`Open::Match`].** The
+/// `Matched::Yes` arm never consults it. "Do not offer to save a login for
+/// this app" and "do not offer to fill the login I already saved for it" are
+/// different questions, and the user answered only the first -- on a card that
+/// was only ever shown because there was nothing to fill.
+/// `a_never_for_an_app_still_fills_it_if_the_vault_gains_a_match` holds that,
+/// and it is the arm that keeps this control from being a way to accidentally
+/// switch autofill off for an app forever.
+///
+/// **The silence control is untouched and still pure.** A window with no
+/// password field and no match is [`Open::Nothing`] whatever `never` says --
+/// `never` is read only inside the `HasPasswordField::Yes` arm, so it can add
+/// silence and can never remove any.
 pub fn disposition<'a>(
     matched: Matched<'a>,
     field: HasPasswordField,
     vault: VaultAvailability,
+    never: NeverForApp,
 ) -> Open<'a> {
     match matched {
         // A match is only representable when the engine holds entries, which
@@ -1177,6 +1316,14 @@ pub fn disposition<'a>(
         // the card the user gets for a recognised window is unchanged.
         Matched::Yes(item_id) => Open::Match(item_id),
         Matched::No => match field {
+            // **`never` is read here and nowhere else in the tree**, so it can
+            // only ever silence the branch it was added for: an unmatched
+            // window with a password field. It does not reach `Matched::Yes`
+            // (see the arm above -- a *save* refusal is not a *fill* refusal),
+            // and it does not reach the `No | Unknown` arm, which is silent
+            // already and whose silence must go on coming from the field
+            // answer rather than from a list.
+            HasPasswordField::Yes if never == NeverForApp::Yes => Open::Nothing,
             HasPasswordField::Yes => match vault {
                 VaultAvailability::Readable => Open::NoMatch,
                 VaultAvailability::Locked => Open::Locked,
@@ -1587,11 +1734,30 @@ pub trait PromptPresenter {
     /// Shows design **3a** -- the card for a window with a password field that
     /// nothing in the vault matches -- and returns when the user dismisses it.
     ///
-    /// **No return value, and no item argument.** There is nothing to choose
-    /// and nothing to name; a signature that could carry an item id here is a
-    /// signature something can later fill in with a sentinel. See
-    /// [`no_match_arm`].
-    fn show_no_match(&self, label: &str, position: Option<(f32, f32)>);
+    /// **No item argument, and no item in the answer.** There is nothing to
+    /// name; a signature that could carry an item id here is a signature
+    /// something can later fill in with a sentinel. See [`no_match_arm`].
+    ///
+    /// It does answer one bit -- whether the user clicked *New login* -- which
+    /// is 3a's button finally having a destination, not a promise about an
+    /// item. See [`overlay_ui::NoMatchAnswer`].
+    fn show_no_match(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::NoMatchAnswer;
+    /// Shows design **3c** -- the save-a-new-login form -- and answers what the
+    /// user decided together with what they typed.
+    ///
+    /// `None` is not a decision: it is the overlay refusing to stack a second
+    /// window on itself. A user who dismisses the card answers
+    /// [`overlay_ui::SaveLoginAction::NotNow`], because "silence today" is a
+    /// decision and is spelled as one.
+    fn show_save_login(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>;
     /// Shows design **3b** -- the card for a window with a password field
     /// focused while the vault cannot be read -- and returns when the user
     /// dismisses it.
@@ -1621,9 +1787,17 @@ pub struct FnPresenter {
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
-    /// Asked to put design 3a on screen. Answers nothing; see
-    /// [`PromptPresenter::show_no_match`].
-    pub show_no_match: fn(&str, Option<(f32, f32)>),
+    /// Asked to put design 3a on screen. Answers whether *New login* was
+    /// clicked; see [`PromptPresenter::show_no_match`].
+    pub show_no_match: fn(&str, Option<(f32, f32)>) -> overlay_ui::NoMatchAnswer,
+    /// Asked to put design 3c on screen. See
+    /// [`PromptPresenter::show_save_login`].
+    #[allow(clippy::type_complexity)]
+    pub show_save_login: fn(
+        &str,
+        Option<(f32, f32)>,
+    )
+        -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>,
     /// Asked to put design 3b on screen. Answers nothing; see
     /// [`PromptPresenter::show_locked`].
     pub show_locked: fn(&str, Option<(f32, f32)>),
@@ -1644,8 +1818,20 @@ impl PromptPresenter for FnPresenter {
         (self.show)(label, matched, position, choices)
     }
 
-    fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
+    fn show_no_match(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::NoMatchAnswer {
         (self.show_no_match)(label, position)
+    }
+
+    fn show_save_login(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+        (self.show_save_login)(label, position)
     }
 
     fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
@@ -1667,6 +1853,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     show: overlay_ui::show_prompt_overlay,
     show_no_match: overlay_ui::show_no_match_overlay,
     show_locked: overlay_ui::show_locked_overlay,
+    show_save_login: overlay_ui::show_save_login_overlay,
 };
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
@@ -1735,9 +1922,123 @@ pub fn prompt_arm<P: PromptPresenter>(
 pub fn no_match_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
-) {
+) -> overlay_ui::NoMatchAnswer {
     let position = presenter.position(window.hwnd, overlay_ui::NO_MATCH_ROWS);
-    presenter.show_no_match(window_label(&window.exe_name, &window.title), position);
+    presenter.show_no_match(window_label(&window.exe_name, &window.title), position)
+}
+
+/// **The whole of the 3c arm, as a pure function** -- [`no_match_arm`]'s
+/// sibling, written the same way and for the same two reasons.
+///
+/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, not
+/// `NO_MATCH_ROWS`. The two are different numbers -- 3c is by far the tallest
+/// state the overlay has -- and the clamp onto the monitor's work area is a
+/// function of the card's height, so asking about the card the user just left
+/// would put this card's *Save* button, its *Never* link and the bottom of its
+/// password field under the taskbar for any window anchored near the bottom of
+/// the screen.
+///
+/// **Nothing about an item crosses this function either**, and that is still
+/// true even though this is the arm that ends in a create: there is no item
+/// *yet*. What comes back is what the user typed, and
+/// [`route_save_answer`] is what decides whether it becomes one.
+pub fn save_login_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+    let position = presenter.position(window.hwnd, overlay_ui::SAVE_LOGIN_ROWS);
+    presenter.show_save_login(window_label(&window.exe_name, &window.title), position)
+}
+
+/// The `NewItem` a filled-in 3c form becomes.
+///
+/// **One function, and it is the whole mapping** from the card's four rows to
+/// the four arguments `NewItem::login` takes -- so "which row went where" is a
+/// claim a test makes about a value, not a claim a reviewer makes about a call
+/// buried in a window callback.
+///
+/// * **name** is the app name, the one pre-filled row: the item is named after
+///   the thing the user was signing in to, which is the only name this process
+///   has for it.
+/// * **username** and **password** are what the user typed. Both may be empty;
+///   `vault_bridge` omits a blank one rather than POSTing `""`.
+/// * **folder** is `None`, always. See [`overlay_ui::FOLDER_ROW_TEXT`] for why
+///   the card states a folder rather than picking one, and
+///   `the_new_login_is_unfiled_because_the_card_offers_no_folder` for the test
+///   that holds the two together.
+///
+/// It takes the form by value so the `Zeroizing` password is *moved* into the
+/// payload rather than copied out of a borrow and left behind in the form.
+pub fn new_login_item(form: overlay_ui::SaveLoginForm) -> crate::vault_bridge::NewItem {
+    crate::vault_bridge::NewItem::login(
+        form.app_name.clone(),
+        form.username.clone(),
+        form.password.as_str(),
+        None,
+    )
+}
+
+/// What routing a 3c answer did.
+///
+/// **[`Self::Nothing`] and [`Self::Silenced`] are different variants, and that
+/// is the point of this type.** *Not now* is silence today; *Never for this
+/// app* is silence forever, and it writes to `settings.json`. A routing that
+/// answered a `bool` -- or that folded both into "did not save" -- is exactly
+/// the bug a user cannot undo without finding a setting, because the two look
+/// identical at the moment they are chosen and only diverge the next time the
+/// window is focused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// *Save*: the create route was called, and this is what it said.
+    Created(Result<String, String>),
+    /// *Not now*, Esc, the ✕, or the overlay refusing to open: nothing was
+    /// written, nothing was remembered, and the card comes back next time.
+    Nothing,
+    /// *Never for this app*: nothing was written to the vault, and this app
+    /// was remembered so that [`disposition`] stops opening 3a and 3b for it.
+    Silenced(String),
+}
+
+/// **The three answers, as a pure function.**
+///
+/// The whole of what 3c decides, with the vault and the settings file behind
+/// two closures -- so a test can drive all three answers, count the calls, and
+/// assert that *Not now* and *Never* really do different things, without a
+/// vault, a window or a disk anywhere near it.
+///
+/// `create` is called **only** for [`overlay_ui::SaveLoginAction::Save`], and
+/// `silence` **only** for [`overlay_ui::SaveLoginAction::Never`]. Neither is
+/// called for the other's answer and neither is called twice;
+/// `the_three_answers_do_three_different_things` counts both.
+///
+/// `answer` is an `Option` because [`save_login_arm`] can come back with
+/// nothing at all -- the overlay refusing to stack a second window. That is
+/// [`SaveOutcome::Nothing`], the same as *Not now*, and deliberately so:
+/// a card that never opened has not been answered, and must not be recorded as
+/// a "never".
+pub fn route_save_answer(
+    answer: Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>,
+    create: impl FnOnce(&crate::vault_bridge::NewItem) -> Result<String, String>,
+    silence: impl FnOnce(&str),
+) -> SaveOutcome {
+    let Some((action, form)) = answer else {
+        return SaveOutcome::Nothing;
+    };
+    match action {
+        overlay_ui::SaveLoginAction::Save => SaveOutcome::Created(create(&new_login_item(form))),
+        overlay_ui::SaveLoginAction::Never => {
+            let app = form.app_name.clone();
+            silence(&app);
+            SaveOutcome::Silenced(app)
+        }
+        // The ✕, Esc, *Not now*, and the card that closed without an answer
+        // all land here, and all of them mean "ask me again". The weakest
+        // gestures a user can make must not be read as the strongest answer
+        // the card offers.
+        overlay_ui::SaveLoginAction::NotNow | overlay_ui::SaveLoginAction::None => {
+            SaveOutcome::Nothing
+        }
+    }
 }
 
 /// Dispatches a freshly foregrounded window that asks for a password and that
@@ -1756,10 +2057,60 @@ pub fn no_match_arm<P: PromptPresenter>(
 /// hotkey armed against a window with no credentials behind it would fire into
 /// whatever holds focus later.
 ///
-/// Only the real presenter is named on this line; every decision is
-/// [`no_match_arm`]'s, which a test drives with a recorder.
-pub fn handle_no_match(window: &crate::window_watch::ForegroundEvent) {
-    no_match_arm(&REAL_OVERLAY, window);
+/// **It takes a [`VaultCache`] now, and that is a real widening of what this
+/// path holds.** 3a's *New login* button leads to 3c, and 3c ends in creating
+/// a vault item; nothing that cannot reach the vault can do that. What the
+/// widening does *not* buy is any of the things the narrow signature was
+/// protecting against: there is still no `Injector` and no `FillStats`, so
+/// nothing here can type; there is still no [`Reprompt`], so the re-prompt
+/// gate -- which is defined over an existing item -- is still not reachable
+/// from a path that has no item; and this still returns `()`, so the fill
+/// hotkey is still not armed. The cache is used for exactly one call,
+/// [`VaultCache::create_item`], which is the same route the edit form takes.
+///
+/// Only the real presenter and the real create route are named on these lines;
+/// every decision is [`no_match_arm`]'s, [`save_login_arm`]'s and
+/// [`route_save_answer`]'s, each of which a test drives with a recorder.
+pub fn handle_no_match(cache: &VaultCache, window: &crate::window_watch::ForegroundEvent) {
+    if no_match_arm(&REAL_OVERLAY, window) != overlay_ui::NoMatchAnswer::NewLogin {
+        return;
+    }
+    let outcome = route_save_answer(
+        save_login_arm(&REAL_OVERLAY, window),
+        // **The one item-creating route in this app**, the same
+        // `VaultCache::create_item` the edit form calls -- not a second one.
+        // `no_match_wiring_tests` pins this call by source text, the way
+        // `prompt_wiring_tests` pins `REAL_OVERLAY`'s two function names,
+        // because this line needs a real vault and a real window and so is
+        // the one thing here no test can execute.
+        |new_item| {
+            cache
+                .create_item(new_item)
+                .map(|item| item.id)
+                .map_err(|e| format!("{e:?}"))
+        },
+        remember_never_for_app,
+    );
+    log::info!("the save-a-new-login card was answered: {}", describe_outcome(&outcome));
+}
+
+/// What a [`SaveOutcome`] is written to the log as.
+///
+/// **A function, so that "the log line never carries the password" is a claim
+/// a test can make** rather than a property of a format string at an
+/// unreachable call site. `SaveOutcome` cannot hold the password -- the
+/// `Zeroizing` is moved into the `NewItem` and dropped with it -- but the item
+/// *name* and the app name are in it, and this is where what is said about
+/// them is decided.
+pub fn describe_outcome(outcome: &SaveOutcome) -> String {
+    match outcome {
+        SaveOutcome::Created(Ok(id)) => format!("saved as vault item {id}"),
+        SaveOutcome::Created(Err(e)) => format!("the save failed: {e}"),
+        SaveOutcome::Nothing => "not now -- nothing was written, and it will ask again".to_string(),
+        SaveOutcome::Silenced(app) => {
+            format!("never for {app} -- the overlay will not open for it again")
+        }
+    }
 }
 
 /// **The whole of the locked arm, as a pure function** -- [`no_match_arm`]'s
@@ -2168,6 +2519,9 @@ mod tests {
         /// The label and placement each `show_locked` was handed -- design
         /// 3b's own log, kept apart from both of the others.
         locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
+        /// The label and placement each `show_save_login` was handed -- design
+        /// 3c's own log, kept apart from all three of the others.
+        save_login_shown: std::cell::RefCell<Vec<NoMatchShown>>,
     }
 
     impl PromptPresenter for RecordingPresenter {
@@ -2197,10 +2551,34 @@ mod tests {
         /// no-match card recorded as though it were a matched one would let
         /// `no_match_arm` satisfy a test written about `prompt_arm`, and the
         /// two states differ by exactly whether an item exists.
-        fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
+        fn show_no_match(
+            &self,
+            label: &str,
+            position: Option<(f32, f32)>,
+        ) -> overlay_ui::NoMatchAnswer {
             self.no_match_shown
                 .borrow_mut()
                 .push((label.to_string(), position));
+            // Dismissed, so this recorder never leads on into 3c: the tests
+            // that use it are about WHERE 3a opened and WHAT it was called,
+            // and a recorder that walked on to the save card would make every
+            // one of them a test of two cards.
+            overlay_ui::NoMatchAnswer::Dismissed
+        }
+
+        /// Design 3c goes into a log of its own too, for the reason 3a and 3b
+        /// do: it is the only card of the four that can WRITE, so a recorder
+        /// that let it satisfy another card's test would be the loosest of the
+        /// four.
+        fn show_save_login(
+            &self,
+            label: &str,
+            position: Option<(f32, f32)>,
+        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+            self.save_login_shown
+                .borrow_mut()
+                .push((label.to_string(), position));
+            None
         }
 
         /// Design 3b goes into a log of its own, for the same reason 3a does
@@ -2691,8 +3069,24 @@ mod tests {
         /// spy exists to catch a raw `exe_name` reaching ANY string the
         /// overlay renders, and 3a's label is one -- indeed it is the only
         /// string that card shows about the window.
-        fn show_no_match(&self, label: &str, _position: Option<(f32, f32)>) {
+        fn show_no_match(
+            &self,
+            label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::NoMatchAnswer {
             self.seen.borrow_mut().push(label.to_string());
+            overlay_ui::NoMatchAnswer::Dismissed
+        }
+
+        /// And so does design 3c's -- it names the app in its App row, which
+        /// is the row the whole card is built around.
+        fn show_save_login(
+            &self,
+            label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+            self.seen.borrow_mut().push(label.to_string());
+            None
         }
 
         /// And so does design 3b's, for the same reason: it is the only
@@ -2788,8 +3182,22 @@ mod tests {
             None
         }
 
-        fn show_no_match(&self, _label: &str, _position: Option<(f32, f32)>) {
+        fn show_no_match(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::NoMatchAnswer {
             self.log.borrow_mut().push("no-match card shown");
+            overlay_ui::NoMatchAnswer::Dismissed
+        }
+
+        fn show_save_login(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+            self.log.borrow_mut().push("save-login card shown");
+            None
         }
 
         fn show_locked(&self, _label: &str, _position: Option<(f32, f32)>) {
@@ -2919,11 +3327,29 @@ mod tests {
     static NO_MATCH_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn recording_show_no_match(label: &str, position: Option<(f32, f32)>) {
+    fn recording_show_no_match(
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::NoMatchAnswer {
         NO_MATCH_FORWARDED
             .lock()
             .unwrap()
             .push((label.to_string(), position));
+        overlay_ui::NoMatchAnswer::Dismissed
+    }
+
+    static SAVE_LOGIN_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn recording_show_save_login(
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+        SAVE_LOGIN_FORWARDED
+            .lock()
+            .unwrap()
+            .push((label.to_string(), position));
+        None
     }
 
     static LOCKED_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
@@ -2946,6 +3372,7 @@ mod tests {
             show: recording_show,
             show_no_match: recording_show_no_match,
             show_locked: recording_show_locked,
+            show_save_login: recording_show_save_login,
         };
 
         assert_eq!(presenter.position(4242, 3), Some((11.0, 22.0)));
@@ -5727,6 +6154,386 @@ mod match_disposition_tests {
     }
 }
 
+/// **Design 3c's three answers, the per-app silence, and the one create
+/// route** -- everything Task 3 decides that a test can execute.
+#[cfg(test)]
+mod save_login_tests {
+    use super::*;
+    use crate::overlay_ui::{SaveLoginAction, SaveLoginForm};
+    use crate::vault_bridge::NewItem;
+
+    const APP: &str = "tracker.exe";
+
+    /// A form as the user would have left it: the app pre-filled, the two
+    /// credential rows typed in.
+    fn filled() -> SaveLoginForm {
+        let mut form = SaveLoginForm::new(APP);
+        form.username = "a.novak@ledgerline.com".to_string();
+        form.password = zeroize::Zeroizing::new("hunter2-but-longer".to_string());
+        form
+    }
+
+    /// A recorder for the two effects `route_save_answer` can have.
+    #[derive(Default)]
+    struct Effects {
+        created: std::cell::RefCell<Vec<NewItem>>,
+        silenced: std::cell::RefCell<Vec<String>>,
+    }
+
+    fn route(effects: &Effects, action: SaveLoginAction) -> SaveOutcome {
+        route_save_answer(
+            Some((action, filled())),
+            |new_item| {
+                effects.created.borrow_mut().push(new_item.clone());
+                Ok("new-id".to_string())
+            },
+            |app| effects.silenced.borrow_mut().push(app.to_string()),
+        )
+    }
+
+    /// **The three answers do three different things**, and in particular
+    /// *Not now* and *Never* do not do the same thing.
+    ///
+    /// This is the assertion Task 3 exists for. The two silences are
+    /// indistinguishable at the moment they are chosen -- both close the card
+    /// and write nothing to the vault -- and they diverge only the next time
+    /// the window is focused, by which point a user who meant *Not now* has no
+    /// idea why the card stopped coming and no obvious place to look. So the
+    /// difference is made here, in a pure function, where it is counted.
+    #[test]
+    fn the_three_answers_do_three_different_things() {
+        let save = Effects::default();
+        let saved = route(&save, SaveLoginAction::Save);
+        assert_eq!(saved, SaveOutcome::Created(Ok("new-id".to_string())));
+        assert_eq!(save.created.borrow().len(), 1, "Save did not create exactly one item");
+        assert!(
+            save.silenced.borrow().is_empty(),
+            "Save silenced the app as well as saving it, so a user who saved a login for an \
+             app would never be offered one for it again"
+        );
+
+        let not_now = Effects::default();
+        assert_eq!(route(&not_now, SaveLoginAction::NotNow), SaveOutcome::Nothing);
+        assert!(not_now.created.borrow().is_empty(), "`Not now` wrote to the vault");
+        assert!(
+            not_now.silenced.borrow().is_empty(),
+            "`Not now` silenced the app forever. That is the one bug on this card a user \
+             cannot undo without finding a setting: they said `not now` and got `never`"
+        );
+
+        let never = Effects::default();
+        assert_eq!(route(&never, SaveLoginAction::Never), SaveOutcome::Silenced(APP.to_string()));
+        assert!(
+            never.created.borrow().is_empty(),
+            "`Never for this app` wrote the login to the vault as well as silencing it"
+        );
+        assert_eq!(
+            *never.silenced.borrow(),
+            vec![APP.to_string()],
+            "`Never for this app` did not record the app, so the silence lasts until the \
+             card is closed and no longer"
+        );
+
+        // ...and the three outcomes are three distinct values, which is what
+        // lets a caller act on them differently at all.
+        assert_ne!(saved, SaveOutcome::Nothing);
+        assert_ne!(SaveOutcome::Nothing, SaveOutcome::Silenced(APP.to_string()));
+    }
+
+    /// A card that never opened is *not* an answer, and above all it is not a
+    /// `Never`.
+    ///
+    /// `save_login_arm` answers `None` when the overlay refuses to stack a
+    /// second window on itself. Reading that as the strongest of the three
+    /// answers would silence an app the user was never shown a card for.
+    #[test]
+    fn a_card_that_never_opened_answers_nothing_and_records_nothing() {
+        let mut created = 0;
+        let mut silenced = 0;
+        let outcome = route_save_answer(
+            None,
+            |_| {
+                created += 1;
+                Ok(String::new())
+            },
+            |_| silenced += 1,
+        );
+        assert_eq!(outcome, SaveOutcome::Nothing);
+        assert_eq!(created, 0, "an overlay that never opened created a vault item");
+        assert_eq!(silenced, 0, "an overlay that never opened silenced an app forever");
+    }
+
+    /// The four rows land on the four arguments of `NewItem::login`, and the
+    /// folder is `None`.
+    #[test]
+    fn the_four_rows_land_on_the_four_arguments_of_the_create() {
+        match new_login_item(filled()) {
+            NewItem::Login { name, folder_id, username, password } => {
+                assert_eq!(name, APP, "the item is not named after the app it is for");
+                assert_eq!(username, "a.novak@ledgerline.com");
+                assert_eq!(
+                    password, "hunter2-but-longer",
+                    "the password the user typed is not the password being saved"
+                );
+                assert_eq!(
+                    folder_id, None,
+                    "the new login is filed somewhere, and the card offers no folder to file \
+                     it in -- see `overlay_ui::FOLDER_ROW_TEXT`"
+                );
+            }
+            other => panic!("3c created something other than a login: {other:?}"),
+        }
+    }
+
+    /// An empty form is still a valid create -- `vault_bridge` omits a blank
+    /// username or password rather than POSTing `""`, and the name is
+    /// pre-filled, so there is nothing here that can produce a nameless item.
+    #[test]
+    fn an_untouched_form_still_names_the_item_after_the_app() {
+        match new_login_item(SaveLoginForm::new(APP)) {
+            NewItem::Login { name, username, password, .. } => {
+                assert_eq!(name, APP);
+                assert_eq!(username, "");
+                assert_eq!(password, "");
+            }
+            other => panic!("3c created something other than a login: {other:?}"),
+        }
+    }
+
+    /// **A `Never` for one app leaves every other app alone.**
+    ///
+    /// The whole risk of a per-app silence is that it turns out not to be
+    /// per-app: a substring match, a normalisation that collapses two names,
+    /// and one press of *Never* stops the overlay everywhere. So the positive
+    /// and the negative are both asserted, and the negatives include the two
+    /// shapes a loose comparison would let through.
+    #[test]
+    fn a_never_for_one_app_leaves_every_other_app_alone() {
+        let list = vec!["tracker.exe".to_string(), "Ledgerline.exe".to_string()];
+
+        assert_eq!(never_for_app(&list, "tracker.exe"), NeverForApp::Yes);
+        // Case: Windows hands the same executable back both ways depending on
+        // how it was launched, and a user who silenced one silenced the app.
+        assert_eq!(never_for_app(&list, "TRACKER.EXE"), NeverForApp::Yes);
+        assert_eq!(never_for_app(&list, "ledgerline.exe"), NeverForApp::Yes);
+
+        // Every other app is untouched...
+        assert_eq!(never_for_app(&list, "notepad.exe"), NeverForApp::No);
+        // ...including the two a loose comparison would catch: a name the
+        // silenced one is a prefix of, and one that contains it.
+        assert_eq!(
+            never_for_app(&list, "tracker.exe.exe"),
+            NeverForApp::No,
+            "a name the silenced one is a prefix of was silenced too"
+        );
+        assert_eq!(
+            never_for_app(&list, "not-tracker.exe"),
+            NeverForApp::No,
+            "a name containing the silenced one was silenced too"
+        );
+        // And the empty list silences nothing, which is what an older
+        // `settings.json` parses as.
+        assert_eq!(never_for_app(&[], "tracker.exe"), NeverForApp::No);
+    }
+
+    /// **A `Never` suppresses 3a and 3b, and does not touch a match or the
+    /// silence control.**
+    ///
+    /// The decision is argued in `disposition`'s own doc. This is the whole of
+    /// it as behaviour, in one place:
+    ///
+    /// * an unmatched password window that would have shown 3a is silent;
+    /// * the same window with the vault locked, which would have shown 3b, is
+    ///   silent too -- because 3b appears on exactly the same trigger, so
+    ///   exempting it means the silenced app starts popping a card up again
+    ///   the moment the vault locks;
+    /// * a window the vault *does* match still raises the fill prompt, because
+    ///   "do not offer to save this" is not "do not offer to fill what I
+    ///   saved"; and
+    /// * the ordinary window with no password field is silent either way,
+    ///   which is the control that `never` can only ever add silence.
+    #[test]
+    fn a_never_suppresses_both_cards_that_only_appear_when_nothing_matched() {
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::Yes
+            ),
+            Open::Nothing,
+            "the user pressed `Never for this app` and the no-match card came back anyway. A \
+             `never` that still shows the card is not a `never`"
+        );
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Locked,
+                NeverForApp::Yes
+            ),
+            Open::Nothing,
+            "a silenced app started showing the LOCKED card the moment the vault locked. 3b \
+             appears on the same trigger as 3a, so from the user's chair that is the window \
+             they turned off coming back on a schedule they cannot see"
+        );
+
+        // The positive controls: with `No` in the same three places, both
+        // cards are exactly what they were.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::No
+            ),
+            Open::NoMatch
+        );
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Locked,
+                NeverForApp::No
+            ),
+            Open::Locked
+        );
+    }
+
+    /// **A `Never` does not switch autofill off for the app.**
+    ///
+    /// The card the user pressed it on was only ever shown because the vault
+    /// had nothing for the window. If they later save a login for it by any
+    /// route, focusing it prompts to fill exactly as it would for any other
+    /// app: `Matched::Yes` never consults `never`.
+    #[test]
+    fn a_never_for_an_app_still_fills_it_if_the_vault_gains_a_match() {
+        let mut checked = 0;
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                assert_eq!(
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes),
+                    Open::Match("42"),
+                    "a saved login stopped being offered because the user had once said \
+                     `never save a login for this app`. Those are different questions, and \
+                     only the first one was asked"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 6, "the loop must have covered every field/vault pair");
+    }
+
+    /// **The silence control is untouched, and `never` can only add silence.**
+    ///
+    /// An ordinary window -- a text editor, a file manager -- matches nothing
+    /// and has no masked field, and it must stay silent whatever else is true.
+    /// Asserted across every combination rather than at one point, because the
+    /// claim is that `never` cannot *remove* silence anywhere.
+    #[test]
+    fn an_ordinary_window_is_still_silence_whatever_the_never_list_says() {
+        let mut checked = 0;
+        for field in [HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                for never in [NeverForApp::Yes, NeverForApp::No] {
+                    assert_eq!(
+                        disposition(Matched::No, field, vault, never),
+                        Open::Nothing,
+                        "a window with no match and no password field opened a card"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 8, "the loop must have covered every combination");
+
+        // And the other direction, stated as an ordering rather than as a
+        // list: for every input, the `Yes` answer is `Nothing` or the same as
+        // the `No` answer. Nothing `never` does can turn silence into a card.
+        for matched in [Matched::No, Matched::Yes("7")] {
+            for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+                for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                    let without = disposition(matched, field, vault, NeverForApp::No);
+                    let with = disposition(matched, field, vault, NeverForApp::Yes);
+                    assert!(
+                        with == Open::Nothing || with == without,
+                        "with `never` this window opens {with:?} and without it {without:?}, \
+                         so the list is changing WHICH card is shown rather than only \
+                         whether one is"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The one item-creating route, pinned by source text.**
+    ///
+    /// `handle_no_match` needs a real vault and opens a real always-on-top
+    /// window, so no test may execute it; the create it names is therefore the
+    /// one line here nothing can observe. This is the same guard
+    /// `prompt_wiring_tests` puts on `REAL_OVERLAY`'s function names, and it
+    /// is here for the same reason: a second item-creating route added beside
+    /// `VaultCache::create_item` would compile, ship, and bypass every
+    /// invariant that one carries (the cache push, the epoch, the era).
+    #[test]
+    fn the_save_goes_through_the_one_create_route_the_edit_form_uses() {
+        let source = include_str!("app.rs");
+        // Split literals, in this crate's idiom: a whole needle would match
+        // its own declaration.
+        let needle = concat!("cache", "\n                .create_item(new_item)");
+        let alt = concat!("cache", "\r\n                .create_item(new_item)");
+        assert_eq!(
+            source.matches(needle).count() + source.matches(alt).count(),
+            1,
+            "`handle_no_match` no longer creates the new login through \
+             `VaultCache::create_item`. That is the route the edit form uses and the only one \
+             that pushes the created item into the cache the match engine is rebuilt from -- \
+             a create that went straight to `VaultBridge` would save the login and leave \
+             autofill blind to it until the next sync"
+        );
+        // The control: the needle does not match a `bridge.create_item`.
+        assert_eq!(
+            concat!("bridge", "\n                .create_item(new_item)").matches(needle).count(),
+            0,
+            "control: the needle matches something other than the cache route"
+        );
+    }
+
+    /// `describe_outcome` never puts a credential in the log.
+    ///
+    /// `SaveOutcome` cannot hold the password -- the `Zeroizing` is moved into
+    /// the `NewItem` and dropped with it -- so this is a claim about the
+    /// remaining strings: the app name is logged, and the username is not,
+    /// because a log line naming a window and an account is a record of who
+    /// signs in to what.
+    #[test]
+    fn the_log_line_names_the_app_and_no_credential() {
+        let created = describe_outcome(&SaveOutcome::Created(Ok("abc".to_string())));
+        assert!(created.contains("abc"), "the log does not say what was saved: {created:?}");
+
+        let silenced = describe_outcome(&SaveOutcome::Silenced(APP.to_string()));
+        assert!(silenced.contains(APP), "the log does not say which app: {silenced:?}");
+
+        let nothing = describe_outcome(&SaveOutcome::Nothing);
+        assert!(
+            !nothing.is_empty() && nothing != silenced,
+            "`Not now` and `Never` produce the same log line, so the one record of which was \
+             chosen does not distinguish them either"
+        );
+
+        for line in [created, silenced, nothing] {
+            for secret in ["a.novak@ledgerline.com", "hunter2-but-longer"] {
+                assert!(
+                    !line.contains(secret),
+                    "the log line {line:?} carries {secret:?}, which is a credential the user \
+                     typed into an overlay"
+                );
+            }
+        }
+    }
+}
+
+
 /// The overlay's second trigger: whether a window with no match, but with a
 /// password field, opens the no-match card -- and, above all, whether an
 /// ordinary window still opens nothing.
@@ -5752,13 +6559,13 @@ mod disposition_tests {
     #[test]
     fn an_ordinary_window_with_no_password_field_is_still_silence() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No),
             Open::Nothing,
             "a window the vault does not know and that asks for no password now raises a card. \
              That is every editor, terminal and file manager the user focuses"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No),
             Open::Nothing,
             "a window UI Automation could not answer for is being treated as a login window. \
              `Unknown` is the case with the LEAST evidence, and it is being read as the most"
@@ -5780,7 +6587,7 @@ mod disposition_tests {
         for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
             for field in [HasPasswordField::No, HasPasswordField::Unknown] {
                 assert_eq!(
-                    disposition(Matched::No, field, vault),
+                    disposition(Matched::No, field, vault, NeverForApp::No),
                     Open::Nothing,
                     "an ordinary window raised a card with {field:?} and {vault:?}"
                 );
@@ -5795,18 +6602,18 @@ mod disposition_tests {
     #[test]
     fn a_password_field_with_no_match_opens_the_no_match_card() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No),
             Open::NoMatch
         );
         assert_eq!(
-            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable),
+            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No),
             Open::Match("7"),
             "a matched window must still open the matched card -- the item id is what the fill \
              is resolved from"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No),
             "the premise: the password-field answer actually decides something. Equal answers \
              mean the probe is being paid for and ignored"
         );
@@ -5828,14 +6635,14 @@ mod disposition_tests {
     #[test]
     fn a_locked_vault_never_claims_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No),
             Open::Locked,
             "with the vault locked and the engine therefore empty, an unmatched login window \
              still opens the card that asserts there is no saved login for it"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked),
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No),
             "the premise: the vault state actually decides something here. Equal answers mean \
              the third input is accepted and ignored, which is the defect unchanged"
         );
@@ -5853,13 +6660,13 @@ mod disposition_tests {
     #[test]
     fn an_empty_but_readable_vault_still_says_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true)),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No),
             Open::NoMatch,
             "a user whose vault genuinely has nothing for this app is now told Deskwarden is \
              locked instead, which is both false and useless to them"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false)),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No),
             Open::Locked
         );
     }
@@ -5891,7 +6698,7 @@ mod disposition_tests {
     fn a_matched_window_ignores_the_field_answer_entirely() {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             assert_eq!(
-                disposition(Matched::Yes("42"), field, VaultAvailability::Readable),
+                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No),
                 Open::Match("42"),
                 "a matched window's disposition changed with {field:?}, so the probe cannot be \
                  skipped on that branch after all"
@@ -5915,7 +6722,7 @@ mod disposition_tests {
                 HasPasswordField::Unknown,
             ] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No),
                     Open::Match("42"),
                     "a matched window's disposition changed with {field:?} and {vault:?}"
                 );
@@ -5932,7 +6739,7 @@ mod disposition_tests {
     fn the_matched_id_is_the_id_that_comes_back_out() {
         for id in ["7", "42", "a-uuid-shaped-thing"] {
             assert_eq!(
-                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable),
+                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No),
                 Open::Match(id)
             );
         }
