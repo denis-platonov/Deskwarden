@@ -93,9 +93,19 @@ will say what it actually does before it does it.
 
   The clipboard *is* used when **you explicitly copy something** — the copy
   buttons and their shortcuts for username, password, website, card number,
-  security code, SSH key and one-time code. That is the point of those
-  commands. Two things are done about what happens next, and one thing is
-  not.
+  security code, SSH key and one-time code, and the **Copy link** button on
+  a Send. That is the point of those commands. Two things are done about what
+  happens next, and one thing is not.
+
+  **The Send link is treated as a secret, and this is worth saying because
+  it does not look like one.** A Send's access link carries that Send's
+  decryption key in the part after the `#`, so anyone holding the link can
+  open the Send — the link *is* the credential. It is meant to be handed to
+  somebody else, but handing it to somebody else is not a reason to leave a
+  copy of it in your own clipboard history or on your other devices, so it
+  goes through exactly the same two things below as a password does. Note
+  that this covers the copy on *your* machine only: once you have sent the
+  link on, where it goes is between you and whoever you sent it to.
 
   **A copied secret is kept out of clipboard history and off your other
   devices.** Windows normally keeps recent clipboard entries behind `Win+V`,
