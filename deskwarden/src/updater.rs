@@ -449,8 +449,17 @@ fn launch_installer(installer_path: &Path) -> Result<(), String> {
     // the clipboard, killing `bw serve`, zeroizing the cache -- still
     // happens: `main` reaches it as soon as this returns.
     crate::app_mutex::release();
+    // `/MERGETASKS=!autostart` deselects the installer's autostart task for
+    // THIS run only. A silent install applies the default task set, and that
+    // task is checked by default (installer/deskwarden.iss), so without this
+    // an update would write the `HKCU\...\Run` value back for a user who had
+    // deliberately cleared it -- changing a system setting during an
+    // unattended update, which is not this path's business either way.
+    // Deselecting does not REMOVE an existing value, so a user who wants
+    // autostart keeps it: an update leaves the setting exactly as it found
+    // it, in both directions.
     Command::new(installer_path)
-        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES"])
+        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/MERGETASKS=!autostart"])
         .spawn()
         .map_err(|e| format!("failed to launch installer: {e}"))?;
     Ok(())
@@ -2562,7 +2571,7 @@ mod tests {
         "fnlaunch_installer(installer_path:&Path)->Result<(),String>{",
         "crate::app_mutex::release();",
         "Command::new(installer_path)",
-        ".args([\"/VERYSILENT\",\"/SUPPRESSMSGBOXES\"])",
+        ".args([\"/VERYSILENT\",\"/SUPPRESSMSGBOXES\",\"/MERGETASKS=!autostart\"])",
         ".spawn()",
         ".map_err(|e|format!(\"failedtolaunchinstaller:{e}\"))?;",
         "Ok(())}",

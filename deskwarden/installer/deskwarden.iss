@@ -105,7 +105,19 @@ Name: "{group}\Deskwarden"; Filename: "{app}\deskwarden.exe"
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Deskwarden"; ValueData: """{app}\deskwarden.exe"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Tasks]
-Name: "autostart"; Description: "Start Deskwarden automatically when you sign in"; Flags: checkedonce
+; No `checkedonce`: this task is checked by default on EVERY interactive
+; install, not only the first. `checkedonce` limits the checked default to a
+; first install, so every upgrade -- including one a user started by hand --
+; offered the box already cleared, which contradicted README's "on by
+; default, opt-out checkbox" for everyone past their first install.
+;
+; This is only safe because the self-update passes /MERGETASKS=!autostart
+; (updater.rs::launch_installer). A silent update applies the DEFAULT task
+; set, so without that flag this line would silently write the Run key back
+; for a user who had deliberately cleared it -- an unattended change to a
+; system setting, which is worse than the wrong default it fixes. The two
+; belong together; changing either alone reintroduces one of the bugs.
+Name: "autostart"; Description: "Start Deskwarden automatically when you sign in"
 
 [Run]
 ; Relaunch Deskwarden once setup finishes. Required by the design spec's
