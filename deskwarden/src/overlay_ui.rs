@@ -520,6 +520,14 @@ pub mod keys {
         }
     }
 
+    /// Whether **Ctrl+R** was pressed this frame -- design 3d's "generate
+    /// another one". See the module note; it is a newtype for the reason the
+    /// other two are, and it reaches `generate_keyboard_action` as the third
+    /// of three `bool`-shaped arguments, which is exactly the position the
+    /// swap bug lived in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RegeneratePressed(bool);
+
     impl EscapePressed {
         /// The only way to obtain one, anywhere in the crate.
         pub fn read(ctx: &egui::Context) -> Self {
@@ -531,9 +539,27 @@ pub mod keys {
             self.0
         }
     }
+
+    impl RegeneratePressed {
+        /// The only way to obtain one, anywhere in the crate.
+        ///
+        /// **Both halves are read from the same frame's input**, and the
+        /// modifier is `ctrl` rather than `command`: this app is Windows
+        /// only, where `egui::Modifiers::command` IS ctrl -- naming the one
+        /// that is true here keeps the reader from being a claim about a
+        /// platform this crate does not build for.
+        pub fn read(ctx: &egui::Context) -> Self {
+            Self(ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R)))
+        }
+
+        /// Whether Ctrl+R was down. Reading is unrestricted.
+        pub fn pressed(self) -> bool {
+            self.0
+        }
+    }
 }
 
-pub use keys::{EnterPressed, EscapePressed};
+pub use keys::{EnterPressed, EscapePressed, RegeneratePressed};
 
 /// What the user did to the overlay card on this frame.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1147,6 +1173,20 @@ pub enum SaveLoginAction {
     /// *Never for this app*: do nothing, **and do not ask about this app
     /// again**.
     Never,
+    /// The Password row's *Generate* link: **leave this card up in spirit and
+    /// open design 3d**, then come back with whatever it produced.
+    ///
+    /// It is an answer of this card rather than a state inside it because the
+    /// overlay is one window at a time -- `OVERLAY_OPEN` refuses to stack a
+    /// second -- so 3c must close for 3d to open. `crate::app::save_login_flow`
+    /// is what carries the half-typed form across the gap, which is why this
+    /// variant travels beside a [`SaveLoginForm`] like the other three: a
+    /// user who typed a username before clicking *Generate* must not lose it.
+    ///
+    /// **[`crate::app::route_save_answer`] never creates an item for it.**
+    /// This is not a decision about the vault; it is a decision about which
+    /// card is on screen.
+    Generate,
 }
 
 /// The 3c card's editable state, and the only place the typed password lives.
@@ -1331,10 +1371,23 @@ pub fn draw_save_login_card(ui: &mut egui::Ui, form: &mut SaveLoginForm) -> Save
                     save_login_field(ui, &mut form.username, false, USERNAME_HINT);
                 });
                 save_login_row(ui, "Password", |ui| {
-                    // `&mut form.password` deref-coerces to the `Zeroizing`'s
-                    // OWN buffer, typed into in place: there is no second
-                    // `String` for the value to be copied into and left in.
-                    save_login_field(ui, &mut form.password, true, PASSWORD_HINT);
+                    // A lane is reserved for the *Generate* link BEFORE the
+                    // field takes what is left: `save_login_field` sizes
+                    // itself from `available_width`, so a link added after it
+                    // would be handed nothing and pushed off the right edge
+                    // of a window that cannot scroll in that direction
+                    // either.
+                    ui.scope(|ui| {
+                        ui.set_width((ui.available_width() - GENERATE_LINK_LANE).max(1.0));
+                        // `&mut form.password` deref-coerces to the
+                        // `Zeroizing`'s OWN buffer, typed into in place:
+                        // there is no second `String` for the value to be
+                        // copied into and left in.
+                        save_login_field(ui, &mut form.password, true, PASSWORD_HINT);
+                    });
+                    if theme::link_label(ui, SAVE_GENERATE_LABEL, 11.0).clicked() {
+                        action = SaveLoginAction::Generate;
+                    }
                 });
                 save_login_row(ui, "Folder", |ui| {
                     ui.add(
@@ -1445,6 +1498,22 @@ pub const SAVE_LOGIN_LABEL: &str = "Save a login";
 /// 3c's primary button.
 pub const SAVE_LABEL: &str = "Save";
 
+/// 3c's Password-row link into design **3d**.
+///
+/// A link rather than a button, and inside the row rather than in the footer,
+/// because it belongs to the field it fills: it is the same placement the
+/// edit form's own generator has, and the footer of this card is already
+/// three answers wide.
+pub const SAVE_GENERATE_LABEL: &str = "Generate";
+
+/// The horizontal lane 3c's Password row keeps clear for
+/// [`SAVE_GENERATE_LABEL`].
+///
+/// A constant rather than a literal because it is subtracted from the
+/// password field's width, and a lane too small clips the link off the right
+/// edge of a window with no horizontal scroll either.
+const GENERATE_LINK_LANE: f32 = 62.0;
+
 /// 3c's *silence today* answer.
 pub const NOT_NOW_LABEL: &str = "Not now";
 
@@ -1491,19 +1560,23 @@ pub fn save_login_keyboard_action(
 /// The password comes back inside a [`zeroize::Zeroizing`] so that the one
 /// copy that crosses this boundary is wiped when the caller drops it.
 pub fn show_save_login_overlay(
-    app_name: &str,
+    form: SaveLoginForm,
     anchor: Option<(f32, f32)>,
 ) -> Option<(SaveLoginAction, SaveLoginForm)> {
     if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
         log::warn!(
-            "save-login overlay requested for {app_name} while one is already open in this \
-             process; ignoring rather than stacking a second window"
+            "save-login overlay requested for {} while one is already open in this \
+             process; ignoring rather than stacking a second window",
+            form.app_name
         );
         return None;
     }
 
-    let answered = Rc::new(RefCell::new((SaveLoginAction::NotNow, SaveLoginForm::new(app_name))));
-    let app = SaveLoginApp { form: SaveLoginForm::new(app_name), answered: Rc::clone(&answered) };
+    // The card opens on the form it was HANDED, not on a fresh one: coming
+    // back from design 3d, that form carries the generated password and
+    // whatever username the user had already typed.
+    let answered = Rc::new(RefCell::new((SaveLoginAction::NotNow, form.clone())));
+    let app = SaveLoginApp { form, answered: Rc::clone(&answered) };
     let options = save_login_options(anchor);
 
     let _ = eframe::run_native(
@@ -1548,6 +1621,800 @@ impl eframe::App for SaveLoginApp {
         if action != SaveLoginAction::None {
             *self.answered.borrow_mut() = (action, self.form.clone());
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+// -------------------------------------------------------------- design 3d
+
+/// Which kind of secret design **3d** asks `bw serve` for.
+///
+/// # This is Words / Letters / PIN, with the middle one renamed
+///
+/// The design draws a three-way *Words / Letters / PIN* against a backend
+/// that has two request types, which is what had Task 4 recorded as blocked.
+/// It resolves once the two axes are separated: the **request type** is a
+/// two-way ([`crate::vault_bridge::PassphraseRecipe`] against
+/// [`crate::vault_bridge::PasswordRecipe`]) and the **alphabet** is what makes
+/// three of them. [`Self::Words`] is the passphrase; [`Self::Characters`] and
+/// [`Self::Pin`] are both `PasswordRecipe`, differing only in which character
+/// classes they turn on. There is no missing recipe.
+///
+/// **The middle one is called *Characters*, not *Letters*, because that is
+/// what it is.** This card has no character-class switches (see
+/// [`draw_generate_card`]) and so the general-purpose choice is the crate's
+/// own [`crate::vault_bridge::PasswordRecipe::default`] -- all four classes,
+/// digits and symbols included. A chip reading "Letters" over a password
+/// containing `7` and `!` would be the card lying about its own output, which
+/// is the class of defect 3b's correction exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedKind {
+    /// A word passphrase: [`crate::vault_bridge::PassphraseRecipe`].
+    Words,
+    /// The default character password: every class on, which is what
+    /// "inherits the defaults" means here.
+    Characters,
+    /// Digits only -- a `PasswordRecipe` with one class on.
+    ///
+    /// **Representable, and it survives the round trip.** The route
+    /// substitutes `uppercase + lowercase + number` only when *all four*
+    /// classes arrive false (`GenerateRequest::query`'s doc, and
+    /// `vault_window::CharClasses`'s reason for existing); one class on is
+    /// honoured. A digits-only recipe is one class on.
+    Pin,
+}
+
+impl GeneratedKind {
+    /// Every kind, in the order the chips are drawn.
+    pub const ALL: [Self; 3] = [Self::Words, Self::Characters, Self::Pin];
+
+    /// The chip's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Words => "Words",
+            Self::Characters => "Characters",
+            Self::Pin => "PIN",
+        }
+    }
+
+    /// What the size readout counts, and **it is read off the kind rather
+    /// than fixed**.
+    ///
+    /// The design draws a static "20 chars" while *Words* is selected, which
+    /// does not cohere: a four-word passphrase is not twenty of anything the
+    /// user chose. The size control on this card sets `words` for a
+    /// passphrase and `length` for a password, so the readout has to say
+    /// which.
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::Words => "words",
+            Self::Characters | Self::Pin => "characters",
+        }
+    }
+
+    /// The inclusive size range the stepper may reach.
+    ///
+    /// **Every lower bound is at or above the one the route would silently
+    /// raise**, which is the rule
+    /// `a_length_the_route_would_silently_raise_is_clamped_before_it_is_sent`
+    /// holds the edit form to. `bw serve` clamps a password `length` below 5
+    /// up to 5 and a passphrase `words` below 3 up to 3, with no error and a
+    /// 200 -- so a stepper that could reach 4 digits would be a control that
+    /// visibly says one thing and silently produces another. **A four-digit
+    /// PIN is therefore not offered at all**, rather than offered and quietly
+    /// turned into five.
+    pub fn bounds(self) -> (u32, u32) {
+        match self {
+            Self::Words => (3, 10),
+            Self::Characters => (8, 64),
+            // 5, not 4: see above. This is the one bound in this table set by
+            // the server rather than by taste.
+            Self::Pin => (5, 12),
+        }
+    }
+
+    /// The size a freshly chosen kind starts at.
+    ///
+    /// `Characters` is 20 and `Words` is 4 because
+    /// [`crate::vault_bridge::PasswordRecipe`]'s and `PassphraseRecipe`'s own
+    /// defaults are -- this card inherits the crate's defaults rather than
+    /// inventing weaker ones.
+    pub fn default_size(self) -> u32 {
+        match self {
+            Self::Words => 4,
+            Self::Characters => 20,
+            Self::Pin => 6,
+        }
+    }
+
+    /// The request this kind makes at `size`, **clamped into
+    /// [`Self::bounds`] first** so no caller can build a recipe the route
+    /// would silently rewrite.
+    pub fn recipe(self, size: u32) -> crate::vault_bridge::GenerateRequest {
+        use crate::vault_bridge::{GenerateRequest, PassphraseRecipe, PasswordRecipe};
+        let (low, high) = self.bounds();
+        let size = size.clamp(low, high);
+        match self {
+            Self::Words => GenerateRequest::Passphrase(PassphraseRecipe {
+                words: size,
+                ..PassphraseRecipe::default()
+            }),
+            Self::Characters => GenerateRequest::Password(PasswordRecipe {
+                length: size,
+                ..PasswordRecipe::default()
+            }),
+            Self::Pin => GenerateRequest::Password(PasswordRecipe {
+                length: size,
+                uppercase: false,
+                lowercase: false,
+                number: true,
+                special: false,
+                // Both minima go to zero WITH the classes they belong to. A
+                // `minSpecial: 1` beside `special: false` is a request that
+                // asks for one of something it has just excluded, and what
+                // the route does with that is not a thing this card should be
+                // betting on.
+                min_number: 0,
+                min_special: 0,
+                // **Off, and the only kind for which it is.** "Avoid
+                // ambiguous" exists so a human can tell `O` from `0` and `l`
+                // from `1`. With no letters in the alphabet there is nothing
+                // to confuse them with, so all it would do is delete two of
+                // the ten digits from a six-character secret.
+                avoid_ambiguous: false,
+            }),
+        }
+    }
+}
+
+/// Where the card's one round-trip to `bw serve` has got to.
+///
+/// **There is no `Idle`.** The card opens generating -- 3d's whole premise is
+/// that the overlay *leads* with a fresh password -- so an empty state would
+/// be one the user never sees and nothing ever leaves.
+///
+/// # Debug
+///
+/// Hand-written: [`Self::Ready`] holds a `Zeroizing<String>`, and `Zeroizing`
+/// **derives** `Debug` and prints the inner value. `debug_leak_guard` refuses
+/// a derived `Debug` on any type that can reach one, and a hand-written impl
+/// here is also the barrier that keeps [`GenerateForm`] off that list.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GenerateState {
+    /// A request has been started and has not answered yet.
+    InFlight,
+    /// The generator answered. This is the password.
+    Ready(zeroize::Zeroizing<String>),
+    /// The generator failed, and this is the sentence the card shows.
+    Failed(String),
+}
+
+impl std::fmt::Debug for GenerateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InFlight => f.write_str("InFlight"),
+            // The LENGTH is not printed either. It is not the password, but
+            // it narrows it, and narrowing a secret is the thing this crate's
+            // guard exists about.
+            Self::Ready(_) => f.write_str("Ready(<redacted>)"),
+            Self::Failed(m) => f.debug_tuple("Failed").field(m).finish(),
+        }
+    }
+}
+
+/// The 3d card's whole state: what to ask for, how much of it, and where the
+/// asking has got to.
+///
+/// It may derive `Debug` because [`GenerateState`] hand-writes its own; see
+/// `debug_leak_guard`'s propagation rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateForm {
+    kind: GeneratedKind,
+    size: u32,
+    state: GenerateState,
+}
+
+impl GenerateForm {
+    /// A card that has just opened: `kind` at its default size, already
+    /// generating.
+    pub fn new(kind: GeneratedKind) -> Self {
+        Self {
+            kind,
+            size: kind.default_size(),
+            state: GenerateState::InFlight,
+        }
+    }
+
+    /// What the card is asking for.
+    pub fn kind(&self) -> GeneratedKind {
+        self.kind
+    }
+
+    /// How many words or characters.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Where the round-trip has got to.
+    pub fn state(&self) -> &GenerateState {
+        &self.state
+    }
+
+    /// Whether a request is outstanding.
+    pub fn in_flight(&self) -> bool {
+        matches!(self.state, GenerateState::InFlight)
+    }
+
+    /// The generated password, if there is one. `None` while in flight and
+    /// after a failure -- which is what makes "Save is unreachable without a
+    /// password" a property of the type rather than of the button.
+    pub fn ready(&self) -> Option<&str> {
+        match &self.state {
+            GenerateState::Ready(p) => Some(p.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The size readout, live and labelled by kind: "4 words", "20
+    /// characters".
+    pub fn readout(&self) -> String {
+        format!("{} {}", self.size, self.kind.unit())
+    }
+
+    /// The request the card would send right now.
+    pub fn request(&self) -> crate::vault_bridge::GenerateRequest {
+        self.kind.recipe(self.size)
+    }
+
+    /// Starts a request, and **answers `false` and changes nothing if one is
+    /// already outstanding.**
+    ///
+    /// This is the whole of "no second generate runs concurrently", and it is
+    /// a refusal in the one function that can enter
+    /// [`GenerateState::InFlight`] rather than a disabled button. The buttons
+    /// are disabled too -- a live control that does nothing is worse than a
+    /// grey one -- but a UI state is not where an invariant lives, and every
+    /// path that regenerates (the *New* link, Ctrl+R, changing kind, changing
+    /// size) goes through here.
+    pub fn begin(&mut self) -> bool {
+        if self.in_flight() {
+            return false;
+        }
+        self.state = GenerateState::InFlight;
+        true
+    }
+
+    /// Records what the generator answered.
+    ///
+    /// **It always leaves a state that is not [`GenerateState::InFlight`]**,
+    /// including on an error, and that is the point. The tray's update item
+    /// shipped the opposite shape -- created disabled and only ever enabled
+    /// on success -- and a user who hit its failure path was left with a
+    /// control that never came back. A card whose failure left it in flight
+    /// could never be regenerated, on a frameless window whose only other way
+    /// out is Esc.
+    pub fn finish(&mut self, answer: Result<zeroize::Zeroizing<String>, String>) {
+        self.state = match answer {
+            Ok(password) => GenerateState::Ready(password),
+            Err(message) => GenerateState::Failed(message),
+        };
+    }
+
+    /// Switches to `kind` at its default size and starts a request. Answers
+    /// whether anything moved.
+    ///
+    /// **Refused while in flight**, by the same [`Self::begin`] the other
+    /// three paths use: the answer to an outstanding request is the answer to
+    /// the recipe that was sent, and pinning it onto whichever chip the user
+    /// clicked in the meantime would be the card mislabelling its own output.
+    pub fn choose(&mut self, kind: GeneratedKind) -> bool {
+        if self.in_flight() || kind == self.kind {
+            return false;
+        }
+        self.kind = kind;
+        self.size = kind.default_size();
+        self.begin()
+    }
+
+    /// Moves the size by `delta`, within [`GeneratedKind::bounds`], and
+    /// starts a request. Answers whether anything moved.
+    pub fn resize(&mut self, delta: i32) -> bool {
+        if self.in_flight() {
+            return false;
+        }
+        let (low, high) = self.kind.bounds();
+        let next = (i64::from(self.size) + i64::from(delta)).clamp(i64::from(low), i64::from(high));
+        let next = next as u32;
+        if next == self.size {
+            return false;
+        }
+        self.size = next;
+        self.begin()
+    }
+
+    /// Whether the stepper's `delta` button should be live.
+    pub fn can_resize(&self, delta: i32) -> bool {
+        let (low, high) = self.kind.bounds();
+        !self.in_flight()
+            && match delta.signum() {
+                1 => self.size < high,
+                -1 => self.size > low,
+                _ => false,
+            }
+    }
+}
+
+/// What the user did to the 3d card.
+///
+/// **No secret reaches this type**, which is why it may derive `Debug`: the
+/// password lives in [`GenerateForm`] and is read out of it by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenerateAction {
+    /// Nothing yet; keep the card up.
+    #[default]
+    None,
+    /// Ask for another password with the settings that are showing.
+    Regenerate,
+    /// *Save to vault*: hand this password back to design 3c.
+    Save,
+    /// *Copy*: put it on the clipboard, and keep the card up.
+    Copy,
+    /// The header ✕ or Esc: close without a password.
+    Dismiss,
+}
+
+/// What 3d's header says where the matched card counts matches.
+pub const GENERATE_LABEL: &str = "New password";
+
+/// 3d's primary button.
+///
+/// **It says *Save to vault*, and the design says *Fill & save to vault*.**
+/// The missing word is the honest one: `crate::app::handle_no_match` holds no
+/// injector and no `FillStats`, deliberately and by signature, so nothing on
+/// this path can type into the window behind the card. What it can do is put
+/// the password into design 3c, which saves it, and onto the clipboard, which
+/// is how it reaches the field. A button that said "Fill" on a surface that
+/// cannot fill would be exactly the "is this thing working?" that 3a exists
+/// to answer, moved one click later.
+pub const GENERATE_SAVE_LABEL: &str = "Save to vault";
+
+/// 3d's clipboard button -- the one control here that gets the password into
+/// the app the user is actually looking at. See [`GENERATE_SAVE_LABEL`].
+pub const GENERATE_COPY_LABEL: &str = "Copy";
+
+/// 3d's regenerate control, beside its `Ctrl+R` chip.
+pub const GENERATE_NEW_LABEL: &str = "New";
+
+/// What the value tile says while the round-trip is outstanding.
+pub const GENERATE_WORKING_TEXT: &str = "Generating…";
+
+/// What the value tile says when the generator could not be reached.
+///
+/// **The sentence, and not the error.** `VaultError`'s `Debug` is a URL, a
+/// status code and a response body, none of which fits one truncated line on
+/// a 396pt card and any of which could carry more than it should. The detail
+/// goes to the log, where `handle_no_match`'s closure writes it; the card
+/// gets the sentence, and its failure state is
+/// `GenerateState::Failed`, which -- unlike the tray's update item -- can be
+/// left by pressing *New*.
+pub const GENERATE_FAILED_TEXT: &str = "Could not generate a password. Try again.";
+
+/// The number of choice rows whose [`overlay_height`] the 3d card is sized by.
+///
+/// Measured and bounded on both sides by
+/// [`the_generate_card_fits_the_window_it_asks_for`], in the idiom
+/// [`SAVE_LOGIN_ROWS`] set: the card must fit `overlay_height(GENERATE_ROWS)`,
+/// must NOT fit one [`ROW_HEIGHT`] less, and the slack between them is pinned
+/// exactly.
+///
+/// **And it is checked in all three states.** This card has an in-flight, a
+/// ready and a failed body, and one window serves all three -- so a failure
+/// sentence that laid out taller than a password would push the *Save* button
+/// off a frameless, unscrollable window at exactly the moment the user most
+/// needs to get out of it.
+///
+/// **It is `2`, and the card draws no choice rows at all.** Like
+/// [`SAVE_LOGIN_ROWS`] this is the argument to [`overlay_height`] -- how many
+/// *choice-row pitches* of window the card needs on top of the chrome -- and
+/// 3d's body is a 44pt value tile over a 26pt control row, which together
+/// come to more than one 50pt choice row and less than two. The card measures
+/// 209pt; `overlay_height(2)` is 214 and `overlay_height(1)` is 164.
+pub const GENERATE_ROWS: usize = 2;
+
+/// The window the 3d card asks the OS for. [`save_login_options`]'s sibling,
+/// public for the same reason: [`show_generate_overlay`] calls
+/// `eframe::run_native`, which no test here may execute.
+pub fn generate_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
+    options_for_rows(GENERATE_ROWS, anchor)
+}
+
+/// The height of 3d's value tile, and **it is fixed across all three
+/// states**.
+///
+/// That is what makes one window serve a password, a "Generating…" and an
+/// error sentence: the tile is this tall whichever of them is in it, and each
+/// of them is a single truncated line.
+const VALUE_TILE_HEIGHT: f32 = 44.0;
+
+/// The height of 3d's chips and stepper buttons. Fixed for the reason
+/// [`VALUE_TILE_HEIGHT`] is.
+const GENERATE_CHIP_HEIGHT: f32 = 26.0;
+
+/// The horizontal lane the *New* control and its `Ctrl+R` chip are given
+/// beside the value tile.
+const NEW_LANE: f32 = 86.0;
+
+/// Design **3d**: the card that offers a freshly generated password.
+///
+/// A header, a value tile, a kind selector and a size stepper, and a footer of
+/// *Save to vault* / *Copy* / `Esc Dismiss`.
+///
+/// **What it does not have is character-class switches.** The edit form has
+/// them (`vault_window::CharClasses`, where all-off is made unrepresentable);
+/// this surface is frameless, always-on-top, unscrollable and appears over
+/// whatever the user is doing, and six toggles on it would be six more
+/// controls to push off a bottom edge that cannot be scrolled back. It
+/// inherits [`crate::vault_bridge::PasswordRecipe::default`] instead --
+/// which, per [`GeneratedKind`], is also why the middle chip is not called
+/// "Letters".
+///
+/// **The password is shown in the clear.** It is a value the user has to be
+/// able to read and re-type, it has not been used for anything yet, and a
+/// masked generator is a generator whose output nobody can check. 3c's
+/// password row, where this value ends up, is masked -- because by then it is
+/// a credential.
+///
+/// Every text run truncates, for the reason [`draw_notice_card`]'s do: this
+/// card paints a generated password, a failure sentence and a live readout,
+/// and the window still cannot scroll.
+///
+/// Public so the `ui_preview` example renders the card the app ships.
+pub fn draw_generate_card(ui: &mut egui::Ui, form: &mut GenerateForm) -> GenerateAction {
+    let mut action = GenerateAction::None;
+
+    let card = egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(36),
+        })
+        .outer_margin(Margin {
+            left: 4,
+            right: 12,
+            top: 2,
+            bottom: 20,
+        });
+
+    card.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(12, 7))
+            .show(ui, |ui| {
+                if theme::card_header_with_close(ui, GENERATE_LABEL) {
+                    action = GenerateAction::Dismiss;
+                }
+            });
+        theme::hairline(ui);
+
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 8.0;
+
+                ui.horizontal(|ui| {
+                    ui.set_height(VALUE_TILE_HEIGHT);
+                    let tile = (ui.available_width() - NEW_LANE).max(1.0);
+                    ui.scope(|ui| {
+                        ui.set_width(tile);
+                        generate_value_tile(ui, form);
+                    });
+                    // Disabled while in flight, so the control agrees with
+                    // `GenerateForm::begin`'s refusal instead of looking live
+                    // and doing nothing.
+                    if ui
+                        .add_enabled_ui(!form.in_flight(), |ui| {
+                            theme::link_label(ui, GENERATE_NEW_LABEL, 11.0)
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        action = GenerateAction::Regenerate;
+                    }
+                    theme::kbd_chip_on_card(ui, "Ctrl+R");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.set_height(GENERATE_CHIP_HEIGHT);
+                    let mut chosen = None;
+                    for kind in GeneratedKind::ALL {
+                        if generate_chip(ui, kind.label(), kind == form.kind(), !form.in_flight())
+                            .clicked()
+                        {
+                            chosen = Some(kind);
+                        }
+                        ui.add_space(4.0);
+                    }
+                    if let Some(kind) = chosen {
+                        if form.choose(kind) {
+                            action = GenerateAction::Regenerate;
+                        }
+                    }
+
+                    // The stepper, right-aligned, with the LIVE readout
+                    // between its two buttons: "4 words" when Words is
+                    // selected and "20 characters" when it is not. The
+                    // design's static "20 chars" beside a passphrase is the
+                    // incoherence this replaces.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if generate_step_button(ui, "+", form.can_resize(1)).clicked()
+                            && form.resize(1)
+                        {
+                            action = GenerateAction::Regenerate;
+                        }
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                theme::semibold(form.readout(), 11.0).color(theme::TEXT_SECONDARY),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(4.0);
+                        if generate_step_button(ui, "−", form.can_resize(-1)).clicked()
+                            && form.resize(-1)
+                        {
+                            action = GenerateAction::Regenerate;
+                        }
+                    });
+                });
+            });
+
+        theme::hairline(ui);
+        egui::Frame::new()
+            .fill(theme::CARD_TINT)
+            .corner_radius(CornerRadius {
+                sw: 9,
+                se: 9,
+                ..CornerRadius::ZERO
+            })
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    // Both controls are dead without a password, and dead is
+                    // drawn rather than merely enforced. *Save* on an
+                    // in-flight card would save nothing; *Copy* would put an
+                    // empty string on the clipboard and clear whatever the
+                    // user had there.
+                    let ready = form.ready().is_some();
+                    if theme::primary_button_enabled(ui, GENERATE_SAVE_LABEL, Some("Enter"), ready)
+                        .clicked()
+                    {
+                        action = GenerateAction::Save;
+                    }
+                    ui.add_space(6.0);
+                    if ui
+                        .add_enabled_ui(ready, |ui| {
+                            theme::secondary_button(ui, GENERATE_COPY_LABEL)
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        action = GenerateAction::Copy;
+                    }
+                    ui.add_space(8.0);
+                    theme::footer_hints(ui, &[("Esc", "Dismiss")]);
+                });
+            });
+    });
+
+    action
+}
+
+/// 3d's value tile: one truncated line, [`VALUE_TILE_HEIGHT`] tall, whichever
+/// of the three states it is showing.
+fn generate_value_tile(ui: &mut egui::Ui, form: &GenerateForm) {
+    egui::Frame::new()
+        .fill(theme::CANVAS)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.set_height(VALUE_TILE_HEIGHT);
+                let label = match form.state() {
+                    GenerateState::InFlight => egui::Label::new(
+                        RichText::new(GENERATE_WORKING_TEXT)
+                            .size(12.0)
+                            .color(theme::TEXT_FAINT),
+                    ),
+                    GenerateState::Failed(message) => egui::Label::new(
+                        RichText::new(message.as_str())
+                            .size(12.0)
+                            .color(theme::ERROR),
+                    ),
+                    GenerateState::Ready(password) => egui::Label::new(
+                        RichText::new(password.as_str())
+                            .size(12.0)
+                            .monospace()
+                            .color(theme::INK),
+                    ),
+                };
+                ui.add(label.truncate());
+            });
+        });
+}
+
+/// One of 3d's three kind chips.
+fn generate_chip(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> egui::Response {
+    let text = theme::semibold(label, 11.0).color(if selected {
+        egui::Color32::WHITE
+    } else {
+        theme::TEXT_SECONDARY
+    });
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(text)
+            .fill(if selected { theme::BLUE } else { theme::CARD })
+            .stroke(Stroke::new(
+                1.0,
+                if selected {
+                    theme::BLUE
+                } else {
+                    theme::BORDER_STRONG
+                },
+            ))
+            .corner_radius(CornerRadius::same(7))
+            .min_size(egui::vec2(0.0, GENERATE_CHIP_HEIGHT)),
+    )
+}
+
+/// One of the size stepper's two buttons.
+fn generate_step_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(theme::semibold(label, 12.0).color(theme::TEXT_SECONDARY))
+            .fill(theme::CARD)
+            .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+            .corner_radius(CornerRadius::same(7))
+            .min_size(egui::vec2(24.0, GENERATE_CHIP_HEIGHT)),
+    )
+}
+
+/// What the keyboard does to the 3d card.
+///
+/// **Esc dismisses, Ctrl+R regenerates, and Enter saves only when there is
+/// something to save.** The last clause is the one worth the argument: Enter
+/// on an in-flight or failed card would hand design 3c an empty password and
+/// close the generator -- a credential the user did not choose being written
+/// to their vault by a key they pressed to accept the one they could see.
+pub fn generate_keyboard_action(
+    escape: EscapePressed,
+    enter: EnterPressed,
+    regenerate: RegeneratePressed,
+    ready: bool,
+) -> GenerateAction {
+    if escape.pressed() {
+        GenerateAction::Dismiss
+    } else if regenerate.pressed() {
+        GenerateAction::Regenerate
+    } else if enter.pressed() && ready {
+        GenerateAction::Save
+    } else {
+        GenerateAction::None
+    }
+}
+
+/// Opens design **3d** for `app_name` at `anchor`, and answers the password
+/// the user chose to keep -- `None` if they dismissed the card.
+///
+/// `generate` is the round trip, passed in rather than reached for: this
+/// module has no vault handle, and `crate::app::handle_no_match` is where the
+/// one that exists lives.
+///
+/// **The round trip happens on the frame after the in-flight state is
+/// painted, and that is deliberate.** It is a blocking call -- the vault
+/// window's own generator makes the same one mid-frame -- so making it in the
+/// frame that decides to make it would paint nothing between the click and
+/// the answer, and the user of a frameless always-on-top card would see it
+/// freeze. Deferring by one frame is not concurrency and does not pretend to
+/// be: what it buys is that [`GenerateState::InFlight`] is a state the user
+/// actually sees, and that [`GenerateForm::begin`]'s refusal has something to
+/// refuse.
+pub fn show_generate_overlay(
+    app_name: &str,
+    anchor: Option<(f32, f32)>,
+    generate: &dyn Fn(
+        &crate::vault_bridge::GenerateRequest,
+    ) -> Result<zeroize::Zeroizing<String>, String>,
+) -> Option<zeroize::Zeroizing<String>> {
+    if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
+        log::warn!(
+            "generate overlay requested for {app_name} while one is already open in this \
+             process; ignoring rather than stacking a second window"
+        );
+        return None;
+    }
+
+    let kept: Rc<RefCell<Option<zeroize::Zeroizing<String>>>> = Rc::new(RefCell::new(None));
+    let app = GenerateApp {
+        form: GenerateForm::new(GeneratedKind::Characters),
+        kept: Rc::clone(&kept),
+        generate,
+    };
+    let options = generate_options(anchor);
+
+    let _ = eframe::run_native(
+        "Deskwarden",
+        options,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    );
+
+    OVERLAY_OPEN.store(false, Ordering::SeqCst);
+
+    let answer = kept.borrow_mut().take();
+    answer
+}
+
+struct GenerateApp<'a> {
+    form: GenerateForm,
+    kept: Rc<RefCell<Option<zeroize::Zeroizing<String>>>>,
+    generate: &'a dyn Fn(
+        &crate::vault_bridge::GenerateRequest,
+    ) -> Result<zeroize::Zeroizing<String>, String>,
+}
+
+impl eframe::App for GenerateApp<'_> {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let keys = generate_keyboard_action(
+            EscapePressed::read(&ctx),
+            EnterPressed::read(&ctx),
+            RegeneratePressed::read(&ctx),
+            self.form.ready().is_some(),
+        );
+        let card = draw_generate_card(ui, &mut self.form);
+        let action = if keys == GenerateAction::None { card } else { keys };
+
+        match action {
+            GenerateAction::Regenerate => {
+                self.form.begin();
+            }
+            GenerateAction::Copy => {
+                if let Some(password) = self.form.ready() {
+                    crate::clipboard::copy_secret(password);
+                }
+            }
+            GenerateAction::Save => {
+                if let GenerateState::Ready(password) = self.form.state() {
+                    *self.kept.borrow_mut() = Some(password.clone());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            GenerateAction::Dismiss => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            GenerateAction::None => {}
+        }
+
+        // The deferred round trip. It runs AFTER this frame's card has been
+        // drawn, so the in-flight tile the user sees is this frame's, and
+        // `finish` -- which cannot leave the form in flight, on either answer
+        // -- runs before the next one.
+        if self.form.in_flight() {
+            let answer = (self.generate)(&self.form.request());
+            self.form.finish(answer);
+            ctx.request_repaint();
         }
     }
 }
@@ -3574,6 +4441,7 @@ mod geometry_tests {
         for decl in [
             concat!("pub struct EnterPres", "sed(bool);"),
             concat!("pub struct EscapePres", "sed(bool);"),
+            concat!("pub struct RegeneratePres", "sed(bool);"),
         ] {
             assert!(
                 keys.contains(decl),
@@ -3590,22 +4458,34 @@ mod geometry_tests {
         );
         assert_eq!(
             keys.matches("fn ").count(),
-            4,
-            "`mod keys` no longer has exactly its four functions (two `read`, two \
+            6,
+            "`mod keys` no longer has exactly its six functions (three `read`, three \
              `pressed`); its source is:\n{keys}"
         );
         assert_eq!(
             keys.matches("Self(").count(),
-            2,
-            "`mod keys` constructs one of its newtypes somewhere other than the two \
+            3,
+            "`mod keys` constructs one of its newtypes somewhere other than the three \
              `read` bodies"
         );
         // Positive controls: the needles match live text rather than nothing.
         assert!(keys.contains("egui::Key::Enter"));
         assert!(keys.contains("egui::Key::Escape"));
+        assert!(keys.contains("egui::Key::R"));
+        // 3d's is the one reader with a MODIFIER, and the modifier is half of
+        // what it claims to read. A `read` that dropped it would answer true
+        // for a bare R -- which is a character a user types into 3c's
+        // username box.
         assert!(
-            production.contains(concat!("pub use keys::{EnterPres", "sed, EscapePressed};")),
-            "the two types are no longer re-exported from this module"
+            keys.contains("modifiers.ctrl"),
+            "`RegeneratePressed::read` no longer asks about Ctrl, so it answers for a bare R"
+        );
+        assert!(
+            production.contains(concat!(
+                "pub use keys::{EnterPres",
+                "sed, EscapePressed, RegeneratePressed};"
+            )),
+            "the three types are no longer re-exported from this module"
         );
 
         // And nothing, anywhere in the file, builds one positionally.
@@ -3613,6 +4493,7 @@ mod geometry_tests {
         for name in [
             concat!("EnterPres", "sed("),
             concat!("EscapePres", "sed("),
+            concat!("RegeneratePres", "sed("),
         ] {
             assert_eq!(
                 whole.matches(name).count(),
@@ -4441,6 +5322,647 @@ mod geometry_tests {
             checked += 1;
         }
         assert_eq!(checked, FIXTURES.len(), "the loop must have covered every fixture");
+    }
+
+    // ------------------------------------------------------------ design 3d
+
+    /// A 3d form pinned into one of its three states, without a server.
+    ///
+    /// `finish` is the only way into `Ready` and `Failed` and it is the
+    /// production one, so a state a test measures is a state the card can
+    /// really be in.
+    fn generate_form(state: &GenerateState) -> GenerateForm {
+        let mut form = GenerateForm::new(GeneratedKind::Characters);
+        match state {
+            GenerateState::InFlight => {}
+            GenerateState::Ready(p) => form.finish(Ok(p.clone())),
+            GenerateState::Failed(m) => form.finish(Err(m.clone())),
+        }
+        assert_eq!(form.state(), state, "the fixture did not reach the state it names");
+        form
+    }
+
+    /// The three states, each carrying `text` where it has somewhere to put
+    /// one -- so the adversarial fixtures reach the strings this card really
+    /// paints. 3d has no app name; what it paints that a user did not choose
+    /// letter by letter is the generated value and the failure sentence, and
+    /// both are unbounded strings on a card that cannot scroll.
+    fn generate_states(text: &str) -> [GenerateState; 3] {
+        [
+            GenerateState::InFlight,
+            GenerateState::Ready(zeroize::Zeroizing::new(text.to_string())),
+            GenerateState::Failed(text.to_string()),
+        ]
+    }
+
+    /// What egui says the 3d card needs, laid out unconstrained.
+    fn generate_card_height(state: &GenerateState) -> f32 {
+        const ROOMY: f32 = 900.0;
+        let ctx = styled_ctx();
+        let mut form = generate_form(state);
+        let mut needed = f32::NAN;
+        let _ = ctx.run_ui(sized(ROOMY), |ui| {
+            assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
+            draw_generate_card(ui, &mut form);
+            needed = ui.min_rect().bottom();
+        });
+        assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
+        assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
+        needed
+    }
+
+    /// Every glyph run the 3d card paints in `state`.
+    fn generate_glyphs(state: &GenerateState) -> Vec<String> {
+        const ROOMY: f32 = 900.0;
+        let ctx = styled_ctx();
+        let mut form = generate_form(state);
+        let output = ctx.run_ui(sized(ROOMY), |ui| {
+            draw_generate_card(ui, &mut form);
+        });
+        let mut ink = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut ink);
+        }
+        ink.retain(|i| i.alpha > 0);
+        ink.into_iter().filter_map(|i| i.glyphs).collect()
+    }
+
+    /// How much taller than it needs to be the 3d card's window is.
+    ///
+    /// Measured, not chosen, exactly as [`SAVE_LOGIN_SLACK`] is, and pinned
+    /// rather than bounded for the same reason: a one-sided bound cannot tell
+    /// deliberate dead space from a row that has stopped being drawn, and
+    /// this card has a value tile, a control row and two footer buttons to
+    /// lose one of.
+    const GENERATE_SLACK: f32 = 5.0;
+
+    /// **`GENERATE_ROWS` is checked against the card, in both directions, in
+    /// all three of its states, and against every adversarial fixture.**
+    ///
+    /// The three states are the half of this that 3a, 3b and 3c did not need.
+    /// One window serves an in-flight tile, a password and an error sentence;
+    /// if the error state laid out taller than the ready one, the card would
+    /// lose its *New* control and its footer at exactly the moment the user
+    /// most needs them -- on a frameless, always-on-top window with no title
+    /// bar, no resize border and no `ScrollArea`.
+    #[test]
+    fn the_generate_card_fits_the_window_it_asks_for() {
+        let asked = generate_options(None)
+            .viewport
+            .inner_size
+            .expect("the generate viewport must request an inner size at all");
+        assert_eq!(asked.x, OVERLAY_WIDTH, "the 3d card asked for a {}pt-wide window", asked.x);
+        assert_eq!(
+            asked.y,
+            overlay_height(GENERATE_ROWS),
+            "the window asked for is not the one GENERATE_ROWS describes, so every assertion \
+             below is about a card the OS will never be given"
+        );
+
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            for state in generate_states(fixture.app) {
+                let needed = generate_card_height(&state);
+                assert!(
+                    needed <= asked.y,
+                    "the 3d card lays out {needed}pt tall in {state:?} for the {:?} fixture \
+                     and the window the overlay asks the OS for is {}pt. This window is \
+                     frameless and always-on-top -- no title bar, no resize border, no \
+                     scroll area -- so the missing {:.1}pt are gone, and on this card that \
+                     is the Save button or the size stepper",
+                    fixture.name,
+                    asked.y,
+                    needed - asked.y
+                );
+                assert!(
+                    needed > asked.y - ROW_HEIGHT,
+                    "the 3d card lays out {needed}pt in {state:?} for the {:?} fixture, which \
+                     still fits a window one ROW_HEIGHT shorter than the {}pt GENERATE_ROWS \
+                     asks for. Either GENERATE_ROWS is a row too generous, or the value tile \
+                     or the control row has stopped being drawn -- and the `fits` bound above \
+                     cannot tell either of those from a card that is simply the right size",
+                    fixture.name,
+                    asked.y
+                );
+                assert_eq!(
+                    asked.y - needed,
+                    GENERATE_SLACK,
+                    "the 3d card lays out {needed}pt in {state:?} for the {:?} fixture in a \
+                     {}pt window, so the dead space at its bottom is {:.1}pt rather than the \
+                     recorded {GENERATE_SLACK}pt. A font, a margin or a control changing size \
+                     fails here rather than by clipping a control off a window that has no \
+                     scrollbar",
+                    fixture.name,
+                    asked.y,
+                    asked.y - needed
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, FIXTURES.len() * 3, "the loop must have covered every state");
+    }
+
+    /// **Neither the generator's output nor a failure sentence can make the
+    /// 3d card taller**, and neither can the state it is in.
+    ///
+    /// The companion to the bound above and the direct question rather than
+    /// the derived one. The height must be a function of the font and the
+    /// card's fixed rows: `VALUE_TILE_HEIGHT` and `GENERATE_CHIP_HEIGHT` are
+    /// the two constants that make that true, and this is what fails if
+    /// either stops being applied.
+    #[test]
+    fn nothing_the_generator_produces_makes_the_3d_card_taller() {
+        let baseline = generate_card_height(&GenerateState::InFlight);
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            for state in generate_states(fixture.app) {
+                let height = generate_card_height(&state);
+                assert_eq!(
+                    height, baseline,
+                    "{state:?} with the {:?} fixture's string made the 3d card {height}pt \
+                     instead of {baseline}pt. The window is a fixed {}pt with no scrollbar, \
+                     so the difference is clipped off the bottom",
+                    fixture.name,
+                    overlay_height(GENERATE_ROWS)
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, FIXTURES.len() * 3, "the loop must have covered every state");
+    }
+
+    /// **Each state paints itself, and does not paint the others.**
+    ///
+    /// The positive half is that the user is told what is happening; the
+    /// negative half is the one worth the test. An in-flight card that still
+    /// painted the previous password would be a card offering a value it is
+    /// about to replace, and a failed card that painted one would be offering
+    /// a password that no longer exists.
+    #[test]
+    fn each_generate_state_paints_itself_and_not_the_others() {
+        const SECRET: &str = "correct-horse-battery";
+        const SENTENCE: &str = "the generator said no";
+
+        let flight = generate_glyphs(&GenerateState::InFlight);
+        assert!(
+            flight.iter().any(|g| g == GENERATE_WORKING_TEXT),
+            "the in-flight card does not say it is working. Painted: {flight:?}"
+        );
+        assert!(
+            !flight.iter().any(|g| g.contains(SECRET)),
+            "the in-flight card painted a password"
+        );
+
+        let ready = generate_glyphs(&GenerateState::Ready(zeroize::Zeroizing::new(
+            SECRET.to_string(),
+        )));
+        assert!(
+            ready.iter().any(|g| g == SECRET),
+            "the ready card does not paint the password it generated. Painted: {ready:?}"
+        );
+        assert!(
+            !ready.iter().any(|g| g == GENERATE_WORKING_TEXT),
+            "the ready card still says it is generating"
+        );
+
+        let failed = generate_glyphs(&GenerateState::Failed(SENTENCE.to_string()));
+        assert!(
+            failed.iter().any(|g| g == SENTENCE),
+            "the failed card does not say what went wrong. Painted: {failed:?}"
+        );
+        for absent in [SECRET, GENERATE_WORKING_TEXT] {
+            assert!(
+                !failed.iter().any(|g| g == absent),
+                "the failed card painted {absent:?}, which is not true of it"
+            );
+        }
+
+        // And the controls are on the card in every state -- the half that a
+        // "does not paint" assertion cannot see. A card that lost its footer
+        // would pass all six negatives above.
+        for state in generate_states(SECRET) {
+            let painted = generate_glyphs(&state);
+            for control in [
+                GENERATE_LABEL,
+                GENERATE_SAVE_LABEL,
+                GENERATE_COPY_LABEL,
+                GENERATE_NEW_LABEL,
+            ] {
+                assert!(
+                    // `contains`, not equality: the primary button lays its
+                    // label and its `Enter` chip out as ONE galley, so the
+                    // run reads "Save to vault  Enter".
+                    painted.iter().any(|g| g.contains(control)),
+                    "{state:?} does not paint {control:?}. On a window with no scrollbar a \
+                     control that is not painted is a control that cannot be reached. \
+                     Painted: {painted:?}"
+                );
+            }
+        }
+    }
+
+    /// **The size readout is live, and it says what it counts.**
+    ///
+    /// Read off the painted card rather than off `readout()`, because the
+    /// claim is about what the user sees: the design's static "20 chars"
+    /// beside a *Words* selection is what this replaces, and a readout that
+    /// was computed correctly and then not drawn would be the same defect.
+    #[test]
+    fn the_size_readout_is_painted_and_follows_the_kind() {
+        const ROOMY: f32 = 900.0;
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            let ctx = styled_ctx();
+            let mut form = GenerateForm::new(kind);
+            form.finish(Ok(zeroize::Zeroizing::new("x".to_string())));
+            let output = ctx.run_ui(sized(ROOMY), |ui| {
+                draw_generate_card(ui, &mut form);
+            });
+            let mut ink = Vec::new();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut ink);
+            }
+            let painted: Vec<String> =
+                ink.into_iter().filter(|i| i.alpha > 0).filter_map(|i| i.glyphs).collect();
+            let expected = format!("{} {}", kind.default_size(), kind.unit());
+            assert!(
+                painted.contains(&expected),
+                "the {:?} card does not paint {expected:?}. Painted: {painted:?}",
+                kind
+            );
+            // The negative that makes it a test of the LABEL and not just of
+            // the number: a passphrase card must not say "characters".
+            let wrong = format!("{} {}", kind.default_size(), if kind == GeneratedKind::Words {
+                "characters"
+            } else {
+                "words"
+            });
+            assert!(
+                !painted.contains(&wrong),
+                "the {kind:?} card paints {wrong:?}, which counts the wrong thing"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, GeneratedKind::ALL.len());
+    }
+
+    /// **3c offers the way in to 3d**, and it is on the Password row.
+    ///
+    /// Read out of the painted 3c card, in the idiom
+    /// `the_locked_card_offers_no_new_login_button` set: a link that is
+    /// computed but not painted is a destination the user cannot reach.
+    #[test]
+    fn the_save_login_card_paints_the_way_into_the_generator() {
+        let painted = save_login_glyphs(APP);
+        assert_eq!(
+            painted.iter().filter(|g| *g == SAVE_GENERATE_LABEL).count(),
+            1,
+            "3c does not paint exactly one {SAVE_GENERATE_LABEL:?} link, so design 3d is \
+             either unreachable or offered twice. Painted: {painted:?}"
+        );
+        // The control: the row it belongs to is still a password field with
+        // its hint, so the link did not replace what it sits beside.
+        assert!(
+            painted.iter().any(|g| g == PASSWORD_HINT),
+            "the Generate link displaced the Password row's own hint"
+        );
+    }
+
+    /// The three key readers, over one real frame carrying `keys` and
+    /// `ctrl`.
+    ///
+    /// [`keys_down`]'s sibling, and the only way a test can obtain a
+    /// [`RegeneratePressed`], for the reason that one is: the field is
+    /// private to `mod keys` and no constructor takes a `bool`.
+    fn generate_keys_down(
+        keys: &[egui::Key],
+        ctrl: bool,
+    ) -> (EscapePressed, EnterPressed, RegeneratePressed) {
+        let ctx = egui::Context::default();
+        let modifiers = egui::Modifiers { ctrl, ..Default::default() };
+        let input = egui::RawInput {
+            modifiers,
+            events: keys
+                .iter()
+                .map(|&key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                })
+                .collect(),
+            ..sized(overlay_height(1))
+        };
+        let mut seen = None;
+        let _ = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            seen = Some((
+                EscapePressed::read(&ctx),
+                EnterPressed::read(&ctx),
+                RegeneratePressed::read(&ctx),
+            ));
+        });
+        seen.expect("the frame body must have run")
+    }
+
+    /// **Ctrl+R is Ctrl+R, and a bare R is nothing.**
+    ///
+    /// The negative is the load-bearing one: `R` without the modifier reaching
+    /// `RegeneratePressed` would make every letter-R keystroke a regenerate,
+    /// and this overlay opens over a window the user is typing into.
+    #[test]
+    fn the_regenerate_reader_needs_both_halves() {
+        fn read(keys: &[egui::Key], ctrl: bool) -> bool {
+            generate_keys_down(keys, ctrl).2.pressed()
+        }
+        assert!(read(&[egui::Key::R], true), "Ctrl+R was not read as Ctrl+R");
+        assert!(!read(&[egui::Key::R], false), "a bare R was read as Ctrl+R");
+        assert!(!read(&[], true), "Ctrl alone was read as Ctrl+R");
+        assert!(!read(&[egui::Key::S], true), "Ctrl+S was read as Ctrl+R");
+    }
+
+    /// **What the keyboard does to 3d, driven from real frames.**
+    ///
+    /// Enter is the one worth the argument, and it is asserted both ways: it
+    /// saves when there is a password and does **nothing** when there is not.
+    /// An Enter that saved an in-flight card would close the generator and
+    /// hand 3c an empty password -- a credential the user did not choose,
+    /// written by the key they pressed to accept the one they could see.
+    #[test]
+    fn the_3d_keyboard_saves_only_what_exists() {
+        fn act(keys: &[egui::Key], ctrl: bool, ready: bool) -> GenerateAction {
+            let (escape, enter, regenerate) = generate_keys_down(keys, ctrl);
+            assert_eq!(
+                (escape.pressed(), enter.pressed(), regenerate.pressed()),
+                (
+                    keys.contains(&egui::Key::Escape),
+                    keys.contains(&egui::Key::Enter),
+                    ctrl && keys.contains(&egui::Key::R)
+                ),
+                "the frame built for {keys:?} ctrl={ctrl} was not read back as that, so \
+                 nothing below tests the case it names"
+            );
+            generate_keyboard_action(escape, enter, regenerate, ready)
+        }
+
+        assert_eq!(act(&[egui::Key::Escape], false, true), GenerateAction::Dismiss);
+        assert_eq!(act(&[egui::Key::Escape], false, false), GenerateAction::Dismiss);
+        assert_eq!(act(&[egui::Key::R], true, true), GenerateAction::Regenerate);
+        // Regenerate works with nothing to regenerate FROM -- which is the
+        // whole of the failed card's way out.
+        assert_eq!(act(&[egui::Key::R], true, false), GenerateAction::Regenerate);
+        assert_eq!(act(&[egui::Key::Enter], false, true), GenerateAction::Save);
+        assert_eq!(
+            act(&[egui::Key::Enter], false, false),
+            GenerateAction::None,
+            "Enter on a card with no password answered something other than nothing"
+        );
+        assert_eq!(act(&[], false, true), GenerateAction::None);
+        // Esc beats Enter, so a user swatting the card away never saves.
+        assert_eq!(
+            act(&[egui::Key::Escape, egui::Key::Enter], false, true),
+            GenerateAction::Dismiss
+        );
+    }
+
+    /// **Each kind asks for the recipe it is named after.**
+    ///
+    /// The two `PasswordRecipe` kinds are asserted apart from each other, not
+    /// just against their own fields: *Characters* and *PIN* are the same
+    /// request type, so "PIN sends a PasswordRecipe" is true of both and
+    /// proves nothing.
+    #[test]
+    fn each_kind_asks_for_the_recipe_it_names() {
+        use crate::vault_bridge::{GenerateRequest, PasswordRecipe};
+
+        match GeneratedKind::Words.recipe(6) {
+            GenerateRequest::Passphrase(p) => {
+                assert_eq!(p.words, 6, "the size did not reach `words`");
+                assert_eq!(
+                    p.separator,
+                    crate::vault_bridge::PassphraseRecipe::default().separator,
+                    "the passphrase no longer inherits the crate's default separator"
+                );
+            }
+            other => panic!("Words asked for {other:?}"),
+        }
+
+        let characters = match GeneratedKind::Characters.recipe(24) {
+            GenerateRequest::Password(p) => p,
+            other => panic!("Characters asked for {other:?}"),
+        };
+        assert_eq!(characters.length, 24, "the size did not reach `length`");
+        assert_eq!(
+            characters,
+            PasswordRecipe { length: 24, ..PasswordRecipe::default() },
+            "Characters no longer inherits the crate's default recipe, which is the whole \
+             of what `no character-class switches in the overlay` means"
+        );
+
+        let pin = match GeneratedKind::Pin.recipe(6) {
+            GenerateRequest::Password(p) => p,
+            other => panic!("PIN asked for {other:?}"),
+        };
+        assert_eq!(pin.length, 6);
+        // Positively: digits are on.
+        assert!(pin.number, "a PIN with no digits is not a PIN");
+        // Negatively: nothing else is.
+        assert!(
+            !pin.uppercase && !pin.lowercase && !pin.special,
+            "the PIN recipe carries a class other than digits: {pin:?}"
+        );
+        // And the two minima went with the classes they belong to.
+        assert_eq!(pin.min_special, 0, "the PIN asks for a symbol it has excluded");
+        assert_eq!(pin.min_number, 0);
+        // The direct comparison that stops PIN drifting into Characters.
+        assert_ne!(
+            pin,
+            PasswordRecipe { length: 6, ..PasswordRecipe::default() },
+            "the PIN recipe is the default recipe, so the chip does nothing"
+        );
+    }
+
+    /// **A PIN never trips the route's silent substitution.**
+    ///
+    /// `GenerateRequest::query`'s doc records, from the serve route's own
+    /// code, that all four classes arriving false is answered with
+    /// `uppercase + lowercase + number` and a 200. One class on is honoured,
+    /// and this asserts that every kind, at every size it can reach, keeps at
+    /// least one on -- which is what makes "digits-only survives `bw serve`
+    /// intact" a property rather than a hope.
+    #[test]
+    fn no_kind_sends_a_recipe_the_route_would_substitute() {
+        use crate::vault_bridge::GenerateRequest;
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            let (low, high) = kind.bounds();
+            for size in [0, 1, low, low + 1, high, high + 100] {
+                if let GenerateRequest::Password(p) = kind.recipe(size) {
+                    assert!(
+                        p.uppercase || p.lowercase || p.number || p.special,
+                        "{kind:?} at {size} sends a recipe with all four classes off, which \
+                         the route answers with three classes it chose itself"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, GeneratedKind::ALL.len() * 6);
+    }
+
+    /// **No size the card can reach is one the route would silently raise.**
+    ///
+    /// `bw serve` clamps a password `length` below 5 up to 5 and a passphrase
+    /// `words` below 3 up to 3, without saying so. The stepper's bounds are
+    /// therefore not taste: a card that could show "4 characters" and receive
+    /// five would be lying about its own output, which is the defect
+    /// `a_length_the_route_would_silently_raise_is_clamped_before_it_is_sent`
+    /// keeps out of the edit form.
+    #[test]
+    fn no_size_the_card_offers_is_one_the_route_would_raise() {
+        use crate::vault_bridge::GenerateRequest;
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            let (low, high) = kind.bounds();
+            assert!(low <= high, "{kind:?} has an empty range");
+            // Positively: the default size is inside the range the stepper
+            // can reach, or the card opens on a number it cannot return to.
+            assert!(
+                (low..=high).contains(&kind.default_size()),
+                "{kind:?}'s default size is outside its own bounds"
+            );
+            for size in [0, 1, 4, low, high, high + 1] {
+                match kind.recipe(size) {
+                    GenerateRequest::Password(p) => assert!(
+                        p.length >= 5,
+                        "{kind:?} at {size} sends length {} and the route would raise it",
+                        p.length
+                    ),
+                    GenerateRequest::Passphrase(p) => assert!(
+                        p.words >= 3,
+                        "{kind:?} at {size} sends {} words and the route would raise it",
+                        p.words
+                    ),
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, GeneratedKind::ALL.len() * 6);
+    }
+
+    /// **No second generate runs while one is outstanding**, by any of the
+    /// four paths that start one.
+    ///
+    /// And the positive half in the same test, because it is the half that
+    /// makes the refusal a guard rather than a wall: once the round trip has
+    /// answered, every one of those paths works again.
+    #[test]
+    fn a_second_generate_cannot_start_while_one_is_outstanding() {
+        let mut form = GenerateForm::new(GeneratedKind::Characters);
+        assert!(form.in_flight(), "the card does not open generating");
+
+        assert!(!form.begin(), "a second request started while one was outstanding");
+        assert!(!form.choose(GeneratedKind::Words), "changing kind started a second request");
+        assert!(!form.resize(1), "changing size started a second request");
+        assert!(!form.can_resize(1), "the stepper is live during a round trip");
+        assert!(!form.can_resize(-1), "the stepper is live during a round trip");
+        // And nothing moved while it refused: an in-flight card that quietly
+        // changed kind would answer the old request into the new label.
+        assert_eq!(form.kind(), GeneratedKind::Characters);
+        assert_eq!(form.size(), GeneratedKind::Characters.default_size());
+
+        form.finish(Ok(zeroize::Zeroizing::new("abc".to_string())));
+        assert!(!form.in_flight());
+        assert!(form.begin(), "a settled card refused to generate again");
+        form.finish(Ok(zeroize::Zeroizing::new("def".to_string())));
+        assert!(form.choose(GeneratedKind::Words), "a settled card refused to change kind");
+        assert_eq!(form.kind(), GeneratedKind::Words);
+        assert_eq!(form.size(), GeneratedKind::Words.default_size());
+        assert!(form.in_flight(), "changing kind did not start a request");
+    }
+
+    /// **A failure leaves the card usable**, which is the defect the tray's
+    /// update item shipped: created disabled, only ever enabled on success,
+    /// and a user who hit the failure path was left with a control that never
+    /// came back.
+    ///
+    /// Here the equivalent would be a card stuck in flight forever, on a
+    /// frameless window whose only other way out is Esc. So: `finish` leaves
+    /// a state that is not in-flight on **either** answer, and the paths that
+    /// regenerate all work from a failed card.
+    #[test]
+    fn a_failed_generate_leaves_the_card_usable() {
+        let mut form = GenerateForm::new(GeneratedKind::Characters);
+        form.finish(Err("no".to_string()));
+
+        assert!(!form.in_flight(), "a failed round trip left the card in flight");
+        assert_eq!(form.state(), &GenerateState::Failed("no".to_string()));
+        assert!(form.ready().is_none(), "a failed card offers a password");
+        assert!(form.can_resize(1), "a failed card's stepper is dead");
+        assert!(form.begin(), "a failed card refused to try again");
+        assert!(form.in_flight());
+
+        // Positive control on the other answer, so this is a test of `finish`
+        // and not of the error path alone.
+        let mut ok = GenerateForm::new(GeneratedKind::Characters);
+        ok.finish(Ok(zeroize::Zeroizing::new("s3cret".to_string())));
+        assert!(!ok.in_flight());
+        assert_eq!(ok.ready(), Some("s3cret"), "a successful round trip lost the password");
+    }
+
+    /// **The stepper stops at the bounds, and says so before it is clicked.**
+    #[test]
+    fn the_size_stepper_stops_at_the_bounds() {
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            let (low, high) = kind.bounds();
+
+            let mut form = GenerateForm::new(kind);
+            form.finish(Ok(zeroize::Zeroizing::new("x".to_string())));
+            while form.can_resize(-1) {
+                assert!(form.resize(-1), "`can_resize` said yes and `resize` did nothing");
+                form.finish(Ok(zeroize::Zeroizing::new("x".to_string())));
+            }
+            assert_eq!(form.size(), low, "the stepper stopped short of the low bound");
+            assert!(!form.resize(-1), "the stepper went below the low bound");
+
+            while form.can_resize(1) {
+                assert!(form.resize(1), "`can_resize` said yes and `resize` did nothing");
+                form.finish(Ok(zeroize::Zeroizing::new("x".to_string())));
+            }
+            assert_eq!(form.size(), high, "the stepper stopped short of the high bound");
+            assert!(!form.resize(1), "the stepper went above the high bound");
+            checked += 1;
+        }
+        assert_eq!(checked, GeneratedKind::ALL.len());
+    }
+
+    /// **The state that holds the password does not print it.**
+    ///
+    /// `debug_leak_guard` asserts the *shape* -- that a type reaching a
+    /// `Zeroizing` does not derive `Debug`. This asserts the consequence,
+    /// which is the thing that actually matters: formatting the state does
+    /// not put the secret, or its length, in the output.
+    #[test]
+    fn the_generate_state_does_not_print_its_secret() {
+        const SECRET: &str = "tq7Rvk29mzpLx4hd8";
+        let form = generate_form(&GenerateState::Ready(zeroize::Zeroizing::new(
+            SECRET.to_string(),
+        )));
+        let printed = format!("{form:?}");
+        assert!(
+            !printed.contains(SECRET),
+            "the form's Debug printed the password: {printed}"
+        );
+        assert!(
+            !printed.contains(&SECRET.len().to_string()),
+            "the form's Debug printed the password's length, which narrows it: {printed}"
+        );
+        // Positive control: it printed SOMETHING, and something identifying,
+        // so a `Debug` that had been reduced to "" would not pass.
+        assert!(printed.contains("Ready"), "the form's Debug says nothing at all: {printed}");
+        assert!(printed.contains("Characters"), "the form's Debug lost its kind: {printed}");
     }
 
     /// **The card does not imply a capture it did not make.**
