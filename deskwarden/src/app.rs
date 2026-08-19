@@ -1053,6 +1053,59 @@ pub enum HasPasswordField {
     Unknown,
 }
 
+/// Whether this process can currently answer questions about the vault's
+/// contents at all.
+///
+/// **The third input to [`disposition`], and it is there to stop the no-match
+/// card lying.** `main`'s `stand_down_after_unlock` calls
+/// `MatchEngine::clear`, and its own log line says what that means: "the app
+/// matches are cleared too, so nothing can prompt to autofill until they are
+/// rebuilt". Every lock, every declined re-authentication and every failed
+/// backend restart goes through it. So with the vault locked
+/// `MatchEngine::lookup` answers `None` for *every* window -- including every
+/// window that does have a saved login -- and without this input `disposition`
+/// read that silence as [`Matched::No`] and put "No saved login for <app>" on
+/// screen. That is a false statement about the user's own vault, from the one
+/// surface whose entire purpose is to be trusted about it.
+///
+/// **Read from [`crate::vault_cache::VaultCache::is_populated`]**, which is the
+/// honest predicate for exactly this question: it is set by a successful
+/// populate and cleared by `VaultCache::clear`, the call every lock path makes
+/// beside `engine.clear()`. It is deliberately *not* "the engine is empty" --
+/// a user whose vault genuinely holds no app matches has an empty engine and a
+/// populated cache, and for them "No saved login for <app>" is true, useful,
+/// and exactly what 3a was built to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultAvailability {
+    /// The vault has been read into this process and not thrown away, so
+    /// "nothing matched" is a fact about the vault.
+    Readable,
+    /// Locked, stood down, or never opened: "nothing matched" is a fact about
+    /// this process and says nothing whatever about the vault.
+    Locked,
+}
+
+/// [`VaultAvailability`] from [`crate::vault_cache::VaultCache::is_populated`].
+///
+/// **A named function over a `bool`, not an `if` at the call site.** The call
+/// site is inside `main`'s event loop, which no test reaches, and the whole
+/// defect this corrects was a decision made where nothing could observe it.
+/// Here the mapping is one line a test can execute in both directions
+/// (`a_populated_cache_is_readable_and_an_empty_one_is_locked`), and the only
+/// thing left unreachable is the `cache.is_populated()` that feeds it.
+///
+/// **The polarity is the whole of it.** Inverted, every locked vault would
+/// report `Readable` and the card would go back to claiming there is no saved
+/// login for apps that have one -- and every unlocked vault would say
+/// "Deskwarden is locked" while it plainly was not.
+pub fn vault_availability(populated: bool) -> VaultAvailability {
+    if populated {
+        VaultAvailability::Readable
+    } else {
+        VaultAvailability::Locked
+    }
+}
+
 /// What focusing this window should put on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Open<'a> {
@@ -1060,6 +1113,9 @@ pub enum Open<'a> {
     Match(&'a str),
     /// The no-match card (design 3a).
     NoMatch,
+    /// The locked card (design 3b) -- a window that asks for a password while
+    /// this process cannot read the vault.
+    Locked,
     /// Nothing at all -- the silence the app has always kept.
     Nothing,
 }
@@ -1086,16 +1142,52 @@ pub enum Open<'a> {
 /// window the vault already recognises costs nothing extra. Passing `Unknown`
 /// there is not a lie: the question genuinely was not asked. The measured cost
 /// of asking it is why this matters; see [`PasswordFieldProbe`].
-pub fn disposition<'a>(matched: Matched<'a>, field: HasPasswordField) -> Open<'a> {
+///
+/// **`vault` is what stops the unmatched branch lying**, and it splits that
+/// branch rather than silencing it. See [`VaultAvailability`] for the chain:
+/// while locked the engine is empty, so every window is `Matched::No`, and 3a
+/// asserted "No saved login for <app>" about apps that may very well have one.
+/// [`VaultAvailability::Locked`] sends that same window to [`Open::Locked`],
+/// which says something true (Deskwarden is locked) and claims nothing about
+/// whether a match exists -- because a locked vault does not know.
+///
+/// **The silence control survives untouched, and in both states.** A window
+/// with no password field and no match is [`Open::Nothing`] whether the vault
+/// is readable or locked; `an_ordinary_window_is_still_silence_in_both_vault_states`
+/// is the test that holds it. That is also why the locked answer is gated on
+/// the field: a card on every window while the vault is locked is not a
+/// feature, it is a popup that follows the user around until they unlock.
+///
+/// **And it is why the probe is still worth paying for while locked.** The
+/// caller must go on asking on the unmatched branch: the answer is *used*
+/// here, to choose between 3b and silence, at exactly the cost the unmatched
+/// branch already pays. Being locked adds no probe that a readable vault would
+/// not also have run. Had the fix been to stay silent when locked, the probe
+/// would have had to be skipped rather than paid and discarded -- see
+/// `main::process_foreground_event`, which is where that lives.
+pub fn disposition<'a>(
+    matched: Matched<'a>,
+    field: HasPasswordField,
+    vault: VaultAvailability,
+) -> Open<'a> {
     match matched {
+        // A match is only representable when the engine holds entries, which
+        // is only true when the vault was read -- so `vault` is not consulted
+        // here, and `a_matched_window_ignores_the_vault_state_too` pins that
+        // the card the user gets for a recognised window is unchanged.
         Matched::Yes(item_id) => Open::Match(item_id),
         Matched::No => match field {
-            HasPasswordField::Yes => Open::NoMatch,
+            HasPasswordField::Yes => match vault {
+                VaultAvailability::Readable => Open::NoMatch,
+                VaultAvailability::Locked => Open::Locked,
+            },
             // Both silence, and deliberately: a window we could not read is
             // treated exactly as today's build treats every unmatched window.
             // Guessing a card onto the screen from an unanswered question is
             // the failure mode the third arm above exists to prevent, and
-            // `Unknown` is the case with the least evidence of all.
+            // `Unknown` is the case with the least evidence of all. Locked or
+            // readable makes no difference: neither is evidence that this
+            // window is asking for a password.
             HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
         },
     }
@@ -1500,6 +1592,16 @@ pub trait PromptPresenter {
     /// signature something can later fill in with a sentinel. See
     /// [`no_match_arm`].
     fn show_no_match(&self, label: &str, position: Option<(f32, f32)>);
+    /// Shows design **3b** -- the card for a window with a password field
+    /// focused while the vault cannot be read -- and returns when the user
+    /// dismisses it.
+    ///
+    /// A separate method rather than a flag on [`Self::show_no_match`], for the
+    /// reason [`handle_no_match`] is separate from [`handle_match`]: the two
+    /// cards make opposite claims about the vault, and a boolean that chose
+    /// between them is a boolean something can pass wrongly. Neither returns
+    /// anything, and neither takes an item.
+    fn show_locked(&self, label: &str, position: Option<(f32, f32)>);
 }
 
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
@@ -1522,6 +1624,9 @@ pub struct FnPresenter {
     /// Asked to put design 3a on screen. Answers nothing; see
     /// [`PromptPresenter::show_no_match`].
     pub show_no_match: fn(&str, Option<(f32, f32)>),
+    /// Asked to put design 3b on screen. Answers nothing; see
+    /// [`PromptPresenter::show_locked`].
+    pub show_locked: fn(&str, Option<(f32, f32)>),
 }
 
 impl PromptPresenter for FnPresenter {
@@ -1542,6 +1647,10 @@ impl PromptPresenter for FnPresenter {
     fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
         (self.show_no_match)(label, position)
     }
+
+    fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
+        (self.show_locked)(label, position)
+    }
 }
 
 /// The production presenter: the real placement calculation and the real
@@ -1557,6 +1666,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: overlay_ui::show_prompt_overlay,
     show_no_match: overlay_ui::show_no_match_overlay,
+    show_locked: overlay_ui::show_locked_overlay,
 };
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
@@ -1650,6 +1760,45 @@ pub fn no_match_arm<P: PromptPresenter>(
 /// [`no_match_arm`]'s, which a test drives with a recorder.
 pub fn handle_no_match(window: &crate::window_watch::ForegroundEvent) {
     no_match_arm(&REAL_OVERLAY, window);
+}
+
+/// **The whole of the locked arm, as a pure function** -- [`no_match_arm`]'s
+/// 3b sibling, written the same way and for the same two reasons: the
+/// placement must be computed for the window the card names, and it must be
+/// computed for the row count the card is *sized* by.
+///
+/// **The placement is asked about [`overlay_ui::LOCKED_ROWS`]**, not
+/// `NO_MATCH_ROWS`, even though the two are equal today. The clamp onto the
+/// monitor's work area is a function of the card's height, so asking about the
+/// other card's constant would be correct only by coincidence -- and would
+/// stop being correct the moment either card changed shape, silently, by
+/// putting this card's footer and its only dismiss hint under the taskbar.
+///
+/// **Nothing about an item or the vault crosses this function.** There is no
+/// id, no `VaultItem`, no cache and no [`Reprompt`] -- the same signature-level
+/// fact `no_match_arm` records, and it is stronger here: this path runs
+/// precisely when the vault cannot be read, so a parameter that could carry an
+/// item would be a parameter nothing could honestly fill.
+pub fn locked_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+) {
+    let position = presenter.position(window.hwnd, overlay_ui::LOCKED_ROWS);
+    presenter.show_locked(window_label(&window.exe_name, &window.title), position);
+}
+
+/// Dispatches a freshly foregrounded window that asks for a password while the
+/// vault cannot be read: design 3b.
+///
+/// [`handle_no_match`]'s sibling, and separate for the reason that one is
+/// separate from [`handle_match`]. It returns nothing, so nothing is armed;
+/// it is handed no cache, no injector, no `FillStats` and no [`Reprompt`], so
+/// nothing it holds can type, count or unlock anything.
+///
+/// Only the real presenter is named on this line; every decision is
+/// [`locked_arm`]'s, which a test drives with a recorder.
+pub fn handle_locked(window: &crate::window_watch::ForegroundEvent) {
+    locked_arm(&REAL_OVERLAY, window);
 }
 
 /// [`prompt_arm`] with the vault lookup in front of it, so that **the item is
@@ -2016,6 +2165,9 @@ mod tests {
         /// The label and placement each `show_no_match` was handed -- design
         /// 3a's own log, kept apart from `shown`.
         no_match_shown: std::cell::RefCell<Vec<NoMatchShown>>,
+        /// The label and placement each `show_locked` was handed -- design
+        /// 3b's own log, kept apart from both of the others.
+        locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
     }
 
     impl PromptPresenter for RecordingPresenter {
@@ -2047,6 +2199,17 @@ mod tests {
         /// two states differ by exactly whether an item exists.
         fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
             self.no_match_shown
+                .borrow_mut()
+                .push((label.to_string(), position));
+        }
+
+        /// Design 3b goes into a log of its own, for the same reason 3a does
+        /// and one more: 3a and 3b are the two cards that make OPPOSITE
+        /// claims about the vault, so a recorder that could not tell them
+        /// apart would let either satisfy a test written about the other --
+        /// which is exactly the defect this state exists to correct.
+        fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
+            self.locked_shown
                 .borrow_mut()
                 .push((label.to_string(), position));
         }
@@ -2150,6 +2313,59 @@ mod tests {
             "the MATCHED card was raised for a window with no match. The two states differ by \
              exactly whether an item exists, and this one has none"
         );
+        assert!(
+            presenter.locked_shown.borrow().is_empty(),
+            "the LOCKED card was raised by `no_match_arm`. That card says Deskwarden cannot \
+             read the vault, which is the opposite of what this arm is called for"
+        );
+    }
+
+    /// [`locked_arm`]'s half of the same claim: the card opens **where** the
+    /// placement answered, and the placement is asked **about this window**
+    /// and **about the row count the 3b card is sized by**.
+    ///
+    /// Written out rather than shared with the 3a test above, because the two
+    /// arms are two functions with two constants, and a test parameterised
+    /// over them would pass if `locked_arm` were a call to `no_match_arm`.
+    #[test]
+    fn the_locked_card_opens_where_the_placement_answered_for_that_window() {
+        let w = window("AtlasLicence.exe", "Atlas Licence");
+        let presenter = RecordingPresenter {
+            placement: Some((120.0, 340.0)),
+            ..Default::default()
+        };
+
+        locked_arm(&presenter, &w);
+
+        assert_eq!(
+            presenter.asked_about.get(),
+            Some(w.hwnd),
+            "the placement was computed for a handle other than the window it was asked about"
+        );
+        assert_eq!(
+            presenter.asked_rows.get(),
+            Some(overlay_ui::LOCKED_ROWS),
+            "the placement was asked about a row count other than the one the 3b card is \
+             SIZED by. The clamp onto the work area is a function of that height, so a wrong \
+             count puts the card's footer -- and its only dismiss hint -- under the taskbar"
+        );
+        let shown = presenter.locked_shown.borrow();
+        assert_eq!(shown.len(), 1, "the locked card is shown exactly once");
+        assert_eq!(
+            shown[0].1,
+            Some((120.0, 340.0)),
+            "the card must open at the placement that was answered for this window"
+        );
+        assert!(
+            presenter.no_match_shown.borrow().is_empty(),
+            "`locked_arm` raised the NO-MATCH card. That card asserts there is no saved login \
+             for this app, which a locked vault cannot know -- and it is the whole reason 3b \
+             exists"
+        );
+        assert!(
+            presenter.shown.borrow().is_empty(),
+            "the matched card was raised for a vault that cannot be read at all"
+        );
     }
 
     /// **The label is `window_label`'s answer, and this card is the one place
@@ -2191,6 +2407,31 @@ mod tests {
     ///
     /// The broader form of the test above, and it fails on a name reaching any
     /// string this arm passes rather than only the one the test names.
+    /// The same claim for 3b, and it is not implied by 3a's. The two arms
+    /// each compute the label themselves, so `locked_arm` passing
+    /// `&window.exe_name` would leave 3a's test green while putting
+    /// "ApplicationFrameHost.exe" on the only line of the locked card that
+    /// names the user's window.
+    #[test]
+    fn nothing_the_locked_card_is_given_carries_the_raw_exe_name() {
+        let spy = StringSpy::default();
+        locked_arm(&spy, &window(HOST, "Speedtest"));
+
+        let seen = spy.seen.borrow();
+        assert!(!seen.is_empty(), "control: the spy recorded nothing, so it observed nothing");
+        for s in seen.iter() {
+            assert!(
+                !s.contains(HOST),
+                "the 3b card was handed {s:?}, which carries the frame host's executable name"
+            );
+        }
+        assert!(
+            seen.iter().any(|s| s == "Speedtest"),
+            "control: the window's real name never reached the card either, so the loop above \
+             was asserting about nothing"
+        );
+    }
+
     #[test]
     fn nothing_the_no_match_card_is_given_carries_the_raw_exe_name() {
         let spy = StringSpy::default();
@@ -2453,6 +2694,12 @@ mod tests {
         fn show_no_match(&self, label: &str, _position: Option<(f32, f32)>) {
             self.seen.borrow_mut().push(label.to_string());
         }
+
+        /// And so does design 3b's, for the same reason: it is the only
+        /// string that card shows about the window.
+        fn show_locked(&self, label: &str, _position: Option<(f32, f32)>) {
+            self.seen.borrow_mut().push(label.to_string());
+        }
     }
 
     /// **Nothing plaintext-secret crosses the prompt.** The overlay is a
@@ -2543,6 +2790,10 @@ mod tests {
 
         fn show_no_match(&self, _label: &str, _position: Option<(f32, f32)>) {
             self.log.borrow_mut().push("no-match card shown");
+        }
+
+        fn show_locked(&self, _label: &str, _position: Option<(f32, f32)>) {
+            self.log.borrow_mut().push("locked card shown");
         }
     }
 
@@ -2675,15 +2926,26 @@ mod tests {
             .push((label.to_string(), position));
     }
 
-    /// The forwarding is the only code between [`REAL_OVERLAY`]'s two named
-    /// functions and the screen, so it is driven here -- swapping the two
-    /// fields, or dropping an argument, fails.
+    static LOCKED_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn recording_show_locked(label: &str, position: Option<(f32, f32)>) {
+        LOCKED_FORWARDED
+            .lock()
+            .unwrap()
+            .push((label.to_string(), position));
+    }
+
+    /// The forwarding is the only code between [`REAL_OVERLAY`]'s named
+    /// functions and the screen, so it is driven here -- swapping two fields,
+    /// or dropping an argument, fails.
     #[test]
     fn an_fn_presenter_forwards_to_the_two_functions_it_was_built_from() {
         let presenter = FnPresenter {
             position: recording_position,
             show: recording_show,
             show_no_match: recording_show_no_match,
+            show_locked: recording_show_locked,
         };
 
         assert_eq!(presenter.position(4242, 3), Some((11.0, 22.0)));
@@ -2717,6 +2979,29 @@ mod tests {
             Some(("Ledgerline".to_string(), Some("denis@example.com".to_string())))
         );
         assert_eq!(forwarded[0].2, Some((3.0, 4.0)));
+
+        // **The two no-item cards are forwarded to DIFFERENT functions**, and
+        // each to its own. `show_no_match` and `show_locked` have identical
+        // signatures, so a swap of the two fields -- which would show "no
+        // saved login" for a locked vault and "Deskwarden is locked" for a
+        // readable one, i.e. exactly the defect this state corrects, inverted
+        // -- compiles cleanly. Only reading both logs catches it.
+        drop(forwarded);
+        presenter.show_no_match("Atlas Licence.exe", Some((5.0, 6.0)));
+        presenter.show_locked("Ledgerline.exe", Some((7.0, 8.0)));
+        assert_eq!(
+            *NO_MATCH_FORWARDED.lock().unwrap(),
+            vec![("Atlas Licence.exe".to_string(), Some((5.0, 6.0)))],
+            "the 3a card was not forwarded to the 3a function, or was handed the 3b call's \r
+             arguments"
+        );
+        assert_eq!(
+            *LOCKED_FORWARDED.lock().unwrap(),
+            vec![("Ledgerline.exe".to_string(), Some((7.0, 8.0)))],
+            "the 3b card was not forwarded to the 3b function. A card that claims the vault \r
+             is locked, shown for a readable vault, is the same lie the locked state exists \r
+             to stop -- in the other direction"
+        );
     }
 }
 
@@ -2763,6 +3048,18 @@ mod prompt_wiring_tests {
         concat!("let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
+    /// **The two no-item cards, each named in its own field.**
+    ///
+    /// `show_no_match` and `show_locked` have identical signatures, so
+    /// swapping the two values in [`REAL_OVERLAY`] compiles, warns about
+    /// nothing, and inverts the entire correction: a locked vault would be
+    /// told "No saved login for <app>" -- the defect 3b exists to remove --
+    /// and a readable one would be told Deskwarden is locked while it plainly
+    /// was not. `FnPresenter`'s forwarding test cannot see it, because the
+    /// swap is in the struct literal it does not build.
+    const REAL_SHOW_NO_MATCH: &str =
+        concat!("show_no_match: ", "overlay_ui::show_no_match_overlay,");
+    const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "overlay_ui::show_locked_overlay,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
     /// it about the value it was HANDED. `match_disposition(true)` -- the
     /// preference read out of the path, the prompt back on for everyone who
@@ -2863,6 +3160,17 @@ mod prompt_wiring_tests {
         assert_eq!(occurrences(planted, REAL_SHOW), 1, "planted: {planted}");
         let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
+
+        // The swap, planted both ways round, so each needle is shown to
+        // notice the other card's function being put in its field.
+        let planted = concat!("    show_no_match: ", "overlay_ui::show_no_match_overlay,");
+        assert_eq!(occurrences(planted, REAL_SHOW_NO_MATCH), 1, "planted: {planted}");
+        let swapped = concat!("    show_no_match: ", "overlay_ui::show_locked_overlay,");
+        assert_eq!(occurrences(swapped, REAL_SHOW_NO_MATCH), 0, "planted: {swapped}");
+        let planted = concat!("    show_locked: ", "overlay_ui::show_locked_overlay,");
+        assert_eq!(occurrences(planted, REAL_SHOW_LOCKED), 1, "planted: {planted}");
+        let swapped = concat!("    show_locked: ", "overlay_ui::show_no_match_overlay,");
+        assert_eq!(occurrences(swapped, REAL_SHOW_LOCKED), 0, "planted: {swapped}");
 
         let planted = concat!("match match_disposition", "(prompt_on_match) {");
         assert_eq!(occurrences(planted, DISPOSITION_CALL), 1, "planted: {planted}");
@@ -2970,6 +3278,22 @@ mod prompt_wiring_tests {
              Zero means the overlay is reached through something other than the real function \
              named plainly, and a wrapper here can substitute any of the three values \
              `prompt_arm` was careful to pass through unaltered"
+        );
+
+        assert_eq!(
+            occurrences(source(), REAL_SHOW_NO_MATCH),
+            1,
+            "expected {REAL_SHOW_NO_MATCH:?} exactly once in app.rs -- `REAL_OVERLAY`'s 3a \
+             field. Zero most likely means it has been swapped with the 3b field, which \
+             compiles and puts \"No saved login for <app>\" back in front of every user whose \
+             vault is merely locked"
+        );
+        assert_eq!(
+            occurrences(source(), REAL_SHOW_LOCKED),
+            1,
+            "expected {REAL_SHOW_LOCKED:?} exactly once in app.rs -- `REAL_OVERLAY`'s 3b \
+             field. Zero means a window with a password field and a locked vault reaches some \
+             card other than the one that says so"
         );
     }
 }
@@ -5428,35 +5752,132 @@ mod disposition_tests {
     #[test]
     fn an_ordinary_window_with_no_password_field_is_still_silence() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::No),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable),
             Open::Nothing,
             "a window the vault does not know and that asks for no password now raises a card. \
              That is every editor, terminal and file manager the user focuses"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Unknown),
+            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable),
             Open::Nothing,
             "a window UI Automation could not answer for is being treated as a login window. \
              `Unknown` is the case with the LEAST evidence, and it is being read as the most"
         );
     }
 
+    /// **And the silence control survives the locked state**, which is the
+    /// half that a fix for the lying no-match card could most easily have
+    /// broken.
+    ///
+    /// The vault is locked for a large part of a session. If lockedness alone
+    /// raised a card, Deskwarden would follow the user from window to window
+    /// announcing itself until they unlocked -- which is not a feature, it is
+    /// a popup, and it is a worse failure than the one being corrected. The
+    /// password field stays the gate, in both vault states.
+    #[test]
+    fn an_ordinary_window_is_still_silence_in_both_vault_states() {
+        let mut checked = 0;
+        for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+            for field in [HasPasswordField::No, HasPasswordField::Unknown] {
+                assert_eq!(
+                    disposition(Matched::No, field, vault),
+                    Open::Nothing,
+                    "an ordinary window raised a card with {field:?} and {vault:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4, "the loop must have covered both states of both inputs");
+    }
+
     /// The trigger itself, and its opposite number, so the function is pinned
     /// in both directions rather than only where it must stay quiet.
     #[test]
     fn a_password_field_with_no_match_opens_the_no_match_card() {
-        assert_eq!(disposition(Matched::No, HasPasswordField::Yes), Open::NoMatch);
         assert_eq!(
-            disposition(Matched::Yes("7"), HasPasswordField::Yes),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
+            Open::NoMatch
+        );
+        assert_eq!(
+            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable),
             Open::Match("7"),
             "a matched window must still open the matched card -- the item id is what the fill \
              is resolved from"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes),
-            disposition(Matched::No, HasPasswordField::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable),
             "the premise: the password-field answer actually decides something. Equal answers \
              mean the probe is being paid for and ignored"
+        );
+    }
+
+    /// **The correction, stated as the assertion that used to be false.**
+    ///
+    /// `main::stand_down_after_unlock` calls `MatchEngine::clear` on every
+    /// lock, and its own log line says what that means: "the app matches are
+    /// cleared too, so nothing can prompt to autofill until they are rebuilt".
+    /// So with the vault locked `lookup` answers `None` for every window,
+    /// `Matched::No` for every window, and the 3a card told the user "No saved
+    /// login for <app>" about apps that may very well have one -- a false
+    /// statement about their own vault, from the one surface whose entire
+    /// purpose is to be trusted about it.
+    ///
+    /// A locked vault gets [`Open::Locked`] instead, which says only that
+    /// Deskwarden is locked: a claim it can support.
+    #[test]
+    fn a_locked_vault_never_claims_there_is_no_saved_login() {
+        assert_eq!(
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked),
+            Open::Locked,
+            "with the vault locked and the engine therefore empty, an unmatched login window \
+             still opens the card that asserts there is no saved login for it"
+        );
+        assert_ne!(
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable),
+            "the premise: the vault state actually decides something here. Equal answers mean \
+             the third input is accepted and ignored, which is the defect unchanged"
+        );
+    }
+
+    /// **A readable but EMPTY vault still gets 3a, and that is deliberate.**
+    ///
+    /// The cheapest way to spell "the vault cannot answer" would have been
+    /// "the match engine is empty" -- which is also the state of a user whose
+    /// vault holds no app matches at all. For them "No saved login for <app>"
+    /// is true, useful, and exactly what 3a was built to say.
+    /// [`VaultAvailability`] is read from `VaultCache::is_populated` rather
+    /// than from the engine for this reason, and this is the case that tells
+    /// the two predicates apart.
+    #[test]
+    fn an_empty_but_readable_vault_still_says_there_is_no_saved_login() {
+        assert_eq!(
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true)),
+            Open::NoMatch,
+            "a user whose vault genuinely has nothing for this app is now told Deskwarden is \
+             locked instead, which is both false and useless to them"
+        );
+        assert_eq!(
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false)),
+            Open::Locked
+        );
+    }
+
+    /// The `bool` -> [`VaultAvailability`] mapping, in both directions.
+    ///
+    /// Its one call site is inside `main`'s event loop, which no test reaches;
+    /// inverted there, every locked vault would report `Readable` and the card
+    /// would go straight back to claiming what it cannot know.
+    #[test]
+    fn a_populated_cache_is_readable_and_an_empty_one_is_locked() {
+        assert_eq!(vault_availability(true), VaultAvailability::Readable);
+        assert_eq!(vault_availability(false), VaultAvailability::Locked);
+        assert_ne!(
+            vault_availability(true),
+            vault_availability(false),
+            "`vault_availability` is ignoring its argument, so the overlay's whole knowledge \
+             of whether it may speak about the vault is a constant"
         );
     }
 
@@ -5470,12 +5891,38 @@ mod disposition_tests {
     fn a_matched_window_ignores_the_field_answer_entirely() {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             assert_eq!(
-                disposition(Matched::Yes("42"), field),
+                disposition(Matched::Yes("42"), field, VaultAvailability::Readable),
                 Open::Match("42"),
                 "a matched window's disposition changed with {field:?}, so the probe cannot be \
                  skipped on that branch after all"
             );
         }
+    }
+
+    /// **And it ignores the vault state too**, so adding the locked card
+    /// changed nothing about what a recognised window does. A match is only
+    /// representable when the engine holds entries, which is only true when
+    /// the vault was read -- so `Locked` beside `Matched::Yes` is a
+    /// contradiction, and the arm resolves it by believing the match rather
+    /// than by suppressing the fill the user came for.
+    #[test]
+    fn a_matched_window_ignores_the_vault_state_too() {
+        let mut checked = 0;
+        for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+            for field in [
+                HasPasswordField::Yes,
+                HasPasswordField::No,
+                HasPasswordField::Unknown,
+            ] {
+                assert_eq!(
+                    disposition(Matched::Yes("42"), field, vault),
+                    Open::Match("42"),
+                    "a matched window's disposition changed with {field:?} and {vault:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 6, "the loop must have covered every combination");
     }
 
     /// The item id is carried through, not merely "some id": a `disposition`
@@ -5484,7 +5931,10 @@ mod disposition_tests {
     #[test]
     fn the_matched_id_is_the_id_that_comes_back_out() {
         for id in ["7", "42", "a-uuid-shaped-thing"] {
-            assert_eq!(disposition(Matched::Yes(id), HasPasswordField::No), Open::Match(id));
+            assert_eq!(
+                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable),
+                Open::Match(id)
+            );
         }
     }
 

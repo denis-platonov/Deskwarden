@@ -115,6 +115,7 @@ enum Surface {
     /// different function, and a state nobody renders is a state nobody looks
     /// at.
     OverlayNoMatch,
+    OverlayLocked,
     /// The login window with a vault that exists and is locked.
     LoginUnlock,
     /// The login window with no account yet -- server dropdown and the Hello
@@ -213,6 +214,7 @@ fn pane_frame() -> egui::Frame {
 const ALL: &[Surface] = &[
     Surface::Overlay,
     Surface::OverlayNoMatch,
+    Surface::OverlayLocked,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -236,6 +238,7 @@ impl Surface {
         match self {
             Surface::Overlay => "overlay",
             Surface::OverlayNoMatch => "overlay_no_match",
+            Surface::OverlayLocked => "overlay_locked",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -267,7 +270,9 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::Overlay | Surface::OverlayNoMatch => egui::vec2(396.0, 164.0),
+            Surface::Overlay | Surface::OverlayNoMatch | Surface::OverlayLocked => {
+                egui::vec2(396.0, 164.0)
+            }
             Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
             Surface::LoginDetail
             | Surface::CardDetail
@@ -501,6 +506,7 @@ impl eframe::App for Preview {
         match self.current() {
             Surface::Overlay => self.draw_overlay(root, &ctx),
             Surface::OverlayNoMatch => self.draw_overlay_no_match(root, &ctx),
+            Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false),
             Surface::LoginSignin => self.draw_login(root, &ctx, true),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
@@ -615,6 +621,20 @@ impl Preview {
     fn draw_overlay_no_match(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
         egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
             if overlay_ui::draw_no_match_card(ui, "Atlas Licence")
+                == overlay_ui::OverlayAction::Dismiss
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+
+    /// Design 3b, drawn by the shipped function for the same reason 3a is:
+    /// this card and the no-match one differ by three strings, and a
+    /// re-implementation here could show either while the app showed the
+    /// other.
+    fn draw_overlay_locked(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
+            if overlay_ui::draw_locked_card(ui, "Atlas Licence")
                 == overlay_ui::OverlayAction::Dismiss
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

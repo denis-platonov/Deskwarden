@@ -25,8 +25,8 @@
 
 use deskwarden::accounts::{self, account_label, Account};
 use deskwarden::app::{
-    fill_from_vault, handle_match, handle_no_match, match_entries, pump_windows_messages,
-    HasPasswordField, Matched, Open,
+    fill_from_vault, handle_locked, handle_match, handle_no_match, match_entries,
+    pump_windows_messages, HasPasswordField, Matched, Open,
 };
 use deskwarden::backend_policy;
 use deskwarden::bw_path;
@@ -1424,9 +1424,10 @@ fn main() {
             &fill_stats,
             &estate.engine,
             estate.settings.prompt_on_match,
+            deskwarden::app::vault_availability(estate.cache.is_populated()),
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
-            &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD },
+            &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
             &deskwarden::injector::sequence::REAL_NOTIFIER,
             &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
         );
@@ -2398,9 +2399,10 @@ fn main() {
                 &fill_stats,
                 &estate.engine,
                 estate.settings.prompt_on_match,
+                deskwarden::app::vault_availability(estate.cache.is_populated()),
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD },
+                &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
                 &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
             );
@@ -2901,6 +2903,12 @@ struct NoMatchEnv<'a> {
     /// and which, un-seamed, would make the two no-match dispatch tests below
     /// hang on a window nobody can close.
     show: fn(&window_watch::ForegroundEvent),
+    /// Asked to put design 3b on screen: the same window, focused while the
+    /// vault cannot be read. Its own `fn` pointer rather than a flag on
+    /// `show`, for the reason `PromptPresenter::show_locked` gives -- and so
+    /// that a dispatch test can say WHICH of the two cards went up, which is
+    /// the whole of what this correction changed.
+    show_locked: fn(&window_watch::ForegroundEvent),
 }
 
 impl NoMatchEnv<'_> {
@@ -2947,6 +2955,10 @@ const REAL_PASSWORD_FIELD_PROBE: fn(isize) -> HasPasswordField = real_password_f
 /// mutation to hide in.
 const REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = handle_no_match;
 
+/// The production 3b card, named and not called -- the same shape, and the
+/// same reason, as [`REAL_NO_MATCH_CARD`] directly above.
+const REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = handle_locked;
+
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
 ///
@@ -2974,6 +2986,15 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // straight back into that binding, so a user who turns the prompt off has
     // it off for the very next window they focus.
     prompt_on_match: bool,
+    // Whether this process can currently answer for the vault's contents at
+    // all, read from `cache.is_populated()` at the ONE call site rather than
+    // from `cache` in here. It is a decision input, so it belongs beside the
+    // other one in `disposition`'s argument list where a test can vary it;
+    // computed in here from the `cache` parameter it would be a branch no test
+    // could reach without a populated `VaultCache`, which is precisely the
+    // shape that let the no-match card claim what it did. See
+    // `app::VaultAvailability`.
+    vault: deskwarden::app::VaultAvailability,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
     // The password-field question, memoised. Borrowed for one event like
@@ -3036,12 +3057,21 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // subtree walk, throttled. `Unknown` here is not a guess -- it is the
     // honest record that the question was not put. See `PasswordFieldProbe`
     // for the measurement.
+    //
+    // **`vault` deliberately does not gate this.** A locked vault still needs
+    // the answer -- it is what chooses between design 3b and silence, and
+    // without it 3b would appear over every window the user touched until they
+    // unlocked. So being locked adds no probe a readable vault would not also
+    // have run, and the rule "never probe for an answer that cannot be used"
+    // is kept by the answer being used, not by the probe being skipped. (Had
+    // the fix for the lying no-match card been to stay silent when locked,
+    // this is the line that would have had to grow a `vault` arm.)
     let field = match matched {
         Matched::Yes(_) => HasPasswordField::Unknown,
         Matched::No => field_probe.ask(event.hwnd),
     };
 
-    match deskwarden::app::disposition(matched, field) {
+    match deskwarden::app::disposition(matched, field, vault) {
         Open::Match(item_id) => {
             log::info!(
                 "matched {} to vault item {item_id} ({:?})",
@@ -3080,6 +3110,18 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // this crate may do -- and which, called directly on this line,
             // would make those tests hang rather than fail.
             (field_probe.show)(event);
+        }
+        Open::Locked => {
+            log::info!(
+                "{} has a password field, and the vault is locked, so the overlay says only \
+                 that rather than claiming there is no saved login for it",
+                deskwarden::app::window_label(&event.exe_name, &event.title)
+            );
+            // Everything `Open::NoMatch` says above applies here and applies
+            // more strongly: nothing is armed, nothing is typed, and this
+            // path is handed no item because there provably is not one to be
+            // had -- the engine that would name it is what the lock cleared.
+            (field_probe.show_locked)(event);
         }
         Open::Nothing => {}
     }
@@ -20743,6 +20785,27 @@ mod tests {
             NO_MATCH_SHOWN.with(|s| std::mem::take(&mut *s.borrow_mut()))
         }
 
+        thread_local! {
+            /// The windows the **locked** card was asked to open for, in
+            /// order. A second recorder rather than a tagged entry in
+            /// `NO_MATCH_SHOWN`, because *which* of the two cards went up is
+            /// the entire subject of the tests that read it: one recorder
+            /// serving both would pass whichever the code chose.
+            static LOCKED_SHOWN: std::cell::RefCell<Vec<(String, isize)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        /// The test seam's 3b -- `record_no_match`'s sibling, and for the same
+        /// reason: `handle_locked` also calls `eframe::run_native`.
+        fn record_locked(window: &window_watch::ForegroundEvent) {
+            LOCKED_SHOWN.with(|s| s.borrow_mut().push((window.exe_name.clone(), window.hwnd)));
+        }
+
+        /// Empties the locked recorder and returns what was in it.
+        fn take_locked_shown() -> Vec<(String, isize)> {
+            LOCKED_SHOWN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        }
+
         /// The re-prompt scoping for a dispatch test, and **the reason it is
         /// safe for one to exist here.**
         ///
@@ -20760,6 +20823,71 @@ mod tests {
         /// is a fixture: see `the_reprompt_is_what_gates_the_fill`.
         fn no_reprompt() -> deskwarden::app::Reprompt<'static> {
             Box::leak(Box::new(deskwarden::app::FillProof::default())).scoped_to(None)
+        }
+
+        /// **The two no-item cards are wired to their own functions**, on the
+        /// four production lines no test can execute.
+        ///
+        /// `REAL_NO_MATCH_CARD` and `REAL_LOCKED_CARD` have the same type, and
+        /// `NoMatchEnv`'s `show` and `show_locked` fields have the same type,
+        /// so BOTH swaps compile and warn about nothing. Either one inverts
+        /// the whole of design 3b: a locked vault would go back to being told
+        /// "No saved login for <app>" about apps that may very well have one,
+        /// and a readable vault would be told Deskwarden is locked while it
+        /// was not. Every behavioural test in this file drives
+        /// `process_foreground_event` through the test seam, so none of them
+        /// can see it -- the swap is in the struct literal `run` builds.
+        #[test]
+        fn the_production_seam_wires_each_no_item_card_to_its_own_function() {
+            let source = include_str!("main.rs");
+            // Split literals on one line, in this crate's idiom: a whole
+            // needle would match its own declaration, and a needle with a
+            // newline in it passes on an LF checkout and fails on a CRLF one.
+            let no_match_const =
+                concat!("REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_no_match;");
+            let locked_const =
+                concat!("REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
+            let no_match_field = concat!("show: ", "REAL_NO_MATCH_CARD,");
+            let locked_field = concat!("show_locked: ", "REAL_LOCKED_CARD ");
+
+            // The counter is shown to notice each swap before it is trusted.
+            let swapped_const =
+                concat!("REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
+            assert_eq!(swapped_const.matches(no_match_const).count(), 0);
+            let swapped_field = concat!("show: ", "REAL_LOCKED_CARD,");
+            assert_eq!(swapped_field.matches(no_match_field).count(), 0);
+            assert_eq!(
+                concat!("    show: ", "REAL_NO_MATCH_CARD,").matches(no_match_field).count(),
+                1,
+                "control: the needle does not match the line it describes"
+            );
+
+            assert_eq!(
+                source.matches(no_match_const).count(),
+                1,
+                "`REAL_NO_MATCH_CARD` no longer names `handle_no_match`. Named `handle_locked` \
+                 instead, every window with no match opens the card that says the vault is \
+                 locked -- while it is open"
+            );
+            assert_eq!(
+                source.matches(locked_const).count(),
+                1,
+                "`REAL_LOCKED_CARD` no longer names `handle_locked`. Named `handle_no_match` \
+                 instead, a locked vault is back to asserting there is no saved login for an \
+                 app it cannot read anything about at all"
+            );
+            assert_eq!(
+                source.matches(no_match_field).count(),
+                2,
+                "expected `NoMatchEnv`'s 3a field to name `REAL_NO_MATCH_CARD` at both \
+                 production call sites in `run`"
+            );
+            assert_eq!(
+                source.matches(locked_field).count(),
+                2,
+                "expected `NoMatchEnv`'s 3b field to name `REAL_LOCKED_CARD` at both \
+                 production call sites in `run`"
+            );
         }
 
         /// **What is left unreachable, held by source position.**
@@ -20925,9 +21053,10 @@ mod tests {
                 &stats,
                 &engine,
                 false,
+                deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -20993,9 +21122,10 @@ mod tests {
                 &stats,
                 &engine,
                 true,
+                deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21026,6 +21156,136 @@ mod tests {
                  user is looking at, and one opened for another window appears somewhere else \
                  naming something else"
             );
+            assert!(
+                take_locked_shown().is_empty(),
+                "the LOCKED card was opened for a readable vault. 3a and 3b make opposite \
+                 claims about the vault, so showing 3b here tells a user whose vault is open \
+                 that it is not"
+            );
+        }
+
+        /// **The correction, at the dispatch level.** The same fixture as
+        /// `an_unmatched_window_with_a_password_field_opens_the_no_match_card`
+        /// with exactly one argument changed -- the vault is locked -- and the
+        /// card that goes up is the other one.
+        ///
+        /// This is the state the shipped build got wrong.
+        /// `stand_down_after_unlock` empties the match engine on every lock,
+        /// so `engine_with(&[])` here is not an artificial fixture: it is what
+        /// EVERY window looks like while the vault is locked, including every
+        /// window that does have a saved login. The old build put "No saved
+        /// login for Atlas Licence" over all of them.
+        ///
+        /// Both recorders are read, and that is the point: an implementation
+        /// that showed 3a here would satisfy any assertion that only counted
+        /// cards.
+        #[test]
+        fn an_unmatched_window_with_a_password_field_says_only_that_the_vault_is_locked() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            // Empty because the vault is locked, which is what
+            // `stand_down_after_unlock` leaves behind -- not because the user
+            // has no matches.
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            assert!(
+                take_locked_shown().is_empty() && take_no_match_shown().is_empty(),
+                "control: both recorders start empty, so the assertions below are about THIS \
+                 call"
+            );
+
+            process_foreground_event(
+                &window("AtlasLicence.exe", "Atlas Licence", 0x779),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                deskwarden::app::VaultAvailability::Locked,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert!(
+                filled.seen().is_empty(),
+                "the locked path typed something. There is no item, and the vault it would \
+                 have come from cannot even be read"
+            );
+            assert_eq!(
+                pending_hotkey_fill, None,
+                "the locked path armed the fill hotkey against a window with no item behind it"
+            );
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x779),
+                "control: the event really did reach the decision, so the assertions above are \
+                 about a decision and not about a dropped event"
+            );
+            assert_eq!(
+                take_locked_shown(),
+                vec![("AtlasLicence.exe".to_string(), 0x779)],
+                "design 3b was not opened for this window, or was opened for a different one"
+            );
+            assert!(
+                take_no_match_shown().is_empty(),
+                "with the vault locked the overlay still told the user there is no saved login \
+                 for this app. The match engine is empty because the lock cleared it, so that \
+                 is a statement about an app that may very well have one -- which is the \
+                 defect this state exists to correct"
+            );
+        }
+
+        /// **And a locked vault does not turn the overlay into a popup.** The
+        /// ordinary-window fixture again, with the vault locked: still
+        /// nothing. Without this, "say something when locked" would mean
+        /// saying it over every window the user touched until they unlocked,
+        /// which is a worse failure than the one being fixed.
+        #[test]
+        fn an_ordinary_window_is_still_silence_while_the_vault_is_locked() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let _ = take_locked_shown();
+            let _ = take_no_match_shown();
+
+            process_foreground_event(
+                &window("Notepad.exe", "Untitled - Notepad", 0x77a),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                deskwarden::app::VaultAvailability::Locked,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x77a),
+                "control: the event was processed, so the silence below is a decision"
+            );
+            assert!(
+                take_locked_shown().is_empty(),
+                "a locked vault raised the 3b card over an ordinary window with no password \
+                 field. That card would then follow the user from window to window for as \
+                 long as the vault stayed locked"
+            );
+            assert!(take_no_match_shown().is_empty(), "and 3a was not raised either");
+            assert!(filled.seen().is_empty(), "an ordinary window was filled into");
         }
 
         /// **The silence control, at the dispatch level rather than the pure
@@ -21054,9 +21314,10 @@ mod tests {
                 &stats,
                 &engine,
                 true,
+                deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21118,9 +21379,10 @@ mod tests {
                 &stats,
                 &engine,
                 false,
+                deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: must_not_be_asked, show: record_no_match },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: must_not_be_asked, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21161,9 +21423,10 @@ mod tests {
                     &stats,
                     &engine,
                     false,
+                    deskwarden::app::VaultAvailability::Readable,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -21210,9 +21473,10 @@ mod tests {
                 &stats,
                 &engine,
                 false,
+                deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21247,9 +21511,10 @@ mod tests {
                     &stats,
                     &engine,
                     false,
+                    deskwarden::app::VaultAvailability::Readable,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -21294,9 +21559,10 @@ mod tests {
                     &stats,
                     &engine,
                     false,
+                    deskwarden::app::VaultAvailability::Readable,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
                     &recorder(),
                     &mut no_reprompt(),
                 );
