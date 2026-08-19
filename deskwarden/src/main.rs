@@ -25,8 +25,8 @@
 
 use deskwarden::accounts::{self, account_label, Account};
 use deskwarden::app::{
-    fill_from_vault, handle_match, match_entries, pump_windows_messages, HasPasswordField, Matched,
-    Open,
+    fill_from_vault, handle_match, handle_no_match, match_entries, pump_windows_messages,
+    HasPasswordField, Matched, Open,
 };
 use deskwarden::backend_policy;
 use deskwarden::bw_path;
@@ -1426,7 +1426,7 @@ fn main() {
             estate.settings.prompt_on_match,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
-            &mut FieldProbe { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE },
+            &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD },
             &deskwarden::injector::sequence::REAL_NOTIFIER,
             &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
         );
@@ -2400,7 +2400,7 @@ fn main() {
                 estate.settings.prompt_on_match,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE },
+                &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD },
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
                 &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
             );
@@ -2892,12 +2892,18 @@ fn describe_signer(subject_dn: Option<&str>) -> String {
 /// so the substitution is the same `fn`-pointer idiom `VaultFrameEnv` uses:
 /// production names [`REAL_PASSWORD_FIELD_PROBE`], a test names its own
 /// function, and the code under test is byte-for-byte the shipped code.
-struct FieldProbe<'a> {
+struct NoMatchEnv<'a> {
     memo: &'a mut deskwarden::app::PasswordFieldProbe,
     ask: fn(isize) -> HasPasswordField,
+    /// Asked to put design 3a on screen. Behind the same `fn` pointer and for
+    /// the same reason: the real one calls `eframe::run_native` and opens a
+    /// frameless always-on-top window, which no test in this crate may do --
+    /// and which, un-seamed, would make the two no-match dispatch tests below
+    /// hang on a window nobody can close.
+    show: fn(&window_watch::ForegroundEvent),
 }
 
-impl FieldProbe<'_> {
+impl NoMatchEnv<'_> {
     /// The answer for `hwnd`, through the throttle.
     ///
     /// `Instant::now()` is read here rather than passed in because this is the
@@ -2935,6 +2941,12 @@ fn real_password_field_probe(hwnd: isize) -> HasPasswordField {
 /// reference with no expression in it for a mutation to hide in.
 const REAL_PASSWORD_FIELD_PROBE: fn(isize) -> HasPasswordField = real_password_field_probe;
 
+/// The production 3a card, named and not called -- the same shape as
+/// `REAL_PASSWORD_FIELD_PROBE` above and `app::REAL_OVERLAY` in the library.
+/// `handle_no_match` takes only the window, so there is no argument here for a
+/// mutation to hide in.
+const REAL_NO_MATCH_CARD: fn(&window_watch::ForegroundEvent) = handle_no_match;
+
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
 ///
@@ -2967,7 +2979,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // The password-field question, memoised. Borrowed for one event like
     // `reprompt` above, because the memory has to outlive the call for the
     // throttle to throttle anything.
-    field_probe: &mut FieldProbe<'_>,
+    field_probe: &mut NoMatchEnv<'_>,
     notifier: &dyn Notifier,
     // The re-prompt scoping, borrowed for the duration of one event rather
     // than owned here: the proof it carries has to outlive this call for
@@ -3052,19 +3064,22 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             }
         }
         Open::NoMatch => {
-            // **The trigger, and nothing on screen yet.** Task 2 of the plan
-            // replaces this with design 3a's card; this commit is the second
-            // question and the route to it, which is the part with the cost
-            // and the risk in it. Nothing is armed and nothing is typed: with
-            // no item there is no id for `pending_hotkey_fill` to carry and no
-            // credentials to fill, which is also why `handle_match` is not
-            // reached and why `reprompt` -- a gate defined over an existing
-            // item -- is not consulted here. See
-            // `the_no_match_path_touches_neither_the_hotkey_nor_the_reprompt`.
             log::info!(
                 "no vault item matches {}, and it has a password field",
                 deskwarden::app::window_label(&event.exe_name, &event.title)
             );
+            // Nothing is armed and nothing is typed, and the signature is what
+            // says so: `handle_no_match` returns nothing, so there is no
+            // `pending_hotkey_fill` to set, and it is handed no cache, no
+            // injector and no `reprompt` -- a gate defined over an existing
+            // item, which this path does not have. See
+            // `an_unmatched_window_with_a_password_field_arms_nothing_and_types_nothing`.
+            //
+            // Through the seam, not by naming `handle_no_match` here: the real
+            // one opens a frameless always-on-top window, which no test in
+            // this crate may do -- and which, called directly on this line,
+            // would make those tests hang rather than fail.
+            (field_probe.show)(event);
         }
         Open::Nothing => {}
     }
@@ -20679,7 +20694,7 @@ mod tests {
         /// what every fixture in this file describes.
         ///
         /// It is here rather than `REAL_PASSWORD_FIELD_PROBE` for the reason
-        /// the whole `FieldProbe` seam exists: the real answer is a
+        /// the whole `NoMatchEnv` seam exists: the real answer is a
         /// cross-process COM call against a real window, and no test in this
         /// crate may probe one. Answering `No` also keeps every existing
         /// dispatch assertion meaning exactly what it meant before this seam
@@ -20692,6 +20707,40 @@ mod tests {
         /// The other answer, for the tests that drive the new trigger.
         fn has_password_field(_hwnd: isize) -> HasPasswordField {
             HasPasswordField::Yes
+        }
+
+        thread_local! {
+            /// The windows the no-match card was asked to open for, in order.
+            ///
+            /// A thread-local rather than a captured closure because the seam
+            /// is an `fn` pointer, which cannot capture -- and it is an `fn`
+            /// pointer so that production names `handle_no_match` with no
+            /// wrapper around it. Each test empties it first, so its first
+            /// assertion is that nothing had been shown yet.
+            static NO_MATCH_SHOWN: std::cell::RefCell<Vec<(String, isize)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        /// The test seam's 3a: record the window, open nothing.
+        ///
+        /// `handle_no_match` calls `eframe::run_native`, which opens a
+        /// frameless always-on-top window. A test that reached it would not
+        /// fail -- it would HANG, on a window with no title bar in a run with
+        /// no user.
+        fn record_no_match(window: &window_watch::ForegroundEvent) {
+            NO_MATCH_SHOWN.with(|s| {
+                // The EVENT, not a label computed here: the label is
+                // `no_match_arm`'s to compute, and a recorder that computed it
+                // the same way would assert nothing but its own arithmetic.
+                // `app::the_no_match_card_is_told_the_window_label_and_not_the
+                // _exe_name` is where that claim lives.
+                s.borrow_mut().push((window.exe_name.clone(), window.hwnd))
+            });
+        }
+
+        /// Empties the recorder and returns what was in it.
+        fn take_no_match_shown() -> Vec<(String, isize)> {
+            NO_MATCH_SHOWN.with(|s| std::mem::take(&mut *s.borrow_mut()))
         }
 
         /// The re-prompt scoping for a dispatch test, and **the reason it is
@@ -20878,7 +20927,7 @@ mod tests {
                 false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -20932,6 +20981,10 @@ mod tests {
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
             let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            assert!(
+                take_no_match_shown().is_empty(),
+                "control: the recorder starts empty, so the assertion below is about THIS call"
+            );
 
             process_foreground_event(
                 &window("AtlasLicence.exe", "Atlas Licence", 0x777),
@@ -20942,7 +20995,7 @@ mod tests {
                 true,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut probe_memo, ask: has_password_field },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -20964,6 +21017,14 @@ mod tests {
                 "control: the event really did get past the dispatch rules and reach the \
                  decision. Without this, the three assertions above would all pass against an \
                  event that was discarded before anything ran"
+            );
+            assert_eq!(
+                take_no_match_shown(),
+                vec![("AtlasLicence.exe".to_string(), 0x777)],
+                "design 3a was not opened for this window, or was opened for a different one. \
+                 The hwnd is what says WHICH window: this card is placed next to the field the \
+                 user is looking at, and one opened for another window appears somewhere else \
+                 naming something else"
             );
         }
 
@@ -20995,7 +21056,7 @@ mod tests {
                 true,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21007,6 +21068,12 @@ mod tests {
                 Some(0x778),
                 "control: the event reached the decision, so the silence above is the \
                  decision's answer and not a dropped event"
+            );
+            assert!(
+                take_no_match_shown().is_empty(),
+                "design 3a was raised over an ordinary window. This is the failure mode the \
+                 whole feature has to avoid: a frameless, always-on-top card appearing over \
+                 every window the vault does not happen to know"
             );
         }
 
@@ -21053,7 +21120,7 @@ mod tests {
                 false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut probe_memo, ask: must_not_be_asked },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: must_not_be_asked, show: record_no_match },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21096,7 +21163,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -21145,7 +21212,7 @@ mod tests {
                 false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -21182,7 +21249,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -21229,7 +21296,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
-                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                    &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match },
                     &recorder(),
                     &mut no_reprompt(),
                 );

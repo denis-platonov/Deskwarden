@@ -1492,6 +1492,14 @@ pub trait PromptPresenter {
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice>;
+    /// Shows design **3a** -- the card for a window with a password field that
+    /// nothing in the vault matches -- and returns when the user dismisses it.
+    ///
+    /// **No return value, and no item argument.** There is nothing to choose
+    /// and nothing to name; a signature that could carry an item id here is a
+    /// signature something can later fill in with a sentinel. See
+    /// [`no_match_arm`].
+    fn show_no_match(&self, label: &str, position: Option<(f32, f32)>);
 }
 
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
@@ -1511,6 +1519,9 @@ pub struct FnPresenter {
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
+    /// Asked to put design 3a on screen. Answers nothing; see
+    /// [`PromptPresenter::show_no_match`].
+    pub show_no_match: fn(&str, Option<(f32, f32)>),
 }
 
 impl PromptPresenter for FnPresenter {
@@ -1527,6 +1538,10 @@ impl PromptPresenter for FnPresenter {
     ) -> Option<FillChoice> {
         (self.show)(label, matched, position, choices)
     }
+
+    fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
+        (self.show_no_match)(label, position)
+    }
 }
 
 /// The production presenter: the real placement calculation and the real
@@ -1541,6 +1556,7 @@ impl PromptPresenter for FnPresenter {
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: overlay_ui::show_prompt_overlay,
+    show_no_match: overlay_ui::show_no_match_overlay,
 };
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
@@ -1578,6 +1594,62 @@ pub fn prompt_arm<P: PromptPresenter>(
     let PromptRequest { label, matched, position, choices } =
         prompt_request(window, subject, position);
     presenter.show(label, matched.as_ref(), position, &choices)
+}
+
+/// **The whole of the no-match arm, as a pure function** -- the 3a sibling of
+/// [`prompt_arm`], and written the same way for the same reason.
+///
+/// It asks the presenter where the card goes and then shows it there. That is
+/// two lines, and both of them are exactly the two lines review 32 found could
+/// be silently wrong at a call site no test could reach: an overlay pinned to
+/// the top of the screen, or one opened for a window other than the one it
+/// names. Driven through a recording presenter, neither can be.
+///
+/// **The placement is asked about [`overlay_ui::NO_MATCH_ROWS`]**, which is
+/// the row count the 3a card is sized by. Asking about `0` -- or about a
+/// choice list this state does not have -- would clamp the card onto the work
+/// area using the wrong height, which on a window anchored near the bottom of
+/// the screen puts its footer, and its only dismiss hint, under the taskbar.
+///
+/// **The label is [`window_label`]**, not `exe_name`, for the reason
+/// `prompt_request` gives: a window matched through the title table belongs to
+/// a process whose name means nothing to the user. It matters more here than
+/// there -- this card's entire content is the name of the app it has nothing
+/// for, so a wrong name is the whole message being wrong.
+///
+/// **Nothing about an item crosses this function**, because there is no item.
+/// There is no id, no `VaultItem`, no [`PromptSubject`] and no cache: the
+/// re-prompt gate ([`permitted_by_reprompt`]) is defined over an existing item
+/// and so cannot be asked here, and this signature is why that is a
+/// type-level fact rather than a discipline.
+pub fn no_match_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+) {
+    let position = presenter.position(window.hwnd, overlay_ui::NO_MATCH_ROWS);
+    presenter.show_no_match(window_label(&window.exe_name, &window.title), position);
+}
+
+/// Dispatches a freshly foregrounded window that asks for a password and that
+/// **nothing in the vault matches**: design 3a.
+///
+/// The sibling of [`handle_match`], and separate from it rather than
+/// `handle_match` gaining an `Option<&str>`. Two functions is the stronger
+/// shape: "there is no item" is not an argument that could be `Some` here, it
+/// is the absence of the parameter, so no sentinel id can be introduced and no
+/// `unwrap` can be reached. It is also why this function takes no `VaultCache`,
+/// no `Injector`, no `FillStats` and no [`Reprompt`] -- nothing it is given
+/// can type, count or unlock anything.
+///
+/// **Returns nothing, so nothing is armed.** `handle_match` answers
+/// `(item_id, hwnd)` for the fill hotkey; there is no item id here, and a
+/// hotkey armed against a window with no credentials behind it would fire into
+/// whatever holds focus later.
+///
+/// Only the real presenter is named on this line; every decision is
+/// [`no_match_arm`]'s, which a test drives with a recorder.
+pub fn handle_no_match(window: &crate::window_watch::ForegroundEvent) {
+    no_match_arm(&REAL_OVERLAY, window);
 }
 
 /// [`prompt_arm`] with the vault lookup in front of it, so that **the item is
@@ -1920,6 +1992,11 @@ mod tests {
     /// compile error rather than a silently unchecked value.
     type Shown = (String, Option<(String, Option<String>)>, Option<(f32, f32)>);
 
+    /// What the **no-match** card was told: the label, and where it was put.
+    /// There is no third element because there is no item -- which is the
+    /// whole distinction between this log and [`Shown`].
+    type NoMatchShown = (String, Option<(f32, f32)>);
+
     /// A [`PromptPresenter`] that answers with a fixed placement and records
     /// what it was asked and what it was shown.
     #[derive(Default)]
@@ -1936,6 +2013,9 @@ mod tests {
         shown: std::cell::RefCell<Vec<Shown>>,
         /// The choice list each `show` was handed.
         offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
+        /// The label and placement each `show_no_match` was handed -- design
+        /// 3a's own log, kept apart from `shown`.
+        no_match_shown: std::cell::RefCell<Vec<NoMatchShown>>,
     }
 
     impl PromptPresenter for RecordingPresenter {
@@ -1959,6 +2039,16 @@ mod tests {
             ));
             self.offered.borrow_mut().push(choices.to_vec());
             self.answer.clone()
+        }
+
+        /// Design 3a goes into a log of its own rather than into `shown`: a
+        /// no-match card recorded as though it were a matched one would let
+        /// `no_match_arm` satisfy a test written about `prompt_arm`, and the
+        /// two states differ by exactly whether an item exists.
+        fn show_no_match(&self, label: &str, position: Option<(f32, f32)>) {
+            self.no_match_shown
+                .borrow_mut()
+                .push((label.to_string(), position));
         }
     }
 
@@ -2013,6 +2103,112 @@ mod tests {
         // the path that actually reaches the overlay.
         assert_eq!(shown[0].0, "Speedtest");
         assert_eq!(shown[0].1, None);
+    }
+
+    /// **Design 3a opens where it was told, for the window it names.**
+    ///
+    /// The 3a sibling of `the_overlay_opens_where_the_placement_answered_for_
+    /// that_window`, and it exists for the same reason: `handle_no_match`'s one
+    /// line is unreachable, so the two things `no_match_arm` does -- ask where
+    /// the card goes, and show it there -- would otherwise be exactly as
+    /// silently alterable as the matched arm's were (review 32's Important 1,
+    /// where mapping the placement's `y` to `0.0` pinned every overlay to the
+    /// top of the screen with the whole suite green).
+    #[test]
+    fn the_no_match_card_opens_where_the_placement_answered_for_that_window() {
+        let w = window("AtlasLicence.exe", "Atlas Licence");
+        let presenter = RecordingPresenter {
+            placement: Some((120.0, 340.0)),
+            ..Default::default()
+        };
+
+        no_match_arm(&presenter, &w);
+
+        assert_eq!(
+            presenter.asked_about.get(),
+            Some(w.hwnd),
+            "the placement was computed for a handle other than the window that has nothing \
+             matching it"
+        );
+        assert_eq!(
+            presenter.asked_rows.get(),
+            Some(overlay_ui::NO_MATCH_ROWS),
+            "the placement was asked about a row count other than the one the 3a card is \
+             SIZED by. The clamp onto the monitor's work area is a function of that height, so \
+             a wrong count puts the card's footer -- and its only dismiss hint -- under the \
+             taskbar on a window anchored near the bottom of the screen"
+        );
+        let shown = presenter.no_match_shown.borrow();
+        assert_eq!(shown.len(), 1, "the no-match card is shown exactly once");
+        assert_eq!(
+            shown[0].1,
+            Some((120.0, 340.0)),
+            "the card must open at the placement that was answered for this window"
+        );
+        assert!(
+            presenter.shown.borrow().is_empty(),
+            "the MATCHED card was raised for a window with no match. The two states differ by \
+             exactly whether an item exists, and this one has none"
+        );
+    }
+
+    /// **The label is `window_label`'s answer, and this card is the one place
+    /// that matters most.**
+    ///
+    /// Every other overlay state also names the item; 3a names nothing but the
+    /// app, so a raw `exe_name` for a title-matched Store frame is the entire
+    /// message being wrong -- "ApplicationFrameHost.exe" is the exact
+    /// complaint that produced `window_label` in the first place.
+    ///
+    /// `HOST` is a host process, which is the only case in which the two
+    /// answers differ; a card told `exe_name` fails here and a card told the
+    /// title passes, which is what makes this a test and not a restatement.
+    #[test]
+    fn the_no_match_card_is_told_the_window_label_and_not_the_exe_name() {
+        let w = window(HOST, "Speedtest");
+        let presenter = RecordingPresenter::default();
+
+        no_match_arm(&presenter, &w);
+
+        let shown = presenter.no_match_shown.borrow();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            shown[0].0, "Speedtest",
+            "the 3a card was told {:?}. That name means nothing to the user, and on this card \
+             it is the ONLY thing about their window that is on screen",
+            shown[0].0
+        );
+        assert_ne!(shown[0].0, HOST, "the raw executable name reached the card");
+        assert_eq!(
+            shown[0].1, None,
+            "control: no placement is not a placement of (0, 0) -- a `no_match_arm` that handed \
+             the card a fixed pair would pass the placement test above and fail this"
+        );
+    }
+
+    /// The string spy, pointed at 3a: **no argument the card is given carries
+    /// a raw executable name.**
+    ///
+    /// The broader form of the test above, and it fails on a name reaching any
+    /// string this arm passes rather than only the one the test names.
+    #[test]
+    fn nothing_the_no_match_card_is_given_carries_the_raw_exe_name() {
+        let spy = StringSpy::default();
+        no_match_arm(&spy, &window(HOST, "Speedtest"));
+
+        let seen = spy.seen.borrow();
+        assert!(!seen.is_empty(), "control: the spy recorded nothing, so it observed nothing");
+        for s in seen.iter() {
+            assert!(
+                !s.contains(HOST),
+                "the 3a card was handed {s:?}, which carries the frame host's executable name"
+            );
+        }
+        assert!(
+            seen.iter().any(|s| s == "Speedtest"),
+            "control: the window's real name never reached the card either, so the loop above \
+             passes for the wrong reason"
+        );
     }
 
     #[test]
@@ -2249,6 +2445,14 @@ mod tests {
             seen.extend(choices.iter().map(|c| c.label()));
             None
         }
+
+        /// Design 3a's label lands in the same log as everything else: this
+        /// spy exists to catch a raw `exe_name` reaching ANY string the
+        /// overlay renders, and 3a's label is one -- indeed it is the only
+        /// string that card shows about the window.
+        fn show_no_match(&self, label: &str, _position: Option<(f32, f32)>) {
+            self.seen.borrow_mut().push(label.to_string());
+        }
     }
 
     /// **Nothing plaintext-secret crosses the prompt.** The overlay is a
@@ -2335,6 +2539,10 @@ mod tests {
         ) -> Option<FillChoice> {
             self.log.borrow_mut().push("overlay shown");
             None
+        }
+
+        fn show_no_match(&self, _label: &str, _position: Option<(f32, f32)>) {
+            self.log.borrow_mut().push("no-match card shown");
         }
     }
 
@@ -2457,6 +2665,16 @@ mod tests {
         Some(FillChoice::Just(key_sequence::FieldRef::Totp))
     }
 
+    static NO_MATCH_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn recording_show_no_match(label: &str, position: Option<(f32, f32)>) {
+        NO_MATCH_FORWARDED
+            .lock()
+            .unwrap()
+            .push((label.to_string(), position));
+    }
+
     /// The forwarding is the only code between [`REAL_OVERLAY`]'s two named
     /// functions and the screen, so it is driven here -- swapping the two
     /// fields, or dropping an argument, fails.
@@ -2465,6 +2683,7 @@ mod tests {
         let presenter = FnPresenter {
             position: recording_position,
             show: recording_show,
+            show_no_match: recording_show_no_match,
         };
 
         assert_eq!(presenter.position(4242, 3), Some((11.0, 22.0)));
