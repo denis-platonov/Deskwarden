@@ -601,7 +601,15 @@ fn main() {
     // Dispatched further down, once the tray exists -- see the call to
     // `open_vault_window` just before the main loop, and its `first_result`
     // parameter for why it is dispatched THERE rather than handled here.
-    let mut startup_vault: Option<vault_window::VaultWindowResult> = None;
+    //
+    // **Declared without a value, because BOTH arms below now decide it.**
+    // Both launches show a window that ends up being the vault -- the one that
+    // signs in and, since the second report, the one that already has a session
+    // -- so a `= None` seed here would be a value no arm can leave behind, and
+    // the one thing it could still do is let a future arm skip the decision and
+    // silently report "the user was never shown a vault" for a window that
+    // showed them one.
+    let mut startup_vault: Option<vault_window::VaultWindowResult>;
     // `Option` rather than a plain `Child`: with `keep_backend_running`
     // turned off, the backend is only up while the vault window is open (see
     // `backend_policy::should_run`), so "not currently running" has to be
@@ -745,60 +753,151 @@ fn main() {
     let mut estate = if let Some(token) = cached_session {
     session_token = token;
     bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
-    let items = match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_MESSAGE) {
-        VaultReadyOutcome::Ready(items) => items,
-        VaultReadyOutcome::Dismissed => {
-            // Closing the "setting up" window is not, on its own, evidence
-            // that the backend or session is broken -- unlike a genuine
-            // timeout (the `Failed` arm below), there's no "maybe the
-            // session was rejected" signal to act on here (review 12's
-            // Important 2). Give the same, still-running backend one more
-            // honest readiness probe -- no kill, no reauth -- before falling
-            // back to the heavier recovery a real failure gets.
-            log::info!(
-                "setup window closed before the vault backend was confirmed ready; trying the \
-                 readiness probe again before treating anything as actually broken"
-            );
-            match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_RETRY_MESSAGE) {
-                VaultReadyOutcome::Ready(items) => items,
-                VaultReadyOutcome::Dismissed => recover_from_failed_vault_wait(
-                    "setup window closed a second time without the vault backend becoming ready",
-                    &vault,
-                    &schedule,
-                    &mut bw_serve_child,
-                    &mut session_token,
-                    &job,
-                    &store,
-                    &config_dir,
-                    login,
-                ),
-                VaultReadyOutcome::Failed(e) => recover_from_failed_vault_wait(
-                    &e,
-                    &vault,
-                    &schedule,
-                    &mut bw_serve_child,
-                    &mut session_token,
-                    &job,
-                    &store,
-                    &config_dir,
-                    login,
-                ),
-            }
-        }
-        VaultReadyOutcome::Failed(e) => recover_from_failed_vault_wait(
-            &e,
-            &vault,
-            &schedule,
-            &mut bw_serve_child,
-            &mut session_token,
-            &job,
-            &store,
-            &config_dir,
-            login,
-        ),
-    };
+    // **ONE WINDOW: the spinner, then the vault.**
+    //
+    // This is the launch the second report was about -- "On start there is
+    // another window Setting up your vault and then actual window loads -
+    // should be same actual window with spinner". It used to open
+    // `loading_ui::show_while`'s own 360x220 window, OS-centred, for however
+    // long `bw serve` took to answer (8s in the reporter's log), close it, and
+    // leave the vault to arrive later somewhere else at a different size. Both
+    // are now stages of one `app_window` window at the vault window's own
+    // geometry, so nothing moves when the spinner is replaced by the item list.
+    //
+    // The readiness probe runs on a worker thread inside that host, not here:
+    // on the frame thread it would freeze the window exactly where it is meant
+    // to be showing a spinner.
+    //
+    // **Everything the `'static` closures need is cloned out first.** The vault
+    // stage's closure is moved into an eframe update closure and can borrow
+    // nothing on this stack; the estate below is built after the window, from
+    // the originals.
+    let vault_for_probe = vault.clone();
+    let schedule_for_probe = schedule.clone();
+    let cache_for_vault = cache.clone();
+    let fill_stats_for_vault = fill_stats.clone();
+    let icon_cache_dir_for_vault = icon_cache_dir.clone();
+    let auto_lock_for_vault = settings.auto_lock();
+    let accounts_for_vault = accounts_state.clone();
+    let entries_out = startup_entries.clone();
+    let token_for_vault = session_token.clone();
 
-    arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    let warm = app_window::run_from_working(
+        SETUP_MESSAGE,
+        // ON A WORKER THREAD: the same probe, on the same schedule, that the
+        // separate spinner window used to run behind itself.
+        move || wait_for_vault_ready(&vault_for_probe, &schedule_for_probe),
+        // ON THE MAIN THREAD, in the frame that drains the worker. The cache
+        // has to be filled BEFORE the vault frame is built, or the window's
+        // first vault frame paints an empty vault as data.
+        move |ready: &mut Result<Vec<deskwarden::vault_bridge::VaultItem>, String>| {
+            // `None` here is the failure the host turns into a close, which is
+            // what leaves `main` to run the recovery below.
+            let items = std::mem::take(ready.as_mut().ok()?);
+            arm_autofill_and_seed_cache(&entries_out, &cache_for_vault, items, startup_epoch);
+            // **Not prefetched, and not waited for.** The toolbar's avatar and
+            // account label come from a `bw status` spawn that is regularly
+            // seconds; the window is already up and the label fills in, exactly
+            // as it does for a window a tray click opens. `est.details` stays
+            // `None`, so the refill below the window still runs off what this
+            // session actually used.
+            let details = account_details_source(None, |tx| {
+                std::thread::spawn(move || {
+                    let _ = tx.send(login_ui::check_bw_status_details());
+                });
+            });
+            let (_options, frame, handles) = vault_window::build_frame(
+                cache_for_vault.clone(),
+                fill_stats_for_vault,
+                details,
+                token_for_vault,
+                icon_cache_dir_for_vault,
+                auto_lock_for_vault,
+                // The readiness probe has just answered, so the backend is up
+                // and the vault's own initial load may skip its readiness wait.
+                true,
+                accounts_for_vault,
+                // This window's first frame already installed the fonts,
+                // rounded the corners and raised it, one stage ago.
+                true,
+                vault_window::VaultFrameEnv::production(),
+            );
+            Some((frame, handles))
+        },
+    );
+    log::info!("the warm launch window showed {:?}", warm.stages);
+    startup_vault = warm.vault;
+
+    // **The window ended without ever showing a vault**, which is the only
+    // state that still needs answering here: on the ordinary path the closure
+    // above has already armed autofill and seeded the cache, and the vault the
+    // user was looking at is dispatched further down.
+    if startup_vault.is_none() {
+        let abandoned = warm.abandoned;
+        let items = match warm.prepared {
+            // The probe answered, and it answered with a failure. Nothing has
+            // been taken out of it -- `build_vault` returns before the
+            // `mem::take` on this path -- and unlike a close, this IS a signal
+            // to act on: the heavier recovery kills the backend, sends the user
+            // back through the master password and starts over.
+            Some(Err(e)) => recover_from_failed_vault_wait(
+                &e,
+                &vault,
+                &schedule,
+                &mut bw_serve_child,
+                &mut session_token,
+                &job,
+                &store,
+                &config_dir,
+                login,
+            ),
+            // No answer at all: the user closed the spinner, the worker died,
+            // or the stage's deadline fired. Closing the window is not, on its
+            // own, evidence that the backend or session is broken -- there is
+            // no "maybe the session was rejected" signal to act on (review 12's
+            // Important 2) -- so the same, still-running backend gets one more
+            // honest readiness probe, no kill and no reauth, before the heavier
+            // recovery.
+            //
+            // **And that retry shows no window.** It used to reopen the spinner
+            // with different wording (`SETUP_RETRY_MESSAGE`, review 13's Minor
+            // 4) so the user could tell it apart from the one they had just
+            // closed. Inside one window there is nothing to tell apart: a
+            // window the user has just closed reopening at all is the two-window
+            // flow this change removes, only worse for having been asked to go
+            // away first. So the retry runs silently and the app lands in the
+            // tray, which is where closing that window says it wants to be.
+            //
+            // (`Some(Ok(..))` cannot reach here -- an `Ok` built the vault
+            // frame, which is a vault -- and folds in with the rest because the
+            // honest response to it would be this one anyway: probe again
+            // rather than read items back out of a value the vault stage may
+            // already have emptied.)
+            _ => {
+                log::info!(
+                    "the warm launch window ended before the vault backend was confirmed ready \
+                     (closed by the user: {abandoned}); trying the readiness probe again, \
+                     without a window, before treating anything as actually broken"
+                );
+                match wait_for_vault_ready(&vault, &schedule) {
+                    Ok(items) => items,
+                    Err(e) => recover_from_failed_vault_wait(
+                        &e,
+                        &vault,
+                        &schedule,
+                        &mut bw_serve_child,
+                        &mut session_token,
+                        &job,
+                        &store,
+                        &config_dir,
+                        login,
+                    ),
+                }
+            }
+        };
+
+        arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    }
 
     SessionEstate {
         cache,
@@ -8884,10 +8983,14 @@ mod tests {
         // proves there is no production code down there at all. Together they
         // do cover the file. Alone, this one covers the top of it.
         //
-        // Five calls plus the one `fn` definition.
+        // Four calls plus the one `fn` definition. It was five calls while the
+        // cached-session launch answered a dismissal by reopening the spinner
+        // window and could therefore be dismissed twice; one window has one
+        // way of ending without a vault, so that third arm went with the
+        // second window.
         assert_eq!(
             production_half_of_this_file().matches(call).count(),
-            6,
+            5,
             "the number of `recover_from_failed_vault_wait` sites changed; a new one is not \
              covered by the argument check above -- extend the guard to reach it"
         );
@@ -9260,11 +9363,15 @@ mod tests {
 
         let paired = main_body.matches(concat!("arm_autofill_and_", "seed_cache(")).count();
         assert_eq!(
-            paired, 4,
-            "startup has {paired} repopulation sites, not the four it should have (the cached \
-             session, the single window's `build_vault`, the `work.items == Err` recovery and \
-             the no-work recovery). Each one must arm the match engine and seed the cache from \
-             the same items, and this count is what makes a new one a deliberate decision"
+            paired, 5,
+            "startup has {paired} repopulation sites, not the five it should have -- two per \
+             launch plus one. Signing in: the single window's `build_vault`, the \
+             `work.items == Err` recovery and the no-work recovery. Already holding a session: \
+             the warm launch window's own `build_vault`, and the one recovery tail that answers \
+             every way that window can end without a vault. The fifth is the extra recovery the \
+             signing-in launch has and the other does not. Each one must arm the match engine \
+             and seed the cache from the same items, and this count is what makes a new one a \
+             deliberate decision"
         );
         assert_eq!(
             main_body.matches(concat!("seed_cache_at_", "startup(")).count(),
@@ -21810,34 +21917,72 @@ mod startup_shape_tests {
         &rest[start..]
     }
 
-    /// **A launch with a good cached session must open no window.** The app
-    /// starting silently into the tray is what it has always done and is not
-    /// what the user reported; the single window is for the launch that signs
-    /// in. This is precisely the kind of property that quietly stops holding
-    /// while someone is chasing "one window from the beginning".
+    /// **A launch with a good cached session shows ONE window, and no card.**
+    ///
+    /// **This test used to say the opposite, and it was re-stated rather than
+    /// deleted.** It read "a launch with a good cached session must open no
+    /// window", on the argument that such a launch "shows nothing today and
+    /// goes straight to the tray". That was true of the vault and false of what
+    /// the user was actually looking at: the arm opened
+    /// `loading_ui::show_while`'s own 360x220 window for as long as `bw serve`
+    /// took to answer -- eight seconds in the reporter's own log -- and closed
+    /// it again. So the property it was defending ("no window pops up on every
+    /// boot, for an app whose whole shape is that it lives in the tray") was
+    /// already not holding; what the test really pinned was that the window
+    /// which did pop up was a DIFFERENT one from the vault. That is the report:
+    /// "On start there is another window Setting up your vault and then actual
+    /// window loads - should be same actual window with spinner".
+    ///
+    /// What is worth pinning is what survives of it, and it is two things, both
+    /// still one edit away from being lost:
+    ///
+    /// * this launch must never show the SIGN-IN CARD. It has a session; a
+    ///   master-password prompt on a boot that does not need one is a real
+    ///   regression, and it is what the old needle actually matched.
+    /// * this launch must not open a window SEPARATE from the vault again --
+    ///   the whole of the report.
     #[test]
-    fn a_launch_with_a_good_cached_session_opens_no_startup_window() {
+    fn a_launch_with_a_good_cached_session_shows_one_window_and_no_sign_in_card() {
         let arm = cached_session_arm();
-        let single_window = concat!("app_window::", "run(");
+        let sign_in_host = concat!("app_window::", "run(");
         assert!(
-            !arm.contains(single_window),
-            "a launch that never asks for a master password now opens the sign-in window \
-             anyway -- a window popping up on every boot, for an app whose whole shape is \
-             that it lives in the tray: {arm:?}"
+            !arm.contains(sign_in_host),
+            "a launch that never asks for a master password now opens the sign-in host \
+             anyway, whose first stage is the card -- a master-password prompt on every \
+             boot for a session that is already good: {arm:?}"
         );
-        // Paired positive control on the same needle: the single window really
-        // is reached from the OTHER arm, so the negative above is about which
-        // arm it is in and not about a needle that never matches anything.
+        // Paired positive control on the same needle: that host really is
+        // reached from the OTHER arm, so the negative above is about which arm
+        // it is in and not about a needle that never matches anything.
         assert!(
-            signing_in_arm().contains(single_window),
+            signing_in_arm().contains(sign_in_host),
             "the single startup window is never opened at all, so signing in is back to \
              three windows"
         );
-        // And the silent launch really is still the old path, so the slice
-        // above is the launch it claims to be.
+        // The window this launch DOES show, and it is the one that becomes the
+        // vault in place.
         assert!(
-            arm.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
-            "the cached-session launch no longer waits for the backend at all: {arm:?}"
+            arm.contains(concat!("app_window::run_from_", "working(")),
+            "the launch that already has a session shows no window of its own any more, so \
+             the user watches nothing at all for the eight seconds `bw serve` takes: {arm:?}"
+        );
+        // And the separate spinner window is gone from this arm, which is the
+        // report itself.
+        assert!(
+            !arm.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
+            "the launch that already has a session opens the separate 360x220 setup window \
+             again -- \"another window Setting up your vault and then actual window loads\" \
+             verbatim: {arm:?}"
+        );
+        // Positive control on that last needle: the separate spinner window is
+        // still a real thing this file opens elsewhere (the wait after a fresh
+        // master-password sign-in, which has no window of its own to put a
+        // spinner in), so the negative above is about this arm rather than
+        // about a needle that no longer matches anything anywhere.
+        assert!(
+            production().contains(concat!("wait_for_vault_ready_with_", "spinner(")),
+            "control: the separate spinner window is gone from the whole file, so the \
+             assertion above is vacuous"
         );
     }
 

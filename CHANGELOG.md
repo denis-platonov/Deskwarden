@@ -8,6 +8,31 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### Starting up is one window now, not two
+
+Launching Deskwarden while it still had a good session showed a small
+"Setting up your vault..." window on its own, for however long the Bitwarden
+backend took to answer — eight seconds is normal on a cold start — and then
+closed it. The vault, when it arrived, was a different window at a different
+size somewhere else on the screen.
+
+- **There is one window from the first frame.** It opens at the vault
+  window's own size and position, shows the spinner while the backend starts,
+  and becomes your item list in place. Nothing moves, resizes or re-centres
+  when the list arrives, because it is the same window throughout.
+- **It can still be closed while the spinner is up**, and closing it means
+  what it always meant: Deskwarden carries on starting in the background and
+  lands in the tray. The one difference is that it no longer pops a second
+  spinner window back at you to say it is trying again — it just tries again,
+  quietly.
+- **If the backend never becomes usable**, the window closes and the same
+  recovery as before runs: Deskwarden restarts the backend and asks for your
+  master password.
+- **Signing in is unchanged.** That launch has been one window since 0.8.0;
+  this is the other launch catching up with it.
+
 ## 0.8.3 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version either. In

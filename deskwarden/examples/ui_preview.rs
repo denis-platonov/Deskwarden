@@ -231,6 +231,18 @@ enum Surface {
     /// the real `rehearsal::transcript`, so what this PNG shows is what a user
     /// watching a rehearsal sees.
     Rehearsal,
+    /// **The startup spinner, in the window it now lives in.**
+    ///
+    /// `loading_ui::draw_spinner_body` at the VAULT window's size, with a LIVE
+    /// close control -- a state that did not exist on screen before the two
+    /// startup windows were merged. At full size the spinner was only ever
+    /// drawn with its close control ghosted (the sign-in launch, which may not
+    /// be abandoned), and live it was only ever drawn in a 360x220 window of
+    /// its own. Both halves of that are what a picture answers: whether one
+    /// spinner and one line of prose look deliberate in a 1240x740 window
+    /// rather than lost in it, and whether the control that closes it is
+    /// visibly there.
+    VaultSetupSpinner,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -288,6 +300,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::Rehearsal,
+    Surface::VaultSetupSpinner,
 ];
 
 impl Surface {
@@ -320,6 +333,7 @@ impl Surface {
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::Rehearsal => "rehearsal",
+            Surface::VaultSetupSpinner => "vault_setup_spinner",
         }
     }
 
@@ -382,6 +396,13 @@ impl Surface {
             Surface::Rehearsal => {
                 egui::vec2(scratch_window::SCRATCH_WIDTH, scratch_window::SCRATCH_HEIGHT)
             }
+            // The VAULT window's own size, because that is the window this
+            // spinner is drawn in now -- the launch that already has a session
+            // opens the vault window and paints the spinner in it until the
+            // item list is ready. Rendered at the 360x220 the standalone
+            // spinner window used, this picture would answer a question about
+            // a window nobody opens any more.
+            Surface::VaultSetupSpinner => egui::vec2(1240.0, 740.0),
         }
     }
 
@@ -651,6 +672,7 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
+            Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
         }
 
         if self.screenshot && !self.done {
@@ -994,6 +1016,22 @@ impl Preview {
     ///
     /// Nothing here sends anything: there is no window, no `Injector` and no
     /// plan. The view is a value.
+    /// The startup spinner, drawn through the same `draw_spinner_body` the
+    /// warm launch window paints -- not a re-creation of it, so what this PNG
+    /// shows is what the user watches while `bw serve` starts.
+    ///
+    /// `CloseControl::Active` because that is the argument the warm launch
+    /// host passes: this stage may be abandoned, and the picture is how a
+    /// reviewer sees that the control saying so is drawn live rather than
+    /// ghosted.
+    fn draw_vault_setup_spinner(&mut self, root: &mut egui::Ui) {
+        let _ = deskwarden::loading_ui::draw_spinner_body(
+            root,
+            "Setting up your vault...",
+            login_ui::CloseControl::Active,
+        );
+    }
+
     fn draw_rehearsal(&mut self, root: &mut egui::Ui) {
         let _ = scratch_window::draw(
             root,

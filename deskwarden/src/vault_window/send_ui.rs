@@ -5098,7 +5098,7 @@ mod source_pins {
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),
             (
                 concat!("VaultFrame", "Env"),
-                vec![("main.rs", 3), ("vault_window/mod.rs", 4)],
+                vec![("main.rs", 4), ("vault_window/mod.rs", 4)],
             ),
         ] {
             let files = crate_sources();
@@ -5122,7 +5122,7 @@ mod source_pins {
                  the binding and its two calls (`spawn_sync` in `mod.rs`), the one read of \
                  the field (`env.sync`), the real spawner's own definition and the one \
                  place `VaultFrameEnv::production` names it, and the type itself -- which \
-                 no file but `mod.rs` and `main.rs`'s three constructions may name, so a \
+                 no file but `mod.rs` and `main.rs`'s four constructions may name, so a \
                  sibling cannot even take an `env` to read the pointer out of"
             );
         }

@@ -1355,7 +1355,12 @@ mod tests {
     const THREAD_SPAWN_SITES: &[(&str, usize)] = &[
         ("app.rs", 1),
         ("app_identity.rs", 1),
-        ("app_window.rs", 4),
+        // Five, not four: `run_from_working` -- the host for the launch that
+        // already has a session -- starts the readiness probe on a worker of
+        // its own, for the reason every other host here does. On the frame
+        // thread it would freeze the window exactly where it is meant to be
+        // showing a spinner.
+        ("app_window.rs", 5),
         ("breach.rs", 2),
         // One: the waiter that sleeps out `clipboard::DEFAULT_CLEAR_AFTER` and then
         // takes a copied secret back off the clipboard. A thread rather than a
@@ -1368,10 +1373,12 @@ mod tests {
         ("injector/mod.rs", 1),
         ("injector/sequence.rs", 1),
         ("login_ui.rs", 10),
-        // Eleven, not twelve: the download-and-apply thread the tray's "Update
-        // available" item used to start is gone with the item, and with the
-        // rest of that flow, to `update_panel.rs` below.
-        ("main.rs", 11),
+        // Twelve. Eleven of them were here when the tray's "Update available"
+        // item and its download-and-apply thread left for `update_panel.rs`
+        // below; the twelfth is the `bw status` the warm launch window's vault
+        // stage starts beside itself, so the toolbar's account label fills in
+        // rather than the window waiting seconds for it.
+        ("main.rs", 12),
         ("picker_ui.rs", 2),
         // Two: the About page's check, and its download-and-verify. Neither
         // can be a tick in a frame loop -- both are seconds-to-minutes of
