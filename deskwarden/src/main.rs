@@ -7765,7 +7765,7 @@ mod tests {
         let body = r#"{
             "tag_name": "v99.0.0",
             "assets": [
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let current = Version::parse("1.0.0").unwrap();

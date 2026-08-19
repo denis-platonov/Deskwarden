@@ -8,6 +8,53 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### Check for updates actually installs the update now
+
+**The in-app updater has never once applied an update.** It refused every
+release it was ever offered, including all the genuine ones, and the reason
+was a placeholder: it required the downloaded installer to carry an
+Authenticode signature matching a certificate thumbprint that did not exist
+yet, so the check could not pass. If you have been updating Deskwarden, you
+have been downloading the installer from the releases page and running it
+yourself.
+
+It now verifies the installer against a **SHA-256 digest** instead, and that
+check can pass.
+
+- **The digest comes from GitHub, on the same connection as the download
+  link.** The releases API publishes a SHA-256 for each asset alongside its
+  URL; Deskwarden reads both out of the one response it was already making,
+  so there is no second request to fail and no checksum file to fall out of
+  step with the build.
+- **The file is hashed twice**: once when the download finishes, and again
+  immediately before the installer is started. The second one is the one that
+  matters — it closes the gap between "this file was checked" and "this file
+  is running".
+- **Every way of not knowing is a refusal.** A release that publishes no
+  digest is not offered as an update at all. A digest that is malformed, a
+  file whose hash does not match, or a file that cannot be read to hash it
+  stops the update and **deletes the downloaded installer**, so a rejected
+  file is not left in the cache folder where a later run — or you — could
+  run it by hand.
+
+#### What this does and does not protect you from
+
+Being straight about it, because the previous behaviour was not: **this is
+not the same as a signed build, and Deskwarden's releases are still
+unsigned.** What the digest proves is that the bytes that run are the bytes
+GitHub's API described — which catches a corrupted, truncated, or swapped
+download. What it cannot prove is *who built them*: the digest comes from the
+same GitHub account the file does, so anyone who could replace the installer
+could generally replace the digest beside it.
+
+That is the same trust root you were relying on downloading the file by hand.
+The difference is that something now checks it. Code signing is still the
+goal, and is still waiting on a certificate; when it arrives the signature
+check comes back **in addition to** this one, not instead of it. See
+[docs/code-signing-policy.md](docs/code-signing-policy.md).
+
 ## 0.8.3 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version either. In

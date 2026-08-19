@@ -137,7 +137,8 @@ pub enum UpdateStage {
         done: u64,
         total: Option<u64>,
     },
-    /// Downloaded and signature-verified. The page now offers the restart.
+    /// Downloaded, and its SHA-256 matched the digest the releases API
+    /// published for the asset. The page now offers the restart.
     Ready(ReleaseInfo),
     /// Something failed. The message is for the user, and the release (if the
     /// failure happened after one was found) is kept so the retry has
@@ -346,8 +347,13 @@ impl UpdatePanel {
         std::thread::spawn(move || {
             let agent = updater::build_download_agent();
             let outcome = updater::download_and_verify(
+                // No expected-value argument: the digest to check against
+                // travels inside `for_thread`, from the same API response
+                // that supplied the download URL. This call site used to
+                // pass `updater::EXPECTED_SIGNER_THUMBPRINT`, and a call site
+                // that hands over the value a check is made against is a
+                // call site that could hand over a different one.
                 &for_thread,
-                updater::EXPECTED_SIGNER_THUMBPRINT,
                 &dest,
                 &agent,
                 // Called between reads on this thread. A `send` into an
@@ -374,15 +380,15 @@ impl UpdatePanel {
     ///
     /// **Does not return on success.** The installer replaces this binary and
     /// relaunches it, so there is nothing for this process to go back to;
-    /// `updater::apply_update` re-verifies the signature and starts it, and
+    /// `updater::apply_update` re-hashes the file and starts it, and
     /// [`UpdateEnv::before_install`] runs first so the decrypted vault cache
     /// and the clipboard are cleared before the handover. `bw serve` needs no
     /// entry there: it is in a kill-on-close job object and the kernel takes
     /// it down with this process.
     ///
     /// Runs on the UI thread rather than on a worker, and that is the one
-    /// place in this module where blocking a frame is right. `apply_update`'s
-    /// re-verification spawns `powershell.exe`, so this can cost a second --
+    /// place in this module where blocking a frame is right. `apply_update`
+    /// re-hashes ~6 MB before it spawns anything, so this can cost a moment --
     /// but it is the last frame this process will ever draw, and putting the
     /// exit on a background thread would mean a window still taking clicks
     /// while its process was being replaced.
@@ -444,6 +450,8 @@ mod tests {
         ReleaseInfo {
             version: Version::parse(v).unwrap(),
             installer_download_url: format!("https://example.invalid/deskwarden-{v}-installer.exe"),
+            installer_sha256: updater::parse_asset_digest(&format!("sha256:{}", "b".repeat(64)))
+                .unwrap(),
             body: "notes".to_string(),
         }
     }
