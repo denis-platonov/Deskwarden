@@ -154,8 +154,21 @@ pub fn overlay_height(rows: usize) -> f32 {
 /// cannot scroll. `overlay_height` floors at one row, so the empty and
 /// one-choice cases are still 164.0.
 pub fn overlay_options(choices: &[FillChoice], anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
+    options_for_rows(choices.len(), anchor)
+}
+
+/// [`overlay_options`] with the row count named directly.
+///
+/// **Private, and it stays private.** `overlay_options`' doc explains why the
+/// public entry point takes the choice list rather than a count: handing it
+/// the wrong number is the entire bug that function exists to prevent, so its
+/// one caller is not given the opportunity to. The no-match card has no choice
+/// list to count -- it has [`NO_MATCH_ROWS`], a constant checked against the
+/// card it really draws -- so it needs this shape, and nothing outside this
+/// module may have it.
+fn options_for_rows(rows: usize, anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(choices.len())])
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(rows)])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
@@ -223,6 +236,86 @@ pub fn show_prompt_overlay(
 
     let answer = chosen.borrow().clone();
     answer
+}
+
+/// Opens design **3a** for `app_name`: the no-match card, at `anchor`.
+///
+/// Returns nothing. There is no item and therefore no choice: the card's only
+/// outcomes are dismissal (the ✕, Esc, or closing the window) and dismissal,
+/// which is why this is not `Option<FillChoice>` -- a return type with a
+/// `Some` in it would be a promise this state cannot keep.
+///
+/// Shares [`OVERLAY_OPEN`] with [`show_prompt_overlay`], and deliberately: the
+/// guard is about how many overlay windows this process has on screen, not
+/// about which kind. Two states of one card stacking on each other is the same
+/// defect as two copies of one state.
+pub fn show_no_match_overlay(app_name: &str, anchor: Option<(f32, f32)>) {
+    if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
+        log::warn!(
+            "no-match overlay requested for {app_name} while one is already open in this \
+             process; ignoring rather than stacking a second window"
+        );
+        return;
+    }
+
+    let app = NoMatchApp { app_name: app_name.to_string() };
+    let options = no_match_options(anchor);
+
+    let _ = eframe::run_native(
+        "Deskwarden",
+        options,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    );
+
+    OVERLAY_OPEN.store(false, Ordering::SeqCst);
+}
+
+struct NoMatchApp {
+    app_name: String,
+}
+
+impl eframe::App for NoMatchApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // `no_match_keyboard_action`, not an `if` here, for the reason
+        // `keyboard_action` exists: this function needs an `eframe::Frame` and
+        // a real always-on-top window, so no test in this crate may execute
+        // it, and "Esc dismisses" is not a claim that may live only where
+        // nothing can check it.
+        let keys = no_match_keyboard_action(EscapePressed::read(&ctx));
+        let card = draw_no_match_card(ui, &self.app_name);
+
+        let done = matches!(
+            if keys == OverlayAction::None { card } else { keys },
+            OverlayAction::Dismiss | OverlayAction::Fill(_)
+        );
+        if done {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+/// What the keyboard does to the no-match card: **Esc dismisses, and that is
+/// all there is.**
+///
+/// Enter is not read at all, and that is the point rather than an omission.
+/// On the matched card Enter fills the primary row; here there is no row and
+/// no item, so an Enter that did anything would be doing it with credentials
+/// that do not exist. It takes only [`EscapePressed`], so there is no second
+/// argument for a swap to hide in -- the defect `keys`' newtypes exist to stop
+/// is not merely prevented here, it is unrepresentable.
+fn no_match_keyboard_action(escape: EscapePressed) -> OverlayAction {
+    if escape.pressed() {
+        return OverlayAction::Dismiss;
+    }
+    OverlayAction::None
 }
 
 struct OverlayApp {
@@ -545,6 +638,184 @@ pub fn draw_overlay_card_rows(
 
     action
 }
+
+/// The number of choice rows whose [`overlay_height`] the no-match card is
+/// sized by.
+///
+/// **A constant, and one that is checked against the card rather than chosen
+/// for it.** The overlay is a frameless, always-on-top window with a hardcoded
+/// inner size, no resize border, no title bar to drag and **no `ScrollArea`
+/// anywhere**: a control past its bottom edge is not merely awkward, it is
+/// unreachable. `f67bf42`'s message records three separate occasions on which
+/// a text or layout change pushed a control out of this viewport, which is why
+/// this card gets a measurement and not a guess.
+///
+/// It is `1` because the no-match card's body is the same shape as one
+/// credential row -- two truncated text lines -- and
+/// [`the_no_match_card_fits_the_window_it_asks_for`] both measures the real
+/// card against `overlay_height(NO_MATCH_ROWS)` and asserts it does NOT fit
+/// the next size down. A one-sided bound would let the body silently shrink to
+/// nothing; a two-sided one would not.
+pub const NO_MATCH_ROWS: usize = 1;
+
+/// The window the no-match card asks the OS for.
+///
+/// Separate from [`overlay_options`] rather than sharing its choice-list
+/// argument, because there is no choice list: the size comes from
+/// [`NO_MATCH_ROWS`]. It is public for the same reason `overlay_options` is --
+/// `show_no_match_overlay` calls `eframe::run_native` and no test here may
+/// execute it, so the size it asks for would otherwise be the one number in
+/// this card nothing could observe.
+pub fn no_match_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
+    options_for_rows(NO_MATCH_ROWS, anchor)
+}
+
+/// The two lines of the no-match card, as [`row_text`] is for the matched one.
+///
+/// Both lines are constants plus **one** user-controlled string, `app_name`,
+/// which is `app::window_label`'s answer -- an executable name or a window
+/// title, either of which a user (or the app they ran) chooses. The card's
+/// height must not depend on it; see [`draw_no_match_card`].
+fn no_match_text(app_name: &str) -> (String, String) {
+    (
+        format!("No saved login for {app_name}"),
+        "Open Deskwarden to search the vault or add one.".to_string(),
+    )
+}
+
+/// Design **3a**: the card for a window that asks for a password and that
+/// nothing in the vault matches.
+///
+/// The state this exists for used to be indistinguishable from a broken app:
+/// focusing an unrecognised login window did nothing whatsoever, and a user
+/// cannot tell "Deskwarden has nothing for this" from "Deskwarden is not
+/// running". This says the first one.
+///
+/// **What is deliberately not here.** 3a as drawn offers two buttons, *Search
+/// vault* and *New login*. Neither is drawn, because neither has a
+/// destination yet: *New login* is 3c's form, which is the next task of this
+/// plan and does not exist, and *Search vault* would have to reach the vault
+/// window from inside `process_foreground_event`, which holds none of the
+/// machinery that opens one. A button on a frameless, always-on-top card that
+/// does nothing when clicked is worse than no button -- it is the same
+/// "is this thing working?" the card exists to answer, moved one click later.
+/// The guidance is in the body text instead, and the buttons land with 3c.
+///
+/// **No avatar, and two truncated lines.** The body is the same shape as one
+/// [`credential_row`] minus the initials tile, so the card is
+/// [`overlay_height`]`(`[`NO_MATCH_ROWS`]`)` tall. Both lines truncate inside
+/// a text column of explicit width for exactly the reason
+/// [`credential_row`]'s do: `app_name` is user-controlled, wrapping is what
+/// made a one-row card 189pt tall in a 164pt window, and this window still
+/// cannot scroll.
+///
+/// Public so the `ui_preview` example renders the card the app ships rather
+/// than a re-implementation that could drift from it.
+///
+/// Answers [`OverlayAction::Dismiss`] when the header's ✕ is clicked, and
+/// [`OverlayAction::None`] otherwise. It never answers `Fill`: there is no
+/// item to fill from, so the variant is unreachable here by construction
+/// rather than by discipline.
+pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
+    let mut action = OverlayAction::None;
+
+    let card = egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(36),
+        })
+        .outer_margin(Margin {
+            left: 4,
+            right: 12,
+            top: 2,
+            bottom: 20,
+        });
+
+    card.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        // The same header as every other overlay state, with the count
+        // replaced by what there is to count. The ✕ matters more here than
+        // anywhere: this window is raised in response to ANOTHER app being
+        // foregrounded, which is exactly the case Windows' foreground lock
+        // refuses keyboard focus for -- so Esc may never reach us, and the ✕
+        // is the only mouse-operable way out of a window with no title bar.
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                if theme::card_header_with_close(ui, NO_MATCH_LABEL) {
+                    action = OverlayAction::Dismiss;
+                }
+            });
+        theme::hairline(ui);
+
+        egui::Frame::new()
+            .inner_margin(Margin::same(6))
+            .show(ui, |ui| {
+                let (primary, secondary) = no_match_text(app_name);
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(10, 9))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // The text column's width is explicit and both labels
+                        // truncate. With no avatar and no Enter chip there is
+                        // no lane to keep clear, so the column is the whole
+                        // row -- but it is still BOUNDED, which is the half
+                        // that stops `app_name` from growing the card.
+                        let text_width = ui.available_width().max(1.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(text_width);
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add(
+                                egui::Label::new(
+                                    theme::semibold(&primary, 13.0).color(theme::INK),
+                                )
+                                .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&secondary).size(11.0).color(theme::TEXT_FAINT),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+            });
+
+        theme::hairline(ui);
+        egui::Frame::new()
+            .fill(theme::CARD_TINT)
+            .corner_radius(CornerRadius {
+                sw: 9,
+                se: 9,
+                ..CornerRadius::ZERO
+            })
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // One hint, not two: there is nothing for Enter to fill, and a
+                // footer that offered `Enter Fill` on a card with nothing to
+                // fill would be the card contradicting itself.
+                theme::footer_hints(ui, &[("Esc", "Dismiss")]);
+            });
+    });
+
+    action
+}
+
+/// What the no-match card's header says where the matched card counts matches.
+///
+/// A constant rather than a literal inside [`draw_no_match_card`] so that the
+/// card's one claim -- there is nothing here -- is a string a test can name
+/// and find in the painted output, rather than one it has to re-spell.
+pub const NO_MATCH_LABEL: &str = "No match";
 
 /// The two lines of the credential row: the recognizable identity on top
 /// (username when known, item name otherwise) and context underneath.
@@ -3001,5 +3272,361 @@ mod geometry_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+
+    // -------------------------------------------------- design 3a: no match
+
+    /// Paints the real no-match card into a window of exactly `height` points
+    /// and returns its ink.
+    fn painted_no_match(app_name: &str, height: f32) -> Vec<Ink> {
+        let ctx = styled_ctx();
+        let output = ctx.run_ui(sized(height), |ui| {
+            draw_no_match_card(ui, app_name);
+        });
+        let mut ink = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut ink);
+        }
+        ink.retain(|i| i.alpha > 0);
+        ink
+    }
+
+    /// What egui says the no-match card needs, laid out unconstrained.
+    fn no_match_card_height(app_name: &str) -> f32 {
+        /// Comfortably taller than any card this module draws, so nothing is
+        /// culled and the layout is the unconstrained one.
+        const ROOMY: f32 = 700.0;
+        let ctx = styled_ctx();
+        let mut needed = f32::NAN;
+        let _ = ctx.run_ui(sized(ROOMY), |ui| {
+            assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
+            draw_no_match_card(ui, app_name);
+            needed = ui.min_rect().bottom();
+        });
+        assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
+        assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
+        needed
+    }
+
+    /// **`NO_MATCH_ROWS` is checked against the card, in both directions.**
+    ///
+    /// The overlay is frameless, always-on-top, hardcoded in size, and has no
+    /// `ScrollArea` anywhere -- so a control past its bottom edge is
+    /// unreachable, with no title bar to drag it back and nothing to scroll.
+    /// `f67bf42`'s message records three separate occasions on which a text or
+    /// layout change pushed a control out of this viewport. So the constant is
+    /// not chosen and left alone:
+    ///
+    /// * the card must **fit** `overlay_height(NO_MATCH_ROWS)` -- the
+    ///   load-bearing half, and the one a growing card fails; and
+    /// * it must **not fit** the next size down -- the half that stops the
+    ///   constant being silently too generous, which is how a body that
+    ///   stopped being drawn at all would otherwise go unnoticed.
+    ///
+    /// The second half is only meaningful because `overlay_height` floors at
+    /// one row, so "the next size down" is a real, smaller number rather than
+    /// the same one: `CHROME_HEIGHT` alone, the card with its body removed.
+    #[test]
+    fn the_no_match_card_fits_the_window_it_asks_for() {
+        let asked = no_match_options(None)
+            .viewport
+            .inner_size
+            .expect("the no-match viewport must request an inner size at all");
+        assert_eq!(asked.x, OVERLAY_WIDTH, "the no-match card asked for a {}pt-wide window", asked.x);
+        assert_eq!(
+            asked.y,
+            overlay_height(NO_MATCH_ROWS),
+            "the window asked for is not the one NO_MATCH_ROWS describes, so every assertion \
+             below is about a card the OS will never be given"
+        );
+
+        let needed = no_match_card_height(APP);
+        assert!(
+            needed <= asked.y,
+            "the no-match card lays out {needed}pt tall and the window the overlay asks the OS \
+             for is {}pt. This window is frameless and always-on-top -- no title bar, no resize \
+             border, no scroll area -- so the missing {:.1}pt, and the Esc hint in it, are gone",
+            asked.y,
+            needed - asked.y
+        );
+        assert!(
+            needed > asked.y - ROW_HEIGHT,
+            "the no-match card lays out {needed}pt, which still fits a window one ROW_HEIGHT \
+             shorter than the {}pt NO_MATCH_ROWS asks for. Either NO_MATCH_ROWS is a row too \
+             generous, or the card's body has stopped being drawn -- and the `fits` bound above \
+             cannot tell either of those from a card that is simply the right size",
+            asked.y
+        );
+
+        // And the slack exactly, in the idiom `CHROME_SLACK` set: a one-sided
+        // bound cannot tell eleven points of deliberate dead space from thirty
+        // points of a body line that silently stopped being painted.
+        assert_eq!(
+            asked.y - needed,
+            NO_MATCH_SLACK,
+            "the no-match card lays out {needed}pt in a {}pt window, so the dead space at its \
+             bottom is {:.1}pt rather than the recorded {NO_MATCH_SLACK}pt. A font, a margin or \
+             a line changing size fails here rather than by clipping a control off a window \
+             that has no scrollbar",
+            asked.y,
+            asked.y - needed
+        );
+    }
+
+    /// How much taller than it needs to be the no-match card's window is.
+    ///
+    /// **Measured, not chosen**, exactly like [`CHROME_SLACK`]: the card lays
+    /// out at 153pt and the window is [`overlay_height`]`(`[`NO_MATCH_ROWS`]`)`
+    /// = 164pt. It is one point more slack than the matched card's ten, for a
+    /// legible reason -- 3a's body has no 28pt initials tile, so its two text
+    /// lines are the whole of its height.
+    ///
+    /// Slack in this direction is the safe direction. A window taller than its
+    /// card wastes eleven points; a window shorter than its card loses the
+    /// bottom of a frameless, always-on-top surface with no scrollbar and no
+    /// resize border -- and the bottom is where the only dismiss hint is.
+    const NO_MATCH_SLACK: f32 = 11.0;
+
+    /// The card's height is a function of the font and nothing else -- and in
+    /// particular **not** of `app_name`, which is `window_label`'s answer and
+    /// therefore a string a user or the app they ran chooses.
+    ///
+    /// This is the exact defect the matched card was found to have: two plain
+    /// wrapping labels in a fixed-height window, measured off one short
+    /// fixture. A one-row card overflowed its 164pt window at 189pt. The
+    /// fixtures below are the same adversarial four.
+    #[test]
+    fn no_app_name_a_user_can_supply_makes_the_no_match_card_taller() {
+        let baseline = no_match_card_height(APP);
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            let height = no_match_card_height(fixture.app);
+            assert_eq!(
+                height, baseline,
+                "the {:?} fixture's app name made the no-match card {height}pt instead of \
+                 {baseline}pt. The window is a fixed {}pt with no scrollbar, so the difference \
+                 is clipped off the bottom -- and the bottom is where the only dismiss hint is",
+                fixture.name,
+                overlay_height(NO_MATCH_ROWS)
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, FIXTURES.len(), "the loop must have covered every fixture");
+
+        // Positive control on the instrument: it CAN see a taller card. A
+        // measurement that returned a constant would pass the loop above
+        // whatever the card did.
+        assert!(
+            no_match_card_height(APP) < {
+                let ctx = styled_ctx();
+                let mut needed = f32::NAN;
+                let _ = ctx.run_ui(sized(700.0), |ui| {
+                    draw_overlay_card_rows(ui, APP, ITEM, Some(USER), &four_choices());
+                    needed = ui.min_rect().bottom();
+                });
+                needed
+            },
+            "control: the instrument reports the same height for a one-body no-match card and \
+             a four-row matched card, so it is not measuring height at all"
+        );
+    }
+
+    /// **The card says what it is for**, and it says it inside the window.
+    ///
+    /// Not a smoke test: the header's "No match", the body's two lines and the
+    /// footer's one hint are the entire content, and the body's first line is
+    /// the only place the app is named. Each is found as exactly one laid-out
+    /// glyph run -- so a line elided to "No saved login for ledgerlin…" has no
+    /// match and fails -- and each is asserted to be inside the window the
+    /// overlay actually asks for.
+    #[test]
+    fn the_no_match_card_names_the_app_and_the_way_out_inside_its_window() {
+        let height = overlay_height(NO_MATCH_ROWS);
+        let ink = painted_no_match(APP, height);
+        let win = window(height);
+
+        let (primary, secondary) = no_match_text(APP);
+        let mut checked = 0;
+        for text in [NO_MATCH_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
+            let rect = glyph_run(&ink, text);
+            assert!(
+                fits(rect, win),
+                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
+                 asks the OS for. There is no scrollbar and no title bar to drag"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have covered all four strings");
+
+        // And the one string that must NOT be here: this card offers no fill,
+        // so a footer promising Enter would be the card contradicting itself.
+        assert!(
+            !ink.iter().any(|i| i.glyphs.as_deref() == Some("Enter Fill")),
+            "the no-match card's footer offers `Enter Fill`. There is no item behind this \
+             window and nothing for Enter to fill"
+        );
+    }
+
+    /// **Esc dismisses, as it does in every other overlay state** -- and Enter
+    /// does not, because there is nothing to fill.
+    ///
+    /// `NoMatchApp::ui` needs an `eframe::Frame` and a real always-on-top
+    /// window and can never be executed here, which is exactly why the
+    /// decision is `no_match_keyboard_action` and not an `if` inside it.
+    #[test]
+    fn escape_dismisses_the_no_match_card_and_nothing_else_does() {
+        // The same reader the card itself uses -- `EscapePressed::read` is the
+        // only way to make one in safe Rust, in a test as in production.
+        let pressed = |key: egui::Key| keys_down(&[key]).1;
+
+        assert_eq!(
+            no_match_keyboard_action(pressed(egui::Key::Escape)),
+            OverlayAction::Dismiss,
+            "Esc did not dismiss the no-match card. It is the only keyboard way out of a \
+             frameless, always-on-top window that appeared over what the user was doing"
+        );
+        assert_eq!(
+            no_match_keyboard_action(pressed(egui::Key::Enter)),
+            OverlayAction::None,
+            "Enter did something to a card with no item behind it"
+        );
+        assert_eq!(
+            no_match_keyboard_action(pressed(egui::Key::A)),
+            OverlayAction::None,
+            "an unrelated key dismissed the card"
+        );
+    }
+
+    /// The header's ✕ dismisses, which matters more on this card than on any
+    /// other: the window is raised in response to ANOTHER app being
+    /// foregrounded, which is exactly the case Windows' foreground lock
+    /// refuses keyboard focus for -- so Esc may never arrive, and the ✕ is the
+    /// only way out that does not depend on it.
+    #[test]
+    fn the_no_match_cards_close_control_dismisses_it() {
+        let height = overlay_height(NO_MATCH_ROWS);
+        let ctx = styled_ctx();
+        // Warm-up frame: the header Frame must have been laid out once before
+        // its rect can be interacted with.
+        let _ = ctx.run_ui(sized(height), |ui| {
+            draw_no_match_card(ui, APP);
+        });
+
+        // Where the ✕ is: the close control the matched card's header uses, at
+        // the right-hand end of the header strip. Found by painting rather
+        // than by arithmetic, so a moved header moves the click with it.
+        let close = {
+            let ink = painted_no_match(APP, height);
+            let segs: Vec<&Ink> = ink
+                .iter()
+                .filter(|i| {
+                    i.glyphs.is_none()
+                        && i.tile.is_none()
+                        && i.rect.width() < 20.0
+                        && i.rect.height() < 20.0
+                        && i.rect.left() > OVERLAY_WIDTH - 60.0
+                })
+                .collect();
+            assert!(
+                !segs.is_empty(),
+                "no close control was painted in the no-match card's header, so this window \
+                 has no mouse-operable way out at all"
+            );
+            let mut r = segs[0].rect;
+            for s in &segs[1..] {
+                r = r.union(s.rect);
+            }
+            r.center()
+        };
+
+        let press = |down: bool| egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(close),
+                egui::Event::PointerButton {
+                    pos: close,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..sized(height)
+        };
+
+        let mut down = OverlayAction::None;
+        let _ = ctx.run_ui(press(true), |ui| down = draw_no_match_card(ui, APP));
+        assert_eq!(
+            down,
+            OverlayAction::None,
+            "the card dismissed on mouse-DOWN. egui decides a click on the release, and a card \
+             that acts on the press acts on a gesture the user can still drag away from"
+        );
+
+        let mut up = OverlayAction::None;
+        let _ = ctx.run_ui(press(false), |ui| up = draw_no_match_card(ui, APP));
+        assert_eq!(
+            up,
+            OverlayAction::Dismiss,
+            "clicking the ✕ did not dismiss the no-match card. With Esc not guaranteed to \
+             reach a window raised behind the foreground lock, this leaves an always-on-top \
+             card with no way out"
+        );
+    }
+
+    /// The card can never answer `Fill`. There is no item behind it, so the
+    /// variant is unreachable **by construction** -- and this is what says so
+    /// about the drawing rather than about the doc comment: no click anywhere
+    /// on the card produces one.
+    #[test]
+    fn no_click_on_the_no_match_card_ever_answers_a_fill() {
+        let height = overlay_height(NO_MATCH_ROWS);
+        let ctx = styled_ctx();
+        let _ = ctx.run_ui(sized(height), |ui| {
+            draw_no_match_card(ui, APP);
+        });
+
+        let mut dismissals = 0;
+        let mut probed = 0;
+        let mut y = 2.0;
+        while y < height {
+            let mut x = 2.0;
+            while x < OVERLAY_WIDTH {
+                let at = egui::pos2(x, y);
+                let press = |down: bool| egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: down,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    ..sized(height)
+                };
+                let _ = ctx.run_ui(press(true), |ui| {
+                    draw_no_match_card(ui, APP);
+                });
+                let mut answer = OverlayAction::None;
+                let _ = ctx.run_ui(press(false), |ui| answer = draw_no_match_card(ui, APP));
+                match answer {
+                    OverlayAction::Fill(choice) => panic!(
+                        "clicking ({x}, {y}) on the no-match card answered Fill({choice:?}). \
+                         There is no item behind this card, so whatever that would type comes \
+                         from somewhere it must not"
+                    ),
+                    OverlayAction::Dismiss => dismissals += 1,
+                    OverlayAction::None => {}
+                }
+                probed += 1;
+                x += 8.0;
+            }
+            y += 8.0;
+        }
+        assert!(probed > 100, "control: only {probed} points were clicked, which is not a sweep");
+        assert!(
+            dismissals > 0,
+            "control: {probed} clicks across the whole card produced no Dismiss either, so this \
+             sweep is not reaching the card's controls and the Fill assertion above is vacuous"
+        );
     }
 }

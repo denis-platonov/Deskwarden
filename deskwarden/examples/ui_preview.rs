@@ -107,6 +107,14 @@ fn target_dir() -> PathBuf {
 enum Surface {
     /// The autofill overlay (design 2a).
     Overlay,
+    /// The autofill overlay with NOTHING to offer (design 3a): a window that
+    /// asks for a password and that the vault does not match.
+    ///
+    /// Its own surface rather than a variation of `Overlay`, because it is a
+    /// different card -- no avatar, no row, no Enter chip -- drawn by a
+    /// different function, and a state nobody renders is a state nobody looks
+    /// at.
+    OverlayNoMatch,
     /// The login window with a vault that exists and is locked.
     LoginUnlock,
     /// The login window with no account yet -- server dropdown and the Hello
@@ -204,6 +212,7 @@ fn pane_frame() -> egui::Frame {
 /// Every surface, in the order `--all` walks them.
 const ALL: &[Surface] = &[
     Surface::Overlay,
+    Surface::OverlayNoMatch,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -226,6 +235,7 @@ impl Surface {
     fn stem(self) -> &'static str {
         match self {
             Surface::Overlay => "overlay",
+            Surface::OverlayNoMatch => "overlay_no_match",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -257,7 +267,7 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::Overlay => egui::vec2(396.0, 164.0),
+            Surface::Overlay | Surface::OverlayNoMatch => egui::vec2(396.0, 164.0),
             Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
             Surface::LoginDetail
             | Surface::CardDetail
@@ -490,6 +500,7 @@ impl eframe::App for Preview {
 
         match self.current() {
             Surface::Overlay => self.draw_overlay(root, &ctx),
+            Surface::OverlayNoMatch => self.draw_overlay_no_match(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false),
             Surface::LoginSignin => self.draw_login(root, &ctx, true),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
@@ -593,6 +604,18 @@ impl Preview {
                 "Ledgerline",
                 Some("a.novak@ledgerline.com"),
             ) == overlay_ui::OverlayAction::Dismiss
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+
+    /// Design 3a, drawn by the shipped function rather than re-implemented --
+    /// which is why `draw_no_match_card` is public.
+    fn draw_overlay_no_match(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
+            if overlay_ui::draw_no_match_card(ui, "Atlas Licence")
+                == overlay_ui::OverlayAction::Dismiss
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
