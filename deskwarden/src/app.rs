@@ -1753,11 +1753,36 @@ pub trait PromptPresenter {
     /// window on itself. A user who dismisses the card answers
     /// [`overlay_ui::SaveLoginAction::NotNow`], because "silence today" is a
     /// decision and is spelled as one.
+    ///
+    /// **It takes the form rather than a label**, which is the whole of the
+    /// 3d handoff on this side: 3c must close for 3d to open (`OVERLAY_OPEN`
+    /// refuses to stack a second window), so the card comes back a second
+    /// time, and a signature that took only a name would re-open it blank --
+    /// losing the username the user typed before clicking *Generate*, and the
+    /// generated password 3d just produced.
     fn show_save_login(
+        &self,
+        form: overlay_ui::SaveLoginForm,
+        position: Option<(f32, f32)>,
+    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>;
+    /// Shows design **3d** -- the generator -- and answers the password the
+    /// user chose to keep, or `None` if they dismissed it.
+    ///
+    /// `generate` is the round trip to `bw serve`, passed in rather than
+    /// reached for: `overlay_ui` has no vault handle, and **there is no
+    /// generator in this crate** -- the randomness is the server's, which is
+    /// the one property of this feature that must not be reimplemented.
+    ///
+    /// A borrowed `dyn Fn` rather than a function pointer because the caller's
+    /// is a closure over a `&VaultCache`; see [`handle_no_match`].
+    fn show_generate(
         &self,
         label: &str,
         position: Option<(f32, f32)>,
-    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>;
+        generate: &dyn Fn(
+            &crate::vault_bridge::GenerateRequest,
+        ) -> Result<zeroize::Zeroizing<String>, String>,
+    ) -> Option<zeroize::Zeroizing<String>>;
     /// Shows design **3b** -- the card for a window with a password field
     /// focused while the vault cannot be read -- and returns when the user
     /// dismisses it.
@@ -1794,10 +1819,20 @@ pub struct FnPresenter {
     /// [`PromptPresenter::show_save_login`].
     #[allow(clippy::type_complexity)]
     pub show_save_login: fn(
-        &str,
+        overlay_ui::SaveLoginForm,
         Option<(f32, f32)>,
     )
         -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>,
+    /// Asked to put design 3d on screen. See
+    /// [`PromptPresenter::show_generate`].
+    #[allow(clippy::type_complexity)]
+    pub show_generate: fn(
+        &str,
+        Option<(f32, f32)>,
+        &dyn Fn(
+            &crate::vault_bridge::GenerateRequest,
+        ) -> Result<zeroize::Zeroizing<String>, String>,
+    ) -> Option<zeroize::Zeroizing<String>>,
     /// Asked to put design 3b on screen. Answers nothing; see
     /// [`PromptPresenter::show_locked`].
     pub show_locked: fn(&str, Option<(f32, f32)>),
@@ -1828,10 +1863,21 @@ impl PromptPresenter for FnPresenter {
 
     fn show_save_login(
         &self,
-        label: &str,
+        form: overlay_ui::SaveLoginForm,
         position: Option<(f32, f32)>,
     ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
-        (self.show_save_login)(label, position)
+        (self.show_save_login)(form, position)
+    }
+
+    fn show_generate(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+        generate: &dyn Fn(
+            &crate::vault_bridge::GenerateRequest,
+        ) -> Result<zeroize::Zeroizing<String>, String>,
+    ) -> Option<zeroize::Zeroizing<String>> {
+        (self.show_generate)(label, position, generate)
     }
 
     fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
@@ -1854,6 +1900,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     show_no_match: overlay_ui::show_no_match_overlay,
     show_locked: overlay_ui::show_locked_overlay,
     show_save_login: overlay_ui::show_save_login_overlay,
+    show_generate: overlay_ui::show_generate_overlay,
 };
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
@@ -1942,12 +1989,93 @@ pub fn no_match_arm<P: PromptPresenter>(
 /// true even though this is the arm that ends in a create: there is no item
 /// *yet*. What comes back is what the user typed, and
 /// [`route_save_answer`] is what decides whether it becomes one.
+/// **It is handed the form to open with**, rather than building one from the
+/// window: design 3d can send the user back here with a password in hand and
+/// a username already typed, and an arm that re-derived a blank form would
+/// throw both away. [`save_login_flow`] is the loop that does the sending.
 pub fn save_login_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
+    form: overlay_ui::SaveLoginForm,
 ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
     let position = presenter.position(window.hwnd, overlay_ui::SAVE_LOGIN_ROWS);
-    presenter.show_save_login(window_label(&window.exe_name, &window.title), position)
+    presenter.show_save_login(form, position)
+}
+
+/// **The 3d arm**: [`save_login_arm`]'s sibling, and the only place design 3d
+/// is opened.
+///
+/// **The placement is asked about [`overlay_ui::GENERATE_ROWS`]** and not
+/// about the card the user just left, for the reason `save_login_arm`'s doc
+/// gives: the clamp onto the monitor's work area is a function of the card's
+/// height, so the wrong height puts this card's *Save to vault* button under
+/// the taskbar for any window anchored near the bottom of the screen.
+pub fn generate_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    generate: &dyn Fn(
+        &crate::vault_bridge::GenerateRequest,
+    ) -> Result<zeroize::Zeroizing<String>, String>,
+) -> Option<zeroize::Zeroizing<String>> {
+    let position = presenter.position(window.hwnd, overlay_ui::GENERATE_ROWS);
+    presenter.show_generate(
+        window_label(&window.exe_name, &window.title),
+        position,
+        generate,
+    )
+}
+
+/// How many times [`save_login_flow`] will hand the user from 3c to 3d and
+/// back before it gives up and answers as if the card had been dismissed.
+///
+/// **A liveness bound, not a budget on the user.** Regenerating a password
+/// happens *inside* 3d -- Ctrl+R, the *New* link, and every change of kind or
+/// size -- and costs no hop at all; a hop is only spent going to the
+/// generator and coming back, which is a thing a person does once or twice.
+/// What the number is really for is that this loop's continuation condition
+/// is an answer from a presenter, and a presenter that always answered
+/// *Generate* would spin forever with a window on screen and no way out. That
+/// presenter exists: it is the recorder
+/// `a_presenter_that_only_ever_generates_does_not_spin_forever` drives this
+/// with.
+pub const GENERATE_HOPS: usize = 8;
+
+/// **The whole of the 3c/3d loop, as a pure function.**
+///
+/// 3c is shown; if the user clicked *Generate*, 3d is shown, whatever it
+/// produced is written into the form's password row, and 3c is shown again --
+/// carrying the username they had already typed. Any other answer ends it.
+///
+/// **The two cards alternate rather than nest** because the overlay is one
+/// window at a time: `overlay_ui::OVERLAY_OPEN` refuses to stack a second,
+/// and `eframe::run_native` on this thread could not open one anyway. So the
+/// form is the thing that crosses between them, and it crosses by value.
+///
+/// A dismissed 3d (`None`) leaves the password exactly as it was and returns
+/// to 3c, which is the only reading of "I changed my mind about generating"
+/// that does not destroy what the user typed.
+pub fn save_login_flow<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    generate: &dyn Fn(
+        &crate::vault_bridge::GenerateRequest,
+    ) -> Result<zeroize::Zeroizing<String>, String>,
+) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+    let mut form =
+        overlay_ui::SaveLoginForm::new(window_label(&window.exe_name, &window.title));
+    for _ in 0..GENERATE_HOPS {
+        let (action, answered) = save_login_arm(presenter, window, form)?;
+        form = answered;
+        if action != overlay_ui::SaveLoginAction::Generate {
+            return Some((action, form));
+        }
+        if let Some(password) = generate_arm(presenter, window, generate) {
+            form.password = password;
+        }
+    }
+    // Out of hops. `NotNow` and not `Never`: the strongest answer this card
+    // offers is not one to reach by running out of something.
+    Some((overlay_ui::SaveLoginAction::NotNow, form))
 }
 
 /// The `NewItem` a filled-in 3c form becomes.
@@ -2038,6 +2166,16 @@ pub fn route_save_answer(
         overlay_ui::SaveLoginAction::NotNow | overlay_ui::SaveLoginAction::None => {
             SaveOutcome::Nothing
         }
+        // **[`overlay_ui::SaveLoginAction::Generate`] is not a decision about
+        // the vault**, and it does not reach here through
+        // [`save_login_flow`], which resolves it by opening design 3d and
+        // asking 3c again. It is spelled out rather than folded into the arm
+        // above because the two mean different things and a `_ =>` would hide
+        // the day a fifth answer is added: a `Generate` that got this far is
+        // a flow that ended mid-hop, and the only safe reading of a card the
+        // user never finished answering is "nothing, ask again".
+        // `a_generate_that_escapes_the_flow_writes_nothing` holds it.
+        overlay_ui::SaveLoginAction::Generate => SaveOutcome::Nothing,
     }
 }
 
@@ -2076,7 +2214,16 @@ pub fn handle_no_match(cache: &VaultCache, window: &crate::window_watch::Foregro
         return;
     }
     let outcome = route_save_answer(
-        save_login_arm(&REAL_OVERLAY, window),
+        save_login_flow(&REAL_OVERLAY, window, &|request| {
+            // **The one generator, and it is `bw serve`'s.** Nothing in this
+            // crate produces randomness for a password; this closure is the
+            // whole of what design 3d can ask for, and it is the same
+            // `VaultBridge::generate` the edit form's own generator calls.
+            cache.bridge().generate(request).map_err(|e| {
+                log::warn!("the overlay could not generate a password: {e:?}");
+                overlay_ui::GENERATE_FAILED_TEXT.to_string()
+            })
+        }),
         // **The one item-creating route in this app**, the same
         // `VaultCache::create_item` the edit form calls -- not a second one.
         // `no_match_wiring_tests` pins this call by source text, the way
@@ -2522,6 +2669,9 @@ mod tests {
         /// The label and placement each `show_save_login` was handed -- design
         /// 3c's own log, kept apart from all three of the others.
         save_login_shown: std::cell::RefCell<Vec<NoMatchShown>>,
+        /// The label and placement each `show_generate` was handed -- design
+        /// 3d's own log, kept apart from all four of the others.
+        generate_shown: std::cell::RefCell<Vec<NoMatchShown>>,
     }
 
     impl PromptPresenter for RecordingPresenter {
@@ -2572,10 +2722,28 @@ mod tests {
         /// four.
         fn show_save_login(
             &self,
-            label: &str,
+            form: overlay_ui::SaveLoginForm,
             position: Option<(f32, f32)>,
         ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
             self.save_login_shown
+                .borrow_mut()
+                .push((form.app_name.clone(), position));
+            None
+        }
+
+        /// Design 3d goes into a log of its own for the reason the other
+        /// three do, and one more: it is the only card that is opened FROM
+        /// another card, so a recorder that shared 3c's log could not tell a
+        /// hop from a re-open.
+        fn show_generate(
+            &self,
+            label: &str,
+            position: Option<(f32, f32)>,
+            _generate: &dyn Fn(
+                &crate::vault_bridge::GenerateRequest,
+            ) -> Result<zeroize::Zeroizing<String>, String>,
+        ) -> Option<zeroize::Zeroizing<String>> {
+            self.generate_shown
                 .borrow_mut()
                 .push((label.to_string(), position));
             None
@@ -3082,9 +3250,23 @@ mod tests {
         /// is the row the whole card is built around.
         fn show_save_login(
             &self,
-            label: &str,
+            form: overlay_ui::SaveLoginForm,
             _position: Option<(f32, f32)>,
         ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+            self.seen.borrow_mut().push(form.app_name.clone());
+            None
+        }
+
+        /// And so does design 3d's: it is the same `window_label` answer, and
+        /// this test is about every string the overlay is handed.
+        fn show_generate(
+            &self,
+            label: &str,
+            _position: Option<(f32, f32)>,
+            _generate: &dyn Fn(
+                &crate::vault_bridge::GenerateRequest,
+            ) -> Result<zeroize::Zeroizing<String>, String>,
+        ) -> Option<zeroize::Zeroizing<String>> {
             self.seen.borrow_mut().push(label.to_string());
             None
         }
@@ -3193,10 +3375,22 @@ mod tests {
 
         fn show_save_login(
             &self,
-            _label: &str,
+            _form: overlay_ui::SaveLoginForm,
             _position: Option<(f32, f32)>,
         ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
             self.log.borrow_mut().push("save-login card shown");
+            None
+        }
+
+        fn show_generate(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+            _generate: &dyn Fn(
+                &crate::vault_bridge::GenerateRequest,
+            ) -> Result<zeroize::Zeroizing<String>, String>,
+        ) -> Option<zeroize::Zeroizing<String>> {
+            self.log.borrow_mut().push("generate card shown");
             None
         }
 
@@ -3342,14 +3536,38 @@ mod tests {
         std::sync::Mutex::new(Vec::new());
 
     fn recording_show_save_login(
-        label: &str,
+        form: overlay_ui::SaveLoginForm,
         position: Option<(f32, f32)>,
     ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
         SAVE_LOGIN_FORWARDED
             .lock()
             .unwrap()
-            .push((label.to_string(), position));
+            .push((form.app_name.clone(), position));
         None
+    }
+
+    static GENERATE_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// **It calls the `generate` it was handed**, and records what came back,
+    /// so the forwarding test can tell a dropped closure argument from a
+    /// forwarded one. A field that arrived but was never called would look
+    /// identical from the label alone.
+    fn recording_show_generate(
+        label: &str,
+        position: Option<(f32, f32)>,
+        generate: &dyn Fn(
+            &crate::vault_bridge::GenerateRequest,
+        ) -> Result<zeroize::Zeroizing<String>, String>,
+    ) -> Option<zeroize::Zeroizing<String>> {
+        GENERATE_FORWARDED
+            .lock()
+            .unwrap()
+            .push((label.to_string(), position));
+        generate(&crate::vault_bridge::GenerateRequest::Password(
+            crate::vault_bridge::PasswordRecipe::default(),
+        ))
+        .ok()
     }
 
     static LOCKED_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
@@ -3373,6 +3591,7 @@ mod tests {
             show_no_match: recording_show_no_match,
             show_locked: recording_show_locked,
             show_save_login: recording_show_save_login,
+            show_generate: recording_show_generate,
         };
 
         assert_eq!(presenter.position(4242, 3), Some((11.0, 22.0)));
@@ -7036,5 +7255,324 @@ mod preflight_guard_tests {
                 "{choice:?} would be refused on every legitimate fill"
             );
         }
+    }
+}
+
+/// **Design 3d's arm and the 3c/3d loop.**
+///
+/// Everything here is driven through a recording presenter, because the two
+/// real cards each call `eframe::run_native` and no test in this crate may
+/// execute one. What is asserted is the shape of the handoff: which card is
+/// opened, what it is handed, and what survives crossing between them.
+#[cfg(test)]
+mod generate_flow_tests {
+    use super::*;
+    use crate::overlay_ui::{SaveLoginAction, SaveLoginForm};
+    use crate::vault_bridge::GenerateRequest;
+
+    const APP: &str = "ledgerline.exe";
+    const TYPED: &str = "a.novak@ledgerline.com";
+    const GENERATED: &str = "tq7Rvk29mzpLx4hd8";
+
+    fn window() -> crate::window_watch::ForegroundEvent {
+        crate::window_watch::ForegroundEvent {
+            hwnd: 4242,
+            pid: 99,
+            exe_name: APP.to_string(),
+            title: String::new(),
+        }
+    }
+
+    /// A generator that never touches a network: it answers `GENERATED` for
+    /// any request and records what it was asked for.
+    #[derive(Default)]
+    struct Generator {
+        asked: std::cell::RefCell<Vec<GenerateRequest>>,
+    }
+
+    impl Generator {
+        fn call(&self) -> impl Fn(&GenerateRequest) -> Result<zeroize::Zeroizing<String>, String> + '_ {
+            move |request| {
+                self.asked.borrow_mut().push(request.clone());
+                Ok(zeroize::Zeroizing::new(GENERATED.to_string()))
+            }
+        }
+    }
+
+    /// What one scripted card answers with.
+    enum Answer {
+        /// 3c answers with this action, having had `typed` put in its
+        /// username row first -- which is how "the username survives the hop"
+        /// becomes observable.
+        Card(SaveLoginAction, Option<&'static str>),
+    }
+
+    /// A presenter that answers 3c from a script and 3d with a fixed
+    /// password, recording every form it was handed.
+    struct Script {
+        answers: std::cell::RefCell<Vec<Answer>>,
+        /// The `(app_name, username, password)` of every form 3c was OPENED
+        /// with -- not the ones it answered. This is the side the handoff is
+        /// visible from.
+        opened_with: std::cell::RefCell<Vec<(String, String, String)>>,
+        /// The rows each card was placed for, in call order.
+        rows: std::cell::RefCell<Vec<usize>>,
+        /// What 3d answers: `None` means the user dismissed it.
+        generated: Option<&'static str>,
+        /// How many times 3d was opened.
+        generate_calls: std::cell::Cell<usize>,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Answer>, generated: Option<&'static str>) -> Self {
+            Self {
+                answers: std::cell::RefCell::new(answers.into_iter().rev().collect()),
+                opened_with: std::cell::RefCell::new(Vec::new()),
+                rows: std::cell::RefCell::new(Vec::new()),
+                generated,
+                generate_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl PromptPresenter for Script {
+        fn position(&self, _hwnd: isize, rows: usize) -> Option<(f32, f32)> {
+            self.rows.borrow_mut().push(rows);
+            Some((1.0, 2.0))
+        }
+
+        fn show(
+            &self,
+            _label: &str,
+            _matched: Option<&overlay_ui::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<FillChoice> {
+            unreachable!("the 3d flow never opens the matched card")
+        }
+
+        fn show_no_match(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::NoMatchAnswer {
+            unreachable!("the 3d flow never opens 3a")
+        }
+
+        fn show_save_login(
+            &self,
+            form: SaveLoginForm,
+            _position: Option<(f32, f32)>,
+        ) -> Option<(SaveLoginAction, SaveLoginForm)> {
+            self.opened_with.borrow_mut().push((
+                form.app_name.clone(),
+                form.username.clone(),
+                form.password.to_string(),
+            ));
+            let Answer::Card(action, typed) = self
+                .answers
+                .borrow_mut()
+                .pop()
+                .expect("the flow opened 3c more times than the script has answers");
+            let mut answered = form;
+            if let Some(typed) = typed {
+                answered.username = typed.to_string();
+            }
+            Some((action, answered))
+        }
+
+        fn show_generate(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+            generate: &dyn Fn(&GenerateRequest) -> Result<zeroize::Zeroizing<String>, String>,
+        ) -> Option<zeroize::Zeroizing<String>> {
+            self.generate_calls.set(self.generate_calls.get() + 1);
+            // The card really does ask the generator it was handed, so a
+            // presenter argument that was accepted and dropped is visible in
+            // the `Generator`'s own log.
+            let _ = generate(&GeneratedKindRequest::default_request());
+            self.generated
+                .map(|p| zeroize::Zeroizing::new(p.to_string()))
+        }
+
+        fn show_locked(&self, _label: &str, _position: Option<(f32, f32)>) {
+            unreachable!("the 3d flow never opens 3b")
+        }
+    }
+
+    /// The request the scripted 3d makes, so the test's generator has
+    /// something real to be asked for. It is the card's own opening recipe.
+    struct GeneratedKindRequest;
+    impl GeneratedKindRequest {
+        fn default_request() -> GenerateRequest {
+            overlay_ui::GeneratedKind::Characters
+                .recipe(overlay_ui::GeneratedKind::Characters.default_size())
+        }
+    }
+
+    /// **The handoff, in both directions.**
+    ///
+    /// 3c is opened blank; the user types a username and clicks *Generate*;
+    /// 3d answers a password; 3c is opened **again** carrying both. That
+    /// second opening is the whole feature -- an arm that rebuilt the form
+    /// from the window would open it blank and throw away both -- and it is
+    /// asserted on the form the presenter was HANDED rather than on the one
+    /// it answered with, because the handed one is what the user would see.
+    #[test]
+    fn the_generated_password_and_the_typed_username_both_reach_3c() {
+        let generator = Generator::default();
+        let script = Script::new(
+            vec![
+                Answer::Card(SaveLoginAction::Generate, Some(TYPED)),
+                Answer::Card(SaveLoginAction::Save, None),
+            ],
+            Some(GENERATED),
+        );
+
+        let answer = save_login_flow(&script, &window(), &generator.call());
+        let (action, form) = answer.expect("the flow answered nothing");
+        assert_eq!(action, SaveLoginAction::Save);
+        assert_eq!(form.password.as_str(), GENERATED, "the flow's answer lost the password");
+        assert_eq!(form.username, TYPED, "the flow's answer lost the username");
+
+        let opened = script.opened_with.borrow();
+        assert_eq!(opened.len(), 2, "3c was not re-opened after the generator");
+        assert_eq!(
+            opened[0],
+            (APP.to_string(), String::new(), String::new()),
+            "3c did not open blank the first time, so it is claiming a capture it did not make"
+        );
+        assert_eq!(
+            opened[1],
+            (APP.to_string(), TYPED.to_string(), GENERATED.to_string()),
+            "3c re-opened without what the user typed and what 3d generated"
+        );
+        assert_eq!(script.generate_calls.get(), 1, "3d was opened other than once");
+        assert_eq!(
+            generator.asked.borrow().len(),
+            1,
+            "the generator the flow was handed was never called, so a presenter that \
+             accepted the argument and dropped it would pass"
+        );
+    }
+
+    /// **Each card is placed for its own height.**
+    ///
+    /// The clamp onto the monitor's work area is computed from the card's
+    /// height, so asking about the card the user just left puts the other
+    /// one's controls under the taskbar for any window anchored near the
+    /// bottom of the screen. 3c and 3d are different heights, and this is
+    /// what fails if the flow asks about the wrong one.
+    #[test]
+    fn each_card_is_placed_for_the_card_it_opens() {
+        let generator = Generator::default();
+        let script = Script::new(
+            vec![
+                Answer::Card(SaveLoginAction::Generate, None),
+                Answer::Card(SaveLoginAction::NotNow, None),
+            ],
+            Some(GENERATED),
+        );
+        let _ = save_login_flow(&script, &window(), &generator.call());
+        assert_eq!(
+            *script.rows.borrow(),
+            vec![
+                overlay_ui::SAVE_LOGIN_ROWS,
+                overlay_ui::GENERATE_ROWS,
+                overlay_ui::SAVE_LOGIN_ROWS
+            ],
+            "the flow asked for a placement sized by the wrong card"
+        );
+        // The control that makes the sequence above mean something: the two
+        // constants really are different numbers, so a flow that used one for
+        // both would fail rather than coincide.
+        assert_ne!(
+            overlay_ui::SAVE_LOGIN_ROWS,
+            overlay_ui::GENERATE_ROWS,
+            "3c and 3d ask for the same window, so this test cannot tell them apart"
+        );
+    }
+
+    /// **A dismissed generator changes nothing.**
+    ///
+    /// The user clicked *Generate*, thought better of it and pressed Esc. The
+    /// password row must be exactly as they left it -- an Esc that wrote an
+    /// empty string over a typed password would destroy work by cancelling.
+    #[test]
+    fn a_dismissed_generator_leaves_the_form_alone() {
+        let generator = Generator::default();
+        let script = Script::new(
+            vec![
+                Answer::Card(SaveLoginAction::Generate, Some(TYPED)),
+                Answer::Card(SaveLoginAction::NotNow, None),
+            ],
+            // The user dismissed 3d.
+            None,
+        );
+
+        let _ = save_login_flow(&script, &window(), &generator.call());
+        let opened = script.opened_with.borrow();
+        assert_eq!(opened.len(), 2);
+        assert_eq!(
+            opened[1],
+            (APP.to_string(), TYPED.to_string(), String::new()),
+            "a dismissed generator did not return to the form the user had typed into"
+        );
+    }
+
+    /// **A presenter that only ever generates does not spin forever.**
+    ///
+    /// The loop's continuation condition is an answer from a presenter, and
+    /// this is the presenter that never advances. Without
+    /// [`GENERATE_HOPS`] this test hangs; with it the flow gives up and
+    /// answers the weakest of 3c's answers.
+    #[test]
+    fn a_presenter_that_only_ever_generates_does_not_spin_forever() {
+        let generator = Generator::default();
+        let script = Script::new(
+            (0..GENERATE_HOPS)
+                .map(|_| Answer::Card(SaveLoginAction::Generate, None))
+                .collect(),
+            Some(GENERATED),
+        );
+
+        let (action, _form) = save_login_flow(&script, &window(), &generator.call())
+            .expect("the flow answered nothing");
+        assert_eq!(
+            action,
+            SaveLoginAction::NotNow,
+            "running out of hops answered something other than the weakest answer the card \
+             offers; `Never` is not a thing to reach by exhaustion"
+        );
+        assert_eq!(
+            script.generate_calls.get(),
+            GENERATE_HOPS,
+            "the flow did not stop at exactly GENERATE_HOPS trips to the generator"
+        );
+    }
+
+    /// **A `Generate` that escapes the flow writes nothing.**
+    ///
+    /// [`save_login_flow`] resolves *Generate* itself and never returns it,
+    /// so this is the arm that is unreachable by construction -- which is
+    /// exactly why it is asserted rather than assumed. If a later change let
+    /// one through, the answer must be "nothing", not a vault write and not a
+    /// permanent silence.
+    #[test]
+    fn a_generate_that_escapes_the_flow_writes_nothing() {
+        let created = std::cell::RefCell::new(0);
+        let silenced = std::cell::RefCell::new(0);
+        let outcome = route_save_answer(
+            Some((SaveLoginAction::Generate, SaveLoginForm::new(APP))),
+            |_| {
+                *created.borrow_mut() += 1;
+                Ok("id".to_string())
+            },
+            |_| *silenced.borrow_mut() += 1,
+        );
+        assert_eq!(outcome, SaveOutcome::Nothing);
+        assert_eq!(*created.borrow(), 0, "a `Generate` created a vault item");
+        assert_eq!(*silenced.borrow(), 0, "a `Generate` silenced the app forever");
     }
 }

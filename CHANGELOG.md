@@ -10,6 +10,38 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### The overlay can generate the password it is about to save
+
+The save-a-login card — the one that appears when you focus a password field
+nothing in the vault matches — made you type a password in. Now it can make
+you one.
+
+- **A *Generate* link on the Password row** opens a new card: a fresh
+  password, a **Words / Characters / PIN** selector, and a size stepper with a
+  live readout that says what it is counting — "4 words" or "20 characters",
+  not one fixed number that means different things in different modes.
+  - **Words** is a passphrase; **Characters** is Deskwarden's usual
+    twenty-character, four-class password; **PIN** is digits only. There are
+    no character-class switches here — those stay in the vault window's edit
+    form, because this card floats over whatever you are doing and every
+    control on it is one more thing to fit on a window that cannot scroll.
+  - The sizes you can pick are the ones the vault will honour without quietly
+    changing them, which is why the shortest PIN offered is five digits rather
+    than four.
+- **Ctrl+R**, the *New* link, and any change of kind or size ask for another
+  one. Only one request is ever outstanding.
+- **The password comes from `bw serve`**, not from Deskwarden. Nothing in this
+  app generates randomness for a password.
+- **If it cannot reach the vault it says so on the card and stays open**, with
+  *New* still live — a failed generate is not a dead card.
+- ***Copy*** puts the password on the clipboard, under your usual clipboard
+  clearing setting. ***Save to vault*** hands it back to the save-a-login
+  card, with the username you had already typed still in it, where *Save*
+  writes the item.
+  - It says *Save to vault* and not *Fill*: this path cannot type into the
+    window behind it, and a button claiming otherwise would be worse than no
+    button.
+
 ### The tray stops claiming an update that is not there
 
 The tray menu had an "Update available" item. It was created with those words

@@ -125,6 +125,24 @@ enum Surface {
     /// edge is unreachable, and the geometry tests can only say the card fits
     /// -- not whether it reads as a form somebody would fill in.
     OverlaySaveLogin,
+    /// The autofill overlay's generator (design 3d) with a password in hand:
+    /// the state the card is in for almost all of the time it is on screen.
+    OverlayGenerate,
+    /// Design 3d while the round-trip to `bw serve` is outstanding.
+    ///
+    /// Its own surface rather than a footnote to the one above, because it is
+    /// a state a reviewer has to be able to LOOK at: it is what the user sees
+    /// for as long as the vault takes to answer, all four of its controls are
+    /// disabled in it, and one fixed-size window has to hold it as well as
+    /// the other two.
+    OverlayGenerateWorking,
+    /// Design 3d after the round-trip failed -- the state the design does not
+    /// draw at all.
+    ///
+    /// The one this list most needs of the three: it must still carry a live
+    /// *New* control, or a failed generate is a card the user can do nothing
+    /// with but Esc.
+    OverlayGenerateFailed,
     /// The login window with a vault that exists and is locked.
     LoginUnlock,
     /// The login window with no account yet -- server dropdown and the Hello
@@ -249,6 +267,9 @@ const ALL: &[Surface] = &[
     Surface::OverlayNoMatch,
     Surface::OverlayLocked,
     Surface::OverlaySaveLogin,
+    Surface::OverlayGenerate,
+    Surface::OverlayGenerateWorking,
+    Surface::OverlayGenerateFailed,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -278,6 +299,9 @@ impl Surface {
             Surface::OverlayNoMatch => "overlay_no_match",
             Surface::OverlayLocked => "overlay_locked",
             Surface::OverlaySaveLogin => "overlay_save_login",
+            Surface::OverlayGenerate => "overlay_generate",
+            Surface::OverlayGenerateWorking => "overlay_generate_working",
+            Surface::OverlayGenerateFailed => "overlay_generate_failed",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -322,6 +346,14 @@ impl Surface {
             Surface::OverlaySaveLogin => egui::vec2(
                 overlay_ui::OVERLAY_WIDTH,
                 overlay_ui::overlay_height(overlay_ui::SAVE_LOGIN_ROWS),
+            ),
+            // Read off the module for the same reason, and it is a THIRD
+            // height: 3d is neither 164pt nor 3c's 264.
+            Surface::OverlayGenerate
+            | Surface::OverlayGenerateWorking
+            | Surface::OverlayGenerateFailed => egui::vec2(
+                overlay_ui::OVERLAY_WIDTH,
+                overlay_ui::overlay_height(overlay_ui::GENERATE_ROWS),
             ),
             Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
             Surface::LoginDetail
@@ -427,6 +459,23 @@ fn main() -> eframe::Result {
                 // and nothing else: the other three rows are what this app can
                 // actually know about the window, which is nothing.
                 save_login: overlay_ui::SaveLoginForm::new("Atlas Licence"),
+                generate: [
+                    {
+                        let mut ready =
+                            overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters);
+                        ready.finish(Ok(zeroize::Zeroizing::new(
+                            "tq7Rvk29mzpLx4-hd8".to_string(),
+                        )));
+                        ready
+                    },
+                    overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters),
+                    {
+                        let mut failed =
+                            overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters);
+                        failed.finish(Err(overlay_ui::GENERATE_FAILED_TEXT.to_string()));
+                        failed
+                    },
+                ],
                 screenshot,
                 done: false,
                 frames: 0,
@@ -491,6 +540,15 @@ struct Preview {
     /// Form state for design 3c (typing works; Save doesn't -- there is no
     /// vault behind this example).
     save_login: overlay_ui::SaveLoginForm,
+    /// Design 3d in each of its three states, one form per state.
+    ///
+    /// **Three forms rather than one that is re-pointed**, because the card
+    /// takes `&mut` and its own controls move it between states: a single
+    /// form would show whichever state the last frame's clicks left it in,
+    /// which is not the state the file name promises. Nothing here reaches a
+    /// vault -- the passwords are fixtures, and `GenerateForm::finish` is the
+    /// production way into both settled states.
+    generate: [overlay_ui::GenerateForm; 3],
     /// Capture and exit, rather than sit there being looked at.
     screenshot: bool,
     /// Every surface has been captured and `Close` has been asked for. The
@@ -568,6 +626,11 @@ impl eframe::App for Preview {
             Surface::OverlayNoMatch => self.draw_overlay_no_match(root, &ctx),
             Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
             Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
+            Surface::OverlayGenerate
+            | Surface::OverlayGenerateWorking
+            | Surface::OverlayGenerateFailed => {
+                self.draw_overlay_generate(root, &ctx, self.current())
+            }
             Surface::LoginUnlock => self.draw_login(root, &ctx, false),
             Surface::LoginSignin => self.draw_login(root, &ctx, true),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
@@ -724,6 +787,33 @@ impl Preview {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+    }
+
+    /// Design 3d, in whichever of its three states `surface` names.
+    ///
+    /// The card is the shipped one, so this preview cannot drift from it. The
+    /// action is dropped rather than acted on: *Copy* would reach the real
+    /// clipboard and *New* would need a vault, and a preview must do neither.
+    fn draw_overlay_generate(
+        &mut self,
+        root: &mut egui::Ui,
+        ctx: &egui::Context,
+        surface: Surface,
+    ) {
+        let slot = match surface {
+            Surface::OverlayGenerate => 0,
+            Surface::OverlayGenerateWorking => 1,
+            _ => 2,
+        };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| {
+                if overlay_ui::draw_generate_card(ui, &mut self.generate[slot])
+                    == overlay_ui::GenerateAction::Dismiss
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
     }
 
     fn draw_login(&mut self, root: &mut egui::Ui, ctx: &egui::Context, signin: bool) {
