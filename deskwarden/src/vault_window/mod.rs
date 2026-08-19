@@ -545,6 +545,13 @@ pub fn build_frame(
     // test that reached the production one would put a real public link on
     // the internet. See `VaultFrameEnv::send_create`.
     let spawn_send_create = env.send_create;
+    // The seventh, and the one that touches the CLIPBOARD. Named here for
+    // `spawn_send_delete`'s reason: behind this pointer is
+    // `clipboard::copy_secret`, whose Win32 half no test may run, so a test
+    // that pressed the real Copy link row without this seam would clobber
+    // whatever the person running `cargo test` had copied. See
+    // `VaultFrameEnv::send_copy`.
+    let copy_send_url = env.send_copy;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -3961,6 +3968,7 @@ pub fn build_frame(
                 tx: &send_create_tx,
                 spawn: spawn_send_create,
             },
+            copy_send_url,
         );
 
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
@@ -4853,6 +4861,18 @@ pub struct VaultFrameEnv {
     /// tests assert is ROUTING -- that a refused proof does not reach the
     /// clipboard, the reveal or the Send composer.
     reprompt: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
+    /// [`copy_send_link`] in production -- the Sends row's Copy link button,
+    /// the only place in this program that puts a Send's access URL on the
+    /// clipboard.
+    ///
+    /// Here because that URL is a SECRET -- it carries the Send's decryption
+    /// key in its fragment -- and now goes through
+    /// [`crate::clipboard::copy_secret`], which ends in Win32 and which no
+    /// test in this crate may reach. Without this field the choice is between
+    /// a Copy link button no test may press and a link copied the ordinary
+    /// way, retained in `Win+V` and synced to the user's other devices. See
+    /// [`SendCopySeam`].
+    send_copy: SendCopySeam,
 }
 
 /// The production re-prompt gate: `reprompt::gate_for_account`, and nothing
@@ -4870,6 +4890,19 @@ pub struct VaultFrameEnv {
 /// and every line break here is a line break someone has to reproduce there.
 fn reprompt_gate_for(account: Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate { crate::reprompt::gate_for_account(account) }
 
+/// The production Send-link copy: `clipboard::copy_secret`, and nothing else.
+///
+/// A function here rather than that path written straight into
+/// [`VaultFrameEnv::production`], for [`reprompt_gate_for`]'s reason exactly:
+/// every seam field is handed a FUNCTION'S OWN NAME, and the whole-body pin
+/// derived over this struct reads the named function's body OUT OF THIS FILE.
+///
+/// One line, deliberately, and the body is held character for character --
+/// hollowing it to `let _ = url;` is a Copy link button that reports success
+/// and copies nothing, and swapping it for an `egui` copy is the leak this
+/// seam was introduced to close.
+fn copy_send_link(url: &str) { crate::clipboard::copy_secret(url); }
+
 impl VaultFrameEnv {
     /// The real world. The only constructor a shipping build has.
     pub fn production() -> Self {
@@ -4883,6 +4916,7 @@ impl VaultFrameEnv {
             aux_load: spawn_aux_load,
             settings_path: crate::settings::default_path(),
             reprompt: reprompt_gate_for,
+            send_copy: copy_send_link,
         }
     }
 }
@@ -7271,6 +7305,23 @@ type SendDeleteSender = mpsc::Sender<SendDeleteReport>;
 /// and the tested run is which of two `fn` items is named.
 type SendDeleteSpawn = fn(egui::Context, SendDeleteSender, zeroize::Zeroizing<String>, String, String);
 
+/// The shape of "put this Send's access link on the clipboard", as a **`fn`
+/// pointer**.
+///
+/// [`SendDeleteSpawn`]'s reason, and one of its own. A Send's access URL
+/// carries the Send's decryption key in its fragment, so it goes through
+/// [`crate::clipboard::copy_secret`] like every other secret this app copies
+/// -- and that path ends in Win32, which **no test in this crate may reach**:
+/// the clipboard is per-session global state, and a test that set it would
+/// clobber whatever the person running `cargo test` had copied.
+///
+/// So the link is unobservable at its point of effect unless there is a seam,
+/// and without one the alternative is a Copy link button no test may ever
+/// press. It used to be observable because it went out through
+/// `ctx.copy_text` and egui reports that in its own frame output -- which is
+/// precisely the leak this seam exists to have fixed.
+type SendCopySeam = fn(&str);
+
 /// Everything the window holds between frames for the revoke.
 ///
 /// **One struct rather than three locals in the frame closure**, because the
@@ -7345,6 +7396,7 @@ fn apply_send_action(
     session: &zeroize::Zeroizing<String>,
     spawn: SendDeleteSpawn,
     create: SendCreateWiring<'_>,
+    copy: SendCopySeam,
 ) {
     let SendCreateWiring {
         state: create,
@@ -7354,23 +7406,41 @@ fn apply_send_action(
     match action {
         // The URL comes out of the row that was clicked and is carried in the
         // action itself -- there is no second lookup here that could resolve
-        // to a different row. `copy_text` takes an owned `String`, which is
-        // why the action owns one.
+        // to a different row. The action owns its `String` because the row it
+        // was built from is gone by the time this runs.
         //
-        // **Deliberately NOT `clipboard::copy_secret`, and this is a
-        // judgement call rather than an oversight.** Every vault secret --
-        // password, card number, security code, SSH key, TOTP -- goes through
-        // that path so Windows is asked to keep it out of `Win+V` history and
-        // off the user's other devices. A Send link is the one copied value
-        // whose whole purpose is to be handed to somebody else, normally by
-        // pasting it into a chat window; it is leaving the machine by the
-        // user's own intent and it expires on its own. Suppressing its history
-        // entry would buy very little, and it would cost the end-to-end
-        // coverage in `the_sends_screen_works_in_every_state_the_user_can_reach`,
-        // which drives a real frame and reads the link back out of egui's
-        // clipboard -- the raw Win32 path is unobservable to a test by design,
-        // because no test in this crate may touch the real clipboard.
-        send_ui::SendUiAction::CopyLink(url) => ctx.copy_text(url),
+        // **`copy` is `clipboard::copy_secret` in production, exactly like a
+        // password, because the link IS one.** A Send's access URL carries
+        // the Send's decryption
+        // key in its fragment -- which is why `CreatedSend`, `SendSummary`,
+        // `RawOutput`, `SendInvocation` and `SendCreateReport` all have
+        // hand-written `Debug` that elides it. Anything that would leak it
+        // from a log leaks it from `Win+V` too.
+        //
+        // This used to be `ctx.copy_text(url)`, on the argument that a Send
+        // link is the one copied value whose purpose is to be handed to
+        // somebody else and that it expires on its own. Neither half holds.
+        // The recipient gets the link out of band -- from a chat window, not
+        // from the sender's clipboard history -- so "meant for another
+        // person" is not a reason to leave it in `Win+V` on this machine and
+        // synced to this user's phone. And what expires is the SEND, server
+        // side; the copy sitting in clipboard history does not expire with
+        // it, and is never cleared. Going through here also puts the link
+        // under the four clearing triggers -- lock, account change, quit,
+        // timer -- which `copy_text` never was.
+        //
+        // The third half of the old argument was real and is answered rather
+        // than dismissed: the end-to-end coverage in
+        // `the_sends_screen_works_in_every_state_the_user_can_reach` read the
+        // link back out of egui's clipboard, and the Win32 path is
+        // unobservable to a test by design. That is what `SendCopySeam` and
+        // `VaultFrameEnv::send_copy` are for: the matrix still drives a real
+        // window and still really presses the SECOND row's button, and now
+        // reads the link back out of the seam instead of out of egui -- and
+        // asserts in the same breath that egui's clipboard was handed
+        // NOTHING, which is exactly what a revert to `ctx.copy_text(url)`
+        // here would do.
+        send_ui::SendUiAction::CopyLink(url) => copy(&url),
         // Refresh and a dismissed band are the same operation: forget the
         // answer, so `wants_fetch` is true on the next frame and the list is
         // asked for again. A dismissal that only hid the message would leave
@@ -20074,6 +20144,38 @@ mod export_wiring {
         );
     }
 
+    /// **The Send-link copy seam is one call to `clipboard::copy_secret`** --
+    /// the whole-body equality [`every_frame_env_seam_has_a_whole_body_pin`]
+    /// requires of every seam field of `VaultFrameEnv`.
+    ///
+    /// The address pin over that struct compares POINTERS, so it is satisfied
+    /// by the right function with its body replaced -- and on this seam the
+    /// replacements that matter are short and look harmless. `{ let _ = url;
+    /// }` is a Copy link button that reports success and copies nothing.
+    /// Reaching `egui`'s clipboard instead copies the link PERFECTLY, so
+    /// every behavioural test of the button goes on passing, while the URL --
+    /// which carries the Send's decryption key in its fragment -- is retained
+    /// in `Win+V`, synced to the user's other devices, and never taken back
+    /// by any of the four clearing triggers. That second one is not
+    /// hypothetical: it is what this app shipped, and it is why this seam
+    /// exists.
+    #[test]
+    fn the_send_copy_seam_only_hands_the_link_to_the_suppressed_clipboard_path() {
+        let body = spawner_body(concat!("copy_send_", "link"));
+        let expected = concat!(
+            "fn copy_send_",
+            "link(url: &str) { crate::clipboard::copy_secret(url); }"
+        );
+        assert_eq!(
+            code_squashed(expected),
+            body,
+            "the production Send-link copy is no longer one call to \
+             `clipboard::copy_secret`. Whatever else it now does, it does on the path that \
+             decides whether a link carrying a Send's decryption key is kept in `Win+V` and \
+             synced to the user's other devices"
+        );
+    }
+
     /// **`spawn_vault_sync` is the wipe, the spawn and nothing else** -- a
     /// whole-body equality, [`spawn_export_only_hands_the_real_work_to_the_tested_spawner`]'s
     /// shape and its reason, required of this seam by
@@ -20780,6 +20882,7 @@ mod export_wiring {
             aux_load,
             settings_path,
             reprompt,
+            send_copy,
         } = VaultFrameEnv::production();
 
         // Typed `let`s rather than casts off the `fn` items, so each one is a
@@ -20801,6 +20904,7 @@ mod export_wiring {
         let real_reprompt: fn(
             Option<&crate::accounts::AccountId>,
         ) -> crate::reprompt::RepromptGate = reprompt_gate_for;
+        let real_send_copy: SendCopySeam = copy_send_link;
 
         // **A row's NAME is its BINDING's name, spelled by the compiler.**
         // These used to be free string literals sitting beside the
@@ -20819,7 +20923,7 @@ mod export_wiring {
             };
         }
 
-        let checked: [(&str, bool); 8] = [
+        let checked: [(&str, bool); 9] = [
             seam!(sync, real_sync),
             seam!(load, real_load),
             seam!(send_list, real_send_list),
@@ -20841,6 +20945,16 @@ mod export_wiring {
             // is the one failure this feature exists to remove, and it
             // looks exactly like success from every other test.
             seam!(reprompt, real_reprompt),
+            // The field that decides HOW a Send's access link -- which
+            // carries that Send's decryption key in its fragment -- reaches
+            // the clipboard. A forwarder here does not make the button
+            // inert: `|url| ctx.copy_text(url)` in this slot copies the link
+            // perfectly, and every behavioural test of Copy link goes on
+            // passing, while the value is retained in `Win+V`, synced to the
+            // user's other signed-in devices, and never taken back by the
+            // lock, the account change, the quit or the timer. That is the
+            // exact shape this app shipped with until this field existed.
+            seam!(send_copy, real_send_copy),
         ];
         // The tie to `VAULT_FRAME_ENV_FIELDS`, and the reason it is an
         // assertion and not a comment: the destructuring above stops a ninth
@@ -21084,7 +21198,7 @@ mod export_wiring {
     /// `send_delete_wiring` pins, both below-the-cut guards, and the rest.
     /// The struct's own doc warned about exactly this and it happened anyway,
     /// which is why the number is recorded rather than the lesson.
-    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 9;
+    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 10;
 
     /// **`VaultFrameEnv` is exactly as WIDE as the fields this module pins --
     /// asked of the compiler, not of any source text.**
@@ -21270,8 +21384,8 @@ mod export_wiring {
         // these whatever its signature, since a `fn` pointer is a thin
         // pointer.
         const SPAWN: usize = std::mem::size_of::<fn()>();
-        // Seven spawns and one `Option<PathBuf>` today: "all of them but the
-        // settings path". Written against `VAULT_FRAME_ENV_FIELDS` rather
+        // Nine `fn` pointers and one `Option<PathBuf>` today: "all of them
+        // but the settings path". Written against `VAULT_FRAME_ENV_FIELDS` rather
         // than as a literal, so the ONLY way to rebalance this after adding a
         // field is to bump that constant -- which is the edit the rest of the
         // chain hangs off.
@@ -25064,7 +25178,13 @@ mod send_delete_wiring {
         matrix_click_watching_the_clipboard(ctx, frame_fn, pos).0
     }
 
-    /// Every string this window put on the clipboard on one frame.
+    /// Every string this window handed to **egui's own, unsuppressed**
+    /// clipboard on one frame -- `ctx.copy_text`.
+    ///
+    /// This is no longer where a copy is expected to show up. It is read so
+    /// that [`MatrixCopies::unsuppressed`] can assert it is EMPTY: a value
+    /// that arrives here has gone out through the path that lands in `Win+V`
+    /// and syncs to the user's other devices.
     fn matrix_copied(output: &egui::FullOutput) -> Vec<String> {
         output
             .platform_output
@@ -25077,7 +25197,24 @@ mod send_delete_wiring {
             .collect()
     }
 
-    /// A click, plus everything it copied. **The clipboard is read across
+    /// What one press put on a clipboard, **by which of the two routes**.
+    ///
+    /// Two fields rather than one list, because "the right string was
+    /// copied" and "it was copied the right way" are two different
+    /// assertions and a single list cannot carry both. The Send link was
+    /// green on the old one-list version for four rounds while going out
+    /// through `copy_text`.
+    #[derive(Debug, Default)]
+    struct MatrixCopies {
+        /// Handed to `clipboard::copy_secret` -- the path that carries the
+        /// `Win+V`/cloud-sync suppression formats and arms the clearing.
+        suppressed: Vec<String>,
+        /// Handed to `egui::Context::copy_text` -- the ordinary path, which
+        /// carries neither.
+        unsuppressed: Vec<String>,
+    }
+
+    /// A click, plus everything it copied. **Both clipboards are read across
     /// ALL of the click's frames**: the command is emitted on the frame the
     /// button is released and would be gone by the frame the screen is read
     /// from.
@@ -25085,14 +25222,17 @@ mod send_delete_wiring {
         ctx: &egui::Context,
         frame_fn: &mut dyn FnMut(&mut egui::Ui),
         pos: egui::Pos2,
-    ) -> (egui::FullOutput, Vec<String>) {
+    ) -> (egui::FullOutput, MatrixCopies) {
         let button = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: Default::default(),
         };
-        let mut copied = Vec::new();
+        // Anything a previous press left behind belongs to that press, not
+        // to this one.
+        let _ = super::frame_env_seam::send_copy_recorded();
+        let mut copied = MatrixCopies::default();
         let down = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::PointerMoved(pos), button(true)],
@@ -25100,16 +25240,20 @@ mod send_delete_wiring {
             },
             |ui| frame_fn(ui),
         );
-        copied.extend(matrix_copied(&down));
+        copied.unsuppressed.extend(matrix_copied(&down));
         let up = ctx.run_ui(
             egui::RawInput { events: vec![button(false)], ..matrix_input() },
             |ui| frame_fn(ui),
         );
-        copied.extend(matrix_copied(&up));
+        copied.unsuppressed.extend(matrix_copied(&up));
         let settling = matrix_frame(ctx, frame_fn);
-        copied.extend(matrix_copied(&settling));
+        copied.unsuppressed.extend(matrix_copied(&settling));
         let last = matrix_frame(ctx, frame_fn);
-        copied.extend(matrix_copied(&last));
+        copied.unsuppressed.extend(matrix_copied(&last));
+        // The suppressed route has no per-frame output to read, so it is
+        // taken once, after the same four frames the other route was read
+        // across.
+        copied.suppressed = super::frame_env_seam::send_copy_recorded();
         (last, copied)
     }
 
@@ -26255,15 +26399,35 @@ mod send_delete_wiring {
             matrix_locate_in_row(state, &output, FRAME_SECOND_SEND_NAME, "Copy link");
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
-            copied,
+            copied.suppressed,
             vec![FRAME_SECOND_SEND_URL.to_string()],
-            "in state {state:?} pressing Copy link on the SECOND Sends row put {copied:?} on \
-             the clipboard, not exactly that row's own access URL -- {FRAME_SECOND_SEND_URL:?} \
-             . A press that answers with the first row's link, or with one constant for every \
-             row, publishes the wrong Send: the user hands out a link to something they did \
-             not mean to share. Copy link is the whole point of a Send, and a press that \
-             reaches nothing looks identical on screen. What was painted: {:?}",
+            "in state {state:?} pressing Copy link on the SECOND Sends row handed \
+             {:?} to `clipboard::copy_secret`, not exactly that row's own access URL -- \
+             {FRAME_SECOND_SEND_URL:?}. A press that answers with the first row's link, or \
+             with one constant for every row, publishes the wrong Send: the user hands out a \
+             link to something they did not mean to share. Copy link is the whole point of a \
+             Send, and a press that reaches nothing looks identical on screen. What was \
+             painted: {:?}",
+            copied.suppressed,
             matrix_texts(&after_copy)
+        );
+        // **AND BY THE SUPPRESSED ROUTE, NOT THE ORDINARY ONE.** A Send's
+        // access URL carries the Send's decryption key in its fragment. Out
+        // through `ctx.copy_text` it is an ordinary clipboard item: kept in
+        // `Win+V` history, synced to the user's other signed-in devices, and
+        // never cleared by the lock, the account change, the quit or the
+        // timer. This is the assertion that reds on a revert of
+        // `apply_send_action`'s `CopyLink` arm to `ctx.copy_text(url)` --
+        // which is exactly how this shipped, green, until the arm above was
+        // changed to read the other route.
+        assert!(
+            copied.unsuppressed.is_empty(),
+            "in state {state:?} pressing Copy link put {:?} on egui's ORDINARY clipboard. A \
+             Send's access URL carries its decryption key in its fragment, so a copy taken \
+             that way is retained in `Win+V` and synced to the user's other devices, and no \
+             clearing trigger ever takes it back. It must go through \
+             `clipboard::copy_secret` like every other secret this app copies.",
+            copied.unsuppressed
         );
         let output = after_copy;
         FRAME_REVOKES.lock().expect("not poisoned").clear();
@@ -26393,6 +26557,7 @@ mod send_delete_wiring {
         fetch: &mut send_ui::SendFetch,
     ) -> Vec<(String, String, String)> {
         SPAWNS.with(|s| s.borrow_mut().clear());
+        COPIES.with(|c| c.borrow_mut().clear());
         let ctx = egui::Context::default();
         let (tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
         apply_send_action(
@@ -26411,11 +26576,24 @@ mod send_delete_wiring {
                 tx: &mpsc::channel().0,
                 spawn: refuses_to_create_here,
             },
+            recording_copy,
         );
         // Held so the sender cannot report "disconnected" for a reason that
         // has nothing to do with what is being asserted.
         drop(rx);
         SPAWNS.with(|s| s.borrow().clone())
+    }
+
+    /// Every link [`apply`] was asked to copy, most recent run only.
+    ///
+    /// Cleared by [`apply`] itself rather than by each test, so a test that
+    /// forgets cannot read the previous test's copy.
+    fn recording_copy(url: &str) {
+        COPIES.with(|c| c.borrow_mut().push(url.to_string()));
+    }
+
+    thread_local! {
+        static COPIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     /// The create spawner these revoke tests hand over. None of them produce
@@ -26607,8 +26785,9 @@ mod send_delete_wiring {
         assert!(fetch.result.is_none() && fetch.generation() == 0);
 
         fetch.result = Some(Ok(Vec::new()));
+        const LINK: &str = "https://send.bitwarden.com/#/x";
         let spawns = apply(
-            send_ui::SendUiAction::CopyLink("https://send.bitwarden.com/#/x".to_string()),
+            send_ui::SendUiAction::CopyLink(LINK.to_string()),
             &mut delete,
             &mut fetch,
         );
@@ -26616,6 +26795,21 @@ mod send_delete_wiring {
         assert!(
             fetch.result.is_some(),
             "copying a link threw the list away and refetched it"
+        );
+        // **AND THE LINK REALLY WENT TO THE COPY SEAM, UNALTERED.** Without
+        // this the arm could drop the URL on the floor -- `CopyLink(_) =>
+        // {}` -- and every other assertion in this test would still hold:
+        // no revoke, no refetch, nothing. `#/x` is the fragment, which is
+        // where a Send carries its decryption key, so a seam handed a
+        // truncated or re-encoded link is a link that does not open.
+        assert_eq!(
+            COPIES.with(|c| c.borrow().clone()),
+            vec![LINK.to_string()],
+            "`CopyLink` did not hand exactly that URL to `VaultFrameEnv::send_copy` -- which \
+             in production is `clipboard::copy_secret`, the path that asks Windows to keep \
+             the value out of `Win+V` and off the user's other devices and that arms the \
+             clearing triggers. An arm that copies nothing, copies something else, or copies \
+             by any other route is one of the three defects this asserts against"
         );
     }
 
@@ -27641,7 +27835,7 @@ mod send_delete_wiring {
             "}) .inner .into_", "action(), &mut send_delete, &mut send_fetch, \
              ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, \
              SendCreateWiring { state: &mut send_create, tx: &send_create_tx, \
-             spawn: spawn_send_create, }, );"
+             spawn: spawn_send_create, }, copy_send_url, );"
         ));
         assert_eq!(
             flat.matches(&tail).count(),
@@ -28052,6 +28246,16 @@ mod frame_env_seam {
             // `with_reprompt` is how a test that IS about the re-prompt
             // says so.
             reprompt: |_| crate::reprompt::RepromptGate::allowing_for_test(),
+            // **Records into a thread-local instead of touching the real
+            // clipboard**, and is a refusal in neither direction: pressing
+            // Copy link is not destructive, and a harness that reached the
+            // production seam would not fail loudly -- it would silently
+            // overwrite whatever the person running `cargo test` had copied,
+            // which is the one failure mode that never shows up as a red
+            // test. `send_copy_recorded` is how the harness that IS about
+            // the copy reads it back; every other caller records into a
+            // drain nobody looks at, which costs a `String` per press.
+            send_copy: record_send_copy,
         }
     }
 
@@ -28090,6 +28294,41 @@ mod frame_env_seam {
              the developer is logged into; build the env with `with_send_delete` and observe \
              the spawn there instead"
         );
+    }
+
+    /// The default [`VaultFrameEnv::send_copy`] of a [`stubbed`] env: the
+    /// link is recorded on this thread and no clipboard is touched.
+    ///
+    /// **Not a refusal**, unlike the export, revoke and create stubs, and for
+    /// the opposite reason to the aux-load stub's. Those three refuse because
+    /// reaching production would be loud and expensive. Reaching the
+    /// production seam HERE would be quiet: `clipboard::copy_secret` would
+    /// succeed, and the only casualty is whatever the person running `cargo
+    /// test` had on their clipboard -- a failure that never appears as a red
+    /// test and is blamed on something else entirely. So this records rather
+    /// than panicking, and pressing Copy link stays an ordinary click that
+    /// any harness may make.
+    fn record_send_copy(url: &str) {
+        SEND_COPIES.with(|copies| copies.borrow_mut().push(url.to_string()));
+    }
+
+    thread_local! {
+        /// What [`record_send_copy`] has been handed on this thread.
+        ///
+        /// A `thread_local!` and not a `static`: each frame-driving test runs
+        /// its window on the test's own thread, and two of them recording
+        /// into one `Vec` would read each other's copies.
+        static SEND_COPIES: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Every link handed to [`record_send_copy`] on this thread since the
+    /// last call, emptying the record as it goes.
+    ///
+    /// Draining rather than peeking, so an assertion about one press cannot
+    /// be satisfied by a copy that some earlier press made.
+    pub(super) fn send_copy_recorded() -> Vec<String> {
+        SEND_COPIES.with(|copies| std::mem::take(&mut *copies.borrow_mut()))
     }
 
     /// [`stubbed`] with the export spawner named too.
@@ -28875,6 +29114,7 @@ mod send_create_wiring {
                 tx: &tx,
                 spawn: recording_create_spawn,
             },
+            refuses_to_copy_here,
         );
         // Held so neither sender can report "disconnected" for a reason that
         // has nothing to do with what is being asserted.
@@ -28893,6 +29133,14 @@ mod send_create_wiring {
         _: String,
     ) {
         panic!("a create-side action started a revoke of {id:?}");
+    }
+
+    /// The copy seam these tests hand over. None of them produce a
+    /// `CopyLink`, so reaching it at all is the failure -- and reaching the
+    /// PRODUCTION one would have overwritten the clipboard of whoever ran
+    /// `cargo test`, silently.
+    fn refuses_to_copy_here(url: &str) {
+        panic!("a create-side action copied {url:?} to the clipboard");
     }
 
     /// **THE PUBLISH HAPPENS, ONCE, WITH WHAT THE USER TYPED.**

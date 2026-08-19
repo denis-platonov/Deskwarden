@@ -1011,7 +1011,7 @@ fn draw_row(
     // **A row with no URL has nothing to copy, and says so by being
     // unclickable.** `send.rs`'s parser rejects a *missing* `accessUrl` but
     // accepts an empty one, so a row can reach here holding `""`; copying
-    // that would hand `copy_text("")` to the clipboard, silently wiping
+    // that would hand `copy_secret("")` to the clipboard, silently wiping
     // whatever the user had there and reporting success. The button is still
     // drawn -- the row must not lose its shape, and a row that quietly has
     // no control is harder to understand than one that has a dead one.
@@ -2606,8 +2606,8 @@ mod paint_tests {
     /// rejects a *missing* `accessUrl` but accepts `""`, so this row shape is
     /// reachable from a real server answer. The button is still painted --
     /// the row keeps its shape -- but pressing it reports nothing, because
-    /// `CopyLink("")` reaches `copy_text("")`, which wipes the clipboard and
-    /// then tells the user it copied a link.
+    /// `CopyLink("")` reaches `copy_secret("")`, which empties the clipboard
+    /// and then tells the user it copied a link.
     #[test]
     fn a_row_whose_url_is_empty_paints_its_button_but_copies_nothing() {
         let state = SendPaneState::Rows(vec![SendRow {
