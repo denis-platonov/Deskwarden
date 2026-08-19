@@ -717,6 +717,66 @@ fn no_match_text(app_name: &str) -> (String, String) {
 /// item to fill from, so the variant is unreachable here by construction
 /// rather than by discipline.
 pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
+    let (primary, secondary) = no_match_text(app_name);
+    draw_notice_card(ui, NO_MATCH_LABEL, &primary, &secondary)
+}
+
+/// Design **3b**: the card for a window that asks for a password while the
+/// vault is **locked**.
+///
+/// **This is a correction, not an addition.** Until it existed a locked vault
+/// reached [`draw_no_match_card`], and the user was told "No saved login for
+/// <app>" -- a statement about the contents of a vault this process cannot
+/// read. `main`'s `stand_down_after_unlock` empties the match engine on every
+/// lock, and says so in its own log line: "the app matches are cleared too, so
+/// nothing can prompt to autofill until they are rebuilt". So while locked
+/// *every* window is unmatched, including every window that does have a saved
+/// login, and 3a asserted the opposite of the truth about each of them. A
+/// surface whose entire purpose is to be believed about the vault was being
+/// shown in the one state where it could not be.
+///
+/// **It claims nothing about whether a match exists**, and that is where it
+/// departs from 3b as drawn. The drawing counts them ("3 logins for Ledgerline
+/// Desktop"); this build cannot count them, because the engine that would is
+/// exactly what the lock cleared -- and a number here would be the same lie in
+/// the other direction. Nor does it offer Windows Hello or a PIN: neither
+/// exists in this app, and a card offering an unlock it cannot perform is
+/// worse than the silence it replaces.
+///
+/// What is left is the one thing that is both true and useful: Deskwarden is
+/// locked, it therefore cannot answer for this app, and unlocking is what
+/// changes that.
+///
+/// Same shape, same window and same height as [`draw_no_match_card`] (see
+/// [`LOCKED_ROWS`]), because it is the same two-line body: they share
+/// [`draw_notice_card`] rather than each spelling the card out.
+///
+/// Public so the `ui_preview` example renders the card the app ships.
+pub fn draw_locked_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
+    let (primary, secondary) = locked_text(app_name);
+    draw_notice_card(ui, LOCKED_LABEL, &primary, &secondary)
+}
+
+/// The card [`draw_no_match_card`] and [`draw_locked_card`] share: a header
+/// with a ✕, a two-line body, and an `Esc Dismiss` footer.
+///
+/// **One function rather than two copies**, because the two states differ only
+/// in three strings -- and because the height evidence is a property of *this*
+/// layout. Two copies would let one of them drift a point taller than the
+/// window they both ask the OS for, in a viewport that cannot scroll; shared,
+/// `the_no_match_card_fits_the_window_it_asks_for` and
+/// `the_locked_card_fits_the_window_it_asks_for` measure the same code twice.
+///
+/// `primary` and `secondary` are borrowed and both labels `.truncate()`, for
+/// the reason [`credential_row`]'s do: each carries one user-controlled string
+/// (`app::window_label`'s answer), wrapping is what made a one-row card 189pt
+/// tall in a 164pt window, and this window still cannot scroll.
+fn draw_notice_card(
+    ui: &mut egui::Ui,
+    label: &str,
+    primary: &str,
+    secondary: &str,
+) -> OverlayAction {
     let mut action = OverlayAction::None;
 
     let card = egui::Frame::new()
@@ -748,7 +808,7 @@ pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
         egui::Frame::new()
             .inner_margin(Margin::symmetric(12, 9))
             .show(ui, |ui| {
-                if theme::card_header_with_close(ui, NO_MATCH_LABEL) {
+                if theme::card_header_with_close(ui, label) {
                     action = OverlayAction::Dismiss;
                 }
             });
@@ -757,7 +817,6 @@ pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
         egui::Frame::new()
             .inner_margin(Margin::same(6))
             .show(ui, |ui| {
-                let (primary, secondary) = no_match_text(app_name);
                 egui::Frame::new()
                     .fill(theme::CANVAS)
                     .corner_radius(CornerRadius::same(8))
@@ -775,13 +834,13 @@ pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(
                                 egui::Label::new(
-                                    theme::semibold(&primary, 13.0).color(theme::INK),
+                                    theme::semibold(primary, 13.0).color(theme::INK),
                                 )
                                 .truncate(),
                             );
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&secondary).size(11.0).color(theme::TEXT_FAINT),
+                                    RichText::new(secondary).size(11.0).color(theme::TEXT_FAINT),
                                 )
                                 .truncate(),
                             );
@@ -816,6 +875,115 @@ pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
 /// card's one claim -- there is nothing here -- is a string a test can name
 /// and find in the painted output, rather than one it has to re-spell.
 pub const NO_MATCH_LABEL: &str = "No match";
+
+/// What the locked card's header says.
+///
+/// A constant for the same reason [`NO_MATCH_LABEL`] is one, and **it must not
+/// be that string**: the two cards are drawn by the same
+/// [`draw_notice_card`], so the header is the only thing in the painted output
+/// that tells them apart, and
+/// `the_locked_card_says_nothing_about_whether_a_match_exists` reads it.
+pub const LOCKED_LABEL: &str = "Vault locked";
+
+/// The number of choice rows whose [`overlay_height`] the locked card is sized
+/// by.
+///
+/// The same `1` as [`NO_MATCH_ROWS`] and **not an alias of it**. They are equal
+/// today because the two cards share [`draw_notice_card`] and so lay out
+/// identically; they are separate constants because the card each one sizes is
+/// separately measured (`the_locked_card_fits_the_window_it_asks_for`), and a
+/// `pub use` would make one card's growth invisible in the other's window.
+/// `the_two_notice_cards_are_the_same_height` asserts the equality it is safe
+/// to rely on, from the cards rather than from the constants.
+pub const LOCKED_ROWS: usize = 1;
+
+/// The window the locked card asks the OS for. [`no_match_options`]'s sibling,
+/// public for the same reason: `show_locked_overlay` calls
+/// `eframe::run_native`, which no test here may execute.
+pub fn locked_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
+    options_for_rows(LOCKED_ROWS, anchor)
+}
+
+/// The two lines of the locked card, as [`no_match_text`] is for 3a.
+///
+/// **Neither line says whether the vault has a login for `app_name`**, and
+/// that is the whole correction: the process cannot know while locked, so it
+/// says what it can know instead -- that it is locked, and that unlocking is
+/// what answers the question. `the_locked_card_claims_nothing_about_a_match`
+/// holds the two strings to that.
+///
+/// `app_name` is `app::window_label`'s answer, so it is user-controlled and
+/// the card's height must not depend on it; see [`draw_notice_card`].
+fn locked_text(app_name: &str) -> (String, String) {
+    (
+        "Deskwarden is locked".to_string(),
+        format!("Unlock it to see whether the vault has a login for {app_name}."),
+    )
+}
+
+/// Opens design **3b** for `app_name`: the locked card, at `anchor`.
+///
+/// [`show_no_match_overlay`]'s sibling, down to sharing [`OVERLAY_OPEN`] --
+/// the guard is about how many overlay windows this process has on screen, not
+/// about which kind, and 3a stacked on 3b is the same defect as two copies of
+/// either.
+///
+/// Returns nothing, for the same reason 3a's does: there is no item, so there
+/// is no choice, and an `Option<FillChoice>` here would be a promise this
+/// state cannot keep.
+pub fn show_locked_overlay(app_name: &str, anchor: Option<(f32, f32)>) {
+    if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
+        log::warn!(
+            "locked overlay requested for {app_name} while one is already open in this \
+             process; ignoring rather than stacking a second window"
+        );
+        return;
+    }
+
+    let app = LockedApp { app_name: app_name.to_string() };
+    let options = locked_options(anchor);
+
+    let _ = eframe::run_native(
+        "Deskwarden",
+        options,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    );
+
+    OVERLAY_OPEN.store(false, Ordering::SeqCst);
+}
+
+struct LockedApp {
+    app_name: String,
+}
+
+impl eframe::App for LockedApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // `no_match_keyboard_action`, shared rather than copied: this card has
+        // the same keyboard as 3a -- Esc dismisses, Enter is not read, because
+        // there is nothing here for Enter to fill either. Both bodies are
+        // unreachable from a test (they need a real always-on-top window), so
+        // sharing the one decision function is what keeps "Esc dismisses"
+        // checked for both.
+        let keys = no_match_keyboard_action(EscapePressed::read(&ctx));
+        let card = draw_locked_card(ui, &self.app_name);
+
+        let done = matches!(
+            if keys == OverlayAction::None { card } else { keys },
+            OverlayAction::Dismiss | OverlayAction::Fill(_)
+        );
+        if done {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
 
 /// The two lines of the credential row: the recognizable identity on top
 /// (username when known, item name otherwise) and context underneath.
@@ -3291,6 +3459,38 @@ mod geometry_tests {
         ink
     }
 
+    /// The locked card, painted into a window `height` tall, and its ink.
+    fn painted_locked(app_name: &str, height: f32) -> Vec<Ink> {
+        let ctx = styled_ctx();
+        let output = ctx.run_ui(sized(height), |ui| {
+            draw_locked_card(ui, app_name);
+        });
+        let mut ink = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut ink);
+        }
+        ink.retain(|i| i.alpha > 0);
+        ink
+    }
+
+    /// What egui says the **locked** card needs, laid out unconstrained.
+    ///
+    /// A second measurement rather than a parameter on the one below, so that
+    /// each card is measured through the function it actually ships.
+    fn locked_card_height(app_name: &str) -> f32 {
+        const ROOMY: f32 = 700.0;
+        let ctx = styled_ctx();
+        let mut needed = f32::NAN;
+        let _ = ctx.run_ui(sized(ROOMY), |ui| {
+            assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
+            draw_locked_card(ui, app_name);
+            needed = ui.min_rect().bottom();
+        });
+        assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
+        assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
+        needed
+    }
+
     /// What egui says the no-match card needs, laid out unconstrained.
     fn no_match_card_height(app_name: &str) -> f32 {
         /// Comfortably taller than any card this module draws, so nothing is
@@ -3387,6 +3587,141 @@ mod geometry_tests {
     /// resize border -- and the bottom is where the only dismiss hint is.
     const NO_MATCH_SLACK: f32 = 11.0;
 
+    /// **`LOCKED_ROWS` is checked against the 3b card, in both directions**,
+    /// exactly as `NO_MATCH_ROWS` is against 3a -- and it is a separate test
+    /// over a separate measurement rather than a note that the two cards share
+    /// a drawer. Sharing is an implementation detail this test must not
+    /// assume: a `draw_locked_card` that grew a third line, or stopped drawing
+    /// its body, would be invisible to 3a's test and to any assertion phrased
+    /// as "they are the same".
+    ///
+    /// The card is 3c's height evidence in miniature and for the same reason:
+    /// the overlay is frameless, always-on-top, hardcoded in size and has no
+    /// `ScrollArea` anywhere, so a control past the bottom edge is
+    /// unreachable, and `f67bf42` records three separate occasions on which a
+    /// text change put one there.
+    #[test]
+    fn the_locked_card_fits_the_window_it_asks_for() {
+        let asked = locked_options(None)
+            .viewport
+            .inner_size
+            .expect("the locked viewport must request an inner size at all");
+        assert_eq!(asked.x, OVERLAY_WIDTH, "the locked card asked for a {}pt-wide window", asked.x);
+        assert_eq!(
+            asked.y,
+            overlay_height(LOCKED_ROWS),
+            "the window asked for is not the one LOCKED_ROWS describes, so every assertion \
+             below is about a card the OS will never be given"
+        );
+
+        let needed = locked_card_height(APP);
+        assert!(
+            needed <= asked.y,
+            "the locked card lays out {needed}pt tall and the window the overlay asks the OS \
+             for is {}pt. This window is frameless and always-on-top -- no title bar, no \
+             resize border, no scroll area -- so the missing {:.1}pt, and the Esc hint in it, \
+             are gone",
+            asked.y,
+            needed - asked.y
+        );
+        assert!(
+            needed > asked.y - ROW_HEIGHT,
+            "the locked card lays out {needed}pt, which still fits a window one ROW_HEIGHT \
+             shorter than the {}pt LOCKED_ROWS asks for. Either LOCKED_ROWS is a row too \
+             generous, or the card's body has stopped being drawn",
+            asked.y
+        );
+        assert_eq!(
+            asked.y - needed,
+            NO_MATCH_SLACK,
+            "the locked card lays out {needed}pt in a {}pt window, so its dead space is \
+             {:.1}pt rather than the recorded {NO_MATCH_SLACK}pt that the two notice cards \
+             share. A font, a margin or a line changing size fails here rather than by \
+             clipping a control off a window that has no scrollbar",
+            asked.y,
+            asked.y - needed
+        );
+    }
+
+    /// **The two notice cards really are the same height**, asserted from the
+    /// cards rather than from their constants -- which is the assertion
+    /// `LOCKED_ROWS == NO_MATCH_ROWS` looks like and is not.
+    ///
+    /// It is worth stating because the two are drawn into windows sized from
+    /// two different constants, and because `locked_text`'s second line is the
+    /// longest string either card carries: if truncation ever stopped applying
+    /// to it, this is where the extra line shows up.
+    #[test]
+    fn the_two_notice_cards_are_the_same_height() {
+        assert_eq!(
+            locked_card_height(APP),
+            no_match_card_height(APP),
+            "the locked and no-match cards lay out to different heights while asking the OS \
+             for windows sized by two constants that are equal. One of them is now wrong"
+        );
+    }
+
+    /// The locked card's height is a function of the font and nothing else --
+    /// and in particular **not** of `app_name`. Its second line embeds the
+    /// name mid-sentence rather than at the end, which is the placement most
+    /// likely to wrap, so the adversarial fixtures matter more here than on
+    /// 3a.
+    #[test]
+    fn no_app_name_a_user_can_supply_makes_the_locked_card_taller() {
+        let baseline = locked_card_height(APP);
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            let height = locked_card_height(fixture.app);
+            assert_eq!(
+                height, baseline,
+                "the {:?} fixture's app name made the locked card {height}pt instead of \
+                 {baseline}pt. The window is a fixed {}pt with no scrollbar, so the difference \
+                 is clipped off the bottom -- and the bottom is where the only dismiss hint is",
+                fixture.name,
+                overlay_height(LOCKED_ROWS)
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, FIXTURES.len(), "the loop must have covered every fixture");
+    }
+
+    /// **The locked card claims nothing about whether a match exists.**
+    ///
+    /// This is the whole content of the correction, and it is asserted about
+    /// the strings themselves rather than about the painted card, so it holds
+    /// however the card is later laid out. 3a's own primary line is the
+    /// forbidden phrase: if it ever appears here, the locked state has become
+    /// the thing it replaced.
+    #[test]
+    fn the_locked_card_claims_nothing_about_a_match() {
+        let (primary, secondary) = locked_text(APP);
+        let (forbidden, _) = no_match_text(APP);
+        for line in [&primary, &secondary] {
+            assert_ne!(
+                line, &forbidden,
+                "the locked card is drawing 3a's own claim. A locked vault does not know \
+                 whether it has a login for this app -- the match engine that would say so is \
+                 exactly what the lock cleared"
+            );
+            for phrase in ["No saved login", "logins for", "nothing for"] {
+                assert!(
+                    !line.contains(phrase),
+                    "the locked card says {line:?}, which contains {phrase:?} -- a claim about \
+                     the contents of a vault this process cannot read"
+                );
+            }
+        }
+        assert!(
+            primary.contains("locked"),
+            "control: the locked card does not say it is locked, so the assertions above are \
+             about a card that says nothing useful at all"
+        );
+        assert!(
+            secondary.contains(APP),
+            "control: the locked card never names the window it appeared over"
+        );
+    }
+
     /// The card's height is a function of the font and nothing else -- and in
     /// particular **not** of `app_name`, which is `window_label`'s answer and
     /// therefore a string a user or the app they ran chooses.
@@ -3467,6 +3802,46 @@ mod geometry_tests {
         );
     }
 
+    /// **The locked card says what it is for, inside its window** -- 3a's
+    /// content test, run against 3b's own strings.
+    ///
+    /// The header is the only painted thing that distinguishes the two cards,
+    /// so it is read here, and 3a's primary line is asserted absent from the
+    /// paint as well as from the strings: a `draw_locked_card` that called
+    /// `no_match_text` would pass every height assertion above and put the lie
+    /// straight back on the screen.
+    #[test]
+    fn the_locked_card_names_the_app_and_the_way_out_inside_its_window() {
+        let height = overlay_height(LOCKED_ROWS);
+        let ink = painted_locked(APP, height);
+        let win = window(height);
+
+        let (primary, secondary) = locked_text(APP);
+        let mut checked = 0;
+        for text in [LOCKED_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
+            let rect = glyph_run(&ink, text);
+            assert!(
+                fits(rect, win),
+                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
+                 asks the OS for. There is no scrollbar and no title bar to drag"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have covered all four strings");
+
+        let (forbidden, _) = no_match_text(APP);
+        assert!(
+            !ink.iter().any(|i| i.glyphs.as_deref() == Some(forbidden.as_str())),
+            "the locked card painted {forbidden:?}. That is a statement about the contents of \
+             a vault this process cannot read, which is the defect 3b exists to correct"
+        );
+        assert!(
+            !ink.iter().any(|i| i.glyphs.as_deref() == Some(NO_MATCH_LABEL)),
+            "the locked card is wearing the no-match card's header, so the only painted thing \
+             that tells the two apart says the wrong one"
+        );
+    }
+
     /// **Esc dismisses, as it does in every other overlay state** -- and Enter
     /// does not, because there is nothing to fill.
     ///
@@ -3494,6 +3869,76 @@ mod geometry_tests {
             no_match_keyboard_action(pressed(egui::Key::A)),
             OverlayAction::None,
             "an unrelated key dismissed the card"
+        );
+    }
+
+    /// The locked card's ✕ dismisses too, and it matters here for the same
+    /// reason it does on 3a: this window is raised in response to ANOTHER app
+    /// being foregrounded -- the case Windows' foreground lock refuses
+    /// keyboard focus for -- so Esc may never arrive.
+    ///
+    /// Driven through the shipped `draw_locked_card` and not through the
+    /// shared drawer, so that a `draw_locked_card` which discarded the
+    /// drawer's answer fails here rather than shipping a card with no
+    /// mouse-operable way out.
+    #[test]
+    fn the_locked_cards_close_control_dismisses_it() {
+        let height = overlay_height(LOCKED_ROWS);
+        let ctx = styled_ctx();
+        let _ = ctx.run_ui(sized(height), |ui| {
+            draw_locked_card(ui, APP);
+        });
+
+        let close = {
+            let ink = painted_locked(APP, height);
+            let segs: Vec<&Ink> = ink
+                .iter()
+                .filter(|i| {
+                    i.glyphs.is_none()
+                        && i.tile.is_none()
+                        && i.rect.width() < 20.0
+                        && i.rect.height() < 20.0
+                        && i.rect.left() > OVERLAY_WIDTH - 60.0
+                })
+                .collect();
+            assert!(
+                !segs.is_empty(),
+                "no close control was painted in the locked card's header, so this window has                  no mouse-operable way out at all"
+            );
+            let mut r = segs[0].rect;
+            for s in &segs[1..] {
+                r = r.union(s.rect);
+            }
+            r.center()
+        };
+
+        let press = |down: bool| egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(close),
+                egui::Event::PointerButton {
+                    pos: close,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..sized(height)
+        };
+
+        let mut down = OverlayAction::None;
+        let _ = ctx.run_ui(press(true), |ui| down = draw_locked_card(ui, APP));
+        assert_eq!(
+            down,
+            OverlayAction::None,
+            "the locked card dismissed on mouse-DOWN, a gesture the user can still drag away              from"
+        );
+
+        let mut up = OverlayAction::None;
+        let _ = ctx.run_ui(press(false), |ui| up = draw_locked_card(ui, APP));
+        assert_eq!(
+            up,
+            OverlayAction::Dismiss,
+            "clicking the ✕ did not dismiss the locked card. With Esc not guaranteed to reach              a window raised behind the foreground lock, this leaves an always-on-top card              with no way out"
         );
     }
 
