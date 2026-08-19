@@ -1,0 +1,20 @@
+# Rust sources are checked out with CRLF endings on every platform, and this
+# is load-bearing rather than a style preference.
+#
+# Roughly fifteen tests in this crate are source pins: they read a file off
+# disk and match on its bytes -- module boundaries, marker comments, struct
+# declarations, a byte-length-plus-hash pin over Cargo.toml. Several of those
+# markers carry a line terminator inside the pattern. Some readers normalize
+# CRLF to LF first (job_object.rs, below_cut.rs, login_ui.rs, and login_ui
+# goes further and asserts both forms); most do not.
+#
+# Measured, not assumed: a clone taken with core.autocrlf=false gives an LF
+# working tree, and 23 tests fail on it -- reported as "contains 0 occurrences
+# of the test-module marker, not 1", which reads like a corrupted file rather
+# than a line-ending mismatch. That is the state a contributor on Linux or
+# macOS gets by default, and the state a Windows contributor gets from a
+# single git config they had a good reason to set.
+#
+# All 84 .rs files are stored LF in the repository, so this changes nothing
+# about what is committed. It fixes what is checked out.
+*.rs text eol=crlf
