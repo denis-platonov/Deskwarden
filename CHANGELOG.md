@@ -18,6 +18,14 @@ things can still change between minor versions.
   32pt tile now, clipped to the tile's own rounded corners so no corner
   overhangs the curve, with the tile's 1px border drawn back over the top so a
   pale icon still has the same edge every monogram beside it has.
+- **Sends and Password health are their own group at the foot of the rail**,
+  below the folders and behind a second separator of the same kind as the one
+  above FOLDERS. They used to sit in the middle of the VAULT rows, which are
+  cuts of the item list — something neither of them is.
+- **The rail scrolls.** It never did: a vault with more folders than the window
+  is tall simply had the last ones off the bottom with no way to reach them,
+  and the two rows above would have joined them there. The auto-lock countdown
+  stays pinned to the floor.
 
 ## 0.8.3 - 2026-08-19
 

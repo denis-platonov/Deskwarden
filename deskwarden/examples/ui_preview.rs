@@ -62,7 +62,7 @@ use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
-use deskwarden::vault_window::sidebar::SidebarFilter;
+use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
@@ -240,6 +240,18 @@ enum Surface {
     /// badges have to be tellable apart from each other, and one card in a
     /// picture cannot show that.
     VaultList,
+    /// **The vault window's rail**, at the exact width the window gives it.
+    ///
+    /// The surface the rail's own grouping is decided on: whether the three
+    /// kinds of row it holds -- cuts of the vault, folders, and the rail's two
+    /// SCREENS -- read as three groups or as one long run with two lines
+    /// through it. That is a question about how a column looks, and no
+    /// assertion about the order of painted rects answers it.
+    ///
+    /// The screens sit below the folders now, so the shot has to reach the
+    /// bottom of the rail: it is drawn at the shipped window's own height with
+    /// a folder list short enough to leave them on screen.
+    VaultRail,
     /// **Design 4d's rehearsal window, finished.** The twelfth surface, and
     /// the one this example exists for: this window shipped as a raw Win32
     /// dialog with none of the app's theme, tokens or type, and no screenshot
@@ -262,6 +274,10 @@ const PANE_WIDTH: f32 = 1240.0 - 212.0 - 390.0;
 /// `vault_window::mod`'s `LIST_WIDTH`. Spelled out here for the reason
 /// [`PANE_WIDTH`] is spelled out.
 const LIST_WIDTH: f32 = 390.0;
+
+/// The rail's exact width in the shipped vault window, i.e.
+/// `vault_window::mod`'s `SIDEBAR_WIDTH`.
+const SIDEBAR_WIDTH: f32 = 212.0;
 
 /// Tall enough that no pane below scrolls, so a screenshot is the whole
 /// surface rather than the top of it. The shipped window is 740 high.
@@ -310,6 +326,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::VaultList,
+    Surface::VaultRail,
     Surface::Rehearsal,
 ];
 
@@ -343,6 +360,7 @@ impl Surface {
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
+            Surface::VaultRail => "vault_rail",
             Surface::Rehearsal => "rehearsal",
         }
     }
@@ -406,6 +424,11 @@ impl Surface {
             // narrow elides its titles and drops its chips, which is a picture
             // of a layout nobody ships.
             Surface::VaultList => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
+            // reason as the two above, and the shipped window's own height --
+            // the rail is measured against the window's floor, so a preview
+            // drawn taller would hide exactly the overflow it is here to show.
+            Surface::VaultRail => egui::vec2(SIDEBAR_WIDTH, PANE_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -428,6 +451,7 @@ fn main() -> eframe::Result {
     let signin = arg("--signin");
     let login = signin || arg("--login");
     let list = arg("--list");
+    let rail = arg("--rail");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -439,6 +463,8 @@ fn main() -> eframe::Result {
         vec![Surface::LoginUnlock]
     } else if list {
         vec![Surface::VaultList]
+    } else if rail {
+        vec![Surface::VaultRail]
     } else {
         vec![Surface::Overlay]
     };
@@ -473,6 +499,8 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_login.png")
     } else if list {
         target_dir().join("ui_preview_vault_item_list.png")
+    } else if rail {
+        target_dir().join("ui_preview_vault_rail.png")
     } else {
         target_dir().join("ui_preview_overlay.png")
     };
@@ -521,6 +549,12 @@ fn main() -> eframe::Result {
                 // ordinary one -- see `draw_vault_list`.
                 list_selected: Some("list-0001".to_string()),
                 list_visible: Vec::new(),
+                // An ordinary item row selected, so the shot carries the
+                // selected treatment and neither screen is up -- the state the
+                // window is in almost all of the time.
+                rail_selected: SidebarFilter::Logins,
+                rail_sends: false,
+                rail_health: false,
                 window_height: 0.0,
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -606,6 +640,10 @@ struct Preview {
     list_search: String,
     list_selected: Option<String>,
     list_visible: Vec<String>,
+    /// The rail shot's own selection state.
+    rail_selected: SidebarFilter,
+    rail_sends: bool,
+    rail_health: bool,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
@@ -701,6 +739,7 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::VaultList => self.draw_vault_list(root),
+            Surface::VaultRail => self.draw_vault_rail(root),
             Surface::Rehearsal => self.draw_rehearsal(root),
         }
 
@@ -1087,6 +1126,36 @@ impl Preview {
             });
     }
 
+    /// The vault window's rail, drawn through `draw_sidebar` itself in the same
+    /// `theme::CARD` panel frame `vault_window::mod` hosts it in -- margins
+    /// included, because the rail's insets are measured against them.
+    ///
+    /// Four folder rows: enough that the FOLDERS group reads as a group, few
+    /// enough that the two screen rows below them are in the picture.
+    fn draw_vault_rail(&mut self, root: &mut egui::Ui) {
+        let fixtures = &self.fixtures;
+        let (selected, sends, health) =
+            (&mut self.rail_selected, &mut self.rail_sends, &mut self.rail_health);
+        egui::CentralPanel::default()
+            // Design 4.8's own frame, copied from the `Panel::left` in
+            // `vault_window::mod`: `theme::CARD` with `padding: 14px 10px`.
+            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
+            .show(root, |ui| {
+                let _ = sidebar::draw_sidebar(
+                    ui,
+                    sidebar::VaultLists {
+                        sends: Some(3),
+                        health_findings: 4,
+                        ..sidebar::VaultLists::live_only(&fixtures.list)
+                    },
+                    &fixtures.rail_folders,
+                    selected,
+                    sidebar::Screens { sends, health },
+                    "Locks in 11:42",
+                );
+            });
+    }
+
     /// The surfaces that live *inside* the vault window rather than in one of
     /// their own, drawn on the window's own canvas so the PNG shows them
     /// against the background they actually sit on.
@@ -1191,6 +1260,8 @@ struct Fixtures {
     card: VaultItem,
     /// The item list's rows -- see [`LIST_JSON`].
     list: Vec<VaultItem>,
+    /// More folders than the rail's height fits -- see `draw_vault_rail`.
+    rail_folders: Vec<Folder>,
     folders: Vec<Folder>,
     totp: TotpState,
     reveal: RevealState,
@@ -1294,6 +1365,31 @@ impl Fixtures {
             login,
             card,
             list,
+            // Three named folders plus `bw serve`'s virtual "No Folder" bucket.
+            // Chosen so the WHOLE rail fits the shot: the point of this surface
+            // is whether the three groups read as three, and a picture whose
+            // bottom group is off the bottom edge cannot answer that. That the
+            // rail scrolls when a vault has more is pinned by
+            // `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter`,
+            // which is a claim about reachability rather than about looks.
+            rail_folders: [
+                "Engineering",
+                "Personal",
+                "Shared with me",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Folder {
+                id: format!("rf-{i}"),
+                name: (*name).to_string(),
+                other: Default::default(),
+            })
+            .chain(std::iter::once(Folder {
+                id: String::new(),
+                name: "No Folder".into(),
+                other: Default::default(),
+            }))
+            .collect(),
             totp,
         }
     }
