@@ -9,6 +9,7 @@ pub mod detail;
 pub mod detail_edit;
 pub mod folder_modal;
 pub mod item_list;
+pub mod password_health;
 pub mod preflight;
 pub mod record_ui;
 pub mod rehearsal;
@@ -818,6 +819,12 @@ pub fn build_frame(
     // through the item pane. `draw_sidebar` is the single place the two are
     // kept mutually exclusive.
     let mut sends_selected = false;
+    // The Password health screen's own flag, beside `sends_selected` for the
+    // reason [`sidebar::Screens`] gives: password reuse is a property of a
+    // PAIR of items, so no per-item `SidebarFilter` predicate can express it
+    // and it cannot be a variant of that enum. Starts `false`, and
+    // `draw_sidebar` is the sole writer.
+    let mut health_selected = false;
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -2088,6 +2095,22 @@ pub fn build_frame(
         // routing below, so the frame cannot start a fetch for a screen it
         // then does not draw.
         let on_sends = sends_selected;
+        // **The report, once per frame, and the only call to `report_for` in
+        // this file.** The rail's badge and the pane both read THIS value, so
+        // a badge saying 4 cannot sit beside a list of 3 -- the same rule
+        // `badge_for` exists for on every other row.
+        //
+        // Recomputed every frame rather than cached, deliberately. It is a
+        // pure function of `items`, and `items` is mutated in place here by
+        // folder drops, deletes, creates and edits as well as replaced
+        // wholesale by a load; every memo key that would be cheaper than the
+        // computation is a key that can go stale over one of those writes,
+        // and a health report that is quietly one edit behind is worse than
+        // no report. The cost it buys out of is one SHA-256 of a short string
+        // per password-bearing item plus an O(n log n) index sort -- see
+        // `password_health`'s own complexity note -- against a window whose
+        // ambient repaint cadence is `FRAME_INTERVAL`.
+        let health = password_health::report_for(&items);
         // **The refetch policy.** Leaving the Sends screen drops the list, so
         // the next visit asks the server again. Both halves of that -- the
         // rule and the remembering -- live in `SendFetch::note_screen`, where
@@ -2304,13 +2327,21 @@ pub fn build_frame(
                     // read as "nothing of yours is published". See
                     // `send_ui::SendFetch::badge_count`.
                     sends: send_fetch.badge_count(),
+                    // Distinct items with a finding, off the one report
+                    // computed above. Never `None`: this is derived from
+                    // `live`, which is already here, so there is no
+                    // unfetched state to report.
+                    health_findings: health.flagged_items(),
                 };
                 match draw_sidebar(
                     ui,
                     lists,
                     &folders,
                     &mut filter,
-                    &mut sends_selected,
+                    sidebar::Screens {
+                        sends: &mut sends_selected,
+                        health: &mut health_selected,
+                    },
                     &lock_countdown,
                 ) {
                     SidebarAction::NewFolder => match cache.create_folder("New folder") {
@@ -2342,6 +2373,22 @@ pub fn build_frame(
                     SidebarAction::None => {}
                 }
             });
+
+        // **Read AFTER the rail, not before it.** `on_sends` above is read
+        // before `draw_sidebar` because `vault_body_state` -- which decides
+        // whether a sidebar is drawn at all -- has to be computed before the
+        // panels are. This screen replaces only the item-list column, so
+        // there is no such ordering to respect and the click can take effect
+        // on the frame it happened rather than the one after.
+        let on_health = health_selected;
+        // The rail row left selected behind the report. See
+        // `password_health::opening_filter`: a finding is always a LIVE vault
+        // item, and the detail pane resolves the selection against
+        // `filter.source()`, so leaving Trash or Archive selected behind this
+        // screen would send every click on it to a list that cannot hold it.
+        if on_health {
+            filter = password_health::opening_filter(&filter);
+        }
 
         // The drop the sidebar reported, acted on now that `items` is free.
         match folder_drop.take() {
@@ -2410,7 +2457,45 @@ pub fn build_frame(
         // `VaultItem`s and must not be forced through a pane that filters a
         // list of them; the Sends rows are drawn in the central panel below
         // instead, at the full width the two panes would have shared.
-        if !show_sends {
+        // **The Password health report takes the item-list column and leaves
+        // the detail pane standing**, which is the whole reason it is not a
+        // whole-body screen like Sends: a click on a finding writes
+        // `selected_id`, and the pane on the right fills in with that item
+        // without the report going anywhere. See `password_health`.
+        //
+        // Its own panel id, and the same `exact_size` as the item list's --
+        // so the column does not move when the two swap, while
+        // `send_ui::source_pins::the_item_list_is_drawn_only_inside_the_not_sends_gate`
+        // can still require the string `Panel::left("vault-item-list")` to
+        // appear exactly once in this file. Two panels sharing an id would
+        // make that guard unable to tell an item list drawn here from one
+        // drawn on the Sends screen.
+        if !show_sends && on_health {
+            egui::Panel::left("vault-password-health")
+                .exact_size(LIST_WIDTH)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::CANVAS))
+                .show(ui, |ui| {
+                    // The live preference, read exactly the way the detail
+                    // pane's own breach badge reads it -- the modal's edited
+                    // value if the gear has been opened this session, else
+                    // what was on disk when the window opened. **Only to say
+                    // what state the setting is in.** Nothing on this screen
+                    // performs a lookup in either state; see
+                    // `password_health::breach_note`.
+                    let check_breaches = edited_settings_for_closure
+                        .borrow()
+                        .as_ref()
+                        .map_or(check_breaches_at_open, |s| s.check_breaches);
+                    password_health::draw_password_health(
+                        ui,
+                        &health,
+                        &mut selected_id,
+                        check_breaches,
+                    );
+                });
+        }
+        if !show_sends && !on_health {
             egui::Panel::left("vault-item-list")
                 .exact_size(LIST_WIDTH)
                 .resizable(false)
@@ -16203,7 +16288,7 @@ mod the_idle_timer_follows_the_edited_setting {
                 VaultLists::live_only(&items),
                 &folders,
                 &mut selected,
-                &mut false,
+                sidebar::Screens { sends: &mut false, health: &mut false },
                 lock_countdown,
             );
         });
