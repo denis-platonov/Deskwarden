@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-19
 
 Deskwarden is a Windows companion application for Bitwarden-compatible
 vaults. It is unofficial and unaffiliated with Bitwarden, Inc.
@@ -22,6 +22,34 @@ install and sign in to yourself. Deskwarden talks to it locally.
 - **Your settings**, including which applications you have matched to which
   vault items, in `%APPDATA%\Deskwarden`.
 - **Cached site icons**, stored as image files in the same folder.
+
+## What Deskwarden looks at, outside its own windows
+
+To offer to fill a password, Deskwarden has to notice that you are being
+asked for one. Two things are read from whichever window you are working in,
+both through Windows' own accessibility interface (UI Automation) — the same
+interface a screen reader uses.
+
+- **The application's identity** — its executable path and, where the file
+  carries one, its description, so that "chrome.exe" can be shown to you as
+  "Google Chrome". This is what a match is keyed on, and it is the only part
+  stored: the applications you have matched sit in `%APPDATA%\Deskwarden`.
+- **Whether the window contains a masked password box.** One question, asked
+  when the focused window changes, answered yes or no, and not written down
+  anywhere.
+
+**What that second question does not do is worth stating plainly, because
+"reads your password field" is the reasonable thing to assume and it is not
+what happens.** It asks Windows whether any text box in the window has its
+*password* property set — the property that draws dots instead of letters.
+It does not read the box's contents, and it could not: masking those
+contents from other programs is that property's entire purpose. Nothing you
+type into another application is read, logged, or sent anywhere.
+
+The answer is used to decide one thing: whether to show you a card saying
+there is no saved login for this application. Without it, an application
+with nothing saved is met with silence, which is indistinguishable from
+Deskwarden being broken.
 
 ## What leaves your machine, and to whom
 

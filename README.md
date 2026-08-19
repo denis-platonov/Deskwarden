@@ -154,6 +154,14 @@ cargo build --release
 See [`deskwarden/installer/README.md`](deskwarden/installer/README.md) for how
 the installer is built.
 
+## Privacy
+
+Deskwarden has no servers, no accounts and no analytics. What it reads, what
+it stores, the four network requests it makes and which of them you can turn
+off are set out in [PRIVACY.md](PRIVACY.md).
+
+Changes between releases are in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). (The same license also ships with the crate at
