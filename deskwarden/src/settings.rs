@@ -968,6 +968,42 @@ pub struct Settings {
     /// (the preferences window greys its field out rather than clearing it),
     /// so turning it back on restores the number the user last chose.
     pub clear_clipboard_seconds: u64,
+    /// The apps the user pressed *Never for this app* on, in design **3c**'s
+    /// save-a-new-login card.
+    ///
+    /// **Empty is the default, and empty is what an older `settings.json`
+    /// without this field parses as** -- this struct carries
+    /// `#[serde(default)]`, so a missing key deserializes as `Vec::new()` and
+    /// every existing installation upgrades into "nothing has been silenced",
+    /// which is exactly the behaviour it has today.
+    ///
+    /// Each entry is one `crate::app::window_label` answer: normally an
+    /// executable file name (`tracker.exe`), and for an unattributable host
+    /// frame the window title, because that is the only name such a window has.
+    /// Matched whole and ASCII-case-insensitively by
+    /// [`crate::app::never_for_app`] -- never as a substring, which is how one
+    /// *Never* would come to silence the overlay everywhere.
+    ///
+    /// **It lives here rather than in the `deskwarden:app-match` convention**,
+    /// and that is not a filing preference. That convention is a custom field
+    /// *on a vault item*; the entire premise of this control is that there is
+    /// no item -- the card it is pressed on is shown precisely because the
+    /// vault has nothing for this window. There is nothing to hang the field
+    /// on.
+    ///
+    /// **What it suppresses**: `crate::app::disposition`'s 3a and 3b arms for
+    /// this app -- the two states that only ever appear when nothing matched.
+    /// It does **not** suppress a fill prompt: an app on this list that later
+    /// gains a saved login still raises the matched card. See `disposition`'s
+    /// own doc for that argument.
+    ///
+    /// **Owned by the overlay**, which makes it a fourth writer of this file;
+    /// see [`Self::persist_never_save_for_app`].
+    ///
+    /// No secret is in here -- these are process names -- which is what lets it
+    /// past `tests::mentions_a_secret`, the blunt substring scan over the whole
+    /// of `settings.json`.
+    pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
     ///
@@ -1059,6 +1095,7 @@ impl Default for Settings {
             clear_clipboard_on_account_change: true,
             clear_clipboard_on_quit: true,
             clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
+            never_save_for_apps: Vec::new(),
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
@@ -1188,6 +1225,12 @@ impl Settings {
             clear_clipboard_on_account_change,
             clear_clipboard_on_quit,
             clear_clipboard_seconds,
+            // Owned by the overlay, not by the preferences window: it is
+            // written by `Self::persist_never_save_for_app` from inside the 3c
+            // card, and the copy `main.rs` holds is stale the moment a user
+            // presses *Never*. Writing it back from here would resurrect an
+            // app the user silenced mid-session.
+            never_save_for_apps: _,
             vault_window: _,
             accounts: _,
             active_account: _,
@@ -1251,6 +1294,37 @@ impl Settings {
         let mut on_disk = Self::load(path);
         on_disk.accounts = accounts.to_vec();
         on_disk.active_account = active.cloned();
+        on_disk.save(path)
+    }
+
+    /// Adds `app` to [`Self::never_save_for_apps`] on disk -- **the fourth
+    /// read-modify-write over this file**, and the overlay's own.
+    ///
+    /// Its own writer rather than a widening of the preferences one, for the
+    /// reason [`Self::persist_accounts`] is: the caller is
+    /// `crate::app::remember_never_for_app`, which runs from inside a frameless
+    /// always-on-top card and holds no `Settings` at all. The only one it could
+    /// save is one it invented, and saving that would write the defaults over
+    /// every preference the user has ever set.
+    ///
+    /// **Adds, never replaces**, and re-reads the list from disk first: two
+    /// *Never*s in one session must both survive, and so must one made in a
+    /// second Deskwarden process. `never_is_added_to_whatever_is_already_on_disk`
+    /// pins the first and `persisting_a_never_keeps_every_preference` the rest
+    /// of the file.
+    ///
+    /// **Idempotent**: an app already on the list is not added twice, so a user
+    /// who presses *Never* for the same app on two machines that later sync the
+    /// same file does not grow a list of duplicates.
+    pub fn persist_never_save_for_app(path: &Path, app: &str) -> std::io::Result<()> {
+        let mut on_disk = Self::load(path);
+        if !on_disk
+            .never_save_for_apps
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(app))
+        {
+            on_disk.never_save_for_apps.push(app.to_string());
+        }
         on_disk.save(path)
     }
 
@@ -1443,6 +1517,7 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             // Listed rather than `..Settings::default()` so this test keeps
             // failing to compile when a field is added -- the same forcing
@@ -1625,6 +1700,7 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
@@ -2131,6 +2207,7 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),
             active_account: None,
@@ -2138,6 +2215,135 @@ mod tests {
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **An older `settings.json` without the never-list parses as an empty
+    /// one**, which is the upgrade direction that matters: every existing
+    /// installation must come up with nothing silenced, because nothing has
+    /// been silenced.
+    ///
+    /// The inverse would be the worst failure this field can have -- an
+    /// unreadable or absent key that defaulted to "silenced" would switch the
+    /// overlay off for an app the user never pressed anything on, and the only
+    /// evidence would be a card that stopped appearing.
+    #[test]
+    fn an_older_settings_file_without_the_never_key_loads_as_empty() {
+        let path = temp_path("no-never-key");
+        // A file with every OTHER key, so the absence being tested is the
+        // never-list's and not the file's.
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running":false,"prompt_on_match":false,"auto_lock_minutes":9}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load(&path);
+        assert!(
+            loaded.never_save_for_apps.is_empty(),
+            "an older settings file loaded with {:?} silenced, which the user never asked for",
+            loaded.never_save_for_apps
+        );
+        // The control: the file really was read, so the emptiness above is the
+        // missing key and not a failed parse falling back to the defaults.
+        assert!(!loaded.keep_backend_running, "control: the file was not read at all");
+        assert_eq!(loaded.auto_lock_minutes, 9, "control: the file was not read at all");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `Never` is **added** to whatever is already on disk, and the same app
+    /// twice is still one entry.
+    ///
+    /// Both halves matter for the same reason: this writer re-reads the file,
+    /// so two `Never`s in one session -- or one from a second Deskwarden
+    /// process -- must both survive, while a user who presses it twice must
+    /// not grow the list.
+    #[test]
+    fn never_is_added_to_whatever_is_already_on_disk() {
+        let path = temp_path("never-adds");
+        Settings::persist_never_save_for_app(&path, "tracker.exe").unwrap();
+        Settings::persist_never_save_for_app(&path, "ledgerline.exe").unwrap();
+        assert_eq!(
+            Settings::load(&path).never_save_for_apps,
+            vec!["tracker.exe".to_string(), "ledgerline.exe".to_string()],
+            "the second `Never` replaced the first instead of joining it"
+        );
+
+        // Idempotent, including across a spelling Windows varies on its own.
+        Settings::persist_never_save_for_app(&path, "tracker.exe").unwrap();
+        Settings::persist_never_save_for_app(&path, "TRACKER.EXE").unwrap();
+        assert_eq!(
+            Settings::load(&path).never_save_for_apps,
+            vec!["tracker.exe".to_string(), "ledgerline.exe".to_string()],
+            "pressing `Never` again grew the list, so a user who presses it on every launch \
+             accumulates a settings file of duplicates"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Recording a `Never` keeps every preference, the geometry and the
+    /// accounts -- the same claim every other writer of this file carries, and
+    /// it is the reason this is a read-modify-write rather than a save.
+    ///
+    /// It matters more here than for the others: `app::remember_never_for_app`
+    /// runs from inside a frameless always-on-top card and holds no `Settings`
+    /// at all, so a whole-struct save from that call site would write the
+    /// defaults over the user's account list.
+    #[test]
+    fn persisting_a_never_keeps_every_preference() {
+        let path = temp_path("never-preserves");
+        Settings {
+            keep_backend_running: false,
+            auto_lock_minutes: 7,
+            clear_clipboard: false,
+            vault_window: Some(WindowGeometry { x: 3, y: 4, width: 900, height: 600 }),
+            ..Settings::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        Settings::persist_never_save_for_app(&path, "tracker.exe").unwrap();
+
+        let back = Settings::load(&path);
+        assert_eq!(back.never_save_for_apps, vec!["tracker.exe".to_string()]);
+        assert!(!back.keep_backend_running, "the never-list writer reset a preference");
+        assert_eq!(back.auto_lock_minutes, 7, "the never-list writer reset the idle timer");
+        assert!(!back.clear_clipboard, "the never-list writer reset the clipboard switch");
+        assert_eq!(
+            back.vault_window,
+            Some(WindowGeometry { x: 3, y: 4, width: 900, height: 600 }),
+            "the never-list writer threw the vault window's geometry away"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And the other direction: a preferences save does **not** carry the
+    /// never-list, because the copy it is saving from is stale in that field.
+    ///
+    /// `main.rs` loads `Settings` once at startup and never refreshes it, so
+    /// its `never_save_for_apps` is whatever was on disk then. Writing that
+    /// back from the preferences window would resurrect an app the user
+    /// silenced ten minutes ago -- the same defect `persist_accounts` exists
+    /// to prevent for the account list.
+    #[test]
+    fn persisting_preferences_from_a_stale_copy_keeps_the_never_list() {
+        let path = temp_path("never-survives-prefs");
+        Settings::persist_never_save_for_app(&path, "tracker.exe").unwrap();
+
+        // The stale copy: loaded before the `Never` existed, so its list is
+        // empty, and it is now changing an unrelated preference.
+        let stale = Settings { keep_backend_running: false, ..Settings::default() };
+        assert!(stale.never_save_for_apps.is_empty(), "control: the stale copy must be empty");
+        stale.persist_preferences(&path).unwrap();
+
+        let back = Settings::load(&path);
+        assert_eq!(
+            back.never_save_for_apps,
+            vec!["tracker.exe".to_string()],
+            "a preferences save wiped the never-list, so an app the user silenced started \
+             raising the overlay again the next time they changed any setting at all"
+        );
+        assert!(!back.keep_backend_running, "control: the preferences save did not happen");
         let _ = std::fs::remove_file(&path);
     }
 
