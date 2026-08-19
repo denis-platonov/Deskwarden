@@ -1,8 +1,138 @@
-use crate::signature::{is_trusted_signer, verify_authenticode};
+//! Finding, downloading and applying deskwarden's own updates.
+//!
+//! # What the update path actually trusts
+//!
+//! **The trust root here is TLS to `api.github.com` plus the integrity of the
+//! `denis-platonov/deskwarden` GitHub account. Nothing else.** This is worth
+//! stating without euphemism, because the module used to imply something
+//! stronger.
+//!
+//! Deskwarden's releases are not code-signed. `.github/workflows/release.yml`
+//! says so on every build, and until now this module gated the launch on an
+//! Authenticode thumbprint constant that read
+//! `PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED` -- a value chosen so it could
+//! never match anything. The gate therefore refused *every* update that had
+//! ever been offered. The self-update did not fail rarely; it had never once
+//! succeeded, and the user was downloading and running each release by hand
+//! instead.
+//!
+//! That is the trade this module now makes, and it is not the trade it looks
+//! like from the diff. Removing a signature check normally means giving up a
+//! guarantee. Here there was no guarantee to give up: the check could not
+//! pass, so its whole effect was to move the act of running an unsigned
+//! installer from this process -- where something could be verified -- into
+//! the user's own hands, where nothing was. What replaces it is a SHA-256
+//! comparison against a digest GitHub publishes for the asset, which is
+//! strictly more checking than either the old gate (which refused everything)
+//! or the manual download (which checked nothing).
+//!
+//! **This is not equivalent to a signed build and must not be described as
+//! one.** A signature would let a user verify the publisher without trusting
+//! the distribution channel. A digest fetched from that same channel cannot:
+//! whoever can replace the asset can generally replace the digest beside it.
+//! What the digest does buy is real but narrower --
+//!
+//!  * the bytes that run are the bytes GitHub's API described, so a corrupted,
+//!    truncated or mid-flight-substituted download is caught;
+//!  * the digest arrives on the SAME TLS response as the download URL
+//!    ([`check_for_update`]), so it is not a second thing to fetch and not a
+//!    second connection to attack -- rewriting one means being able to rewrite
+//!    the other, rather than merely sitting on the CDN fetch;
+//!  * and the file is re-hashed immediately before the spawn, so the window
+//!    between "verified" and "executed" is closed.
+//!
+//! When a code-signing certificate is obtained, an Authenticode gate should be
+//! added back ON TOP of this one -- `signature::is_trusted_signer` is still
+//! present and still tested for exactly that day. See
+//! `docs/code-signing-policy.md`.
+//!
+//! # Everything here fails closed
+//!
+//! There is deliberately no path on which "the digest could not be checked"
+//! becomes "launch it anyway". A release whose installer asset carries no
+//! digest, or a malformed one, is not reported as an available update at all;
+//! a downloaded file whose digest disagrees -- or which cannot be read in
+//! order to hash it -- is deleted and refused. See [`apply_update_with`].
+
 use semver::Version;
+use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+/// A SHA-256 digest, as 32 raw bytes.
+///
+/// A newtype rather than a `String` so that the comparison at the gate is
+/// between two things that are *already* known to be well-formed digests. A
+/// string comparison would have to decide, at the gate, what to do about
+/// casing, about a `sha256:` prefix that might or might not be there, and
+/// about a value that is not hex at all -- and "decide at the gate" is where
+/// a lenient answer turns into a launch. Parsing happens once, at the edge, in
+/// [`parse_asset_digest`]; by the time a value of this type exists it is 32
+/// bytes and nothing else, and `==` on it cannot mean anything but equality of
+/// those bytes.
+///
+/// `Copy` because it is 32 bytes and gets carried around inside [`ReleaseInfo`]
+/// clones; `Eq` because that is the whole point of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sha256Digest([u8; 32]);
+
+impl std::fmt::Display for Sha256Digest {
+    /// Lowercase hex, no prefix -- the spelling that appears in error messages
+    /// when a digest is rejected, so a user can compare it by eye against
+    /// what GitHub shows for the asset.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The prefix GitHub puts on a release asset's `digest` field.
+///
+/// Required rather than tolerated-if-absent. The field is documented as
+/// algorithm-qualified, and the qualifier is the only thing that says the 64
+/// hex characters after it are a SHA-256 rather than something else this code
+/// would then compare a SHA-256 against and always reject -- or, worse, some
+/// future shorter algorithm it would compare against a truncation of.
+const ASSET_DIGEST_PREFIX: &str = "sha256:";
+
+/// Parses a release asset's `digest` field: `"sha256:"` followed by exactly 64
+/// hex characters.
+///
+/// Every rejection here is a refusal to offer the update at all, which is the
+/// intended direction: this runs inside [`check_for_update`], long before
+/// anything has been downloaded, and a release this function cannot make sense
+/// of is a release nothing in this module will go on to launch.
+pub fn parse_asset_digest(field: &str) -> Result<Sha256Digest, String> {
+    let hex = field.strip_prefix(ASSET_DIGEST_PREFIX).ok_or_else(|| {
+        format!(
+            "release asset digest '{field}' is not a SHA-256 digest (expected a \
+             '{ASSET_DIGEST_PREFIX}' prefix)"
+        )
+    })?;
+    if hex.len() != 64 {
+        return Err(format!(
+            "release asset digest '{field}' has {} hex characters after the prefix, not 64",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        // `from_str_radix` on a two-character slice, rather than a hand-rolled
+        // nibble table, because it is the piece that rejects a non-hex
+        // character -- and rejecting it is the job. Note it also rejects a
+        // leading `+`, and `-`, and whitespace, all of which `u8::from_str`
+        // would take. Slicing by byte index is safe here: the length check
+        // above passed, and every character of a 64-length ASCII-hex string is
+        // one byte. A multi-byte character makes `len()` exceed 64 and so
+        // never reaches this loop.
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("release asset digest '{field}' is not hexadecimal"))?;
+    }
+    Ok(Sha256Digest(out))
+}
 
 /// `Clone` so the About page's download button can hand a copy to the
 /// background download/verify thread (see `update_panel.rs`) while keeping its
@@ -16,6 +146,33 @@ use std::time::Duration;
 pub struct ReleaseInfo {
     pub version: Version,
     pub installer_download_url: String,
+    /// SHA-256 of the installer asset, from the SAME asset object in the SAME
+    /// API response `installer_download_url` came from.
+    ///
+    /// # Why it is not an `Option`
+    ///
+    /// This is the fail-closed decision, made in the type rather than at the
+    /// gate. If this were `Option<Sha256Digest>` then every consumer would
+    /// have to decide what `None` means, and there would be one obvious wrong
+    /// answer available to each of them. As a required field, a release whose
+    /// installer asset has no usable digest cannot be REPRESENTED as an
+    /// available update: [`check_for_update`] returns an error instead of
+    /// `Some`, the About page shows that error, and no download and no launch
+    /// ever begins. "We could not check" therefore cannot become "proceed"
+    /// by anyone forgetting a branch, because there is no branch.
+    ///
+    /// # Why it comes from this response and not a second one
+    ///
+    /// Same reason [`ReleaseInfo::body`] does, plus a security one. The
+    /// releases API returns a per-asset `digest` field of the form
+    /// `sha256:<64 hex>` alongside `browser_download_url`, so the digest and
+    /// the URL it describes are read out of one object, delivered by one TLS
+    /// response, from one host. A `SHA256SUMS` asset fetched separately would
+    /// be a second request that could fail on its own, be answered by a
+    /// different CDN edge, or be omitted -- and "omitted" is a state that
+    /// invites exactly the lenient branch the paragraph above exists to
+    /// prevent.
+    pub installer_sha256: Sha256Digest,
     /// The release's notes, verbatim from the GitHub release body.
     ///
     /// Kept here rather than fetched separately because the response
@@ -173,16 +330,38 @@ pub fn check_for_update(
     let latest_version =
         Version::parse(version_str).map_err(|e| format!("release tag '{tag}' is not valid semver: {e}"))?;
 
-    let installer_url = body["assets"]
+    // The asset object is bound ONCE and both the URL and the digest are read
+    // out of it. Deliberately not two independent searches through `assets`:
+    // two searches can disagree about which asset they found, and a digest
+    // taken from a different asset than the URL is a check that passes on the
+    // wrong file or fails on the right one. One object, one pair.
+    let asset = body["assets"]
         .as_array()
         .and_then(|assets| {
             assets
                 .iter()
                 .find(|a| a["name"].as_str().map(|n| n.ends_with("-installer.exe")).unwrap_or(false))
         })
-        .and_then(|asset| asset["browser_download_url"].as_str())
-        .ok_or("release has no installer asset")?
+        .ok_or("release has no installer asset")?;
+
+    let installer_url = asset["browser_download_url"]
+        .as_str()
+        .ok_or("release installer asset has no download URL")?
         .to_string();
+
+    // Absent is an ERROR, unlike `body` below. A release whose installer
+    // carries no digest is one this build has no way to check, and the whole
+    // shape of this module is that such a release is not offered rather than
+    // offered-and-trusted. The message names the asset so the failure is
+    // actionable rather than mysterious.
+    let digest_field = asset["digest"].as_str().ok_or_else(|| {
+        format!(
+            "release installer asset '{}' carries no digest, so the download could not be \
+             verified; refusing to offer this update",
+            asset["name"].as_str().unwrap_or("<unnamed>")
+        )
+    })?;
+    let installer_sha256 = parse_asset_digest(digest_field)?;
 
     // Absent, null, or a non-string are all one case here: a release with no
     // notes. Not an error -- a release genuinely may have an empty body, and
@@ -194,6 +373,7 @@ pub fn check_for_update(
         Ok(Some(ReleaseInfo {
             version: latest_version,
             installer_download_url: installer_url,
+            installer_sha256,
             body: notes,
         }))
     } else {
@@ -254,8 +434,72 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Streams the release installer to `dest_dir` and refuses anything not signed
-/// by the expected signer.
+/// SHA-256 of the file at `path`, read as a stream.
+///
+/// **Streamed, in [`HASH_CHUNK`]-sized reads, rather than via
+/// `std::fs::read`.** The installer is ~6 MB and this function runs twice per
+/// update -- once at download time and once immediately before the launch --
+/// so reading the whole thing into a `Vec` would mean two 6 MB allocations
+/// that exist only to be fed forward a chunk at a time anyway.
+///
+/// An I/O error is an `Err`, never a zero hash or a partial one. That matters
+/// more here than the usual amount: this function's return value is the only
+/// thing standing between a file on disk and a process start, so a failure to
+/// READ the file has to be as loud as a failure to MATCH it. Both callers
+/// treat it as a refusal.
+fn file_sha256(path: &Path) -> Result<Sha256Digest, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("could not open {} to hash it: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_CHUNK];
+    loop {
+        let n = match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("could not read {} to hash it: {e}", path.display())),
+        };
+        hasher.update(&buf[..n]);
+    }
+    Ok(Sha256Digest(hasher.finalize().into()))
+}
+
+/// Read size for [`file_sha256`]. The same 8 KiB `std::io::copy` uses, and the
+/// same [`copy_reporting`] uses, for no deeper reason than that there is no
+/// reason for this file to have two different opinions about a buffer size.
+const HASH_CHUNK: usize = 8 * 1024;
+
+/// Deletes an installer this module has just refused, and says so in the log.
+///
+/// Called from every refusal that happens with a file already on disk. **A
+/// rejected installer must not be left in the download directory**: it is an
+/// executable, in a predictable location, under the exact name
+/// [`installer_file_name`] produces and [`apply_update_with`] reconstructs --
+/// so leaving it there means a later run, or a user browsing the cache folder,
+/// can run the very thing that was just judged unfit to run.
+///
+/// Best-effort, and deliberately does not turn a failed delete into a
+/// different error: the caller is already returning a refusal, and that
+/// refusal is the important half. A file that could not be deleted is logged
+/// so it is not silent, and `cleanup_stale_downloads` sweeps it at the next
+/// startup.
+fn discard_rejected_installer(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => log::warn!("deleted rejected update download {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("could not delete rejected update download {}: {e}", path.display()),
+    }
+}
+
+/// Streams the release installer to `dest_dir` and refuses anything whose
+/// SHA-256 is not the one the releases API published for the asset.
+///
+/// The digest is taken from `release` -- i.e. from the API response that also
+/// supplied the URL just downloaded from -- and never from a parameter. It
+/// used to be a parameter: `expected_thumbprint: &str`, chosen by the caller,
+/// which is the same weakness [`apply_update`] removed when it stopped taking
+/// a path. A caller that picks the value a check is made against picks the
+/// answer.
 ///
 /// `agent` comes from [`build_download_agent`], and the type says so rather
 /// than the comment: this is the one caller in the crate whose bound is "time
@@ -278,7 +522,6 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
 /// download; the About page's implementation is a `send` down an `mpsc`.
 pub fn download_and_verify(
     release: &ReleaseInfo,
-    expected_thumbprint: &str,
     dest_dir: &Path,
     agent: &crate::http_agent::StallBounded,
     on_progress: &dyn Fn(u64, Option<u64>),
@@ -304,7 +547,7 @@ pub fn download_and_verify(
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(&dest_path).map_err(|e| e.to_string())?;
     // A stalled transfer aborts here, part-written, and the partial file must
-    // not be left behind -- same cleanup the signature-failure branch below
+    // not be left behind -- same cleanup the digest-failure branch below
     // does, for the same reason. `cleanup_stale_downloads` would eventually
     // catch it at the next startup, but this path stopped being near-
     // unreachable when the bound went from a 600s total to a 15s stall: a
@@ -322,10 +565,24 @@ pub fn download_and_verify(
     }
     drop(file);
 
-    let info = verify_authenticode(&dest_path)?;
-    if !is_trusted_signer(&info, expected_thumbprint) {
-        let _ = std::fs::remove_file(&dest_path);
-        return Err("downloaded installer failed signature verification".to_string());
+    // Both arms below delete the file, and that is the point of writing the
+    // hash failure and the mismatch as two arms of one decision rather than as
+    // a `?`: a hash that could not be COMPUTED is exactly as much a refusal as
+    // a hash that did not MATCH, and neither may leave an executable behind.
+    let actual = match file_sha256(&dest_path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            discard_rejected_installer(&dest_path);
+            return Err(format!("downloaded installer could not be verified: {e}"));
+        }
+    };
+    if actual != release.installer_sha256 {
+        discard_rejected_installer(&dest_path);
+        return Err(format!(
+            "downloaded installer failed SHA-256 verification: the release published \
+             {expected} and the downloaded file is {actual}",
+            expected = release.installer_sha256
+        ));
     }
 
     Ok(dest_path)
@@ -370,56 +627,61 @@ fn copy_reporting(
     Ok(copied)
 }
 
-/// The Authenticode signer thumbprint an installer must carry before
-/// [`apply_update`] will launch it.
-///
-/// The real certificate deskwarden's release builds will be signed with does
-/// not exist yet at this point in the project, so there is no genuine value to
-/// put here. This placeholder is intentionally not a plausible-looking
-/// thumbprint: it can never match a real signature, so `is_trusted_signer`
-/// -- and therefore both [`download_and_verify`] and [`apply_update`] -- fails
-/// closed, refusing every update, until this constant is replaced with the
-/// real one.
-///
-/// It lives HERE rather than in `main.rs` on purpose. [`apply_update`] is the
-/// one function in this crate that turns a file on disk into a running
-/// process, and if the signer it checks against were a parameter then the
-/// check would be worth exactly as much as the caller wanted it to be worth:
-/// any caller could pass the thumbprint of whatever it had just planted. A
-/// compile-time constant cannot be argued with at a call site.
-pub const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
-
-/// The launch-time trust decision, as a pure function of the signature so it
-/// can be tested without a signed file on disk.
-///
-/// This pins WHAT the decision computes. It says nothing about whether the
-/// launcher consults it, and that gap was not theoretical: the previous shape
-/// of this module disclosed that deleting the `if !installer_is_launchable(..)`
-/// branch from [`apply_update`] SURVIVED the whole suite, and rested its
-/// defence on the dead-code warning the deletion leaves behind. **That backstop
-/// did not exist.** Measured on this crate at `e7327f9`, replacing the entire
-/// gating block with
-///
-/// ```ignore
-/// let _launchable = installer_is_launchable(&info);
-/// ```
-///
-/// -- which uses `info`, uses the function, and removes the gate -- survived at
-/// 2168 lib / 217 bin / 4 ignored / 0 failed and ZERO warnings. Composed with a
-/// one-line `pub fn zz_start(d: &Path, r: &ReleaseInfo)` forwarder in
-/// `accounts.rs` (see [`apply_update`]'s note on the child-start guard's
-/// `ALLOWED` list) it restored an arbitrary-directory, signature-free, jobless
-/// process launcher on the crate's public surface, still at 2168 / 0 failed /
-/// 0 warnings.
-///
-/// Substitution was killed; deletion and NEUTRALISATION were both free. The
-/// difference is the whole lesson: a pin on a pure decision cannot see whether
-/// the decision is in a GATING POSITION. That is now held separately, by
-/// [`apply_update_with`] and the routing tests over it, and this function is
-/// only one half of the pair.
-fn installer_is_launchable(info: &crate::signature::SignatureInfo) -> bool {
-    is_trusted_signer(info, EXPECTED_SIGNER_THUMBPRINT)
-}
+// **There is no signer thumbprint here any more, and no second placeholder
+// standing in for one.**
+//
+// This is where `EXPECTED_SIGNER_THUMBPRINT` used to be, holding the literal
+// string `PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED`, and where
+// `installer_is_launchable` used to compare an Authenticode signature against
+// it. Both are gone, and the reason is written here rather than in a commit
+// message because the shape of the mistake is easy to re-create.
+//
+// The placeholder was chosen so it could never match, so that the module
+// would fail closed until a real certificate existed. It did fail closed. It
+// also failed closed on every genuine release, because the releases it was
+// judging are unsigned by construction (`.github/workflows/release.yml`), so
+// the gate refused 100% of real updates and 100% of hypothetical hostile
+// ones alike. A gate with that discrimination is not a gate; it is an off
+// switch on the feature, and its practical effect was to send the user to
+// download and run the same unsigned installer by hand, with nothing checked
+// at all.
+//
+// Three things could have replaced it, and two of them are the same bug
+// again:
+//
+//  * **Keep verifying, but do not gate, and log the result.** Rejected. The
+//    call would sit immediately before the spawn -- exactly where a reader
+//    expects a gate -- and change nothing. That is the defect being fixed,
+//    wearing a log line as a disguise.
+//  * **Gate only when the constant is not the placeholder.** Rejected, and
+//    it is the worst of the three: it makes the placeholder a SWITCH, so
+//    whether this crate checks anything before starting a process becomes a
+//    property of a string literal's value rather than of its code. Every
+//    reader would have to know the current value to know what the code does.
+//  * **Remove it, and gate on something that can actually pass.** Taken.
+//    The launch gate is now `file_sha256` against
+//    `ReleaseInfo::installer_sha256`, which is a check that succeeds on a
+//    genuine release and fails on a substituted one -- the discrimination the
+//    thumbprint gate never had.
+//
+// # What was NOT deleted
+//
+// `signature.rs` stays, whole and tested. It is not dead code: `main.rs`
+// verifies the resolved `bw.exe` with `verify_authenticode` /
+// `is_trusted_organization` / `dn_component`, which is a live trust decision
+// on a different binary and is unaffected by any of this.
+// `signature::is_trusted_signer` -- the pure predicate this module used to
+// call -- also stays, with its own unit tests, because it is precisely what
+// an Authenticode gate would need on the day a certificate is issued. The
+// intent then is to add that gate ON TOP of the digest check, not in place
+// of it: they answer different questions, and only one of them can be
+// answered today.
+//
+// # The lesson from the old gate that DID survive the rewrite
+//
+// The doc comment removed from here also recorded a measured escape, which was
+// worth keeping and has moved to `apply_update_with` -- onto the function that
+// actually holds the gate, rather than sitting beside the deleted one.
 
 /// The one place in this crate that turns the downloaded installer into a
 /// running process.
@@ -471,37 +733,45 @@ fn launch_installer(installer_path: &Path) -> Result<(), String> {
 /// # Why this exists
 ///
 /// `apply_update` cannot be driven to its spawn by any test that is allowed to
-/// exist in this crate: doing so would mean shipping a genuinely
-/// Authenticode-signed installer as a fixture and then RUNNING it. So for three
-/// revisions the trust decision was lifted into the pure
-/// [`installer_is_launchable`] and pinned over hand-built [`SignatureInfo`]
-/// values, and the question "does the launcher still ask?" was disclosed as
-/// untestable. It was not untestable. It was untested, and measured survivors
-/// followed -- see [`installer_is_launchable`] for the numbers.
+/// exist in this crate: doing so would mean RUNNING the installer. So for three
+/// revisions the trust decision was lifted into a pure predicate and pinned
+/// over hand-built values, and the question "does the launcher still ask?" was
+/// disclosed as untestable. It was not untestable. It was untested, and
+/// measured survivors followed -- see [`apply_update_with`] for the numbers.
 ///
-/// Behind this seam the launcher can be run end to end with **no real file, no
-/// real signature and no real process**: the harness supplies a
-/// [`SignatureInfo`] by hand through `verify` and records every path that
-/// arrives at `launch`. The assertions are then about ROUTING -- that `launch`
-/// is NOT reached for a wrong signer, an invalid signature, a missing
-/// thumbprint or an unreadable file, and IS reached, with exactly the
-/// constructed path, for the trusted one. That is the property deletion and
-/// neutralisation both break and substitution also breaks, so one shape of test
-/// now covers all three.
+/// Behind this seam the launcher can be run end to end with **no real file and
+/// no real process**: the harness answers `hash` by hand and records every
+/// path that arrives at `launch`. The assertions are then about ROUTING --
+/// that `launch` is NOT reached for a digest that differs from the release's,
+/// nor for a file that could not be hashed at all, and IS reached, with
+/// exactly the constructed path, for the matching one. That is the property
+/// deletion and neutralisation both break and substitution also breaks, so one
+/// shape of test covers all three.
+///
+/// The seam is `hash`, not "the whole check". The COMPARISON stays in
+/// [`apply_update_with`], in production code, where no substitute can reach
+/// it: a seam that returned a verdict rather than a digest would let a test
+/// harness -- or anything else holding an env -- decide the answer, which is
+/// the caller-chooses-the-check weakness this module has already removed twice
+/// (see [`apply_update`] on why it takes no path, and [`download_and_verify`]
+/// on why it takes no expected value). What crosses this boundary is a fact
+/// about bytes; what stays inside is the decision made from it.
 ///
 /// # `fn` pointers rather than `impl Fn`
 ///
 /// Closures would be more convenient at the call site and would be the wrong
 /// choice here, for the reason `VaultFrameEnv` in `vault_window/mod.rs`
 /// records: a seam that is itself unpinned only MOVES the hole. A `fn` pointer
-/// has an address, so [`production_holds_the_real_verify_and_the_real_launch`]
+/// has an address, so [`production_holds_the_real_hash_and_the_real_launch`]
 /// can assert that what [`UpdaterEnv::production`] hands over is the real
-/// `verify_authenticode` and the real [`launch_installer`] BY IDENTITY, with
+/// [`file_sha256`] and the real [`launch_installer`] BY IDENTITY, with
 /// `std::ptr::fn_addr_eq`. A wrapper, a forwarder, a rename or a flag-gated
-/// no-op is a different address and fails there, whatever it is spelled.
+/// no-op is a different address and fails there, whatever it is spelled. That
+/// matters most for `hash`: a substitute that returned a constant would make
+/// the gate below always agree with itself.
 pub struct UpdaterEnv {
-    /// [`crate::signature::verify_authenticode`] in production.
-    verify: fn(&Path) -> Result<crate::signature::SignatureInfo, String>,
+    /// [`file_sha256`] in production -- the real bytes on disk, read again.
+    hash: fn(&Path) -> Result<Sha256Digest, String>,
     /// [`launch_installer`] in production -- the module's only process start.
     launch: fn(&Path) -> Result<(), String>,
 }
@@ -514,29 +784,66 @@ impl UpdaterEnv {
     /// every source guard in this file, so that a test-gated item up here
     /// cannot truncate the slice those guards read.
     pub fn production() -> Self {
-        Self { verify: verify_authenticode, launch: launch_installer }
+        Self { hash: file_sha256, launch: launch_installer }
     }
 }
 
 /// [`apply_update`]'s whole body, with the outside world as a parameter.
 ///
-/// The gate is the point: `launch` is unreachable except through the `if`
-/// below, and there is no other path to a process start in this module. See
-/// [`UpdaterEnv`] for why this shape exists and
+/// The gate is the point: `launch` is unreachable except through the digest
+/// comparison below, and there is no other path to a process start in this
+/// module. See [`UpdaterEnv`] for why this shape exists and
 /// [`the_only_process_start_in_this_module_is_the_launch_seam`] for the guard
 /// that keeps a second, ungated spawn from being written beside it.
+///
+/// # Why the gate lives HERE and not in a pure predicate
+///
+/// This is the lesson the deleted signature gate paid for, and it applies
+/// unchanged to the digest one. With the trust decision merely lifted into a
+/// pure function and pinned over hand-built values, replacing the entire
+/// gating block with
+///
+/// ```ignore
+/// let _ok = the_decision(&thing);
+/// ```
+///
+/// -- which uses the value, uses the function, and removes the gate -- SURVIVED
+/// the whole suite at zero warnings; composed with a one-line forwarder in
+/// `accounts.rs` it restored an arbitrary-directory, check-free process
+/// launcher on the crate's public surface. Substitution was killed; deletion
+/// and NEUTRALISATION were both free, because a pin on a pure decision cannot
+/// see whether the decision is in a GATING POSITION.
+///
+/// So the digest comparison is not a predicate pinned in isolation. It is a
+/// `!=` in this body, held by the routing tests over this function, which
+/// assert that the launch seam is NOT REACHED for a differing digest or an
+/// unreadable file and IS reached for a matching one.
 fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -> Result<(), String> {
     let installer_path = dest_dir.join(installer_file_name(&release.version));
     // The path is folded into every error on this path deliberately: the one
     // thing a caller must be able to see is WHICH file was about to be
-    // launched, and `verify_authenticode`'s own errors are about the Win32
-    // call rather than about the file.
-    let info = (env.verify)(&installer_path)
-        .map_err(|e| format!("refusing to launch {}: {e}", installer_path.display()))?;
-    if !installer_is_launchable(&info) {
+    // launched, and the hasher's own errors are about a read syscall rather
+    // than about the update.
+    //
+    // Both failure arms below delete the file. A refusal that left the
+    // installer sitting under its predictable name would leave the rejected
+    // executable one double-click -- or one later run of this same function --
+    // away from being run anyway, which is most of the way back to having no
+    // gate at all.
+    let actual = match (env.hash)(&installer_path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            discard_rejected_installer(&installer_path);
+            return Err(format!("refusing to launch {}: {e}", installer_path.display()));
+        }
+    };
+    if actual != release.installer_sha256 {
+        discard_rejected_installer(&installer_path);
         return Err(format!(
-            "refusing to launch {}: it is not signed by the expected signer",
-            installer_path.display()
+            "refusing to launch {path}: its SHA-256 is {actual}, but the release published \
+             {expected}",
+            path = installer_path.display(),
+            expected = release.installer_sha256
         ));
     }
     (env.launch)(&installer_path)
@@ -564,24 +871,30 @@ fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -
 /// recognises it by. A caller chooses a directory and a version; it does not
 /// choose a file.
 ///
-/// # And it re-verifies
+/// # And it re-hashes
 ///
 /// Naming the file is not on its own enough -- a caller can still name a
-/// directory, and a directory is a place a file can be planted. So the
-/// signature check is repeated here, immediately before the spawn, against
-/// [`EXPECTED_SIGNER_THUMBPRINT`] rather than against anything the caller
+/// directory, and a directory is a place a file can be planted. So the digest
+/// check is repeated here, immediately before the spawn, against
+/// [`ReleaseInfo::installer_sha256`] rather than against anything the caller
 /// supplied. [`download_and_verify`] already checks, but it checks at download
 /// time and hands back a path; the gap between those two moments is exactly
-/// where a swap goes. This is the check that is adjacent to the launch.
+/// where a swap goes. This is the check that is adjacent to the launch, and it
+/// re-reads the bytes rather than remembering a verdict from earlier -- a
+/// remembered verdict describes the file that WAS there.
 ///
-/// # And the check is now known to be CONSULTED
+/// The cost is one extra pass over ~6 MB, streamed (see [`file_sha256`]), on a
+/// path that is about to start an installer and exit the process. That is not
+/// a price worth optimising away by trusting the earlier answer.
+///
+/// # And the check is known to be CONSULTED
 ///
 /// The body lives in [`apply_update_with`], over an [`UpdaterEnv`], and this is
 /// a two-line wrapper over it holding production's env. That is not a
-/// refactoring for its own sake: with the decision merely lifted into a pure
-/// [`installer_is_launchable`], neutralising the gate to `let _launchable =
-/// installer_is_launchable(&info);` was measured surviving the entire suite at
-/// zero warnings. The routing tests behind the seam are what fail on it now.
+/// refactoring for its own sake: with the trust decision merely lifted into a
+/// pure predicate and pinned there, neutralising the gate to `let _ok =
+/// the_predicate(&thing);` was measured surviving the entire suite at zero
+/// warnings. The routing tests behind the seam are what fail on that now.
 pub fn apply_update(dest_dir: &Path, release: &ReleaseInfo) -> Result<(), String> {
     apply_update_with(dest_dir, release, &UpdaterEnv::production())
 }
@@ -597,7 +910,7 @@ mod tests {
         let body = r#"{
             "tag_name": "v1.2.0",
             "assets": [
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let _m = server
@@ -613,6 +926,11 @@ mod tests {
         let release = result.expect("expected an available update");
         assert_eq!(release.version, Version::parse("1.2.0").unwrap());
         assert_eq!(release.installer_download_url, "https://example.com/deskwarden-installer.exe");
+        assert_eq!(
+            release.installer_sha256,
+            digest_of_byte("11"),
+            "the digest the asset published did not come back with the URL it describes"
+        );
         assert_eq!(
             release.body, "",
             "a release whose JSON carries no `body` must read as empty notes, not as junk"
@@ -634,7 +952,7 @@ mod tests {
             "tag_name": "v1.2.0",
             "body": "Fixed\n- the overlay no longer lies",
             "assets": [
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let _m = server
@@ -756,8 +1074,8 @@ mod tests {
         let body = r#"{
             "tag_name": "v1.2.0",
             "assets": [
-                {"name": "deskwarden.exe", "browser_download_url": "https://example.com/deskwarden.exe"},
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden.exe", "browser_download_url": "https://example.com/deskwarden.exe", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let _m = server
@@ -772,6 +1090,246 @@ mod tests {
 
         let release = result.expect("expected an available update");
         assert_eq!(release.installer_download_url, "https://example.com/deskwarden-installer.exe");
+        // **The digest is read from the SAME asset object as the URL.** The
+        // two fixtures publish different digests on purpose: a parse that
+        // searched `assets` twice, or took the first digest it saw, would
+        // bring back the bare exe's here and be checking the wrong file's
+        // hash against the right file's bytes.
+        assert_eq!(
+            release.installer_sha256,
+            digest_of_byte("11"),
+            "the digest came from a different asset than the download URL did"
+        );
+        assert_ne!(release.installer_sha256, digest_of_byte("22"));
+    }
+
+    /// **A release whose installer asset carries no digest is not offered.**
+    ///
+    /// The failure direction is the point. There is nothing this build could
+    /// check such a download against, so it declines to report an update at
+    /// all rather than reporting one it would go on to run unverified. "We
+    /// could not check" must never become "proceed", and the earliest place
+    /// to make that true is here, before anything is downloaded.
+    #[test]
+    fn a_release_whose_installer_has_no_digest_is_refused_rather_than_offered() {
+        let mut server = mockito::Server::new();
+        let body = r#"{
+            "tag_name": "v1.2.0",
+            "assets": [
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+            ]
+        }"#;
+        let _m = server
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let current = Version::parse("1.1.0").unwrap();
+        let error = check_for_update(&server.url(), &current, &build_api_agent())
+            .expect_err("a release with no digest must not be offered as an update");
+
+        assert!(
+            error.contains("digest"),
+            "the refusal does not say what was missing: {error}"
+        );
+    }
+
+    /// A digest that is present but not something this code can make sense of
+    /// is the same refusal, for the same reason. Each fixture below is a
+    /// different way of being wrong, and none of them may be leniently
+    /// accepted into a value the gate would then compare against.
+    #[test]
+    fn a_release_whose_digest_is_malformed_is_refused_rather_than_offered() {
+        let sixty_four = "a".repeat(64);
+        for bad in [
+            // No algorithm qualifier: 64 hex characters that might be anything.
+            sixty_four.clone(),
+            // A different algorithm, whose length happens to fit.
+            format!("sha512:{sixty_four}"),
+            // Right prefix, too short -- a truncated compare's favourite input.
+            "sha256:abcdef".to_string(),
+            // Right prefix, right length, not hexadecimal.
+            format!("sha256:{}", "z".repeat(64)),
+            // Empty.
+            String::new(),
+        ] {
+            let mut server = mockito::Server::new();
+            let body = format!(
+                r#"{{"tag_name": "v1.2.0", "assets": [{{"name": "deskwarden-installer.exe",
+                   "browser_download_url": "https://example.com/i-installer.exe",
+                   "digest": "{bad}"}}]}}"#
+            );
+            let _m = server
+                .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+                .with_status(200)
+                .with_body(body)
+                .create();
+
+            let current = Version::parse("1.1.0").unwrap();
+            let result = check_for_update(&server.url(), &current, &build_api_agent());
+
+            assert!(
+                result.is_err(),
+                "the digest {bad:?} was accepted; a value the gate cannot trust must not \
+                 become an offered update"
+            );
+        }
+    }
+
+    /// The parser, directly, in both directions.
+    #[test]
+    fn a_well_formed_digest_parses_to_its_bytes_and_back() {
+        let parsed = parse_asset_digest(SHA256_OF_ABC).expect("the NIST vector is well-formed");
+        assert_eq!(
+            parsed.to_string(),
+            SHA256_OF_ABC.trim_start_matches("sha256:"),
+            "a parsed digest must render back as the hex it came from"
+        );
+
+        // Hex is case-insensitive, and GitHub's own casing is not something
+        // this crate should depend on.
+        let upper = format!("sha256:{}", SHA256_OF_ABC.trim_start_matches("sha256:").to_uppercase());
+        assert_eq!(
+            parse_asset_digest(&upper).expect("upper-case hex is still hex"),
+            parsed
+        );
+
+        // And the control: two different digests are not equal, so the
+        // equality above is not something every pair of these has.
+        assert_ne!(parsed, digest_of_byte("11"));
+    }
+
+    /// **The hasher computes SHA-256, over the whole file, in one pass.**
+    ///
+    /// Pinned against published vectors rather than against itself. The empty
+    /// case catches a hasher that never runs; the multi-chunk case catches a
+    /// streaming loop that drops or double-counts a chunk -- which a
+    /// single-read fixture cannot see, because it never crosses
+    /// [`HASH_CHUNK`].
+    #[test]
+    fn the_hasher_is_sha256_over_the_whole_stream() {
+        let dir = scratch_dir("hasher");
+
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            file_sha256(&empty).unwrap().to_string(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the published SHA-256 of the empty input"
+        );
+
+        let abc = dir.join("abc.bin");
+        std::fs::write(&abc, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&abc).unwrap(),
+            parse_asset_digest(SHA256_OF_ABC).unwrap()
+        );
+
+        // Larger than HASH_CHUNK, so the loop runs several times. A million
+        // 'a's is the third standard vector.
+        let long_bytes = "a".repeat(1_000_000);
+        let long = dir.join("long.bin");
+        std::fs::write(&long, long_bytes.as_bytes()).unwrap();
+        assert!(
+            long_bytes.len() > HASH_CHUNK,
+            "control: the fixture really does span more than one read"
+        );
+        assert_eq!(
+            file_sha256(&long).unwrap().to_string(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            "the published SHA-256 of one million 'a' characters"
+        );
+
+        // A file that is not there is an Err, never a hash of nothing: the
+        // empty input has a perfectly good digest, and confusing the two
+        // would make a missing installer indistinguishable from an empty one.
+        let missing = dir.join("not-here.bin");
+        assert!(file_sha256(&missing).is_err());
+        assert_ne!(
+            file_sha256(&empty).unwrap().to_string(),
+            String::new(),
+            "control: the empty file hashes to something, so the Err above is about absence"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The download pass refuses and DELETES an installer whose bytes are
+    /// not the ones the release published.**
+    ///
+    /// Served over a real socket by `mockito`, so the bytes travel the same
+    /// path a real download does. The pair below is one server response apart:
+    /// same code, same fixture size, different digest on the release.
+    #[test]
+    fn a_download_whose_digest_does_not_match_is_deleted_and_refused() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/deskwarden-9.9.9-installer.exe")
+            .with_status(200)
+            .with_body("abc")
+            .create();
+
+        let dir = scratch_dir("download-mismatch");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: format!("{}/deskwarden-9.9.9-installer.exe", server.url()),
+            // The release claims something the served body is not.
+            installer_sha256: digest_of_byte("11"),
+            body: String::new(),
+        };
+
+        let error = download_and_verify(&release, &dir, &build_download_agent(), NO_PROGRESS)
+            .expect_err("a download whose digest disagrees must not be a success");
+
+        assert!(
+            error.contains("SHA-256"),
+            "the refusal does not say what failed: {error}"
+        );
+        let written = dir.join(installer_file_name(&release.version));
+        assert!(
+            !written.exists(),
+            "the rejected download is still at {}; it must not be left in the cache directory \
+             where a later run -- or the user -- could execute it",
+            written.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The counterpart: a download whose digest DOES match is kept, and the
+    /// path handed back is the file that was hashed.
+    ///
+    /// Without this, the test above is satisfied by a download pass that
+    /// rejects everything -- which is precisely the updater this change
+    /// replaced.
+    #[test]
+    fn a_download_whose_digest_matches_is_kept_and_its_path_returned() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/deskwarden-9.9.9-installer.exe")
+            .with_status(200)
+            .with_body("abc")
+            .create();
+
+        let dir = scratch_dir("download-match");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: format!("{}/deskwarden-9.9.9-installer.exe", server.url()),
+            installer_sha256: parse_asset_digest(SHA256_OF_ABC).unwrap(),
+            body: String::new(),
+        };
+
+        let path = download_and_verify(&release, &dir, &build_download_agent(), NO_PROGRESS)
+            .expect("a download matching the published digest must be accepted");
+
+        assert_eq!(path, dir.join(installer_file_name(&release.version)));
+        assert!(path.exists(), "an ACCEPTED download was deleted");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"abc",
+            "the file left on disk is not the one that was served"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -780,7 +1338,7 @@ mod tests {
         let body = r#"{
             "tag_name": "v1.1.0",
             "assets": [
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let _m = server
@@ -802,7 +1360,7 @@ mod tests {
         let body = r#"{
             "tag_name": "v1.0.0",
             "assets": [
-                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
         }"#;
         let _m = server
@@ -963,9 +1521,9 @@ mod tests {
     /// *next* startup -- and this path stopped being near-unreachable when the
     /// bound became a 15s stall rather than a 600s total, so on a flaky link
     /// every retry now leaves another partial file in the cache directory for
-    /// the rest of the session. The signature-failure branch already cleaned
-    /// up after itself; this is the same courtesy on the branch that got
-    /// common.
+    /// the rest of the session. The verification-failure branch already
+    /// cleaned up after itself; this is the same courtesy on the branch that
+    /// got common.
     ///
     /// Stalls the body rather than the head on purpose: a failure before the
     /// response arrives never reaches `File::create` and so proves nothing
@@ -1004,13 +1562,15 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: format!("http://127.0.0.1:{port}/installer.exe"),
+            // Never reached: the transfer dies before anything is hashed. The
+            // value is irrelevant and deliberately unmatchable.
+            installer_sha256: digest_of_byte("cd"),
             body: String::new(),
         };
         let agent =
             crate::http_agent::bounded_stall(Duration::from_secs(1), Duration::from_secs(1));
 
-        let result =
-            download_and_verify(&release, "irrelevant-thumbprint", &dir, &agent, NO_PROGRESS);
+        let result = download_and_verify(&release, &dir, &agent, NO_PROGRESS);
 
         assert!(result.is_err(), "a transfer that stopped moving must not look like success");
         let partial = dir.join(installer_file_name(&release.version));
@@ -1022,25 +1582,140 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `apply_update` starts a process, so every test of it has to be certain
-    /// it cannot start one. These two are: the placeholder thumbprint can
-    /// never match a real signature, and neither of the files below is a
-    /// signed PE in the first place, so `verify_authenticode` fails before the
-    /// spawn is reached on either path.
-    #[test]
-    fn apply_update_refuses_an_installer_it_cannot_verify() {
-        let dir = scratch_dir("apply-unverifiable");
+    // -------------------------------------------------------------------
+    // THE GATE, OVER REAL FILES ON REAL DISK
+    //
+    // The routing tests further down answer `hash` by hand, which proves the
+    // ROUTING but says nothing about the hasher. These two run the production
+    // `file_sha256` over real bytes in a real directory, with only the process
+    // start substituted, and they are a matched pair on purpose: the refusal
+    // and the launch come out of the SAME call to `apply_update_with`, one
+    // digest apart. Either one alone is worthless -- a gate that refuses
+    // everything passes the first, and the shipped updater passed exactly that
+    // sort of test for four releases while never once applying an update.
+    // -------------------------------------------------------------------
+
+    /// What [`apply_over_real_file`] reports: the gate's verdict, every path
+    /// that reached the substituted launch, and the installer path the module
+    /// constructed.
+    type AppliedOnDisk = (Result<(), String>, Vec<PathBuf>, PathBuf);
+
+    /// Every path the substituted launch was asked to start, for the on-disk
+    /// pair below. Separate from the routing `Recorder`, which validates its
+    /// entries against generation-tagged synthetic directories these tests do
+    /// not use.
+    static DISK_LAUNCHES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Serialises the two on-disk tests, so [`DISK_LAUNCHES`] means one run.
+    static DISK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn disk_launch(path: &Path) -> Result<(), String> {
+        DISK_LAUNCHES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Runs `apply_update_with` over a REAL directory with the REAL hasher and
+    /// only the launch substituted, and reports what happened.
+    ///
+    /// `bytes` are written to the file `apply_update` will look for; `claimed`
+    /// is the digest the release publishes. Nothing else differs between the
+    /// two tests below.
+    fn apply_over_real_file(tag: &str, bytes: &[u8], claimed: Sha256Digest) -> AppliedOnDisk {
+        let _serial = DISK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        DISK_LAUNCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+
+        let dir = scratch_dir(tag);
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            installer_sha256: claimed,
             body: String::new(),
         };
-        std::fs::write(dir.join(installer_file_name(&release.version)), b"not a signed PE").unwrap();
+        let installer = dir.join(installer_file_name(&release.version));
+        std::fs::write(&installer, bytes).unwrap();
 
-        let result = apply_update(&dir, &release);
+        // The REAL `file_sha256`, not a substitute: these two tests are the
+        // only ones that exercise the hasher through the gate.
+        let env = UpdaterEnv::substitute(file_sha256, disk_launch);
+        let result = apply_update_with(&dir, &release, &env);
+        let launched =
+            DISK_LAUNCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        (result, launched, installer)
+    }
 
-        assert!(result.is_err(), "an installer that fails verification must not be launched");
-        std::fs::remove_dir_all(&dir).ok();
+    /// The published SHA-256 of `b"abc"`, written out rather than computed.
+    ///
+    /// A test that hashed the fixture with the same code under test would
+    /// agree with any hash function at all, including a broken one. This is
+    /// the standard NIST vector, so the positive case below also asserts that
+    /// [`file_sha256`] computes SHA-256 and not merely something consistent.
+    const SHA256_OF_ABC: &str =
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    /// **The actual attack: a file that is present, readable and well-formed,
+    /// and is not the release.**
+    ///
+    /// It is refused, no process is started, and -- the part a refusal alone
+    /// does not give you -- the rejected executable is DELETED. Left on disk
+    /// it would sit at the exact predictable path `apply_update` reconstructs,
+    /// where the next run of this same function, or a user in the cache
+    /// folder, could run it.
+    #[test]
+    fn an_installer_whose_bytes_are_not_the_release_is_refused_deleted_and_never_launched() {
+        let (result, launched, installer) = apply_over_real_file(
+            "apply-wrong-bytes",
+            b"a perfectly readable impostor",
+            parse_asset_digest(SHA256_OF_ABC).unwrap(),
+        );
+
+        let error = result.expect_err("an installer with the wrong bytes must not be a success");
+        assert!(
+            launched.is_empty(),
+            "an installer whose bytes are not the release reached the launch seam \
+             ({launched:?}); in production that is a process start"
+        );
+        assert!(
+            !installer.exists(),
+            "the rejected installer is still at {}; it must not be left where a later run or \
+             the user could execute it",
+            installer.display()
+        );
+        assert!(
+            error.contains("refusing to launch") && error.contains("SHA-256"),
+            "the refusal does not say what it refused or why: {error}"
+        );
+        std::fs::remove_dir_all(installer.parent().unwrap()).ok();
+    }
+
+    /// **The counterpart, from the same code path, one digest apart: a file
+    /// whose bytes ARE the release is launched.**
+    ///
+    /// This is the assertion whose absence let the shipped updater refuse
+    /// every release for four versions without a single red test. It is also
+    /// what says the deletion above is a consequence of the MISMATCH rather
+    /// than something `apply_update_with` does to every file it looks at.
+    #[test]
+    fn an_installer_whose_bytes_are_the_release_is_launched_and_kept() {
+        let (result, launched, installer) = apply_over_real_file(
+            "apply-right-bytes",
+            b"abc",
+            parse_asset_digest(SHA256_OF_ABC).unwrap(),
+        );
+
+        assert!(result.is_ok(), "the matching installer was refused: {result:?}");
+        assert_eq!(
+            launched,
+            vec![installer.clone()],
+            "the launch seam did not receive exactly the file the module constructed the path to"
+        );
+        assert!(
+            installer.exists(),
+            "an ACCEPTED installer was deleted; the deletion belongs to the refusal path only"
+        );
+        std::fs::remove_dir_all(installer.parent().unwrap()).ok();
     }
 
     /// The narrowing itself, asserted rather than left to the doc comment: the
@@ -1050,19 +1725,22 @@ mod tests {
     ///
     /// A directory holding a *differently* named executable therefore has
     /// nothing in it `apply_update` will touch, and the error says which file
-    /// it looked for.
+    /// it looked for. Safe to run against the PRODUCTION env -- no substituted
+    /// launch -- precisely because the file it names is not there: the hasher
+    /// fails to open it and the refusal happens before any spawn.
     #[test]
     fn apply_update_launches_only_the_file_the_download_pass_wrote() {
         let dir = scratch_dir("apply-constructs");
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            installer_sha256: digest_of_byte("11"),
             body: String::new(),
         };
         // A plausible decoy, sitting right beside where the real one would go.
-        std::fs::write(dir.join("setup.exe"), b"not a signed PE").unwrap();
+        std::fs::write(dir.join("setup.exe"), b"MZ not the one you want").unwrap();
 
-        let error = apply_update(&dir, &release).expect_err("nothing here is verifiable");
+        let error = apply_update(&dir, &release).expect_err("the named file is not there");
 
         let wanted = dir.join(installer_file_name(&release.version));
         assert!(
@@ -1075,50 +1753,32 @@ mod tests {
             !error.contains("setup.exe"),
             "apply_update went looking at a file the caller merely left lying around: {error}"
         );
+        assert!(
+            dir.join("setup.exe").exists(),
+            "apply_update deleted a file it was never asked about; the discard is for the \
+             installer it names, not for the directory"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The signer is a constant, not an argument, so no call site can weaken
-    /// it. If this ever becomes a parameter again, this stops compiling.
+    /// [`download_and_verify`]'s exact shape, named so the pin below reads as
+    /// one statement rather than as four lines of punctuation.
+    type DownloadFn = fn(
+        &ReleaseInfo,
+        &Path,
+        &crate::http_agent::StallBounded,
+        &dyn Fn(u64, Option<u64>),
+    ) -> Result<PathBuf, String>;
+
+    /// The expected digest is not something a caller supplies. If it ever
+    /// becomes a parameter again -- of `apply_update` or of
+    /// `download_and_verify` -- these lines stop compiling.
     #[test]
-    fn the_launch_time_signer_check_is_not_something_a_caller_supplies() {
-        assert_eq!(EXPECTED_SIGNER_THUMBPRINT, "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED");
-        // And the shape is pinned by the type system rather than by prose: a
-        // function pointer of exactly this signature. If `apply_update` grows
-        // back a `&Path` for the installer, or a caller-supplied thumbprint,
-        // this line stops compiling.
+    fn the_launch_time_digest_is_not_something_a_caller_supplies() {
         let narrowed: fn(&Path, &ReleaseInfo) -> Result<(), String> = apply_update;
         let _ = narrowed;
-    }
-
-    /// The decision [`apply_update`] makes immediately before it spawns, over
-    /// signatures built by hand -- the only way to reach it, since a test that
-    /// got there through a real file would need a real signed installer.
-    #[test]
-    fn the_launch_time_trust_decision_is_the_expected_signer() {
-        use crate::signature::SignatureInfo;
-        let info = |valid, thumbprint: Option<&str>| SignatureInfo {
-            valid,
-            thumbprint: thumbprint.map(str::to_string),
-            subject_dn: Some("CN=Deskwarden".to_string()),
-        };
-
-        // The one accepted case: a valid signature carrying exactly the
-        // constant, case-insensitively (thumbprints are hex).
-        assert!(installer_is_launchable(&info(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
-        assert!(installer_is_launchable(&info(
-            true,
-            Some(&EXPECTED_SIGNER_THUMBPRINT.to_ascii_lowercase())
-        )));
-
-        // A valid signature by SOMEONE ELSE is the case that matters: it is
-        // what a planted installer would carry, and it is what a check against
-        // a caller-supplied thumbprint would have accepted.
-        assert!(!installer_is_launchable(&info(true, Some("AABBCCDDEEFF00112233445566778899"))));
-        // ...and an invalid or absent signature, whoever it names.
-        assert!(!installer_is_launchable(&info(false, Some(EXPECTED_SIGNER_THUMBPRINT))));
-        assert!(!installer_is_launchable(&info(true, None)));
-        assert!(!installer_is_launchable(&info(false, None)));
+        let download: DownloadFn = download_and_verify;
+        let _ = download;
     }
 
     /// Pins the two production numbers against the failure each was chosen to
@@ -1160,7 +1820,6 @@ mod tests {
     // path that reaches the launch seam.
     // ---------------------------------------------------------------------
 
-    use crate::signature::SignatureInfo;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Mutex, MutexGuard};
 
@@ -1168,7 +1827,7 @@ mod tests {
     ///
     /// # This used to be `thread_local!`, and that was the defect
     ///
-    /// The previous shape of this harness kept `VERIFY_ANSWER`, `VERIFIED`
+    /// The previous shape of this harness kept `VERIFY_ANSWER`, `HASHED`
     /// and `LAUNCHED` in `thread_local!` storage and its doc called that a
     /// feature: "per-test state with no ordering assumption". It was a hole,
     /// and a measured one. Inserted into [`apply_update_with`] immediately
@@ -1204,7 +1863,7 @@ mod tests {
         /// # This tag used to be write-only, and that made the suite lie
         ///
         /// It was stamped onto every entry below and read by nothing:
-        /// `Session::launched()`/`verified()` were `.map(|(_, p)| p.clone())`
+        /// `Session::launched()`/`hashed()` were `.map(|(_, p)| p.clone())`
         /// over the whole vector, and [`assert_no_late_launch`] only asked
         /// whether that vector was empty. Measured on `0cd9fe0`, replacing
         /// `let generation = r.generation;` with `let generation = 0;` in
@@ -1222,18 +1881,17 @@ mod tests {
         /// lands after `Session::drop` has cleared, after the NEXT
         /// `Session::open` has cleared, and is therefore stamped with the new
         /// window's generation -- so
-        /// [`a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam`]
-        /// reported that an installer validly signed by someone else had
-        /// reached the launch seam, in a run where nothing of the sort
-        /// happened. Measured over 30 isolated `updater::` runs under
+        /// [`a_well_formed_installer_with_the_wrong_digest_never_reaches_the_launch_seam`]
+        /// reported that an installer with the wrong digest had reached the
+        /// launch seam, in a run where nothing of the sort happened. Measured over 30 isolated `updater::` runs under
         /// concurrent compilation: 6 red, across three different victims.
         ///
         /// So the tag is READ now, in two places that between them leave a
         /// stray nowhere to be silently attributed:
         ///
-        ///  * [`Session::launched`] and [`Session::verified`] go through
+        ///  * [`Session::launched`] and [`Session::hashed`] go through
         ///    [`entries_of_window`], which panics -- naming the WINDOW, not
-        ///    the signature -- on any entry stamped with a different one.
+        ///    the digest -- on any entry stamped with a different one.
         ///  * [`Session::drop`] bumps the generation to a value no session
         ///    owns before it releases [`ROUTE_LOCK`], and waits out
         ///    [`CLOSE_GRACE`] while still holding it. A launch arriving in
@@ -1242,9 +1900,9 @@ mod tests {
         ///    is no longer erased, and it can no longer be inherited.
         generation: u64,
         /// What the substitute `verify` answers on its next call.
-        answer: Option<Result<SignatureInfo, String>>,
+        answer: Option<Result<Sha256Digest, String>>,
         /// Every path the substitute `verify` was asked about.
-        verified: Vec<(u64, PathBuf)>,
+        hashed: Vec<(u64, PathBuf)>,
         /// Every path that reached the launch seam. **If this is ever
         /// non-empty when it should be empty, an unverified installer would
         /// have been started for real.**
@@ -1254,7 +1912,7 @@ mod tests {
     static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
         generation: 0,
         answer: None,
-        verified: Vec::new(),
+        hashed: Vec::new(),
         launched: Vec::new(),
     });
 
@@ -1276,16 +1934,16 @@ mod tests {
         r.launched.push((generation, path.to_path_buf()));
     }
 
-    fn substitute_verify(path: &Path) -> Result<SignatureInfo, String> {
+    fn substitute_hash(path: &Path) -> Result<Sha256Digest, String> {
         {
             let mut r = recorder();
             let generation = r.generation;
-            r.verified.push((generation, path.to_path_buf()));
+            r.hashed.push((generation, path.to_path_buf()));
         }
         recorder()
             .answer
             .take()
-            .expect("the test did not program a verify answer")
+            .expect("the test did not program a hash answer")
     }
 
     fn substitute_launch(path: &Path) -> Result<(), String> {
@@ -1315,7 +1973,7 @@ mod tests {
     /// [`assert_no_late_launch`] for the VERIFY recorder.
     ///
     /// `Session::open` asserted emptiness of `launched` and silently cleared
-    /// `verified`, so a verification that outlived its window left no trace
+    /// `hashed`, so a verification that outlived its window left no trace
     /// at all. A late verify starts no process -- this is the cosmetic half
     /// -- but it is the same evidence of a thread outliving the window that
     /// a late launch is, and swallowing it means the loud half is the only
@@ -1325,11 +1983,11 @@ mod tests {
     /// assertion, for the reason given on [`assert_no_late_launch`]:
     /// nothing in this suite legitimately leaves one behind, so written
     /// inline it would be inert and nobody would know.
-    fn assert_no_late_verify(verified: &[(u64, PathBuf)]) {
+    fn assert_no_late_hash(hashed: &[(u64, PathBuf)]) {
         assert!(
-            verified.is_empty(),
+            hashed.is_empty(),
             "a verification reached the seam AFTER the routing window that caused it \
-             had closed: {verified:?}. Nothing was started by it, but the thread that \
+             had closed: {hashed:?}. Nothing was started by it, but the thread that \
              did it outlived the window that asked for it"
         );
     }
@@ -1383,7 +2041,7 @@ mod tests {
             strays.is_empty(),
             "a {what} from a previous window arrived late: {strays:?}, read inside routing \
              window {window}. It is NOT this window's -- attributing it here is how a stray \
-             detached launch used to red an unrelated signature assertion with a message that \
+             detached launch used to red an unrelated gating assertion with a message that \
              was a false alarm. Whatever else this run reports, something reached the seam \
              after the window that caused it had closed"
         );
@@ -1483,7 +2141,7 @@ mod tests {
     }
 
     impl Session {
-        fn open(answer: Option<Result<SignatureInfo, String>>) -> Self {
+        fn open(answer: Option<Result<Sha256Digest, String>>) -> Self {
             let serial = ROUTE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let mut r = recorder();
             r.generation += 1;
@@ -1503,10 +2161,10 @@ mod tests {
             // exactly one test reds: the one that was actually holding the
             // stray.
             let late_launches = std::mem::take(&mut r.launched);
-            let late_verifies = std::mem::take(&mut r.verified);
+            let late_verifies = std::mem::take(&mut r.hashed);
             drop(r);
             assert_no_late_launch(&late_launches);
-            assert_no_late_verify(&late_verifies);
+            assert_no_late_hash(&late_verifies);
             Session { generation, _serial: serial }
         }
 
@@ -1514,8 +2172,8 @@ mod tests {
             entries_of_window(&recorder().launched, self.generation, "launch")
         }
 
-        fn verified(&self) -> Vec<PathBuf> {
-            entries_of_window(&recorder().verified, self.generation, "verify")
+        fn hashed(&self) -> Vec<PathBuf> {
+            entries_of_window(&recorder().hashed, self.generation, "verify")
         }
 
         /// Wait for the recorder to stop changing before it is read.
@@ -1531,9 +2189,9 @@ mod tests {
         /// lands under a generation no window owns (see [`Session::drop`]) and
         /// reds the next [`Session::open`] with a message about a late launch,
         /// rather than being inherited by the next window and reported as a
-        /// signature failure.
+        /// gate failure.
         fn settle(&self) {
-            // BOTH recorders, not just `launched`: a verify still arriving is
+            // BOTH recorders, not just `launched`: a hash still arriving is
             // a thread still running, and a window that stopped waiting while
             // one was in flight closes on top of it.
             let sizes = || {
@@ -1543,7 +2201,7 @@ mod tests {
                 // the reading below is unchanged.
                 SETTLE_POLLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let r = recorder();
-                (r.launched.len(), r.verified.len())
+                (r.launched.len(), r.hashed.len())
             };
             let mut last = sizes();
             let mut quiet_since = std::time::Instant::now();
@@ -1595,7 +2253,7 @@ mod tests {
         // generation is left where it is, for `Session::open`'s emptiness
         // assertion to find -- clearing it here is precisely what used to
         // erase the evidence.
-        r.verified.retain(|(g, _)| *g != generation);
+        r.hashed.retain(|(g, _)| *g != generation);
         r.launched.retain(|(g, _)| *g != generation);
         // Retire the generation. From here until the next `open` the recorder
         // stamps entries no session will ever claim.
@@ -1628,10 +2286,10 @@ mod tests {
         /// [`the_only_process_start_in_this_module_is_the_launch_seam`] read,
         /// and blind both of them to everything below it.
         fn substitute(
-            verify: fn(&Path) -> Result<SignatureInfo, String>,
+            hash: fn(&Path) -> Result<Sha256Digest, String>,
             launch: fn(&Path) -> Result<(), String>,
         ) -> Self {
-            Self { verify, launch }
+            Self { hash, launch }
         }
     }
 
@@ -1639,7 +2297,7 @@ mod tests {
     struct Routed {
         result: Result<(), String>,
         launched: Vec<PathBuf>,
-        verified: Vec<PathBuf>,
+        hashed: Vec<PathBuf>,
         /// The installer path THIS window's directory produces -- what a
         /// correct launch must equal. Carried out of the window rather than
         /// recomputed by the caller, because the window number is part of it.
@@ -1649,7 +2307,7 @@ mod tests {
     /// Runs `apply_update_with` against the recording seam, with `verify`
     /// programmed to answer `answer`, and reports every path that reached
     /// either half of the seam ON ANY THREAD.
-    fn route_recording(answer: Result<SignatureInfo, String>) -> Routed {
+    fn route_recording(answer: Result<Sha256Digest, String>) -> Routed {
         let session = Session::open(Some(answer));
 
         // A directory that does not exist and is never created: nothing on
@@ -1660,32 +2318,53 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            // The digest the release CLAIMS. Every routing case below is a
+            // statement about what the seam answers relative to this value.
+            installer_sha256: release_digest(),
             body: String::new(),
         };
-        let env = UpdaterEnv::substitute(substitute_verify, substitute_launch);
+        let env = UpdaterEnv::substitute(substitute_hash, substitute_launch);
         let result = apply_update_with(&dir, &release, &env);
         session.settle();
         Routed {
             result,
             launched: session.launched(),
-            verified: session.verified(),
+            hashed: session.hashed(),
             expected: routed_path(session.generation),
         }
     }
 
     /// [`route_recording`] for the cases that only care about `launch`.
-    fn route(answer: Result<SignatureInfo, String>) -> (Result<(), String>, Vec<PathBuf>) {
+    fn route(answer: Result<Sha256Digest, String>) -> (Result<(), String>, Vec<PathBuf>) {
         let routed = route_recording(answer);
         (routed.result, routed.launched)
     }
 
-    /// A `SignatureInfo` as `verify_authenticode` would return one.
-    fn signature(valid: bool, thumbprint: Option<&str>) -> SignatureInfo {
-        SignatureInfo {
-            valid,
-            thumbprint: thumbprint.map(str::to_string),
-            subject_dn: Some("CN=Deskwarden".to_string()),
-        }
+    /// A `Sha256Digest` built from one repeated hex byte. The routing cases
+    /// care only about whether two digests are the SAME one, never about what
+    /// any particular file hashes to, so a recognisable constant is clearer
+    /// here than a real hash would be.
+    fn digest_of_byte(byte: &str) -> Sha256Digest {
+        parse_asset_digest(&format!("sha256:{}", byte.repeat(32)))
+            .expect("the routing fixtures are well-formed digests")
+    }
+
+    /// The digest a routing window's release publishes -- the value the gate
+    /// in `apply_update_with` compares against.
+    fn release_digest() -> Sha256Digest {
+        digest_of_byte("11")
+    }
+
+    /// A well-formed digest that is NOT [`release_digest`].
+    ///
+    /// **This is the shape of the actual attack.** Not a missing file, not a
+    /// truncated one, not one that fails to parse: a perfectly readable,
+    /// perfectly well-formed installer sitting at exactly the path the module
+    /// constructs, whose bytes are somebody else's. Every "never reaches the
+    /// launch seam" assertion that used a MALFORMED input would pass on a
+    /// gate that only rejects malformed inputs.
+    fn wrong_digest() -> Sha256Digest {
+        digest_of_byte("22")
     }
 
     /// The path a routing window builds, for the assertions below to compare
@@ -1695,120 +2374,105 @@ mod tests {
         routing_dir(window).join(installer_file_name(&Version::parse("9.9.9").unwrap()))
     }
 
-    /// **The gate is consulted: a valid signature by SOMEONE ELSE is never
-    /// launched.**
+    /// **The gate is consulted: a well-formed installer with the WRONG
+    /// digest is never launched.**
     ///
-    /// This is the case that matters, because it is what a planted installer
-    /// carries -- a real, valid Authenticode signature, by a signer that is
-    /// not ours. `verify` succeeds, `installer_is_launchable` says no, and the
-    /// question is whether anything downstream cares. Deleting the `if`, or
-    /// neutralising it to a `let _`, makes `LAUNCHED` non-empty here.
+    /// This is the case that matters, because it is what a swapped installer
+    /// looks like -- a file that opens, reads and hashes perfectly well, whose
+    /// hash is simply not the one the release published. `hash` succeeds, the
+    /// comparison says no, and the question is whether anything downstream
+    /// cares. Deleting the `if`, or neutralising it to a `let _`, makes
+    /// `launched` non-empty here.
     #[test]
-    fn a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam() {
-        let (result, launched) =
-            route(Ok(signature(true, Some("AABBCCDDEEFF00112233445566778899"))));
+    fn a_well_formed_installer_with_the_wrong_digest_never_reaches_the_launch_seam() {
+        let (result, launched) = route(Ok(wrong_digest()));
 
         assert!(
             launched.is_empty(),
-            "an installer validly signed by someone other than the expected signer reached the \
-             launch seam ({launched:?}); in production that is a process start"
+            "an installer whose SHA-256 is not the released one reached the launch seam              ({launched:?}); in production that is a process start"
         );
-        let error = result.expect_err("a wrong-signer installer must not be a success");
+        let error = result.expect_err("a wrong-digest installer must not be a success");
         assert!(
-            error.contains("not signed by the expected signer"),
-            "the refusal does not say why: {error}"
+            error.contains(&wrong_digest().to_string())
+                && error.contains(&release_digest().to_string()),
+            "the refusal names neither what it found nor what it wanted: {error}"
         );
     }
 
-    /// An INVALID signature naming the right signer is not launched either --
-    /// a thumbprint match is not on its own a verdict.
+    /// A digest that differs from the release's in ONE BYTE is refused just as
+    /// flatly as one that differs in all of them.
+    ///
+    /// Written separately because "close" is where a lenient comparison hides:
+    /// a prefix match, a truncated compare, or a `starts_with` would pass the
+    /// test above -- where the two digests share no bytes at all -- and fail
+    /// here.
     #[test]
-    fn an_invalid_signature_never_reaches_the_launch_seam() {
-        let (result, launched) = route(Ok(signature(false, Some(EXPECTED_SIGNER_THUMBPRINT))));
+    fn a_digest_differing_in_one_byte_never_reaches_the_launch_seam() {
+        let mut off_by_one = release_digest();
+        off_by_one.0[31] ^= 0x01;
+        assert_ne!(off_by_one, release_digest(), "control: the fixture really does differ");
+
+        let (result, launched) = route(Ok(off_by_one));
 
         assert!(
             launched.is_empty(),
-            "an installer whose signature the OS rejected reached the launch seam ({launched:?})"
+            "an installer whose SHA-256 differs from the released one in a single byte              reached the launch seam ({launched:?})"
         );
         assert!(result.is_err());
     }
 
-    /// No thumbprint at all -- an unsigned file, or one whose certificate
-    /// could not be read -- is not launched.
-    #[test]
-    fn a_missing_thumbprint_never_reaches_the_launch_seam() {
-        let (result, launched) = route(Ok(signature(true, None)));
-
-        assert!(
-            launched.is_empty(),
-            "an installer carrying no signer thumbprint reached the launch seam ({launched:?})"
-        );
-        assert!(result.is_err());
-    }
-
-    /// `verify` returning `Err` -- the answer is UNKNOWN, not "untrusted" --
-    /// is also a refusal, and the failure is propagated rather than swallowed
+    /// `hash` returning `Err` -- the answer is UNKNOWN, not "matching" -- is
+    /// also a refusal, and the failure is propagated rather than swallowed
     /// into a default verdict.
     ///
-    /// This is the mutant shaped as "the result is ignored rather than
-    /// unused": a body that turns the `?` into an `unwrap_or(..)` of a
-    /// fabricated trusted `SignatureInfo` still USES `verify`, still USES
-    /// `installer_is_launchable`, and warns about nothing.
+    /// **This is the "we could not check" path, and it must not become
+    /// "proceed".** The mutant here is shaped as "the result is ignored rather
+    /// than unused": a body that turns the failure arm into an
+    /// `unwrap_or(release.installer_sha256)` still USES `hash`, still USES the
+    /// comparison, and warns about nothing.
     #[test]
-    fn an_unverifiable_installer_never_reaches_the_launch_seam() {
-        let (result, launched) = route(Err("the file could not be read as a signed object".into()));
+    fn an_installer_that_could_not_be_hashed_never_reaches_the_launch_seam() {
+        let (result, launched) = route(Err("the file could not be read".into()));
 
         assert!(
             launched.is_empty(),
-            "an installer that could not be verified at all reached the launch seam ({launched:?})"
+            "an installer that could not be hashed at all reached the launch seam              ({launched:?})"
         );
         let error = result.expect_err("an unknown verdict is not a success");
         assert!(
-            error.contains("the file could not be read as a signed object"),
-            "the verifier's own failure was swallowed: {error}"
+            error.contains("the file could not be read"),
+            "the hasher's own failure was swallowed: {error}"
         );
     }
 
     /// **The counterpart, without which every assertion above is vacuous:**
-    /// the trusted case IS launched, and with exactly the path the module
+    /// the matching case IS launched, and with exactly the path the module
     /// constructed -- not one the caller named, and not some other file in the
     /// same directory.
     ///
-    /// A gate that refuses everything passes the four tests above and is a
-    /// broken updater. A launcher that launches a DIFFERENT path than the one
-    /// it verified passes them too, and is the swap the re-verification exists
-    /// to close; the path equality here is what says the file that was
-    /// checked is the file that runs.
+    /// A gate that refuses everything passes the three tests above and is
+    /// exactly the updater this change exists to fix: the placeholder
+    /// thumbprint refused every release for four versions and no test
+    /// noticed, because nothing asserted that a GOOD update gets through.
+    ///
+    /// A launcher that launches a DIFFERENT path than the one it hashed
+    /// passes them too, and is the swap the re-hashing exists to close; the
+    /// path equality here is what says the file that was checked is the file
+    /// that runs.
     #[test]
-    fn the_trusted_installer_is_launched_and_it_is_the_file_that_was_verified() {
-        let Routed { result, launched, verified, expected } =
-            route_recording(Ok(signature(true, Some(EXPECTED_SIGNER_THUMBPRINT))));
+    fn the_matching_installer_is_launched_and_it_is_the_file_that_was_hashed() {
+        let Routed { result, launched, hashed, expected } = route_recording(Ok(release_digest()));
 
-        assert!(result.is_ok(), "the trusted installer was refused: {result:?}");
+        assert!(result.is_ok(), "the matching installer was refused: {result:?}");
         assert_eq!(
             launched,
             vec![expected],
             "the launch seam did not receive exactly the one path the module constructed"
         );
         assert_eq!(
-            verified, launched,
-            "the file that was VERIFIED is not the file that was LAUNCHED; the gap between \
-             those two paths is exactly where a swap goes"
+            hashed, launched,
+            "the file that was HASHED is not the file that was LAUNCHED; the gap between              those two paths is exactly where a swap goes"
         );
-    }
-
-    /// The gate is case-insensitive on the thumbprint (they are hex), the same
-    /// way [`the_launch_time_trust_decision_is_the_expected_signer`] says --
-    /// asserted here through the ROUTING rather than over the predicate.
-    #[test]
-    fn the_trusted_thumbprint_is_matched_case_insensitively_through_the_gate() {
-        let Routed { result, launched, expected, .. } = route_recording(Ok(signature(
-            true,
-            Some(&EXPECTED_SIGNER_THUMBPRINT.to_ascii_lowercase()),
-        )));
-
-        assert!(result.is_ok(), "a lower-cased thumbprint was refused: {result:?}");
-        assert_eq!(launched, vec![expected]);
     }
 
     /// **A launch on a thread this test did not create is still witnessed.**
@@ -1986,10 +2650,10 @@ mod tests {
     /// was write-only, a stray detached launch that landed after the recorder
     /// had been cleared was read as the NEXT window's launch -- and the next
     /// window happened to be
-    /// [`a_valid_signature_by_the_wrong_signer_never_reaches_the_launch_seam`],
-    /// so a run in which nothing was mis-signed reported that an installer
-    /// validly signed by someone else had reached the launch seam. Here that
-    /// is a different failure with a different message.
+    /// [`a_well_formed_installer_with_the_wrong_digest_never_reaches_the_launch_seam`],
+    /// so a run in which every digest matched reported that an installer with
+    /// the wrong one had reached the launch seam. Here that is a different
+    /// failure with a different message.
     ///
     /// Pure over the tag, so it is deterministic and touches no window: the
     /// payload of every launch in this module is a recorded no-op, never a
@@ -2066,7 +2730,7 @@ mod tests {
             // Restored before the lock is released, so this scratch state is
             // invisible to every other test.
             r.launched.clear();
-            r.verified.clear();
+            r.hashed.clear();
         }
         drop(session);
 
@@ -2094,12 +2758,12 @@ mod tests {
         assert_no_late_launch(&[(7, PathBuf::from(r"Z:\late-installer.exe"))]);
     }
 
-    /// The same control for [`assert_no_late_verify`], and for the same
+    /// The same control for [`assert_no_late_hash`], and for the same
     /// reason: no test here can leave one behind, so it must be handed one.
     #[test]
     #[should_panic(expected = "AFTER the routing window")]
-    fn a_late_verify_left_in_the_recorder_is_a_failure() {
-        assert_no_late_verify(&[(7, PathBuf::from(r"Z:\late-installer.exe"))]);
+    fn a_late_hash_left_in_the_recorder_is_a_failure() {
+        assert_no_late_hash(&[(7, PathBuf::from(r"Z:\late-installer.exe"))]);
     }
 
     // ---------------------------------------------------------------------
@@ -2116,16 +2780,24 @@ mod tests {
     /// The same hold `vault_window`'s
     /// `production_hands_the_window_the_real_functions` puts on its five spawn
     /// fields, and for the same measured reason: a wrapper written at module
-    /// level -- `fn verify_when_enabled(p: &Path) -> Result<SignatureInfo,
-    /// String> { if CHECKS_ENABLED { verify_authenticode(p) } else {
-    /// Ok(trusted()) } }` -- still spells the real name, still leaves
-    /// `production` defining nothing of its own, and is invisible to every
-    /// routing test above, because those substitute this very pointer. It is a
-    /// different address, so it fails here.
+    /// level -- `fn hash_when_enabled(p: &Path) -> Result<Sha256Digest,
+    /// String> { if CHECKS_ENABLED { file_sha256(p) } else {
+    /// Ok(whatever_the_release_said()) } }` -- still spells the real name,
+    /// still leaves `production` defining nothing of its own, and is invisible
+    /// to every routing test above, because those substitute this very
+    /// pointer. It is a different address, so it fails here.
+    ///
+    /// This matters more for `hash` than it did for the signature check it
+    /// replaced. The gate is an equality between what this function returns
+    /// and what the release published, so a `hash` that returned the
+    /// release's own digest would make the comparison agree with itself and
+    /// leave every routing test above still green.
     ///
     /// What this does NOT cover, plainly: it says the pointer is the right
-    /// FUNCTION, never what that function does. A hollowed-out
-    /// `verify_authenticode` passes this and is `signature.rs`'s problem.
+    /// FUNCTION, never what that function does. A hollowed-out `file_sha256`
+    /// passes this -- and is why
+    /// [`an_installer_whose_bytes_are_the_release_is_launched_and_kept`] pins
+    /// the hasher against a published NIST vector rather than against itself.
     ///
     /// And one profile caveat, measured rather than assumed: `fn_addr_eq`
     /// does not survive identical-code folding, so under this crate's release
@@ -2135,21 +2807,21 @@ mod tests {
     /// what `cargo test` builds and what every number in this file's ledger
     /// was measured under, the two are distinguished.
     #[test]
-    fn production_holds_the_real_verify_and_the_real_launch() {
+    fn production_holds_the_real_hash_and_the_real_launch() {
         let env = UpdaterEnv::production();
 
         // Typed `let`s rather than casts off the `fn` items, so each is a `fn`
         // POINTER of exactly the field's type before any address is taken: a
         // signature drift is a compile error here, not a silently different
         // address.
-        let real_verify: fn(&Path) -> Result<SignatureInfo, String> = verify_authenticode;
+        let real_hash: fn(&Path) -> Result<Sha256Digest, String> = file_sha256;
         let real_launch: fn(&Path) -> Result<(), String> = launch_installer;
 
         assert!(
-            std::ptr::fn_addr_eq(env.verify, real_verify),
+            std::ptr::fn_addr_eq(env.hash, real_hash),
             "`UpdaterEnv::production` hands the launcher something other than the real \
-             `verify_authenticode`. A wrapper, a forwarder or a flag-gated pass-through still \
-             SPELLS the name, and the routing tests cannot see it because they substitute this \
+             `file_sha256`. A wrapper, a forwarder or a flag-gated pass-through still SPELLS \
+             the name, and the routing tests cannot see it because they substitute this \
              pointer. This is the assertion it fails"
         );
         assert!(
@@ -2175,7 +2847,7 @@ mod tests {
         );
     }
 
-    /// The decoy [`production_holds_the_real_verify_and_the_real_launch`]
+    /// The decoy [`production_holds_the_real_hash_and_the_real_launch`]
     /// compares against: `launch`'s signature exactly, and nothing else.
     fn not_the_launcher(_: &Path) -> Result<(), String> {
         unreachable!("never called -- this exists to have an address")
@@ -2580,7 +3252,7 @@ mod tests {
     /// **[`UpdaterEnv::production`] is the only constructor a shipping build
     /// compiles.**
     ///
-    /// [`production_holds_the_real_verify_and_the_real_launch`] pins the value
+    /// [`production_holds_the_real_hash_and_the_real_launch`] pins the value
     /// `production()` builds. It is worth nothing if a shipping build has a
     /// SECOND constructor that some call site can reach instead -- a
     /// `pub fn permissive() -> Self` is one line, and the address test never

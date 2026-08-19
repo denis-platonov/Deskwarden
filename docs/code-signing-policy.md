@@ -8,6 +8,50 @@ free code signing programme for open source projects.
 
 ---
 
+## Status: not yet in effect
+
+**Deskwarden releases are not currently signed.** No certificate has been
+issued, the SignPath project has not been approved, and the two
+`Sign ... (SignPath)` steps in the release workflow are labelled TODO no-ops
+that print a line and sign nothing. Every release published so far is an
+unsigned build, and each one says so in its release notes.
+
+Everything below this section describes the policy that **will** apply once a
+certificate exists. It is written in the present tense because it is the
+commitment being made as a condition of the programme, not a description of
+controls already running. Where a statement is not true yet, it is not true
+yet; the section immediately below says what the project does in the meantime.
+
+### What is verified today, in place of a signature
+
+The application's self-update path verifies the installer it downloads against
+a **SHA-256 digest** published by the GitHub releases API for that asset, in
+the same TLS response that supplies the download URL. The downloaded file is
+hashed when it arrives and again immediately before it is launched, and any
+mismatch, malformed digest, absent digest, or unreadable file is a refusal:
+the file is deleted and nothing is started. See
+[`deskwarden/src/updater.rs`](../deskwarden/src/updater.rs).
+
+**This is not a substitute for code signing and is not described as one.** Its
+trust root is TLS to `api.github.com` plus the integrity of the
+`denis-platonov/deskwarden` account -- an attacker who can replace a release
+asset can generally replace the digest published beside it. A signature would
+let someone verify the publisher *without* trusting the distribution channel;
+a digest from that channel cannot. What the digest does establish is that the
+bytes which run are the bytes the API described, which catches corruption,
+truncation, and substitution in flight, and which is strictly more than the
+user got by downloading and running the installer by hand.
+
+Until 2026-08-19 the updater instead gated on an Authenticode thumbprint
+constant holding a placeholder value that could never match. Because releases
+are unsigned, that gate refused **every** update it was ever offered, so the
+self-update had never once succeeded and each release was installed manually
+with nothing checked at all. The digest check replaces it. When a certificate
+is issued, an Authenticode gate is intended to be added back **on top of** the
+digest check rather than in place of it.
+
+---
+
 ## What gets signed
 
 Two artifacts, both produced by the release workflow from a `vX.Y.Z` tag:
@@ -123,3 +167,8 @@ is not useful to someone deciding whether to trust a binary.
   practice from the tagged source, but this project does not currently publish
   a third-party rebuild or a provenance attestation that would let someone
   verify that independently.
+- **No signing at all yet.** See [Status](#status-not-yet-in-effect) above.
+  Until a certificate is issued, nothing in this document about signatures
+  describes a control that is running, and the update path's only integrity
+  check is the SHA-256 comparison described there -- whose trust root is the
+  GitHub account and the TLS connection to it, not a publisher identity.

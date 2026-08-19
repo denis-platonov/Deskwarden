@@ -954,6 +954,11 @@ impl Preview {
             version: semver::Version::parse("0.9.0").unwrap(),
             installer_download_url: "https://example.invalid/deskwarden-0.9.0-installer.exe"
                 .to_string(),
+            installer_sha256: deskwarden::updater::parse_asset_digest(&format!(
+                "sha256:{}",
+                "a".repeat(64)
+            ))
+            .unwrap(),
             body: concat!(
                 "Added\n",
                 "- The update flow moved out of the tray and onto this page.\n",
