@@ -24,7 +24,10 @@
 //! note there). This file is only `fn main()` and the startup sequence.
 
 use deskwarden::accounts::{self, account_label, Account};
-use deskwarden::app::{fill_from_vault, handle_match, match_entries, pump_windows_messages};
+use deskwarden::app::{
+    fill_from_vault, handle_match, match_entries, pump_windows_messages, HasPasswordField, Matched,
+    Open,
+};
 use deskwarden::backend_policy;
 use deskwarden::bw_path;
 // `BACKEND_OP_TIMEOUT`: the upper bound on how long a legitimate backend
@@ -1388,6 +1391,12 @@ fn main() {
     // forever, so "Dismiss" never dismissed).
     let mut last_dispatched_hwnd: Option<isize> = None;
 
+    // The password-field probe's memory, owned by `run` and borrowed per
+    // event. It lives out here rather than inside `process_foreground_event`
+    // for the obvious reason: a throttle rebuilt on every event throttles
+    // nothing.
+    let mut field_probe_memo = deskwarden::app::PasswordFieldProbe::new();
+
     // The process id of the last real (not our own) foreground window, kept
     // up to date alongside every event below. "Add app..." defaults its
     // process picker to this -- the app the user was just in -- rather than
@@ -1417,6 +1426,7 @@ fn main() {
             estate.settings.prompt_on_match,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
+            &mut FieldProbe { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE },
             &deskwarden::injector::sequence::REAL_NOTIFIER,
             &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
         );
@@ -2390,6 +2400,7 @@ fn main() {
                 estate.settings.prompt_on_match,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE },
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
                 &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
             );
@@ -2870,6 +2881,60 @@ fn describe_signer(subject_dn: Option<&str>) -> String {
     }
 }
 
+/// The password-field question as `process_foreground_event` is given it: the
+/// memory that throttles it, and the function that answers it.
+///
+/// **An `fn` pointer, not a call inside the body.** `mod tests` drives
+/// `process_foreground_event` end to end with a recording injector, and the
+/// real answer is a cross-process COM call against a real window -- which no
+/// test here may make. A `cfg(test)` branch is banned crate-wide
+/// (`job_object::nothing_in_this_crate_is_compiled_differently_when_it_is_tested`),
+/// so the substitution is the same `fn`-pointer idiom `VaultFrameEnv` uses:
+/// production names [`REAL_PASSWORD_FIELD_PROBE`], a test names its own
+/// function, and the code under test is byte-for-byte the shipped code.
+struct FieldProbe<'a> {
+    memo: &'a mut deskwarden::app::PasswordFieldProbe,
+    ask: fn(isize) -> HasPasswordField,
+}
+
+impl FieldProbe<'_> {
+    /// The answer for `hwnd`, through the throttle.
+    ///
+    /// `Instant::now()` is read here rather than passed in because this is the
+    /// one place with no decision in it: `PasswordFieldProbe::ask` takes the
+    /// clock as a parameter precisely so that the throttle's behaviour over
+    /// time is driven by a test with the clock in its hand, and this line is
+    /// what supplies the real one.
+    fn ask(&mut self, hwnd: isize) -> HasPasswordField {
+        self.memo.ask(hwnd, std::time::Instant::now(), self.ask)
+    }
+}
+
+/// The production answer: ask UI Automation, and map the three outcomes onto
+/// the three variants **without collapsing any of them**.
+///
+/// An `Err` is `Unknown`, never `No`. The distinction is the whole reason
+/// `HasPasswordField` has three variants: `disposition` treats both as
+/// silence today, so the mapping is currently invisible -- but a future arm
+/// that treated `No` as "definitely an ordinary window" would be wrong about
+/// every window UI Automation could not read, and that would be a bug written
+/// at this line rather than at that one.
+fn real_password_field_probe(hwnd: isize) -> HasPasswordField {
+    match deskwarden::injector::ui_automation::window_has_password_field(hwnd) {
+        Ok(true) => HasPasswordField::Yes,
+        Ok(false) => HasPasswordField::No,
+        Err(e) => {
+            log::debug!("could not ask hwnd {hwnd} whether it has a password field: {e:?}");
+            HasPasswordField::Unknown
+        }
+    }
+}
+
+/// The production probe function, named and not called -- the same shape as
+/// `app::REAL_OVERLAY`, so that the one line no test can execute is a
+/// reference with no expression in it for a mutation to hide in.
+const REAL_PASSWORD_FIELD_PROBE: fn(isize) -> HasPasswordField = real_password_field_probe;
+
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
 ///
@@ -2899,6 +2964,10 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     prompt_on_match: bool,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
+    // The password-field question, memoised. Borrowed for one event like
+    // `reprompt` above, because the memory has to outlive the call for the
+    // throttle to throttle anything.
+    field_probe: &mut FieldProbe<'_>,
     notifier: &dyn Notifier,
     // The re-prompt scoping, borrowed for the duration of one event rather
     // than owned here: the proof it carries has to outlive this call for
@@ -2944,26 +3013,60 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // choice. The field is still parsed and preserved -- see
     // `AppMatch::trigger` -- so an item this build writes is still readable
     // by v0.5.0.
-    if let Some((item_id, _m)) = engine.lookup(event) {
-        log::info!(
-            "matched {} to vault item {item_id} ({:?})",
-            deskwarden::app::window_label(&event.exe_name, &event.title),
-            deskwarden::app::match_disposition(prompt_on_match)
-        );
-        if let Some(armed) =
-            handle_match(
-                cache,
-                injector,
-                fill_stats,
-                item_id,
-                prompt_on_match,
-                event,
-                notifier,
-                reprompt,
-            )
-        {
-            *pending_hotkey_fill = Some(armed);
+    let matched = match engine.lookup(event) {
+        Some((item_id, _m)) => Matched::Yes(item_id),
+        None => Matched::No,
+    };
+
+    // **The probe is asked only on the unmatched branch, and `disposition`'s
+    // `a_matched_window_ignores_the_field_answer_entirely` is what licenses
+    // that.** A matched window costs nothing extra; an unmatched one costs one
+    // subtree walk, throttled. `Unknown` here is not a guess -- it is the
+    // honest record that the question was not put. See `PasswordFieldProbe`
+    // for the measurement.
+    let field = match matched {
+        Matched::Yes(_) => HasPasswordField::Unknown,
+        Matched::No => field_probe.ask(event.hwnd),
+    };
+
+    match deskwarden::app::disposition(matched, field) {
+        Open::Match(item_id) => {
+            log::info!(
+                "matched {} to vault item {item_id} ({:?})",
+                deskwarden::app::window_label(&event.exe_name, &event.title),
+                deskwarden::app::match_disposition(prompt_on_match)
+            );
+            if let Some(armed) =
+                handle_match(
+                    cache,
+                    injector,
+                    fill_stats,
+                    item_id,
+                    prompt_on_match,
+                    event,
+                    notifier,
+                    reprompt,
+                )
+            {
+                *pending_hotkey_fill = Some(armed);
+            }
         }
+        Open::NoMatch => {
+            // **The trigger, and nothing on screen yet.** Task 2 of the plan
+            // replaces this with design 3a's card; this commit is the second
+            // question and the route to it, which is the part with the cost
+            // and the risk in it. Nothing is armed and nothing is typed: with
+            // no item there is no id for `pending_hotkey_fill` to carry and no
+            // credentials to fill, which is also why `handle_match` is not
+            // reached and why `reprompt` -- a gate defined over an existing
+            // item -- is not consulted here. See
+            // `the_no_match_path_touches_neither_the_hotkey_nor_the_reprompt`.
+            log::info!(
+                "no vault item matches {}, and it has a password field",
+                deskwarden::app::window_label(&event.exe_name, &event.title)
+            );
+        }
+        Open::Nothing => {}
     }
 }
 
@@ -20572,6 +20675,25 @@ mod tests {
             deskwarden::injector::sequence::RecordingNotifier::default()
         }
 
+        /// The password-field answer for a dispatch test: **no**, which is
+        /// what every fixture in this file describes.
+        ///
+        /// It is here rather than `REAL_PASSWORD_FIELD_PROBE` for the reason
+        /// the whole `FieldProbe` seam exists: the real answer is a
+        /// cross-process COM call against a real window, and no test in this
+        /// crate may probe one. Answering `No` also keeps every existing
+        /// dispatch assertion meaning exactly what it meant before this seam
+        /// was added -- an unmatched window in these fixtures reaches
+        /// `Open::Nothing`, which is the silence they were written against.
+        fn no_password_field(_hwnd: isize) -> HasPasswordField {
+            HasPasswordField::No
+        }
+
+        /// The other answer, for the tests that drive the new trigger.
+        fn has_password_field(_hwnd: isize) -> HasPasswordField {
+            HasPasswordField::Yes
+        }
+
         /// The re-prompt scoping for a dispatch test, and **the reason it is
         /// safe for one to exist here.**
         ///
@@ -20745,6 +20867,7 @@ mod tests {
             let (stats, _path) = scratch_fill_stats();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
 
             process_foreground_event(
                 &window("Ledgerline.exe", "Ledgerline -- Invoices", 0x4321),
@@ -20755,6 +20878,7 @@ mod tests {
                 false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -20777,6 +20901,172 @@ mod tests {
             assert_eq!(last_dispatched_hwnd, Some(0x4321));
         }
 
+        /// **The second trigger, end to end through the real dispatch -- and
+        /// the two things it must NOT touch.**
+        ///
+        /// `disposition`'s own tests hold the decision; this holds the wiring,
+        /// which is the half that has repeatedly been the defect in this file.
+        /// An unmatched window with a password field must reach `Open::NoMatch`
+        /// and, from there:
+        ///
+        /// * **arm nothing.** There is no item, so there is no id for
+        ///   `pending_hotkey_fill` to carry, and a `Some` here would mean a
+        ///   later Ctrl+Alt+B fired at a window with no credentials behind it.
+        /// * **type nothing.** `Filled` empty. The no-match card offers a user
+        ///   a way forward; it never types.
+        /// * **not reach the re-prompt gate at all.** `permitted_by_reprompt`
+        ///   is defined over an existing item and cannot be asked without one.
+        ///   `strict_reprompt()` below is a gate that would REFUSE if it were
+        ///   consulted, and the assertion is that nothing was refused because
+        ///   nothing was asked -- the fill path was never entered.
+        ///
+        /// The bridge is pointed at a closed port, so any arm that read the
+        /// vault would fail rather than silently succeed.
+        #[test]
+        fn an_unmatched_window_with_a_password_field_arms_nothing_and_types_nothing() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            // Deliberately empty: nothing in the vault claims this window.
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+
+            process_foreground_event(
+                &window("AtlasLicence.exe", "Atlas Licence", 0x777),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut probe_memo, ask: has_password_field },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert!(
+                filled.seen().is_empty(),
+                "the no-match path typed something. There is no item behind this window, so \
+                 whatever was typed came from somewhere it should not have"
+            );
+            assert_eq!(
+                pending_hotkey_fill, None,
+                "the no-match path armed the fill hotkey. With no item id there is nothing to \
+                 arm WITH, so a `Some` here is a fabricated or leftover id, and Ctrl+Alt+B \
+                 would later fire at this window carrying it"
+            );
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x777),
+                "control: the event really did get past the dispatch rules and reach the \
+                 decision. Without this, the three assertions above would all pass against an \
+                 event that was discarded before anything ran"
+            );
+        }
+
+        /// **The silence control, at the dispatch level rather than the pure
+        /// one.** Same fixture as above, one input changed: the window has no
+        /// password field. Nothing may happen -- and `last_dispatched_hwnd`
+        /// proves the event was processed rather than dropped, so the silence
+        /// is a decision and not an accident of the harness.
+        ///
+        /// Paired with the test above, these two differ in exactly one
+        /// argument, which is what makes the probe's answer observably
+        /// load-bearing in production wiring and not just in `disposition`.
+        #[test]
+        fn an_unmatched_window_with_no_password_field_is_still_silence() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+
+            process_foreground_event(
+                &window("Notepad.exe", "Untitled - Notepad", 0x778),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert!(filled.seen().is_empty(), "an ordinary window was filled into");
+            assert_eq!(pending_hotkey_fill, None, "an ordinary window armed the hotkey");
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x778),
+                "control: the event reached the decision, so the silence above is the \
+                 decision's answer and not a dropped event"
+            );
+        }
+
+        /// **The probe is not asked about a window the vault already matched.**
+        ///
+        /// This is the whole of the laziness, and it is worth a test because it
+        /// is a cost claim rather than a behaviour claim: `disposition` answers
+        /// `Open::Match` whatever the field says, so a call site that probed
+        /// unconditionally would pass every other test in this file while
+        /// adding a measured median of 27ms -- and a p90 of 133ms -- to every
+        /// matched window the user focuses.
+        ///
+        /// The probe function panics. That is the assertion: if the dispatch
+        /// asks it about a matched window, this test fails loudly rather than
+        /// by a count nobody reads.
+        #[test]
+        fn a_matched_window_is_never_probed_for_a_password_field() {
+            fn must_not_be_asked(_hwnd: isize) -> HasPasswordField {
+                panic!(
+                    "the password-field probe was run against a window the vault already \
+                     matched. The answer cannot change that window's disposition, so this is a \
+                     measured 27ms median (133ms p90) of the foreground app's UI thread spent \
+                     on a question with no consumer"
+                );
+            }
+
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[(
+                "1",
+                AppMatch::for_process("Ledgerline.exe", TriggerMode::Hotkey),
+            )]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+
+            process_foreground_event(
+                &window("Ledgerline.exe", "Ledgerline", 0x779),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                false,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut probe_memo, ask: must_not_be_asked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert_eq!(
+                pending_hotkey_fill,
+                Some(("1".to_string(), 0x779)),
+                "control: the window really was matched and really did reach `handle_match`. \
+                 Without this the panic above would be un-triggerable for the trivial reason \
+                 that nothing ran"
+            );
+        }
+
         /// **The differing half of the fixture above.** Same setting, a
         /// different stored `trigger` -- and the same outcome, which is what
         /// "the per-item mode no longer decides anything" actually means. A
@@ -20796,6 +21086,7 @@ mod tests {
                     engine_with(&[(id, AppMatch::for_process("Ledgerline.exe", trigger))]);
                 let mut pending_hotkey_fill = None;
                 let mut last_dispatched_hwnd = None;
+                let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
                 process_foreground_event(
                     &window("Ledgerline.exe", "Ledgerline", 0x99),
                     &cache,
@@ -20805,6 +21096,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
+                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -20842,6 +21134,7 @@ mod tests {
             let (stats, _path) = scratch_fill_stats();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
 
             process_foreground_event(
                 &window("Solitaire.exe", "Solitaire", 0x11),
@@ -20852,6 +21145,7 @@ mod tests {
                 false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
                 &recorder(),
                 &mut no_reprompt(),
             );
@@ -20876,6 +21170,7 @@ mod tests {
             let (stats, _path) = scratch_fill_stats();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
 
             let lines = captured_logs(|| {
                 process_foreground_event(
@@ -20887,6 +21182,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
+                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
                     &recorder(),
                     &mut no_reprompt(),
                 );
@@ -20921,6 +21217,7 @@ mod tests {
             let (stats, _path) = scratch_fill_stats();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
 
             let lines = captured_logs(|| {
                 process_foreground_event(
@@ -20932,6 +21229,7 @@ mod tests {
                     false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
+                    &mut FieldProbe { memo: &mut probe_memo, ask: no_password_field },
                     &recorder(),
                     &mut no_reprompt(),
                 );

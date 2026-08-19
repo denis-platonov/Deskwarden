@@ -5,7 +5,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationValuePattern, TreeScope_Descendants,
-    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ValuePatternId,
+    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
+    UIA_ValuePatternId,
 };
 
 /// A UTF-16 string handle whose buffer [`set_value_wiping`] zeroes before the
@@ -198,6 +199,67 @@ pub fn focused_is_masked() -> Result<bool> {
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
         Ok(automation.GetFocusedElement()?.CurrentIsPassword()?.as_bool())
+    }
+}
+
+/// Whether the window `hwnd` contains **any** masked field.
+///
+/// The question the no-match overlay is built on: `fill_via_ui_automation`
+/// asks `CurrentIsPassword` of every Edit it found, but it only runs against a
+/// window the vault already matched, on a path the user has already waited
+/// for. This asks the same property of a window nothing matched, on the focus
+/// change itself -- a hot path -- so it is deliberately the *cheapest* shape of
+/// the question:
+///
+/// * **`FindFirst`, not `FindAll`.** One cross-process round trip that stops at
+///   the first hit, rather than one for the list plus one `CurrentIsPassword`
+///   per element. On a login window the answer is usually the second or third
+///   Edit; on an ordinary window there is no hit and both shapes walk the whole
+///   subtree, so the saving is on the yes case and the cost of the no case is
+///   the same either way. That no case is what
+///   [`crate::app::PasswordFieldProbe`]'s throttle exists for.
+/// * **The `IsPassword` property is in the condition**, so the filtering
+///   happens in the provider rather than as a property fetch per element from
+///   this process.
+/// * The control type is still ANDed in, because `IsPassword` alone would also
+///   admit a non-Edit provider that reports the property, and every field this
+///   app has ever filled is an Edit.
+///
+/// `Err` means the question could not be asked -- no apartment, a window that
+/// has gone away, a provider that does not answer. The caller must treat that
+/// as *unknown*, not as `false`: see [`crate::app::disposition`], where
+/// `HasPasswordField::Unknown` opens nothing, so a window we could not read is
+/// silent exactly as it is today rather than guessing a card onto the screen.
+pub fn window_has_password_field(hwnd: isize) -> Result<bool> {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+            log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
+        }
+
+        let automation: IUIAutomation =
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+
+        let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))?;
+
+        let is_edit = automation.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_EditControlTypeId.0),
+        )?;
+        let is_password = automation
+            .CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(true))?;
+        let masked_edit = automation.CreateAndCondition(&is_edit, &is_password)?;
+
+        // `FindFirst` answers a null element rather than an error when nothing
+        // matches, which `windows-rs` surfaces as `Err`. So "not found" and
+        // "could not ask" arrive the same way here, and the conservative
+        // reading is the one that keeps today's behaviour: no hit means no
+        // card. `Ok(false)` and `Err` are therefore both silence at the
+        // disposition, and the distinction is kept only for the log.
+        match root.FindFirst(TreeScope_Descendants, &masked_edit) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 }
 

@@ -1020,6 +1020,207 @@ pub fn match_disposition(prompt_on_match: bool) -> MatchDisposition {
     }
 }
 
+/// Whether the match engine recognised the foreground window.
+///
+/// A two-variant enum rather than the `Option<(String, AppMatch)>` the engine
+/// answers, because [`disposition`] must be callable with no vault, no cache
+/// and no `AppMatch` -- and because the id is the only part of the engine's
+/// answer the decision uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Matched<'a> {
+    /// Nothing in the vault claims this window.
+    No,
+    /// This vault item id claims it.
+    Yes(&'a str),
+}
+
+/// Whether the foreground window contains a masked field, as
+/// [`crate::injector::ui_automation::window_has_password_field`] reports it.
+///
+/// **`Unknown` is a variant and not a `false`.** UI Automation can fail to
+/// answer -- no apartment, a window that closed between the focus event and the
+/// probe, a provider that exposes nothing -- and it is also what the *matched*
+/// path passes, because that path never asks (see [`disposition`]'s note on
+/// laziness). Folding either case into `No` would be a claim the code did not
+/// make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HasPasswordField {
+    /// A masked field was found.
+    Yes,
+    /// The window was read and has no masked field.
+    No,
+    /// The question was not asked, or could not be answered.
+    Unknown,
+}
+
+/// What focusing this window should put on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Open<'a> {
+    /// The matched-item card (design 2a), for this item id.
+    Match(&'a str),
+    /// The no-match card (design 3a).
+    NoMatch,
+    /// Nothing at all -- the silence the app has always kept.
+    Nothing,
+}
+
+/// **The whole of the "does the overlay open, and as what" decision, as a pure
+/// function.**
+///
+/// Until this existed the overlay had exactly one trigger -- the match engine
+/// said yes -- and "the vault has nothing for this window" was indistinguishable
+/// from "Deskwarden is broken", because both were silence. This adds the second
+/// question and keeps the answer in one place nothing needs a window to reach.
+///
+/// **The control that stops this becoming "always open" is the third arm.** An
+/// ordinary window -- a text editor, a file manager, a browser on a page with
+/// no login -- matches nothing and has no masked field, and it must still be
+/// silent. A card that appears over every window the vault does not know is
+/// not a feature, it is a popup. `an_ordinary_window_with_no_password_field_is_still_silence`
+/// is the test that holds it, and it is the first one written.
+///
+/// **`Matched::Yes` ignores the field entirely, and that is what makes the
+/// probe lazy.** The caller is expected to ask
+/// [`crate::injector::ui_automation::window_has_password_field`] *only* on the
+/// unmatched branch and to pass [`HasPasswordField::Unknown`] otherwise -- so a
+/// window the vault already recognises costs nothing extra. Passing `Unknown`
+/// there is not a lie: the question genuinely was not asked. The measured cost
+/// of asking it is why this matters; see [`PasswordFieldProbe`].
+pub fn disposition<'a>(matched: Matched<'a>, field: HasPasswordField) -> Open<'a> {
+    match matched {
+        Matched::Yes(item_id) => Open::Match(item_id),
+        Matched::No => match field {
+            HasPasswordField::Yes => Open::NoMatch,
+            // Both silence, and deliberately: a window we could not read is
+            // treated exactly as today's build treats every unmatched window.
+            // Guessing a card onto the screen from an unanswered question is
+            // the failure mode the third arm above exists to prevent, and
+            // `Unknown` is the case with the least evidence of all.
+            HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
+        },
+    }
+}
+
+/// How long an answer about one window stays good, in the absence of any
+/// reason to think the window changed.
+///
+/// See [`PasswordFieldProbe`] for the measurement this number is chosen
+/// against. Short enough that a window the user comes back to a minute later
+/// is re-read (a single-page app can navigate to a sign-in form without its
+/// `HWND` changing); long enough that cycling through open windows with
+/// Alt+Tab costs one probe per window rather than one per keystroke.
+pub const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many windows' answers are remembered at once.
+///
+/// One entry -- the shape `last_dispatched_hwnd` uses -- would make alternating
+/// between two windows cost a full probe every time, which is the commonest
+/// thing a user does. Eight covers an ordinary Alt+Tab set; the store is a
+/// `Vec` because at this size a scan beats a hash and the code stays readable.
+pub const PROBE_MEMORY: usize = 8;
+
+/// One remembered answer.
+#[derive(Debug, Clone, Copy)]
+struct ProbedWindow {
+    hwnd: isize,
+    answer: HasPasswordField,
+    at: std::time::Instant,
+}
+
+/// **The throttle in front of the UI Automation probe, and the reason it is
+/// not optional.**
+///
+/// [`crate::injector::ui_automation::window_has_password_field`] is a
+/// cross-process COM call that walks the foreground window's whole
+/// accessibility subtree, and when the answer is *no* -- the common case, since
+/// most focused windows are not login windows -- there is no early exit and it
+/// walks all of it. Measured over the 29 visible top-level windows of a real
+/// desktop, with the `IUIAutomation` object reused so the number is the walk
+/// and not the setup:
+///
+/// ```text
+/// min 1.7ms   median 27.4ms   p90 133.4ms   max 200.0ms
+/// ```
+///
+/// `CoCreateInstance(CUIAutomation)` is 8.5ms cold and 0.5ms warm, so the
+/// setup is not where the time goes -- the tree walk is. The tail is
+/// Chromium- and Electron-hosted windows: a Teams chat, a Chrome profile and
+/// File Explorer's browser pane were the worst three.
+///
+/// **That is too expensive to pay on every foreground event**, and the cost
+/// lands on the *provider* -- the UI thread of the app the user just switched
+/// to -- so it is felt as the newly focused app being slow, not as Deskwarden
+/// being slow. Paid once per newly focused window it is acceptable; paid
+/// repeatedly for the same window it is a stutter with no possible new answer
+/// to show for it.
+///
+/// So the throttle is **an interval and a change gate**, and both halves are
+/// load-bearing:
+///
+/// * **The change gate** is the map key: a *different* window is a different
+///   question and is probed at once, with no wait. A throttle that were only
+///   an interval would make the user wait to find out about a window it had
+///   never seen.
+/// * **The interval** ([`PROBE_TTL`]) is what stops the *same* window being
+///   re-asked. A window that has not changed cannot have a different answer,
+///   so re-walking its subtree buys nothing. A throttle that were only a
+///   change gate would re-ask the same window forever as the user alternated
+///   between two apps.
+///
+/// `dispatch::should_dispatch` already suppresses a repeat foreground event
+/// for the same `HWND`, so in the ordinary case this cache is not what saves
+/// the call. It is here for the cases that check does not cover -- an app that
+/// recreates its top-level window, an Alt+Tab cycle through a set, a window
+/// re-focused after an excursion -- and because the probe's own memory should
+/// not depend on an unrelated dispatch rule staying the way it is.
+///
+/// **The probe is a parameter of [`Self::ask`], not a call inside it**, and
+/// the clock is too. That is what lets the whole of this be driven by a test
+/// that counts calls and moves time by hand, with no COM apartment and no real
+/// window anywhere near it.
+#[derive(Debug, Default)]
+pub struct PasswordFieldProbe {
+    /// Most-recently-answered first.
+    seen: Vec<ProbedWindow>,
+}
+
+impl PasswordFieldProbe {
+    /// A probe that has never asked anything.
+    pub fn new() -> Self {
+        Self { seen: Vec::new() }
+    }
+
+    /// The answer for `hwnd` at `now`, asking `probe` only if this window has
+    /// no answer still inside [`PROBE_TTL`].
+    ///
+    /// Returns the answer, so the caller cannot tell a cached answer from a
+    /// fresh one -- which is the point: the decision downstream must not
+    /// depend on whether the probe was actually run.
+    pub fn ask(
+        &mut self,
+        hwnd: isize,
+        now: std::time::Instant,
+        probe: impl FnOnce(isize) -> HasPasswordField,
+    ) -> HasPasswordField {
+        if let Some(hit) = self
+            .seen
+            .iter()
+            .find(|w| w.hwnd == hwnd && now.duration_since(w.at) < PROBE_TTL)
+        {
+            return hit.answer;
+        }
+
+        let answer = probe(hwnd);
+        // Any stale or superseded entry for this window goes first, so one
+        // window never occupies two slots and a fresh answer cannot be
+        // shadowed by the expired one it replaces.
+        self.seen.retain(|w| w.hwnd != hwnd);
+        self.seen.insert(0, ProbedWindow { hwnd, answer, at: now });
+        self.seen.truncate(PROBE_MEMORY);
+        answer
+    }
+}
+
 /// **Whether a match arms the fill hotkey. Always.**
 ///
 /// A function rather than a literal `Some(...)` inside [`handle_match`] so
@@ -4980,6 +5181,234 @@ mod match_disposition_tests {
                 MatchDisposition::Nothing => {}
             }
         }
+    }
+}
+
+/// The overlay's second trigger: whether a window with no match, but with a
+/// password field, opens the no-match card -- and, above all, whether an
+/// ordinary window still opens nothing.
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    /// **Written first, and the one that must never be deleted.**
+    ///
+    /// The whole risk of adding a second trigger is that it becomes "always
+    /// open". An ordinary window -- a text editor, a file manager, a browser
+    /// on a page with no login -- matches nothing and has no masked field, and
+    /// the app's answer to it must stay exactly what it is today: nothing at
+    /// all.
+    ///
+    /// `Unknown` is asserted beside `No` because it is the *same* silence for
+    /// a different reason: a `disposition` that answered `NoMatch` on an
+    /// unanswerable probe would put a card over every window UI Automation
+    /// happens to choke on, which is a superset of the windows this feature is
+    /// for.
+    #[test]
+    fn an_ordinary_window_with_no_password_field_is_still_silence() {
+        assert_eq!(
+            disposition(Matched::No, HasPasswordField::No),
+            Open::Nothing,
+            "a window the vault does not know and that asks for no password now raises a card. \
+             That is every editor, terminal and file manager the user focuses"
+        );
+        assert_eq!(
+            disposition(Matched::No, HasPasswordField::Unknown),
+            Open::Nothing,
+            "a window UI Automation could not answer for is being treated as a login window. \
+             `Unknown` is the case with the LEAST evidence, and it is being read as the most"
+        );
+    }
+
+    /// The trigger itself, and its opposite number, so the function is pinned
+    /// in both directions rather than only where it must stay quiet.
+    #[test]
+    fn a_password_field_with_no_match_opens_the_no_match_card() {
+        assert_eq!(disposition(Matched::No, HasPasswordField::Yes), Open::NoMatch);
+        assert_eq!(
+            disposition(Matched::Yes("7"), HasPasswordField::Yes),
+            Open::Match("7"),
+            "a matched window must still open the matched card -- the item id is what the fill \
+             is resolved from"
+        );
+        assert_ne!(
+            disposition(Matched::No, HasPasswordField::Yes),
+            disposition(Matched::No, HasPasswordField::No),
+            "the premise: the password-field answer actually decides something. Equal answers \
+             mean the probe is being paid for and ignored"
+        );
+    }
+
+    /// **A match outranks the field answer, whatever it is.**
+    ///
+    /// This is what licenses the caller to skip the probe entirely on the
+    /// matched branch and pass `Unknown`. If any field answer could change a
+    /// matched window's disposition, that laziness would be a behaviour change
+    /// hiding inside an optimisation.
+    #[test]
+    fn a_matched_window_ignores_the_field_answer_entirely() {
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(Matched::Yes("42"), field),
+                Open::Match("42"),
+                "a matched window's disposition changed with {field:?}, so the probe cannot be \
+                 skipped on that branch after all"
+            );
+        }
+    }
+
+    /// The item id is carried through, not merely "some id": a `disposition`
+    /// that answered `Open::Match` with a constant would satisfy every
+    /// assertion above that only checks the variant.
+    #[test]
+    fn the_matched_id_is_the_id_that_comes_back_out() {
+        for id in ["7", "42", "a-uuid-shaped-thing"] {
+            assert_eq!(disposition(Matched::Yes(id), HasPasswordField::No), Open::Match(id));
+        }
+    }
+
+    /// A probe that records every window it was asked about, so "was it
+    /// called" and "how many times" are observable without COM.
+    fn counting_probe(calls: &Cell<usize>, answer: HasPasswordField) -> impl Fn(isize) -> HasPasswordField + '_ {
+        move |_hwnd| {
+            calls.set(calls.get() + 1);
+            answer
+        }
+    }
+
+    /// **The change gate.** A different window is a different question and is
+    /// asked at once -- no interval, no wait. A throttle that made the user
+    /// wait to learn about a window it had never seen would be the wrong
+    /// throttle.
+    #[test]
+    fn a_window_never_seen_before_is_probed_immediately() {
+        let calls = Cell::new(0);
+        let mut probe = PasswordFieldProbe::new();
+        let now = Instant::now();
+
+        assert_eq!(probe.ask(1, now, counting_probe(&calls, HasPasswordField::Yes)), HasPasswordField::Yes);
+        assert_eq!(calls.get(), 1, "the first window was not probed at all");
+
+        // Same instant, different window: still probed.
+        assert_eq!(probe.ask(2, now, counting_probe(&calls, HasPasswordField::No)), HasPasswordField::No);
+        assert_eq!(
+            calls.get(),
+            2,
+            "a second, different window was answered from another window's cache entry -- the \
+             card would name the wrong window's answer"
+        );
+    }
+
+    /// **The interval.** The same window inside the TTL is answered from
+    /// memory and costs no COM call, because a window that has not changed
+    /// cannot have a different answer.
+    #[test]
+    fn the_same_window_inside_the_ttl_is_not_probed_again() {
+        let calls = Cell::new(0);
+        let mut probe = PasswordFieldProbe::new();
+        let start = Instant::now();
+
+        probe.ask(1, start, counting_probe(&calls, HasPasswordField::Yes));
+        assert_eq!(calls.get(), 1, "control: the first ask really did probe");
+
+        let answer = probe.ask(
+            1,
+            start + PROBE_TTL - Duration::from_millis(1),
+            counting_probe(&calls, HasPasswordField::No),
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the same window was re-probed inside the TTL. At a measured median of 27ms and a \
+             p90 of 133ms, on the foreground app's own UI thread, that is the stutter this type \
+             exists to prevent"
+        );
+        assert_eq!(
+            answer, HasPasswordField::Yes,
+            "the cached answer was not the one that comes back -- the second probe's answer \
+             leaked through a path that was supposed to skip it"
+        );
+    }
+
+    /// And the other side of the interval: once it has elapsed the window IS
+    /// asked again, so a page that navigated to a sign-in form in the same
+    /// `HWND` is eventually noticed. A cache with no expiry would answer `No`
+    /// for that window for the life of the session.
+    #[test]
+    fn the_same_window_past_the_ttl_is_probed_again_and_the_new_answer_wins() {
+        let calls = Cell::new(0);
+        let mut probe = PasswordFieldProbe::new();
+        let start = Instant::now();
+
+        probe.ask(1, start, counting_probe(&calls, HasPasswordField::No));
+        let answer = probe.ask(
+            1,
+            start + PROBE_TTL,
+            counting_probe(&calls, HasPasswordField::Yes),
+        );
+        assert_eq!(calls.get(), 2, "the entry never expired, so this window can never change its answer");
+        assert_eq!(
+            answer, HasPasswordField::Yes,
+            "the window was re-probed and the STALE answer was returned anyway"
+        );
+
+        // And the refreshed entry is the one that is now cached -- one window,
+        // one slot, no shadowing by the expired entry it replaced.
+        let again = probe.ask(
+            1,
+            start + PROBE_TTL + Duration::from_millis(1),
+            counting_probe(&calls, HasPasswordField::No),
+        );
+        assert_eq!(calls.get(), 2, "the refreshed entry did not take");
+        assert_eq!(again, HasPasswordField::Yes, "the expired entry shadowed the fresh one");
+    }
+
+    /// Alternating between two windows -- the commonest thing a user does --
+    /// must not cost a probe every time. A one-entry cache would probe four
+    /// times here; this is why [`PROBE_MEMORY`] is not 1.
+    #[test]
+    fn alternating_between_two_windows_probes_each_once() {
+        let calls = Cell::new(0);
+        let mut probe = PasswordFieldProbe::new();
+        let now = Instant::now();
+
+        for hwnd in [1, 2, 1, 2, 1, 2] {
+            probe.ask(hwnd, now, counting_probe(&calls, HasPasswordField::Yes));
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "each of the two windows should have been probed exactly once; a one-entry cache \
+             probes six times"
+        );
+    }
+
+    /// The memory is bounded, and the bound evicts the oldest rather than
+    /// growing without limit for the life of a session.
+    #[test]
+    fn the_memory_is_bounded_and_evicts_the_oldest_first() {
+        let calls = Cell::new(0);
+        let mut probe = PasswordFieldProbe::new();
+        let now = Instant::now();
+
+        for hwnd in 0..(PROBE_MEMORY as isize + 1) {
+            probe.ask(hwnd, now, counting_probe(&calls, HasPasswordField::Yes));
+        }
+        assert_eq!(calls.get(), PROBE_MEMORY + 1, "control: every distinct window was probed once");
+
+        // The most recent PROBE_MEMORY windows are still remembered...
+        probe.ask(PROBE_MEMORY as isize, now, counting_probe(&calls, HasPasswordField::No));
+        assert_eq!(calls.get(), PROBE_MEMORY + 1, "the newest entry was evicted instead of the oldest");
+
+        // ...and the very first one is not.
+        probe.ask(0, now, counting_probe(&calls, HasPasswordField::No));
+        assert_eq!(
+            calls.get(),
+            PROBE_MEMORY + 2,
+            "window 0 survived past the bound, so the memory grows without limit"
+        );
     }
 }
 
