@@ -1,0 +1,4 @@
+                    // [mutant 01] the gate is gone: the sender is called
+                    // directly, exactly as it was before `dispatch_with`
+                    // existed.
+                    let sent = injector.fill_sequence(hwnd, plan, sink);

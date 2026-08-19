@@ -5201,10 +5201,19 @@ mod fill_dispatch_tests {
     /// whether the recording filler saw a single keystroke.
     ///
     /// Delete the gate from `fill_from_vault_with`'s sequence arm -- or
-    /// neutralise it to a `let _gated = dispatch_with(..);` -- and the two
-    /// refusal cases below type the password, which is exactly the survivor
-    /// `updater::installer_is_launchable` records for the shape of test that
-    /// only pins the decision.
+    /// neutralise it so the sender runs whatever the gate answered -- and the
+    /// two refusal cases below type the password, which is exactly the
+    /// survivor `updater::installer_is_launchable` records for the shape of
+    /// test that only pins the decision.
+    ///
+    /// Those two mutations are `mutations/cases/01-gate-deleted` and
+    /// `02-gate-neutralised`. **How many tests they redden is not written
+    /// down here**, because a number in a comment cannot be re-derived: run
+    /// `mutations/run.ps1`, which applies each one to a throwaway worktree and
+    /// prints the count and the killing test names. `mutations/README.md`
+    /// records the last measured output, and case 02's `about.md` records why
+    /// the literal `let _gated = dispatch_with(..);` spelling is NOT the
+    /// mutation this paragraph means.
     fn gated_password_fill(
         describe: fn() -> Option<crate::injector::target::SendTarget>,
     ) -> (usize, Vec<String>) {
@@ -5321,7 +5330,10 @@ mod fill_dispatch_tests {
 
     /// **The hosting, driven from the entry point.** Delete the
     /// `confirmed_by_preflight` call from `fill_from_vault_with` and this is
-    /// red at `asked == 1` while every routing test above stays green.
+    /// red at `asked == 1` while every routing test above stays green -- the
+    /// hosting isolated from the gating. That is
+    /// `mutations/cases/03-confirm-deleted`; `mutations/run.ps1` measures how
+    /// much else goes red with it.
     #[test]
     fn a_bare_secret_fill_asks_the_confirmation_before_it_types() {
         let (asked, typed) =
@@ -5337,7 +5349,10 @@ mod fill_dispatch_tests {
     /// And the answer is obeyed. Reading the confirmation's answer and
     /// carrying on regardless -- `let _ = confirmed_by_preflight(..);`, the
     /// neutralisation this crate has measured surviving elsewhere at zero
-    /// warnings -- is red here.
+    /// warnings -- is red here. It is
+    /// `mutations/cases/04-confirm-answer-ignored`, and `mutations/run.ps1`
+    /// is what says so; this test is the only thing that catches it, which is
+    /// the reason it exists separately from the one above.
     #[test]
     fn a_cancelled_confirmation_types_nothing() {
         let (asked, typed) =

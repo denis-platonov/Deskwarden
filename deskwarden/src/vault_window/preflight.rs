@@ -139,9 +139,18 @@ impl SendGate {
     /// and refuses on its own terms. So there is no ordering of clicks, holds
     /// or window switches that reaches a sender without the refusal arms in
     /// `dispatch_with` having allowed it, and the mutation measurement those
-    /// arms carry (neutralise: 3 red, delete: 2 red) is unchanged by hosting
-    /// the surface -- the tests drive this seam with a stub that always
-    /// answers `Send`, so what they measure is still the gate alone.
+    /// arms carry is unchanged by hosting the surface -- the tests drive this
+    /// seam with a stub that always answers `Send`, so what they measure is
+    /// still the gate alone.
+    ///
+    /// **The measurement is not quoted here.** It used to be, as
+    /// "neutralise: 3 red, delete: 2 red", and it was not reproducible: the
+    /// prose did not pin the mutants closely enough for two readers to write
+    /// the same ones. They now live as anchored source replacements under
+    /// `mutations/cases/`, and `mutations/run.ps1` applies each to a
+    /// throwaway worktree and prints the count and the killing test names.
+    /// The names are the part worth reading -- a count that moved says
+    /// nothing on its own about whether the same escape is still caught.
     ///
     /// The other direction is a real gain: [`draw`]'s refusal state paints no
     /// hold affordance at all, so a refused target never even offers the user

@@ -63,7 +63,7 @@ fn a_password_field_with_no_match_opens_the_overlay() {
 
 - [ ] **Step 6: `handle_match` takes an item id it will no longer always have.** Change the shape so "no item" is representable rather than faked — an `Option` at the call site is the obvious answer, a sentinel id is not.
 
-- [ ] **Step 7: The re-prompt gate is defined over an existing item.** `reprompt_protected(item)` cannot be asked when there is no item. Confirm the gate is not reached in the no-match path, and that nothing added here bypasses it in the matched path — the four recorded preflight mutations must still red at 3 / 2 / 1 / 2.
+- [ ] **Step 7: The re-prompt gate is defined over an existing item.** `reprompt_protected(item)` cannot be asked when there is no item. Confirm the gate is not reached in the no-match path, and that nothing added here bypasses it in the matched path — the four recorded preflight mutations must still be killed by the same tests — run `mutations/run.ps1` and compare its killing test names against the recorded output in `mutations/README.md`. (This step originally cited "3 / 2 / 1 / 2"; that figure was never reproducible from the prose the mutations were written in, and the harness replaced it.)
 
 - [ ] **Step 8: Commit.**
 

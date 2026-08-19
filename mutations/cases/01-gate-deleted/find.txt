@@ -1,0 +1,21 @@
+                    let gated = crate::vault_window::preflight::dispatch_with(
+                        gate,
+                        guard,
+                        || injector.fill_sequence(hwnd, plan, sink),
+                    );
+                    let sent = match gated {
+                        crate::vault_window::preflight::Gated::Sent(result) => result,
+                        crate::vault_window::preflight::Gated::Refused(why) => {
+                            let message =
+                                crate::vault_window::preflight::refusal_notice(Some(why));
+                            log::warn!("preflight refused a fill of item {item_id}: {message}");
+                            notifier.refused(&message);
+                            return;
+                        }
+                        crate::vault_window::preflight::Gated::NoTarget => {
+                            let message = crate::vault_window::preflight::refusal_notice(None);
+                            log::warn!("preflight could not describe the foreground; not filling");
+                            notifier.refused(&message);
+                            return;
+                        }
+                    };

@@ -1,0 +1,1 @@
+                    // [mutant 03] the `confirmed_by_preflight` call is gone.

@@ -1,0 +1,9 @@
+                    // [mutant 02] the gate is still called -- and still
+                    // refuses -- but its verdict is dropped on the floor and
+                    // the sender runs regardless.
+                    let _gated = crate::vault_window::preflight::dispatch_with(
+                        gate,
+                        guard,
+                        || Ok::<(), String>(()),
+                    );
+                    let sent = injector.fill_sequence(hwnd, plan, sink);
