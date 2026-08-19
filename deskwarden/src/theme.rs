@@ -695,59 +695,84 @@ pub fn initials(name: &str) -> String {
     }
 }
 
-/// How far a favicon is inset inside its [`avatar_tile`], per side.
+/// Paints `texture` to FILL an [`avatar_tile`], clipped to the tile's own
+/// corner radius, and re-draws the tile's border over it.
 ///
-/// A JUDGEMENT CALL, and one now made against reports from BOTH SIDES. The
-/// design document has no favicon example anywhere, so there is no value to
-/// read off it.
+/// **Full bleed, and it took three passes to get here.** The history, because
+/// the next person to look at this row will be holding one of these reports
+/// and not the other two:
 ///
-/// * **"the favicon fills its tile edge-to-edge and feels too big"** is what
-///   moved this off zero. The reference is the MONOGRAM, which is what a
-///   favicon sits beside in a list and has to weigh the same as: [`avatar`]
-///   draws its letters at `size * 0.38` -- ~12pt of ink centred in a 32pt tile
-///   -- so a monogram's ink covers roughly a third of the tile, while an
-///   edge-to-edge favicon covers all of it.
-/// * **"icon is not fully taking the rounded rectangle"** is the answer 4pt
-///   got, and it is the same user looking at the same row. 4pt put the artwork
-///   in a 24pt box inside a 32pt one; against a filled, bordered tile that
-///   reads as an icon floating in a frame rather than a tile with an icon in
-///   it.
+/// 1. The favicon was drawn at the full 32pt with `fit_to_exact_size`, and the
+///    report was "the favicon fills its tile edge-to-edge and feels too big".
+/// 2. So it was inset 4pt a side -- a 24pt image in a 32pt tile, set against
+///    the MONOGRAM beside it, whose letters ([`avatar`], `size * 0.38`) cover
+///    about a third of their tile. The report on THAT was "icon is not fully
+///    taking the rounded rectangle".
+/// 3. The design is the tiebreaker, and it says the image takes the tile. The
+///    spec has no favicon rule of its own to read off -- it gives the tile
+///    ("rows = 32px monogram") and the radius (the avatar radius is ~25% of
+///    the tile size), which is what [`avatar_corner_radius`] already computes
+///    -- so a favicon is that same 32pt tile with artwork in it, not a smaller
+///    box floating inside one.
 ///
-/// 2pt a side is deliberately BETWEEN the two: a 28pt image in a 32pt box.
-/// Not flush -- the tile is drawn filled and bordered exactly as the
-/// monogram's is, and artwork against a bordered edge is what the first report
-/// was about -- but the remaining gap is a hairline rather than a moat. Zero is
-/// not available to whoever tunes this next: zero is the first report,
-/// re-shipped. `a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_
-/// to_edge` holds both ends.
+/// **The rounding is the whole risk, and it is why this is a function and not
+/// a `0.0` constant.** The tile is a rounded rectangle. An image painted flush
+/// to its bounds with square corners would poke four corners out past the
+/// rounding, which is a worse result than any inset. The corner radius is
+/// therefore given to the image itself: egui tessellates a textured
+/// `RectShape` with a rounded, antialiased outline exactly as it does an
+/// untextured one, so the artwork is clipped to the tile's curve rather than
+/// merely placed inside its box.
+///
+/// **The fill and the border still earn their place, in that order.**
+/// [`avatar_tile`] paints both first: the fill is what a favicon with
+/// transparent margins (which is most of them) shows through, and it carries
+/// the selected treatment's `BLUE_WASH`. The BORDER is then re-drawn ON TOP of
+/// the artwork, because `StrokeKind::Middle` straddles the edge -- an image
+/// painted over it would eat its inner half and leave a half-pixel ghost.
+/// Drawn over, the tile keeps one visible edge against a pale favicon, which is
+/// the same edge every monogram beside it has.
 ///
 /// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
 /// resamples every icon to a 64px longest edge, a number chosen for a 32pt
 /// draw at 200% scaling. Nothing in the code links that constant to this one.
-/// 64 still covers a 28pt draw comfortably (56 physical px at 200%), so this
-/// inset is safe, but a tile that ever grows past 32pt needs `decode_rgba`'s
-/// constant raised with it.
-pub const AVATAR_ICON_INSET: f32 = 2.0;
+/// It covers a full-bleed 32pt draw exactly, so a tile that ever grows past
+/// 32pt needs `decode_rgba`'s constant raised with it.
+pub fn avatar_image(ui: &Ui, tile: Rect, texture: &egui::TextureHandle, emphasized: bool) {
+    let rounding = avatar_corner_radius(tile.width());
+    egui::Image::new((texture.id(), texture.size_vec2()))
+        .corner_radius(rounding)
+        .paint_at(ui, tile);
+    ui.painter()
+        .rect_stroke(tile, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
+}
+
+/// The avatar tile's 1px border, in its two states.
+///
+/// One function rather than a colour picked at each of the two places that
+/// draw it ([`avatar_tile`], which draws it under the content, and
+/// [`avatar_image`], which draws it again over a full-bleed favicon), so the
+/// selected treatment cannot end up blue in one and grey in the other.
+pub fn avatar_tile_stroke(emphasized: bool) -> Stroke {
+    Stroke::new(1.0, if emphasized { BLUE_EDGE } else { HAIRLINE })
+}
 
 /// The avatar tile's BOX -- allocated, filled, bordered and rounded -- with
 /// nothing drawn in it, returning the rect so the caller can place its own
 /// content inside.
 ///
 /// Split out of [`avatar`] so a favicon can be drawn into the very same box
-/// the monogram fallback draws, rather than replacing the box entirely: a
-/// bare full-bleed image in place of a bordered tile is what made favicons
-/// read as bigger and heavier than the monograms beside them.
+/// the monogram fallback draws, rather than replacing the box entirely:
+/// the favicon and the monogram are the same tile, at the same size, with the
+/// same edge, and only their contents differ. [`avatar_image`] is the favicon
+/// half, and it paints over what this leaves.
 pub fn avatar_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let (bg, border) = if emphasized {
-        (BLUE_WASH, BLUE_EDGE)
-    } else {
-        (CANVAS, HAIRLINE)
-    };
+    let bg = if emphasized { BLUE_WASH } else { CANVAS };
     let rounding = avatar_corner_radius(size);
     ui.painter().rect_filled(rect, rounding, bg);
     ui.painter()
-        .rect_stroke(rect, rounding, Stroke::new(1.0, border), StrokeKind::Middle);
+        .rect_stroke(rect, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
     rect
 }
 

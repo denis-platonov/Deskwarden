@@ -12,12 +12,12 @@ things can still change between minor versions.
 
 ### The vault window's list and rail
 
-- **A favicon now nearly fills its tile.** It was inset 4pt a side inside a
-  32pt tile — a 24pt icon in a bordered box, which read as an icon adrift in a
-  frame ("icon is not fully taking the rounded rectangle"). The inset is 2pt
-  now: 28pt of icon in the same 32pt tile. It is deliberately not zero — the
-  opposite report, "the favicon fills its tile edge-to-edge and feels too big",
-  is what put an inset there in the first place.
+- **A favicon now fills its tile.** It was inset 4pt a side inside a 32pt tile
+  — a 24pt icon in a bordered box, which read as an icon adrift in a frame
+  ("icon is not fully taking the rounded rectangle"). The icon takes the whole
+  32pt tile now, clipped to the tile's own rounded corners so no corner
+  overhangs the curve, with the tile's 1px border drawn back over the top so a
+  pale icon still has the same edge every monogram beside it has.
 
 ## 0.8.3 - 2026-08-19
 
