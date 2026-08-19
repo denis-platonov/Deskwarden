@@ -60,7 +60,9 @@ compare the names against the run below before concluding anything.
 
 ## Last measured
 
-Commit `e22805f`, 2026-08-19, on Windows 11 / `pwsh` 7.
+Commit `e22805f`, 2026-08-19, on Windows 11 / `pwsh` 7. Re-run unchanged at
+`d750693` (this work merged with the password-health branch, 2026-08-19):
+same counts, same killing test names.
 
 ```
 deskwarden preflight mutations -- e22805f -- 2026-08-19
