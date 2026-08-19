@@ -2019,8 +2019,8 @@ mod tests {
         let manifest = manifest_raw.replace("\r\n", "\n");
         assert_eq!(
             (manifest.len(), fnv1a64(&manifest)),
-            // Re-pinned for the 0.8.2 version bump: `version = "0.8.1"`
-            // became `"0.8.2"`, which is the same LENGTH -- so 8005 is
+            // Re-pinned for the 0.8.3 version bump: `version = "0.8.2"`
+            // became `"0.8.3"`, which is the same LENGTH -- so 8005 is
             // unchanged and only the digest moves. No dependency was added,
             // removed, re-pointed or re-featured by this commit.
             //
@@ -2062,7 +2062,7 @@ mod tests {
             // path or fork appeared, and `[build-dependencies]` still reads
             // exactly `winresource = "0.1"`. 7547 -> 8005 bytes, all of it the
             // feature name and the comment above it.
-            (8005, 0xbfdf_8dd6_13a2_05c9_u64),
+            (8005, 0x284d_ba99_71ed_c3ec_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

@@ -8,7 +8,14 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.8.3 - 2026-08-19
+
+> The manual pre-release checklist was not run for this version either. In
+> addition to 0.8.2's overlay probe, the update flow on Preferences > About
+> is new and every part of it is stubbed in the tests: the request to
+> GitHub, the installer download, and the signature check. It has not been
+> run end to end against the real service. If Check for updates does not
+> behave, please open an issue rather than assuming it is your network.
 
 ### The overlay can generate the password it is about to save
 
@@ -74,6 +81,40 @@ Nothing about what is downloaded or how it is trusted has changed: a check
 reads a version and some notes, the installer is fetched only when you ask,
 and it is verified against the signing certificate before anything launches
 it.
+
+### The vault can say which of its passwords are bad
+
+A new **Password health** entry in the vault window's sidebar, under *Sends*.
+
+- **Reused passwords**, grouped: the same password on more than one item, with
+  every item in the group listed. This is exact rather than a guess, and it is
+  the finding worth acting on first.
+- **Weak passwords**, with the reason stated rather than scored — "9
+  characters, lowercase letters and digits" instead of a number out of a
+  hundred. It is the same rule the detail pane already uses for its
+  *Strength* line, so the two cannot disagree about the same password.
+- **Clicking a finding opens that item** beside the report, which stays where
+  it is. Twelve reused logins is twelve clicks, not twelve trips through the
+  sidebar.
+- A long single-class passphrase is deliberately **not** called weak. Twenty
+  lowercase characters is a wider space than eight mixed ones, and flagging it
+  would be crying wolf at passwords this app's own generator produces.
+- **Nothing here is sent anywhere.** The whole report is computed on your
+  machine from the vault already in memory, and it makes no breach lookup in
+  either state of that setting — opening a report over a large vault is not
+  consent to a request per password. Breach status stays where you asked for
+  it, on the item.
+- Items with no password — cards, notes, SSH keys — are excluded rather than
+  counted, and two items with empty passwords are not a reused pair.
+
+### Internal
+
+- The four preflight mutations that this project treats as a merge gate now
+  live in `mutations/` as a harness that applies each one and reports which
+  tests kill it. They had been recorded as prose, and the figure quoted in
+  three places turned out not to be reproducible from it: three separate
+  attempts produced three different numbers. The gate itself was never weaker
+  than it looked — only the record of it was.
 
 ## 0.8.2 - 2026-08-19
 
