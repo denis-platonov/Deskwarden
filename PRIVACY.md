@@ -99,10 +99,29 @@ This request carries no information about you or your vault beyond what any
 HTTP request necessarily reveals to the server (your IP address, and the fact
 that a request was made).
 
-**You can switch it off.** Preferences → General → *Check for updates*. On by
+There are **two** ways this request is made, and the setting governs one of
+them.
+
+**The automatic check** runs once at startup and once a day thereafter. This
+is what Preferences → General → *Check for updates* switches off. It is on by
 default, because an app that quietly stops telling you a security fix exists
 is a worse outcome than the IP address the check discloses — and one you
 would have no way to notice.
+
+**The manual check** is the *Check for updates* button on Preferences →
+About. **It works whether or not the automatic check is switched off**, and
+it makes the same request to the same address. Switching the setting off asks
+Deskwarden not to contact GitHub on its own; pressing this button is you
+asking it to contact GitHub now. The About page says so, next to the button,
+so this is not a behaviour you have to come here to discover.
+
+**Neither check downloads anything.** A check reads the latest release's
+version number and its release notes and stops there. The installer is
+fetched only after you press *Download* on that page, and it is verified
+against Deskwarden's signing certificate before anything can launch it.
+Release notes come from the GitHub release and are shown as **plain text**:
+they are never interpreted as markup, and nothing in them becomes a link that
+can be clicked.
 
 An earlier version of this policy said that builds distributed through the
 Microsoft Store do not perform this check. **There is no Microsoft Store

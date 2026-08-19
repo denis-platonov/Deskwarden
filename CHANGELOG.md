@@ -8,6 +8,41 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### The tray stops claiming an update that is not there
+
+The tray menu had an "Update available" item. It was created with those words
+already on it and disabled, and the daily check's only effect was to *enable*
+it. So on every session where no update existed — nearly all of them — the
+menu asserted that one did, and then refused the click it was inviting.
+
+- **The update item is gone from the tray.** So is the tooltip that announced
+  updates: a tooltip is visible only while the pointer rests on a 16px icon,
+  which is no way to report something you asked for and are waiting on. The
+  tray tooltip still reports a sync, which is started from that menu.
+- **The whole flow now lives on Preferences → About**, where it can say the
+  thing the tray never could: that you are on the latest release.
+  - A **Check for updates** button, so you can ask now instead of waiting out
+    the 24 hours between automatic checks.
+  - When there is one: the version, **the release notes**, and a Download
+    button. Notes come from the GitHub release and are shown as plain text —
+    nothing in them is treated as markup and nothing in them is clickable —
+    inside a region that scrolls, so a long release note cannot push the
+    buttons off a window that does not resize.
+  - **Progress while it downloads**, on the page you started it from, then a
+    *Restart to install* prompt. A failure says why, on the page, with a
+    retry beside it.
+- **The button works even when automatic checks are switched off.** That
+  setting is about Deskwarden contacting GitHub on its own; pressing the
+  button is you asking it to. The page says so where the button is, and
+  `PRIVACY.md` now describes both checks rather than only the automatic one.
+
+Nothing about what is downloaded or how it is trusted has changed: a check
+reads a version and some notes, the installer is fetched only when you ask,
+and it is verified against the signing certificate before anything launches
+it.
+
 ## 0.8.2 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version. The

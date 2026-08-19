@@ -85,23 +85,16 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// API host the releases endpoint actually lives on.
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Authenticode thumbprint an update's signature must match before it's
-/// trusted and applied.
-///
-/// TODO: set once SignPath cert is issued (Task 5's manual prerequisite).
-/// The real certificate deskwarden's release builds will be signed with does
-/// not exist yet at this point in the project, so there is no genuine value
-/// to put here. This placeholder is intentionally not a plausible-looking
-/// thumbprint: it can never match a real signature, so `is_trusted_signer`
-/// (and therefore `download_and_verify`) fails closed -- refusing every
-/// update -- until this constant is replaced with the real one.
-///
-/// Defined in `updater.rs` and merely re-read here. `apply_update` checks the
-/// signature again immediately before it launches anything, and that check has
-/// to be against a value no call site can choose -- so the constant lives next
-/// to the launch rather than next to the caller, and there is exactly one of
-/// it.
-use deskwarden::updater::EXPECTED_SIGNER_THUMBPRINT;
+// **`updater::EXPECTED_SIGNER_THUMBPRINT` is no longer named in this file, and
+// that is a small improvement rather than a loss.**
+//
+// It used to be imported here so the tray's download handler could pass it to
+// `download_and_verify`. That handler is gone; the download now starts in
+// `update_panel`, which reads the constant from `updater` directly. The
+// constant deliberately lives beside `apply_update`, which re-checks the
+// signature immediately before launching anything, precisely so the value can
+// never be chosen at a call site -- and the fewer files that name it, the
+// fewer places anyone could be tempted to.
 
 /// Organization (`O=`) values accepted as proof that the resolved `bw.exe`
 /// (see `bw_path::resolve_bw_exe`) really is Bitwarden's own CLI.
@@ -1265,14 +1258,48 @@ fn main() {
     let current_version =
         Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
 
-    // Two agents, not one, because the two updater requests need two different
-    // *kinds* of bound and ureq can carry only one per agent: the releases
-    // check is a small JSON response bounded by total time, the installer
-    // download is a ~6 MB stream bounded by time without progress. See
-    // `deskwarden::http_agent`. Both are cheap `Arc`-backed handles, so it's
-    // fine to clone them into the background threads below.
+    // The releases check is a small JSON response bounded by total time; the
+    // installer download is a ~6 MB stream bounded by time without progress,
+    // and ureq can carry only one kind of bound per agent (see
+    // `deskwarden::http_agent`). Only the check's agent is built here now --
+    // the download's belongs to whoever starts a download, which since the
+    // tray item was deleted is `update_panel`, on the About page's own thread.
     let update_check_agent = updater::build_api_agent();
-    let download_agent = updater::build_download_agent();
+
+    // **Everything the About page's update flow needs from this process,
+    // handed over once.**
+    //
+    // Installed here rather than passed to `prefs_ui::run`, because every
+    // field is a fact about the process, identical at both of that page's two
+    // shells (the tray's Preferences window and the vault window's Preferences
+    // modal), and threading it to the second would mean widening
+    // `vault_window::build_frame`'s closure to carry a value it never uses.
+    // `update_panel`'s header argues the trade-off; the cost is that a build
+    // which failed to do this gets a page that says so, rather than a page
+    // that silently does nothing.
+    //
+    // `before_install` is the teardown the old tray path ran inline before
+    // `process::exit`, minus `bw serve`: that child is assigned to a
+    // kill-on-close job object (`job_object`), so the kernel takes it down
+    // with this process however this process dies, and the `stop_bw_serve`
+    // call on that path was belt to a kernel-held brace.
+    {
+        let cache_for_install = estate.cache.clone();
+        let installed = deskwarden::update_panel::install_env(deskwarden::update_panel::UpdateEnv {
+            current_version: current_version.clone(),
+            api_base: GITHUB_API_BASE.to_string(),
+            download_dir: update_download_dir.clone(),
+            before_install: std::sync::Arc::new(move || {
+                cache_for_install.clear();
+                deskwarden::clipboard::clear_if_still_ours_for(
+                    deskwarden::clipboard::ClearTrigger::Quit,
+                );
+            }),
+        });
+        // One installer, one install. A second would mean two places believe
+        // they own this.
+        debug_assert!(installed, "the update environment was installed twice");
+    }
 
     // The update check talks to an external host and, prior to this fix, ran
     // synchronously here -- before the tray, hotkey, and window-watch thread
@@ -1282,7 +1309,15 @@ fn main() {
     // `update_rx`, polled non-blockingly from the main loop below, so a slow
     // or hung check can never delay startup. Same shape as the
     // `window_watch` thread just below.
-    let mut available_update: Option<ReleaseInfo> = None;
+    //
+    // **What the answer now does is put a line in the log, and no more.** This
+    // is the *automatic* check -- the one `Settings::check_for_updates`
+    // governs -- and the only control it ever drove was the tray item that
+    // has been deleted. It is kept because it is what makes that setting mean
+    // anything, and because "an update exists" belongs in the log of an app
+    // whose user may be reading it to find out why they are on an old build.
+    // The About page's button is a separate check, explicitly asked for, that
+    // reports to the page that asked.
     let (update_tx, update_rx) = mpsc::channel::<ReleaseInfo>();
     {
         let agent = update_check_agent.clone();
@@ -1346,30 +1381,16 @@ fn main() {
         });
     }
 
-    // Outcome of a click-triggered update attempt. `Ok(())` means the
-    // installer was downloaded, signature-verified, and launched, and this
-    // process should now shut down for it; `Err` carries a message for the
-    // log and the tray.
-    //
-    // The work behind this channel used to run inline in the tray-click
-    // handler below, which streams a multi-megabyte download and then blocks
-    // on a `powershell.exe` spawn for signature verification -- all while
-    // `pump_windows_messages()` isn't running, so the tray, the global
-    // hotkey, and window-watching were dead for the whole duration and
-    // Windows would flag the app as not responding. It now runs on a
-    // background thread and reports back here, polled non-blockingly from the
-    // main loop, exactly like `update_rx` above.
-    //
-    // The *shutdown* deliberately stays on the main thread: `bw_serve_child`
-    // is owned here, and the whole point of the shutdown path is that the
-    // backend is killed before this process goes away.
-    let (apply_tx, apply_rx) = mpsc::channel::<Result<(), String>>();
-
-    // True from the moment a download starts until its outcome arrives, so a
-    // second click can't start a second concurrent download of the same
-    // installer into the same destination path.
-    let mut update_in_progress = false;
-
+    // **There is no download channel here any more, and no
+    // `update_in_progress` beside it.** Both existed to serve one tray item:
+    // the channel carried a click-triggered download's outcome back to this
+    // loop, and the flag stopped a second click starting a second concurrent
+    // download into the same path. The item is gone, and with it the click
+    // that could arrive twice. The download now belongs to
+    // `update_panel::UpdatePanel`, which owns its own channel, drains it from
+    // the frames the About page is already drawing, and refuses a second start
+    // with the receiver it is holding rather than with a separate bool that
+    // could disagree with it.
     let (tx, rx) = mpsc::channel::<window_watch::ForegroundEvent>();
     std::thread::spawn(move || {
         if let Err(e) = window_watch::watch_foreground_windows(move |event| {
@@ -2056,53 +2077,6 @@ fn main() {
                 }
             }
 
-            if event.id == tray.update_id {
-                // The item is disabled (and so shouldn't be clickable) until
-                // `available_update` is `Some`, but the check is repeated
-                // here defensively rather than trusting tray-icon's disabled
-                // state to suppress the click event. Same reasoning for
-                // re-checking `update_in_progress`.
-                match (&available_update, update_in_progress) {
-                    (Some(release), false) => {
-                        log::info!(
-                            "update requested from tray; downloading v{} in the background",
-                            release.version
-                        );
-                        tray::set_update_in_progress(&tray, &release.version);
-                        update_in_progress = true;
-
-                        // Everything the thread needs is cloned in: the
-                        // release (hence `ReleaseInfo: Clone`), the agent (a
-                        // cheap `Arc` handle), the destination directory, and
-                        // a sender. Nothing here is joined or waited on --
-                        // the main loop keeps pumping messages and picks the
-                        // outcome up from `apply_rx` whenever it lands.
-                        let release = release.clone();
-                        let agent = download_agent.clone();
-                        let dest_dir = update_download_dir.clone();
-                        let tx = apply_tx.clone();
-                        std::thread::spawn(move || {
-                            let outcome = updater::download_and_verify(
-                                &release,
-                                EXPECTED_SIGNER_THUMBPRINT,
-                                &dest_dir,
-                                &agent,
-                            )
-                            // The downloaded path is deliberately discarded:
-                            // `apply_update` reconstructs it from the release
-                            // and re-verifies it, so this call site cannot
-                            // name the file that gets launched.
-                            .and_then(|_installer_path| updater::apply_update(&dest_dir, &release));
-                            let _ = tx.send(outcome);
-                        });
-                    }
-                    (Some(release), true) => log::info!(
-                        "update to v{} is already being downloaded; ignoring repeat click",
-                        release.version
-                    ),
-                    (None, _) => log::debug!("update item clicked with no update available"),
-                }
-            }
         }
 
         // Left click opens the vault directly; right click still shows the
@@ -2336,56 +2310,17 @@ fn main() {
             }
         }
 
+        // The automatic check's answer, drained so the channel does not grow
+        // and so the finding is logged from the loop rather than from the
+        // worker. Nothing else is done with it: there is no tray item left to
+        // relabel, and the app deliberately does not interrupt the user with a
+        // window they did not ask for. What acts on an available update is
+        // Preferences → About, when they go and look.
         if let Ok(release) = update_rx.try_recv() {
-            // Not while a download is in flight: relabelling the item back to
-            // "Update available" mid-download would contradict what is
-            // actually happening (the click would be rejected anyway, see the
-            // handler above). Rare -- checks are 24h apart -- but the tray is
-            // the only status this app shows, so it shouldn't lie.
-            if !update_in_progress {
-                tray::set_update_available(&tray, &release.version);
-            }
-            available_update = Some(release);
-        }
-
-        // Non-blocking, like the check above: the download thread reports here
-        // when it's finished (or failed), and the main loop never waits on it.
-        if let Ok(outcome) = apply_rx.try_recv() {
-            update_in_progress = false;
-            match outcome {
-                Ok(()) => {
-                    // Same shutdown path as the Quit handler above: kill
-                    // `bw serve` and clear the cache explicitly before
-                    // exiting so the installer (which replaces and
-                    // relaunches this binary) doesn't leave an orphaned
-                    // backend serving the unlocked vault, or decrypted vault
-                    // contents sitting in this process's memory a moment
-                    // longer than it takes to tear down.
-                    log::info!("update installer launched; shutting down for update");
-                    estate.cache.clear();
-                    // The clipboard too, for the same reason and with the
-                    // same caveat as the Quit handler above. The installer
-                    // relaunches this binary, so the waiting thread is
-                    // certainly gone.
-                    deskwarden::clipboard::clear_if_still_ours_for(
-                        deskwarden::clipboard::ClearTrigger::Quit,
-                    );
-                    if let Some(child) = estate.child.as_mut() {
-                        bw_serve::stop_bw_serve(child);
-                    }
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    // Surfaced, not just logged: a tray app with no window
-                    // and no console has nowhere else to say this, and the
-                    // user just asked for an update and is entitled to know
-                    // it didn't happen.
-                    log::error!("update failed: {e}");
-                    if let Some(release) = &available_update {
-                        tray::set_update_failed(&tray, &release.version);
-                    }
-                }
-            }
+            log::info!(
+                "the periodic check found v{}; it is offered in Preferences > About",
+                release.version
+            );
         }
 
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {

@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 47] = [
+        const OPENS_NO_WINDOW: [&str; 48] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1149,6 +1149,13 @@ mod tests {
             "signature",
             "theme",
             "tray",
+            // The About page's update flow: a state machine, two worker
+            // threads and a channel. It draws nothing and owns no window --
+            // the frames it reports into belong to `prefs_ui`, which is
+            // classified in its own right -- and the only window it can cause
+            // to appear is the installer's, in a process that replaces this
+            // one.
+            "update_panel",
             "updater",
             "vault_bridge",
             "vault_cache",

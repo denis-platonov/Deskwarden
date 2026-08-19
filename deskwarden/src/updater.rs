@@ -4,14 +4,103 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// `Clone` so the tray-click handler can hand a copy to the background
-/// download/verify/apply thread (see `main.rs`) while keeping its own copy for
-/// the tray label, rather than moving the app's record of the available update
-/// into a thread it can't get it back from.
-#[derive(Clone, Debug)]
+/// `Clone` so the About page's download button can hand a copy to the
+/// background download/verify thread (see `update_panel.rs`) while keeping its
+/// own copy for the version and notes it is displaying, rather than moving the
+/// app's record of the available update into a thread it can't get it back
+/// from.
+/// `PartialEq`/`Eq` so `update_panel::UpdateStage` -- which carries one -- can
+/// answer "did this frame change anything", which is what stops the About page
+/// from asking for a repaint it does not need.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseInfo {
     pub version: Version,
     pub installer_download_url: String,
+    /// The release's notes, verbatim from the GitHub release body.
+    ///
+    /// Kept here rather than fetched separately because the response
+    /// [`check_for_update`] already parses for `tag_name` and `assets` carries
+    /// it: a second request for text that arrived with the first one is a
+    /// second thing to time out.
+    ///
+    /// **This is network-supplied text and nothing in this crate treats it as
+    /// anything else.** It is never parsed, never rendered as markup, never
+    /// mined for links, and never handed to a shell or a process. Its one
+    /// consumer is the About page, which passes it through
+    /// [`release_notes_for_display`] and paints the result as plain text.
+    /// Empty when the release has no body -- a release with no notes is
+    /// normal, not an error.
+    pub body: String,
+}
+
+/// The longest run of release notes the About page will render.
+///
+/// A GitHub release body has no length limit this crate can rely on, and the
+/// About page's notes region lives inside a fixed-size window. That region
+/// scrolls, so length alone cannot push a control off the page -- but an
+/// unbounded string is still an unbounded per-frame layout cost, so it is cut
+/// here as well.
+pub const MAX_RELEASE_NOTES_CHARS: usize = 4000;
+
+/// Appended when [`release_notes_for_display`] cuts, so a truncated read looks
+/// truncated rather than looking like the notes simply ended.
+const NOTES_TRUNCATION_MARK: &str = "\n[...]";
+
+/// [`ReleaseInfo::body`] reduced to something safe to paint.
+///
+/// Three jobs, all of them about the string being *data*:
+///
+/// 1. **Control characters go.** A release body is UTF-8 from a web API and
+///    may contain anything encodable. `\r\n` is normalised to `\n` and every
+///    other control character -- including the bare `\r` a lone carriage
+///    return would leave, and any bidirectional-override or zero-width
+///    formatting character that could make the painted text disagree with the
+///    bytes -- is dropped rather than handed to a text layout engine.
+/// 2. **Length is bounded** to [`MAX_RELEASE_NOTES_CHARS`], cut on a `char`
+///    boundary. Never a byte index: `&s[..n]` on a multi-byte codepoint
+///    panics, and this string is chosen by a remote host.
+/// 3. **Nothing is interpreted.** No markdown, no autolinking, no HTML, no
+///    clickable anything. What comes back is a plain string and the caller
+///    paints it as one.
+pub fn release_notes_for_display(body: &str) -> String {
+    let cleaned: String = body
+        .replace("\r\n", "\n")
+        .chars()
+        .filter(|c| *c == '\n' || (!c.is_control() && !is_invisible_formatting(*c)))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.chars().count() <= MAX_RELEASE_NOTES_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(MAX_RELEASE_NOTES_CHARS).collect();
+    out.push_str(NOTES_TRUNCATION_MARK);
+    out
+}
+
+/// Characters that paint as nothing but change what the text around them
+/// looks like, listed because `char::is_control` does not cover them: it is
+/// about the C0/C1 ranges, and every character below is a Unicode *format*
+/// character that sails straight through it.
+///
+/// These matter here for one specific reason. The notes are chosen by whoever
+/// can publish a GitHub release, and a bidirectional override can make a
+/// painted line read in the opposite order from the characters it is made of
+/// -- so what the user sees and what the string says can be made to disagree,
+/// on a page whose whole job is telling them what they are about to install.
+/// Zero-width characters do the same trick by hiding joins. None of them have
+/// any legitimate use in a release note, so they are dropped rather than
+/// escaped.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'                  // soft hyphen
+        | '\u{061c}'                // arabic letter mark
+        | '\u{200b}'..='\u{200f}'   // zero-width set, LRM, RLM
+        | '\u{202a}'..='\u{202e}'   // bidi embeddings and overrides
+        | '\u{2060}'..='\u{2064}'   // word joiner and the invisible operators
+        | '\u{2066}'..='\u{206f}'   // bidi isolates and deprecated formatting
+        | '\u{feff}'                // byte-order mark as a character
+        | '\u{fff9}'..='\u{fffb}'   // interlinear annotation
+    )
 }
 
 /// How long to wait for a TCP connection to establish before giving up.
@@ -95,8 +184,18 @@ pub fn check_for_update(
         .ok_or("release has no installer asset")?
         .to_string();
 
+    // Absent, null, or a non-string are all one case here: a release with no
+    // notes. Not an error -- a release genuinely may have an empty body, and
+    // failing the whole check over missing prose would turn "no notes" into
+    // "no update".
+    let notes = body["body"].as_str().unwrap_or_default().to_string();
+
     if latest_version > *current_version {
-        Ok(Some(ReleaseInfo { version: latest_version, installer_download_url: installer_url }))
+        Ok(Some(ReleaseInfo {
+            version: latest_version,
+            installer_download_url: installer_url,
+            body: notes,
+        }))
     } else {
         Ok(None)
     }
@@ -166,11 +265,23 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
 /// `main.rs`. The wrong direction is not cosmetic: [`build_api_agent`]'s 30s
 /// *total* cap applied to a 6 MB stream aborts every legitimately slow
 /// download, which is worse than the 600s cap this shape exists to remove.
+///
+/// `on_progress` is called with `(bytes_so_far, total_if_known)` as the stream
+/// arrives. It exists because the About page reports this download to the user
+/// who asked for it (see `update_panel.rs`), and a multi-megabyte transfer with
+/// no visible progress is indistinguishable from a hung one. It is a `&dyn Fn`
+/// rather than a channel so this function keeps knowing nothing about who is
+/// watching; a caller that isn't watching passes [`NO_PROGRESS`].
+///
+/// **`on_progress` is called on the downloading thread, between reads.** It is
+/// on the transfer's critical path, so anything expensive in it slows the
+/// download; the About page's implementation is a `send` down an `mpsc`.
 pub fn download_and_verify(
     release: &ReleaseInfo,
     expected_thumbprint: &str,
     dest_dir: &Path,
     agent: &crate::http_agent::StallBounded,
+    on_progress: &dyn Fn(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
     // Created here rather than assumed to exist: this is a dedicated cache
     // subdirectory (see `main.rs`), not the config directory the rest of the
@@ -183,6 +294,13 @@ pub fn download_and_verify(
         .get(&release.installer_download_url)
         .call()
         .map_err(|e| format!("failed to download installer: {e}"))?;
+    // Advisory only. A server may omit it, and a chunked response has none at
+    // all, so every consumer of this number has to cope with `None` -- which
+    // is why it is passed on as an `Option` rather than being defaulted to
+    // zero here and silently reported as "0 bytes total".
+    let total = response
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok());
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(&dest_path).map_err(|e| e.to_string())?;
     // A stalled transfer aborts here, part-written, and the partial file must
@@ -192,7 +310,12 @@ pub fn download_and_verify(
     // unreachable when the bound went from a 600s total to a 15s stall: a
     // flaky link now produces a partial installer every retry, and each one
     // sits in the cache directory until the app is next restarted.
-    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+    //
+    // Hand-rolled rather than `std::io::copy` for one reason: `copy` cannot
+    // say how far it has got, and the About page has to. The buffer is
+    // `copy`'s own default size, and the failure handling is the same
+    // remove-the-partial it always was.
+    if let Err(e) = copy_reporting(&mut reader, &mut file, total, on_progress) {
         drop(file);
         let _ = std::fs::remove_file(&dest_path);
         return Err(e.to_string());
@@ -206,6 +329,45 @@ pub fn download_and_verify(
     }
 
     Ok(dest_path)
+}
+
+/// A progress sink for callers that aren't watching, so `download_and_verify`
+/// never has to take an `Option` and branch on it per read.
+pub const NO_PROGRESS: &dyn Fn(u64, Option<u64>) = &|_, _| {};
+
+/// `std::io::copy` that also says how far it has got.
+///
+/// Its own function, over plain `Read`/`Write`, so the reporting contract is
+/// testable without a socket: the tests below drive it from a `&[u8]` and
+/// assert on what came out of the sink. What is pinned is the contract the
+/// About page depends on -- **the final call always reports the total number
+/// of bytes actually written** -- which is what stops a progress bar from
+/// stopping at 97% on a transfer that finished.
+///
+/// `total` is passed through untouched rather than being reconciled against
+/// what arrived. It is the server's claim; `copied` is the truth, and the
+/// caller is shown both.
+fn copy_reporting(
+    reader: &mut dyn std::io::Read,
+    writer: &mut dyn std::io::Write,
+    total: Option<u64>,
+    on_progress: &dyn Fn(u64, Option<u64>),
+) -> std::io::Result<u64> {
+    let mut buf = vec![0u8; 8 * 1024];
+    let mut copied: u64 = 0;
+    on_progress(0, total);
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        writer.write_all(&buf[..n])?;
+        copied += n as u64;
+        on_progress(copied, total);
+    }
+    Ok(copied)
 }
 
 /// The Authenticode signer thumbprint an installer must carry before
@@ -442,6 +604,138 @@ mod tests {
         let release = result.expect("expected an available update");
         assert_eq!(release.version, Version::parse("1.2.0").unwrap());
         assert_eq!(release.installer_download_url, "https://example.com/deskwarden-installer.exe");
+        assert_eq!(
+            release.body, "",
+            "a release whose JSON carries no `body` must read as empty notes, not as junk"
+        );
+    }
+
+    /// **The release notes come out of the check that was already being made.**
+    ///
+    /// The About page renders `ReleaseInfo::body`, and the whole reason it is a
+    /// field rather than a second call is that this one response already
+    /// carries it. If the parse ever stops reading it, the page shows a release
+    /// with no notes and looks merely like a release that has none -- which is
+    /// a real state, so nothing else would fail. Hence a test that names the
+    /// exact prose the mock served.
+    #[test]
+    fn the_release_notes_come_back_with_the_version_from_the_one_response() {
+        let mut server = mockito::Server::new();
+        let body = r#"{
+            "tag_name": "v1.2.0",
+            "body": "Fixed\n- the overlay no longer lies",
+            "assets": [
+                {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe"}
+            ]
+        }"#;
+        let _m = server
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let current = Version::parse("1.1.0").unwrap();
+        let release = check_for_update(&server.url(), &current, &build_api_agent())
+            .unwrap()
+            .expect("expected an available update");
+
+        assert_eq!(release.body, "Fixed\n- the overlay no longer lies");
+    }
+
+    /// The notes are DATA. Everything markup-shaped in them survives verbatim
+    /// -- because nothing interprets it -- and everything control-shaped in
+    /// them does not, because a text layout engine is the last place a remote
+    /// host's control characters should arrive.
+    #[test]
+    fn release_notes_are_stripped_of_control_characters_and_never_interpreted() {
+        let hostile = "line one\r\n<script>alert(1)</script>\r\n[click](http://evil.example)\u{202e}\u{200b}\u{0007}end";
+        let shown = release_notes_for_display(hostile);
+
+        assert!(
+            !shown.contains('\r')
+                && !shown.contains('\u{202e}')
+                && !shown.contains('\u{200b}')
+                && !shown.contains('\u{0007}'),
+            "a control or bidi-override character reached the painter: {shown:?}"
+        );
+        assert!(
+            shown.contains("<script>alert(1)</script>")
+                && shown.contains("[click](http://evil.example)"),
+            "markup and link syntax must survive UNINTERPRETED, as the literal text it is: \
+             {shown:?}"
+        );
+        assert_eq!(shown.lines().count(), 3, "newlines are the one control kept: {shown:?}");
+    }
+
+    /// The bound exists so a release body chosen by a remote host cannot become
+    /// an unbounded per-frame layout. Cut on a `char` boundary, deliberately: a
+    /// byte slice through a multi-byte codepoint panics, and this string is not
+    /// ours.
+    #[test]
+    fn release_notes_are_bounded_and_cut_on_a_char_boundary() {
+        let huge = "\u{00e9}".repeat(MAX_RELEASE_NOTES_CHARS * 3);
+        let shown = release_notes_for_display(&huge);
+
+        assert_eq!(
+            shown.chars().count(),
+            MAX_RELEASE_NOTES_CHARS + NOTES_TRUNCATION_MARK.chars().count()
+        );
+        assert!(shown.ends_with(NOTES_TRUNCATION_MARK), "a cut read must look cut: {shown:?}");
+        // The real proof that the cut respected codepoints: every character is
+        // still the one that went in, so nothing was sliced in half.
+        assert!(shown.trim_end_matches(NOTES_TRUNCATION_MARK).chars().all(|c| c == '\u{00e9}'));
+    }
+
+    /// **The last progress report is the whole file.**
+    ///
+    /// This is the contract the About page's progress bar rests on: without it
+    /// a completed download can leave the bar short of the end, which reads as
+    /// a transfer that stalled at the finish line.
+    #[test]
+    fn the_download_reports_progress_and_ends_on_the_byte_count_it_wrote() {
+        let payload = vec![7u8; 20 * 1024];
+        let mut source = payload.as_slice();
+        let mut sink: Vec<u8> = Vec::new();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let total = payload.len() as u64;
+
+        let copied =
+            copy_reporting(&mut source, &mut sink, Some(total), &|done, declared| {
+                seen.lock().unwrap().push((done, declared));
+            })
+            .unwrap();
+
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(copied, total);
+        assert_eq!(sink.len(), payload.len(), "the bytes must still all arrive");
+        assert!(seen.len() > 2, "a 20 KiB stream reported only {} time(s)", seen.len());
+        assert_eq!(seen.first().copied(), Some((0, Some(total))));
+        assert_eq!(
+            seen.last().copied(),
+            Some((total, Some(total))),
+            "the final report must be the total actually written, or the bar never fills"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "progress went backwards, which no bar can render honestly"
+        );
+    }
+
+    /// A server that declares no length is normal (a chunked response has
+    /// none), and the caller has to be told so rather than being handed a zero
+    /// it would render as a 0-byte download.
+    #[test]
+    fn an_unknown_total_is_reported_as_unknown_rather_than_as_zero() {
+        let mut source: &[u8] = b"0123456789";
+        let mut sink: Vec<u8> = Vec::new();
+        let last = std::sync::Mutex::new(None);
+
+        copy_reporting(&mut source, &mut sink, None, &|done, declared| {
+            *last.lock().unwrap() = Some((done, declared));
+        })
+        .unwrap();
+
+        assert_eq!(last.into_inner().unwrap(), Some((10, None)));
     }
 
     #[test]
@@ -701,11 +995,13 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: format!("http://127.0.0.1:{port}/installer.exe"),
+            body: String::new(),
         };
         let agent =
             crate::http_agent::bounded_stall(Duration::from_secs(1), Duration::from_secs(1));
 
-        let result = download_and_verify(&release, "irrelevant-thumbprint", &dir, &agent);
+        let result =
+            download_and_verify(&release, "irrelevant-thumbprint", &dir, &agent, NO_PROGRESS);
 
         assert!(result.is_err(), "a transfer that stopped moving must not look like success");
         let partial = dir.join(installer_file_name(&release.version));
@@ -728,6 +1024,7 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            body: String::new(),
         };
         std::fs::write(dir.join(installer_file_name(&release.version)), b"not a signed PE").unwrap();
 
@@ -751,6 +1048,7 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            body: String::new(),
         };
         // A plausible decoy, sitting right beside where the real one would go.
         std::fs::write(dir.join("setup.exe"), b"not a signed PE").unwrap();
@@ -1353,6 +1651,7 @@ mod tests {
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),
             installer_download_url: String::new(),
+            body: String::new(),
         };
         let env = UpdaterEnv::substitute(substitute_verify, substitute_launch);
         let result = apply_update_with(&dir, &release, &env);

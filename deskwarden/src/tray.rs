@@ -1,5 +1,4 @@
 use crate::accounts::{account_label, AccountId, AccountsState};
-use semver::Version;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -9,9 +8,22 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 /// contract.
 const APP_ICON_RESOURCE_ID: u16 = 1;
 
-/// Tooltip shown when nothing update-related is going on. Also the string the
-/// tray reverts to conceptually -- the update states below replace it while
-/// they apply.
+/// The tooltip, and now very nearly the only one.
+///
+/// **It no longer announces updates, and that is the point of this constant's
+/// new doc.** It used to be one of four strings: the other three said an
+/// update was available, was downloading, or had failed. All three are gone
+/// with the menu item they described, because a tooltip is visible only while
+/// the pointer is resting on a 16px icon -- so it reported a download to
+/// whoever happened to be hovering and to nobody else, and reported a failure
+/// the same way. That is not a channel for something the user asked for and is
+/// waiting on.
+///
+/// The update flow reports into Preferences → About instead: the page the user
+/// clicked in is the page that answers. What is left here is the app's name,
+/// plus `set_sync_in_progress`/`set_sync_failed`'s two sync lines -- which
+/// stay, because a sync is something the user starts *from this menu* and the
+/// menu item beside the tooltip carries the same words.
 const IDLE_TOOLTIP: &str = "Deskwarden";
 
 /// Label of the submenu every account action lives under.
@@ -193,10 +205,16 @@ impl AccountsMenu {
 }
 
 pub struct AppTray {
-    /// Kept (not just dropped-on-the-floor) because the tooltip is this app's
-    /// only user-visible channel for update progress/failure: a tray app has
-    /// no window and no console, so without this a failed update would be
-    /// visible only to whoever goes looking in the log file.
+    /// Kept (not just dropped-on-the-floor) because the tooltip is set through
+    /// it: `set_sync_in_progress`/`set_sync_failed` say there what the Sync
+    /// item says in the menu beside it.
+    ///
+    /// It used to carry the update flow's only user-visible reporting too, on
+    /// the grounds that a tray app has no window. That grounds was wrong in
+    /// one direction -- the app does have a window when Preferences is open,
+    /// which is exactly when an update is being asked for -- and the tooltip
+    /// was a poor channel in the other, being visible only while the pointer
+    /// rests on the icon. See [`IDLE_TOOLTIP`].
     icon: TrayIcon,
     pub open_vault_id: MenuId,
     pub add_app_id: MenuId,
@@ -210,20 +228,13 @@ pub struct AppTray {
     /// `main.rs`'s menu-event handling).
     pub preferences_id: MenuId,
     pub quit_id: MenuId,
-    /// Id of the "Update available" item, for comparing against
-    /// `MenuEvent::id` in the main loop -- same pattern as `add_app_id` and
-    /// `quit_id`.
-    pub update_id: MenuId,
-    /// The item itself, kept (not just its id) because making its label and
-    /// enabled state reflect a discovered update requires the `MenuItem`
-    /// handle: `set_text`/`set_enabled` mutate it in place. Private so
-    /// callers go through `set_update_available` rather than poking at menu
-    /// internals directly.
-    update_item: MenuItem,
-    /// Same reasoning as `update_item`, for `set_sync_in_progress`/
-    /// `set_sync_idle`/`set_sync_failed`.
+    /// Kept (not just its id) because `set_sync_in_progress`/`set_sync_idle`/
+    /// `set_sync_failed` make its label and enabled state reflect what the
+    /// backend is doing, and `set_text`/`set_enabled` mutate it in place.
+    /// Private so callers go through those functions rather than poking at
+    /// menu internals directly.
     sync_item: MenuItem,
-    /// The "Accounts" submenu, kept for the same reason `update_item` is: its
+    /// The "Accounts" submenu, kept for the same reason `sync_item` is: its
     /// contents change whenever an account is added, removed or switched to,
     /// and rebuilding it needs the handle.
     accounts_submenu: Submenu,
@@ -239,13 +250,15 @@ pub fn build_tray() -> AppTray {
     let add_app = MenuItem::new("Add app...", true, None);
     let sync_item = MenuItem::new("Sync", true, None);
     let quit = MenuItem::new("Quit", true, None);
-    // Present in the menu from startup, but disabled until an update is
-    // actually found. Muda's `MenuItem` supports updating text and enabled
-    // state in place after the menu is built (`set_text`/`set_enabled`),
-    // which is simpler and less error-prone than inserting/removing menu
-    // entries at runtime, so that's the mechanism `set_update_available`
-    // uses rather than rebuilding the menu.
-    let update_item = MenuItem::new("Update available", false, None);
+    // **There is no update item here, and its absence is deliberate.** There
+    // was one, created as `MenuItem::new("Update available", false, None)`:
+    // the words were baked in at build time and the check's only effect was to
+    // *enable* it. So on every session with no update -- nearly all of them --
+    // this menu asserted that an update was available and then refused the
+    // click it was inviting. The whole flow now lives on Preferences → About
+    // (`prefs_ui::draw_update_card`), where it can say "no update" as easily
+    // as "update", where the release notes fit, and where the download it
+    // starts can report back to the page that started it.
     let preferences = MenuItem::new("Preferences...", true, None);
     // Empty here and filled by `rebuild_accounts_menu`, which `main` calls
     // once the account list exists and again after every change to it. Built
@@ -255,7 +268,6 @@ pub fn build_tray() -> AppTray {
     menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
     menu.append(&sync_item).unwrap();
-    menu.append(&update_item).unwrap();
     menu.append(&accounts_submenu).unwrap();
     menu.append(&preferences).unwrap();
     menu.append(&quit).unwrap();
@@ -281,8 +293,6 @@ pub fn build_tray() -> AppTray {
         sync_id: sync_item.id().clone(),
         preferences_id: preferences.id().clone(),
         quit_id: quit.id().clone(),
-        update_id: update_item.id().clone(),
-        update_item,
         sync_item,
         accounts_submenu,
         accounts: AccountsMenu::default(),
@@ -446,52 +456,11 @@ pub fn discard_queued_icon_events() -> usize {
     left_clicks
 }
 
-/// Enables the "Update available" tray item and labels it with the version
-/// that was found, once `updater::check_for_update` has found one. Called
-/// from the main loop's periodic update check; a no-op on repeated calls with
-/// the same version beyond redundantly re-setting the same text.
-pub fn set_update_available(tray: &AppTray, version: &Version) {
-    tray.update_item.set_text(format!("Update available (v{version})"));
-    tray.update_item.set_enabled(true);
-    set_tooltip(tray, format!("Deskwarden - update available (v{version})"));
-}
-
-/// Reflects an in-flight download/verify/apply attempt (see `main.rs`'s
-/// background update thread).
-///
-/// The item is disabled for the duration so a second click can't start a
-/// second concurrent download of the same installer, and the label says what
-/// is happening: the work now runs off the main thread, so without this the
-/// only feedback for a multi-megabyte download would be a menu item that
-/// appears to do nothing.
-pub fn set_update_in_progress(tray: &AppTray, version: &Version) {
-    tray.update_item.set_text(format!("Downloading update (v{version})..."));
-    tray.update_item.set_enabled(false);
-    set_tooltip(tray, format!("Deskwarden - downloading update v{version}"));
-}
-
-/// Reports a failed update attempt.
-///
-/// A failure used to be logged and otherwise invisible: the app has no window
-/// and (deliberately) no console, so the user clicked "Update available" and
-/// simply nothing ever happened. The item is re-enabled -- the failure is
-/// frequently transient (network, a GitHub hiccup) and retrying is the right
-/// affordance -- and both the label and the tooltip say so.
-pub fn set_update_failed(tray: &AppTray, version: &Version) {
-    tray.update_item
-        .set_text(format!("Update to v{version} failed - click to retry"));
-    tray.update_item.set_enabled(true);
-    set_tooltip(
-        tray,
-        format!("Deskwarden - update to v{version} failed; see the log file"),
-    );
-}
-
 /// Reflects an in-flight tray-triggered sync (see `main.rs`'s background sync
 /// thread, spawned from the "Sync" menu item).
 ///
-/// Same shape as `set_update_in_progress`: the item is disabled for the
-/// duration so a second click can't start a second concurrent sync, and the
+/// The item is disabled for the duration so a second click can't start a
+/// second concurrent sync, and the
 /// label says what's happening -- the work runs off the main thread, so
 /// without this the item would just appear to do nothing while it's running.
 pub fn set_sync_in_progress(tray: &AppTray) {
@@ -520,13 +489,13 @@ pub fn set_sync_idle(tray: &AppTray) {
 
 /// Reports a failed tray-triggered sync.
 ///
-/// Re-enabled immediately (unlike the update item, which stays disabled while
-/// its "click to retry" label shows): a sync failure is frequently transient
-/// (network, `bw serve` still coming up) and there's no download in flight
-/// that a second click could collide with.
+/// Re-enabled immediately: a sync failure is frequently transient (network,
+/// `bw serve` still coming up) and there's no work in flight that a second
+/// click could collide with.
 ///
-/// The label itself, though, follows `set_update_failed`'s pattern rather
-/// than the tooltip-only shape this used to have: a tray tooltip is only
+/// The label itself, though, does not follow the tooltip-only shape this used
+/// to have -- for the reason [`IDLE_TOOLTIP`] now records at length: a tray
+/// tooltip is only
 /// visible on hover, so a failure that landed while the user wasn't looking
 /// was otherwise invisible until they happened to hover the icon or went
 /// looking in the log file. The label is seen the moment the menu is opened,
@@ -1148,6 +1117,51 @@ mod tests {
                 "{needle:?} is a use-after-free in muda 0.15.3 and returns a corrupted label \
                  under a parallel test run -- see `label_at`, which reads the same label \
                  soundly and by position. Offending lines: {offenders:?}"
+            );
+        }
+    }
+
+    /// **Nothing in this menu talks about updates, and nothing here may put it
+    /// back.**
+    ///
+    /// The item that was removed was not removed for being redundant. It was
+    /// removed because of what it *was*: `MenuItem::new("Update available",
+    /// false, None)` -- the words baked in at build time, the check's only
+    /// effect being to enable it -- so a session with no update (nearly every
+    /// session) showed a permanent claim that there was one, on a control that
+    /// then refused the click it invited. A tray menu cannot fix that, because
+    /// it has nowhere to say "no update" and nowhere to put the release notes
+    /// or a progress bar; the About page can, and does.
+    ///
+    /// A source-text guard rather than a menu walk, deliberately. `build_tray`
+    /// creates a real `TrayIcon`, which needs a window and a message pump and
+    /// so cannot be built in a test at all -- which is exactly how the defect
+    /// survived: nothing could look at that menu. This can, and it also
+    /// catches the near-miss the menu walk would not, which is a
+    /// `set_update_*` helper reintroduced with no item appended yet.
+    #[test]
+    fn the_tray_menu_makes_no_claim_about_updates() {
+        // Comments stripped, because the ones explaining WHY the item is gone
+        // necessarily quote it -- including this test's own doc. What is being
+        // pinned is the code.
+        let source: String = include_str!("tray.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            concat!("Update", " available"),
+            concat!("update_", "item"),
+            concat!("set_update_", "available"),
+            concat!("Downloading ", "update"),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "{needle:?} is back in tray.rs. The update flow lives on Preferences > About \
+                 (`prefs_ui::draw_update_card`), which can say \"no update\" as easily as \
+                 \"update\", can show the release notes, and can report a download to the page \
+                 that started it. A tray menu item can do none of those, and the one that was \
+                 here spent nearly every session asserting an update nobody had."
             );
         }
     }
