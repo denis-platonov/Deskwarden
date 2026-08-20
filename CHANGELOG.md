@@ -8,7 +8,13 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.8.4 - 2026-08-20
+
+> The manual pre-release checklist was not run for this version either.
+> This release changes what happens when Deskwarden starts and when a
+> second copy is launched, and adds a self-update that can now actually
+> install. None of those three has been exercised outside the test suite.
+> If an update, a launch, or a takeover misbehaves, please open an issue.
 
 ### Cyrillic names render in the app's own typeface, at the right weight
 
