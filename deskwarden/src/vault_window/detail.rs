@@ -1726,7 +1726,7 @@ fn pane_chords() -> Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)
             CopyShortcut::CardExpiry => ("copy a card's Expires", *modifiers, *key, *chord),
             CopyShortcut::CardCode => ("copy a card's Code", *modifiers, *key, *chord),
             CopyShortcut::Cardholder => {
-                ("copy a card's Cardholder name", *modifiers, *key, *chord)
+                ("copy a card's Cardholder", *modifiers, *key, *chord)
             }
         })
         .collect();
@@ -6685,7 +6685,15 @@ fn card_rows(
 const NUMBER_LABEL: &str = "Number";
 const EXPIRY_LABEL: &str = "Expires";
 const CODE_LABEL: &str = "Code";
-const CARDHOLDER_LABEL: &str = "Cardholder name";
+/// `Cardholder`, not "Cardholder name": the owner's own words, and it reads
+/// the way `Number`, `Expires` and `Code` above it do -- the noun the card
+/// prints, with nothing appended. The label column is a fixed
+/// [`ROW_LABEL_WIDTH`] rather than one derived from the longest label, so
+/// shortening this moves no value on the pane; it is a word, not a layout
+/// change. `copy_shortcut_label` carries it to the copy toast and the chord
+/// description follows it, so the row, the toast and the shortcut list say
+/// one thing.
+const CARDHOLDER_LABEL: &str = "Cardholder";
 
 /// How wide a digits run wants to be, unwrapped -- the question
 /// [`digits_fit`] asks, asked from outside a row.
@@ -9851,7 +9859,7 @@ mod tests {
         let texts = painted(&a_full_card(), &TotpState::NoSecret);
         for label in [
             "CARD DETAILS",
-            "Cardholder name",
+            CARDHOLDER_LABEL,
             "John Doe",
             "Number",
             "Expires",
@@ -12682,7 +12690,7 @@ mod tests {
             contains(&texts, "No card details"),
             "an empty card drew a heading over nothing: {texts:?}"
         );
-        for absent in ["Cardholder name", "Number", "Security code"] {
+        for absent in [CARDHOLDER_LABEL, "Number", "Security code"] {
             assert!(
                 !contains(&texts, absent),
                 "an empty card drew a {absent:?} row it has no data for: {texts:?}"
