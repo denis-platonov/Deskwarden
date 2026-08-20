@@ -77,6 +77,11 @@ pub const ERROR: Color32 = Color32::from_rgb(0xb4, 0x23, 0x18);
 // Global style
 // ---------------------------------------------------------------------------
 
+/// Face name for Archivo Regular (the design's 400 weight). Unlike the three
+/// below it is not a *named family*: it is the front of egui's own
+/// [`FontFamily::Proportional`] stack, which is what plain text resolves to.
+const REGULAR: &str = "Archivo-Regular";
+
 /// Named font family for Archivo SemiBold (the design's 600 weight: buttons,
 /// row titles, field emphasis). Use via [`semibold`].
 pub const SEMIBOLD: &str = "Archivo-SemiBold";
@@ -129,6 +134,56 @@ fn system_monospace() -> Option<Vec<u8>> {
     }
 }
 
+/// The four Cyrillic faces, paired with the Archivo weight each stands
+/// behind: `(Archivo family name, Noto face name, Noto bytes)`.
+///
+/// **All four bundled Archivo faces carry ZERO codepoints in U+0400–04FF.**
+/// Without these, every Cyrillic string in the app — item names, usernames,
+/// folder names, notes — fell through to egui's bundled proportional
+/// fallback, which is one typeface at one weight: a Cyrillic name rendered
+/// identically whether the design asked for 400, 600, 700 or 800, and
+/// visibly lighter than the Latin sitting beside it.
+///
+/// These are Noto Sans' *Cyrillic subset* (Fontsource, SIL OFL 1.1; see
+/// assets/fonts/OFL-NotoSans.txt, kept as its own file rather than folded
+/// into Archivo's OFL.txt). The subset carries 100 Cyrillic codepoints and
+/// **no Latin at all**, and that absence is the point: a face with no
+/// `A`–`z` in its `cmap` cannot win a Latin lookup wherever it sits in a
+/// family stack, so adding these cannot move one existing Latin
+/// measurement. 64 KB for all four. Their `usWeightClass` values
+/// (400/600/700/800) land exactly on the four Archivo cuts.
+const CYRILLIC_FACES: [(&str, &str, &[u8]); 4] = [
+    (
+        REGULAR,
+        "NotoSans-Cyrillic-Regular",
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-Regular.ttf"),
+    ),
+    (
+        SEMIBOLD,
+        "NotoSans-Cyrillic-SemiBold",
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-SemiBold.ttf"),
+    ),
+    (
+        BOLD,
+        "NotoSans-Cyrillic-Bold",
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-Bold.ttf"),
+    ),
+    (
+        EXTRABOLD,
+        "NotoSans-Cyrillic-ExtraBold",
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-ExtraBold.ttf"),
+    ),
+];
+
+/// The Noto Cyrillic face standing behind `archivo`, from [`CYRILLIC_FACES`].
+fn cyrillic_for(archivo: &str) -> &'static str {
+    CYRILLIC_FACES
+        .iter()
+        .find(|(a, _, _)| *a == archivo)
+        .map(|(_, noto, _)| *noto)
+        .expect("every Archivo weight is paired with a Cyrillic face in CYRILLIC_FACES")
+}
+
 /// The bundled Archivo faces (the design's typeface, OFL-licensed; see
 /// assets/fonts/OFL.txt), layered over egui's defaults.
 ///
@@ -136,10 +191,18 @@ fn system_monospace() -> Option<Vec<u8>> {
 /// weight is registered as its own named family, with egui's default
 /// proportional stack kept behind it for glyphs Archivo lacks (arrows,
 /// emoji, CJK).
+///
+/// Cyrillic used to be on that "glyphs Archivo lacks" list, and reaching
+/// egui's fallback for it meant losing the weight (see [`CYRILLIC_FACES`]).
+/// Each weight's Noto face therefore goes in at **position 1: behind its own
+/// Archivo cut, ahead of egui's defaults**. Behind Archivo so Latin keeps
+/// resolving exactly as it does today; ahead of the defaults because the
+/// defaults are precisely what Cyrillic was reaching, so a face appended
+/// after them would never be consulted and nothing would change.
 fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "Archivo-Regular".to_owned(),
+        REGULAR.to_owned(),
         Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/Archivo-Regular.ttf"
         ))),
@@ -163,6 +226,12 @@ fn font_definitions() -> egui::FontDefinitions {
         ))),
     );
 
+    for (_, noto, bytes) in CYRILLIC_FACES {
+        fonts
+            .font_data
+            .insert(noto.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
+    }
+
     let default_stack = fonts
         .families
         .get(&FontFamily::Proportional)
@@ -170,16 +239,28 @@ fn font_definitions() -> egui::FontDefinitions {
         .unwrap_or_default();
 
     if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
-        proportional.insert(0, "Archivo-Regular".to_owned());
+        proportional.insert(0, REGULAR.to_owned());
+        proportional.insert(1, cyrillic_for(REGULAR).to_owned());
     }
     for weight in [SEMIBOLD, BOLD, EXTRABOLD] {
-        let mut stack = vec![weight.to_owned()];
+        let mut stack = vec![weight.to_owned(), cyrillic_for(weight).to_owned()];
         stack.extend(default_stack.iter().cloned());
         fonts
             .families
             .insert(FontFamily::Name(weight.into()), stack);
     }
 
+    // Monospace gets NO Cyrillic face, deliberately. Consolas covers
+    // U+0400-04FF itself, and so does the Hack egui bundles behind it, so
+    // the family already renders Cyrillic from a real monospaced face at
+    // both ends of the `system_monospace` branch below -- asserted in
+    // `the_monospace_family_carries_cyrillic_without_a_noto_face`. Putting
+    // the proportional Noto subset in front of them would be strictly
+    // worse: it would take those codepoints away from a monospaced face and
+    // hand them to one whose advances differ per glyph, breaking the one
+    // property the monospace family exists for. Monospace is also a single
+    // weight here; there is no lost-weight problem to fix.
+    //
     // Front of the monospace stack, not a replacement for it -- egui's Hack
     // stays behind as the fallback for anything Consolas lacks, and as the
     // whole family if `system_monospace` came back empty.
@@ -3679,6 +3760,286 @@ mod tests {
             "ExtraBold is not wider than Bold ({extrabold}px vs {bold}px for {word:?}) \
              -- the 800 face is probably not loading"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Cyrillic coverage (see `CYRILLIC_FACES`).
+    // -----------------------------------------------------------------
+
+    /// A word in Cyrillic ("Passwords"), all of it inside U+0400-04FF and
+    /// none of it in Archivo.
+    const CYRILLIC_WORD: &str = "Пароли";
+
+    /// Every family that carries one of the four weights, paired with the
+    /// Archivo face and the Noto face that belong in it. Regular's home is
+    /// egui's own `Proportional`; the other three are named families.
+    fn weighted_families() -> Vec<(FontFamily, &'static str, &'static str)> {
+        CYRILLIC_FACES
+            .iter()
+            .map(|(archivo, noto, _)| {
+                let family = if *archivo == REGULAR {
+                    FontFamily::Proportional
+                } else {
+                    FontFamily::Name((*archivo).into())
+                };
+                (family, *archivo, *noto)
+            })
+            .collect()
+    }
+
+    /// A context whose font set is exactly `fonts`, two frames in (see
+    /// [`ctx_with_fonts`] for why two).
+    fn ctx_with(fonts: egui::FontDefinitions) -> egui::Context {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        ctx.set_fonts(fonts);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        ctx
+    }
+
+    /// **Position, not presence.** A Noto face appended to the *end* of a
+    /// family list is registered, is contained, and changes absolutely
+    /// nothing: egui's own fallbacks are still in these lists and are what
+    /// Cyrillic was reaching. So this pins both edges -- each Noto face sits
+    /// after its Archivo cut (Latin must never be taken away from Archivo)
+    /// and before every entry egui shipped (or the fallback still wins).
+    #[test]
+    fn each_cyrillic_face_sits_behind_its_archivo_cut_and_ahead_of_eguis_fallbacks() {
+        let fonts = font_definitions();
+        let egui_defaults = egui::FontDefinitions::default()
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .expect("egui ships a Proportional family");
+        assert!(
+            !egui_defaults.is_empty(),
+            "egui's Proportional family is empty, so \"Noto comes before the fallbacks\" \
+             below would be vacuously true"
+        );
+
+        for (family, archivo, noto) in weighted_families() {
+            let stack = fonts
+                .families
+                .get(&family)
+                .unwrap_or_else(|| panic!("no family {family:?} in the font set"));
+            let at = |face: &str| {
+                stack
+                    .iter()
+                    .position(|f| f == face)
+                    .unwrap_or_else(|| panic!("{face} is not in {family:?}: {stack:?}"))
+            };
+            let (archivo_at, noto_at) = (at(archivo), at(noto));
+
+            assert!(
+                archivo_at < noto_at,
+                "{noto} sits at {noto_at} in {family:?}, ahead of {archivo} at {archivo_at} \
+                 -- Latin would resolve to a Cyrillic-only subset first. Stack: {stack:?}"
+            );
+
+            for fallback in &egui_defaults {
+                let fallback_at = at(fallback);
+                assert!(
+                    noto_at < fallback_at,
+                    "{noto} sits at {noto_at} in {family:?}, BEHIND egui's own {fallback} at \
+                     {fallback_at}. Registered, contained -- and never consulted, because the \
+                     fallback is exactly what Cyrillic already resolved to. Stack: {stack:?}"
+                );
+            }
+        }
+    }
+
+    /// **Rendering, not registration.** The reported symptom was one
+    /// typeface at one weight for every Cyrillic string, whatever the design
+    /// asked for; the four weights collapsing onto a single measurement is
+    /// precisely that symptom, and it is what this refuses.
+    ///
+    /// Also checks the run has real ink: a `uv_rect` of zero size is a glyph
+    /// that rasterised to nothing, which is how a missing codepoint gets
+    /// through a width comparison unnoticed.
+    #[test]
+    fn a_cyrillic_run_renders_real_glyphs_at_the_weight_it_was_asked_for() {
+        let ctx = ctx_with_fonts();
+        let measure = |family: &FontFamily| {
+            ctx.fonts_mut(|f| {
+                let galley = f.layout_no_wrap(
+                    CYRILLIC_WORD.to_owned(),
+                    FontId::new(25.0, family.clone()),
+                    INK,
+                );
+                let glyphs: Vec<_> = galley.rows.iter().flat_map(|r| r.glyphs.iter()).collect();
+                assert_eq!(
+                    glyphs.iter().map(|g| g.chr).collect::<String>(),
+                    CYRILLIC_WORD,
+                    "{family:?} laid out something other than the text it was given"
+                );
+                for g in &glyphs {
+                    assert!(
+                        g.uv_rect.size.x > 0.0 && g.uv_rect.size.y > 0.0,
+                        "{:?} rasterised to nothing in {family:?} -- the run is blank, not \
+                         merely the wrong weight",
+                        g.chr
+                    );
+                }
+                galley.size().x
+            })
+        };
+
+        let widths: Vec<(String, f32)> = weighted_families()
+            .iter()
+            .map(|(family, archivo, _)| ((*archivo).to_owned(), measure(family)))
+            .collect();
+
+        for (i, (a_name, a)) in widths.iter().enumerate() {
+            for (b_name, b) in widths.iter().skip(i + 1) {
+                assert!(
+                    (a - b).abs() > 0.5,
+                    "{CYRILLIC_WORD:?} measures the same at {a_name} ({a}px) and {b_name} \
+                     ({b}px), so Cyrillic is resolving to ONE face for every weight -- the \
+                     bug itself. All four: {widths:?}"
+                );
+            }
+        }
+
+        // ...and that one face is not the one egui ships: an unstyled
+        // context is what the app rendered Cyrillic with before.
+        let bare = ctx_with(egui::FontDefinitions::default());
+        let fallback = bare.fonts_mut(|f| {
+            f.layout_no_wrap(
+                CYRILLIC_WORD.to_owned(),
+                FontId::new(25.0, FontFamily::Proportional),
+                INK,
+            )
+            .size()
+            .x
+        });
+        for (name, w) in &widths {
+            assert!(
+                (w - fallback).abs() > 0.5,
+                "{name} still measures {w}px for {CYRILLIC_WORD:?}, the same as egui's \
+                 untouched default ({fallback}px) -- nothing was actually substituted"
+            );
+        }
+    }
+
+    /// **The negative half, and the whole promise of a Latin-free subset.**
+    ///
+    /// The Noto faces carry no `A`-`z` at all, so no Latin lookup can reach
+    /// them however the stacks are ordered -- meaning not one existing
+    /// measurement in the app is allowed to move. Proving that needs the
+    /// "before" to exist, so this builds it: the very same font set with the
+    /// four faces stripped back out, and compares whole laid-out galleys
+    /// glyph field by glyph field (position, advance, ascent, line height,
+    /// and the `uv_rect` that identifies the rasterised glyph itself, so a
+    /// substituted face of coincidentally equal width could not pass).
+    #[test]
+    fn latin_layout_is_identical_with_and_without_the_cyrillic_faces() {
+        let mut stripped = font_definitions();
+        for (_, noto, _) in CYRILLIC_FACES {
+            assert!(
+                stripped.font_data.remove(noto).is_some(),
+                "{noto} was never registered, so stripping it proves nothing"
+            );
+            let mut removed = false;
+            for stack in stripped.families.values_mut() {
+                let before = stack.len();
+                stack.retain(|f| f != noto);
+                removed |= stack.len() != before;
+            }
+            assert!(removed, "{noto} was in no family, so stripping it proves nothing");
+        }
+
+        let with = ctx_with(font_definitions());
+        let without = ctx_with(stripped);
+
+        // A Latin run that exercises both cases and the digits and
+        // punctuation between them, plus the two strings the design's own
+        // measurements are taken from.
+        let texts = [
+            "The quick brown fox jumps over the lazy dog, 0123456789 (@/+-.)",
+            "Deskwarden",
+            "CTRL+L",
+        ];
+        let dump = |ctx: &egui::Context, text: &str, font: FontId| {
+            ctx.fonts_mut(|f| {
+                let galley = f.layout_no_wrap(text.to_owned(), font, INK);
+                let mut out = format!("{:?}\n", galley.size());
+                for row in &galley.rows {
+                    for glyph in &row.glyphs {
+                        out.push_str(&format!("{glyph:?}\n"));
+                    }
+                }
+                out
+            })
+        };
+
+        for (family, archivo, _) in weighted_families() {
+            for text in texts {
+                for size in [11.0, 13.0, 14.0, 22.0, 25.0] {
+                    let font = FontId::new(size, family.clone());
+                    assert_eq!(
+                        dump(&with, text, font.clone()),
+                        dump(&without, text, font),
+                        "{text:?} at {size}px in {archivo} lays out differently once the \
+                         Cyrillic subset faces are added. They carry no Latin codepoints, \
+                         so this cannot happen unless one of them is being consulted for \
+                         Latin -- which means the stack order is wrong"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The monospace family deliberately gets no Noto face (see the comment
+    /// in `font_definitions`), which is only defensible while it renders
+    /// Cyrillic itself. Consolas covers U+0400-04FF, and so does the Hack
+    /// egui bundles when `system_monospace` finds nothing -- so this holds
+    /// on both branches, and reds if the branch it runs on stops covering
+    /// Cyrillic, which is the point at which the decision would need
+    /// revisiting.
+    #[test]
+    fn the_monospace_family_carries_cyrillic_without_a_noto_face() {
+        let fonts = font_definitions();
+        let monospace = fonts
+            .families
+            .get(&FontFamily::Monospace)
+            .expect("egui ships a Monospace family");
+        for (_, noto, _) in CYRILLIC_FACES {
+            assert!(
+                !monospace.contains(&noto.to_owned()),
+                "{noto} is proportional; in the Monospace family it would take Cyrillic \
+                 away from a monospaced face and hand it to one with per-glyph advances"
+            );
+        }
+
+        let ctx = ctx_with_fonts();
+        let font = FontId::new(13.0, FontFamily::Monospace);
+        ctx.fonts_mut(|f| {
+            let galley = f.layout_no_wrap(CYRILLIC_WORD.to_owned(), font.clone(), INK);
+            for row in &galley.rows {
+                for glyph in &row.glyphs {
+                    assert!(
+                        glyph.uv_rect.size.x > 0.0 && glyph.uv_rect.size.y > 0.0,
+                        "{:?} rasterises to nothing in the monospace family, so a Cyrillic \
+                         run in a monospace context IS blank and the family needs a \
+                         Cyrillic face after all",
+                        glyph.chr
+                    );
+                }
+            }
+
+            // Still monospaced for it: the reason the Noto subset was kept out.
+            let narrow = f.layout_no_wrap("шшшшшш".to_owned(), font.clone(), INK).size().x;
+            let wide = f.layout_no_wrap("ііііії".to_owned(), font, INK).size().x;
+            assert!(
+                (narrow - wide).abs() < 0.5,
+                "the monospace family renders Cyrillic with unequal advances \
+                 ({narrow}px vs {wide}px), so it is resolving them from a proportional face"
+            );
+        });
     }
 
     #[test]
