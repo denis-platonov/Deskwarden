@@ -1,4 +1,12 @@
-//! The update flow the About page drives, and the thread it runs on.
+//! The update flow the Updates page drives, and the thread it runs on.
+//!
+//! **It was the About page's until the Preferences window was reorganised.**
+//! Nothing in this module changed for that move -- not a stage, not a
+//! message, not a thread. What changed is which `prefs_ui` page calls
+//! [`UpdatePanel::pump`], and the answer to "what if the user navigates away
+//! mid-download" is unchanged with it: the channel is unbounded, the worker
+//! never blocks on a full queue, and everything it sent while nobody was
+//! draining is drained in one frame on the way back. See [`UpdatePanel::pump`].
 //!
 //! # Why this is not in `main.rs`
 //!
@@ -13,14 +21,14 @@
 //! # Why it owns its own thread and channel
 //!
 //! `prefs_ui::run` blocks. It pumps its own event loop (`run_ui_native`) and
-//! does not return until the window closes, so for as long as the About page
-//! is on screen `main.rs`'s loop is not running: it is not calling `try_recv`
+//! does not return until the window closes, so for as long as the Updates
+//! page is on screen `main.rs`'s loop is not running: it is not calling `try_recv`
 //! on anything and it is not spawning anything. A check or a download driven
 //! from that page therefore cannot be main's work reported back to main. It
 //! has to be work this page starts and this page collects.
 //!
 //! So an [`UpdatePanel`] holds a `Receiver` and nothing else does. Every frame
-//! the About page draws, it calls [`UpdatePanel::pump`], which drains whatever
+//! the Updates page draws, it calls [`UpdatePanel::pump`], which drains whatever
 //! has arrived without ever blocking, and asks for another frame while
 //! anything is still in flight. Nothing here joins a thread, and nothing here
 //! waits: a frame that waited would freeze the window it is trying to report
@@ -33,8 +41,15 @@
 //! polled from the draw needs nothing from it.
 //!
 //! The same shape serves the preferences *modal* over the vault window for
-//! free, because that modal draws the same `draw_about` inside the vault
+//! free, because that modal draws the same `draw_updates` inside the vault
 //! window's own blocking loop. One flow, two shells, no duplication.
+//!
+//! **Both shells reach this the same way, and the move did not change that.**
+//! `prefs_ui::run` and `vault_window::build_frame` both build a `PrefsState`
+//! and both call `draw_prefs_body`, which dispatches on the state's own
+//! section; neither shell knows which pages exist. So a section moving from
+//! one place in `Section::ALL` to another is invisible to both -- there is no
+//! shell-side list of pages to fall out of step.
 //!
 //! # Why the environment is installed once rather than passed in
 //!
@@ -108,7 +123,7 @@ pub fn env() -> Option<&'static UpdateEnv> {
     ENV.get()
 }
 
-/// What the About page is showing about updates.
+/// What the Updates page is showing about updates.
 ///
 /// One enum rather than a set of booleans, because the states are exclusive
 /// and the previous shape's defect was precisely two independent flags
@@ -166,7 +181,7 @@ enum UpdateMsg {
     Downloaded(Result<(), String>),
 }
 
-/// The About page's update section, and the only owner of the channel its
+/// The Updates page's update section, and the only owner of the channel its
 /// worker threads report on.
 pub struct UpdatePanel {
     stage: UpdateStage,
@@ -212,6 +227,28 @@ impl UpdatePanel {
     /// A disconnected channel with nothing in it is not an error and not a
     /// failure to report: it means the worker finished and its outcome has
     /// already been applied, so the receiver is simply retired.
+    ///
+    /// # What happens while nobody is calling this
+    ///
+    /// Only the Updates page pumps, so a user who starts a download and then
+    /// clicks another section in the nav stops draining. **The download does
+    /// not stop, and nothing it says is lost.** The channel is an unbounded
+    /// `mpsc`, so the worker's `send` never blocks on a queue nobody is
+    /// reading; the bytes keep arriving, the file keeps being written, and
+    /// the progress messages queue. Coming back to the page drains the whole
+    /// backlog in this one loop before the frame paints, so the bar is drawn
+    /// at where the transfer *is* -- not where it was when the user left, and
+    /// never replayed as an animation.
+    ///
+    /// That is the same answer as before the Preferences window was
+    /// reorganised, and worth stating because the question changed shape: the
+    /// panel used to be a card on About, so "navigate away" already meant
+    /// "stop pumping" for every other section. Updates being its own page
+    /// makes leaving it likelier, not different.
+    ///
+    /// The two things that genuinely pause are cosmetic and self-correcting:
+    /// the repaint request (asked for by the page, not here) and the stage,
+    /// which is only ever a rendering of messages already sent.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
         loop {

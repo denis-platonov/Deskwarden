@@ -248,7 +248,22 @@ const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP s
      on the details screen as an extra masked row under its TOTP code, revealed by clicking \
      the eye. The code expires in 30 seconds; the secret behind it never does.";
 
-const UPDATE_CHECK_LABEL: &str = "Check for updates";
+/// The automatic-check row's label.
+///
+/// **It said "Check for updates" until this row moved onto
+/// [`Section::Updates`]**, where [`UPDATE_CHECK_BUTTON`] says exactly that in
+/// the card directly below. Two identical strings a card apart, one a switch
+/// and one a button, is the worst possible reading of a distinction the whole
+/// page is built to make -- and it was invisible while they were two pages
+/// apart, which is how it survived this long.
+///
+/// So the switch names the half it actually governs, and the button keeps the
+/// words for the thing a user presses. Nothing about either behaviour
+/// changed; the row simply stopped calling itself by the button's name. The
+/// copy underneath it ([`UPDATE_CHECK_DESCRIPTION`]) was already written this
+/// way -- "Deskwarden asks GitHub" -- so this is the label catching up to its
+/// own description.
+const UPDATE_CHECK_LABEL: &str = "Check for updates automatically";
 /// **Says what the request discloses and, unusually, argues for leaving it
 /// on.** Every other privacy row here describes a cost; this one has to
 /// describe a cost that is small and a consequence of switching it off that
@@ -464,7 +479,7 @@ pub enum AccountStatus {
     SignedOut,
 }
 
-// --- About: the update flow -----------------------------------------------
+// --- Updates: the update flow ---------------------------------------------
 //
 // **This is where the tray's update item went.** That item was created as
 // `MenuItem::new("Update available", false, None)` -- the words present from
@@ -479,7 +494,21 @@ pub enum AccountStatus {
 // its own thread and channel because `run` below blocks and `main.rs`'s loop is
 // not running while this page is on screen.
 
-const UPDATE_SECTION_LABEL: &str = "Updates";
+/// The flow card's label -- the row the description and the button sit on.
+///
+/// **It said "Updates" while this card lived on About**, where that was the
+/// only word on the page naming the subject. On [`Section::Updates`] it is
+/// also the page heading and also the nav row, so the same string was about
+/// to be painted three times in one view and `ink_of` would no longer have
+/// been able to say which one a test meant.
+///
+/// A noun phrase rather than [`SCAN_SECTION_LABEL`]'s imperative, and that is
+/// the one place these two pages deliberately differ: "Scan the whole vault"
+/// stays true while a scan is running, whereas an imperative here would be
+/// telling the user to check for a release they are already downloading. The
+/// stage is the *description's* job on both pages; this label only has to
+/// name what the card is about, at every stage.
+const UPDATE_SECTION_LABEL: &str = "New releases";
 const UPDATE_CHECK_BUTTON: &str = "Check for updates";
 const UPDATE_CHECKING_BUTTON: &str = "Checking...";
 const UPDATE_DOWNLOAD_BUTTON: &str = "Download";
@@ -505,8 +534,15 @@ const UPDATE_UNAVAILABLE_DESCRIPTION: &str =
 /// button that appears to ignore a preference and one that is explicit about
 /// which preference it is not governed by. `PRIVACY.md` carries the same
 /// claim.
+///
+/// **It used to say "on the General page", and no longer has to.** The switch
+/// is now the card directly above this row (see [`draw_updates`]), so the
+/// sentence can point at it instead of sending the reader somewhere to check
+/// -- which is the whole reason the two were put on one page. Naming a page
+/// that no longer holds the switch would have been worse than vague; naming
+/// no page at all, with the switch in the same glance, is better than either.
 const UPDATE_AUTOMATIC_OFF_NOTE: &str =
-    "Automatic checks are off on the General page. This button still asks, because you asked it \
+    "Automatic checks are off — the switch above. This button still asks, because you asked it \
      to.";
 
 const UPDATE_NOTES_LABEL: &str = "What is new";
@@ -572,7 +608,7 @@ const SCAN_BUTTON_WIDTH: f32 = 184.0;
 // Sections
 // ---------------------------------------------------------------------------
 
-/// The eight pages the nav lists, in its order.
+/// The pages the nav lists, in its order.
 ///
 /// **Clipboard is the one page 3e does not contain.** 3e lists seven sections
 /// and none of them is about the clipboard, because 3e was drawn before this
@@ -608,12 +644,35 @@ pub enum Section {
     Clipboard,
     Shortcuts,
     SyncAndAccount,
+    /// **Everything about updating this build**: the automatic-check pill, the
+    /// manual check, what the release says, the download, and the restart.
+    ///
+    /// The same argument as [`Section::Breaches`], reached from the other
+    /// side. There, the pill was on General and there was no button at all;
+    /// here the pill was on General and the whole flow was on About -- the
+    /// same split, with both halves already built. The switch governs what
+    /// Deskwarden asks **on its own**; the button is the user asking. Those
+    /// two sentences only read as honest when the switch and the control it
+    /// does not govern are in one glance -- see [`UPDATE_AUTOMATIC_OFF_NOTE`],
+    /// which used to have to name another page and now points at the row
+    /// directly above it.
+    ///
+    /// **Directly before About, not after General.** Breaches went to the top
+    /// because its setting lived on General and that is where its user's hand
+    /// goes; nearly all of this page came off About, so that is where *this*
+    /// page's user's hand goes -- one row up in the nav rather than seven.
+    /// The rule is the same in both cases: the new page lands where the bulk
+    /// of it came from. It also keeps the tail of the nav reading outward
+    /// from the vault -- the account this vault comes from, then this build,
+    /// then what this build is -- and leaves About last, which is where a
+    /// page that does nothing belongs.
+    Updates,
     About,
 }
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::General,
         Section::Breaches,
         Section::Autofill,
@@ -622,6 +681,7 @@ impl Section {
         Section::Clipboard,
         Section::Shortcuts,
         Section::SyncAndAccount,
+        Section::Updates,
         Section::About,
     ];
 
@@ -637,6 +697,7 @@ impl Section {
             Section::Clipboard => "Clipboard",
             Section::Shortcuts => "Shortcuts",
             Section::SyncAndAccount => "Sync & account",
+            Section::Updates => "Updates",
             Section::About => "About",
         }
     }
@@ -662,6 +723,17 @@ impl Section {
             Section::Clipboard => "When a secret you have copied is taken back off the clipboard.",
             Section::Shortcuts => "The keys that reach Deskwarden from anywhere.",
             Section::SyncAndAccount => "The Bitwarden account this vault comes from.",
+            // Both halves, in the order the page draws them: the switch that
+            // decides what Deskwarden does unasked, then the button that does
+            // not consult it.
+            Section::Updates => {
+                "Whether Deskwarden looks for new releases by itself, and how to install one now."
+            }
+            // **Unchanged, and now literally true.** It was already the
+            // sentence for an identity page while the page underneath it
+            // carried a check button, a download and a restart. Those went to
+            // `Section::Updates`; this is what is left, and it is what this
+            // line always said it would be.
             Section::About => "Which build of Deskwarden this is.",
         }
     }
@@ -698,7 +770,7 @@ pub struct PrefsState {
     /// would put the message on screen while the user was still typing `0.` on
     /// the way to `0.5`, which is scolding them for not having finished.
     clipboard_entry_error: Option<&'static str>,
-    /// The About page's update flow: its stage, and the receiver its worker
+    /// The Updates page's update flow: its stage, and the receiver its worker
     /// threads report on.
     ///
     /// **It lives on the state rather than in the draw**, because it is the
@@ -1299,6 +1371,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             ui,
             "Signing in, syncing and locking are all done from the vault window.",
         ),
+        Section::Updates => draw_updates(ui, state),
         Section::About => draw_about(ui, state),
     }
 }
@@ -1539,20 +1612,14 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
                 enabled,
             );
         });
-        row_separator(ui);
-        // **Last, and deliberately not beside the breach and site-icon
-        // rows.** Those two are network calls keyed on the VAULT -- a
-        // password's hash, an item's domain -- and a user weighing one is
-        // weighing the other. This request is keyed on nothing but the app's
-        // own version, so grouping it with them would suggest it discloses
-        // the same kind of thing. It sits at the foot of the card, after the
-        // rows about how this machine behaves.
-        state.settings.check_for_updates = toggle_row(
-            ui,
-            UPDATE_CHECK_LABEL,
-            UPDATE_CHECK_DESCRIPTION,
-            state.settings.check_for_updates,
-        );
+        // **The update row is not here any more either**, and it left for
+        // the same reason the breach row did. It used to sit last on this
+        // card, deliberately apart from the two vault-keyed network rows
+        // above -- that request is keyed on nothing but the app's own
+        // version, and grouping it with them would have suggested it
+        // discloses the same kind of thing. It is now on
+        // `Section::Updates`, directly above the check button it does not
+        // govern; see `draw_updates`.
     });
 }
 
@@ -2218,6 +2285,30 @@ fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) 
     }
 }
 
+/// The **About** page: which build this is, and whose account it is reading.
+///
+/// # Nothing on this page acts
+///
+/// It used to carry the whole update flow -- a check button, the release
+/// notes, Download, a progress bar, Restart to install, and a failure with a
+/// retry on it -- under a two-row version card. That is
+/// [`Section::Updates`]'s now, entire. What is left is two statements of
+/// fact, which is what an About page is for and what
+/// [`Section::subtitle`] already claimed this one was.
+///
+/// # It keeps the version, and the version is not a button
+///
+/// "Which build am I running" is a fact about this build, and About is where
+/// a user asks it; moving it to Updates would have left About with one row
+/// and sent anyone looking for a version number to a page named after an
+/// action. What did NOT stay is anything that *does* something about that
+/// version -- the distinction the whole reorganisation turns on.
+///
+/// The Updates page deliberately does not restate it. The nav rail paints
+/// [`version_line`] on every page including that one (see [`draw_nav`]), so
+/// the number is already in front of a user reading the update card; a second
+/// row saying it would be a third place for one fact to be stated and the
+/// two that can drift.
 fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         value_row(
@@ -2229,11 +2320,47 @@ fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
         row_separator(ui);
         account_row(ui, (state.account_source)());
     });
+}
+
+/// The **Updates** page: the automatic-check pill, then the flow it does not
+/// govern.
+///
+/// # Both halves on one page, for [`draw_breaches`]'s reason
+///
+/// The pill was the last row on General and the flow was a card on About, so
+/// a user weighing "should this app talk to GitHub by itself" was reading a
+/// switch whose consequence was two pages away, and a user pressing *Check
+/// for updates* was acting on a rule they could not see. The two cards below
+/// are the same arrangement Breaches settled two days ago: the switch, the
+/// control it does **not** gate, and the sentence saying so
+/// ([`UPDATE_AUTOMATIC_OFF_NOTE`]) all in one glance.
+///
+/// # The button is not gated on the pill, and the page says so
+///
+/// Unchanged, and it is the point. `Settings::check_for_updates` governs what
+/// Deskwarden asks **on its own**; a click on the button is the user making
+/// the request in the same breath as consenting to it. That was already the
+/// rule -- it is the rule `breach_scan` cites for its own button -- and it is
+/// now arguable in front of the switch rather than about a switch on another
+/// page.
+fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        // **Moved off General, whole.** It was the last row there,
+        // deliberately apart from the two vault-keyed network rows because
+        // this request is keyed on nothing but the app's own version. That
+        // separation is now the page break, which says it louder.
+        state.settings.check_for_updates = toggle_row(
+            ui,
+            UPDATE_CHECK_LABEL,
+            UPDATE_CHECK_DESCRIPTION,
+            state.settings.check_for_updates,
+        );
+    });
 
     draw_update_card(ui, state);
 }
 
-/// The update flow, as a card of its own below the version card.
+/// The update flow, as a card of its own below the setting.
 ///
 /// **Every frame starts by draining the worker channel.** This is the whole
 /// answer to "how does a page inside a blocking event loop hear back from a
@@ -3457,7 +3584,7 @@ mod tests {
     #[test]
     fn every_nav_section_design_3e_lists_is_painted() {
         let painted = paint(Section::General);
-        // The nine labels, spelled out rather than looped over
+        // The ten labels, spelled out rather than looped over
         // `Section::ALL`: a test that re-derives its expectation from the
         // enum under test would still pass if a section were renamed,
         // removed, or added.
@@ -3479,6 +3606,12 @@ mod tests {
             "Clipboard",
             "Shortcuts",
             "Sync & account",
+            // Updates sits directly BEFORE About, not after General, because
+            // that is where nearly all of it came from -- the check button,
+            // the notes, the download and the restart were all a card on the
+            // About page. Same rule as Breaches, opposite answer, because the
+            // bulk of the page came from somewhere else.
+            "Updates",
             "About",
         ];
         for label in expected {
@@ -3581,12 +3714,16 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_seven_toggles_and_one_stepper() {
+    fn general_paints_exactly_six_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            7,
-            "seven 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`,              `use_brand_logos`, `reveal_totp_seed`, `auto_lock_enabled` and              `check_for_updates`, and nothing else. `check_breaches` is NOT here any more              -- it moved to Breaches, which owns the scan button it does not govern; see              `draw_breaches`"
+            6,
+            "six 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`, \
+             `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
+             TWO settings are no longer here and both left for the same reason -- \
+             `check_breaches` moved to Breaches and `check_for_updates` moved to Updates, each \
+             to sit beside the button it does NOT govern; see `draw_breaches` and `draw_updates`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -4123,9 +4260,11 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // THIRD pill down now: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates. The breach row that used to sit second is
-        // on the Breaches page.
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // THIRD pill down now: backend, prompt, site icons, network logos,
+        // TOTP secret, auto-lock. The breach row that used to sit second is
+        // on the Breaches page, and the update row that used to sit last is
+        // on the Updates page.
         let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
@@ -4169,9 +4308,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
         // FOURTH pill down: backend, prompt, site icons, network logos, TOTP
-        // secret, auto-lock, updates.
+        // secret, auto-lock.
         let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
@@ -4219,13 +4358,16 @@ mod tests {
     /// first click turns it OFF, with the same counter-assertions its
     /// neighbours carry.
     ///
-    /// The SEVENTH pill, at the foot of the card below the auto-lock stepper
-    /// -- see `draw_general` for why it is not beside the two vault-keyed
-    /// network rows.
+    /// **On the Updates page now, not General.** The pill moved to sit above
+    /// the check button it does not govern, exactly as `check_breaches`
+    /// moved to sit above the scan button -- so it is the ONLY pill on its
+    /// page, and this test finds it by being the only one rather than by
+    /// counting six neighbours it no longer has.
     #[test]
     fn clicking_the_update_check_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Updates;
         assert!(
             state.settings.check_for_updates,
             "the default: Deskwarden tells you about releases until this is clicked"
@@ -4239,9 +4381,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // Last pill down: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates.
-        let pill = pills[6].center();
+        assert_eq!(
+            pills.len(),
+            1,
+            "the Updates page paints exactly one pill -- the consent switch -- and the check \
+             button beside it is not one"
+        );
+        let pill = pills[0].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4255,38 +4401,59 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
         assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
-        // The stepper it now sits below is untouched, which a click that had
-        // landed on the auto-lock row instead would not leave true.
+        // Nothing on General moved either, which is the half that would fail
+        // if the pill had been copied to this page rather than moved to it.
         assert_eq!(state.settings.auto_lock_minutes, 15);
 
         frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.check_for_updates, "and back on again");
     }
 
-    /// The update row is the LAST one on the card, read off the paint rather
-    /// than off source order -- below the auto-lock stepper it was
-    /// deliberately placed under.
+    /// **The update row is not on General at all any more**, and this is the
+    /// test that used to say it was at the foot of that card. It asserts the
+    /// move instead of being deleted: a page that quietly regrew the row
+    /// would put the switch back on one page and the button it does not
+    /// govern on another, which is the arrangement the reorganisation
+    /// existed to end.
+    ///
+    /// The twin of `breaches_owns_the_consent_pill_and_general_does_not`,
+    /// down to the second half -- the row is somewhere, not merely gone.
     #[test]
-    fn the_update_check_row_sits_at_the_foot_of_the_card() {
-        let painted = paint(Section::General);
-        let auto_lock = painted.ink_of(AUTO_LOCK_LABEL).rect;
-        let updates = painted.ink_of(UPDATE_CHECK_LABEL).rect;
-        // The instrument first: two labels at two distinct, non-empty
-        // heights, so `top()` is telling them apart.
-        assert!(auto_lock.height() > 0.0 && updates.height() > 0.0);
+    fn updates_owns_the_check_pill_and_general_does_not() {
+        let general = paint(Section::General);
         assert!(
-            auto_lock.top() < updates.top(),
-            "the update row is not below the auto-lock stepper: stepper at {auto_lock:?}, \
-             updates at {updates:?}"
+            !general.contains(UPDATE_CHECK_LABEL),
+            "the automatic-check row is still on General; it belongs above the button it does \
+             not govern. Got {:?}",
+            general.strings()
         );
         assert!(
-            updates.top() - auto_lock.top() > 1.0,
+            !general.contains(UPDATE_CHECK_DESCRIPTION),
+            "General still carries the update row's copy: {:?}",
+            general.strings()
+        );
+        // The rows that stayed, so this cannot pass by General having been
+        // emptied.
+        assert!(general.contains(AUTO_LOCK_LABEL));
+        assert!(general.contains(FETCH_ICONS_LABEL));
+
+        // And it is on Updates, above the check button rather than below it:
+        // the pill is the rule and the button is the exception to it, and a
+        // rule stated after its exception explains nothing.
+        let updates = paint(Section::Updates);
+        let pill = updates.ink_of(UPDATE_CHECK_LABEL).rect;
+        let flow = updates.ink_of(UPDATE_SECTION_LABEL).rect;
+        assert!(pill.height() > 0.0 && flow.height() > 0.0);
+        assert!(
+            pill.top() < flow.top(),
+            "the setting is painted below the flow it governs the automatic half of: pill at \
+             {pill:?}, flow at {flow:?}"
+        );
+        assert!(
+            flow.top() - pill.top() > 1.0,
             "the two labels are painted at the same height, so the ordering assertion above \
              cannot fail"
         );
-        // ...and it is below the site-icons row too, so it is at the foot of
-        // the card rather than merely below one row.
-        assert!(painted.ink_of(FETCH_ICONS_LABEL).rect.top() < updates.top());
     }
 
     /// The copy is on screen, not merely declared, and it says the one thing
@@ -4294,8 +4461,17 @@ mod tests {
     /// costs. A missed security fix has no symptom.
     #[test]
     fn the_update_check_row_says_what_turning_it_off_costs() {
-        let painted = paint(Section::General);
+        let painted = paint(Section::Updates);
         assert!(painted.contains(UPDATE_CHECK_LABEL), "got {:?}", painted.strings());
+        // The label is not the button's words. Both are on this page now, a
+        // card apart, and two identical strings -- one a switch and one a
+        // control it does not gate -- would erase the distinction this page
+        // was built to make.
+        assert_ne!(
+            UPDATE_CHECK_LABEL, UPDATE_CHECK_BUTTON,
+            "the automatic-check switch and the manual-check button are painted on one page and \
+             must not read as the same thing twice"
+        );
         assert!(painted.contains(UPDATE_CHECK_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
             UPDATE_CHECK_DESCRIPTION.contains("security"),
@@ -4376,8 +4552,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FIFTH pill down now: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates.
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FIFTH pill down now: backend, prompt, site icons, network logos,
+        // TOTP secret, auto-lock.
         let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
@@ -4427,7 +4604,7 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
+        assert_eq!(pills.len(), 6);
         assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
         assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
@@ -5271,19 +5448,25 @@ mod tests {
         assert!(painted.contains(ACCOUNT_STATUS));
     }
 
-    // -- About: the update card --------------------------------------------
+    // -- Updates: the update card ------------------------------------------
     //
     // One frame of the real `draw_prefs_body` per stage, read back through
     // what egui painted. Nothing here can reach the network: no
     // `update_panel::UpdateEnv` is installed in a test process (the panel's
     // own suite asserts that), and every stage below is parked rather than
     // arrived at.
+    //
+    // **These used to open `Section::About`.** The card moved to
+    // `Section::Updates` and every one of them moved with it, rather than
+    // About being kept open so the old expectations would still find their
+    // needles -- which would have left the suite asserting that a page which
+    // no longer draws the card still draws it.
 
-    /// One frame of About with the update panel parked in `stage`.
-    fn paint_about(stage: crate::update_panel::UpdateStage, settings: Settings) -> Painted {
+    /// One frame of Updates with the update panel parked in `stage`.
+    fn paint_updates(stage: crate::update_panel::UpdateStage, settings: Settings) -> Painted {
         let ctx = styled_context();
         let mut state = PrefsState::new(settings);
-        state.section = Section::About;
+        state.section = Section::Updates;
         state.show_update_stage(stage);
         frame(&ctx, &mut state, &[])
     }
@@ -5524,7 +5707,7 @@ mod tests {
         );
     }
 
-    /// Two frames of the About page in one `Context`, and the SECOND one's
+    /// Two frames of the Updates page in one `Context`, and the SECOND one's
     /// paint.
     ///
     /// The notes region's `notes_fit` reads the previous frame's overflow
@@ -5532,13 +5715,13 @@ mod tests {
     /// pessimistic one -- it shows the bar. Anything asserting on the settled
     /// verdict has to run the frame that has a memory to read, and this is
     /// that helper rather than an extra `frame` call copied into each test.
-    fn paint_about_settled(
+    fn paint_updates_settled(
         stage: crate::update_panel::UpdateStage,
         settings: Settings,
     ) -> Painted {
         let ctx = styled_context();
         let mut state = PrefsState::new(settings);
-        state.section = Section::About;
+        state.section = Section::Updates;
         state.show_update_stage(stage);
         let _first = frame(&ctx, &mut state, &[]);
         frame(&ctx, &mut state, &[])
@@ -5553,7 +5736,7 @@ mod tests {
     }
 
     /// The white card the notes heading is painted on, found by containment
-    /// rather than by index -- the About page has several cards and their
+    /// rather than by index -- the Updates page has several cards and their
     /// order is not this test's business.
     fn notes_card_rect(painted: &Painted) -> Rect {
         let heading = painted.rect_of(UPDATE_NOTES_LABEL);
@@ -5587,11 +5770,11 @@ mod tests {
     /// the text continues past the region and is noise when it does not.
     #[test]
     fn short_notes_paint_no_scrollbar_and_long_notes_do() {
-        let short = paint_about_settled(
+        let short = paint_updates_settled(
             crate::update_panel::UpdateStage::Available(a_release()),
             Settings::default(),
         );
-        let long = paint_about_settled(
+        let long = paint_updates_settled(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: notes_that_overflow(),
                 ..a_release()
@@ -5628,11 +5811,11 @@ mod tests {
     /// as release notes got longer -- next to a Version card that does not.
     #[test]
     fn the_notes_card_is_the_same_width_short_or_long() {
-        let short = paint_about_settled(
+        let short = paint_updates_settled(
             crate::update_panel::UpdateStage::Available(a_release()),
             Settings::default(),
         );
-        let long = paint_about_settled(
+        let long = paint_updates_settled(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: notes_that_overflow(),
                 ..a_release()
@@ -5660,7 +5843,7 @@ mod tests {
     /// it.
     #[test]
     fn about_says_you_are_current_and_still_offers_the_check() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::UpToDate,
             Settings::default(),
         );
@@ -5682,7 +5865,7 @@ mod tests {
     /// A found release shows its version, its notes, and the way to get it.
     #[test]
     fn about_shows_the_release_notes_beside_the_download() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Available(a_release()),
             Settings::default(),
         );
@@ -5695,7 +5878,7 @@ mod tests {
 
     /// Every run of ink the notes region painted, joined.
     fn painted_notes(body: &str) -> String {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: body.to_string(),
                 ..a_release()
@@ -5819,14 +6002,14 @@ mod tests {
     /// particular number of points.
     #[test]
     fn a_body_with_a_paragraph_break_paints_taller_than_one_without() {
-        let flowing = paint_about(
+        let flowing = paint_updates(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: "alpha\nbeta".to_string(),
                 ..a_release()
             }),
             Settings::default(),
         );
-        let broken = paint_about(
+        let broken = paint_updates(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: "alpha\n\nbeta".to_string(),
                 ..a_release()
@@ -5858,7 +6041,7 @@ mod tests {
             .map(|n| format!("line {n} of a release note nobody bounded"))
             .collect::<Vec<_>>()
             .join("\n");
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: enormous,
                 ..a_release()
@@ -5884,7 +6067,7 @@ mod tests {
     /// download reports here rather than into a tray tooltip.
     #[test]
     fn a_download_in_flight_reports_its_progress_on_the_page() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Downloading {
                 release: a_release(),
                 done: 3_355_443,
@@ -5905,7 +6088,7 @@ mod tests {
 
     #[test]
     fn a_finished_download_offers_the_restart_rather_than_taking_it() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Ready(a_release()),
             Settings::default(),
         );
@@ -5923,7 +6106,7 @@ mod tests {
     /// resting a pointer on a 16px icon.
     #[test]
     fn a_failure_says_why_on_the_page_and_offers_the_retry() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Failed {
                 message: "failed to reach GitHub releases API".to_string(),
                 release: Some(a_release()),
@@ -5951,7 +6134,7 @@ mod tests {
     #[test]
     fn with_automatic_checks_off_the_button_stays_and_the_page_explains_why() {
         let off = Settings { check_for_updates: false, ..Settings::default() };
-        let painted = paint_about(crate::update_panel::UpdateStage::UpToDate, off);
+        let painted = paint_updates(crate::update_panel::UpdateStage::UpToDate, off);
 
         assert!(
             painted.contains(UPDATE_CHECK_BUTTON),
@@ -5971,11 +6154,11 @@ mod tests {
     /// explaining a decision the user has already made.
     #[test]
     fn the_automatic_checks_note_is_absent_when_it_would_explain_nothing() {
-        let on = paint_about(crate::update_panel::UpdateStage::UpToDate, Settings::default());
+        let on = paint_updates(crate::update_panel::UpdateStage::UpToDate, Settings::default());
         assert!(!on.contains(UPDATE_AUTOMATIC_OFF_NOTE), "shown with the setting ON");
 
         let off = Settings { check_for_updates: false, ..Settings::default() };
-        let downloading = paint_about(
+        let downloading = paint_updates(
             crate::update_panel::UpdateStage::Downloading {
                 release: a_release(),
                 done: 1,
@@ -5993,7 +6176,7 @@ mod tests {
     /// would be indistinguishable from a box that failed to load.
     #[test]
     fn a_release_with_no_notes_says_so_rather_than_showing_an_empty_box() {
-        let painted = paint_about(
+        let painted = paint_updates(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
                 body: String::new(),
                 ..a_release()
