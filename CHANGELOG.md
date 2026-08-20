@@ -119,6 +119,16 @@ check comes back **in addition to** this one, not instead of it. See
   and the two rows above would have joined them there. The auto-lock countdown
   stays pinned to the floor.
 
+### The item detail pane
+
+- **"One-time code" is called TOTP now**, because it is shorter and it is what
+  the field is called everywhere else. The live code's row, its copy
+  confirmation and the CTRL+T chord all read **TOTP**; the seed rows read
+  **TOTP secret**, **TOTP seed** and **TOTP seed (sealed)**; and the form that
+  adds one is **Add a TOTP**. The qualifiers stay on purpose — the pane can
+  show a live code and its seed one above the other, and two rows with the
+  same label are two rows you cannot tell apart.
+
 ## 0.8.3 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version either. In

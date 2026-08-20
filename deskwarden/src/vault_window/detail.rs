@@ -194,15 +194,25 @@ const TOTP_CODE_TRACKING: f32 = 2.04;
 const TOTP_GAP: f32 = 12.0;
 const TOTP_BAR_WIDTH: f32 = 96.0;
 const TOTP_BAR_HEIGHT: f32 = 4.0;
-/// The masked SECRET row's label -- the seed, distinct from the "One-time
-/// code" row above it, which is the six digits derived from it.
+/// The masked SECRET row's label -- the seed, distinct from the "TOTP" row
+/// above it, which is the six digits derived from it.
+///
+/// **The qualifier is load-bearing and survives the rename.** Both rows are
+/// about the same feature, so both would like to be called "TOTP"; the pane
+/// draws them one above the other, and two rows sharing a label is two rows
+/// the user cannot tell apart. The live code is the bare name because it is
+/// the thing the user came for; this one carries "secret" because it is the
+/// material behind it.
 ///
 /// Not read out of `copy_shortcut_label`: that helper's whole job is to keep a
 /// row and its copy TOAST spelling the same string, and this row has no chord
 /// and therefore no `CopyShortcut` variant. The word "secret" is the user's
-/// own ("a field masked 'show secret'"), and it is what the preferences row
-/// that turns this on calls it too (`prefs_ui::TOTP_SECRET_LABEL`).
-const TOTP_SECRET_LABEL: &str = "One-time code secret";
+/// own ("a field masked 'show secret'"). The preferences row that turns this
+/// on (`prefs_ui::TOTP_SECRET_LABEL`) names the same field for the same user,
+/// so the two are meant to read as one thing -- but that module has not been
+/// renamed yet, and nothing here may claim the two strings are identical
+/// until it follows.
+const TOTP_SECRET_LABEL: &str = "TOTP secret";
 /// The 11px runs the design uses for a row's secondary line (2b's `18s`).
 const ROW_HINT_SIZE: f32 = 11.0;
 
@@ -1619,7 +1629,7 @@ fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
     match which {
         CopyShortcut::Username => "Username",
         CopyShortcut::Password => "Password",
-        CopyShortcut::Totp => "One-time code",
+        CopyShortcut::Totp => "TOTP",
         CopyShortcut::Url => "Website",
         // The card's four, read off the very constants `card_rows` paints, so
         // the row's label, the chord's name and the toast are one string in
@@ -1674,7 +1684,7 @@ fn pane_chords() -> Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)
         .map(|(which, modifiers, key, chord)| match which {
             CopyShortcut::Username => ("copy Username", *modifiers, *key, *chord),
             CopyShortcut::Password => ("copy Password", *modifiers, *key, *chord),
-            CopyShortcut::Totp => ("copy One-time code", *modifiers, *key, *chord),
+            CopyShortcut::Totp => ("copy TOTP", *modifiers, *key, *chord),
             CopyShortcut::Url => ("copy Website", *modifiers, *key, *chord),
             CopyShortcut::CardNumber => ("copy a card's Number", *modifiers, *key, *chord),
             CopyShortcut::CardExpiry => ("copy a card's Expires", *modifiers, *key, *chord),
@@ -7115,7 +7125,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
 fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
     row(
         ui,
-        "One-time code",
+        "TOTP",
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -9495,7 +9505,7 @@ mod tests {
             ] {
                 let texts = painted(&an_item(item_type_for(kind)), &totp);
                 assert!(
-                    !contains(&texts, "One-time code"),
+                    !contains(&texts, "TOTP"),
                     "{kind:?} rendered a One-time code row for {totp:?}: {texts:?}"
                 );
                 assert!(
@@ -9527,14 +9537,14 @@ mod tests {
         ] {
             let texts = painted(&item, &totp);
             assert!(
-                contains(&texts, "One-time code"),
+                contains(&texts, "TOTP"),
                 "{totp:?} lost its One-time code row: {texts:?}"
             );
             assert!(contains(&texts, needle), "{totp:?} rendered the wrong row: {texts:?}");
         }
         let texts = painted(&item, &TotpState::NoSecret);
         assert!(
-            !contains(&texts, "One-time code"),
+            !contains(&texts, "TOTP"),
             "NoSecret must still draw no row: {texts:?}"
         );
     }
@@ -12114,7 +12124,7 @@ mod tests {
         };
         let mut pane = Pane::new();
         let laid_out = pane.idle(&item, &totp);
-        let row = laid_out.rect_of("One-time code");
+        let row = laid_out.rect_of("TOTP");
 
         let clicked = pane.click(&item, &totp, row.center());
         assert_eq!(
@@ -14114,7 +14124,7 @@ mod tests {
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &totp);
 
-        for label in ["Username", "Password", "One-time code", "Website"] {
+        for label in ["Username", "Password", "TOTP", "Website"] {
             assert!(
                 frame.painted(label),
                 "the {label:?} row is not on this pane at all, so finding no chord on \
@@ -14165,7 +14175,7 @@ mod tests {
         for (label, chord) in [
             ("Username", "CTRL+U"),
             ("Password", "CTRL+B"),
-            ("One-time code", "CTRL+T"),
+            ("TOTP", "CTRL+T"),
             ("Website", "CTRL+SHIFT+U"),
         ] {
             let mut pane = Pane::new();
@@ -14194,7 +14204,7 @@ mod tests {
             for (_, other) in [
                 ("Username", "CTRL+U"),
                 ("Password", "CTRL+B"),
-                ("One-time code", "CTRL+T"),
+                ("TOTP", "CTRL+T"),
                 ("Website", "CTRL+SHIFT+U"),
             ] {
                 if other == chord {
@@ -17145,7 +17155,7 @@ mod tests {
         // Absolute, not re-derived: these are the four words the user reads.
         assert_eq!(copy_shortcut_label(CopyShortcut::Password), "Password");
         assert_eq!(copy_shortcut_label(CopyShortcut::Username), "Username");
-        assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "One-time code");
+        assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "TOTP");
         assert_eq!(copy_shortcut_label(CopyShortcut::Url), "Website");
     }
 
@@ -17195,7 +17205,7 @@ mod tests {
         // The fixtures' actual secrets, spelled out here rather than read off
         // the items, so this test still fails if a fixture changes.
         let secrets = ["hunter2", "4242424242424242", "a.novak@ledgerline.com"];
-        for label in ["Password", "Username", "One-time code", "Website", "Number"] {
+        for label in ["Password", "Username", "TOTP", "Website", "Number"] {
             let text = copy_toast_text(label, false);
             assert_eq!(text, format!("{label} copied"));
             for secret in secrets {
@@ -17415,7 +17425,7 @@ mod tests {
         for (modifiers, key, want) in [
             (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
             (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
-            (egui::Modifiers::CTRL, egui::Key::T, "One-time code copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "TOTP copied"),
             (shift_ctrl, egui::Key::U, "Website copied"),
         ] {
             let mut pane = Pane::new();
@@ -17614,7 +17624,7 @@ mod tests {
     }
 
     /// **A chord that copies nothing says nothing.** The one thing standing
-    /// between the user and "One-time code copied" on an item with no TOTP.
+    /// between the user and "TOTP copied" on an item with no TOTP.
     ///
     /// Live behaviour is already correct, and that is the problem this pins:
     /// hoisting `note_copied` OUT of the `if let Some(copy)` guard -- so
@@ -17634,7 +17644,7 @@ mod tests {
         let chords = [
             (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
             (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
-            (egui::Modifiers::CTRL, egui::Key::T, "One-time code copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "TOTP copied"),
             (shift_ctrl, egui::Key::U, "Website copied"),
         ];
 

@@ -80,7 +80,7 @@ const MODAL_WIDTH: f32 = 380.0;
 // ---------------------------------------------------------------------------
 
 /// The heading over the whole surface.
-pub const HEADING: &str = "Add a one-time code";
+pub const HEADING: &str = "Add a TOTP";
 
 /// What the control that opens this form is CALLED, and the chord that also
 /// opens it.
@@ -100,7 +100,7 @@ pub const HEADING: &str = "Add a one-time code";
 /// compares it against `ADD_TOTP_MODIFIERS`/`ADD_TOTP_KEY`, the values the key
 /// handler really matches on, so it cannot advertise a binding the code does
 /// not have.
-pub const ADD_TOTP_LABEL: &str = "Add a one-time code";
+pub const ADD_TOTP_LABEL: &str = "Add a TOTP";
 /// See [`ADD_TOTP_LABEL`].
 pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 

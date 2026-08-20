@@ -104,7 +104,7 @@ pub const URI_LABEL: &str = "Website";
 /// See [`USERNAME_LABEL`].
 pub const NOTES_LABEL: &str = "Notes";
 /// See [`USERNAME_LABEL`]. **Not ticked by default.** A seed is not a default.
-pub const TOTP_LABEL: &str = "One-time code seed";
+pub const TOTP_LABEL: &str = "TOTP seed";
 
 /// **The safety control of this whole feature, verbatim.**
 ///
@@ -352,7 +352,7 @@ pub fn fields_present(record: &Record) -> Vec<&'static str> {
 }
 
 /// How a sealed seed is named in [`fields_present`].
-pub const SEALED_SEED_LABEL: &str = "One-time code seed (sealed)";
+pub const SEALED_SEED_LABEL: &str = "TOTP seed (sealed)";
 
 /// Whether to show the passphrase box at all.
 ///

@@ -170,7 +170,7 @@ impl FieldRef {
         match self {
             Self::Username => "Username".to_string(),
             Self::Password => "Password".to_string(),
-            Self::Totp => "One-time code".to_string(),
+            Self::Totp => "TOTP".to_string(),
             Self::Custom(name) => name.clone(),
         }
     }
@@ -679,9 +679,9 @@ pub fn resolve_preview(tokens: &[Token], source: &ResolveSource<'_>) -> Vec<Prev
             Token::Field(FieldRef::Totp) => match source.totp {
                 TotpState::Code { code, .. } => PreviewPart::Value(code.clone()),
                 TotpState::Fetching => PreviewPart::Pending,
-                TotpState::NoSecret => missing("no one-time code on this item"),
-                TotpState::NoCodeReported => missing("no current one-time code"),
-                TotpState::Unavailable => missing("one-time code unavailable"),
+                TotpState::NoSecret => missing("no TOTP on this item"),
+                TotpState::NoCodeReported => missing("no current TOTP"),
+                TotpState::Unavailable => missing("TOTP unavailable"),
             },
             Token::Field(FieldRef::Custom(name)) => match source.custom_value(name) {
                 Some(value) if !value.is_empty() => PreviewPart::Value(value.to_string()),
