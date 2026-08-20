@@ -31,3 +31,10 @@ target/
 .idea/
 Thumbs.db
 Desktop.ini
+# Brand-mark source material, staged locally and never distributed.
+# The network logos are trademarks; deskwarden ships none of them and reads
+# marks from %APPDATA%\Deskwarden\brand-marks at runtime instead
+# (see src/brand_mark.rs). Keeping this directory out of the repository is
+# what makes that true -- a logo committed here would be distributed by the
+# project whether or not any build draws it.
+docs/brands/
