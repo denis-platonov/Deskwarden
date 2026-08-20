@@ -3065,6 +3065,29 @@ mod row_tile_tests {
         make_icons: impl FnOnce(&egui::Context) -> IconCache,
         menu: Menu,
     ) -> Painted {
+        paint_core_with_marks(items, selected, wheel_frames, pane_width, make_icons, menu, None)
+    }
+
+    /// [`paint_core`], plus a directory of brand logo files to draw the
+    /// network marks from.
+    ///
+    /// **`None` -- what every other harness here passes -- installs a policy
+    /// that is switched OFF and has nowhere to look, and that is not
+    /// tidiness.** With no policy installed at all, `card_mark` resolves the
+    /// real `settings.json` and, if the developer running the suite has turned
+    /// the preference on, their real Deskwarden `brand-marks` folder: the
+    /// row tests below assert on painted WORDS, so the suite would pass or
+    /// fail depending on what is in a folder on one machine. Every context
+    /// here is told what to think.
+    fn paint_core_with_marks(
+        items: &[VaultItem],
+        selected: Option<&str>,
+        wheel_frames: usize,
+        pane_width: f32,
+        make_icons: impl FnOnce(&egui::Context) -> IconCache,
+        menu: Menu,
+        marks: Option<std::path::PathBuf>,
+    ) -> Painted {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -3078,7 +3101,15 @@ mod row_tile_tests {
         // same reason `detail.rs`'s and `sidebar.rs`'s harnesses run them.
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
+        crate::card_mark::install_logo_policy(
+            &ctx,
+            crate::card_mark::LogoPolicy {
+                enabled: marks.is_some(),
+                dirs: std::sync::Arc::new(marks.into_iter().collect()),
+            },
+        );
 
         let mut selected_id = selected.map(str::to_string);
         let mut search = String::new();
@@ -4686,6 +4717,206 @@ mod row_tile_tests {
             plain_rect.width(),
             plain_rect.width() - marked_rect.width(),
             pill + ROW_GAP_X
+        );
+    }
+
+    // ---- brand logos on the row ----------------------------------------
+
+    /// A directory holding brand logo fixtures, **under the process's temp
+    /// directory and never the real one**: these are files this test wrote,
+    /// and the Deskwarden folder under `%APPDATA%` is not somewhere a test may
+    /// look.
+    fn marks_dir(files: &[(CardBrand, Vec<u8>)]) -> std::path::PathBuf {
+        let dir = crate::brand_mark::tests::tempdir("item-list");
+        for (brand, bytes) in files {
+            let name = crate::brand_mark::file_name(*brand).expect("a brand with a file name");
+            std::fs::write(dir.join(name), bytes).expect("the fixture was written");
+        }
+        dir
+    }
+
+    fn paint_with_marks(items: &[VaultItem], width: f32, dir: std::path::PathBuf) -> Painted {
+        paint_core_with_marks(
+            items,
+            None,
+            0,
+            width,
+            |_| IconCache::default(),
+            Menu::none(),
+            Some(dir),
+        )
+    }
+
+    /// Every textured shape inside `area` -- an image, as opposed to the
+    /// wordmark's flat blue ground.
+    fn logos_in(p: &Painted, area: egui::Rect) -> Vec<egui::Rect> {
+        p.rects
+            .iter()
+            .filter(|r| r.brush.is_some() && area.contains_rect(r.rect))
+            .map(|r| r.rect)
+            .collect()
+    }
+
+    /// **The mixed vault, which is the state this feature will actually be
+    /// used in**: a user downloads the marks they can find, and the rest of
+    /// their cards keep their words. Both kinds must appear on one list and
+    /// neither may disturb the row around it.
+    #[test]
+    fn a_vault_with_some_marks_supplied_draws_logos_and_words_side_by_side() {
+        let dir = marks_dir(&[
+            // One of each shape a brand centre publishes, because a real
+            // folder will hold both.
+            (CardBrand::Visa, crate::brand_mark::tests::on_ground_png(300, 100, 46)),
+            (CardBrand::Mastercard, crate::brand_mark::tests::isolated_png(96, 60, 40)),
+        ]);
+        let items = [
+            card_branded("Visa card", "Visa"),
+            card_branded("Mastercard card", "Mastercard"),
+            card_branded("Amex card", "Amex"),
+            card_branded("JCB card", "JCB"),
+        ];
+        let p = paint_with_marks(&items, PANE_WIDTH, dir);
+        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
+        assert_eq!(rows.len(), 4);
+
+        // The two with files draw an image and NO word...
+        for (row, brand) in rows.iter().zip([CardBrand::Visa, CardBrand::Mastercard]) {
+            assert_eq!(logos_in(&p, *row).len(), 1, "{brand:?} has a file and drew no logo");
+            assert!(
+                marks_in(&p, *row).is_empty(),
+                "{brand:?} drew its logo AND its wordmark pill, stacked on one another"
+            );
+        }
+        // ...and the two without draw their word and no image. This is the
+        // whole claim: some files present is a normal state, not a broken one.
+        for (row, brand) in rows[2..].iter().zip([CardBrand::AmericanExpress, CardBrand::Jcb]) {
+            assert!(
+                logos_in(&p, *row).is_empty(),
+                "{brand:?} has no file and drew an image anyway"
+            );
+            let words = marks_in(&p, *row);
+            assert_eq!(words.len(), 1, "{brand:?} lost its mark entirely");
+            assert_eq!(words[0].1, brand.wordmark());
+        }
+
+        // And the row itself is undisturbed: every mark, of either kind, sits
+        // beside its tile and inside the row.
+        let tiles = avatar_tiles(&p);
+        assert_eq!(tiles.len(), 4);
+        for (i, row) in rows.iter().enumerate() {
+            let mark = logos_in(&p, *row)
+                .into_iter()
+                .chain(marks_in(&p, *row).into_iter().map(|(r, _)| r))
+                .next()
+                .expect("every row here has a mark");
+            assert!(
+                mark.left() >= tiles[i].right(),
+                "row {i}'s mark at {mark:?} overlaps its tile at {:?}",
+                tiles[i]
+            );
+            assert!(row.contains_rect(mark), "row {i}'s mark escaped its row");
+        }
+    }
+
+    /// **A logo lands on the name's optical line, exactly as the word does, at
+    /// both pane widths.** The row's alignment is derived from the WORDMARK's
+    /// galley -- see `mark_ink_drop` -- so a logo drawn into the same box is
+    /// the case where that derivation could silently stop being about what is
+    /// on screen.
+    #[test]
+    fn a_logo_row_keeps_its_ink_on_the_names_line_at_both_pane_widths() {
+        // One point, the tolerance this module's own alignment test allows
+        // between a mark and the 32pt tile: a logo's ink centre is its
+        // rectangle's centre only for a trimmed mark, and a mark on its own
+        // ground is centred on its lettering rather than on its rectangle.
+        const TOGETHER: f32 = 1.0;
+        const NAME: &str = "Household card";
+        for source in [
+            crate::brand_mark::tests::on_ground_png(300, 100, 46),
+            crate::brand_mark::tests::isolated_png(120, 60, 40),
+        ] {
+            for width in [170.0f32, PANE_WIDTH] {
+                let dir = marks_dir(&[(CardBrand::Mastercard, source.clone())]);
+                let mut item = card_branded(NAME, "Mastercard");
+                item.card.as_mut().unwrap().number =
+                    Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
+                let p = paint_with_marks(&[item], width, dir);
+                let row = row_tiles_of_width(&p, width)[0].rect;
+                let title = ink_centre_of(&p, NAME);
+                let Some(logo) = logos_in(&p, row).first().copied() else {
+                    // At the narrow pane the mark stands aside entirely, the
+                    // same rule the wordmark follows -- and a mark that is not
+                    // drawn cannot be misaligned.
+                    assert!(width < PANE_WIDTH, "the real pane must draw the mark");
+                    continue;
+                };
+                assert!(
+                    (logo.center().y - title).abs() <= TOGETHER,
+                    "at a {width}pt pane the logo is centred at {} and the name's ink at \
+                     {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
+                    logo.center().y,
+                    (logo.center().y - title).abs()
+                );
+                let tile = square(&p, AVATAR_SIZE).rect;
+                assert!(logo.left() >= tile.right(), "the logo overlaps the tile");
+                assert!(row.contains_rect(logo), "the logo escaped its row");
+            }
+        }
+    }
+
+    /// **The truncation budget holds with a logo in the box**, which is the
+    /// property a mark of a different width could quietly break: the name is
+    /// laid into what the mark left, so the room it gives up has to be the
+    /// logo's own width and not the width of the word it replaced.
+    #[test]
+    fn a_logo_row_gives_the_name_the_room_the_logo_took() {
+        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
+        let mut marked = card_branded(LONG, "Mastercard");
+        marked.card.as_mut().unwrap().number =
+            Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
+        // The control: the same item on a network this app cannot name, so no
+        // mark at all and the whole column.
+        let mut unmarked = marked.clone();
+        unmarked.card.as_mut().unwrap().brand = Some("Ledger Coin".to_string());
+
+        let dir = marks_dir(&[(
+            CardBrand::Mastercard,
+            crate::brand_mark::tests::on_ground_png(300, 100, 46),
+        )]);
+        let with = paint_with_marks(&[marked], PANE_WIDTH, dir.clone());
+        let without = paint_with_marks(&[unmarked], PANE_WIDTH, dir);
+        let row = row_tiles(&with)[0].rect;
+        let logo = logos_in(&with, row);
+        assert_eq!(logo.len(), 1, "the premise: this row drew a logo");
+        assert!(
+            marks_in(&with, row).is_empty(),
+            "the premise: the logo replaced the word rather than joining it"
+        );
+
+        let name_of = |p: &Painted| {
+            p.texts
+                .iter()
+                .find(|(t, _, _)| t.starts_with("Bank of"))
+                .map(|(_, r, _)| *r)
+                .expect("the name was painted")
+        };
+        let marked_rect = name_of(&with);
+        let plain_rect = name_of(&without);
+        // The mark's BOX, not the image inside it: the box is what the row
+        // allocated, and `card_mark` pads the image within it. Read off the
+        // painted image plus that padding, so this is measured from the frame
+        // rather than recomputed from the same arithmetic under test.
+        let box_width = logo[0].width() + 2.0 * (NETWORK_MARK_HEIGHT * 0.22).round();
+        assert!(
+            (plain_rect.width() - marked_rect.width() - box_width - ROW_GAP_X).abs() < TITLE_SIZE,
+            "the name is {}pt wide beside a {box_width}pt logo box and {}pt wide with no mark \
+             -- a difference of {}pt against the {}pt the box plus the row's gap took. The logo \
+             took the wrong amount off the truncation budget, which is the overflow bug \
+             returning in a new shape.",
+            marked_rect.width(),
+            plain_rect.width(),
+            plain_rect.width() - marked_rect.width(),
+            box_width + ROW_GAP_X
         );
     }
 
@@ -6374,6 +6605,7 @@ mod toolbar_strip_tests {
         // same reason `detail.rs`'s `painted_text` harness runs them.
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut selected = None;
@@ -6817,6 +7049,7 @@ mod move_error_band_tests {
         // Two throwaway frames so `theme::apply`'s font set is live.
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut selected = None;
@@ -7218,6 +7451,7 @@ mod list_placeholder_paint_tests {
         // them.
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut search = search.to_string();
@@ -7530,6 +7764,7 @@ mod keyboard_selection_tests {
             // the same reason the header-strip harness above runs them.
             let _ = ctx.run_ui(raw(Vec::new()), |_ui| {});
             theme::apply(&ctx);
+            crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
             let _ = ctx.run_ui(raw(Vec::new()), |_ui| {});
             let mut pane = Pane {
                 ctx,

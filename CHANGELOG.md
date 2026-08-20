@@ -10,6 +10,30 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Card network marks can be the networks' own logos
+
+**Preferences → General → Show card network logos**, off unless you turn it
+on. With it on, a card's network mark is drawn as that network's own logo
+instead of its printed name.
+
+- **You supply the images.** Nothing is downloaded and no logo ships with
+  Deskwarden. Put PNGs named after the network — `visa.png`, `mastercard.png`,
+  `amex.png`, `discover.png`, `diners.png`, `jcb.png`, `maestro.png`,
+  `unionpay.png`, `rupay.png` — in `%APPDATA%\Deskwarden\brand-marks`. A
+  `brand-marks` folder beside the program is read too, and yours wins, so a
+  mark you supply always replaces one that was installed for you.
+- **A brand with no image keeps its word.** So does one whose file cannot be
+  read, is not a PNG, or is too large. Six logos and three words is a normal
+  state, not a broken one — nothing is ever left blank.
+- **Both shapes of asset work.** An isolated mark on transparency and a
+  reversed mark full-bleed on the brand's own colour are fitted the same way:
+  each is scaled until its lettering stands as tall as the word it replaced
+  and centred on the same line, so a folder filled from two brand centres
+  still reads as one set. A logo can never take more room from the item's name
+  than the longest wordmark already did.
+- **Files are re-read while Deskwarden runs**, so dropping one into the folder
+  and reopening the vault window shows it — no reinstall, and no rebuild.
+
 ### Card rows name the network beside the icon, not over it
 
 A card row drew its network badge inside the bank icon's tile, overlapping

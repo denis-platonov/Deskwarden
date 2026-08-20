@@ -22,6 +22,14 @@ install and sign in to yourself. Deskwarden talks to it locally.
 - **Your settings**, including which applications you have matched to which
   vault items, in `%APPDATA%\Deskwarden`.
 - **Cached site icons**, stored as image files in the same folder.
+- **Card network logo files, if you supply any.** With *Show card network
+  logos* switched on (it is off unless you turn it on), Deskwarden reads PNG
+  files from `%APPDATA%\Deskwarden\brand-marks` and from a `brand-marks`
+  folder beside the program itself. It only ever reads files named after a
+  card network — `visa.png`, `mastercard.png` and so on — it never writes to
+  either folder, and nothing about them leaves your PC. No logo is downloaded
+  and none is included with Deskwarden: these are files you put there. With
+  the setting off, neither folder is opened at all.
 
 ## What Deskwarden looks at, outside its own windows
 

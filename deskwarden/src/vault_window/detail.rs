@@ -7568,6 +7568,7 @@ mod tests {
         };
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut reveal = reveal;
@@ -7614,6 +7615,7 @@ mod tests {
         };
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let output = ctx.run_ui(input(), |ui| draw_out_of_vault_read(ui, item, out));
@@ -7933,6 +7935,22 @@ mod tests {
         totp: &TotpState,
         reveal: RevealState,
     ) -> Vec<egui::epaint::ClippedShape> {
+        frame_shapes_with_marks(item, totp, reveal, None)
+    }
+
+    /// [`frame_shapes`], plus a directory of brand logo files for the network
+    /// mark to be read from.
+    ///
+    /// **`None` -- what every other harness here passes -- installs a policy
+    /// that is switched off with nowhere to look**, so that no test in this
+    /// module can resolve the developer's own settings file or their own marks
+    /// folder and pass or fail according to what is in it.
+    fn frame_shapes_with_marks(
+        item: &VaultItem,
+        totp: &TotpState,
+        reveal: RevealState,
+        marks: Option<std::path::PathBuf>,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -7943,6 +7961,13 @@ mod tests {
         };
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(
+            &ctx,
+            crate::card_mark::LogoPolicy {
+                enabled: marks.is_some(),
+                dirs: std::sync::Arc::new(marks.into_iter().collect()),
+            },
+        );
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut reveal = reveal;
@@ -8388,6 +8413,7 @@ mod tests {
             // from the start of the next one.
             let _ = ctx.run_ui(input.clone(), |_ui| {});
             theme::apply(&ctx);
+            crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
             let _ = ctx.run_ui(input, |_ui| {});
             Self {
                 ctx,
@@ -11115,6 +11141,7 @@ mod tests {
             };
             let _ = ctx.run_ui(input.clone(), |_ui| {});
             theme::apply(&ctx);
+            crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
             let _ = ctx.run_ui(input.clone(), |_ui| {});
 
             let mut taken = 0.0;
@@ -11372,6 +11399,7 @@ mod tests {
         };
         let _ = ctx.run_ui(input.clone(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input.clone(), |_ui| {});
 
         let bound = bound_to(&a_login(), &a_desktop_match());
@@ -13003,6 +13031,103 @@ mod tests {
         assert!(
             contains(&painted(&a_full_card(), &TotpState::NoSecret), CardBrand::Visa.wordmark()),
             "the mark did not paint the network's own word"
+        );
+    }
+
+    /// Everything a card's read pane painted that this module's brand-mark
+    /// tests care about: its runs with their boxes, the blue wordmark grounds,
+    /// and the TEXTURED rects -- which is what a logo is.
+    fn painted_with_logos(
+        item: &VaultItem,
+        marks: Option<std::path::PathBuf>,
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, Vec<egui::Rect>) {
+        fn walk(
+            shape: &egui::Shape,
+            texts: &mut Vec<(String, egui::Rect)>,
+            grounds: &mut Vec<egui::Rect>,
+            images: &mut Vec<egui::Rect>,
+        ) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.brush.is_some() => images.push(rect.rect),
+                egui::Shape::Rect(rect) if rect.fill == theme::BLUE => grounds.push(rect.rect),
+                egui::Shape::Text(text) => {
+                    texts.push((
+                        text.galley.text().to_string(),
+                        // Where it was PAINTED: a galley's own rect is local to
+                        // itself and starts at the origin.
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    ))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, texts, grounds, images);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let shapes =
+            frame_shapes_with_marks(item, &TotpState::NoSecret, RevealState::default(), marks);
+        let (mut texts, mut grounds, mut images) = (Vec::new(), Vec::new(), Vec::new());
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut texts, &mut grounds, &mut images);
+        }
+        (texts, grounds, images)
+    }
+
+    /// **The read pane's own brand mark, drawn from a logo file.** The list row
+    /// has its own tests; this is the second surface, and the two have to
+    /// agree -- one mark, of one kind at a time, in a box the digits beside it
+    /// were laid out around.
+    #[test]
+    fn a_supplied_logo_replaces_the_word_on_the_read_pane_too() {
+        let dir = crate::brand_mark::tests::tempdir("detail-marks");
+        std::fs::write(
+            dir.join(crate::brand_mark::file_name(CardBrand::Visa).expect("a name")),
+            crate::brand_mark::tests::on_ground_png(300, 100, 46),
+        )
+        .expect("the fixture was written");
+
+        // The control first: the same card with nowhere to look draws the
+        // word, so everything below is about the FILE and not about the card.
+        let (texts, grounds, images) = painted_with_logos(&a_full_card(), None);
+        assert!(images.is_empty(), "an image was drawn with no marks directory");
+        assert!(!grounds.is_empty(), "the control did not draw its wordmark pill");
+        assert!(
+            texts.iter().any(|(t, _)| t == CardBrand::Visa.wordmark()),
+            "the control did not draw the word"
+        );
+
+        let (texts, grounds, images) = painted_with_logos(&a_full_card(), Some(dir));
+        assert_eq!(images.len(), 1, "the logo was not drawn on the read pane");
+        assert!(
+            grounds.is_empty(),
+            "the pane drew the logo AND the blue wordmark pill under it: {grounds:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t == CardBrand::Visa.wordmark()),
+            "the word was painted as well as the logo"
+        );
+        // The box the mark was given is the pane's own mark height, exactly as
+        // the wordmark's is -- so the Number row's arithmetic, which reserves
+        // `card_mark::mark_width` before deciding how the digits fit, reserved
+        // the right box.
+        assert!(
+            images[0].height() <= BRAND_MARK_SIZE + 0.01,
+            "the logo is {}pt tall in a {BRAND_MARK_SIZE}pt box",
+            images[0].height()
+        );
+        // ...and the digits start after it rather than under it, which is the
+        // failure a mark measured one way and drawn another produces.
+        let digits = texts
+            .iter()
+            .find(|(t, _)| t.contains("4242"))
+            .map(|(_, r)| *r)
+            .expect("the card number was painted");
+        assert!(
+            digits.left() >= images[0].right(),
+            "the digits at {digits:?} start inside the logo at {:?}",
+            images[0]
         );
     }
 
@@ -17267,6 +17392,7 @@ mod tests {
         };
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
         let _ = ctx.run_ui(input(), |ui| {
             let ordinary = ordinary_value_galley(ui);
@@ -20024,6 +20150,7 @@ mod read_pane_scroll_tests {
             // registered during a frame is only usable from the next one.
             let _ = ctx.run_ui(input.clone(), |_ui| {});
             theme::apply(&ctx);
+            crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
             let _ = ctx.run_ui(input, |_ui| {});
             Self {
                 ctx,
@@ -21986,6 +22113,7 @@ mod breach_badge_tests {
         // every other harness in this file does.
         let _ = ctx.run_ui(input(), |_ui| {});
         theme::apply(&ctx);
+        crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut cache = BreachCache::new(Arc::new(move |_, _| answer));

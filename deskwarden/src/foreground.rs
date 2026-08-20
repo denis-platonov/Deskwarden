@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 52] = [
+        const OPENS_NO_WINDOW: [&str; 53] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1057,6 +1057,10 @@ mod tests {
             // A test-only brace matcher over source text. It is
             // `#[cfg(test)]` at its declaration and draws nothing.
             "below_cut",
+            // Reads brand logo files off disk, bounds them and normalises
+            // them to pixels. It draws nothing and knows nothing about a
+            // window: `card_mark` turns what it returns into a texture.
+            "brand_mark",
             // Hashes a password and talks to the Have I Been Pwned range
             // API. Pure logic plus one HTTP call; it draws nothing.
             "breach",

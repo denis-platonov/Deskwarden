@@ -197,6 +197,26 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
 /// already been expanded to full RGB/RGBA. `info.color_type` below can
 /// never actually observe `Indexed` -- see the comment on that match arm.
 pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let (width, height, rgba) = decode_rgba_unscaled(png_bytes)?;
+    Some(resample_for_display(width, height, rgba))
+}
+
+/// The decode half of [`decode_rgba`], **without** the display resampling.
+///
+/// Split out for [`crate::card_mark`]'s brand marks, which must see the
+/// source's own pixels: [`resample_for_display`] letterboxes a non-square
+/// image onto a transparent square, and a mark is classified by whether its
+/// border is transparent -- so a mark run through the icon path would arrive
+/// with a transparent border this app had just added, and a full-bleed logo
+/// would be mistaken for an isolated one and cropped.
+///
+/// One decoder, two callers, and deliberately not a second one: the colour
+/// types, bit depths and the indexed-palette expansion are the same problem
+/// for a file off disk as for a file off the wire, and the arm-by-arm
+/// reasoning above is the part that must not be duplicated. The *bounds* are
+/// not shared, because they are not the same question -- see
+/// `card_mark::MAX_MARK_BYTES`.
+pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     let mut decoder = png::Decoder::new(png_bytes);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
@@ -227,7 +247,7 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
         png::ColorType::Indexed => return None,
     };
 
-    Some(resample_for_display(width, height, rgba))
+    Some((width, height, rgba))
 }
 
 /// The longest edge, in pixels, a decoded icon is reduced to fit inside.
@@ -315,7 +335,11 @@ fn resample_for_display(width: usize, height: usize, rgba: Vec<u8>) -> (usize, u
 /// because that is what the `from_rgba_unmultiplied` call sites want.
 ///
 /// Callers guarantee `dst_w <= src_w` and `dst_h <= src_h`.
-fn box_downscale(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+///
+/// `pub(crate)` for [`crate::card_mark`], which reduces a brand mark to the
+/// size it is drawn at for exactly the reason above and must not grow a
+/// second, worse reduction of its own.
+pub(crate) fn box_downscale(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
     let mut out = vec![0u8; dst_w * dst_h * 4];
     let x_ratio = src_w as f64 / dst_w as f64;
     let y_ratio = src_h as f64 / dst_h as f64;

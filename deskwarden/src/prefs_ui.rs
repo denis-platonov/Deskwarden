@@ -202,6 +202,30 @@ const FETCH_ICONS_DESCRIPTION: &str = "On by default. Deskwarden asks the icon s
      username, the password, or which account the item is in. Off shows coloured initials \
      instead and nothing leaves your PC.";
 
+const BRAND_LOGOS_LABEL: &str = "Show card network logos";
+/// **Says where the images come from, because that is the part a user cannot
+/// guess and the only part they have to act on.** This row is unlike every
+/// other pill on this page: turning it on does nothing whatever until the user
+/// has put a file somewhere, so copy that said only "shows network logos"
+/// would be describing a switch that looks broken.
+///
+/// So it names the folder, and it names the fallback in the same breath -- a
+/// brand with no image keeps its printed name -- which is what makes a
+/// half-filled folder a reasonable state to be in rather than a half-broken
+/// vault.
+///
+/// It also says **nothing is downloaded**, because "logos" on a page whose
+/// neighbouring row is about a request to an icon service is exactly where a
+/// careful reader assumes a second one.
+///
+/// Off by default, and stated in the copy rather than left to
+/// `Settings::default`, the same way `FETCH_ICONS_DESCRIPTION` and
+/// `BREACH_DESCRIPTION` state theirs.
+const BRAND_LOGOS_DESCRIPTION: &str = "Off by default. Draws a card's network mark as that \
+     network's own logo, read from PNG files you put in the brand-marks folder beside your \
+     settings — visa.png, mastercard.png, amex.png and so on. Nothing is downloaded. Any brand \
+     with no image keeps its printed name.";
+
 const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// **Says what ON adds, and what it costs.** Off is the default and is stated
 /// in the copy rather than left to `Settings::default`, exactly as
@@ -1469,7 +1493,21 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.fetch_icons,
         );
         row_separator(ui);
-        // Directly under the icon row, the other off-by-default row, and
+        // Directly under the icon row because the two are the same question
+        // about the same tile column -- what a card wears -- and a user
+        // looking for either is looking at this part of the page. They are
+        // NOT a group: that one is a network request and this one reads two
+        // folders on the user's own disk, which is why each states its own
+        // default in its own copy instead of sharing a heading that would
+        // imply a shared rule.
+        state.settings.use_brand_logos = toggle_row(
+            ui,
+            BRAND_LOGOS_LABEL,
+            BRAND_LOGOS_DESCRIPTION,
+            state.settings.use_brand_logos,
+        );
+        row_separator(ui);
+        // The other off-by-default row, and
         // wired exactly as it is. This pill is the only thing that decides
         // whether the read pane draws a TOTP-secret row at all -- the pane
         // skips the row outright when this is off rather than drawing it
@@ -3543,12 +3581,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_six_toggles_and_one_stepper() {
+    fn general_paints_exactly_seven_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            6,
-            "six 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`,              `reveal_totp_seed`, `auto_lock_enabled` and `check_for_updates`, and nothing              else. `check_breaches` is NOT here any more -- it moved to Breaches, which              owns the scan button it does not govern; see `draw_breaches`"
+            7,
+            "seven 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`,              `use_brand_logos`, `reveal_totp_seed`, `auto_lock_enabled` and              `check_for_updates`, and nothing else. `check_breaches` is NOT here any more              -- it moved to Breaches, which owns the scan button it does not govern; see              `draw_breaches`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -4085,8 +4123,8 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // THIRD pill down now: backend, prompt, site icons, TOTP secret, auto-lock, updates. The breach row that used to sit second is
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // THIRD pill down now: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates. The breach row that used to sit second is
         // on the Breaches page.
         let pill = pills[2].center();
 
@@ -4106,6 +4144,75 @@ mod tests {
         assert!(state.settings.fetch_icons, "and back on again");
         assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
         assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
+    }
+
+    /// **The network-logos switch, driven at the pane**, with the same
+    /// counter-assertions its neighbours carry: a row wired to `fetch_icons`
+    /// -- the row directly above it, and the one it is most likely to be
+    /// confused with -- would still flip *a* setting on this click.
+    ///
+    /// This one starts `false`, so the first click turns it ON, which is the
+    /// direction that matters for an off-by-default row.
+    #[test]
+    fn clicking_the_network_logos_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(
+            !state.settings.use_brand_logos,
+            "the default: cards wear their printed network name until this is clicked"
+        );
+        assert!(state.settings.fetch_icons, "the neighbour above starts true");
+        assert!(!state.settings.reveal_totp_seed, "the neighbour below starts false");
+        assert!(state.settings.keep_backend_running, "the neighbour starts true");
+        assert!(state.settings.prompt_on_match, "the neighbour starts true");
+        assert!(state.settings.auto_lock_enabled, "the neighbour starts true");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // FOURTH pill down: backend, prompt, site icons, network logos, TOTP
+        // secret, auto-lock, updates.
+        let pill = pills[3].center();
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.use_brand_logos,
+            "the network-logos toggle did not turn on -- the row is painted but its value is \
+             never written back, so the pill is decoration"
+        );
+        assert!(state.settings.fetch_icons, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.use_brand_logos, "and back off again");
+        assert!(state.settings.fetch_icons, "the wrong row's toggle moved");
+    }
+
+    /// The copy is on screen, and it says the two things a user cannot infer
+    /// from the pill: that they have to supply the images themselves, and that
+    /// a brand with no image is not a blank -- it keeps its word.
+    #[test]
+    fn the_network_logos_row_says_where_the_images_come_from_and_what_happens_without_them() {
+        let painted = paint(Section::General);
+        assert!(painted.contains(BRAND_LOGOS_LABEL), "got {:?}", painted.strings());
+        assert!(painted.contains(BRAND_LOGOS_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            BRAND_LOGOS_DESCRIPTION.contains("brand-marks"),
+            "the copy has to name the folder: with none named, a user turns this on, sees no \
+             change whatever, and has nothing to act on"
+        );
+        assert!(
+            BRAND_LOGOS_DESCRIPTION.contains("Off by default"),
+            "the default is stated in the copy, as every other row's is"
+        );
+        assert!(
+            BRAND_LOGOS_DESCRIPTION.contains("Nothing is downloaded"),
+            "on a page whose neighbouring row IS a network request, silence here reads as a \
+             second one"
+        );
     }
 
     /// **The update-check switch, driven at the pane.** Starts `true`, so the
@@ -4132,9 +4239,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // Last pill down: backend, prompt, site icons, TOTP secret, auto-lock, updates.
-        let pill = pills[5].center();
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // Last pill down: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates.
+        let pill = pills[6].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4269,9 +4376,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // FOURTH pill down now: backend, prompt, site icons, TOTP secret, auto-lock, updates.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // FIFTH pill down now: backend, prompt, site icons, network logos, TOTP secret, auto-lock, updates.
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4320,15 +4427,15 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
-        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the site-icons pill");
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 7);
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[3].top() > breach.bottom(),
+            pills[4].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[3].bottom() < auto_lock.top(),
+            pills[4].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -4385,15 +4492,17 @@ mod tests {
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the FIFTH pill down is the one wired to it -- `prompt_on_match`,
-        // `fetch_icons` and `reveal_totp_seed` sit between it and the backend
-        // row. It was the sixth until `check_breaches` moved to its own page.
+        // the SIXTH pill down is the one wired to it -- `prompt_on_match`,
+        // `fetch_icons`, `use_brand_logos` and `reveal_totp_seed` sit between
+        // it and the backend row. It was the fifth until the network-logos row
+        // was inserted, and the sixth before `check_breaches` moved to its own
+        // page.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[4].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[5].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");

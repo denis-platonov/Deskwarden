@@ -28,6 +28,11 @@ pub mod backend_policy;
 /// Test-only at the declaration, so nothing in it can ship.
 #[cfg(test)]
 pub mod below_cut;
+/// Brand logo files on disk: where a card network's mark is looked for, what
+/// is refused, and how one is normalised. It draws nothing -- [`card_mark`]
+/// does that, and falls back to the wordmark whenever this module has no
+/// answer for a brand.
+pub mod brand_mark;
 pub mod breach;
 /// The whole-vault breach scan the Preferences page drives: one lookup per
 /// distinct password, bounded concurrency, failures counted out loud, and

@@ -705,6 +705,25 @@ pub fn truncated_galley(
 /// line" looks like. `None` for a run with no glyphs, where there is no ink
 /// to centre and the caller should leave the box alone.
 pub fn ink_center_y(galley: &egui::Galley) -> Option<f32> {
+    ink_band_y(galley).map(|(lo, hi)| (lo + hi) / 2.0)
+}
+
+/// The top and the bottom of a laid-out run's INK, measured down from the top
+/// of its own box.
+///
+/// [`ink_center_y`] is the midpoint of this band and is expressed in terms of
+/// it, so the two cannot come to disagree about where a run's ink is.
+///
+/// The BAND rather than only its centre is what a caller needs when it has to
+/// match a run's optical *size* and not just its position:
+/// [`crate::card_mark`] scales a brand logo so that the logo's ink stands
+/// exactly as tall as the wordmark it replaced, which is what makes a row of
+/// mixed marks -- some logos, some words, some logos on their own coloured
+/// ground -- read as one set rather than as whatever files the user happened
+/// to download.
+///
+/// `None` for a run with no glyphs, where there is no ink to measure.
+pub fn ink_band_y(galley: &egui::Galley) -> Option<(f32, f32)> {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for row in galley.rows.iter() {
         for glyph in row.glyphs.iter() {
@@ -713,7 +732,7 @@ pub fn ink_center_y(galley: &egui::Galley) -> Option<f32> {
             hi = hi.max(top + glyph.uv_rect.size.y);
         }
     }
-    lo.is_finite().then(|| (lo + hi) / 2.0)
+    lo.is_finite().then_some((lo, hi))
 }
 
 pub fn ink_offset_x(galley: &egui::Galley) -> f32 {

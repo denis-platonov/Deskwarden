@@ -123,12 +123,24 @@ impl CardBrand {
     /// The network's name as the mark SETS IT IN TYPE -- `VISA`,
     /// `MASTERCARD`, `AMEX`.
     ///
-    /// **Words, because this app does not ship the logos.** The network marks
-    /// are registered trademarks whose brand guidelines restrict their use to
-    /// licensed issuers and merchants; this is an MIT-licensed community
-    /// project and its author does not want that exposure. Naming which
-    /// network a card belongs to is a statement of fact about the user's own
-    /// card, and a word is how a fact is stated.
+    /// **The word is what this app draws unless a logo file is present, and
+    /// it is the fallback in every case where one is not.** Real network
+    /// marks are supported -- see [`Self::mark_stem`] and
+    /// [`crate::brand_mark`] -- on a nominative basis: the mark identifies
+    /// which network the user's own card is on and promotes nothing. The
+    /// images are not compiled in and not distributed with the source; they
+    /// are read from disk at runtime, and the setting that reads them
+    /// ([`crate::settings::Settings::use_brand_logos`]) is off until a user
+    /// turns it on.
+    ///
+    /// So this table is not a substitute for logos that could not be had. It
+    /// is the mark for: the setting off, no file for this brand, and a file
+    /// that was there and was refused. A user with the setting on and six of
+    /// nine files present reads six logos and three words, and every word
+    /// still says which network the card is on -- which is the only thing the
+    /// mark was ever for. It is therefore load-bearing for every brand,
+    /// including the ones an image will eventually exist for, and nothing
+    /// here is dead once the images arrive.
     ///
     /// **Full words, now that the mark has the row's width and not a tile
     /// corner's.** These were once capped at four characters -- `MC`, `DC`,
@@ -177,6 +189,45 @@ impl CardBrand {
             // about the digits, which it does not (see `network`).
             CardBrand::Other => "OTHER",
         }
+    }
+
+    /// The file-name stem a brand's logo is read from -- `visa.png` is
+    /// `"visa"` -- or `None` for a brand that has no logo to look for.
+    ///
+    /// **Lower case, one word, no punctuation**, which is what makes these
+    /// nameable by a user who has just downloaded an asset from a brand
+    /// centre and has to decide what to call it. `amex` and `diners` follow
+    /// [`Self::wordmark`]'s abbreviations rather than
+    /// [`Self::canonical`]'s strings, so a user reading the pill on screen
+    /// already knows the file name.
+    ///
+    /// **A `match` on the enum, in the file that owns the enum, and
+    /// deliberately not derived from another string by rule.** It is the same
+    /// argument `wordmark` makes: `American Express` -> `amex` and
+    /// `UnionPay` -> `unionpay` are not one rule. What it buys is that a
+    /// network added later does not compile without an answer here, so it
+    /// cannot arrive half-wired -- looked up in the dropdown and in the
+    /// grouping table, and silently invisible to the one table that decides
+    /// whether it can have a logo at all. `CARD_BRANDS` drives the test that
+    /// holds it.
+    ///
+    /// **[`Other`](Self::Other) answers `None`, and that is not an
+    /// oversight.** It is not a network; there is no mark for it to have, and
+    /// no file named `other.png` would be anything but a user's own picture
+    /// on a row that means "none of the above". It keeps its word.
+    pub fn mark_stem(self) -> Option<&'static str> {
+        Some(match self {
+            CardBrand::Visa => "visa",
+            CardBrand::Mastercard => "mastercard",
+            CardBrand::AmericanExpress => "amex",
+            CardBrand::Discover => "discover",
+            CardBrand::DinersClub => "diners",
+            CardBrand::Jcb => "jcb",
+            CardBrand::Maestro => "maestro",
+            CardBrand::UnionPay => "unionpay",
+            CardBrand::RuPay => "rupay",
+            CardBrand::Other => return None,
+        })
     }
 
     /// The digit groups the network prints on the plastic.

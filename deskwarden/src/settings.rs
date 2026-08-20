@@ -860,6 +860,34 @@ pub struct Settings {
     /// a picture of which domains they hold entries for. `PRIVACY.md` names
     /// this as the request with the most privacy weight in the app.
     pub fetch_icons: bool,
+    /// Whether a card's network mark is drawn as the network's own logo, when
+    /// an image for it is on disk.
+    ///
+    /// `false` (the default, and what an older `settings.json` without this
+    /// field parses as) is the behaviour that has always existed: every card
+    /// wears the drawn wordmark -- `VISA`, `MASTERCARD`, `AMEX` in this app's
+    /// own blue pill. So **nobody's display changes on upgrade**, and nothing
+    /// is lost on a downgrade either.
+    ///
+    /// `true` asks [`crate::card_mark`] to look for a logo file for each brand
+    /// it draws, in [`crate::brand_mark::search_dirs`]' two directories, and
+    /// to draw the image where it finds a usable one. The wordmark remains the
+    /// mark everywhere else -- for a brand with no file, and for a file that
+    /// was refused -- so turning this on can never leave a row with no mark
+    /// on it.
+    ///
+    /// **Off by default, and the reason is not privacy.** This one reads no
+    /// network and no vault: the directories are on the user's own disk. It is
+    /// off because there is nothing in either of them until somebody puts
+    /// something there -- no image is compiled in and none is distributed with
+    /// the source -- so `true` on a fresh install would be a preference that
+    /// silently does nothing, which is worse than one a user turns on when
+    /// they have the files.
+    ///
+    /// It is a preference in the ordinary sense as well: these are trademarked
+    /// marks, drawn to identify which network a card is on, and a user who
+    /// would rather read the plain word is entitled to.
+    pub use_brand_logos: bool,
     /// Whether Deskwarden asks GitHub whether a newer Deskwarden exists.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -1126,6 +1154,7 @@ impl Default for Settings {
             prompt_on_match: true,
             check_breaches: false,
             fetch_icons: true,
+            use_brand_logos: false,
             check_for_updates: true,
             reveal_totp_seed: false,
             auto_lock_enabled: true,
@@ -1256,6 +1285,7 @@ impl Settings {
             prompt_on_match,
             check_breaches,
             fetch_icons,
+            use_brand_logos,
             check_for_updates,
             reveal_totp_seed,
             auto_lock_enabled,
@@ -1284,6 +1314,7 @@ impl Settings {
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
+        on_disk.use_brand_logos = *use_brand_logos;
         on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
@@ -1543,6 +1574,9 @@ mod tests {
             // Deliberately the OPPOSITE of this field's own default
             // (`true`), for the reason the line above gives.
             fetch_icons: false,
+            // Deliberately the OPPOSITE of this field's own default
+            // (`false`), for the reason the lines above give.
+            use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
@@ -1726,6 +1760,7 @@ mod tests {
             prompt_on_match: false,
             check_breaches: true,
             fetch_icons: false,
+            use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: false,
@@ -1962,6 +1997,64 @@ mod tests {
             "upgrading turned icon fetching off for a user who never asked, so every item in \
              their vault silently lost its icon"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same upgrade question for `use_brand_logos`, whose answer is the
+    /// other way round and for the other reason: this field defaults OFF, so
+    /// an older `settings.json` must read as off and **nobody's card rows
+    /// change appearance on upgrade**. A brand logo appearing on a user's
+    /// vault because they installed a new version is exactly the surprise the
+    /// default is chosen to avoid.
+    #[test]
+    fn an_older_settings_file_without_the_brand_logo_key_loads_as_off() {
+        let path = temp_path("brand-logos-older-file");
+        let older = br#"{"keep_backend_running": false, "fetch_icons": true, "auto_lock_minutes": 9}"#;
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("use_brand_logos"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // The premise that the file was read at all, rather than falling back
+        // to `Settings::default()` wholesale.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 9);
+        assert!(
+            !loaded.use_brand_logos,
+            "upgrading turned brand logos on for a user who never asked for them"
+        );
+        // ...and the in-memory default and the no-file-at-all path agree with
+        // it, which is the whole of "off by default".
+        assert!(!Settings::default().use_brand_logos);
+        assert!(!Settings::load(&temp_path("brand-logos-absent")).use_brand_logos);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard the two tests below document**, for
+    /// `use_brand_logos`: `persist_preferences` destructures exhaustively, so
+    /// the field cannot go unnamed -- but binding it and never assigning
+    /// `on_disk.use_brand_logos` compiles, and a preference that silently
+    /// refuses to persist is indistinguishable from one that does not work.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`false`) would pass a one-way test.
+    #[test]
+    fn the_brand_logo_toggle_survives_persist_preferences() {
+        let path = temp_path("brand-logos-persist");
+        let _ = std::fs::remove_file(&path);
+        assert!(!Settings::load(&path).use_brand_logos, "the premise: it starts off");
+        Settings { use_brand_logos: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .expect("the write succeeded");
+        assert!(
+            Settings::load(&path).use_brand_logos,
+            "turning brand logos on did not survive the write"
+        );
+        Settings { use_brand_logos: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .expect("the write succeeded");
+        assert!(!Settings::load(&path).use_brand_logos, "and back off again");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2233,6 +2326,7 @@ mod tests {
             prompt_on_match: true,
             check_breaches: true,
             fetch_icons: false,
+            use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: true,
@@ -3452,6 +3546,7 @@ mod tests {
             prompt_on_match: false,
             check_breaches: true,
             fetch_icons: false,
+            use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
             auto_lock_enabled: false,
