@@ -1790,13 +1790,25 @@ fn release_notes(ui: &mut Ui, body: &str) {
             ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).color(theme::TEXT_FAINT));
             return;
         }
-        let width = ui.available_width();
-        // egui's default scrollbar floats over the content and is painted in
-        // its own light grey, which on this card's white is very nearly
-        // nothing. Pinned open at a real width and given the page's own
-        // border colour, so the cue that there is more to read is a cue
-        // someone can see.
-        ui.spacing_mut().scroll.floating = false;
+        // egui's default scrollbar is painted in its own light grey, which on
+        // this card's white is very nearly nothing. Given a real width and
+        // the page's own border colour, so the cue that there is more to read
+        // is a cue someone can see.
+        //
+        // **Floating, with the lane allocated** -- the item list's and the
+        // health pane's arrangement (`theme::scrollbar_in_gutter`), reached
+        // here from the other side. This region used to pin a NON-floating
+        // bar open and subtract its width from the content by hand, and that
+        // hand-subtraction is what made the notes that fit and the notes that
+        // scroll indistinguishable: a non-floating bar's paint cannot be
+        // suppressed without also giving up its lane. `floating_allocated_
+        // width` reserves the lane from `AlwaysVisible` alone, unconditionally
+        // and independently of whether anything is drawn in it, which is what
+        // lets `notes_fit` below change the paint and nothing else.
+        ui.spacing_mut().scroll.floating = true;
+        ui.spacing_mut().scroll.floating_width = UPDATE_NOTES_BAR_WIDTH;
+        ui.spacing_mut().scroll.floating_allocated_width =
+            UPDATE_NOTES_BAR_WIDTH + UPDATE_NOTES_BAR_MARGIN * 2.0;
         ui.spacing_mut().scroll.bar_width = UPDATE_NOTES_BAR_WIDTH;
         ui.spacing_mut().scroll.bar_inner_margin = UPDATE_NOTES_BAR_MARGIN;
         ui.spacing_mut().scroll.bar_outer_margin = 0.0;
@@ -1804,7 +1816,27 @@ fn release_notes(ui: &mut Ui, body: &str) {
         ui.visuals_mut().widgets.hovered.bg_fill = theme::TEXT_SECONDARY;
         ui.visuals_mut().widgets.active.bg_fill = theme::TEXT_SECONDARY;
         ui.visuals_mut().extreme_bg_color = theme::CANVAS;
-        egui::ScrollArea::vertical()
+        if notes_fit(ui) {
+            // Notes that fit paint no bar at all: a line down the side of a
+            // region with nothing to scroll points at nothing. Only the PAINT
+            // is suppressed -- see `notes_fit`.
+            theme::hide_scrollbar(ui);
+        } else {
+            // **Fully opaque, not egui's dormant defaults.** A floating bar
+            // is normally faint until the pointer comes near it, which is the
+            // same "cue behind an action nobody takes" the visibility comment
+            // below rejects, only spelled in alpha rather than in a mode.
+            // Clipped notes get a bar at full strength with the pointer
+            // nowhere near the card.
+            let scroll = &mut ui.spacing_mut().scroll;
+            scroll.dormant_background_opacity = 1.0;
+            scroll.active_background_opacity = 1.0;
+            scroll.interact_background_opacity = 1.0;
+            scroll.dormant_handle_opacity = 1.0;
+            scroll.active_handle_opacity = 1.0;
+            scroll.interact_handle_opacity = 1.0;
+        }
+        let scrolled = egui::ScrollArea::vertical()
             .max_height(UPDATE_NOTES_HEIGHT)
             .auto_shrink([false, true])
             // **Always visible, never on hover.** Long notes are clipped at
@@ -1813,14 +1845,23 @@ fn release_notes(ui: &mut Ui, body: &str) {
             // egui's default hides the bar until the pointer is inside the
             // region, which puts the only cue that there is more to read
             // behind an action nobody takes without the cue.
+            //
+            // This stays `AlwaysVisible` for the notes that fit as well, and
+            // that is the load-bearing half: it is also what makes egui
+            // RESERVE the bar's lane. On the default `VisibleWhenNeeded` the
+            // reservation would come and go with the content, and this card
+            // would change width as the notes got longer -- the defect
+            // `password_health` was just fixed for, in mirror image.
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
-                // The bar is not floating, so it takes width from the row
-                // rather than sitting over it. Subtracted here rather than
-                // left to egui, which would otherwise let the region grow
-                // wider than the card and leave this card's right edge a few
-                // points past the Version card's directly above it.
-                ui.set_width(width - UPDATE_NOTES_BAR_WIDTH - UPDATE_NOTES_BAR_MARGIN * 2.0);
+                // The lane is already reserved out of `available_width` by
+                // `floating_allocated_width` above, so this is the content's
+                // full width and nothing is subtracted from it a second time.
+                // Subtracting again is what would leave this card's right
+                // edge a few points shy of the Version card's directly above
+                // it -- the mismatch the bar constants' comment warns about,
+                // in the direction nobody notices until they measure.
+                ui.set_width(ui.available_width());
                 // `Label::wrap`, not a `TextEdit` and not rich text: one
                 // galley of plain characters, wrapped to the card.
                 ui.add(
@@ -1830,7 +1871,48 @@ fn release_notes(ui: &mut Ui, body: &str) {
                     .wrap(),
                 );
             });
+        remember_notes_overflow(
+            ui,
+            scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
+        );
     });
+}
+
+/// Whether the notes are short enough that there is nothing to scroll, which
+/// is when the bar is not painted.
+///
+/// **Read back from the LAST frame's scroll area rather than predicted from
+/// the text**, for the reason `password_health::content_fits` gives at
+/// length: predicting the height would mean laying the wrapped, styled notes
+/// out a second time here, and a second layout that disagreed with the real
+/// one would hide the bar on notes that really do continue.
+///
+/// **Nothing about the LAYOUT turns on this.** The bar's lane is reserved in
+/// both states -- `AlwaysVisible` above reserves it, and the width
+/// subtraction inside the region is unconditional -- so only the bar's six
+/// opacities change. A verdict that is one frame stale therefore cannot move
+/// the card's edge by a single point; it can only paint a bar one frame
+/// longer than needed, and [`remember_notes_overflow`] asks for the repaint
+/// that ends it.
+fn notes_fit(ui: &Ui) -> bool {
+    // Ties go to "can scroll", as they do in the health pane: being wrong the
+    // other way hides the cue on notes the user really can move. The first
+    // frame has no memory and so shows the bar.
+    !ui.ctx().data(|d| d.get_temp::<bool>(notes_overflow_id()).unwrap_or(true))
+}
+
+/// Stores what [`notes_fit`] reads, and asks for one more frame when the
+/// answer changed -- see there.
+fn remember_notes_overflow(ui: &Ui, overflows: bool) {
+    let previous = ui.ctx().data(|d| d.get_temp::<bool>(notes_overflow_id()));
+    if previous != Some(overflows) {
+        ui.ctx().data_mut(|d| d.insert_temp(notes_overflow_id(), overflows));
+        ui.ctx().request_repaint();
+    }
+}
+
+fn notes_overflow_id() -> egui::Id {
+    egui::Id::new("update_notes_overflows")
 }
 
 /// The download's progress: a bar and a byte count.
@@ -4102,6 +4184,132 @@ mod tests {
             .unwrap(),
             body: "Fixed the thing".to_string(),
         }
+    }
+
+    /// Two frames of the About page in one `Context`, and the SECOND one's
+    /// paint.
+    ///
+    /// The notes region's `notes_fit` reads the previous frame's overflow
+    /// (see there), so the first frame of a fresh context is deliberately the
+    /// pessimistic one -- it shows the bar. Anything asserting on the settled
+    /// verdict has to run the frame that has a memory to read, and this is
+    /// that helper rather than an extra `frame` call copied into each test.
+    fn paint_about_settled(
+        stage: crate::update_panel::UpdateStage,
+        settings: Settings,
+    ) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(settings);
+        state.section = Section::About;
+        state.show_update_stage(stage);
+        let _first = frame(&ctx, &mut state, &[]);
+        frame(&ctx, &mut state, &[])
+    }
+
+    /// A release body far longer than [`UPDATE_NOTES_HEIGHT`] can show.
+    fn notes_that_overflow() -> String {
+        (0..60)
+            .map(|n| format!("line {n} of a release note that keeps going"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The white card the notes heading is painted on, found by containment
+    /// rather than by index -- the About page has several cards and their
+    /// order is not this test's business.
+    fn notes_card_rect(painted: &Painted) -> Rect {
+        let heading = painted.rect_of(UPDATE_NOTES_LABEL);
+        painted
+            .rects
+            .iter()
+            .map(|r| r.rect)
+            .filter(|r| r.contains(heading.center()) && r.width() > heading.width())
+            .min_by(|a, b| a.width().partial_cmp(&b.width()).unwrap())
+            .expect("the notes heading is painted on no card at all")
+    }
+
+    /// Is a scrollbar-width rectangle painted in ink anyone can see?
+    ///
+    /// Colour, not geometry, is the question: `theme::hide_scrollbar` works by
+    /// taking the bar's opacities to zero, and a bar at alpha 0 still occupies
+    /// a perfectly reasonable rectangle. A test reading only rectangles would
+    /// pass whether the bar was suppressed or not.
+    fn paints_a_visible_scrollbar(painted: &Painted) -> bool {
+        painted.rects.iter().any(|r| {
+            (r.rect.width() - UPDATE_NOTES_BAR_WIDTH).abs() < 0.5
+                && r.rect.height() > UPDATE_NOTES_BAR_WIDTH
+                && r.fill.a() > 0
+        })
+    }
+
+    /// **The bar appears only when something is actually clipped.**
+    ///
+    /// The reported defect: a pinned-open scrollbar down the side of three
+    /// lines of notes, pointing at nothing. The cue is worth its space when
+    /// the text continues past the region and is noise when it does not.
+    #[test]
+    fn short_notes_paint_no_scrollbar_and_long_notes_do() {
+        let short = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let long = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: notes_that_overflow(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        assert!(
+            !paints_a_visible_scrollbar(&short),
+            "notes that fit inside the region are not clipped, so a scrollbar beside them \
+             is a cue pointing at nothing. Bar-width rectangles painted: {:?}",
+            short
+                .rects
+                .iter()
+                .filter(|r| (r.rect.width() - UPDATE_NOTES_BAR_WIDTH).abs() < 0.5)
+                .map(|r| (r.rect, r.fill))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            paints_a_visible_scrollbar(&long),
+            "notes clipped at UPDATE_NOTES_HEIGHT with no bar read as text that failed to \
+             load rather than as text that continues -- and the bar must be there WITHOUT \
+             the pointer, which this frame has nowhere near the region"
+        );
+    }
+
+    /// **The bar's lane is reserved whether or not the bar is painted.**
+    ///
+    /// This is the half that `password_health` was just fixed for in mirror
+    /// image: `AlwaysVisible` is what makes egui lay the gutter out, and the
+    /// width subtracted inside the region is unconditional, so suppressing
+    /// the PAINT cannot move the card's edge. If the reservation were made to
+    /// follow the bar's visibility instead, this card would grow and shrink
+    /// as release notes got longer -- next to a Version card that does not.
+    #[test]
+    fn the_notes_card_is_the_same_width_short_or_long() {
+        let short = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let long = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: notes_that_overflow(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        let short_card = notes_card_rect(&short);
+        let long_card = notes_card_rect(&long);
+        assert!(
+            (short_card.width() - long_card.width()).abs() < 0.5
+                && (short_card.left() - long_card.left()).abs() < 0.5,
+            "the card moved with the length of its notes: short {short_card:?}, long \
+             {long_card:?}"
+        );
     }
 
     /// **The state the tray could not express.**

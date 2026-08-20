@@ -217,6 +217,12 @@ enum Surface {
     /// growing -- the layout claim that matters, this window being unresizable
     /// and this crate having pushed a control out of reach before.
     PrefsAboutUpdateAvailable,
+    /// **The same card with notes that FIT.** Its whole point is the absence
+    /// of a scrollbar: the region reserves the bar's lane either way, so this
+    /// picture beside `prefs_about_update_available` is the review of "the
+    /// cue appears only when something is actually clipped, and the card's
+    /// right edge does not move when it does".
+    PrefsAboutUpdateShortNotes,
     /// Mid-download: the progress bar, the byte count, and the notes still
     /// readable underneath. Its own surface because "is the bar there and does
     /// the card still fit" is exactly what a picture answers and an assertion
@@ -347,6 +353,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsClipboardOff,
     Surface::PrefsAboutNoUpdate,
     Surface::PrefsAboutUpdateAvailable,
+    Surface::PrefsAboutUpdateShortNotes,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::VaultList,
@@ -383,6 +390,7 @@ impl Surface {
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
             Surface::PrefsAboutNoUpdate => "prefs_about_no_update",
             Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
+            Surface::PrefsAboutUpdateShortNotes => "prefs_about_update_short_notes",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
@@ -444,6 +452,7 @@ impl Surface {
             | Surface::PrefsClipboardOff
             | Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutUpdateShortNotes
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
             // The list panel's exact shipped width, spelled out for the same
@@ -789,6 +798,7 @@ impl eframe::App for Preview {
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
             Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutUpdateShortNotes
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::VaultList => self.draw_vault_list(root),
@@ -1105,6 +1115,12 @@ impl Preview {
 
         let stage = match surface {
             Surface::PrefsAboutUpdateAvailable => UpdateStage::Available(release),
+            // Short enough to fit the region with room to spare, which is the
+            // state whose review is that there is NO bar beside it.
+            Surface::PrefsAboutUpdateShortNotes => UpdateStage::Available(ReleaseInfo {
+                body: "Fixed\n- The vault window remembers its size between runs.".to_string(),
+                ..release
+            }),
             Surface::PrefsAboutDownloading => UpdateStage::Downloading {
                 release,
                 done: 2_400_000,
