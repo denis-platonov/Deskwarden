@@ -1346,8 +1346,31 @@ pub fn close_glyph(ui: &mut Ui) -> Response {
 // module's test.
 // ---------------------------------------------------------------------------
 
-/// Vertices in the star's outline: five points and five valleys.
-pub const STAR_VERTICES: usize = 10;
+/// Corners in the star's skeleton: five points and five valleys.
+///
+/// The skeleton is not the outline. Every one of these ten corners is
+/// replaced by a rounding arc in [`star_outline`], so the path that reaches
+/// the screen has [`STAR_VERTICES`] points and not ten.
+const STAR_CORNERS: usize = 10;
+
+/// Samples along each corner's rounding arc, endpoints included, so a corner
+/// contributes `STAR_ROUND_SEGMENTS + 1` points.
+///
+/// Three. The arc it draws is about 1.5px long at the shipped size, and a
+/// quadratic Bézier across 1.5px is already smooth at four samples; more of
+/// them buy nothing a person can see and cost vertices in every frame the
+/// detail pane is drawn in.
+const STAR_ROUND_SEGMENTS: usize = 3;
+
+/// Vertices in the star's outline: one rounding arc per [`STAR_CORNERS`].
+///
+/// **It was 10** -- one point per corner, back when the corners were sharp.
+/// The number itself is this file's business; what is not is that it stays
+/// distinct from every other closed path this crate strokes, because
+/// [`icon_probe`] tells the marks apart by point count and nothing else.
+/// [`no_two_drawn_icons_share_a_vertex_count`] is the live guard, which is
+/// why the arithmetic is written out here rather than the answer.
+pub const STAR_VERTICES: usize = STAR_CORNERS * (STAR_ROUND_SEGMENTS + 1);
 
 /// Samples along the eye's upper lid.
 const EYE_LID_SEGMENTS: usize = 12;
@@ -1479,20 +1502,32 @@ const ENVELOPE_HALF_HEIGHT: f32 = 6.5;
 /// [`the_drawn_close_marks_do_not_share_an_extent`] is the live guard.
 const PANE_CLOSE_ARM: f32 = 7.05;
 
-/// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
-const EYE_PUPIL_RADIUS: f32 = 2.4;
+/// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there, and not
+/// [`CLOCK_RADIUS`] for the same reason.
+///
+/// **It was 2.4, against an almond 10.0 tall**: the pupil filled 48% of the
+/// eye's height and left barely a pixel of white above and below it, which
+/// is the cramped middle the old mark had. The almond is 12.8 tall now
+/// ([`eye_toggle`]'s `HALF_H`), and a pupil left at 2.4 would have rattled
+/// around inside it -- so this grows with it, to 2.9, which holds the same
+/// share of a taller eye and keeps a clear 2.85pt of white between the
+/// pupil's edge and the lid's inner face.
+const EYE_PUPIL_RADIUS: f32 = 2.9;
 
 /// The clock face of [`add_totp_button`], as a radius.
 ///
-/// **Deliberately none of the other three ring radii in this app.**
-/// [`icon_probe::tune_icons`] matches [`TUNE_KNOB_RADIUS`],
+/// **Deliberately none of the other ring radii in this app.**
 /// [`icon_probe::kebab_dots`] matches [`KEBAB_DOT_RADIUS`] and the eye's
-/// pupil is [`EYE_PUPIL_RADIUS`]; every one of those is walked out of the
-/// same shape tree this mark is painted into, and a ring that shared a radius
-/// with any of them would be counted as one of that family in every frame the
-/// detail header is drawn in. [`the_drawn_ring_radii_are_all_different`] is
+/// pupil is [`EYE_PUPIL_RADIUS`]; both of those are walked out of the same
+/// shape tree this mark is painted into, and a ring that shared a radius
+/// with either would be counted as one of that family in every frame the
+/// detail header is drawn in. [`the_drawn_circles_do_not_share_a_radius`] is
 /// the live guard, and it is the reason this is 8.5 rather than a rounder
 /// number that happened to collide.
+///
+/// The Preferences mark used to be a fourth radius in this list. It is a
+/// mixer now and its handles are filled blocks, so it contributes no circle
+/// at all -- see that test for why the shorter list is not a weaker one.
 ///
 /// 8.5 also puts the face at 17px across, inside the 34px header button and
 /// at the same optical extent as the star's 18 and the envelope's 18.
@@ -1514,51 +1549,89 @@ const CLOCK_RADIUS: f32 = 8.5;
 const CLOCK_HOUR_HAND: f32 = 4.5;
 const CLOCK_MINUTE_HAND: f32 = 6.0;
 
-/// Slider rows in the Preferences "tune" mark. **Two, where Material
-/// Symbols' own `tune` draws three.**
+/// Channel faders in the Preferences mark. **Three, and the mark is
+/// vertical.**
 ///
-/// This is the same judgement the gear's tooth count was made under, and the
-/// record of that argument is why it lands on two rather than three. The
-/// user's standing note about this control was that it looked *outdated*
-/// beside its neighbours, and what dated it was density: the icons it sits
-/// with are all one- or two-mark shapes -- five points ([`STAR_VERTICES`]),
-/// three dots, one almond and a pupil, two chevron strokes. Three rows is
-/// six marks, twice the kebab's three and the busiest thing in the strip
-/// again. Two rows is four, and two is already the fewest that can say what
-/// this icon says: a single row cannot show knobs at *differing* positions,
-/// and differing positions are the whole difference between a tune control
-/// and a list.
-pub const TUNE_ROWS: usize = 2;
-
-/// Half the length of each slider line, so each spans 17px inside the 28px
-/// button -- close to the gear's old 17.6px extent, so the control's optical
-/// width did not change when the mark did.
-const TUNE_HALF_WIDTH: f32 = 8.5;
-
-/// Vertical distance between the two slider lines. It has to clear
-/// `2 * TUNE_KNOB_RADIUS` (6.0) or the knobs of adjacent rows touch and the
-/// mark reads as one blob; 9.0 leaves a 3px gap, and puts the whole icon
-/// 15px tall including the knobs.
-const TUNE_ROW_PITCH: f32 = 9.0;
-
-/// A slider knob's radius. Not [`KEBAB_DOT_RADIUS`] (1.7) and not
-/// [`EYE_PUPIL_RADIUS`] (2.4), for exactly the reason those two differ from
-/// each other, and for the reason the gear's hub before it did:
-/// `icon_probe::kebab_dots` finds circles BY radius, so a knob that matched
-/// would be reported as a stray kebab dot in every frame the titlebar is
-/// painted in. `the_drawn_circles_do_not_share_a_radius` is the live guard.
-pub const TUNE_KNOB_RADIUS: f32 = 3.0;
-
-/// Where each row's knob sits along its line, as an offset from the icon's
-/// centre.
+/// It was two horizontal slider rows, on a density argument: the icons it
+/// sits with are one- and two-mark shapes, and a third row would have made
+/// this the busiest thing in the strip again. That argument was sound and it
+/// has been overruled by the person it was made for, who asked for "vertical
+/// with just cross bars like a DJ mixer" and, asked how many, answered
+/// three.
 ///
-/// **They must differ**, and not merely by sign: two knobs mirrored about
-/// the centre read as a symmetrical ornament, and two at the same x read as
-/// a bulleted list. -3.4 and +2.6 are visibly different distances from both
-/// the centre and from each other. Both satisfy `|offset| +
-/// TUNE_KNOB_RADIUS <= TUNE_HALF_WIDTH`, which is what keeps a knob sitting
-/// *on* its line rather than hanging off the end of it.
-const TUNE_KNOB_OFFSETS: [f32; TUNE_ROWS] = [-3.4, 2.6];
+/// Three is also what the metaphor needs once the mark turns vertical. Two
+/// faders at different heights read as a comparison; three is the fewest
+/// that reads as a *bank* of them, which is the whole of what a mixing desk
+/// looks like. The density cost is paid back by the handles: a fader block
+/// is a solid rectangle rather than a stroked ring, so three tracks and
+/// three blocks are still only two kinds of mark, which is what
+/// [`the_tune_icon_repeats_no_more_marks_than_the_kebab_beside_it`] actually
+/// bounds.
+pub const TUNE_FADERS: usize = 3;
+
+/// Half the length of each fader's track, so each spans 16.7px inside the
+/// 28px button and the mark stands 18.0px tall with its stroke -- the extent
+/// the drawn-icon family shares.
+const TUNE_TRACK_HALF_HEIGHT: f32 = 8.35;
+
+/// Horizontal distance between adjacent tracks.
+///
+/// It has to clear the fader block's own width or the blocks of neighbouring
+/// channels touch and the bank reads as one bar. A first pass at 6.4 against
+/// a 4.4-wide block was rendered and looked at: the blocks cleared each other
+/// by 2.0 and still read as cramped, because what the eye judges is the white
+/// between them against the ink of them and 2.0 against 4.4 is not enough of
+/// it. 7.0 against a 4.0-wide block leaves 3.0 of white -- more gap than
+/// block -- and puts the whole mark 18.0px across, the extent the family
+/// shares.
+const TUNE_TRACK_PITCH: f32 = 7.0;
+
+/// A fader block: the cap that rides the track, as a full width and height.
+///
+/// **Blocks, not bars crossing the track.** The report said "cross bars",
+/// and a line crossing the track is the literal reading -- but the owner's
+/// reference image settled it as a filled cap, and at this size that is also
+/// the reading that survives: a crossing stroke at [`ICON_STROKE`] is one
+/// pixel of ink laid across another pixel of ink, which at 18pt merges into
+/// a thickened section of line rather than reading as a separate handle.
+///
+/// Taller than it is wide, at 1.65:1, because that is what a fader cap is
+/// and because a block as wide as it is tall reads as a knot in the track.
+/// 4.0 wide leaves 1.35 of block proud of the 1.3 track on each side, which
+/// is what makes it a cap rather than a bulge.
+const TUNE_FADER_WIDTH: f32 = 4.0;
+const TUNE_FADER_HEIGHT: f32 = 6.6;
+
+/// The corner radius on a fader block.
+///
+/// 1.2 on a 4.4 x 6.6 block: enough to take the hardness off the corners at
+/// 18pt, not so much that the cap turns into a lozenge. Below about 0.8 it
+/// stops being visible at this size at all, which would make it a number
+/// that costs a reader's attention and buys nothing.
+const TUNE_FADER_ROUNDING: f32 = 1.2;
+
+/// Where each channel's block sits along its track, as an offset from the
+/// mark's centre. Positive is DOWN, as everywhere else in egui.
+///
+/// **The stagger is the mark.** Three blocks level with each other read as a
+/// fence or a grid; three at visibly different heights read as a mixing
+/// desk, and nothing else in the shape carries that. The owner's reference
+/// puts the left channel high, the middle one low and the right one near the
+/// middle, and these are those three positions.
+///
+/// They are not merely different, they are far apart: -3.2 and +3.4 are on
+/// opposite sides of the centre and 6.6 apart on a track only 16.7 long --
+/// two fifths of its travel -- and -0.4 is off the centre line rather than
+/// on it, so no two blocks and no axis of symmetry line up.
+///
+/// Each satisfies `|offset| + TUNE_FADER_HEIGHT / 2 <=
+/// TUNE_TRACK_HALF_HEIGHT`, which is what keeps a block *on* its track with
+/// a run of track still showing past both of its ends -- a block flush with
+/// the end reads as a cap on a post, not as a fader that could travel. A
+/// first pass at ±3.8/4.0 was rendered and pulled back for exactly that:
+/// 1.25pt of track above the highest block is under a pixel once it is
+/// anti-aliased, and the mark looked as though its travel had run out.
+const TUNE_FADER_OFFSETS: [f32; TUNE_FADERS] = [-3.2, 3.4, -0.4];
 
 /// The weight every drawn icon in this titlebar/header family is stroked at:
 /// the tune icon's lines and knobs, the eye's almond, the switcher's chevron
@@ -1573,36 +1646,114 @@ const TUNE_KNOB_OFFSETS: [f32; TUNE_ROWS] = [-3.4, 2.6];
 /// carries, are unchanged.
 pub const ICON_STROKE: f32 = 1.3;
 
-/// The five-pointed star's outline, starting at the top point.
+/// How far in from the tip the star's outline leaves the skeleton, as a
+/// fraction of the edge it leaves along.
+///
+/// **This is what rounds the points, and it is geometry rather than a stroke
+/// setting.** The previous version got its blunting from a fat
+/// [`STAR_STROKE`], because egui's `Stroke` has no join style and a heavy
+/// width makes the miter clamp visible. That worked and it cost the mark its
+/// weight: the star was the only thing on the header strip not drawn at
+/// [`ICON_STROKE`], which is exactly what "the star looks too bold compared
+/// to the other glyphs" is a report of. Cutting the corner in the PATH
+/// separates the two -- the tip is as blunt as this number says, at whatever
+/// weight the family is drawn at.
+const STAR_TIP_ROUND: f32 = 0.32;
+
+/// The same, for the five valleys between the points.
+///
+/// **Smaller than [`STAR_TIP_ROUND`] on purpose.** The tips are the acute
+/// corners and the ones a person calls spiky; the valleys are already
+/// obtuse, and rounding them as hard as the tips shallows them until the
+/// five points stop separating and the mark drifts towards a blob -- which
+/// is the failure the old 0.382-ratio comment was reaching for when it said
+/// "flower".
+///
+/// The pair also has an invariant: `STAR_TIP_ROUND + STAR_VALLEY_ROUND < 1`,
+/// or the trims taken from the two ends of a single edge overlap and the
+/// outline crosses itself. 0.44 leaves plenty of room, and
+/// [`the_stars_rounded_corners_do_not_eat_their_own_edges`] holds it.
+///
+/// 0.12 rather than something nearer the tip's number is a MEASURED
+/// retreat. A first pass at 0.24 was rendered and looked at, and the five
+/// points stopped separating -- the mark read as a rounded pentagon with
+/// bumps, not as a star. The valleys are what make a star a star.
+const STAR_VALLEY_ROUND: f32 = 0.12;
+
+/// The star's valley radius as a fraction of its point radius -- how FAT the
+/// five points are.
+///
+/// Deliberately NOT 1/φ² (0.382), the regular pentagram's ratio: that is the
+/// geometrically pure star, and at 18px it reads as thin and dated, the
+/// points long spikes with very little body. It was raised to 0.50 once
+/// already for that reason. **It has come back DOWN to 0.46, and that is the
+/// finding.** The report asked for "more rounded (wider) edges so it looks
+/// bit more modern", and the obvious reading -- push the ratio further up,
+/// to 0.56, so the points fatten -- was tried, rendered and rejected by
+/// looking at it: combined with the corner fillets it left a mark whose
+/// valleys were too shallow to separate the points, so it read as a rounded
+/// pentagon rather than as a star. Width and roundness are what was asked
+/// for; a ratio that high buys them by spending the shape.
+///
+/// So the roundness comes from [`STAR_TIP_ROUND`], which is a fillet and
+/// costs the valleys nothing, and the ratio moves the other way to give the
+/// valleys back their depth. 0.46 puts the point at 46.6°, sharper than the
+/// 52.5° it had, but the tip a person actually sees is the 0.32 fillet
+/// across it and not that angle.
+///
+/// The old comment here claimed anything past 0.382 "reads as a flower".
+/// Measured, the flower turns up well before it was expected to once the
+/// corners are rounded as well -- so the claim was right about the failure
+/// and wrong about where it starts. Recorded because it is the reason the
+/// ratio went unquestioned for so long, and because the next person to reach
+/// for a fatter star should know the ceiling is real.
+const STAR_INNER_RATIO: f32 = 0.46;
+
+/// The five-pointed star's outline, starting just short of the top point.
 ///
 /// Built around the origin and then translated so its own BOUNDING BOX --
 /// not the circle its points lie on -- is centred on `center`, exactly as
 /// [`pencil_glyph_at`] does and for the same reason: a pentagram has one
-/// point above and two below, so its extent is 9 up and 7.3 down, and
+/// point above and two below, so its extent is taller above than below, and
 /// anchoring by the circle's centre leaves it sitting visibly high in a
 /// square hit target.
+///
+/// **Every corner is an arc, not a point.** The ten skeleton corners are
+/// laid out as before and then each is replaced by a quadratic Bézier that
+/// leaves the incoming edge at [`STAR_TIP_ROUND`]/[`STAR_VALLEY_ROUND`] of
+/// its length, passes the corner as its control point, and rejoins the
+/// outgoing edge the same distance along. A quadratic with the corner as
+/// control is tangent to both edges at its ends, so the result is a true
+/// fillet with no crease where it meets the straights -- the round join
+/// egui's `Stroke` cannot be asked for, drawn into the path where it also
+/// applies to the FILLED state.
 fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
-    // Deliberately NOT 1/φ² (0.382), the regular pentagram's valley-to-point
-    // ratio. That is the geometrically pure star, and at 18px it reads as
-    // thin and dated -- the points are long spikes with very little body.
-    // 0.50 fills them out while keeping the tips sharp, which is the whole
-    // point of choosing it over a rounded-join treatment: fatter, not softer.
-    //
-    // The old comment here claimed anything larger than 0.382 "reads as a
-    // flower". That is only true much further up -- a star does not round off
-    // into a flower until the valleys are shallow enough to lose the tips,
-    // which is well past 0.5. Recorded because the claim was the reason the
-    // ratio went unquestioned.
-    let inner = outer * 0.50;
-    let local: Vec<Vec2> = (0..STAR_VERTICES)
-        .map(|i| {
-            let radius = if i % 2 == 0 { outer } else { inner };
-            // -90° so a POINT is at the top, not a valley.
-            let angle = -std::f32::consts::FRAC_PI_2
-                + i as f32 * std::f32::consts::TAU / STAR_VERTICES as f32;
-            Vec2::new(radius * angle.cos(), radius * angle.sin())
-        })
-        .collect();
+    let inner = outer * STAR_INNER_RATIO;
+    let corner = |i: usize| {
+        let radius = if i % 2 == 0 { outer } else { inner };
+        // -90° so a POINT is at the top, not a valley.
+        let angle = -std::f32::consts::FRAC_PI_2
+            + i as f32 * std::f32::consts::TAU / STAR_CORNERS as f32;
+        Vec2::new(radius * angle.cos(), radius * angle.sin())
+    };
+    let mut local: Vec<Vec2> = Vec::with_capacity(STAR_VERTICES);
+    for i in 0..STAR_CORNERS {
+        let here = corner(i);
+        let before = corner((i + STAR_CORNERS - 1) % STAR_CORNERS);
+        let after = corner((i + 1) % STAR_CORNERS);
+        // A star polygon's ten edges are all the same length, so a fraction
+        // of the vector to the neighbour IS a fraction of the edge and no
+        // normalise-then-scale is needed.
+        let cut = if i % 2 == 0 { STAR_TIP_ROUND } else { STAR_VALLEY_ROUND };
+        let from = here + (before - here) * cut;
+        let to = here + (after - here) * cut;
+        for step in 0..=STAR_ROUND_SEGMENTS {
+            let t = step as f32 / STAR_ROUND_SEGMENTS as f32;
+            let u = 1.0 - t;
+            local.push(from * (u * u) + here * (2.0 * u * t) + to * (t * t));
+        }
+    }
+    debug_assert_eq!(local.len(), STAR_VERTICES);
     let top = local.iter().fold(f32::INFINITY, |a, p| a.min(p.y));
     let bottom = local.iter().fold(f32::NEG_INFINITY, |a, p| a.max(p.y));
     let offset = Vec2::new(0.0, -(top + bottom) / 2.0);
@@ -1612,11 +1763,21 @@ fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
 /// Paints the star at `center`, filled or outlined, in one colour.
 /// Stroke width for the favourite star, in both states.
 ///
-/// This is a shape control, not a line weight: see the comment in
-/// [`paint_star`] for why the width is what blunts the points. 2.2 at an
-/// outer radius of 9 is roughly a quarter of the tip's own length, which is
-/// where the mark stops reading as spiky without losing the five points.
-const STAR_STROKE: f32 = 2.2;
+/// **It was 2.2, and that is what the report was about.** "Star (fav) glyph
+/// looks too bold now compared to the other glyphs" -- and measured, it was
+/// the only mark on the header strip not drawn at [`ICON_STROKE`]: the
+/// envelope, the clock, the kebab's dots and the eye beside it are all 1.3,
+/// and 2.2 is 69% more ink along every millimetre of the same outline. The
+/// star's own doc for that width said so outright, calling it "deliberately
+/// heavy" -- it was carrying the corner rounding, because egui's `Stroke`
+/// offers no join style and a wide line makes the miter clamp visible.
+///
+/// [`STAR_TIP_ROUND`] carries the rounding now, in the path, so the width no
+/// longer has a second job and can simply be the family's. Measured on the
+/// rendered strip that nearly halves the outlined star's ink (123.6 -> 70.8
+/// square px of stroke) and takes 12% off the filled one, without touching
+/// what the mark is.
+const STAR_STROKE: f32 = ICON_STROKE;
 
 /// The favourite star's outer radius, as [`star_outline`] takes it.
 ///
@@ -1627,59 +1788,90 @@ const STAR_STROKE: f32 = 2.2;
 /// it is on, and a solid shape already reads heavier than an outline at the
 /// same extent, so it should be the smallest of the set and not the biggest.
 ///
-/// 8.46 is derived, not picked: [`star_outline`] scales linearly with this,
-/// [`STAR_STROKE`] adds a fixed 2.2 on top of it, and 8.46 is what solves
-/// `outline_width + 2.2 = 18.30` for the clock's own extent. The result is
-/// 18.29x17.50 -- level with the clock across, a little under it down,
-/// which is where a pentagram sits when it is no longer the loudest thing on
-/// the strip. Pinned by
-/// [`the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it`].
+/// 8.46 solved `outline_width + STAR_STROKE = 18.30` for the clock's own
+/// extent back when [`STAR_STROKE`] was 2.2, and landed the mark at
+/// 18.29x17.50 -- level with the clock across. **That answer was measured
+/// against the wrong quantity.** Squaring a FILLED mark to an outlined one's
+/// bounding box equalises the boxes and not the ink, and the report that
+/// followed ("looks too bold") was about the ink: at 18.29 across, solid, the
+/// star painted 167 square px against the envelope's 118 and the clock's 90,
+/// and no bounding box was going to show that.
+///
+/// 9.20 is measured against the ink instead. With the corners rounded
+/// ([`STAR_TIP_ROUND`]) and the weight back at [`ICON_STROKE`], it paints
+/// 17.01x16.24 and 147 square px filled, 71 outlined -- and 17.01 is
+/// deliberately BETWEEN the strip's two tiers rather than in either. The
+/// edge marks (✉ 19.30x14.30, ⏱ 18.30x18.30) reach their extremes at a few
+/// points and need the box; the sparse marks (⋮ 3.40x15.40, ✕ 15.40x15.40)
+/// would read as the biggest thing on the strip at that size. A solid star
+/// is neither: it fills its box the way neither tier does, so it earns its
+/// own position just above the sparse tier and well below the edge one. The
+/// tiers are not collapsed by this -- all three sizes stay distinct and
+/// [`the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it`]
+/// still holds them apart.
 ///
 /// Named rather than left inline for the reason the rest of this family is
 /// named: a number written at one call site is a number nobody can find when
 /// the next report arrives.
-const STAR_OUTER: f32 = 8.46;
+const STAR_OUTER: f32 = 9.20;
 
 fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
     let points = star_outline(center, outer);
     let painter = ui.painter();
     if filled {
-        // A pentagram is CONCAVE, so `convex_polygon` over its ten vertices
+        // A pentagram is CONCAVE, so `convex_polygon` over its outline
         // would tessellate to garbage. It is star-shaped about its own
         // centre, though, so a triangle fan from there is exact -- and every
         // triangle in it is convex. The apex is the mean of the outline's
         // own vertices, NOT `center`, which `star_outline` has offset away
         // from the star's geometric middle.
+        //
+        // **One MESH, not one filled shape per triangle**, and the
+        // difference is visible rather than a tidiness. Each
+        // `Shape::convex_polygon` is tessellated on its own WITH its own
+        // anti-aliased feather, so a fan of them lays a soft edge down the
+        // inside of every spoke: adjacent triangles double up where their
+        // feathers overlap and fall short where they do not, which is the
+        // mottling the old fan showed through its fill. Rounding the corners
+        // made it worse by multiplying the fan four-fold, and at
+        // [`STAR_ROUND_SEGMENTS`] the arc triangles are slivers narrow
+        // enough that one of them tessellated to a detached speck outside
+        // the mark. A mesh shares its vertices, so there are no interior
+        // edges to feather at all and no sliver has an edge of its own; the
+        // outline stroked over it is what gives the silhouette its
+        // anti-aliasing, which is the one place it belongs.
         let apex = points
             .iter()
             .fold(Vec2::ZERO, |a, p| a + p.to_vec2())
             .to_pos2()
             / points.len() as f32;
-        for i in 0..points.len() {
-            painter.add(egui::Shape::convex_polygon(
-                vec![apex, points[i], points[(i + 1) % points.len()]],
-                color,
-                Stroke::NONE,
-            ));
+        let mut fan = egui::epaint::Mesh::default();
+        fan.colored_vertex(apex, color);
+        for point in &points {
+            fan.colored_vertex(*point, color);
         }
+        for i in 0..points.len() as u32 {
+            fan.add_triangle(0, 1 + i, 1 + (i + 1) % points.len() as u32);
+        }
+        painter.add(egui::Shape::mesh(fan));
     }
     // Always, in both states: outlined it IS the star, and filled it covers
     // the hairline seams anti-aliasing leaves between adjacent fan triangles.
     // It is also what [`icon_probe::stars`] finds, so both states are equally
     // visible to a test.
     //
-    // **The width is what rounds the tips**, and it is deliberately heavy.
-    // egui's `Stroke` exposes no join style, so there is no `linejoin: round`
-    // to ask for; what it does instead is clamp the miter length at sharp
-    // corners, which bevels them. At a hairline that bevel is invisible and
-    // the star reads as five spikes. At [`STAR_STROKE`] the bevel is a
-    // meaningful fraction of the tip, so the points blunt and the whole mark
-    // fattens -- the same thing a round join would do here, arrived at
-    // through the one control this toolkit gives.
+    // **The width no longer rounds anything** -- [`star_outline`] does, in
+    // the path. That is the whole of the change: egui's `Stroke` exposes no
+    // join style, so a wide line's miter clamp used to be the only blunting
+    // available here, and paying for it in weight is what made this the one
+    // mark on the strip heavier than [`ICON_STROKE`]. A fillet in the path
+    // is free of that, and it rounds the FILLED silhouette too, which a
+    // stroke-side trick never could.
     //
-    // It applies to both states so the filled and outlined stars are the
-    // same silhouette. A thinner stroke under the fill would leave the "on"
-    // star visibly pointier than the "off" one, which reads as two icons.
+    // The width still applies to both states, and for the unchanged reason:
+    // a thinner stroke under the fill would leave the "on" star a different
+    // size from the "off" one, which reads as two icons rather than two
+    // states of one.
     painter.add(egui::Shape::closed_line(points, Stroke::new(STAR_STROKE, color)));
 }
 
@@ -1910,52 +2102,76 @@ pub fn add_totp_button(ui: &mut Ui) -> Response {
 /// the knob sitting on that line.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TuneRow {
-    /// Left and right ends of the line, in that order. Same `y` in both, by
-    /// construction -- a tune control's lines are horizontal.
+    /// Top and bottom ends of the track, in that order. Same `x` in both, by
+    /// construction -- a mixer's tracks are vertical, and
+    /// [`icon_probe::tune_icons`] finds the mark by exactly that.
     pub line: [Pos2; 2],
-    /// Centre of the knob. Always on `line`'s `y`, and always far enough
-    /// inside the ends that the whole knob overlaps the line.
-    pub knob: Pos2,
+    /// The fader block riding this track. Always on `line`'s `x`, and always
+    /// far enough inside the ends that a run of track shows above and below.
+    pub knob: Rect,
 }
 
-/// The tune icon's geometry: [`TUNE_ROWS`] horizontal lines of equal length,
-/// stacked about `center`, each carrying one knob at its own offset.
+/// The mixer mark's geometry: [`TUNE_FADERS`] vertical tracks of equal
+/// length, spaced about `center`, each carrying one block at its own height.
 ///
 /// A pure function, and public to this module's tests, for the reason
 /// `gear_outline` was before it: nothing computed inside an eframe closure
 /// can be asserted about. Everything that decides how this mark reads -- the
-/// rows being horizontal, the knobs sitting on their lines, the two offsets
-/// differing -- is decided here and measured directly.
+/// tracks being vertical and equal, the blocks sitting on them, the three
+/// heights differing -- is decided here and measured directly.
 fn tune_rows(center: Pos2) -> Vec<TuneRow> {
-    // Rows centred on `center.y` as a group: for two rows that is ±half the
-    // pitch. Written for any `TUNE_ROWS` rather than for two so a third row
-    // could be added without the icon drifting off its own hit target.
-    let first = -(TUNE_ROWS as f32 - 1.0) / 2.0;
-    (0..TUNE_ROWS)
-        .map(|row| {
-            let y = center.y + (first + row as f32) * TUNE_ROW_PITCH;
+    // Channels centred on `center.x` as a group: for three that is one in
+    // the middle and one either side. Written for any `TUNE_FADERS` rather
+    // than for three, so a fourth could be added without the mark drifting
+    // off its own hit target -- which is the mistake the horizontal version
+    // of this function was written to avoid, and it was right about it.
+    let first = -(TUNE_FADERS as f32 - 1.0) / 2.0;
+    (0..TUNE_FADERS)
+        .map(|channel| {
+            let x = center.x + (first + channel as f32) * TUNE_TRACK_PITCH;
+            let y = center.y + TUNE_FADER_OFFSETS[channel];
             TuneRow {
                 line: [
-                    Pos2::new(center.x - TUNE_HALF_WIDTH, y),
-                    Pos2::new(center.x + TUNE_HALF_WIDTH, y),
+                    Pos2::new(x, center.y - TUNE_TRACK_HALF_HEIGHT),
+                    Pos2::new(x, center.y + TUNE_TRACK_HALF_HEIGHT),
                 ],
-                knob: Pos2::new(center.x + TUNE_KNOB_OFFSETS[row], y),
+                knob: Rect::from_center_size(
+                    Pos2::new(x, y),
+                    Vec2::new(TUNE_FADER_WIDTH, TUNE_FADER_HEIGHT),
+                ),
             }
         })
         .collect()
 }
 
-/// The vault titlebar's Preferences control: a **tune** mark -- two slider
-/// lines, each with a knob, at differing positions -- stroked rather than
-/// typed.
+/// The vault titlebar's Preferences control: a **mixer** mark -- three
+/// vertical tracks, each carrying a fader block at its own height -- drawn
+/// rather than typed.
 ///
-/// **It was a gear**, and the gear's whole design record is still worth
-/// reading (see [`TUNE_ROWS`], which inherits the argument): the tooth count
+/// **It was two horizontal slider rows**, on the report "also settings glyph
+/// I prefer to have vertical with just cross bars like a DJ mixer, maybe".
+/// The same mark rotated, in other words, which is what the vocabulary
+/// below still is: a straight stroke and a handle, repeated per channel.
+/// The handle became a filled block rather than a stroked ring for the
+/// reason [`TUNE_FADER_WIDTH`] records -- a ring reads as a slider knob and
+/// a block reads as a fader cap, and the cap is what a mixing desk has.
+///
+/// **The trailing "maybe" was taken seriously and the mark was rendered
+/// before it was shipped.** A horizontal tune icon is the more conventional
+/// signifier for *settings*, and there was a real chance the vertical
+/// version would not read as one at 18pt. Looked at against its neighbours
+/// it does: the bank of three staggered blocks is unmistakably a control
+/// surface, and it is a good deal more legible than the two-row version it
+/// replaces, whose ring knobs were small enough to blur into their own
+/// lines.
+///
+/// **It was a gear before that**, and the gear's whole design record is
+/// still worth reading (see [`TUNE_FADERS`], which inherits it): the tooth count
 /// had already been cut twice on the user's note that the mark looked
 /// outdated beside its neighbours. A cog is a dense shape at 18px no matter
-/// how few teeth it has, and the same note is what asked for this. The tune
-/// mark answers it structurally rather than by tuning: straight lines and
-/// two circles, nothing radial, nothing with corners.
+/// how few teeth it has, and the same note is what asked for this. The
+/// drawn-control mark answers it structurally rather than by tuning:
+/// straight lines and three small blocks, nothing radial.
 ///
 /// **Measured, not assumed** -- and the measurement is the same one
 /// `the_icon_codepoints_are_not_carried_by_this_apps_own_typeface` records
@@ -1973,17 +2189,21 @@ fn tune_rows(center: Pos2) -> Vec<TuneRow> {
 /// `SIZE`), so its hit target is theirs rather than only as big as the mark.
 ///
 /// **It sits in the drawn-icon family the same way the gear was made to.**
-/// Every line and every knob is stroked at [`ICON_STROKE`], which is what
-/// [`eye_toggle`] and [`account_switcher_button`] are stroked at. Its
-/// vocabulary is two kinds of mark -- a straight stroke and a small ring --
-/// repeated [`TUNE_ROWS`] times, which is the kebab's own idiom (one dot,
-/// three times) at two repeats rather than three. The hit target and the
-/// two-state colouring are unchanged; neither was ever the complaint.
+/// Every track is stroked at [`ICON_STROKE`], which is what [`eye_toggle`]
+/// and [`account_switcher_button`] are stroked at, and
+/// [`the_tune_icon_is_stroked_at_the_weight_the_eye_and_the_switcher_are`]
+/// reads that off the painted shapes rather than off the constant. Its
+/// vocabulary is two kinds of mark -- a straight stroke and a small block --
+/// repeated [`TUNE_FADERS`] times, which is exactly the kebab's own idiom
+/// (one dot, three times). The hit target and the two-state colouring are
+/// unchanged; neither was ever the complaint.
 ///
-/// The knobs are **stroked rings, not filled discs**, for the reason the
-/// gear's hub was: at radius 3 a filled disc is the heaviest thing in the
-/// titlebar and swallows the line it sits on. The ring reads as a slider
-/// handle with the line visible through it.
+/// The blocks are **filled and opaque, and they cover their track**: a fader
+/// cap is a solid thing that hides the run of track behind it, and that is
+/// the reading the reference image asked for. It is also what makes the
+/// handle findable by eye at 18pt, which a crossing stroke at
+/// [`ICON_STROKE`] would not be -- one pixel of ink over another pixel of
+/// ink is a thickened line, not a handle.
 ///
 /// Carries a hover label because, unlike Lock, it has no word on it --
 /// [`close_glyph`]'s "Dismiss" is the precedent for an unlabelled drawn
@@ -2003,13 +2223,14 @@ pub fn tune_button(ui: &mut Ui) -> Response {
     let stroke = Stroke::new(ICON_STROKE, color);
     let painter = ui.painter();
     for row in tune_rows(rect.center()) {
-        // The line first, the knob over it: the knob is a ring, so whatever
-        // is painted second is what shows inside it. Line-then-knob leaves
-        // the line running through the knob, which is what a slider looks
-        // like; the other order would too, but only by accident of both
-        // being the same colour, and this way says which is on top.
+        // The track first, the block over it. It matters here in a way it
+        // did not when the handle was a ring: the block is OPAQUE, and
+        // painting it second is what hides the run of track behind it. The
+        // other order would leave a hairline of track showing down the
+        // middle of every cap, which at this size reads as a seam in the
+        // block rather than as a track passing behind it.
         painter.line_segment(row.line, stroke);
-        painter.circle_stroke(row.knob, TUNE_KNOB_RADIUS, stroke);
+        painter.rect_filled(row.knob, TUNE_FADER_ROUNDING, color);
     }
     response.on_hover_text("Preferences")
 }
@@ -2084,16 +2305,48 @@ pub fn account_switcher_button(ui: &mut Ui) -> Response {
     response.on_hover_text("Switch account")
 }
 
-/// The eye's almond outline: two parabolic lids meeting at the corners.
+/// How full each of the eye's lids is, as the exponent on `1 - t²`.
+///
+/// **It was 1.0 -- a plain parabola -- and that is what "eye glyphs, bit
+/// taller / more rounded" was a report of.** A parabolic lid is flat across
+/// the middle and then dives at the ends: at 90% of the way to the corner it
+/// has already given up 81% of its height, so the almond's belly is thin
+/// everywhere except dead centre and the mark reads as a squashed oval
+/// rather than as an eye.
+///
+/// The exponent is the direct control on that, and it runs the useful way
+/// round: 1.0 is the parabola, 0.5 is an exact ellipse, and anything between
+/// is fuller than the one and less mechanical than the other. 0.72 keeps
+/// 74% of the height at that same 90% mark -- an almond with a body -- while
+/// staying off the ellipse, which at this size reads as a circle squashed by
+/// a layout rather than as a drawn shape.
+///
+/// Below 1.0 the lids also meet the corners with a vertical tangent instead
+/// of a shallow one, which is what gives the almond its two points. That is
+/// the shape's own doing and not a separate treatment.
+const EYE_LID_FULLNESS: f32 = 0.72;
+
+/// The eye's almond outline: two lids meeting at the corners.
+///
+/// **Sampled by ANGLE, not by x.** The lids are walked as `t = sin(u)` with
+/// `u` sweeping corner to corner, so the samples bunch where the curve turns
+/// hardest and spread where it runs straight. Stepping `t` uniformly -- what
+/// this did while the lids were parabolas, when it hardly mattered -- puts
+/// the same number of points along the flat middle as along the corner, and
+/// [`EYE_LID_FULLNESS`] below 1.0 turns the corner sharply enough that the
+/// faceting shows at 28px. The point count is unchanged; only where they sit
+/// is.
 fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
-    let lid = |t: f32, sign: f32| {
-        center + Vec2::new(t * half_w, sign * half_h * (1.0 - t * t))
+    let lid = |i: usize, sign: f32| {
+        let sweep = std::f32::consts::PI * i as f32 / EYE_LID_SEGMENTS as f32;
+        let t = (sweep - std::f32::consts::FRAC_PI_2).sin();
+        let height = (1.0 - t * t).max(0.0).powf(EYE_LID_FULLNESS);
+        center + Vec2::new(t * half_w, sign * half_h * height)
     };
-    let step = |i: usize| -1.0 + 2.0 * i as f32 / EYE_LID_SEGMENTS as f32;
-    let mut points: Vec<Pos2> = (0..=EYE_LID_SEGMENTS).map(|i| lid(step(i), -1.0)).collect();
+    let mut points: Vec<Pos2> = (0..=EYE_LID_SEGMENTS).map(|i| lid(i, -1.0)).collect();
     // The lower lid, back from just inside the right corner to just inside
     // the left one -- the corners themselves are already in the list.
-    points.extend((1..EYE_LID_SEGMENTS).rev().map(|i| lid(step(i), 1.0)));
+    points.extend((1..EYE_LID_SEGMENTS).rev().map(|i| lid(i, 1.0)));
     debug_assert_eq!(points.len(), EYE_VERTICES);
     points
 }
@@ -2116,8 +2369,17 @@ pub const EYE_TOGGLE_SIZE: f32 = 28.0;
 /// now the only thing on that line: the `CTRL+B` text that used to sit beside
 /// it moved into the row's hover tooltip.
 pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
+    /// Half the almond's width. Unchanged: the eye's width is what
+    /// `detail.rs`'s `masked_row` budgets a row's controls against, and
+    /// nothing about it was reported.
     const HALF_W: f32 = 8.5;
-    const HALF_H: f32 = 5.0;
+    /// Half the almond's height. **It was 5.0**, which with a parabolic lid
+    /// put the mark at 17.0 x 10.0 -- a 1.7:1 letterbox, and the "bit
+    /// taller" half of the report. 6.4 makes it 17.0 x 12.8, a 1.33:1
+    /// almond, which is where an eye stops reading as an oval somebody sat
+    /// on. The 28px hit target ([`EYE_TOGGLE_SIZE`]) is nowhere near
+    /// troubled by it, and the strike below still clears the lids.
+    const HALF_H: f32 = 6.4;
 
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(EYE_TOGGLE_SIZE), Sense::click());
     if response.hovered() {
@@ -3875,11 +4137,21 @@ mod drawn_icon_family_tests {
     /// So the tiers are asserted by NAMING a member of each rather than by
     /// writing either number down:
     ///
-    /// * the edge marks -- star, envelope, clock -- against the clock, the
-    ///   round mark none of this touched;
+    /// * the edge marks -- envelope, clock -- against the clock, the round
+    ///   mark none of this touched;
     /// * the sparse marks -- kebab, close -- against the kebab, which nobody
     ///   reported and which is therefore the evidence for where that tier
     ///   sits.
+    ///
+    /// **The star was in the first list and is not any more**, on the report
+    /// that followed this one ("Star (fav) glyph looks too bold now compared
+    /// to the other glyphs"). It is the one mark here that is SOLID when it
+    /// is on, so its box and its ink are the same thing, and squaring that
+    /// box to an outlined mark's was equalising the wrong quantity -- at
+    /// 18.29 across it painted 167 square px against the envelope's 118.
+    /// It now sits strictly between the two tiers, which the assert at the
+    /// end of this test pins by order rather than by number.  [`STAR_OUTER`]
+    /// carries the full measurement.
     ///
     /// The second tier is the whole of the repair: the ✕ was in it by kind
     /// and nowhere near it by size, 12.30 against 15.40, which is what the
@@ -3908,7 +4180,7 @@ mod drawn_icon_family_tests {
                 .collect::<Vec<_>>()
         };
         for (tier, reference, members) in [
-            ("the edge marks", "⏱", ["★", "✉", "⏱"].as_slice()),
+            ("the edge marks", "⏱", ["✉", "⏱"].as_slice()),
             ("the sparse marks", "⋮", ["⋮", "✕"].as_slice()),
         ] {
             let nominal = long(reference);
@@ -3923,13 +4195,37 @@ mod drawn_icon_family_tests {
                 );
             }
         }
-        // The control. "Each mark is near its own tier" is only worth
-        // asserting while there really are two tiers; if they ever converge
-        // this test has stopped saying anything and the simpler one-nominal
-        // rule should replace it rather than being quietly satisfied.
+        // **The star is a third tier of its own, and it is asserted by
+        // POSITION rather than by a nominal.** It was in the edge tier and
+        // squared to the clock, which equalised the bounding boxes and not
+        // the ink -- see [`STAR_OUTER`] for the measurement that refuted it.
+        // A solid mark fills its box the way neither outlined tier does, so
+        // it belongs strictly between them: bigger than the sparse marks,
+        // which are mostly whitespace, and smaller than the edge marks,
+        // whose ink is only their rim.
+        //
+        // Naming no number here is the same discipline the two loops above
+        // follow. What is pinned is the ORDER, which is the design claim;
+        // the sizes themselves stay in the constants that draw them.
         assert!(
-            long("⏱") - long("⋮") > 1.0,
-            "the two tiers have collapsed into one, so this test is no longer checking \
+            long("★") > long("⋮") && long("★") < long("⏱"),
+            "the solid star reaches {:.2}pt, which is not between the sparse marks' \
+             {:.2}pt and the edge marks' {:.2}pt -- a filled mark sits between the two \
+             tiers precisely because a bounding box does not measure its ink: {:?}",
+            long("★"),
+            long("⋮"),
+            long("⏱"),
+            all()
+        );
+        // The control. "Each mark is near its own tier" is only worth
+        // asserting while the tiers are really apart; if they ever converge
+        // this test has stopped saying anything and the simpler one-nominal
+        // rule should replace it rather than being quietly satisfied. The
+        // margin has to clear the star's own position between them, or the
+        // assert above would be satisfiable by three marks all but touching.
+        assert!(
+            long("⏱") - long("⋮") > 2.0,
+            "the tiers have collapsed together, so this test is no longer checking \
              anything: {:?}",
             all()
         );
@@ -3968,6 +4264,69 @@ mod drawn_icon_family_tests {
                 other.height()
             );
         }
+    }
+
+    /// **The star's corner fillets have to fit on the edges they are cut
+    /// from**, and nothing about the drawn result says when they stop.
+    ///
+    /// [`star_outline`] trims [`STAR_TIP_ROUND`] of an edge at the point end
+    /// and [`STAR_VALLEY_ROUND`] of the same edge at the valley end. Past a
+    /// sum of 1.0 those two trims cross, the Bézier control points swap
+    /// order along the edge, and the outline self-intersects -- which
+    /// tessellates to a mark that is still recognisably a star and is
+    /// subtly, permanently wrong in its fill. There is no assertion in the
+    /// painter that could catch it, because both states still paint.
+    ///
+    /// So it is checked here, and on the OUTLINE rather than on the two
+    /// constants. Comparing the constants would be a truth about two
+    /// literals -- something the compiler can fold and clippy says so -- and
+    /// it would not survive [`star_outline`] being rewritten around them.
+    /// Measuring the straight run left between one corner's fillet and the
+    /// next one's is a fact about the shape that reaches the screen, at the
+    /// size it is shipped at.
+    #[test]
+    fn the_stars_rounded_corners_do_not_eat_their_own_edges() {
+        let points = star_outline(Pos2::ZERO, STAR_OUTER);
+        let arc = STAR_ROUND_SEGMENTS + 1;
+        for corner in 0..STAR_CORNERS {
+            // Where this corner's fillet lets go of the edge, to where the
+            // next one takes hold of it.
+            let run = points[corner * arc + arc - 1]
+                .distance(points[((corner + 1) % STAR_CORNERS) * arc]);
+            assert!(
+                run > 1.0,
+                "the star's corner {corner} leaves only {run:.2}pt of straight edge before \
+                 the next corner's fillet starts -- at zero the two fillets meet, past it \
+                 they cross and the outline self-intersects, and either way the shape has \
+                 stopped having edges to read as a star by"
+            );
+        }
+        // **And the five points still project.** This is the failure that
+        // was actually rendered and rejected on the way here: at
+        // STAR_INNER_RATIO 0.56 with the valleys filleted at 0.24, the star
+        // read as a rounded pentagon with bumps on it -- every assertion in
+        // this file passed and the mark had stopped being a star.
+        //
+        // Measured as how deep the valleys come in against how far the
+        // points reach out, both from the outline's own centroid, so it
+        // holds whatever combination of ratio and fillet produces them.
+        // Shipped it is 0.54; the pentagon that was rejected measured 0.66.
+        let middle = points
+            .iter()
+            .fold(Vec2::ZERO, |a, p| a + p.to_vec2())
+            .to_pos2()
+            / points.len() as f32;
+        let reach = points.iter().fold(0.0_f32, |a, p| a.max(p.distance(middle)));
+        let valley = points
+            .iter()
+            .fold(f32::INFINITY, |a, p| a.min(p.distance(middle)));
+        assert!(
+            valley / reach < 0.60,
+            "the star's valleys reach {valley:.2}pt against its points' {reach:.2}pt, a \
+             ratio of {:.3} -- past 0.60 the points stop separating and the mark reads as \
+             a rounded pentagon rather than as a star",
+            valley / reach
+        );
     }
 
     /// **This app strokes three different ✕ marks, and `icon_probe` tells
@@ -4010,13 +4369,19 @@ mod drawn_icon_family_tests {
         );
     }
 
-    /// **The circle counterpart of the test above**, and a live one: three
+    /// **The circle counterpart of the test above**, and a live one: several
     /// controls in this family paint circles, and `icon_probe` tells them
     /// apart by RADIUS alone -- [`icon_probe::kebab_dots`] matches
-    /// [`KEBAB_DOT_RADIUS`], [`icon_probe::tune_icons`] matches
-    /// [`TUNE_KNOB_RADIUS`], and the eye's pupil must be neither. Two of them
-    /// sharing a radius would report the tune icon's knobs as stray kebab
-    /// dots in every frame the vault titlebar is painted in.
+    /// [`KEBAB_DOT_RADIUS`], `one_time_code_clocks` matches [`CLOCK_RADIUS`],
+    /// and the eye's pupil must be neither. Two of them sharing a radius
+    /// would report one mark's circles as another's in every frame the vault
+    /// titlebar is painted in.
+    ///
+    /// The Preferences mark's knob used to be in this list. It is not any
+    /// more, and not because the constraint relaxed: the mark became a mixer
+    /// and its handles became filled blocks, so it paints no circle to
+    /// collide with anything. Recorded rather than silently dropped, because
+    /// a shorter list here looks like a weakened test.
     ///
     /// **Every pair, generated rather than written out**: the list used to be
     /// three hand-written rows over three radii, and adding
@@ -4027,7 +4392,6 @@ mod drawn_icon_family_tests {
     #[test]
     fn the_drawn_circles_do_not_share_a_radius() {
         let radii = [
-            (TUNE_KNOB_RADIUS, "the tune knob"),
             (KEBAB_DOT_RADIUS, "the kebab dot"),
             (EYE_PUPIL_RADIUS, "the eye's pupil"),
             (CLOCK_RADIUS, "the one-time code clock's face"),
@@ -4113,8 +4477,15 @@ mod drawn_icon_family_tests {
     /// that company: its vocabulary is no larger than the eye's two kinds of
     /// mark, and it repeats them fewer times than the kebab repeats its dot.
     ///
-    /// This is what a third slider row would fail, which is why the icon has
-    /// [`TUNE_ROWS`] = 2 where Material's own `tune` has three.
+    /// **The ceiling was strict and is now inclusive**, and that is a
+    /// decision rather than a slip. It read `rows < kebab.len()`, which is
+    /// what kept the horizontal tune mark to two slider rows where
+    /// Material's own `tune` draws three. The mark became a three-channel
+    /// mixer on the owner's own instruction, so the strict form would now be
+    /// this file forbidding what it was asked for. The claim that still has
+    /// force is the one the kebab settles: one mark repeated three times is
+    /// not three icons, and three is where that stops being true. A fourth
+    /// channel still fails here.
     #[test]
     fn the_tune_icon_repeats_no_more_marks_than_the_kebab_beside_it() {
         let (_, tune) = control(tune_button);
@@ -4159,10 +4530,10 @@ mod drawn_icon_family_tests {
             kinds(&eye)
         );
 
-        // The repeats: one slider row is one line plus one knob, so the row
-        // count is the mark count over the vocabulary. Measured off the
-        // painted frame rather than read back out of `TUNE_ROWS`, which
-        // would be the constant asserting it equals itself.
+        // The repeats: one channel is one track plus one block, so the
+        // channel count is the mark count over the vocabulary. Measured off
+        // the painted frame rather than read back out of `TUNE_FADERS`,
+        // which would be the constant asserting it equals itself.
         assert_eq!(
             tune.len() % kinds(&tune),
             0,
@@ -4173,24 +4544,24 @@ mod drawn_icon_family_tests {
         );
         let rows = tune.len() / kinds(&tune);
         assert!(
-            rows < kebab.len(),
-            "the tune icon repeats its marks {rows} times against the kebab's {}, which \
-             is this family's ceiling -- it is again the busiest icon in a strip of one- \
-             and two-mark shapes",
+            rows <= kebab.len(),
+            "the mixer mark repeats its marks {rows} times against the kebab's {}, which \
+             is this family's ceiling -- past it, it is again the busiest icon in a strip \
+             of one- and two-mark shapes",
             kebab.len()
         );
     }
 
-    /// **It is a tune control and not a list**, measured off `tune_rows`
-    /// rather than read back out of [`TUNE_KNOB_OFFSETS`] -- a test that
-    /// asserted the constants equal themselves would pass against any knob
-    /// placement at all, including every knob at the same x.
+    /// **It is a mixing desk and not a fence**, measured off `tune_rows`
+    /// rather than read back out of [`TUNE_FADER_OFFSETS`] -- a test that
+    /// asserted the constants equal themselves would pass against any block
+    /// placement at all, including every block at the same height.
     ///
-    /// Two knobs at the same offset is precisely the failure worth pinning:
-    /// the lines would still be sliders, but the mark would read as a
-    /// bulleted list, which is a different icon meaning a different thing.
+    /// Two blocks at the same height is precisely the failure worth pinning:
+    /// the tracks would still be tracks, but the mark would read as a fence
+    /// or a grid, which is a different icon meaning a different thing.
     #[test]
-    fn the_tune_knobs_sit_at_different_positions_along_their_lines() {
+    fn the_tune_blocks_sit_at_different_heights_along_their_tracks() {
         let center = Pos2::new(50.0, 50.0);
         let rows = tune_rows(center);
 
@@ -4206,72 +4577,121 @@ mod drawn_icon_family_tests {
         for (i, a) in rows.iter().enumerate() {
             for b in &rows[i + 1..] {
                 assert!(
-                    (a.knob.x - b.knob.x).abs() > 1.0,
-                    "two knobs sit at x {} and {}, within a knob's own width of each \
-                     other -- stacked at one offset this mark reads as a bulleted list \
-                     rather than as a tune control",
-                    a.knob.x,
-                    b.knob.x
+                    (a.knob.center().y - b.knob.center().y).abs() > 1.0,
+                    "two fader blocks sit at y {} and {}, within a block's own height of \
+                     each other -- level with one another this mark reads as a fence or a \
+                     grid rather than as a mixing desk",
+                    a.knob.center().y,
+                    b.knob.center().y
                 );
             }
         }
+
+        // **And the stagger is pronounced, not merely non-zero.** The
+        // reference the owner sent has one channel high, one low and one near
+        // the middle; three blocks a hair apart would satisfy the loop above
+        // and would still read as a fence. So the spread across all of them
+        // is held to a real fraction of the track they ride.
+        let highest = rows.iter().fold(f32::INFINITY, |a, r| a.min(r.knob.center().y));
+        let lowest = rows.iter().fold(f32::NEG_INFINITY, |a, r| a.max(r.knob.center().y));
+        let travel = rows[0].line[1].y - rows[0].line[0].y;
+        assert!(
+            lowest - highest > travel / 3.0,
+            "the fader blocks are spread over {:.2}pt of a {travel:.2}pt track, under a \
+             third of its travel -- the stagger is what makes this a mixer rather than a \
+             row of posts",
+            lowest - highest
+        );
     }
 
-    /// **Horizontal lines, with the knobs ON them**, and every row the same
-    /// length -- the three facts that make this shape a bank of sliders
-    /// rather than a scatter of dashes and dots.
+    /// **Vertical tracks, with the blocks ON them**, and every track the same
+    /// length -- the three facts that make this shape a bank of faders rather
+    /// than a scatter of strokes and chips.
+    ///
+    /// It read "horizontal lines with the knobs on them" until the mark was
+    /// turned on its side. The claim is the same one rotated, and it is
+    /// asserted off `tune_rows` rather than off the constants for the reason
+    /// it always was: a test over the constants would pass against any
+    /// arrangement at all.
     #[test]
-    fn every_tune_row_is_a_horizontal_line_with_its_knob_on_it() {
+    fn every_tune_row_is_a_vertical_track_with_its_block_on_it() {
         let center = Pos2::new(50.0, 50.0);
         let rows = tune_rows(center);
-        assert!(!rows.is_empty(), "`tune_rows` produced no rows to measure");
+        assert!(!rows.is_empty(), "`tune_rows` produced no tracks to measure");
 
-        let first_width = (rows[0].line[1].x - rows[0].line[0].x).abs();
-        assert!(first_width > 0.0, "the first row's line has no length");
+        let first_length = (rows[0].line[1].y - rows[0].line[0].y).abs();
+        assert!(first_length > 0.0, "the first track has no length");
 
         for row in &rows {
-            let [left, right] = row.line;
+            let [top, bottom] = row.line;
             assert!(
-                (left.y - right.y).abs() < 0.01,
-                "a slider line runs from y {} to y {}, so it is not horizontal",
-                left.y,
-                right.y
+                (top.x - bottom.x).abs() < 0.01,
+                "a track runs from x {} to x {}, so it is not vertical",
+                top.x,
+                bottom.x
             );
             assert!(
-                ((right.x - left.x).abs() - first_width).abs() < 0.01,
-                "a slider line is {} long against the first row's {first_width} -- rows \
+                ((bottom.y - top.y).abs() - first_length).abs() < 0.01,
+                "a track is {} long against the first channel's {first_length} -- tracks \
                  of unequal length read as a ragged list, not as one control",
-                (right.x - left.x).abs()
+                (bottom.y - top.y).abs()
             );
             assert!(
-                (row.knob.y - left.y).abs() < 0.01,
-                "a knob sits at y {} while its line is at y {}, so it is floating beside \
-                 the line rather than riding on it",
-                row.knob.y,
-                left.y
+                (row.knob.center().x - top.x).abs() < 0.01,
+                "a fader block sits at x {} while its track is at x {}, so it is floating \
+                 beside the track rather than riding on it",
+                row.knob.center().x,
+                top.x
             );
-            // The whole knob, not just its centre, has to be over the line --
-            // a knob hanging off an end reads as a dot beside a dash.
+            // The whole block, not just its centre, has to be on the track,
+            // and with track still showing past both of its ends -- a block
+            // flush with an end reads as a cap on a post rather than as a
+            // fader that could travel.
             assert!(
-                row.knob.x - TUNE_KNOB_RADIUS > left.x.min(right.x) - 0.01
-                    && row.knob.x + TUNE_KNOB_RADIUS < left.x.max(right.x) + 0.01,
-                "a knob at x {} with radius {TUNE_KNOB_RADIUS} overhangs its line, which \
-                 spans {} to {}",
-                row.knob.x,
-                left.x,
-                right.x
+                row.knob.top() > top.y.min(bottom.y) + 0.01
+                    && row.knob.bottom() < top.y.max(bottom.y) - 0.01,
+                "a fader block spanning y {}..{} reaches the end of its track, which spans \
+                 {}..{}",
+                row.knob.top(),
+                row.knob.bottom(),
+                top.y,
+                bottom.y
+            );
+            // A cap, not a knot: taller than it is wide, and proud of the
+            // track it covers on both sides.
+            assert!(
+                row.knob.height() > row.knob.width()
+                    && row.knob.width() > ICON_STROKE * 2.0,
+                "a fader block is {:.2} wide by {:.2} tall against a {ICON_STROKE} track -- \
+                 a block no taller than it is wide, or no wider than the track, reads as a \
+                 thickened section of line rather than as a handle",
+                row.knob.width(),
+                row.knob.height()
             );
         }
 
-        // The rows are centred on the icon's own centre, so the mark sits in
-        // the middle of its 28px target rather than high or low in it.
-        let top = rows.iter().fold(f32::INFINITY, |a, r| a.min(r.line[0].y));
-        let bottom = rows.iter().fold(f32::NEG_INFINITY, |a, r| a.max(r.line[0].y));
+        // The tracks are centred on the icon's own centre, so the mark sits
+        // in the middle of its 28px target rather than off to one side.
+        let left = rows.iter().fold(f32::INFINITY, |a, r| a.min(r.line[0].x));
+        let right = rows.iter().fold(f32::NEG_INFINITY, |a, r| a.max(r.line[0].x));
         assert!(
-            ((top + bottom) / 2.0 - center.y).abs() < 0.01,
-            "the rows span y {top}..{bottom}, whose middle is not the icon's centre {}",
-            center.y
+            ((left + right) / 2.0 - center.x).abs() < 0.01,
+            "the tracks span x {left}..{right}, whose middle is not the icon's centre {}",
+            center.x
         );
+        // And they do not touch: adjacent blocks with no white between them
+        // are one bar, not a bank of channels.
+        let mut xs: Vec<f32> = rows.iter().map(|r| r.knob.center().x).collect();
+        xs.sort_by(f32::total_cmp);
+        for pair in xs.windows(2) {
+            assert!(
+                pair[1] - pair[0] > rows[0].knob.width() + 1.0,
+                "two channels are {:.2}pt apart against a {:.2}pt block, so their caps all \
+                 but touch and the bank reads as one bar",
+                pair[1] - pair[0],
+                rows[0].knob.width()
+            );
+        }
     }
 
     /// **The regression this change exists to prevent: it must not be a cog
@@ -4325,38 +4745,38 @@ mod drawn_icon_family_tests {
         let (rect, tune) = control(tune_button);
         let expected = tune_rows(rect.center());
 
-        let knobs: Vec<&egui::epaint::CircleShape> = tune
+        let blocks: Vec<&egui::epaint::RectShape> = tune
             .iter()
             .filter_map(|s| match s {
-                egui::Shape::Circle(c) => Some(c),
+                egui::Shape::Rect(r) => Some(r),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            knobs.len(),
+            blocks.len(),
             expected.len(),
-            "the control painted {} knobs where `tune_rows` computes {}",
-            knobs.len(),
+            "the control painted {} fader blocks where `tune_rows` computes {}",
+            blocks.len(),
             expected.len()
         );
-        for (knob, row) in knobs.iter().zip(&expected) {
+        for (block, row) in blocks.iter().zip(&expected) {
             assert!(
-                (knob.center - row.knob).length() < 0.01,
-                "a knob was painted at {:?} where `tune_rows` puts it at {:?}",
-                knob.center,
-                row.knob
+                (block.rect.center() - row.knob.center()).length() < 0.01,
+                "a fader block was painted at {:?} where `tune_rows` puts it at {:?}",
+                block.rect.center(),
+                row.knob.center()
             );
             assert!(
-                (knob.radius - TUNE_KNOB_RADIUS).abs() < 0.01,
-                "a knob was painted at radius {} rather than {TUNE_KNOB_RADIUS}, which \
-                 is what `icon_probe::tune_icons` finds it by",
-                knob.radius
+                (block.rect.size() - row.knob.size()).length() < 0.01,
+                "a fader block was painted {:?} where `tune_rows` sizes it {:?}",
+                block.rect.size(),
+                row.knob.size()
             );
-            assert_eq!(
-                knob.fill,
+            assert_ne!(
+                block.fill,
                 Color32::TRANSPARENT,
-                "a knob was painted filled -- at this radius a disc is the heaviest \
-                 thing in the titlebar and swallows the line it sits on"
+                "a fader block was painted unfilled -- a cap that lets its track show \
+                 through reads as a bulge in the line rather than as a handle"
             );
         }
 
@@ -4472,11 +4892,19 @@ pub mod icon_probe {
     /// The favourite stars this shape tree paints, in both states -- the
     /// filled star carries the same outline the outlined one does, plus the
     /// triangle fan that fills it (see `paint_star`).
+    ///
+    /// **The fan is a `Shape::Mesh` and this used to look for three-point
+    /// filled paths.** It changed with the mark: a fan of separately
+    /// tessellated triangles laid a visible seam down every spoke, so
+    /// `paint_star` emits one mesh instead. A mesh is a *better* anchor than
+    /// the old triangles were -- nothing else in this crate paints one
+    /// (images do, but through `Shape::Image`), where a filled triangle was
+    /// close enough to the envelope's flap that
+    /// [`the_envelope_flap_is_not_findable_as_a_star_fill`] had to exist to
+    /// hold them apart.
     pub fn stars(shape: &egui::Shape) -> Vec<Star> {
-        let mut triangles = Vec::new();
-        walk(shape, &mut triangles, &|s| {
-            matches!(s, egui::Shape::Path(p) if p.points.len() == 3 && p.fill != Color32::TRANSPARENT)
-        });
+        let mut fills = Vec::new();
+        walk(shape, &mut fills, &|s| matches!(s, egui::Shape::Mesh(_)));
         let mut strokes = Vec::new();
         walk_paths(shape, STAR_VERTICES, &mut strokes);
         strokes
@@ -4484,7 +4912,7 @@ pub mod icon_probe {
             .map(|(rect, stroke)| Star {
                 rect,
                 stroke,
-                filled: triangles.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
+                filled: fills.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
             })
             .collect()
     }
@@ -4660,40 +5088,81 @@ pub mod icon_probe {
         out
     }
 
-    /// The Preferences tune icons this shape tree paints, each as the union
-    /// of its knobs, with the colour it was stroked in --
-    /// which is the only way `tune_button`'s hover state is visible to a
-    /// test, since it paints no fill and no string.
+    /// The Preferences mixer marks this shape tree paints, each as the union
+    /// of its tracks, with the colour they were stroked in -- which is the
+    /// only way `tune_button`'s hover state is visible to a test, since the
+    /// mark paints no string.
     ///
-    /// **Found by its knobs**, matched on [`TUNE_KNOB_RADIUS`], the way
-    /// [`kebab_dots`] finds its dots -- the gear this replaced was found by
-    /// its outline's vertex count, and a tune mark has no closed path to
-    /// count. [`TUNE_ROWS`] consecutive knobs are one icon; the lines are
-    /// deliberately NOT part of the identification (they are plain
-    /// horizontal segments, which the titlebar's own — close glyph also
-    /// draws), so retuning a line cannot make the icon invisible here.
+    /// **Found by its TRACKS**, which is the reverse of how the two-slider
+    /// version of this mark was found: that one was identified by its ring
+    /// knobs, on the same principle [`kebab_dots`] works by, and its lines
+    /// were deliberately excluded because a plain horizontal segment is a
+    /// shape the titlebar's own — close glyph also draws.
+    ///
+    /// Turning the mark vertical inverts both halves of that. The handles
+    /// became filled rounded rectangles, which is the least distinctive
+    /// shape in this app -- every card, pill and badge is one -- while the
+    /// tracks became vertical segments of one exact length, which nothing
+    /// else here draws. [`walk_tracks`] carries the full argument.
+    /// [`TUNE_FADERS`] consecutive tracks are one mark.
     ///
     /// An odd remainder means half an icon was found, which is a probe that
     /// has stopped matching rather than a shape worth reporting -- so it
     /// panics, exactly as [`chevrons`] does.
     pub fn tune_icons(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
-        let mut knobs = Vec::new();
-        walk_rings(shape, TUNE_KNOB_RADIUS, &mut knobs);
+        let mut tracks = Vec::new();
+        walk_tracks(shape, &mut tracks);
         assert!(
-            knobs.len() % TUNE_ROWS == 0,
-            "found {} tune knobs, which is not a whole number of {TUNE_ROWS}-row tune \
-             icons -- this probe has stopped matching what `tune_button` draws",
-            knobs.len()
+            tracks.len() % TUNE_FADERS == 0,
+            "found {} mixer tracks, which is not a whole number of {TUNE_FADERS}-channel \
+             marks -- this probe has stopped matching what `tune_button` draws",
+            tracks.len()
         );
-        knobs
-            .chunks(TUNE_ROWS)
-            .map(|rows| {
-                let rect = rows.iter().fold(Rect::NOTHING, |a, (r, _)| a.union(*r));
-                (rect, rows[0].1)
+        tracks
+            .chunks(TUNE_FADERS)
+            .map(|channels| {
+                let rect = channels.iter().fold(Rect::NOTHING, |a, (r, _)| a.union(*r));
+                (rect, channels[0].1)
             })
             .collect()
     }
 
+    /// One mixer channel's track: a VERTICAL line segment of exactly the
+    /// length [`tune_rows`] gives it.
+    ///
+    /// **The track is the anchor and not the block**, which is the opposite
+    /// of how the knob-ringed version of this mark was found. A filled
+    /// rounded rectangle is the least distinctive shape this crate paints --
+    /// every card, pill and badge in the app is one -- so anchoring on the
+    /// blocks would have made this probe report a control surface wherever
+    /// three small rects happened to line up. A line segment whose bounding
+    /// box is exactly [`ICON_STROKE`] wide and the full track long is a
+    /// shape nothing else here draws: the app's other short segments are the
+    /// clock's hands (much shorter), the eye's strike, the switcher's
+    /// chevron and the ✕ marks (all diagonal, so none has a box this narrow).
+    fn walk_tracks(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::LineSegment { stroke, .. } => {
+                let rect = shape.visual_bounding_rect();
+                let long = TUNE_TRACK_HALF_HEIGHT * 2.0 + stroke.width;
+                if (rect.width() - stroke.width).abs() < 0.01
+                    && (rect.height() - long).abs() < 0.01
+                {
+                    out.push((rect, stroke.color));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_tracks(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stroked circles at one radius. The mixer mark no longer paints any --
+    /// its handles are filled blocks -- but [`one_time_code_clocks`] still
+    /// finds its face this way.
     fn walk_rings(shape: &egui::Shape, radius: f32, out: &mut Vec<(Rect, Color32)>) {
         match shape {
             egui::Shape::Circle(c)

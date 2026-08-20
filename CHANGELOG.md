@@ -39,6 +39,50 @@ white tile and over the background behind it.
 - **The weak-password detail line** ("9 characters, lowercase letters and
   digits") is bounded by the same tile, for the same reason.
 
+### Preferences is now a mixer mark
+
+Reported as "also settings glyph I prefer to have vertical with just cross
+bars like a DJ mixer, maybe".
+
+- **Three vertical faders**, each a full-height track with a filled block
+  riding it, replacing the two horizontal slider rows.
+- **The blocks sit at three clearly different heights**, which is what makes
+  it read as a mixing desk rather than as a fence.
+- **It is more legible than what it replaces**, not just different: the old
+  ring knobs were small enough at this size to blur into their own lines,
+  and a solid cap does not.
+
+### The favourite star is lighter, rounder and no longer the loudest mark
+
+Reported as "Star (fav) glyph looks too bold now compared to the other
+glyphs, and maybe there is some with more rounded (wider) edges so it looks
+bit more modern".
+
+- **It was the only mark on the detail header not drawn at the family's line
+  weight** -- 2.2 against everything else's 1.3, because the fat line was
+  what blunted the star's points. The rounding moved into the shape itself,
+  so the weight could go back to the family's. The outlined star's ink drops
+  by 44% on the rendered strip.
+- **Every corner is a proper fillet now**, in the path, so the filled star is
+  rounded too -- which a stroke-side trick could never do.
+- **A little smaller, with the valleys kept deep**, so the five points still
+  read as points: 17.01 x 16.24 against the old 18.29 x 17.50, and 12% less
+  ink when it is filled.
+- **The filled star no longer shows seams through itself.** It was drawn as a
+  fan of separately anti-aliased triangles; it is one mesh.
+
+### The reveal eye is taller and rounder
+
+Reported as "same for eye glyphs - bit taller\more rounded".
+
+- **17.0 x 10.0 becomes 17.0 x 12.8** -- a 1.7:1 letterbox becomes a 1.33:1
+  almond. The width is untouched, because a masked row budgets its controls
+  against it.
+- **The lids are fuller across their whole length**, not just at the centre,
+  so the eye has a body rather than a thin crescent at each end.
+- **The pupil grows with the eye**, from 2.4 to 2.9, so the middle of the
+  mark is neither cramped nor rattling around.
+
 ### Browsers no longer get the "no saved login" card
 
 In a browser that card could never be right. Every sign-in page has a password
