@@ -10,6 +10,36 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Browsers no longer get the "no saved login" card
+
+In a browser that card could never be right. Every sign-in page has a password
+field, so it appeared on all of them; and Deskwarden matches apps by their
+**executable** while a browser's logins belong to **sites**, so saving one
+would not have made it stop.
+
+- **The unmatched cards are switched off in browsers** -- Firefox, Chrome,
+  Edge, Brave, Opera, Vivaldi, and the other Chromium and Gecko builds
+  Deskwarden knows by name.
+- **A browser Deskwarden does not recognise behaves as it always has**: one
+  card, with *Never for this app* on it, which silences it for good.
+- **A browser you matched to a vault item on purpose still prompts to fill
+  it.** That rule is one you wrote by hand, and it is still obeyed.
+
+### The autofill prompt setting now silences every pop-up, not half of them
+
+Turning **Prompt on match** off in Preferences stopped the overlay for apps
+you had saved a login for, and left the "No saved login for <app>" card
+appearing for the apps you had not -- which is the wrong half. The setting is
+now the one switch for every card the overlay raises on its own.
+
+- **Off means nothing opens by itself**: no fill prompt, no "no saved login"
+  card, no "Deskwarden is locked" card. `CTRL+ALT+B` still fills a matched
+  window, exactly as before -- this was never an autofill switch and still is
+  not.
+- **The toggle is called "Show autofill prompts"** now, because "on match" was
+  no longer true of what it governs. Nothing on disk changed: your existing
+  choice is read and written under the same key, so an upgrade keeps it.
+
 ### Starting up is one window now, not two
 
 Launching Deskwarden while it still had a good session showed a small

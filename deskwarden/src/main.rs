@@ -3023,6 +3023,13 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // every event rather than captured once: the preferences window writes
     // straight back into that binding, so a user who turns the prompt off has
     // it off for the very next window they focus.
+    //
+    // **It now reaches two decisions, not one.** `handle_match` asks
+    // `app::match_disposition` about it for the matched card, and the
+    // `disposition` call below asks `app::overlay_prompts` about it for the
+    // two unmatched ones. Until it did the second, turning the prompt off
+    // silenced the overlay for apps the user had saved a login for and left
+    // the no-match card appearing for the apps they had not.
     prompt_on_match: bool,
     // Whether this process can currently answer for the vault's contents at
     // all, read from `cache.is_populated()` at the ONE call site rather than
@@ -3119,7 +3126,20 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
         deskwarden::app::window_label(&event.exe_name, &event.title),
     );
 
-    match deskwarden::app::disposition(matched, field, vault, never) {
+    // The fifth and sixth inputs. Both are computed inline, in the call, so
+    // that `the_production_dispatch_gates_the_unmatched_cards` can pin the
+    // whole expression: a literal substituted for either -- the setting read
+    // out of the path, or every window declared a non-browser -- is a mutation
+    // no behavioural test in this crate can see, because every test here drives
+    // `disposition` directly.
+    match deskwarden::app::disposition(
+        matched,
+        field,
+        vault,
+        never,
+        deskwarden::app::overlay_prompts(prompt_on_match),
+        deskwarden::app::browser_window(&event.exe_name),
+    ) {
         Open::Match(item_id) => {
             log::info!(
                 "matched {} to vault item {item_id} ({:?})",
@@ -21076,6 +21096,43 @@ mod tests {
             );
         }
 
+        /// **The two gates on the unmatched cards reach `disposition`, on the
+        /// one line no test can execute.**
+        ///
+        /// Every dispatching test in this module drives
+        /// `process_foreground_event` with a literal `false` for the prompt
+        /// and with window names of its own choosing, so what nothing here can
+        /// observe is the production expression: an `overlay_prompts(true)` in
+        /// place of the user's setting puts the no-match card back for
+        /// everyone who switched it off -- the reported defect, exactly -- and
+        /// a `BrowserWindow::No` in place of the lookup puts it back in every
+        /// browser. Both mutants compile and leave the whole suite green, so
+        /// they are pinned by source text, as this file already pins the
+        /// notifier and the setting itself.
+        #[test]
+        fn the_production_dispatch_gates_the_unmatched_cards() {
+            let source = include_str!("main.rs");
+            // Split literals, so this test's own text is not the match.
+            let prompt = concat!("app::overlay_prompts", "(prompt_on_match),");
+            let browser = concat!("app::browser_window", "(&event.exe_name),");
+            assert_eq!(
+                source.matches(prompt).count(),
+                1,
+                "the unmatched cards are no longer gated on the user's prompt setting: a \
+                 literal in its place means `Prompt on match` silences the overlay for the \
+                 apps the user HAS saved a login for and leaves it popping up for the ones \
+                 they have not, which is the defect this gate exists for"
+            );
+            assert_eq!(
+                source.matches(browser).count(),
+                1,
+                "the browser exclusion is no longer asked about the window in hand. Asked \
+                 about a literal it either excludes nothing -- the no-match card back in \
+                 every browser, where no saved login can ever make it stop -- or excludes \
+                 everything, which silences the card for every native app there is"
+            );
+        }
+
         /// **Finding 1, and the retirement of `Auto`, in one test.**
         ///
         /// The item's own `trigger` is `Auto` -- the mode that used to type
@@ -21217,6 +21274,158 @@ mod tests {
                 "the LOCKED card was opened for a readable vault. 3a and 3b make opposite \
                  claims about the vault, so showing 3b here tells a user whose vault is open \
                  that it is not"
+            );
+        }
+
+        /// **Defect 1 at the dispatch level, with its own positive control.**
+        ///
+        /// The same fixture twice, one argument apart: with the prompt off no
+        /// card goes up for an unmatched window that has a password field, and
+        /// with it on the very same window still gets design 3a. The second
+        /// half is what stops this test being satisfied by an overlay that
+        /// never opens at all -- which is what every other assertion about
+        /// this fix would accept.
+        ///
+        /// Two separate `last_dispatched_hwnd` bindings, and two hwnds: a
+        /// repeat foreground event for the same window is suppressed by
+        /// `dispatch::should_dispatch` before any of this is reached, so
+        /// re-using one would make the second half assert about an event that
+        /// was thrown away.
+        #[test]
+        fn the_prompt_setting_gates_the_no_match_card_and_leaves_it_working_when_on() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            assert!(take_no_match_shown().is_empty(), "control: the recorder starts empty");
+
+            process_foreground_event(
+                &window("AtlasLicence.exe", "Atlas Licence", 0x901),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                // The user turned `Prompt on match` off in Preferences.
+                false,
+                deskwarden::app::VaultAvailability::Readable,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x901),
+                "control: the event reached the decision rather than being discarded before it"
+            );
+            assert!(
+                take_no_match_shown().is_empty(),
+                "the prompt is off and the no-match card went up anyway -- the reported \
+                 defect: the setting silenced the overlay for apps with a saved login and \
+                 left it popping up for apps without one"
+            );
+            assert!(take_locked_shown().is_empty(), "the locked card went up instead");
+
+            // The positive control: the same window, the same probe answer,
+            // the same empty vault -- with the setting on.
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            process_foreground_event(
+                &window("AtlasLicence.exe", "Atlas Licence", 0x902),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                deskwarden::app::VaultAvailability::Readable,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(
+                take_no_match_shown(),
+                vec![("AtlasLicence.exe".to_string(), 0x902)],
+                "with the prompt ON the no-match card no longer appears for an ordinary \
+                 unmatched app, so the gate above has silenced the overlay outright rather \
+                 than obeyed the setting"
+            );
+        }
+
+        /// **Defect 2 at the dispatch level, with its own positive control.**
+        ///
+        /// A browser and a native app, identical in every other respect --
+        /// unmatched, password field found, vault readable, prompt on. The
+        /// browser gets nothing (its credentials are keyed on sites, and this
+        /// card's offer is keyed on the executable, so no saved login could
+        /// ever make it stop); the native app still gets design 3a.
+        #[test]
+        fn a_browser_gets_no_no_match_card_and_a_native_app_still_does() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            assert!(take_no_match_shown().is_empty(), "control: the recorder starts empty");
+
+            let browser = deskwarden::app::BROWSER_IMAGE_NAMES[0];
+            process_foreground_event(
+                &window(browser, "Sign in -- Ledgerline", 0x903),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                deskwarden::app::VaultAvailability::Readable,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+
+            assert_eq!(
+                last_dispatched_hwnd,
+                Some(0x903),
+                "control: the event reached the decision rather than being discarded before it"
+            );
+            assert!(
+                take_no_match_shown().is_empty(),
+                "a browser got the no-match card. Every login page has a password field, so \
+                 this is the card the user sees on every site they sign in to, and saving a \
+                 login would not stop it"
+            );
+            assert!(take_locked_shown().is_empty(), "the locked card went up in a browser");
+
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            process_foreground_event(
+                &window("AtlasLicence.exe", "Atlas Licence", 0x904),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                true,
+                deskwarden::app::VaultAvailability::Readable,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(
+                take_no_match_shown(),
+                vec![("AtlasLicence.exe".to_string(), 0x904)],
+                "the browser exclusion has taken the card away from native apps too, which \
+                 is every app the card was built for"
             );
         }
 
