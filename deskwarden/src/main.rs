@@ -1539,6 +1539,12 @@ fn main() {
     let prefetch_for = estate.active_account.as_ref().map(|a| a.id.clone());
     let (status_details_tx, status_details_rx) =
         mpsc::channel::<(Option<accounts::AccountId>, login_ui::BwStatusDetails)>();
+    // Published BEFORE the thread starts, so a Preferences window opened
+    // during the lookup says "Checking..." rather than "Not signed in". The
+    // answer took 2.8 seconds to arrive on the machine this row was reported
+    // from, so that window is not hypothetical -- and the two states are
+    // opposite claims, not shades of the same one.
+    prefs_ui::publish_account_status(prefs_ui::AccountStatus::Checking);
     {
         let tx = status_details_tx.clone();
         std::thread::spawn(move || {
@@ -2479,6 +2485,13 @@ fn main() {
                 about.as_ref(),
                 details,
             ) {
+                // Published only from the ADOPTED answer, never from the raw
+                // one: `adopt_startup_prefetch` returns `None` when the
+                // prefetch describes the account this app started on rather
+                // than the one it is on now, and an email under the wrong
+                // account is the same wrong claim on this page that it is in
+                // `settings.json`.
+                prefs_ui::publish_account_status(prefs_ui::account_status_of(&adopted));
                 estate.details = Some(adopted);
             }
         }
@@ -7910,7 +7923,14 @@ fn account_details_source(
     spawn: impl FnOnce(mpsc::Sender<login_ui::BwStatusDetails>),
 ) -> vault_window::AccountDetails {
     match cached {
-        Some(details) => vault_window::AccountDetails::Ready(details),
+        Some(details) => {
+            // The warm-cache path: the vault window will paint these details
+            // immediately, so the About page -- reachable as a modal over
+            // that very window -- must not still be showing whatever was
+            // published at startup.
+            prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
+            vault_window::AccountDetails::Ready(details)
+        }
         None => {
             log::info!(
                 "vault window: account details were not prefetched; fetching them on a thread \

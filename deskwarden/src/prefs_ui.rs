@@ -345,18 +345,70 @@ const FILL_HOTKEY_DESCRIPTION: &str =
 /// produced it rather than here.
 const FILL_HOTKEY_UNAVAILABLE_LABEL: &str = "Fill the focused app — shortcut not working";
 
-/// What the About page can say about the account, which is nothing.
+/// What the About page says about the account when nobody has published one.
 ///
-/// 3e's nav footer reads "Bitwarden account linked", and this window has no
-/// way to know that. The status lives in `main.rs`'s
-/// `cached_status_details: Option<login_ui::BwStatusDetails>` -- which is in
-/// scope at the `prefs_ui::run(settings.clone())` call site -- and getting it
-/// here means widening this function's signature, i.e. editing `main.rs`.
-/// Until that happens the page says where the answer actually is rather than
-/// asserting a link that may not exist; re-running `bw status` from this
-/// window to find out would be a blocking subprocess call on the UI thread for
-/// a decorative line.
+/// **Kept, and it is the floor rather than the answer.** The page now shows
+/// the signed-in address when the app knows it (see [`AccountStatus`]), and
+/// this is what the row says when no shell has published anything at all --
+/// `examples/ui_preview`, a test, and any future entry point that draws this
+/// page without going through `main`. The row is never blank in any of them,
+/// which is the property the original constant existed for: a label with an
+/// empty right-hand column reads as a field that failed to load.
 const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account.";
+
+/// The row's label, and the three things it can say about a known account.
+const ACCOUNT_LABEL: &str = "Bitwarden account";
+/// While the lookup is in flight.
+///
+/// **Deliberately not the same words as [`ACCOUNT_SIGNED_OUT`].** The answer
+/// took 2.8 seconds to arrive on the machine this was reported from, so the
+/// waiting state is one a user will really see -- and "we have not asked yet"
+/// and "nobody is signed in" are opposite facts. A row that showed the same
+/// thing for both would make the page assert the second one for three seconds
+/// every time it is opened.
+const ACCOUNT_CHECKING: &str = "Checking...";
+const ACCOUNT_CHECKING_NOTE: &str = "Asking the Bitwarden CLI which account is signed in.";
+const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
+/// **One sentence for two situations, because this build cannot tell them
+/// apart.** `login_ui::unknown_status_details` returns the same value for a
+/// CLI that could not be spawned, one that answered nothing usable, and one
+/// that answered honestly that nobody is signed in. Saying only "not signed
+/// in" would be a claim this page cannot support; saying both is the honest
+/// width of what is known.
+const ACCOUNT_SIGNED_OUT_NOTE: &str =
+    "No account is signed in, or the Bitwarden CLI could not be reached to ask.";
+/// A signed-in account whose address the CLI did not report. Not blank, and
+/// not silently "signed in" either -- the row promises to say WHICH account.
+const ACCOUNT_NO_EMAIL: &str = "Signed in";
+const ACCOUNT_NO_EMAIL_NOTE: &str = "The Bitwarden CLI did not report the address.";
+/// Under a known address: which server this vault lives on.
+const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
+
+/// What the About page knows about the signed-in account.
+///
+/// # Why the email is on this page at all
+///
+/// It is a personal identifier arriving on a screen that had none, so the
+/// call is made deliberately rather than by default. It is the user's own
+/// address, on their own machine, in a window they opened -- and it is the
+/// one fact that answers "which account is this vault", which the row has
+/// promised to answer since it was written. It goes nowhere: it is painted,
+/// never logged (`vault_window` logs only whether an email was *present*),
+/// never copied, and never sent. The alternative -- a row that says an
+/// account is linked without saying which -- is the state the user reported
+/// as "empty but we know it for sure".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountStatus {
+    /// A `bw status` is in flight and has not answered yet.
+    Checking,
+    /// The CLI reported a signed-in account. `email` is `None` when it
+    /// reported one without an address; `server` is `None` for Bitwarden's
+    /// own cloud, which is the CLI's default.
+    SignedIn { email: Option<String>, server: Option<String> },
+    /// The CLI reported nobody signed in -- or could not be asked. See
+    /// [`ACCOUNT_SIGNED_OUT_NOTE`].
+    SignedOut,
+}
 
 // --- About: the update flow -----------------------------------------------
 //
@@ -578,6 +630,85 @@ pub struct PrefsState {
     /// screenshot example holds its `PrefsState` for the update surfaces where
     /// it rebuilds it for the clipboard ones.
     update: crate::update_panel::UpdatePanel,
+    /// Where the About page reads the account from, **as a function pointer
+    /// read every frame** rather than a value captured when the window
+    /// opened.
+    ///
+    /// Both halves matter. Every frame, because the answer arrives late --
+    /// 2.8 seconds after the window on the machine this was reported from --
+    /// so a value snapshotted in `new` would show "Checking..." for the whole
+    /// life of a window opened during the lookup. A seam, because the default
+    /// reads a process-wide published value, and a test that drove that
+    /// global would leave the next test's page describing an account nobody
+    /// set: the tests and `examples/ui_preview` install their own `fn` and
+    /// touch no shared state at all.
+    account_source: fn() -> Option<AccountStatus>,
+}
+
+/// The account the shells publish and the About page reads.
+///
+/// # Why a published value rather than a parameter
+///
+/// The same two-shells problem `update_panel::install_env` solves, and the
+/// same answer for the same reason: `prefs_ui::run` is entered from `main`
+/// and `PrefsState::new` from inside `vault_window::build_frame`'s closure,
+/// so a parameter would have to be threaded through `run`, `PrefsState::new`
+/// and that closure -- a signature change two call sites away from the row
+/// that uses it, in two shells that must not disagree.
+///
+/// # Why an `RwLock` and not a `OnceLock`
+///
+/// This is where it deliberately differs from `install_env`, which was
+/// flagged as the decision most worth overruling. An update environment is
+/// fixed at startup; an ACCOUNT is not. This app switches accounts
+/// (`accounts.rs`), signs out, and learns the address several seconds after
+/// launch. A `OnceLock` would pin whichever answer landed first -- most often
+/// `Checking` -- and the row would then be wrong for the rest of the session
+/// with no way to correct it. So the value is republished whenever it
+/// changes, and the last publisher wins.
+static PUBLISHED_ACCOUNT: std::sync::RwLock<Option<AccountStatus>> =
+    std::sync::RwLock::new(None);
+
+/// Publishes what the app now knows about the signed-in account.
+///
+/// Called by the shells at the moments the answer changes: when the startup
+/// lookup is spawned, when it lands, and when a vault window receives details
+/// of its own. Cheap and idempotent -- publishing the same value again is a
+/// write of a value that was already there.
+///
+/// A poisoned lock is ignored rather than propagated: this is a decorative
+/// row on an About page, and panicking a caller mid-startup over it would be
+/// a much worse failure than a row that is one publish out of date.
+pub fn publish_account_status(status: AccountStatus) {
+    if let Ok(mut slot) = PUBLISHED_ACCOUNT.write() {
+        *slot = Some(status);
+    }
+}
+
+/// What was last published, or `None` where nothing ever was -- the
+/// screenshot example, and any test.
+pub fn published_account_status() -> Option<AccountStatus> {
+    PUBLISHED_ACCOUNT.read().ok().and_then(|slot| slot.clone())
+}
+
+/// A `bw status` answer as this page understands it.
+///
+/// **One mapping, here, for both publishers.** `main`'s startup drain and
+/// `vault_window`'s late arrival both hold a `BwStatusDetails` and both feed
+/// this row; two conversions would be two chances for the same CLI answer to
+/// reach the page as two different sentences.
+pub fn account_status_of(details: &crate::login_ui::BwStatusDetails) -> AccountStatus {
+    match details.status {
+        // `Unauthenticated` is also what a CLI that could not be spawned or
+        // could not be parsed comes back as -- see
+        // `login_ui::unknown_status_details` -- which is why the row's
+        // wording for this case covers both.
+        crate::login_ui::BwStatus::Unauthenticated => AccountStatus::SignedOut,
+        _ => AccountStatus::SignedIn {
+            email: details.user_email.clone(),
+            server: details.server_url.clone(),
+        },
+    }
 }
 
 impl PrefsState {
@@ -615,6 +746,7 @@ impl PrefsState {
             clipboard_interval_text: interval.as_minutes_text(),
             clipboard_entry_error: None,
             update: crate::update_panel::UpdatePanel::default(),
+            account_source: published_account_status,
         }
     }
 
@@ -635,6 +767,17 @@ impl PrefsState {
     /// even by accident.
     pub fn show_update_stage(&mut self, stage: crate::update_panel::UpdateStage) {
         self.update = crate::update_panel::UpdatePanel::parked(stage);
+    }
+
+    /// Points the About page's account row at `source` instead of at the
+    /// process-wide published value.
+    ///
+    /// For `examples/ui_preview` and for tests, and a function pointer rather
+    /// than a value for the reason [`PrefsState::account_source`] gives: the
+    /// row is read every frame, and nothing here may write the global that
+    /// the rest of the process -- and the next test -- reads.
+    pub fn show_account_source(&mut self, source: fn() -> Option<AccountStatus>) {
+        self.account_source = source;
     }
 }
 
@@ -1641,6 +1784,55 @@ fn draw_shortcuts(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
     });
 }
 
+/// The account row: which Bitwarden account this vault is, and where it
+/// lives.
+///
+/// **Never blank in any state**, which is the property the row had when it
+/// could say nothing at all and had to keep when it could say something: an
+/// empty right-hand column reads as a field that failed to load, and this
+/// page is read by someone checking whether their app is working.
+fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
+    let (description, value) = account_row_text(status.as_ref());
+    match value {
+        // Nothing published: the old sentence, in the old shape. A row with
+        // no value is honest here because there is no value -- as opposed to
+        // a row with an empty one, which claims there should be.
+        None => card_row(ui, |ui| row_text(ui, ACCOUNT_LABEL, &description)),
+        Some(value) => value_row(ui, ACCOUNT_LABEL, &description, &value),
+    }
+}
+
+/// What the account row says, as a pure function of what is known.
+///
+/// Split out so every state's wording is testable without a window, and so
+/// the four cases are visible in one place rather than spread through a draw.
+fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) {
+    match status {
+        None => (ACCOUNT_STATUS.to_string(), None),
+        Some(AccountStatus::Checking) => {
+            (ACCOUNT_CHECKING_NOTE.to_string(), Some(ACCOUNT_CHECKING.to_string()))
+        }
+        Some(AccountStatus::SignedOut) => {
+            (ACCOUNT_SIGNED_OUT_NOTE.to_string(), Some(ACCOUNT_SIGNED_OUT.to_string()))
+        }
+        Some(AccountStatus::SignedIn { email, server }) => {
+            // `server_host` is `login_ui`'s, so the address here reads
+            // exactly as it does in the login window's footer -- one app
+            // naming one server one way -- and `None` renders as Bitwarden's
+            // own cloud, which is what the CLI's default means.
+            let where_it_lives =
+                format!("{ACCOUNT_SERVER_PREFIX}{}.", crate::login_ui::server_host(server.as_deref()));
+            match email {
+                Some(email) => (where_it_lives, Some(email.clone())),
+                None => (
+                    format!("{where_it_lives} {ACCOUNT_NO_EMAIL_NOTE}"),
+                    Some(ACCOUNT_NO_EMAIL.to_string()),
+                ),
+            }
+        }
+    }
+}
+
 fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         value_row(
@@ -1650,10 +1842,7 @@ fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
             &version_line(),
         );
         row_separator(ui);
-        // No trailing value, because there is no value to put there -- see
-        // `ACCOUNT_STATUS`. A row with an empty right-hand column would read
-        // as a field that failed to load.
-        card_row(ui, |ui| row_text(ui, "Bitwarden account", ACCOUNT_STATUS));
+        account_row(ui, (state.account_source)());
     });
 
     draw_update_card(ui, state);
@@ -4347,6 +4536,157 @@ mod tests {
             .unwrap(),
             body: "Fixed the thing".to_string(),
         }
+    }
+
+    // -- the account row ----------------------------------------------------
+
+    /// The About page with the account row pointed at `source`.
+    ///
+    /// **Never at the published global.** A test that published would leave
+    /// the next test's About page describing an account nobody set, and these
+    /// run in one process in parallel; `show_account_source` is the seam that
+    /// exists so no test has to.
+    fn paint_about_account(source: fn() -> Option<AccountStatus>) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::About;
+        state.show_account_source(source);
+        frame(&ctx, &mut state, &[])
+    }
+
+    fn a_signed_in_account() -> Option<AccountStatus> {
+        Some(AccountStatus::SignedIn {
+            email: Some("someone@example.invalid".to_string()),
+            server: Some("https://vault.example.invalid/api".to_string()),
+        })
+    }
+
+    /// **The reported defect: "Bitwarden account is empty but we know it for
+    /// sure".**
+    ///
+    /// The app had the address -- `vault_window` logs its arrival -- and this
+    /// page said to go and look somewhere else for it.
+    #[test]
+    fn the_about_page_names_the_signed_in_account_and_its_server() {
+        let painted = paint_about_account(a_signed_in_account);
+
+        assert!(painted.contains(ACCOUNT_LABEL));
+        assert!(
+            painted.contains("someone@example.invalid"),
+            "the page knows the address and still will not say it: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("vault.example.invalid"),
+            "which server this vault lives on is half of which account it is: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.contains(ACCOUNT_STATUS),
+            "the page is still pointing at the vault window for an answer it has: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **Waiting and signed-out must not look alike.**
+    ///
+    /// The lookup landed 2.8 seconds after the window on the machine this was
+    /// reported from, so the waiting state is one users really see -- and
+    /// "we have not asked yet" and "nobody is signed in" are opposite claims.
+    #[test]
+    fn checking_and_signed_out_say_different_things() {
+        let checking = paint_about_account(|| Some(AccountStatus::Checking));
+        let signed_out = paint_about_account(|| Some(AccountStatus::SignedOut));
+
+        assert!(checking.contains(ACCOUNT_CHECKING), "got {:?}", checking.strings());
+        assert!(signed_out.contains(ACCOUNT_SIGNED_OUT), "got {:?}", signed_out.strings());
+        assert!(
+            !checking.contains(ACCOUNT_SIGNED_OUT),
+            "a page that has not asked yet must not assert that nobody is signed in: {:?}",
+            checking.strings()
+        );
+    }
+
+    /// **The row is never blank, in any state.**
+    ///
+    /// The property the old constant existed for and the one this change had
+    /// to keep: an empty right-hand column reads as a field that failed to
+    /// load, on the page someone opens to check whether their app is working.
+    #[test]
+    fn the_account_row_always_says_something() {
+        let states = [
+            None,
+            Some(AccountStatus::Checking),
+            Some(AccountStatus::SignedOut),
+            Some(AccountStatus::SignedIn { email: None, server: None }),
+            Some(AccountStatus::SignedIn {
+                email: Some("a@b.invalid".to_string()),
+                server: None,
+            }),
+        ];
+
+        for state in states {
+            let (description, value) = account_row_text(state.as_ref());
+            assert!(!description.trim().is_empty(), "{state:?} paints no description");
+            assert!(
+                value.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(true),
+                "{state:?} paints an EMPTY value, which reads as a field that failed to load; \
+                 a state with nothing to say must carry no value at all"
+            );
+        }
+    }
+
+    /// A signed-in account whose address the CLI did not report still says
+    /// which of the two facts is missing, rather than silently reading as an
+    /// account with no name.
+    #[test]
+    fn a_signed_in_account_with_no_address_says_so() {
+        let (description, value) = account_row_text(Some(&AccountStatus::SignedIn {
+            email: None,
+            server: None,
+        }));
+
+        assert_eq!(value.as_deref(), Some(ACCOUNT_NO_EMAIL));
+        assert!(description.contains(ACCOUNT_NO_EMAIL_NOTE), "got {description:?}");
+    }
+
+    /// **A `bw status` answer becomes one sentence, in one place.**
+    ///
+    /// Two publishers feed this row -- `main`'s startup drain and
+    /// `vault_window`'s late arrival -- and both go through
+    /// `account_status_of`, so one CLI answer cannot reach the page as two
+    /// different claims.
+    #[test]
+    fn a_cli_answer_maps_to_the_state_it_describes() {
+        use crate::login_ui::{BwStatus, BwStatusDetails};
+
+        let unlocked = account_status_of(&BwStatusDetails {
+            status: BwStatus::Unlocked,
+            user_email: Some("who@example.invalid".to_string()),
+            server_url: None,
+        });
+        assert_eq!(
+            unlocked,
+            AccountStatus::SignedIn {
+                email: Some("who@example.invalid".to_string()),
+                server: None
+            }
+        );
+
+        // A locked vault is still a signed-in account: the row answers "which
+        // account", not "is it open".
+        let locked = account_status_of(&BwStatusDetails {
+            status: BwStatus::Locked,
+            user_email: Some("who@example.invalid".to_string()),
+            server_url: None,
+        });
+        assert!(matches!(locked, AccountStatus::SignedIn { .. }));
+
+        // And the value a failed or unparseable `bw status` comes back as.
+        assert_eq!(
+            account_status_of(&crate::login_ui::unknown_status_details()),
+            AccountStatus::SignedOut
+        );
     }
 
     /// Two frames of the About page in one `Context`, and the SECOND one's

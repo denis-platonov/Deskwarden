@@ -1195,6 +1195,16 @@ impl Preview {
         });
         state.show(prefs_ui::Section::About);
         state.show_update_stage(stage);
+        // **A signed-in account, from a fixture rather than from the process.**
+        // The row reads a published value in the app; this example publishes
+        // nothing and installs its own source, so the picture shows the state
+        // a real user is in without a `bw` anywhere near it.
+        state.show_account_source(|| {
+            Some(prefs_ui::AccountStatus::SignedIn {
+                email: Some("someone@example.invalid".to_string()),
+                server: Some("https://vault.example.invalid/api".to_string()),
+            })
+        });
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
