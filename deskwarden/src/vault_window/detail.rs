@@ -7404,6 +7404,71 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Dates for fixtures, stated as an AGE and never as a calendar date.
+///
+/// **This exists because a hard-coded date in a fixture is a timer.** Every
+/// relative-time string this pane renders is `SystemTime::now()` minus a
+/// stored date -- there is no clock seam, and threading one in would cross
+/// `VaultFrameEnv` and four call sites in `main.rs` for a fact production is
+/// right to read off the real clock. So a literal date renders a DIFFERENT
+/// string tomorrow, and any pin taken over it is a pin on today's calendar.
+///
+/// It has already gone off once: `the_age_segment_costs_no_row_at_full_width`
+/// pinned a card height derived from `7y 170d ago`, the age crossed to
+/// `7y 171d ago` at UTC midnight, `1` is narrower than `0` by more than the
+/// wrapped run had spare, and a released tag went red with no code in
+/// between. That was repaired by stating the age; this module is where the
+/// repair lives so the next fixture does not have to reinvent it.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    /// Howard Hinnant's civil-from-days: the inverse of
+    /// [`days_from_civil`](super::days_from_civil), which this file already
+    /// carries for production.
+    ///
+    /// Here rather than beside it because nothing the app ships needs it --
+    /// production only ever goes date-to-days, and a public function with no
+    /// production caller is a seam waiting to be leaned on.
+    pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    /// Today, in days since the Unix epoch.
+    pub(crate) fn today() -> i64 {
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is not before the Unix epoch")
+            .as_secs()
+            / 86400) as i64
+    }
+
+    /// How old the password-history entries in this file's fixtures are.
+    ///
+    /// **21, because that is exactly how old the `2026-07-30` those fixtures
+    /// used to hard-code was on 2026-08-20**, the day it was replaced. Taking
+    /// the age they already had means the strings under every assertion are
+    /// byte for byte what they were, so nothing was re-photographed while
+    /// being repaired. Next year the literal would have rendered `1y 21d ago`
+    /// -- a wider string, and the shape of the failure described above.
+    pub(crate) const HISTORY_AGE_DAYS: i64 = 21;
+
+    /// A wire-shaped timestamp exactly `days` before today, so whatever reads
+    /// it computes the same age on every day this test is ever run -- and
+    /// therefore renders the same string forever.
+    pub(crate) fn days_ago(days: i64) -> String {
+        let (y, m, d) = civil_from_days(today() - days);
+        format!("{y:04}-{m:02}-{d:02}T09:15:00.000Z")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17390,7 +17455,7 @@ mod tests {
         let history: Vec<serde_json::Value> = (0..entries)
             .map(|i| {
                 serde_json::json!({
-                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
                     "password": format!("old-secret-{i}"),
                 })
             })
@@ -20131,7 +20196,7 @@ mod read_pane_scroll_tests {
         let history: Vec<serde_json::Value> = (0..5)
             .map(|i| {
                 serde_json::json!({
-                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
                     "password": format!("old-secret-{i}"),
                 })
             })
@@ -21514,7 +21579,7 @@ mod read_pane_scroll_tests {
         let history: Vec<serde_json::Value> = (0..5)
             .map(|i| {
                 serde_json::json!({
-                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
                     "password": format!("{LONG_HISTORY_PASSWORD}{i}"),
                 })
             })
@@ -21972,24 +22037,12 @@ mod breach_badge_tests {
     /// re-photographing whatever the code happens to do today.
     const PASSWORD_AGE_DAYS: i64 = 2725;
 
-    /// Howard Hinnant's civil-from-days: the inverse of [`days_from_civil`],
-    /// which this file already carries.
-    ///
-    /// Here rather than beside it because nothing the app ships needs it --
-    /// production only ever goes date-to-days, and a public function with no
-    /// production caller is a seam waiting to be leaned on.
-    fn civil_from_days(z: i64) -> (i64, i64, i64) {
-        let z = z + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        (if m <= 2 { y + 1 } else { y }, m, d)
-    }
+    // `civil_from_days` used to be written out here. It moved to
+    // `super::test_clock` when three password-history fixtures in this file
+    // needed the same repair this one had already had -- one piece of date
+    // arithmetic in this file, rather than one per module that rediscovers
+    // the problem.
+    use super::test_clock::{civil_from_days, today};
 
     /// The same fixture with a `creationDate` on it, so its password HAS a
     /// datable age: a login whose password nobody has ever changed in seven
@@ -22038,12 +22091,7 @@ mod breach_badge_tests {
     /// [`the_age_fixture_is_the_same_age_on_every_day_it_is_run`].
     fn an_item_that_can_date_its_password() -> VaultItem {
         let mut item = an_item_of(ItemKind::Login, Some(PASSWORD));
-        let today = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the system clock is not before the Unix epoch")
-            .as_secs()
-            / 86400) as i64;
-        let (y, m, d) = civil_from_days(today - PASSWORD_AGE_DAYS);
+        let (y, m, d) = civil_from_days(today() - PASSWORD_AGE_DAYS);
         item.other.insert(
             "creationDate".to_string(),
             serde_json::Value::String(format!("{y:04}-{m:02}-{d:02}T05:06:07.000Z")),
