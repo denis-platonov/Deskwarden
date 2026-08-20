@@ -2366,6 +2366,56 @@ fn draw_not_yet(ui: &mut Ui, detail: &str) {
 /// `keep_backend_running`, `prompt_on_match`, `auto_lock_enabled` and
 /// `auto_lock_minutes` -- the four fields `Settings::persist_preferences` owns. `vault_window` is carried through
 /// untouched, which is what makes `main.rs`'s stale copy of it harmless.
+/// The window shell: the titlebar, and the one form directly under it.
+///
+/// **Split out of [`run`] so the geometry can be asserted**, which is the
+/// whole reason it exists as a function. `run` opens an OS window and blocks;
+/// "does the rail start where the chrome ends" is a question about a frame,
+/// and a frame is what this is.
+///
+/// **The body is given an explicit rect rather than taking the cursor's.**
+/// `draw_window_chrome` ends in `ui.advance_cursor_after_rect(bar)`, and
+/// egui's `advance_cursor_after_rect` leaves the cursor at the rect's bottom
+/// PLUS `item_spacing.y` -- the ambient 8 points. That was the reported gap:
+/// a strip of window background between the titlebar's hairline and the top
+/// of the nav rail, on a page where the rail is meant to read as continuing
+/// the chrome. Deliberately fixed by naming where the body starts rather than
+/// by subtracting 8 somewhere, because a negative offset cancelling a
+/// positive one is two numbers that were never meant to relate, and the next
+/// person to change the bar's height would be debugging both.
+///
+/// The rect is computed the same way [`modal_body_rect`] computes the modal's
+/// -- the window's full area, minus the header's height, from the top -- so
+/// the two shells now space the body by the same rule instead of one
+/// measuring and one inheriting.
+///
+/// **Public for the screenshot job** (`examples/ui_preview`), for the same
+/// reason [`draw_prefs_body`] is: the other prefs surfaces draw the body
+/// alone, so the seam between the chrome and the rail -- which is what was
+/// reported -- appears in no picture unless something can draw the shell.
+pub fn draw_prefs_window(ui: &mut Ui, state: &mut PrefsState) -> ChromeAction {
+    let full = ui.max_rect();
+    let action = draw_window_chrome(ui, WINDOW_TITLE);
+
+    let body = Rect::from_min_max(
+        Pos2::new(full.min.x, (full.min.y + CHROME_BAR_HEIGHT).min(full.max.y)),
+        full.max,
+    );
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    draw_prefs_body(&mut body_ui, state);
+
+    action
+}
+
+/// Height of the titlebar [`draw_window_chrome`] paints.
+///
+/// Read off `ChromeMetrics::LOGIN`, which is the metrics that function uses,
+/// rather than written out again: this number decides where the body starts,
+/// and a second `40.0` here would be a value that has to agree with one over
+/// there with no mechanism making it -- the defect this constant's neighbours
+/// in this file keep being written to avoid.
+const CHROME_BAR_HEIGHT: f32 = crate::login_ui::ChromeMetrics::LOGIN.bar_height;
+
 pub fn run(settings: Settings) -> Settings {
     let state = Rc::new(RefCell::new(PrefsState::new(settings)));
     let state_for_closure = state.clone();
@@ -2402,7 +2452,7 @@ pub fn run(settings: Settings) -> Settings {
             return;
         }
 
-        match draw_window_chrome(ui, WINDOW_TITLE) {
+        match draw_prefs_window(ui, &mut state_for_closure.borrow_mut()) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             // The chrome paints a - control whether or not anyone listens for
             // it; this window used to draw it and drop the action, so the
@@ -2412,12 +2462,6 @@ pub fn run(settings: Settings) -> Settings {
                 .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
         }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(ui, |ui| {
-                draw_prefs_body(ui, &mut state_for_closure.borrow_mut());
-            });
     });
 
     let edited = state.borrow().settings.clone();
@@ -4536,6 +4580,78 @@ mod tests {
             .unwrap(),
             body: "Fixed the thing".to_string(),
         }
+    }
+
+    // -- where the body starts, in both shells -------------------------------
+
+    /// The top edge of the nav rail, found by its own fill.
+    ///
+    /// The rail is the full-height `theme::CARD` rectangle at the left of the
+    /// body, `NAV_WIDTH` wide -- located by shape rather than by index
+    /// because this page paints several white rectangles and their order is
+    /// not this test's business.
+    fn rail_top(painted: &Painted) -> f32 {
+        painted
+            .rects
+            .iter()
+            .filter(|r| {
+                r.fill == theme::CARD && (r.rect.width() - NAV_WIDTH).abs() < 0.5
+            })
+            .map(|r| r.rect.top())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// **The window shell: the rail starts where the titlebar ends.**
+    ///
+    /// The reported defect -- "there is a gap between window title panel and
+    /// left nav panel on settings screen" -- was a strip of window background
+    /// between the chrome's hairline and the top of the rail.
+    /// `draw_window_chrome` ends in `advance_cursor_after_rect`, which leaves
+    /// the cursor a whole `item_spacing.y` BELOW the bar, and the body used
+    /// to start from that cursor.
+    ///
+    /// Its own test, separate from the modal's below, because a single
+    /// assertion over "the page looks right" would pass while one of the two
+    /// shells drifted.
+    #[test]
+    fn the_nav_rail_starts_exactly_where_the_window_chrome_ends() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            draw_prefs_window(ui, &mut state);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+
+        assert!(
+            (rail_top(&painted) - CHROME_BAR_HEIGHT).abs() < 0.5,
+            "the rail starts at {} and the titlebar ends at {CHROME_BAR_HEIGHT}: the strip \
+             between them is the reported gap",
+            rail_top(&painted)
+        );
+    }
+
+    /// **The modal shell: the same claim, asserted separately.**
+    ///
+    /// This shell computes its body rect rather than inheriting a cursor, so
+    /// it was already right -- which is what identified the window shell as
+    /// the one at fault. Pinned anyway: the fix made the two shells space the
+    /// body by the same rule, and a rule that holds in one place and not the
+    /// other is how they came to differ in the first place.
+    #[test]
+    fn the_modal_body_starts_exactly_where_its_header_ends() {
+        let card = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0));
+
+        let body = modal_body_rect(card);
+
+        assert!(
+            (body.top() - (card.top() + MODAL_HEADER_HEIGHT)).abs() < 0.5,
+            "the modal's body starts at {} and its header ends at {}",
+            body.top(),
+            card.top() + MODAL_HEADER_HEIGHT
+        );
     }
 
     // -- the account row ----------------------------------------------------

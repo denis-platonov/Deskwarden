@@ -229,6 +229,14 @@ enum Surface {
     /// for, and the case where a scrollbar is legitimately wanted -- so this
     /// picture is the review of both halves at once.
     PrefsAboutUpdateManyReleases,
+    /// **The preferences WINDOW, chrome included**, rather than its body.
+    ///
+    /// Every other prefs surface draws `draw_prefs_body` at the size the
+    /// window gives it, which is the right frame for the pages -- and means
+    /// the seam between the titlebar and the top of the nav rail appears in
+    /// no picture at all. That seam is what was reported ("there is a gap
+    /// between window title panel and left nav panel"), so it gets a surface.
+    PrefsWindowChrome,
     /// Mid-download: the progress bar, the byte count, and the notes still
     /// readable underneath. Its own surface because "is the bar there and does
     /// the card still fit" is exactly what a picture answers and an assertion
@@ -324,7 +332,9 @@ const PANE_HEIGHT: f32 = 740.0;
 /// rather than imported for the same reason [`PANE_WIDTH`] is -- an example is
 /// a separate crate and `WINDOW_SIZE` is private to `prefs_ui`.
 const PREFS_BODY_WIDTH: f32 = 1000.0;
-const PREFS_BODY_HEIGHT: f32 = 780.0 - 40.0;
+const PREFS_BODY_HEIGHT: f32 = 780.0 - PREFS_CHROME_HEIGHT;
+/// The titlebar's height, which is `ChromeMetrics::LOGIN`'s.
+const PREFS_CHROME_HEIGHT: f32 = 40.0;
 
 /// The detail pane's own frame, copied from the `CentralPanel` in
 /// `vault_window::mod` that hosts it: `theme::CANVAS` and
@@ -361,6 +371,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutUpdateAvailable,
     Surface::PrefsAboutUpdateShortNotes,
     Surface::PrefsAboutUpdateManyReleases,
+    Surface::PrefsWindowChrome,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::VaultList,
@@ -399,6 +410,7 @@ impl Surface {
             Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
             Surface::PrefsAboutUpdateShortNotes => "prefs_about_update_short_notes",
             Surface::PrefsAboutUpdateManyReleases => "prefs_about_update_many_releases",
+            Surface::PrefsWindowChrome => "prefs_window_chrome",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
@@ -464,6 +476,12 @@ impl Surface {
             | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
+            // The WHOLE window, chrome included -- the one prefs surface that
+            // is not the body alone, because the seam it exists to show is
+            // between the two.
+            Surface::PrefsWindowChrome => {
+                egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT + PREFS_CHROME_HEIGHT)
+            }
             // The list panel's exact shipped width, spelled out for the same
             // reason [`PANE_WIDTH`] is: `vault_window::mod`'s `LIST_WIDTH` is
             // `pub(crate)` and an example is a separate crate. A list drawn
@@ -811,6 +829,7 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
+            Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
             Surface::VaultHealth => self.draw_vault_health(root),
@@ -1085,6 +1104,19 @@ impl Preview {
     /// The state is rebuilt each frame, as `draw_prefs` rebuilds its own:
     /// there is nothing here to carry between frames, because every stage
     /// these surfaces show is stated outright rather than arrived at.
+    /// The preferences window as the OS shows it: the titlebar this app
+    /// paints itself, and the form directly under it.
+    ///
+    /// `prefs_ui::draw_prefs_window` is the exact function `run` calls every
+    /// frame, so what this picture says about the seam between the chrome and
+    /// the rail is what the real window says.
+    fn draw_prefs_window(&mut self, root: &mut egui::Ui) {
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+        state.show(prefs_ui::Section::About);
+        let _ = prefs_ui::draw_prefs_window(root, &mut state);
+    }
+
     fn draw_prefs_about(&mut self, root: &mut egui::Ui, surface: Surface) {
         use deskwarden::update_panel::UpdateStage;
         use deskwarden::updater::ReleaseInfo;
