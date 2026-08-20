@@ -5840,15 +5840,27 @@ mod fill_dispatch_tests {
     }
 
     /// Drives a whole fill with both halves of the gate as fixtures, and
-    /// reports how many times the confirmation was asked and how many
-    /// sequences were typed.
+    /// reports how many times the confirmation was asked, how many sequences
+    /// were typed, and what the confirmation was handed.
+    ///
+    /// **All three are read while the lock is still held**, and handed back by
+    /// value. The two counters always were; `CONFIRM_SAW_SECRET` used to be
+    /// loaded by the caller *after* this function returned, which is after
+    /// `_serialised` had been dropped -- so the next test to take the lock
+    /// (`an_ungated_fill_opens_no_confirmation`, whose own `hosted_fill` opens
+    /// by storing `false` into it) could clobber the flag in the few
+    /// microseconds between the release and the read. `asked` and `typed` were
+    /// already snapshotted by then, so exactly the third assertion failed,
+    /// intermittently, and only on a machine loaded enough for the waiting
+    /// thread to win that race. Returning the flag alongside the counters is
+    /// what makes the three facts one observation of one fill.
     fn hosted_fill(
         choice: FillChoice,
         confirm: fn(
             crate::vault_window::preflight::PreflightState,
             zeroize::Zeroizing<String>,
         ) -> Option<crate::vault_window::preflight::PreflightAction>,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, bool) {
         let _serialised = crate::injector::sequence_test_lock();
         CONFIRMS_ASKED.store(0, std::sync::atomic::Ordering::SeqCst);
         CONFIRM_SAW_SECRET.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -5870,7 +5882,11 @@ mod fill_dispatch_tests {
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
         let typed = rec.sequences.lock().unwrap().len();
-        (CONFIRMS_ASKED.load(std::sync::atomic::Ordering::SeqCst), typed)
+        (
+            CONFIRMS_ASKED.load(std::sync::atomic::Ordering::SeqCst),
+            typed,
+            CONFIRM_SAW_SECRET.load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     /// **The hosting, driven from the entry point.** Delete the
@@ -5881,12 +5897,12 @@ mod fill_dispatch_tests {
     /// much else goes red with it.
     #[test]
     fn a_bare_secret_fill_asks_the_confirmation_before_it_types() {
-        let (asked, typed) =
+        let (asked, typed, saw_secret) =
             hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), confirmed);
         assert_eq!(asked, 1, "the 4b confirmation was never shown");
         assert_eq!(typed, 1, "the confirmed fill did not type, so `asked` proves nothing");
         assert!(
-            CONFIRM_SAW_SECRET.load(std::sync::atomic::Ordering::SeqCst),
+            saw_secret,
             "the surface was handed a step list with no secret in it, or a copy payload that              is not the value this fill was about to type"
         );
     }
@@ -5900,7 +5916,7 @@ mod fill_dispatch_tests {
     /// the reason it exists separately from the one above.
     #[test]
     fn a_cancelled_confirmation_types_nothing() {
-        let (asked, typed) =
+        let (asked, typed, _) =
             hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), cancelled);
         assert_eq!(asked, 1, "control: the confirmation really was shown");
         assert_eq!(typed, 0, "the fill typed a password the user had just cancelled");
@@ -5912,7 +5928,7 @@ mod fill_dispatch_tests {
     /// and would ask a masking question those fills deliberately do not answer.
     #[test]
     fn an_ungated_fill_opens_no_confirmation() {
-        let (asked, typed) = hosted_fill(FillChoice::Saved, must_not_be_asked);
+        let (asked, typed, _) = hosted_fill(FillChoice::Saved, must_not_be_asked);
         assert_eq!(asked, 0);
         assert_eq!(typed, 1, "control: the ungated fill really ran");
     }
