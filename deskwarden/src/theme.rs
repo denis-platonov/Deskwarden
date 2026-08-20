@@ -1412,15 +1412,34 @@ const ENVELOPE_HALF_WIDTH: f32 = 9.0;
 const ENVELOPE_HALF_HEIGHT: f32 = 6.5;
 
 /// Half the diagonal extent of the detail pane's close ✕, so its two arms
-/// span 11x11.
+/// span 14.1x14.1 and the mark's ink covers 15.4x15.4 once
+/// [`ICON_STROKE`] is on it.
+///
+/// **It was 5.5 -- an 11x11 cross, 12.3x12.3 of ink -- and that was the
+/// strip's odd one out.** Reported as "also those icons are not same size
+/// feels like", and measured rather than left at that: the other four marks
+/// cover 15.4 to 19.3 on their long side, and this one covered 12.3. All five
+/// allocate the same 34pt square, so nothing about the boxes or the hit
+/// targets was wrong and no rect assertion could ever have seen it; the
+/// difference was entirely in what got drawn inside them.
+///
+/// 7.05 is not a chosen number. It is what puts this mark's ink at exactly
+/// the kebab's 15.4 -- the nearest neighbour in the set and the smallest mark
+/// that was NOT reported -- so the target is read off the strip rather than
+/// invented. It deliberately does not go all the way to the clock's 18.3: a ✕
+/// reaches its corners diagonally, so a cross whose box matches a circle's
+/// diameter reads as the bigger mark, and every icon set draws diagonal marks
+/// inside the nominal for that reason. [`every_header_mark_is_drawn_at_the_
+/// same_optical_size`] is the live band check.
 ///
 /// **Deliberately none of the other three ✕ sizes in this app.** The vault
 /// titlebar strokes a 9x9 close and [`close_glyph`] a 7x7 one, and
 /// [`icon_probe::pane_close_marks`] tells them apart by extent alone -- so a
 /// ✕ that matched either would report the titlebar's window-close as the
-/// detail pane's, in every frame the whole window is painted in.
+/// detail pane's, in every frame the whole window is painted in. Growing this
+/// one moves it further from both, not nearer.
 /// [`the_drawn_close_marks_do_not_share_an_extent`] is the live guard.
-const PANE_CLOSE_ARM: f32 = 5.5;
+const PANE_CLOSE_ARM: f32 = 7.05;
 
 /// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
 const EYE_PUPIL_RADIUS: f32 = 2.4;
@@ -1561,6 +1580,28 @@ fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
 /// where the mark stops reading as spiky without losing the five points.
 const STAR_STROKE: f32 = 2.2;
 
+/// The favourite star's outer radius, as [`star_outline`] takes it.
+///
+/// **It was a bare `9.0` at the call site, and it was the largest mark on the
+/// header strip.** Measured: at 9.0 the star's ink covered 19.32x18.48
+/// against the clock's 18.30x18.30 and the envelope's 19.30 wide, which is
+/// the wrong way round twice over -- the star is the one mark that FILLS when
+/// it is on, and a solid shape already reads heavier than an outline at the
+/// same extent, so it should be the smallest of the set and not the biggest.
+///
+/// 8.46 is derived, not picked: [`star_outline`] scales linearly with this,
+/// [`STAR_STROKE`] adds a fixed 2.2 on top of it, and 8.46 is what solves
+/// `outline_width + 2.2 = 18.30` for the clock's own extent. The result is
+/// 18.29x17.50 -- level with the clock across, a little under it down,
+/// which is where a pentagram sits when it is no longer the loudest thing on
+/// the strip. Pinned by
+/// [`the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it`].
+///
+/// Named rather than left inline for the reason the rest of this family is
+/// named: a number written at one call site is a number nobody can find when
+/// the next report arrives.
+const STAR_OUTER: f32 = 8.46;
+
 fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
     let points = star_outline(center, outer);
     let painter = ui.painter();
@@ -1624,7 +1665,7 @@ pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
     } else {
         TEXT_FAINT
     };
-    paint_star(ui, rect.center(), 9.0, on, color);
+    paint_star(ui, rect.center(), STAR_OUTER, on, color);
     response
 }
 
@@ -3692,6 +3733,201 @@ mod drawn_icon_family_tests {
             assert!(
                 icon_probe::envelopes(&star_tree).is_empty(),
                 "the {on} star is being reported as an envelope"
+            );
+        }
+    }
+
+    /// The detail header's five controls, each drawn alone, in the order the
+    /// strip reads left to right, with the box its painted ink really covers.
+    ///
+    /// The ★ is asked for in its OFF state and the ⋮ unarmed, which is what
+    /// an ordinary item shows -- and neither state changes the geometry
+    /// anyway, only the colour.
+    ///
+    /// `visual_bounding_rect` and not the control's own rect: every one of
+    /// the five allocates `Vec2::splat(HEADER_BUTTON_HEIGHT)`, so the rects
+    /// are identical by construction and say nothing about what is drawn
+    /// inside them. The INK is the thing a reader compares.
+    fn header_control_ink() -> Vec<(&'static str, Rect)> {
+        header_control_marks()
+            .into_iter()
+            .map(|(name, marks)| {
+                let extent = marks
+                    .iter()
+                    .map(|m| m.visual_bounding_rect())
+                    .filter(|r| r.is_finite())
+                    .reduce(|a, b| a.union(b))
+                    .unwrap_or_else(|| panic!("the header's {name} painted nothing at all"));
+                (name, extent)
+            })
+            .collect()
+    }
+
+    /// The shapes each of the five header controls paints, named.
+    ///
+    /// The tier below [`header_control_ink`], and separate from it because
+    /// [`no_header_control_paints_a_glyph`] asks about the shape KINDS rather
+    /// than about their extents -- and because a list of five controls
+    /// written out twice is a list that drifts.
+    fn header_control_marks() -> Vec<(&'static str, Vec<egui::Shape>)> {
+        vec![
+            ("★", control(|ui| star_toggle(ui, false)).1),
+            ("✉", control(send_record_button).1),
+            ("⏱", control(add_totp_button).1),
+            ("⋮", control(|ui| kebab_button(ui, false)).1),
+            ("✕", control(close_pane_button).1),
+        ]
+    }
+
+    /// **The five header marks are drawn, not typed -- so their sizes are
+    /// this file's to answer for.**
+    ///
+    /// The premise everything below rests on. Reported as "also those icons
+    /// are not same size feels like", and the first question such a report
+    /// raises here is the glyph trap this project has hit three times: a mark
+    /// that renders out of egui's bundled emoji fallback rather than the
+    /// app's own face has different metrics AND is a different typeface, and
+    /// no amount of tuning a size fixes that. [`add_totp_button`]'s own doc
+    /// records U+23F1 ⏱ resolving exactly that way, which is why it is drawn.
+    ///
+    /// It cannot be the cause on this strip, and this is what says so: not
+    /// one of the five emits a `Shape::Text`, so no face is involved in any
+    /// of them and there is no font metric to blame. All five are paths,
+    /// circles and line segments this module draws itself, and their extents
+    /// are a consequence of this file's own constants and of nothing else.
+    #[test]
+    fn no_header_control_paints_a_glyph() {
+        for (name, marks) in header_control_marks() {
+            assert!(
+                !marks.iter().any(|m| matches!(m, egui::Shape::Text(_))),
+                "the header's {name} paints a text glyph, so its size is a font's decision \
+                 and not this file's -- and the face answering may not be the app's own"
+            );
+        }
+    }
+
+    /// **The strip reads as one set of marks, measured rather than felt.**
+    ///
+    /// Reported as "also those icons are not same size feels like". All five
+    /// allocate the same 34pt square, so the boxes and the hit targets were
+    /// already identical to the pixel and no rect assertion could see the
+    /// defect. What differs is the painted ink, and here it is -- the extents
+    /// this file drew before the report and after it:
+    ///
+    /// ```text
+    ///        before            after
+    /// *  19.32 x 18.48   18.29 x 17.50
+    /// M  19.30 x 14.30   19.30 x 14.30
+    /// O  18.30 x 18.30   18.30 x 18.30
+    /// :   3.40 x 15.40    3.40 x 15.40
+    /// X  12.30 x 12.30   15.40 x 15.40
+    /// ```
+    ///
+    /// **Two tiers, and that is a finding rather than an excuse.** The naive
+    /// rule -- one nominal extent for all five -- is wrong here, and the
+    /// measurements are what say so. Three of these marks put their ink on
+    /// the edges of their box (a star's points, an envelope's rectangle, a
+    /// clock's rim); two do not (a column of three dots, and a cross whose
+    /// only ink is two diagonals). Sparse ink reads smaller at equal extent,
+    /// and diagonal ink reads LARGER because it reaches the corners -- two
+    /// pulls in opposite directions that land the cross and the kebab in the
+    /// same place, below the round marks. Squaring all five to one number
+    /// would put a ✕ on this strip that read as the biggest thing on it.
+    ///
+    /// So the tiers are asserted by NAMING a member of each rather than by
+    /// writing either number down:
+    ///
+    /// * the edge marks -- star, envelope, clock -- against the clock, the
+    ///   round mark none of this touched;
+    /// * the sparse marks -- kebab, close -- against the kebab, which nobody
+    ///   reported and which is therefore the evidence for where that tier
+    ///   sits.
+    ///
+    /// The second tier is the whole of the repair: the ✕ was in it by kind
+    /// and nowhere near it by size, 12.30 against 15.40, which is what the
+    /// report felt. The tolerance is 1.0pt -- wide enough for the envelope's
+    /// 19.30 against the clock's 18.30, tight enough that the old 12.30
+    /// misses by triple it.
+    ///
+    /// The short dimension of the envelope and the kebab is not asserted at
+    /// all, and deliberately: an envelope as tall as it is wide is a picture
+    /// frame ([`ENVELOPE_HALF_HEIGHT`] argues that already) and a kebab is one
+    /// dot across by definition. That is silhouette, not size.
+    #[test]
+    fn every_header_mark_is_drawn_at_the_same_optical_size() {
+        let ink = header_control_ink();
+        let long = |name: &str| {
+            let rect = ink
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} is not on the strip"))
+                .1;
+            rect.width().max(rect.height())
+        };
+        let all = || {
+            ink.iter()
+                .map(|(n, r)| (*n, r.width(), r.height()))
+                .collect::<Vec<_>>()
+        };
+        for (tier, reference, members) in [
+            ("the edge marks", "⏱", ["★", "✉", "⏱"].as_slice()),
+            ("the sparse marks", "⋮", ["⋮", "✕"].as_slice()),
+        ] {
+            let nominal = long(reference);
+            for name in members {
+                assert!(
+                    (long(name) - nominal).abs() <= 1.0,
+                    "the header's {name} is one of {tier} and reaches {:.2}pt against \
+                     {reference}'s {nominal:.2}pt, so the strip no longer reads as one set: \
+                     {:?}",
+                    long(name),
+                    all()
+                );
+            }
+        }
+        // The control. "Each mark is near its own tier" is only worth
+        // asserting while there really are two tiers; if they ever converge
+        // this test has stopped saying anything and the simpler one-nominal
+        // rule should replace it rather than being quietly satisfied.
+        assert!(
+            long("⏱") - long("⋮") > 1.0,
+            "the two tiers have collapsed into one, so this test is no longer checking \
+             anything: {:?}",
+            all()
+        );
+    }
+
+    /// **And the star is not the loudest thing on the strip.**
+    ///
+    /// Split from the band check above because it is a different claim. The
+    /// star is the one FILLED mark here when an item is a favourite, and a
+    /// filled mark reads heavier than an outlined one at the same extent --
+    /// so "inside the band" is not enough for it; it has to be no bigger than
+    /// the outlined marks it sits among. It used to be the biggest of the
+    /// five in both dimensions, 19.32 x 18.48 against the clock's 18.30,
+    /// which is the wrong way round twice over.
+    #[test]
+    fn the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it() {
+        let ink = header_control_ink();
+        let of = |want: &str| {
+            ink.iter()
+                .find(|(name, _)| *name == want)
+                .unwrap_or_else(|| panic!("{want} is not on the strip"))
+                .1
+        };
+        let star = of("★");
+        for outlined in ["✉", "⏱"] {
+            let other = of(outlined);
+            let reach = other.width().max(other.height());
+            assert!(
+                star.width() <= reach + 0.01 && star.height() <= reach + 0.01,
+                "the filled star paints {:.2}x{:.2}, larger than the outlined {outlined}'s \
+                 {:.2}x{:.2} -- a solid mark already reads heavier than an outline at the \
+                 same size",
+                star.width(),
+                star.height(),
+                other.width(),
+                other.height()
             );
         }
     }

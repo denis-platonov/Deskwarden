@@ -143,6 +143,13 @@ check comes back **in addition to** this one, not instead of it. See
   rest. It is still never red — that is the point of the rule, because a
   Delete that arms on its first click is one control away — and a neutral
   grey was never at risk of being mistaken for it.
+- **The five header icons read as one set.** They always shared a hit target —
+  all five sit in the same 34pt square — but the marks drawn inside them did
+  not match ("also those icons are not same size feels like"). Measured, the
+  close ✕ covered 12.3pt against 15.4 to 19.3 for everything else, and the
+  favourite ★ was the largest thing on the strip despite being the only one
+  that fills in. The ✕ is now drawn at the ⋮'s size and the ★ at the ⏱'s. The
+  ✉ and the ⋮ are untouched.
 
 ## 0.8.3 - 2026-08-19
 
