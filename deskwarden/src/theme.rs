@@ -1308,8 +1308,31 @@ pub fn close_glyph(ui: &mut Ui) -> Response {
 // module's test.
 // ---------------------------------------------------------------------------
 
-/// Vertices in the star's outline: five points and five valleys.
-pub const STAR_VERTICES: usize = 10;
+/// Corners in the star's skeleton: five points and five valleys.
+///
+/// The skeleton is not the outline. Every one of these ten corners is
+/// replaced by a rounding arc in [`star_outline`], so the path that reaches
+/// the screen has [`STAR_VERTICES`] points and not ten.
+const STAR_CORNERS: usize = 10;
+
+/// Samples along each corner's rounding arc, endpoints included, so a corner
+/// contributes `STAR_ROUND_SEGMENTS + 1` points.
+///
+/// Three. The arc it draws is about 1.5px long at the shipped size, and a
+/// quadratic Bézier across 1.5px is already smooth at four samples; more of
+/// them buy nothing a person can see and cost vertices in every frame the
+/// detail pane is drawn in.
+const STAR_ROUND_SEGMENTS: usize = 3;
+
+/// Vertices in the star's outline: one rounding arc per [`STAR_CORNERS`].
+///
+/// **It was 10** -- one point per corner, back when the corners were sharp.
+/// The number itself is this file's business; what is not is that it stays
+/// distinct from every other closed path this crate strokes, because
+/// [`icon_probe`] tells the marks apart by point count and nothing else.
+/// [`no_two_drawn_icons_share_a_vertex_count`] is the live guard, which is
+/// why the arithmetic is written out here rather than the answer.
+pub const STAR_VERTICES: usize = STAR_CORNERS * (STAR_ROUND_SEGMENTS + 1);
 
 /// Samples along the eye's upper lid.
 const EYE_LID_SEGMENTS: usize = 12;
@@ -1535,36 +1558,114 @@ const TUNE_KNOB_OFFSETS: [f32; TUNE_ROWS] = [-3.4, 2.6];
 /// carries, are unchanged.
 pub const ICON_STROKE: f32 = 1.3;
 
-/// The five-pointed star's outline, starting at the top point.
+/// How far in from the tip the star's outline leaves the skeleton, as a
+/// fraction of the edge it leaves along.
+///
+/// **This is what rounds the points, and it is geometry rather than a stroke
+/// setting.** The previous version got its blunting from a fat
+/// [`STAR_STROKE`], because egui's `Stroke` has no join style and a heavy
+/// width makes the miter clamp visible. That worked and it cost the mark its
+/// weight: the star was the only thing on the header strip not drawn at
+/// [`ICON_STROKE`], which is exactly what "the star looks too bold compared
+/// to the other glyphs" is a report of. Cutting the corner in the PATH
+/// separates the two -- the tip is as blunt as this number says, at whatever
+/// weight the family is drawn at.
+const STAR_TIP_ROUND: f32 = 0.32;
+
+/// The same, for the five valleys between the points.
+///
+/// **Smaller than [`STAR_TIP_ROUND`] on purpose.** The tips are the acute
+/// corners and the ones a person calls spiky; the valleys are already
+/// obtuse, and rounding them as hard as the tips shallows them until the
+/// five points stop separating and the mark drifts towards a blob -- which
+/// is the failure the old 0.382-ratio comment was reaching for when it said
+/// "flower".
+///
+/// The pair also has an invariant: `STAR_TIP_ROUND + STAR_VALLEY_ROUND < 1`,
+/// or the trims taken from the two ends of a single edge overlap and the
+/// outline crosses itself. 0.44 leaves plenty of room, and
+/// [`the_stars_rounded_corners_do_not_eat_their_own_edges`] holds it.
+///
+/// 0.12 rather than something nearer the tip's number is a MEASURED
+/// retreat. A first pass at 0.24 was rendered and looked at, and the five
+/// points stopped separating -- the mark read as a rounded pentagon with
+/// bumps, not as a star. The valleys are what make a star a star.
+const STAR_VALLEY_ROUND: f32 = 0.12;
+
+/// The star's valley radius as a fraction of its point radius -- how FAT the
+/// five points are.
+///
+/// Deliberately NOT 1/φ² (0.382), the regular pentagram's ratio: that is the
+/// geometrically pure star, and at 18px it reads as thin and dated, the
+/// points long spikes with very little body. It was raised to 0.50 once
+/// already for that reason. **It has come back DOWN to 0.46, and that is the
+/// finding.** The report asked for "more rounded (wider) edges so it looks
+/// bit more modern", and the obvious reading -- push the ratio further up,
+/// to 0.56, so the points fatten -- was tried, rendered and rejected by
+/// looking at it: combined with the corner fillets it left a mark whose
+/// valleys were too shallow to separate the points, so it read as a rounded
+/// pentagon rather than as a star. Width and roundness are what was asked
+/// for; a ratio that high buys them by spending the shape.
+///
+/// So the roundness comes from [`STAR_TIP_ROUND`], which is a fillet and
+/// costs the valleys nothing, and the ratio moves the other way to give the
+/// valleys back their depth. 0.46 puts the point at 46.6°, sharper than the
+/// 52.5° it had, but the tip a person actually sees is the 0.32 fillet
+/// across it and not that angle.
+///
+/// The old comment here claimed anything past 0.382 "reads as a flower".
+/// Measured, the flower turns up well before it was expected to once the
+/// corners are rounded as well -- so the claim was right about the failure
+/// and wrong about where it starts. Recorded because it is the reason the
+/// ratio went unquestioned for so long, and because the next person to reach
+/// for a fatter star should know the ceiling is real.
+const STAR_INNER_RATIO: f32 = 0.46;
+
+/// The five-pointed star's outline, starting just short of the top point.
 ///
 /// Built around the origin and then translated so its own BOUNDING BOX --
 /// not the circle its points lie on -- is centred on `center`, exactly as
 /// [`pencil_glyph_at`] does and for the same reason: a pentagram has one
-/// point above and two below, so its extent is 9 up and 7.3 down, and
+/// point above and two below, so its extent is taller above than below, and
 /// anchoring by the circle's centre leaves it sitting visibly high in a
 /// square hit target.
+///
+/// **Every corner is an arc, not a point.** The ten skeleton corners are
+/// laid out as before and then each is replaced by a quadratic Bézier that
+/// leaves the incoming edge at [`STAR_TIP_ROUND`]/[`STAR_VALLEY_ROUND`] of
+/// its length, passes the corner as its control point, and rejoins the
+/// outgoing edge the same distance along. A quadratic with the corner as
+/// control is tangent to both edges at its ends, so the result is a true
+/// fillet with no crease where it meets the straights -- the round join
+/// egui's `Stroke` cannot be asked for, drawn into the path where it also
+/// applies to the FILLED state.
 fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
-    // Deliberately NOT 1/φ² (0.382), the regular pentagram's valley-to-point
-    // ratio. That is the geometrically pure star, and at 18px it reads as
-    // thin and dated -- the points are long spikes with very little body.
-    // 0.50 fills them out while keeping the tips sharp, which is the whole
-    // point of choosing it over a rounded-join treatment: fatter, not softer.
-    //
-    // The old comment here claimed anything larger than 0.382 "reads as a
-    // flower". That is only true much further up -- a star does not round off
-    // into a flower until the valleys are shallow enough to lose the tips,
-    // which is well past 0.5. Recorded because the claim was the reason the
-    // ratio went unquestioned.
-    let inner = outer * 0.50;
-    let local: Vec<Vec2> = (0..STAR_VERTICES)
-        .map(|i| {
-            let radius = if i % 2 == 0 { outer } else { inner };
-            // -90° so a POINT is at the top, not a valley.
-            let angle = -std::f32::consts::FRAC_PI_2
-                + i as f32 * std::f32::consts::TAU / STAR_VERTICES as f32;
-            Vec2::new(radius * angle.cos(), radius * angle.sin())
-        })
-        .collect();
+    let inner = outer * STAR_INNER_RATIO;
+    let corner = |i: usize| {
+        let radius = if i % 2 == 0 { outer } else { inner };
+        // -90° so a POINT is at the top, not a valley.
+        let angle = -std::f32::consts::FRAC_PI_2
+            + i as f32 * std::f32::consts::TAU / STAR_CORNERS as f32;
+        Vec2::new(radius * angle.cos(), radius * angle.sin())
+    };
+    let mut local: Vec<Vec2> = Vec::with_capacity(STAR_VERTICES);
+    for i in 0..STAR_CORNERS {
+        let here = corner(i);
+        let before = corner((i + STAR_CORNERS - 1) % STAR_CORNERS);
+        let after = corner((i + 1) % STAR_CORNERS);
+        // A star polygon's ten edges are all the same length, so a fraction
+        // of the vector to the neighbour IS a fraction of the edge and no
+        // normalise-then-scale is needed.
+        let cut = if i % 2 == 0 { STAR_TIP_ROUND } else { STAR_VALLEY_ROUND };
+        let from = here + (before - here) * cut;
+        let to = here + (after - here) * cut;
+        for step in 0..=STAR_ROUND_SEGMENTS {
+            let t = step as f32 / STAR_ROUND_SEGMENTS as f32;
+            let u = 1.0 - t;
+            local.push(from * (u * u) + here * (2.0 * u * t) + to * (t * t));
+        }
+    }
+    debug_assert_eq!(local.len(), STAR_VERTICES);
     let top = local.iter().fold(f32::INFINITY, |a, p| a.min(p.y));
     let bottom = local.iter().fold(f32::NEG_INFINITY, |a, p| a.max(p.y));
     let offset = Vec2::new(0.0, -(top + bottom) / 2.0);
@@ -1574,11 +1675,21 @@ fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
 /// Paints the star at `center`, filled or outlined, in one colour.
 /// Stroke width for the favourite star, in both states.
 ///
-/// This is a shape control, not a line weight: see the comment in
-/// [`paint_star`] for why the width is what blunts the points. 2.2 at an
-/// outer radius of 9 is roughly a quarter of the tip's own length, which is
-/// where the mark stops reading as spiky without losing the five points.
-const STAR_STROKE: f32 = 2.2;
+/// **It was 2.2, and that is what the report was about.** "Star (fav) glyph
+/// looks too bold now compared to the other glyphs" -- and measured, it was
+/// the only mark on the header strip not drawn at [`ICON_STROKE`]: the
+/// envelope, the clock, the kebab's dots and the eye beside it are all 1.3,
+/// and 2.2 is 69% more ink along every millimetre of the same outline. The
+/// star's own doc for that width said so outright, calling it "deliberately
+/// heavy" -- it was carrying the corner rounding, because egui's `Stroke`
+/// offers no join style and a wide line makes the miter clamp visible.
+///
+/// [`STAR_TIP_ROUND`] carries the rounding now, in the path, so the width no
+/// longer has a second job and can simply be the family's. Measured on the
+/// rendered strip that nearly halves the outlined star's ink (123.6 -> 70.8
+/// square px of stroke) and takes 12% off the filled one, without touching
+/// what the mark is.
+const STAR_STROKE: f32 = ICON_STROKE;
 
 /// The favourite star's outer radius, as [`star_outline`] takes it.
 ///
@@ -1589,59 +1700,90 @@ const STAR_STROKE: f32 = 2.2;
 /// it is on, and a solid shape already reads heavier than an outline at the
 /// same extent, so it should be the smallest of the set and not the biggest.
 ///
-/// 8.46 is derived, not picked: [`star_outline`] scales linearly with this,
-/// [`STAR_STROKE`] adds a fixed 2.2 on top of it, and 8.46 is what solves
-/// `outline_width + 2.2 = 18.30` for the clock's own extent. The result is
-/// 18.29x17.50 -- level with the clock across, a little under it down,
-/// which is where a pentagram sits when it is no longer the loudest thing on
-/// the strip. Pinned by
-/// [`the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it`].
+/// 8.46 solved `outline_width + STAR_STROKE = 18.30` for the clock's own
+/// extent back when [`STAR_STROKE`] was 2.2, and landed the mark at
+/// 18.29x17.50 -- level with the clock across. **That answer was measured
+/// against the wrong quantity.** Squaring a FILLED mark to an outlined one's
+/// bounding box equalises the boxes and not the ink, and the report that
+/// followed ("looks too bold") was about the ink: at 18.29 across, solid, the
+/// star painted 167 square px against the envelope's 118 and the clock's 90,
+/// and no bounding box was going to show that.
+///
+/// 9.20 is measured against the ink instead. With the corners rounded
+/// ([`STAR_TIP_ROUND`]) and the weight back at [`ICON_STROKE`], it paints
+/// 17.01x16.24 and 147 square px filled, 71 outlined -- and 17.01 is
+/// deliberately BETWEEN the strip's two tiers rather than in either. The
+/// edge marks (✉ 19.30x14.30, ⏱ 18.30x18.30) reach their extremes at a few
+/// points and need the box; the sparse marks (⋮ 3.40x15.40, ✕ 15.40x15.40)
+/// would read as the biggest thing on the strip at that size. A solid star
+/// is neither: it fills its box the way neither tier does, so it earns its
+/// own position just above the sparse tier and well below the edge one. The
+/// tiers are not collapsed by this -- all three sizes stay distinct and
+/// [`the_favourite_star_is_no_larger_than_the_outlined_marks_beside_it`]
+/// still holds them apart.
 ///
 /// Named rather than left inline for the reason the rest of this family is
 /// named: a number written at one call site is a number nobody can find when
 /// the next report arrives.
-const STAR_OUTER: f32 = 8.46;
+const STAR_OUTER: f32 = 9.20;
 
 fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
     let points = star_outline(center, outer);
     let painter = ui.painter();
     if filled {
-        // A pentagram is CONCAVE, so `convex_polygon` over its ten vertices
+        // A pentagram is CONCAVE, so `convex_polygon` over its outline
         // would tessellate to garbage. It is star-shaped about its own
         // centre, though, so a triangle fan from there is exact -- and every
         // triangle in it is convex. The apex is the mean of the outline's
         // own vertices, NOT `center`, which `star_outline` has offset away
         // from the star's geometric middle.
+        //
+        // **One MESH, not one filled shape per triangle**, and the
+        // difference is visible rather than a tidiness. Each
+        // `Shape::convex_polygon` is tessellated on its own WITH its own
+        // anti-aliased feather, so a fan of them lays a soft edge down the
+        // inside of every spoke: adjacent triangles double up where their
+        // feathers overlap and fall short where they do not, which is the
+        // mottling the old fan showed through its fill. Rounding the corners
+        // made it worse by multiplying the fan four-fold, and at
+        // [`STAR_ROUND_SEGMENTS`] the arc triangles are slivers narrow
+        // enough that one of them tessellated to a detached speck outside
+        // the mark. A mesh shares its vertices, so there are no interior
+        // edges to feather at all and no sliver has an edge of its own; the
+        // outline stroked over it is what gives the silhouette its
+        // anti-aliasing, which is the one place it belongs.
         let apex = points
             .iter()
             .fold(Vec2::ZERO, |a, p| a + p.to_vec2())
             .to_pos2()
             / points.len() as f32;
-        for i in 0..points.len() {
-            painter.add(egui::Shape::convex_polygon(
-                vec![apex, points[i], points[(i + 1) % points.len()]],
-                color,
-                Stroke::NONE,
-            ));
+        let mut fan = egui::epaint::Mesh::default();
+        fan.colored_vertex(apex, color);
+        for point in &points {
+            fan.colored_vertex(*point, color);
         }
+        for i in 0..points.len() as u32 {
+            fan.add_triangle(0, 1 + i, 1 + (i + 1) % points.len() as u32);
+        }
+        painter.add(egui::Shape::mesh(fan));
     }
     // Always, in both states: outlined it IS the star, and filled it covers
     // the hairline seams anti-aliasing leaves between adjacent fan triangles.
     // It is also what [`icon_probe::stars`] finds, so both states are equally
     // visible to a test.
     //
-    // **The width is what rounds the tips**, and it is deliberately heavy.
-    // egui's `Stroke` exposes no join style, so there is no `linejoin: round`
-    // to ask for; what it does instead is clamp the miter length at sharp
-    // corners, which bevels them. At a hairline that bevel is invisible and
-    // the star reads as five spikes. At [`STAR_STROKE`] the bevel is a
-    // meaningful fraction of the tip, so the points blunt and the whole mark
-    // fattens -- the same thing a round join would do here, arrived at
-    // through the one control this toolkit gives.
+    // **The width no longer rounds anything** -- [`star_outline`] does, in
+    // the path. That is the whole of the change: egui's `Stroke` exposes no
+    // join style, so a wide line's miter clamp used to be the only blunting
+    // available here, and paying for it in weight is what made this the one
+    // mark on the strip heavier than [`ICON_STROKE`]. A fillet in the path
+    // is free of that, and it rounds the FILLED silhouette too, which a
+    // stroke-side trick never could.
     //
-    // It applies to both states so the filled and outlined stars are the
-    // same silhouette. A thinner stroke under the fill would leave the "on"
-    // star visibly pointier than the "off" one, which reads as two icons.
+    // The width still applies to both states, and for the unchanged reason:
+    // a thinner stroke under the fill would leave the "on" star a different
+    // size from the "off" one, which reads as two icons rather than two
+    // states of one.
     painter.add(egui::Shape::closed_line(points, Stroke::new(STAR_STROKE, color)));
 }
 
@@ -3837,11 +3979,21 @@ mod drawn_icon_family_tests {
     /// So the tiers are asserted by NAMING a member of each rather than by
     /// writing either number down:
     ///
-    /// * the edge marks -- star, envelope, clock -- against the clock, the
-    ///   round mark none of this touched;
+    /// * the edge marks -- envelope, clock -- against the clock, the round
+    ///   mark none of this touched;
     /// * the sparse marks -- kebab, close -- against the kebab, which nobody
     ///   reported and which is therefore the evidence for where that tier
     ///   sits.
+    ///
+    /// **The star was in the first list and is not any more**, on the report
+    /// that followed this one ("Star (fav) glyph looks too bold now compared
+    /// to the other glyphs"). It is the one mark here that is SOLID when it
+    /// is on, so its box and its ink are the same thing, and squaring that
+    /// box to an outlined mark's was equalising the wrong quantity -- at
+    /// 18.29 across it painted 167 square px against the envelope's 118.
+    /// It now sits strictly between the two tiers, which the assert at the
+    /// end of this test pins by order rather than by number.  [`STAR_OUTER`]
+    /// carries the full measurement.
     ///
     /// The second tier is the whole of the repair: the ✕ was in it by kind
     /// and nowhere near it by size, 12.30 against 15.40, which is what the
@@ -3870,7 +4022,7 @@ mod drawn_icon_family_tests {
                 .collect::<Vec<_>>()
         };
         for (tier, reference, members) in [
-            ("the edge marks", "⏱", ["★", "✉", "⏱"].as_slice()),
+            ("the edge marks", "⏱", ["✉", "⏱"].as_slice()),
             ("the sparse marks", "⋮", ["⋮", "✕"].as_slice()),
         ] {
             let nominal = long(reference);
@@ -3885,13 +4037,37 @@ mod drawn_icon_family_tests {
                 );
             }
         }
-        // The control. "Each mark is near its own tier" is only worth
-        // asserting while there really are two tiers; if they ever converge
-        // this test has stopped saying anything and the simpler one-nominal
-        // rule should replace it rather than being quietly satisfied.
+        // **The star is a third tier of its own, and it is asserted by
+        // POSITION rather than by a nominal.** It was in the edge tier and
+        // squared to the clock, which equalised the bounding boxes and not
+        // the ink -- see [`STAR_OUTER`] for the measurement that refuted it.
+        // A solid mark fills its box the way neither outlined tier does, so
+        // it belongs strictly between them: bigger than the sparse marks,
+        // which are mostly whitespace, and smaller than the edge marks,
+        // whose ink is only their rim.
+        //
+        // Naming no number here is the same discipline the two loops above
+        // follow. What is pinned is the ORDER, which is the design claim;
+        // the sizes themselves stay in the constants that draw them.
         assert!(
-            long("⏱") - long("⋮") > 1.0,
-            "the two tiers have collapsed into one, so this test is no longer checking \
+            long("★") > long("⋮") && long("★") < long("⏱"),
+            "the solid star reaches {:.2}pt, which is not between the sparse marks' \
+             {:.2}pt and the edge marks' {:.2}pt -- a filled mark sits between the two \
+             tiers precisely because a bounding box does not measure its ink: {:?}",
+            long("★"),
+            long("⋮"),
+            long("⏱"),
+            all()
+        );
+        // The control. "Each mark is near its own tier" is only worth
+        // asserting while the tiers are really apart; if they ever converge
+        // this test has stopped saying anything and the simpler one-nominal
+        // rule should replace it rather than being quietly satisfied. The
+        // margin has to clear the star's own position between them, or the
+        // assert above would be satisfiable by three marks all but touching.
+        assert!(
+            long("⏱") - long("⋮") > 2.0,
+            "the tiers have collapsed together, so this test is no longer checking \
              anything: {:?}",
             all()
         );
@@ -3930,6 +4106,69 @@ mod drawn_icon_family_tests {
                 other.height()
             );
         }
+    }
+
+    /// **The star's corner fillets have to fit on the edges they are cut
+    /// from**, and nothing about the drawn result says when they stop.
+    ///
+    /// [`star_outline`] trims [`STAR_TIP_ROUND`] of an edge at the point end
+    /// and [`STAR_VALLEY_ROUND`] of the same edge at the valley end. Past a
+    /// sum of 1.0 those two trims cross, the Bézier control points swap
+    /// order along the edge, and the outline self-intersects -- which
+    /// tessellates to a mark that is still recognisably a star and is
+    /// subtly, permanently wrong in its fill. There is no assertion in the
+    /// painter that could catch it, because both states still paint.
+    ///
+    /// So it is checked here, and on the OUTLINE rather than on the two
+    /// constants. Comparing the constants would be a truth about two
+    /// literals -- something the compiler can fold and clippy says so -- and
+    /// it would not survive [`star_outline`] being rewritten around them.
+    /// Measuring the straight run left between one corner's fillet and the
+    /// next one's is a fact about the shape that reaches the screen, at the
+    /// size it is shipped at.
+    #[test]
+    fn the_stars_rounded_corners_do_not_eat_their_own_edges() {
+        let points = star_outline(Pos2::ZERO, STAR_OUTER);
+        let arc = STAR_ROUND_SEGMENTS + 1;
+        for corner in 0..STAR_CORNERS {
+            // Where this corner's fillet lets go of the edge, to where the
+            // next one takes hold of it.
+            let run = points[corner * arc + arc - 1]
+                .distance(points[((corner + 1) % STAR_CORNERS) * arc]);
+            assert!(
+                run > 1.0,
+                "the star's corner {corner} leaves only {run:.2}pt of straight edge before \
+                 the next corner's fillet starts -- at zero the two fillets meet, past it \
+                 they cross and the outline self-intersects, and either way the shape has \
+                 stopped having edges to read as a star by"
+            );
+        }
+        // **And the five points still project.** This is the failure that
+        // was actually rendered and rejected on the way here: at
+        // STAR_INNER_RATIO 0.56 with the valleys filleted at 0.24, the star
+        // read as a rounded pentagon with bumps on it -- every assertion in
+        // this file passed and the mark had stopped being a star.
+        //
+        // Measured as how deep the valleys come in against how far the
+        // points reach out, both from the outline's own centroid, so it
+        // holds whatever combination of ratio and fillet produces them.
+        // Shipped it is 0.54; the pentagon that was rejected measured 0.66.
+        let middle = points
+            .iter()
+            .fold(Vec2::ZERO, |a, p| a + p.to_vec2())
+            .to_pos2()
+            / points.len() as f32;
+        let reach = points.iter().fold(0.0_f32, |a, p| a.max(p.distance(middle)));
+        let valley = points
+            .iter()
+            .fold(f32::INFINITY, |a, p| a.min(p.distance(middle)));
+        assert!(
+            valley / reach < 0.60,
+            "the star's valleys reach {valley:.2}pt against its points' {reach:.2}pt, a \
+             ratio of {:.3} -- past 0.60 the points stop separating and the mark reads as \
+             a rounded pentagon rather than as a star",
+            valley / reach
+        );
     }
 
     /// **This app strokes three different ✕ marks, and `icon_probe` tells
@@ -4434,11 +4673,19 @@ pub mod icon_probe {
     /// The favourite stars this shape tree paints, in both states -- the
     /// filled star carries the same outline the outlined one does, plus the
     /// triangle fan that fills it (see `paint_star`).
+    ///
+    /// **The fan is a `Shape::Mesh` and this used to look for three-point
+    /// filled paths.** It changed with the mark: a fan of separately
+    /// tessellated triangles laid a visible seam down every spoke, so
+    /// `paint_star` emits one mesh instead. A mesh is a *better* anchor than
+    /// the old triangles were -- nothing else in this crate paints one
+    /// (images do, but through `Shape::Image`), where a filled triangle was
+    /// close enough to the envelope's flap that
+    /// [`the_envelope_flap_is_not_findable_as_a_star_fill`] had to exist to
+    /// hold them apart.
     pub fn stars(shape: &egui::Shape) -> Vec<Star> {
-        let mut triangles = Vec::new();
-        walk(shape, &mut triangles, &|s| {
-            matches!(s, egui::Shape::Path(p) if p.points.len() == 3 && p.fill != Color32::TRANSPARENT)
-        });
+        let mut fills = Vec::new();
+        walk(shape, &mut fills, &|s| matches!(s, egui::Shape::Mesh(_)));
         let mut strokes = Vec::new();
         walk_paths(shape, STAR_VERTICES, &mut strokes);
         strokes
@@ -4446,7 +4693,7 @@ pub mod icon_probe {
             .map(|(rect, stroke)| Star {
                 rect,
                 stroke,
-                filled: triangles.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
+                filled: fills.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
             })
             .collect()
     }

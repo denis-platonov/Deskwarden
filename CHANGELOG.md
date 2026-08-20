@@ -10,6 +10,25 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### The favourite star is lighter, rounder and no longer the loudest mark
+
+Reported as "Star (fav) glyph looks too bold now compared to the other
+glyphs, and maybe there is some with more rounded (wider) edges so it looks
+bit more modern".
+
+- **It was the only mark on the detail header not drawn at the family's line
+  weight** -- 2.2 against everything else's 1.3, because the fat line was
+  what blunted the star's points. The rounding moved into the shape itself,
+  so the weight could go back to the family's. The outlined star's ink drops
+  by 44% on the rendered strip.
+- **Every corner is a proper fillet now**, in the path, so the filled star is
+  rounded too -- which a stroke-side trick could never do.
+- **A little smaller, with the valleys kept deep**, so the five points still
+  read as points: 17.01 x 16.24 against the old 18.29 x 17.50, and 12% less
+  ink when it is filled.
+- **The filled star no longer shows seams through itself.** It was drawn as a
+  fan of separately anti-aliased triangles; it is one mesh.
+
 ### Browsers no longer get the "no saved login" card
 
 In a browser that card could never be right. Every sign-in page has a password
