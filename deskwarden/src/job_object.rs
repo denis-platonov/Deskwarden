@@ -1362,6 +1362,15 @@ mod tests {
         // showing a spinner.
         ("app_window.rs", 5),
         ("breach.rs", 2),
+        // One: the worker a `breach_scan` run starts. There are up to
+        // `breach_scan::MAX_IN_FLIGHT` of them at a time, from this ONE site
+        // in a loop -- the census counts sites, not threads, and the ceiling
+        // on threads is the whole politeness policy toward a free public API.
+        // Not a tick in a frame loop for `update_panel`'s reason exactly:
+        // a whole-vault scan is seconds to minutes of network, and the loop
+        // it would have to run on is not running while the window that
+        // started it is open.
+        ("breach_scan.rs", 1),
         // One: the waiter that sleeps out `clipboard::DEFAULT_CLEAR_AFTER` and then
         // takes a copied secret back off the clipboard. A thread rather than a
         // tick in some frame loop because the vault window can be closed --

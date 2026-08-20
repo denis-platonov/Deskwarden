@@ -1466,6 +1466,30 @@ fn main() {
         debug_assert!(installed, "the update environment was installed twice");
     }
 
+    // The breach scan's environment, installed here for exactly the reason
+    // the update flow's is: the Preferences window is a blocking window in
+    // one shell and a modal in another, neither owns the vault, and the page
+    // that shows the findings is in a third place. See `breach_scan`'s
+    // header.
+    //
+    // **`items` is a closure, not a snapshot.** A vault captured here would
+    // be the vault as it was at startup, and a scan started an hour later
+    // would check passwords the user has since changed.
+    //
+    // `live_check` is named here and nowhere else in this crate. Nothing in
+    // this block starts a scan: `ScanPanel::begin_scan` is behind the one
+    // button on the Breaches page, and `breach_scan`'s own source walk fails
+    // if a second caller ever appears.
+    {
+        let cache_for_scan = estate.cache.clone();
+        let installed = deskwarden::breach_scan::install_env(deskwarden::breach_scan::ScanEnv {
+            items: std::sync::Arc::new(move || cache_for_scan.items()),
+            check: deskwarden::breach_scan::live_check(),
+            history_path: deskwarden::scan_history::default_path(),
+        });
+        debug_assert!(installed, "the scan environment was installed twice");
+    }
+
     // The update check talks to an external host and, prior to this fix, ran
     // synchronously here -- before the tray, hotkey, and window-watch thread
     // even existed -- so a stalled `api.github.com` connection hung the
@@ -1720,6 +1744,11 @@ fn main() {
                 // `process::exit` actually tearing the process down.
                 log::info!("quit requested from tray; killing bw serve");
                 estate.cache.clear();
+                // And what the last breach scan found, for the same
+                // reason and in the same breath: "item X is breached" is a
+                // claim about this vault's contents, and it must not outlive
+                // them. See `breach_scan::clear`.
+                deskwarden::breach_scan::clear();
                 // **And the clipboard, for exactly the reason the line above
                 // gives.** The clipboard outlives this process: a password
                 // copied a moment ago would otherwise still be pasteable long
@@ -3671,6 +3700,9 @@ fn take_the_session_down_after_a_second_lock(
     bw_serve_child: &mut Option<Child>,
 ) {
     cache.clear();
+    // And the last scan's findings, which are a claim about the contents this
+    // line has just dropped. See `breach_scan::clear`.
+    deskwarden::breach_scan::clear();
     if let Some(child) = bw_serve_child.as_mut() {
         bw_serve::stop_bw_serve(child);
     }
@@ -5927,6 +5959,10 @@ fn resettle_session_with(
     // passwords under the new session, indefinitely if `bw sync` then
     // fails offline.
     cache.clear();
+    // The scan findings go with it, and for the stronger version of the same
+    // reason: they are keyed on THIS account's item ids, and the next unlock
+    // may be a different account entirely. See `breach_scan::clear`.
+    deskwarden::breach_scan::clear();
     if backend_is_running(bw_serve_child) {
         if let Some(child) = bw_serve_child.as_mut() {
             bw_serve::stop_bw_serve(child);

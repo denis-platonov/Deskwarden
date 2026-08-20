@@ -246,6 +246,29 @@ enum Surface {
     /// The old flow's failure went to a tray tooltip, visible only to someone
     /// already hovering a 16px icon.
     PrefsAboutFailed,
+    /// **The Breaches page, before anything has been asked for.** The consent
+    /// pill, the scan button, the sentence saying the button ignores the
+    /// pill, and an empty history that says so in words rather than being a
+    /// blank panel.
+    ///
+    /// Its own surface because the whole point of the page is that those four
+    /// things are readable in one glance -- which is a claim about a picture
+    /// and not about the order of painted rects.
+    PrefsBreachesIdle,
+    /// **A scan in flight, with failures already counted.** The state this
+    /// design is arranged around: a run that will end with forty failures
+    /// must not look clean while it runs, and the progress line has to fit
+    /// beside a disabled button that has not vanished.
+    PrefsBreachesRunning,
+    /// **A finished run that could not check most of what it asked about.**
+    /// The failure count is the last thing the sentence says, because it
+    /// qualifies everything before it, and the history row for such a run is
+    /// painted in the error ink rather than as an ordinary result.
+    PrefsBreachesFailed,
+    /// **The history under the button**, several runs deep, each with its own
+    /// local timestamp and outcome -- including one that failed, so the two
+    /// inks are in one picture.
+    PrefsBreachesHistory,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -374,6 +397,10 @@ const ALL: &[Surface] = &[
     Surface::PrefsWindowChrome,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
+    Surface::PrefsBreachesIdle,
+    Surface::PrefsBreachesRunning,
+    Surface::PrefsBreachesFailed,
+    Surface::PrefsBreachesHistory,
     Surface::VaultList,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -413,6 +440,10 @@ impl Surface {
             Surface::PrefsWindowChrome => "prefs_window_chrome",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
+            Surface::PrefsBreachesIdle => "prefs_breaches_idle",
+            Surface::PrefsBreachesRunning => "prefs_breaches_running",
+            Surface::PrefsBreachesFailed => "prefs_breaches_failed",
+            Surface::PrefsBreachesHistory => "prefs_breaches_history",
             Surface::VaultList => "vault_item_list",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -475,7 +506,11 @@ impl Surface {
             | Surface::PrefsAboutUpdateShortNotes
             | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
-            | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
+            | Surface::PrefsAboutFailed
+            | Surface::PrefsBreachesIdle
+            | Surface::PrefsBreachesRunning
+            | Surface::PrefsBreachesFailed
+            | Surface::PrefsBreachesHistory => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
             // The WHOLE window, chrome included -- the one prefs surface that
             // is not the body alone, because the seam it exists to show is
             // between the two.
@@ -829,6 +864,10 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
+            Surface::PrefsBreachesIdle
+            | Surface::PrefsBreachesRunning
+            | Surface::PrefsBreachesFailed
+            | Surface::PrefsBreachesHistory => self.draw_prefs_breaches(root, self.current()),
             Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
@@ -1110,6 +1149,70 @@ impl Preview {
     /// `prefs_ui::draw_prefs_window` is the exact function `run` calls every
     /// frame, so what this picture says about the seam between the chrome and
     /// the rail is what the real window says.
+    /// The Breaches page, in each of the four states worth looking at.
+    ///
+    /// **Nothing here can reach the network, and that is structural rather
+    /// than careful.** The panel is parked in a stage with no receiver behind
+    /// it (`PrefsState::show_scan_stage`), and the flow refuses to start any
+    /// work at all without a process-wide `breach_scan::ScanEnv` -- which
+    /// only `main.rs` installs and this example does not. So a preview run
+    /// makes no request and spawns no thread even if a frame's button were
+    /// somehow clicked.
+    ///
+    /// The history is supplied here rather than read off disk: this example
+    /// must not touch `%APPDATA%\Deskwarden`, and the instants below are
+    /// stated so the picture is the same one twice running.
+    fn draw_prefs_breaches(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::breach_scan::ScanStage;
+        use deskwarden::scan_history::{ScanHistory, ScanRecord};
+
+        // 2026-08-18T00:30:00Z, and the days before it. Rendered in the
+        // machine's own timezone, which is the rule -- see `local_time`.
+        const AT: i64 = 1_787_013_000_000;
+        const DAY: i64 = 86_400_000;
+        let entry = |ago: i64, checked: u32, items: u32, found: u32, failed: u32| ScanRecord {
+            finished_at_unix_millis: AT - ago * DAY,
+            passwords_checked: checked,
+            items_covered: items,
+            found,
+            failed,
+        };
+
+        let failed_run = entry(0, 128, 1_600, 3, 40);
+        let stage = match surface {
+            Surface::PrefsBreachesRunning => {
+                ScanStage::Running { done: 61, total: 128, found: 3, failed: 40 }
+            }
+            Surface::PrefsBreachesFailed => ScanStage::Finished(failed_run),
+            _ => ScanStage::Idle,
+        };
+        let history = match surface {
+            // The empty state is a result and not a blank panel, so it is a
+            // picture of its own.
+            Surface::PrefsBreachesIdle | Surface::PrefsBreachesRunning => Vec::new(),
+            Surface::PrefsBreachesFailed => vec![failed_run],
+            // Several runs deep, and DELIBERATELY mixed: a clean run, a run
+            // that found something, and a run that could not check most of
+            // what it asked about -- so the two inks the list uses are both
+            // in one picture and can be told apart.
+            _ => vec![
+                entry(0, 128, 1_600, 3, 0),
+                entry(1, 127, 1_598, 0, 12),
+                entry(4, 126, 1_590, 1, 0),
+                entry(11, 120, 1_502, 0, 0),
+            ],
+        };
+
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+        state.show(prefs_ui::Section::Breaches);
+        state.show_scan_stage(stage);
+        state.show_scan_history(ScanHistory { entries: history });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
+    }
+
     fn draw_prefs_window(&mut self, root: &mut egui::Ui) {
         theme::paint_window_background(root);
         let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());

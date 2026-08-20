@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 51] = [
+        const OPENS_NO_WINDOW: [&str; 52] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1060,6 +1060,10 @@ mod tests {
             // Hashes a password and talks to the Have I Been Pwned range
             // API. Pure logic plus one HTTP call; it draws nothing.
             "breach",
+            // The whole-vault breach scan: a plan, a worker pool and a state
+            // machine the Preferences page draws. It opens no window of its
+            // own -- the page that draws it is `prefs_ui`.
+            "breach_scan",
             "bw_path",
             "bw_serve",
             // The card network table: a prefix lookup and two string masks,

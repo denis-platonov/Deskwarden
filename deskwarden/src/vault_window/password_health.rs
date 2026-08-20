@@ -141,8 +141,14 @@ pub const HEALTH_PANE_TITLE: &str = "Password health";
 /// where_it_actually_is` reads `prefs_ui.rs` off disk and fails if the two
 /// ever disagree, so renaming the preference and leaving this sentence
 /// behind reds the suite rather than sending the user hunting.
+///
+/// **The PAGE is checked too, and it was the half that went stale.** The
+/// setting moved from General to its own Breaches page -- beside the scan
+/// button it does not govern -- and a sentence still naming General would
+/// have sent the reader to a page that exists and does not have it on, which
+/// is the most confusing of the available wrong answers.
 pub const BREACH_SETTING_LOCATION: &str =
-    "Preferences > General > \"Check passwords against known breaches\"";
+    "Preferences > Breaches > \"Check passwords against known breaches\"";
 
 /// One item a finding is about: enough to draw its row and to select it, and
 /// **nothing else**.
@@ -238,7 +244,15 @@ impl HealthReport {
 /// Returns a borrow. It does not clone, and must not be made to: a clone is a
 /// second plaintext copy on the heap, and the only reason this function
 /// exists is so that there is exactly one place that decides what counts.
-fn password_of(item: &VaultItem) -> Option<&str> {
+///
+/// `pub(crate)` rather than private, and only for [`crate::breach_scan`],
+/// which plans a scan over **the same set of items this report is over**. A
+/// second "does this item have a password" rule over there would let a scan
+/// check an item this report does not list, or skip one it does, and the user
+/// would have no way to tell which of the two was lying -- exactly the
+/// argument the module docs make for having one weakness rule and two
+/// surfaces.
+pub(crate) fn password_of(item: &VaultItem) -> Option<&str> {
     item.login
         .as_ref()
         .and_then(|login| login.password.as_ref())
@@ -1455,6 +1469,22 @@ mod tests {
             text.contains(&format!("{label:?}")),
             "`prefs_ui.rs` has no row labelled {label:?} any more, so \
              `BREACH_SETTING_LOCATION` sends the user to a preference that is not there"
+        );
+
+        // **And the PAGE, not only the row.** The page name is the half that
+        // went stale when the setting moved, and a wrong page name is worse
+        // than a wrong row name: the reader arrives somewhere real, does not
+        // find the switch, and concludes the app is describing a feature it
+        // does not have.
+        let page = BREACH_SETTING_LOCATION
+            .split(" > ")
+            .nth(1)
+            .expect("the location string names a page between two chevrons");
+        assert_eq!(page, "Breaches", "control: the parse");
+        assert!(
+            text.contains(&format!("=> {page:?},")),
+            "`prefs_ui.rs` has no nav section labelled {page:?}, so \
+             `BREACH_SETTING_LOCATION` names a page that is not in that window"
         );
     }
 

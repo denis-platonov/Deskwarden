@@ -29,6 +29,10 @@ pub mod backend_policy;
 #[cfg(test)]
 pub mod below_cut;
 pub mod breach;
+/// The whole-vault breach scan the Preferences page drives: one lookup per
+/// distinct password, bounded concurrency, failures counted out loud, and
+/// nothing that starts on its own.
+pub mod breach_scan;
 /// `#[cfg(test)]` for [`below_cut`]'s reason: it reads this crate's own
 /// source text to guard it, and nothing in it can ship.
 #[cfg(test)]

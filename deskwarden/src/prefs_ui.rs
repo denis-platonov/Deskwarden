@@ -158,6 +158,29 @@ const BREACH_DESCRIPTION: &str = "Off by default. When on, Deskwarden sends the 
      characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this \
      machine. Your password, and the rest of its hash, never leave your PC.";
 
+/// The scan card's own heading, in `UPDATE_SECTION_LABEL`'s idiom.
+const SCAN_SECTION_LABEL: &str = "Scan the whole vault";
+const SCAN_BUTTON: &str = "Scan all passwords now";
+const SCAN_RUNNING_BUTTON: &str = "Scanning...";
+/// **Says what a scan costs before it is started**, in requests and in what
+/// leaves the machine, because the button beside it is the one control in
+/// this app that makes hundreds of outbound calls from a single click.
+const SCAN_IDLE_DESCRIPTION: &str = "Checks every saved password against Have I Been Pwned, one \
+     request per distinct password -- so a vault full of reused passwords is far fewer requests \
+     than it has items. Only the first 5 characters of each hash leave your PC.";
+/// The empty state of the history list. A result, not a blank panel: see
+/// `password_health`'s summary for the same argument.
+const SCAN_NO_HISTORY: &str = "No scan has been run yet.";
+const SCAN_HISTORY_LABEL: &str = "Previous scans";
+/// What the page says when the vault has nothing to check. Its own wording,
+/// not "0 found": those are different results.
+const SCAN_NOTHING_DESCRIPTION: &str = "There are no saved passwords in this vault to check. \
+     Cards, notes, SSH keys and logins with an empty password are not checked.";
+/// The state no shipped build reaches -- rendered honestly rather than as a
+/// button that does nothing.
+const SCAN_UNAVAILABLE_DESCRIPTION: &str = "This build cannot scan: nothing set the scan up when \
+     Deskwarden started.";
+
 const FETCH_ICONS_LABEL: &str = "Show site icons";
 /// **Says what the request discloses, and says it is the DOMAIN.** This is the
 /// row for the request `PRIVACY.md` calls the one with the most privacy weight
@@ -515,6 +538,11 @@ const UPDATE_BAR_RADIUS: u8 = 4;
 /// Wide enough for the longest label above without truncating it, since a
 /// button whose text is cut is a button whose action is a guess.
 const UPDATE_BUTTON_WIDTH: f32 = 150.0;
+/// The scan button's box. Wider than [`UPDATE_BUTTON_WIDTH`] because its
+/// label is longer, and drawn on a row of its own rather than in the trailing
+/// control column -- see [`draw_breaches`], where the alternative (widening
+/// `CONTROL_COLUMN_WIDTH` for every row on every page) is spelled out.
+const SCAN_BUTTON_WIDTH: f32 = 184.0;
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -537,6 +565,19 @@ const UPDATE_BUTTON_WIDTH: f32 = 150.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     General,
+    /// **Everything about checking passwords against known breaches**: the
+    /// consent pill, the scan button, and what previous scans counted.
+    ///
+    /// Its own page rather than three more rows on General, and the toggle
+    /// moved here rather than being left behind. A pill on one page and the
+    /// button it does *not* govern on another is precisely the arrangement
+    /// that makes a user distrust both -- see
+    /// [`crate::breach_scan::SCAN_CONSENT_NOTE`], which has to be readable in
+    /// the same glance as the switch it is talking about.
+    ///
+    /// Directly after General, because that is where this setting used to be
+    /// and where a reader will look for it.
+    Breaches,
     Autofill,
     NativeApps,
     Security,
@@ -548,8 +589,9 @@ pub enum Section {
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::General,
+        Section::Breaches,
         Section::Autofill,
         Section::NativeApps,
         Section::Security,
@@ -564,6 +606,7 @@ impl Section {
     pub fn label(self) -> &'static str {
         match self {
             Section::General => "General",
+            Section::Breaches => "Breaches",
             Section::Autofill => "Autofill",
             Section::NativeApps => "Native apps",
             Section::Security => "Security",
@@ -579,6 +622,10 @@ impl Section {
     fn subtitle(self) -> &'static str {
         match self {
             Section::General => "How Deskwarden runs in the background, and when it locks itself.",
+            Section::Breaches => {
+                "Whether your saved passwords are checked against public breach lists, and \
+                 what the last checks found."
+            }
             Section::Autofill => {
                 "How Deskwarden behaves when a native login field takes focus."
             }
@@ -650,6 +697,50 @@ pub struct PrefsState {
     /// set: the tests and `examples/ui_preview` install their own `fn` and
     /// touch no shared state at all.
     account_source: fn() -> Option<AccountStatus>,
+    /// The Breaches page's scan flow: its stage, and the receiver its worker
+    /// threads report on.
+    ///
+    /// On the state rather than in the draw for [`Self::update`]'s reason
+    /// exactly: a scan takes seconds to minutes, and a panel rebuilt each
+    /// frame would drop its receiver every 16ms and never see an answer.
+    ///
+    /// A `Default` panel is `Idle` and wired to nothing, so a window opened
+    /// and closed without touching this page has started no scan and holds no
+    /// thread -- which is the whole "nothing runs on its own" rule, in the
+    /// only place it could have been broken by accident.
+    scan: crate::breach_scan::ScanPanel,
+    /// What `scan_history.json` held when this window opened, refreshed
+    /// whenever a scan finishes.
+    ///
+    /// Read once rather than every frame: it is a file, the page draws at 60
+    /// frames a second, and the only thing that changes it is a scan
+    /// finishing -- which this window is the one to notice.
+    scan_history: crate::scan_history::ScanHistory,
+}
+
+/// The wall clock, in milliseconds since the Unix epoch, UTC.
+///
+/// The one place this window reads it. A scan record's timestamp is "when it
+/// finished", so it genuinely has to come from the clock -- and every
+/// *display* of it goes through [`crate::local_time`] with the offset
+/// resolved for that instant, so nothing here depends on where or when the
+/// machine is.
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The recorded scans, or an empty history where there is no resolvable
+/// config directory or the file could not be read.
+///
+/// Empty is a state the page renders out loud ("No scan has been run yet"),
+/// so there is nothing here to report as an error.
+fn load_scan_history() -> crate::scan_history::ScanHistory {
+    crate::scan_history::default_path()
+        .map(|path| crate::scan_history::ScanHistory::load(&path))
+        .unwrap_or_default()
 }
 
 /// The account the shells publish and the About page reads.
@@ -754,6 +845,16 @@ impl PrefsState {
             clipboard_entry_error: None,
             update: crate::update_panel::UpdatePanel::default(),
             account_source: published_account_status,
+            scan: crate::breach_scan::ScanPanel::default(),
+            // **Empty, and NOT read off disk here.** See
+            // [`Self::with_scan_history`]: `new` is called by roughly forty
+            // tests, and a constructor that reached `%APPDATA%\Deskwarden`
+            // would make every one of them a test that reads -- and, one
+            // careless edit later, writes -- the user's real file. The two
+            // production shells load it explicitly; anything that does not
+            // gets an empty history, which is a state the page renders in
+            // words.
+            scan_history: crate::scan_history::ScanHistory::default(),
         }
     }
 
@@ -774,6 +875,44 @@ impl PrefsState {
     /// even by accident.
     pub fn show_update_stage(&mut self, stage: crate::update_panel::UpdateStage) {
         self.update = crate::update_panel::UpdatePanel::parked(stage);
+    }
+
+    /// The same state, with the recorded scans loaded off disk.
+    ///
+    /// **The only thing in this module that reads `scan_history.json`**, and
+    /// it is a separate constructor rather than part of [`Self::new`] for one
+    /// reason: `new` is what the paint tests build, and no test in this crate
+    /// may touch `%APPDATA%\Deskwarden`. A constructor that read the file
+    /// would make every one of them a reader of the user's real history.
+    ///
+    /// Both production shells -- [`run`] and the vault window's modal -- call
+    /// this. `examples/ui_preview` deliberately does not; it supplies its own
+    /// entries through [`Self::show_scan_history`].
+    pub fn with_scan_history(settings: Settings) -> Self {
+        Self { scan_history: load_scan_history(), ..Self::new(settings) }
+    }
+
+    /// Parks the scan flow in a given stage, for
+    /// [`show_update_stage`](Self::show_update_stage)'s reason exactly:
+    /// `examples/ui_preview` has to draw a scan in flight and a scan that
+    /// mostly failed, and must reach neither by touching the network.
+    ///
+    /// The panel it installs is wired to nothing
+    /// ([`crate::breach_scan::ScanPanel::parked`]), and the flow refuses to
+    /// begin any work without a process-wide `ScanEnv` that only `main.rs`
+    /// installs -- so a preview cannot start a scan even by accident.
+    pub fn show_scan_stage(&mut self, stage: crate::breach_scan::ScanStage) {
+        self.scan = crate::breach_scan::ScanPanel::parked(stage);
+    }
+
+    /// Supplies the scan history the Breaches page lists, instead of the one
+    /// that was on disk when this state was built.
+    ///
+    /// For the screenshot example, which **must not read**
+    /// `%APPDATA%\Deskwarden`, and for the paint tests, which must not
+    /// either.
+    pub fn show_scan_history(&mut self, history: crate::scan_history::ScanHistory) {
+        self.scan_history = history;
     }
 
     /// Points the About page's account row at `source` instead of at the
@@ -1113,6 +1252,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
     section_heading(ui, state.section);
     match state.section {
         Section::General => draw_general(ui, state),
+        Section::Breaches => draw_breaches(ui, state),
         Section::Autofill => draw_not_yet(
             ui,
             "Overlay behaviour is fixed for now. Per-app behaviour is chosen from the tray's \
@@ -1309,22 +1449,19 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.prompt_on_match,
         );
         row_separator(ui);
-        // Directly under the prompt row, wired exactly as it is. Off by
-        // default and left that way here: this row is the only consent that
-        // exists for the range request, so it is set by a click on this pill
-        // and by nothing else.
-        state.settings.check_breaches = toggle_row(
-            ui,
-            BREACH_LABEL,
-            BREACH_DESCRIPTION,
-            state.settings.check_breaches,
-        );
-        row_separator(ui);
-        // Directly under the breach row, because the two are the app's two
-        // vault-keyed network calls and a user weighing one is weighing the
-        // other. They default OPPOSITE ways -- see `Settings::fetch_icons`
-        // for why -- so they are neighbours rather than a group with a
-        // shared rule.
+        // **The breach row is not here any more.** It moved, whole, to
+        // `Section::Breaches`, which owns the scan button and the history as
+        // well: a consent pill on one page and the control it governs on
+        // another is an arrangement a user has to hold in their head, and
+        // `breach_scan::SCAN_CONSENT_NOTE` -- which says exactly what the
+        // pill does and does not decide -- has to be readable in the same
+        // glance as the pill itself.
+        //
+        // Site icons is the app's other vault-keyed network call, and used to
+        // sit under the breach row for that reason. It stays on General
+        // because it has no page of its own to go to, and the two default
+        // OPPOSITE ways in any case -- see `Settings::fetch_icons` -- so they
+        // were neighbours rather than a group with a shared rule.
         state.settings.fetch_icons = toggle_row(
             ui,
             FETCH_ICONS_LABEL,
@@ -1475,6 +1612,209 @@ fn row_text_ghosted(ui: &mut Ui, label: &str, description: &str) {
 /// neither: it is a thing that is always on and always will be.
 fn note_row(ui: &mut Ui, label: &str, note: &str) {
     card_row(ui, |ui| row_text(ui, label, note));
+}
+
+/// The **Breaches** page: the consent pill, the scan button, and what previous
+/// scans counted.
+///
+/// # The three things on this page are on ONE page deliberately
+///
+/// The pill used to be on General and there was no button at all. A user
+/// weighing "should I let this app talk to Have I Been Pwned" was reading a
+/// switch with no visible consequence; a user pressing a scan button on
+/// another page would have been acting on a rule they could not see. Here the
+/// switch, the control it does *not* govern, the sentence saying so
+/// ([`crate::breach_scan::SCAN_CONSENT_NOTE`]), and the record of what has
+/// actually been sent are all in one glance.
+///
+/// # The button is not gated on the pill, and the page says so
+///
+/// See `breach_scan`'s module header for the argument in full. In short:
+/// pressing the button is the user initiating the request in the same breath
+/// as consenting to it -- the same reasoning that settled the manual update
+/// check -- and the setting governs what this app does **on its own**, which
+/// is the per-item badge and nothing on this page.
+fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
+    use crate::breach_scan::ScanStage;
+
+    // `pump` is where the side effects are (the history write, the publish);
+    // this is the only place it is called, once per frame, exactly as
+    // `draw_update_card` calls its own.
+    if state.scan.pump(now_unix_millis()) {
+        // A finished run rewrote the history file. Re-read rather than
+        // reconstructed, so the list on screen is what is on disk -- and so a
+        // scan run from the other shell of this window shows up here.
+        state.scan_history = load_scan_history();
+    }
+    if state.scan.is_busy() {
+        // egui repaints on input. A progress line nobody is typing over would
+        // otherwise advance only when the mouse moved.
+        ui.ctx().request_repaint_after(crate::breach_scan::SCAN_POLL_INTERVAL);
+    }
+
+    card(ui, |ui| {
+        // Off by default and left that way here: this pill is the only
+        // consent that exists for the automatic per-item check, so it is set
+        // by a click on it and by nothing else.
+        state.settings.check_breaches = toggle_row(
+            ui,
+            BREACH_LABEL,
+            BREACH_DESCRIPTION,
+            state.settings.check_breaches,
+        );
+    });
+
+    card(ui, |ui| {
+        let stage = state.scan.stage().clone();
+        let description = match &stage {
+            ScanStage::Idle => SCAN_IDLE_DESCRIPTION.to_string(),
+            ScanStage::Running { done, total, found, failed } => {
+                crate::breach_scan::progress_wording(*done, *total, *found, *failed)
+            }
+            // **The outcome, in `breach_scan`'s own words**, so the sentence
+            // on this page and the numbers in `scan_history.json` cannot
+            // disagree about what just happened -- and so the failure count
+            // is the last thing said, here as everywhere.
+            ScanStage::Finished(record) => crate::breach_scan::outcome_wording(record),
+            ScanStage::NothingToScan => SCAN_NOTHING_DESCRIPTION.to_string(),
+            ScanStage::Unavailable => SCAN_UNAVAILABLE_DESCRIPTION.to_string(),
+        };
+        control_row(ui, SCAN_SECTION_LABEL, &description, |_ui| {});
+
+        row_separator(ui);
+        // **The button is on its own row, left-aligned**, rather than in the
+        // trailing control column every other row on this window uses. Its
+        // label is wider than `CONTROL_COLUMN_WIDTH`, and widening that
+        // column would move the control on every row of every page to make
+        // room for one button.
+        //
+        // A running scan still draws a button -- disabled, and labelled with
+        // what is happening -- rather than drawing nothing: a control that
+        // vanishes mid-action reflows the card under the cursor.
+        //
+        // **Driven by the STAGE, not by `is_busy`.** They agree in the
+        // shipped app, and they must not be used interchangeably: `is_busy`
+        // asks whether a channel is still open, which is a fact about this
+        // process, while `Running` is what the page is claiming. The
+        // screenshot example parks a panel in `Running` with no channel
+        // behind it, and a button keyed on `is_busy` drew that surface with
+        // an idle, clickable button on it -- a picture of a state the app
+        // cannot be in.
+        let running = matches!(stage, ScanStage::Running { .. });
+        let mut clicked = false;
+        card_row(ui, |ui| {
+            let label = if running { SCAN_RUNNING_BUTTON } else { SCAN_BUTTON };
+            clicked = scan_button(ui, label, !running);
+        });
+        if let ScanStage::Running { done, total, .. } = &stage {
+            row_separator(ui);
+            // The same bar the update card's download uses, so "something is
+            // in flight and this is how far it has got" looks the same in
+            // both places. The total is always known here -- it is the number
+            // of distinct passwords the plan counted before anything was
+            // spawned -- which is the honest half of `progress_bar`'s
+            // `Option`.
+            //
+            // The bar alone: the sentence above it already says "Checked 61
+            // of 128", in passwords, and `progress_bar`'s own caption counts
+            // BYTES.
+            let fraction = if *total == 0 { 0.0 } else { *done as f32 / *total as f32 };
+            card_row(ui, |ui| progress_track(ui, fraction.clamp(0.0, 1.0)));
+        }
+        if clicked {
+            // **The one call to `begin_scan` in this crate**, and it is
+            // behind a click. Nothing consults `check_breaches` here; see
+            // this function's doc and `SCAN_CONSENT_NOTE` below.
+            state.scan.begin_scan(now_unix_millis());
+        }
+
+        row_separator(ui);
+        card_row(ui, |ui| {
+            ui.label(
+                RichText::new(crate::breach_scan::SCAN_CONSENT_NOTE)
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        });
+    });
+
+    card(ui, |ui| {
+        card_row(ui, |ui| {
+            ui.label(RichText::new(SCAN_HISTORY_LABEL).size(13.0).color(theme::INK));
+        });
+        if state.scan_history.entries.is_empty() {
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.label(RichText::new(SCAN_NO_HISTORY).size(12.0).color(theme::TEXT_FAINT));
+            });
+            return;
+        }
+        for record in &state.scan_history.entries {
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+                ui.label(
+                    RichText::new(scan_history_when(record)).size(12.0).color(theme::INK),
+                );
+                ui.label(
+                    RichText::new(crate::breach_scan::outcome_wording(record))
+                        .size(11.0)
+                        // A run with a failure in it is not an ordinary
+                        // result and is not painted like one. `ERROR` is what
+                        // this app uses for "something is wrong" everywhere
+                        // else; there is no success colour in this design, so
+                        // a complete run is ordinary secondary ink.
+                        .color(if record.is_complete() {
+                            theme::TEXT_SECONDARY
+                        } else {
+                            theme::ERROR
+                        }),
+                );
+            });
+        }
+    });
+}
+
+/// When a recorded scan finished, in the user's **own** timezone.
+///
+/// The stored instant is UTC and the label never says so; see
+/// [`crate::local_time`]. The offset is resolved for that instant rather than
+/// once for the process, so an entry from the far side of a daylight-saving
+/// change still reads as the time the user's clock showed.
+fn scan_history_when(record: &crate::scan_history::ScanRecord) -> String {
+    crate::local_time::format_day_time(crate::local_time::local_parts(
+        record.finished_at_unix_millis,
+        &crate::local_time::SystemZone,
+    ))
+}
+
+/// The scan button: [`update_button`]'s box, wide enough for its own label.
+fn scan_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(SCAN_BUTTON_WIDTH, STEPPER_HEIGHT), sense);
+    let hovered = enabled && response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        if hovered { theme::CANVAS } else { theme::CARD },
+        Stroke::new(1.0, if enabled { theme::BORDER_STRONG } else { theme::HAIRLINE }),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST },
+    );
+    let at = Pos2::new(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(at, galley, theme::TEXT_SECONDARY);
+    enabled && response.clicked()
 }
 
 fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
@@ -2285,21 +2625,7 @@ fn progress_bar(ui: &mut Ui, done: u64, total: Option<u64>) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
         if let Some(fraction) = download_fraction(done, total) {
-            let (rect, _) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), UPDATE_BAR_HEIGHT),
-                Sense::hover(),
-            );
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(UPDATE_BAR_RADIUS), theme::CANVAS);
-            let filled = Rect::from_min_size(
-                rect.min,
-                Vec2::new(rect.width() * fraction, rect.height()),
-            );
-            ui.painter().rect_filled(
-                filled,
-                CornerRadius::same(UPDATE_BAR_RADIUS),
-                theme::TEXT_SECONDARY,
-            );
+            progress_track(ui, fraction);
         }
         ui.label(
             RichText::new(download_label(done, total))
@@ -2307,6 +2633,28 @@ fn progress_bar(ui: &mut Ui, done: u64, total: Option<u64>) {
                 .color(theme::TEXT_FAINT),
         );
     });
+}
+
+/// The bar itself, without a caption.
+///
+/// Split out of [`progress_bar`] because the scan needs the same bar and a
+/// different sentence: `download_label` measures BYTES, and a scan measures
+/// passwords. Drawing the update card's caption under a scan's bar would have
+/// put "61 B of 128 B" under a whole-vault check -- a number that is true of
+/// nothing.
+fn progress_track(ui: &mut Ui, fraction: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), UPDATE_BAR_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(UPDATE_BAR_RADIUS), theme::CANVAS);
+    let filled =
+        Rect::from_min_size(rect.min, Vec2::new(rect.width() * fraction, rect.height()));
+    ui.painter().rect_filled(
+        filled,
+        CornerRadius::same(UPDATE_BAR_RADIUS),
+        theme::TEXT_SECONDARY,
+    );
 }
 
 /// The update card's button: [`reset_button`]'s box at [`UPDATE_BUTTON_WIDTH`],
@@ -2424,7 +2772,7 @@ pub fn draw_prefs_window(ui: &mut Ui, state: &mut PrefsState) -> ChromeAction {
 const CHROME_BAR_HEIGHT: f32 = crate::login_ui::ChromeMetrics::LOGIN.bar_height;
 
 pub fn run(settings: Settings) -> Settings {
-    let state = Rc::new(RefCell::new(PrefsState::new(settings)));
+    let state = Rc::new(RefCell::new(PrefsState::with_scan_history(settings)));
     let state_for_closure = state.clone();
     let mut styled = false;
 
@@ -2972,7 +3320,12 @@ mod tests {
     /// `raw_input` are pinned to `BODY_SIZE`; the wrapping assertions need
     /// more than one width, and a row that fits at 1000 points is not thereby
     /// known to fit at 652.
-    fn paint_general_at(width: f32) -> Painted {
+    /// One page, painted at an arbitrary width. The long-copy tests below run
+    /// at three widths, and on the page the copy under test is actually on --
+    /// which is no longer the same page for all of them, since the breach row
+    /// moved. A second copy of this harness is how two of them would come to
+    /// disagree about what "the pane" is.
+    fn paint_section_at(section: Section, width: f32) -> Painted {
         let size = Vec2::new(width, BODY_SIZE.y);
         let input = |events: &[egui::Event]| egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
@@ -2984,7 +3337,7 @@ mod tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(input(&[]), |_ui| {});
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::General;
+        state.section = section;
         let output = ctx.run_ui(input(&[]), |ui| draw_prefs_body(ui, &mut state));
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -3066,7 +3419,7 @@ mod tests {
     #[test]
     fn every_nav_section_design_3e_lists_is_painted() {
         let painted = paint(Section::General);
-        // The eight labels, spelled out rather than looped over
+        // The nine labels, spelled out rather than looped over
         // `Section::ALL`: a test that re-derives its expectation from the
         // enum under test would still pass if a section were renamed,
         // removed, or added.
@@ -3079,6 +3432,9 @@ mod tests {
         // loop is structurally blind to.
         let expected = [
             "General",
+            // Breaches sits directly after General because that is where its
+            // one pill used to be, and where a reader will look for it.
+            "Breaches",
             "Autofill",
             "Native apps",
             "Security",
@@ -3187,12 +3543,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_seven_toggles_and_one_stepper() {
+    fn general_paints_exactly_six_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            7,
-            "seven 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches`,              `fetch_icons`, `reveal_totp_seed`, `auto_lock_enabled` and `check_for_updates`,              and nothing else"
+            6,
+            "six 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`,              `reveal_totp_seed`, `auto_lock_enabled` and `check_for_updates`, and nothing              else. `check_breaches` is NOT here any more -- it moved to Breaches, which              owns the scan button it does not govern; see `draw_breaches`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -3294,6 +3650,10 @@ mod tests {
     fn clicking_the_breach_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // **On the Breaches page now, not General.** The pill moved to sit
+        // beside the scan button it does not govern and the sentence that
+        // says so.
+        state.section = Section::Breaches;
         assert!(
             !state.settings.check_breaches,
             "the default: nothing about a password leaves the machine until this is clicked"
@@ -3304,10 +3664,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // Third pill down: backend, prompt, breaches, site icons, TOTP
-        // secret, auto-lock.
-        let pill = pills[2].center();
+        assert_eq!(
+            pills.len(),
+            1,
+            "the Breaches page paints exactly one pill -- the consent switch -- and the scan \
+             button is not a pill"
+        );
+        let pill = pills[0].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -3332,53 +3695,273 @@ mod tests {
     /// another, and "directly under the prompt row" is a claim about the
     /// screen.
     #[test]
-    fn the_breach_row_sits_under_the_prompt_row() {
-        let painted = paint(Section::General);
-        let prompt = painted.ink_of(PROMPT_LABEL).rect;
+    fn the_breach_row_is_the_first_thing_on_the_breaches_page() {
+        let painted = paint(Section::Breaches);
         let breach = painted.ink_of(BREACH_LABEL).rect;
-        let auto_lock = painted.ink_of(AUTO_LOCK_ENABLED_LABEL).rect;
-        // The instrument first: three labels at three distinct, non-empty
-        // heights, so `top()` is telling them apart and not reading one
-        // number three times.
-        assert!(prompt.height() > 0.0 && breach.height() > 0.0 && auto_lock.height() > 0.0);
+        let scan = painted.ink_of(SCAN_SECTION_LABEL).rect;
+        let consent = painted.ink_of(crate::breach_scan::SCAN_CONSENT_NOTE).rect;
+        let history = painted.ink_of(SCAN_HISTORY_LABEL).rect;
+        // The instrument first: four labels at four distinct, non-empty
+        // heights, so `top()` is telling them apart rather than reading one
+        // number four times.
+        for rect in [breach, scan, consent, history] {
+            assert!(rect.height() > 0.0, "a label has no box: {rect:?}");
+        }
         assert!(
-            prompt.top() < breach.top(),
-            "the breach row is not under the prompt row: prompt at {prompt:?}, breach at              {breach:?}"
+            breach.top() < scan.top(),
+            "the consent pill is not above the scan button it does not govern: breach at \
+             {breach:?}, scan at {scan:?}"
         );
         assert!(
-            breach.top() < painted.ink_of(FETCH_ICONS_LABEL).rect.top(),
-            "the breach row is not above the site-icons row, so it is not DIRECTLY under the              prompt row"
+            scan.top() < consent.top(),
+            "the sentence explaining the button is not under the button"
         );
         assert!(
-            breach.top() < auto_lock.top(),
-            "the breach row is not above the auto-lock row"
+            consent.top() < history.top(),
+            "the history is not last: it is a record of what has been sent, and it belongs \
+             under the thing that sends it"
         );
-        // The positive control: the two tops differ by a real amount, so the
-        // comparison above is telling two rows apart rather than comparing one
-        // number with itself -- which is what it would be doing if `rect_of`
-        // ever returned the same galley twice.
         assert!(
-            breach.top() - prompt.top() > 1.0,
-            "the prompt and breach labels are painted at the same height, so the ordering              assertion above cannot fail: prompt {:?}, breach {:?}",
-            prompt.top(),
-            breach.top()
+            scan.top() - breach.top() > 1.0,
+            "the pill and the scan heading are painted at the same height, so the ordering \
+             assertions above cannot fail"
         );
 
-        // ... and the pills follow the labels, so it is the row that moved
-        // and not just its text.
+        // The pill follows the label, so it is the row that moved and not
+        // just its text -- and there is exactly ONE pill on this page.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
-        assert!(pills[1].top() < pills[2].top(), "the breach pill is not below the prompt pill");
-        assert!(pills[2].top() < pills[3].top(), "the breach pill is not above the site-icons pill");
-        assert!(pills[3].top() < pills[4].top(), "the site-icons pill is not above the TOTP-secret pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 1);
         assert!(
-            pills[2].top() > prompt.bottom(),
-            "the breach pill is level with the prompt row's text, so the pills and the labels              disagree about which row is which"
+            pills[0].bottom() < scan.top(),
+            "the consent pill overhangs the scan row"
+        );
+
+        // And it is no longer on General, which is the half a test that only
+        // looked at this page would be blind to.
+        let general = paint(Section::General);
+        assert!(
+            !general.contains(BREACH_LABEL),
+            "the breach row is still painted on General as well, so there are two of it: {:?}",
+            general.strings()
+        );
+    }
+
+    // -- Breaches ----------------------------------------------------------
+
+    /// **No test in this module reads the real scan history.**
+    ///
+    /// `%APPDATA%\\Deskwarden` is off limits to the suite, and the way a test
+    /// would reach it is by accident: `PrefsState::new` used to load the file
+    /// itself, which would have made every paint test in here a reader of the
+    /// user's own record. The loading constructor is separate and named, and
+    /// this is a source pin over the test half saying it is never used there.
+    #[test]
+    fn no_test_here_resolves_the_real_scan_history() {
+        let source = include_str!("prefs_ui.rs");
+        let tests = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file")
+            .1;
+        for needle in [concat!("with_scan_", "history("), concat!("load_scan_", "history(")] {
+            assert_eq!(
+                tests.matches(needle).count(),
+                0,
+                "a test in this module spells `{needle}`, which reads the real \
+                 %APPDATA%\\Deskwarden scan history"
+            );
+        }
+        // The positive control: production really does spell both, so
+        // counting zero above means something.
+        assert_eq!(
+            source.matches(concat!("pub fn with_scan_", "history(")).count(),
+            1,
+            "the loading constructor is no longer spelled that way -- the needle above has \
+             drifted and its absence proves nothing"
+        );
+        assert_eq!(
+            source.matches(concat!("fn load_scan_", "history()")).count(),
+            1,
+            "the loader is no longer spelled that way -- see above"
+        );
+    }
+
+    /// A Breaches page parked in `stage`, with `history` under the button.
+    ///
+    /// **Nothing here can reach the network, and that is structural rather
+    /// than careful**: `ScanPanel::parked` has no receiver, and
+    /// `begin_scan` refuses outright without a process-wide `ScanEnv` that
+    /// only `main.rs` installs and no test does. So a frame here makes no
+    /// request and spawns no thread even if one of these clicks landed on the
+    /// button.
+    fn paint_scan(
+        stage: crate::breach_scan::ScanStage,
+        history: Vec<crate::scan_history::ScanRecord>,
+    ) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Breaches;
+        state.scan = crate::breach_scan::ScanPanel::parked(stage);
+        state.scan_history = crate::scan_history::ScanHistory { entries: history };
+        frame(&ctx, &mut state, &[])
+    }
+
+    fn record(finished_at: i64, found: u32, failed: u32) -> crate::scan_history::ScanRecord {
+        crate::scan_history::ScanRecord {
+            finished_at_unix_millis: finished_at,
+            passwords_checked: 128,
+            items_covered: 1_600,
+            found,
+            failed,
+        }
+    }
+
+    /// The idle page: the switch, the button, the sentence that says the
+    /// button ignores the switch, and an empty history that says so out loud.
+    #[test]
+    fn the_idle_scan_page_offers_the_button_and_claims_nothing() {
+        let painted = paint_scan(crate::breach_scan::ScanStage::Idle, vec![]);
+        for text in [
+            BREACH_LABEL,
+            SCAN_SECTION_LABEL,
+            SCAN_IDLE_DESCRIPTION,
+            SCAN_BUTTON,
+            crate::breach_scan::SCAN_CONSENT_NOTE,
+            SCAN_HISTORY_LABEL,
+            SCAN_NO_HISTORY,
+        ] {
+            assert!(painted.contains(text), "{text:?} is not on the page: {:?}", painted.strings());
+        }
+        assert!(
+            !painted.contains(SCAN_RUNNING_BUTTON),
+            "an idle page paints the running button as well as the idle one"
+        );
+    }
+
+    /// **The failure count is on screen WHILE the scan runs**, not only at the
+    /// end. A run that will finish with forty failures must not look clean for
+    /// the first thirty seconds of it.
+    #[test]
+    fn a_running_scan_reports_its_failures_as_they_happen() {
+        let painted = paint_scan(
+            crate::breach_scan::ScanStage::Running { done: 60, total: 128, found: 3, failed: 40 },
+            vec![],
+        );
+        let expected = crate::breach_scan::progress_wording(60, 128, 3, 40);
+        assert!(expected.contains("40 could not be checked"), "control: {expected:?}");
+        assert!(painted.contains(&expected), "got {:?}", painted.strings());
+        // The button is still there, disabled and saying what is happening --
+        // a control that vanishes mid-action reflows the card under the
+        // cursor.
+        assert!(
+            painted.contains(SCAN_RUNNING_BUTTON) || painted.contains(SCAN_BUTTON),
+            "the button disappeared while the scan ran: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// A finished run says both numbers and ends on the failures, in
+    /// `breach_scan`'s own words -- so the page and `scan_history.json`
+    /// cannot disagree about what happened.
+    #[test]
+    fn a_finished_scan_reports_the_failures_last() {
+        let done = record(1_787_013_000_000, 3, 40);
+        let painted = paint_scan(crate::breach_scan::ScanStage::Finished(done), vec![]);
+        let expected = crate::breach_scan::outcome_wording(&done);
+        assert!(painted.contains(&expected), "got {:?}", painted.strings());
+        assert!(
+            expected.ends_with("40 could not be checked, so nothing is known about them."),
+            "control: {expected:?}"
+        );
+    }
+
+    /// "Nothing to check" is its own wording and not a run that found zero.
+    /// Those are different results and drawing them alike is the mistake
+    /// `password_health::Summary::NothingToCheck` exists to avoid.
+    #[test]
+    fn a_vault_with_no_passwords_says_so_rather_than_reporting_a_clean_run() {
+        let painted = paint_scan(crate::breach_scan::ScanStage::NothingToScan, vec![]);
+        assert!(painted.contains(SCAN_NOTHING_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            !painted.contains("None was found in a breach."),
+            "an unscannable vault was reported as a clean scan"
+        );
+    }
+
+    /// A build with no environment says so rather than offering a button that
+    /// does nothing.
+    #[test]
+    fn a_build_that_cannot_scan_says_so_on_the_page() {
+        let painted = paint_scan(crate::breach_scan::ScanStage::Unavailable, vec![]);
+        assert!(painted.contains(SCAN_UNAVAILABLE_DESCRIPTION), "got {:?}", painted.strings());
+    }
+
+    /// **The history, newest first, with each entry's own outcome under it.**
+    #[test]
+    fn the_history_lists_each_scan_newest_first_with_what_it_found() {
+        // 2026-08-18T00:30:00Z and a day earlier. Stated instants, never the
+        // clock: see `local_time`.
+        let newest = record(1_787_013_000_000, 3, 0);
+        let older = record(1_787_013_000_000 - 86_400_000, 0, 7);
+        let painted = paint_scan(
+            crate::breach_scan::ScanStage::Idle,
+            vec![newest, older],
+        );
+        assert!(!painted.contains(SCAN_NO_HISTORY), "the empty state is drawn over real entries");
+        let top = painted.ink_of(&scan_history_when(&newest)).rect;
+        let bottom = painted.ink_of(&scan_history_when(&older)).rect;
+        assert!(top.height() > 0.0 && bottom.height() > 0.0, "an entry has no box");
+        assert!(
+            top.top() < bottom.top(),
+            "the history is not newest-first: newest at {top:?}, older at {bottom:?}"
         );
         assert!(
-            pills[2].bottom() < auto_lock.top(),
-            "the breach pill overhangs the auto-lock row"
+            painted.contains(&crate::breach_scan::outcome_wording(&older)),
+            "an entry's outcome is not under it: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **A recorded scan's time is the user's own, and never says "UTC".**
+    ///
+    /// The stored instant is UTC; the label is not. This asserts the rule
+    /// rather than a particular offset, because the offset is the machine's
+    /// and no test in this crate may depend on which machine that is.
+    #[test]
+    fn a_history_entry_names_no_timezone() {
+        let when = scan_history_when(&record(1_787_013_000_000, 0, 0));
+        assert!(!when.contains("UTC") && !when.contains("GMT"), "{when:?}");
+        assert!(when.contains("Aug 2026") || when.contains("Aug 2026"), "{when:?}");
+    }
+
+    /// **The one call to `begin_scan` on this page is behind the button**, and
+    /// a parked panel proves the click reaches it without anything being able
+    /// to run: `begin_scan` with no installed environment lands on
+    /// `Unavailable`, which is a state change only a real click can produce.
+    #[test]
+    fn clicking_the_scan_button_asks_for_a_scan() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Breaches;
+        assert!(!state.settings.check_breaches, "the premise: the setting is OFF");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let button = first.rect_of(SCAN_BUTTON).center();
+        frame(&ctx, &mut state, &click(button));
+
+        // **The decision, driven rather than described.** With no `ScanEnv`
+        // installed the request cannot be carried out, and the page says so
+        // -- but it was ATTEMPTED, which is the whole point: the button is
+        // not gated on the pill above it.
+        assert_eq!(
+            *state.scan.stage(),
+            crate::breach_scan::ScanStage::Unavailable,
+            "the button did nothing with the setting off, which is the control that refuses to \
+             be clicked this design exists to delete"
+        );
+        assert!(
+            !state.settings.check_breaches,
+            "pressing the button silently turned the automatic setting on as well, which is \
+             consent the user did not give"
         );
     }
 
@@ -3418,7 +4001,7 @@ mod tests {
                 "`contains_rect` cannot fail at width {width}"
             );
 
-            let painted = paint_general_at(width);
+            let painted = paint_section_at(Section::Breaches, width);
             let ink = painted.ink_of(BREACH_DESCRIPTION);
             assert_eq!(
                 ink.rendered.split_whitespace().collect::<Vec<_>>(),
@@ -3453,12 +4036,18 @@ mod tests {
             // are actually next to each other, and `FETCH_ICONS_DESCRIPTION`
             // is the other long one, so this is now the hardest pair on the
             // card rather than a pair separated by two rows.
+            // **The rows either side of it, re-pinned for the page the row
+            // is actually on now.** Its neighbours used to be the prompt row
+            // above and the site-icons row below; on Breaches it is the first
+            // thing on the page, and what sits under it is the scan card --
+            // whose own description is the other long copy here, so this is
+            // still the hardest pair on the page rather than a pair separated
+            // by two rows.
             for neighbour in [
-                PROMPT_LABEL,
-                PROMPT_DESCRIPTION,
                 BREACH_LABEL,
-                FETCH_ICONS_LABEL,
-                FETCH_ICONS_DESCRIPTION,
+                SCAN_SECTION_LABEL,
+                SCAN_IDLE_DESCRIPTION,
+                crate::breach_scan::SCAN_CONSENT_NOTE,
             ] {
                 let other = painted.ink_of(neighbour).rect;
                 assert!(
@@ -3496,10 +4085,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // Fourth pill down: backend, prompt, breaches, site icons, TOTP
-        // secret, auto-lock.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // THIRD pill down now: backend, prompt, site icons, TOTP secret, auto-lock, updates. The breach row that used to sit second is
+        // on the Breaches page.
+        let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -3543,8 +4132,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        let pill = pills[6].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // Last pill down: backend, prompt, site icons, TOTP secret, auto-lock, updates.
+        let pill = pills[5].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -3679,10 +4269,9 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // Fifth pill down: backend, prompt, breaches, site icons, TOTP
-        // secret, auto-lock.
-        let pill = pills[4].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FOURTH pill down now: backend, prompt, site icons, TOTP secret, auto-lock, updates.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -3731,15 +4320,15 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the site-icons pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 6);
+        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the site-icons pill");
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[4].top() > breach.bottom(),
+            pills[3].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[4].bottom() < auto_lock.top(),
+            pills[3].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -3796,15 +4385,15 @@ mod tests {
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the SIXTH pill down is the one wired to it -- `prompt_on_match`,
-        // `check_breaches`, `fetch_icons` and `reveal_totp_seed` sit between
-        // it and the backend row.
+        // the FIFTH pill down is the one wired to it -- `prompt_on_match`,
+        // `fetch_icons` and `reveal_totp_seed` sit between it and the backend
+        // row. It was the sixth until `check_breaches` moved to its own page.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[5].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[4].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");

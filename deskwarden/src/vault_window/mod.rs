@@ -1865,7 +1865,7 @@ pub fn build_frame(
                                 .map(crate::settings::Settings::load)
                         })
                         .unwrap_or_default();
-                    prefs = Some(crate::prefs_ui::PrefsState::new(seed));
+                    prefs = Some(crate::prefs_ui::PrefsState::with_scan_history(seed));
                 }
                 // **The avatar, the chevron beside it, and the menu they open
                 // together**, all inside one call -- see `account_menu`, which
@@ -15801,7 +15801,7 @@ mod settings_gear_placement_tests {
     #[test]
     fn the_gear_opens_the_modal_and_leaves_the_window_open() {
         let body = gear_click_body();
-        let opens = concat!("prefs = Some(crate::prefs_ui::", "PrefsState::new(seed));");
+        let opens = concat!("prefs = Some(crate::prefs_ui::", "PrefsState::with_scan_history(seed));");
         let closes = concat!("ViewportCommand::", "Close");
 
         assert!(
