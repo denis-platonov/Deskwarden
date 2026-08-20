@@ -10,6 +10,30 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### The "no saved login" card can search the vault
+
+The card that appears when you focus a password field Deskwarden has nothing
+for offered one button, *New login*. It was designed with two; the second one
+is here now.
+
+- ***Search vault*** opens the vault window **with that app's name already in
+  the search box**, so a login saved under a name the matcher did not
+  recognise is one click away instead of one click and some typing. The name
+  goes in without its `.exe` — searching for `Ledgerline.exe` would find
+  nothing, which is the one answer this card must not give twice.
+- **The query is a starting point, not a filter you are stuck with.** Clear it
+  or edit it like any other search. Opening the vault any other way — the tray
+  menu, a tray click, startup — still opens it on the whole list, and if that
+  window locks or you switch account while it is up, the one that comes back
+  is unfiltered.
+- **The locked card does not offer it**, for the same reason it offers no
+  *New login*: while the vault is locked there is nothing to search, and a
+  window opened onto an empty list would read as "you have nothing" rather
+  than "it is locked".
+- The card's second line no longer says "Open Deskwarden to search the vault"
+  — the button does that now. It says what would otherwise be a mystery
+  instead: matching is by process name and window title.
+
 ### Card rows name the network beside the icon, not over it
 
 A card row drew its network badge inside the bank icon's tile, overlapping

@@ -2391,9 +2391,13 @@ pub fn route_save_answer(
 /// Only the real presenter and the real create route are named on these lines;
 /// every decision is [`no_match_arm`]'s, [`save_login_arm`]'s and
 /// [`route_save_answer`]'s, each of which a test drives with a recorder.
-pub fn handle_no_match(cache: &VaultCache, window: &crate::window_watch::ForegroundEvent) {
-    if no_match_arm(&REAL_OVERLAY, window) != overlay_ui::NoMatchAnswer::NewLogin {
-        return;
+pub fn handle_no_match(
+    cache: &VaultCache,
+    window: &crate::window_watch::ForegroundEvent,
+) -> NoMatchFollowUp {
+    let answer = no_match_arm(&REAL_OVERLAY, window);
+    if answer != overlay_ui::NoMatchAnswer::NewLogin {
+        return no_match_follow_up(answer, window_label(&window.exe_name, &window.title));
     }
     let outcome = route_save_answer(
         save_login_flow(&REAL_OVERLAY, window, &|request| {
@@ -2421,6 +2425,91 @@ pub fn handle_no_match(cache: &VaultCache, window: &crate::window_watch::Foregro
         remember_never_for_app,
     );
     log::info!("the save-a-new-login card was answered: {}", describe_outcome(&outcome));
+    // 3c's own answers never open a window: `Save` wrote the item, and the
+    // other three are silences of different lengths. Nothing follows.
+    NoMatchFollowUp::Nothing
+}
+
+/// **What the caller must do after design 3a closes**, and the only thing it
+/// can be asked to do.
+///
+/// Two variants and not a `bool` or an `Option<String>`, for the reason
+/// [`overlay_ui::NoMatchAnswer`] is two variants: the value crosses
+/// `main::process_foreground_event` and lands in `run`'s loop, and "there is a
+/// string" is a worse way to say "open a window" than saying it.
+///
+/// **This is the whole of what the overlay can make `main` do**, which is the
+/// property that matters more than the shape. `handle_no_match` is still handed
+/// no `Injector`, no `FillStats` and no [`Reprompt`], and still cannot arm the
+/// fill hotkey; what it gained is one request, for a window `run` already opens
+/// at three other doors, carrying one string that is
+/// [`window_label`]'s answer and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NoMatchFollowUp {
+    /// The card was dismissed, or it led to 3c and 3c has finished. Nothing
+    /// follows.
+    #[default]
+    Nothing,
+    /// *Search vault* was clicked. Open the vault window, with this in its
+    /// search box -- the same [`window_label`] the card itself was naming, so
+    /// the user is handed the query they were just looking at rather than an
+    /// unfiltered list of everything.
+    SearchVault(String),
+}
+
+/// [`overlay_ui::NoMatchAnswer`] as a [`NoMatchFollowUp`], **as a pure
+/// function**.
+///
+/// It exists so that the mapping is testable at all: the only production
+/// caller is [`handle_no_match`], which raises a real always-on-top window and
+/// so is the one thing on that path no test in this crate may execute.
+///
+/// [`overlay_ui::NoMatchAnswer::NewLogin`] answers `Nothing` here and that is
+/// not a hole: `handle_no_match` never reaches this function with it, because
+/// `NewLogin` means "run 3c" and 3c's own outcome is a save or a silence.
+/// Mapping it rather than making it unrepresentable keeps this function total,
+/// which is what lets a test walk all three answers.
+/// A [`window_label`] as something worth typing into the vault's search box:
+/// **the same name without a trailing `.exe`.**
+///
+/// The card says "No saved login for Atlas Licence.exe" because that is what
+/// the window is, and the executable name is what every log line and overlay in
+/// this app has always said. But it is a poor *query*: the vault's search runs
+/// over item names, usernames and URIs, and an item saved for that app is
+/// called "Atlas Licence". Handing the box `Atlas Licence.exe` would open the
+/// window on an empty list -- the one result that reads as "you have nothing"
+/// on a surface the user came to precisely because they were told that.
+///
+/// **Only that suffix, and only when something is left.** A host frame's label
+/// is its window title and has no suffix to strip; a hypothetical `.exe` would
+/// leave the empty string, which is not "no query" here but "match everything",
+/// so the label is kept whole instead. Case-insensitively, because Windows
+/// paths are.
+///
+/// It is deliberately not cleverer than that. Splitting on separators or
+/// dropping a version number would be guessing at the user's item names, and a
+/// query is a starting point they can edit rather than a filter they are stuck
+/// with.
+pub fn search_query(label: &str) -> &str {
+    let cut = label.len().saturating_sub(4);
+    if cut > 0 && label.is_char_boundary(cut) && label[cut..].eq_ignore_ascii_case(".exe") {
+        return &label[..cut];
+    }
+    label
+}
+
+pub fn no_match_follow_up(
+    answer: overlay_ui::NoMatchAnswer,
+    app_name: &str,
+) -> NoMatchFollowUp {
+    match answer {
+        overlay_ui::NoMatchAnswer::SearchVault => {
+            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
+        }
+        overlay_ui::NoMatchAnswer::Dismissed | overlay_ui::NoMatchAnswer::NewLogin => {
+            NoMatchFollowUp::Nothing
+        }
+    }
 }
 
 /// What a [`SaveOutcome`] is written to the log as.
@@ -3094,6 +3183,61 @@ mod tests {
             presenter.shown.borrow().is_empty(),
             "the matched card was raised for a vault that cannot be read at all"
         );
+    }
+
+    /// **Only *Search vault* asks for a window**, and it asks with a query.
+    ///
+    /// The pair matters more than either half: `NewLogin` mapping to
+    /// `SearchVault` would open the vault instead of design 3c, and
+    /// `Dismissed` mapping to it would open the vault on every card the user
+    /// closed -- an always-on-top card whose ✕ opens a window is worse than
+    /// the silence 3a replaced.
+    #[test]
+    fn only_the_search_button_asks_for_a_window() {
+        assert_eq!(
+            no_match_follow_up(overlay_ui::NoMatchAnswer::SearchVault, "Ledgerline.exe"),
+            NoMatchFollowUp::SearchVault("Ledgerline".to_string()),
+            "`Search vault` asked for nothing, or asked with the wrong query"
+        );
+        for quiet in [overlay_ui::NoMatchAnswer::Dismissed, overlay_ui::NoMatchAnswer::NewLogin] {
+            assert_eq!(
+                no_match_follow_up(quiet, "Ledgerline.exe"),
+                NoMatchFollowUp::Nothing,
+                "{quiet:?} opened the vault window. Only one of 3a's controls may, and this \
+                 is not it"
+            );
+        }
+    }
+
+    /// The query is the app's name, **without the `.exe` the card shows**.
+    ///
+    /// Asserted positively and negatively: a suffix that is not stripped opens
+    /// the vault on an empty list, and a strip that fires on anything ending
+    /// in four characters would cut real names apart.
+    #[test]
+    fn the_search_query_drops_an_executable_suffix_and_nothing_else() {
+        assert_eq!(search_query("Atlas Licence.exe"), "Atlas Licence");
+        assert_eq!(search_query("LEDGERLINE.EXE"), "LEDGERLINE", "the suffix is case-blind");
+        assert_eq!(
+            search_query("Ledgerline -- Sign in"),
+            "Ledgerline -- Sign in",
+            "a host frame's window title is not an executable name and must survive whole"
+        );
+        assert_eq!(
+            search_query("bank.example"),
+            "bank.example",
+            "a four-character suffix that is not `.exe` was cut off"
+        );
+        assert_eq!(
+            search_query(".exe"),
+            ".exe",
+            "the name was reduced to the empty query, which is not `no query` in a search \
+             box -- it matches everything, and the user is handed the whole vault"
+        );
+        // Multi-byte, because the cut is a byte index: a name whose last four
+        // BYTES are inside one character must not be sliced through.
+        assert_eq!(search_query("Кошелёк"), "Кошелёк");
+        assert_eq!(search_query("Кошелёк.exe"), "Кошелёк");
     }
 
     /// **The label is `window_label`'s answer, and this card is the one place

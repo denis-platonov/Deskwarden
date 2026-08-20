@@ -438,6 +438,15 @@ struct FaviconResult {
 ///
 /// Mirrors `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
 /// update closure is `FnMut + 'static` and can't return anything directly.
+/// # The search box starts empty here
+///
+/// One caller needs it not to -- the autofill overlay's *Search vault* button,
+/// which opens this window looking for the app it just said it had nothing for
+/// -- and that caller uses [`build_frame_with_search`]. This function is that
+/// one with an empty query, kept as the name every other caller already used
+/// rather than a tenth argument added to nine call sites that would all have
+/// passed the same thing. `overlay_ui::draw_overlay_card` and
+/// `draw_overlay_card_rows` are the same pair for the same reason.
 #[allow(clippy::too_many_arguments)]
 pub fn build_frame(
     cache: std::sync::Arc<VaultCache>,
@@ -500,6 +509,56 @@ pub fn build_frame(
     // had before this parameter existed.
     env: VaultFrameEnv,
 ) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
+    build_frame_with_search(
+        cache,
+        fill_stats,
+        details,
+        session_token,
+        icon_cache_dir,
+        auto_lock,
+        backend_already_running,
+        accounts,
+        pre_styled,
+        env,
+        String::new(),
+    )
+}
+
+/// [`build_frame`] with the search box already filled in.
+///
+/// See [`build_frame`] for every other parameter; only the last one is new,
+/// and only one caller passes a non-empty value for it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_frame_with_search(
+    cache: std::sync::Arc<VaultCache>,
+    fill_stats: FillStats,
+    details: AccountDetails,
+    session_token: String,
+    icon_cache_dir: std::path::PathBuf,
+    auto_lock: AutoLock,
+    backend_already_running: bool,
+    accounts: Option<crate::accounts::AccountsState>,
+    pre_styled: bool,
+    env: VaultFrameEnv,
+    // What the search box starts with. Empty from every caller but one.
+    //
+    // The exception is the autofill overlay's 3a card: it has just named the
+    // app it found nothing for, and its *Search vault* button opens this
+    // window to look for that name (see `crate::overlay_ui::SEARCH_VAULT_LABEL`
+    // and `crate::app::NoMatchFollowUp`). An unfiltered list would make the
+    // user retype a name the card was showing them a moment earlier.
+    //
+    // A `String` and not an `Option<String>`, because "no query" and "the
+    // empty query" are the same state in a search box and two spellings of one
+    // state is how a filter gets lost. The *caller* holds the option, and
+    // `main`'s `RealVaultOps` takes it once so a window reopened by a lock
+    // recovery or an account switch does not silently re-apply a query the
+    // user has since cleared.
+    initial_search: String,
+) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
+    // The body is unchanged from before `initial_search` existed; see
+    // `build_frame` above for why the parameter is on this function and not on
+    // that one.
     // **The session, wrapped before anything else touches it.** The parameter
     // arrives as a bare `String`, and a bare `String` holding the token that
     // unlocks the whole vault goes back to the allocator with the token still
@@ -883,7 +942,11 @@ pub fn build_frame(
         mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
         Receiver<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
     ) = mpsc::channel();
-    let mut search = String::new();
+    // Seeded, not blank: see the `initial_search` parameter. It is an ordinary
+    // `String` from here on and the user can clear or edit it like any other,
+    // which is the whole of what "the query is a starting point, not a mode"
+    // means here.
+    let mut search = initial_search;
     // Nothing to select yet -- set from the first item once the load lands.
     let mut selected_id: Option<String> = None;
     // Tracks the previous frame's `selected_id` so a change (from clicking a

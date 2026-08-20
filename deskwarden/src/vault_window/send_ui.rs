@@ -5122,7 +5122,14 @@ mod source_pins {
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),
             (
                 concat!("VaultFrame", "Env"),
-                vec![("main.rs", 4), ("vault_window/mod.rs", 4)],
+                // **Five in `mod.rs`, not four**, and the fifth is a
+                // PARAMETER: `build_frame` forwards to
+                // `build_frame_with_search`, so the type is written on both
+                // signatures. A forwarded parameter cannot read the pointer
+                // out of the env -- only `env.sync` does that, and it is
+                // pinned to one, one file down -- so this is still the count
+                // of every place that could.
+                vec![("main.rs", 4), ("vault_window/mod.rs", 5)],
             ),
         ] {
             let files = crate_sources();
@@ -5142,7 +5149,7 @@ mod source_pins {
                 seen, expected,
                 "{needle:?} is written in the crate's production at {seen:?}, not \
                  {expected:?}. `VaultFrameEnv::sync` is a `fn` pointer to a real `bw sync` \
-                 spawner, and these four counts are every way there is to get hold of one: \
+                 spawner, and these counts are every way there is to get hold of one: \
                  the binding and its two calls (`spawn_sync` in `mod.rs`), the one read of \
                  the field (`env.sync`), the real spawner's own definition and the one \
                  place `VaultFrameEnv::production` names it, and the type itself -- which \
