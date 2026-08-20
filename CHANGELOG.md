@@ -136,6 +136,13 @@ check comes back **in addition to** this one, not instead of it. See
   high for the same reason and have moved with it. Both now use the same
   measurement the card-number rows have used since they were reported for
   exactly this, so the three digit rows and the code cannot drift apart.
+- **The close ✕ is as legible as the controls beside it.** It rested at the
+  faintest ink the palette has for something still meant to be clicked, which
+  read as disabled next to the ✉ and the ⋮ ("close button feels too
+  gray/thin compared to the rest on details screen"). It now rests where they
+  rest. It is still never red — that is the point of the rule, because a
+  Delete that arms on its first click is one control away — and a neutral
+  grey was never at risk of being mistaken for it.
 
 ## 0.8.3 - 2026-08-19
 

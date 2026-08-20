@@ -1726,23 +1726,46 @@ pub fn send_record_button(ui: &mut Ui) -> Response {
 /// The detail header's close ✕: it clears the selection, so the item list
 /// takes the whole window and the pane is gone until a row is clicked.
 ///
-/// **Deliberately the quietest mark in the strip, and never [`ERROR`].** It
-/// sits immediately to the right of the kebab, and inside that kebab is a
-/// Delete that arms on its first click -- so these two controls are one
-/// misclick apart and one of them is permanent. A red ✕, or one drawn at the
-/// weight of a primary, would be inviting exactly that mistake. It rests at
-/// [`TEXT_GHOST`] -- fainter than the kebab's [`TEXT_SECONDARY`] and the
-/// star's [`TEXT_FAINT`], the lightest ink this palette has for something
-/// still meant to be clicked -- and darkens only to [`INK`] on hover. It has
-/// no armed state, because closing a pane is undone by clicking the row
-/// again.
+/// **Never [`ERROR`], and that is the whole of the safety rule.** It sits
+/// immediately to the right of the kebab, and inside that kebab is a Delete
+/// that arms on its first click and is permanent on its second -- so these
+/// two controls are one misclick apart and one of them cannot be undone. A
+/// red ✕, or one drawn at the weight of a primary, would be inviting exactly
+/// that mistake.
+///
+/// # It used to rest at `TEXT_GHOST`, and that was overshooting
+///
+/// Reported as "close button feels too gray/thin compared to the rest on
+/// details screen", and the report is simply right: the palette's faintest
+/// clickable ink, on a strip where the ✉ and the ⋮ beside it rest at
+/// [`TEXT_SECONDARY`], made the ✕ read as disabled rather than as quiet.
+///
+/// The old reasoning ran "not mistakable for the armed Delete, therefore as
+/// faint as possible", and the second half does not follow from the first.
+/// **Not red is the property.** [`ERROR`] is `#b42318`; [`TEXT_SECONDARY`] is
+/// `#444141`, a neutral dark grey with no hue in it at all. Nothing about
+/// resting there makes a ✕ readable as a delete, and the distance to
+/// [`TEXT_GHOST`] bought no safety the neutral grey did not already have --
+/// it only cost legibility on the one control that is on every detail pane.
+///
+/// So it rests where its siblings rest, and darkens to [`INK`] on hover as
+/// they do. The favourite star's [`TEXT_FAINT`] is not the reference: that is
+/// the colour of a TOGGLE THAT IS OFF, and this is an action, which is the
+/// same distinction [`send_record_button`] makes in its own body.
+///
+/// It still has no armed state, because closing a pane is undone by clicking
+/// the row again.
+///
+/// `the_close_mark_is_never_dressed_as_the_delete_beside_it` is the live
+/// guard, and it asserts the invariant -- never `ERROR`, and the same resting
+/// ink as the ✉ -- rather than either constant's value.
 pub fn close_pane_button(ui: &mut Ui) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let color = if response.hovered() { INK } else { TEXT_GHOST };
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
     let stroke = Stroke::new(ICON_STROKE, color);
     let arm = PANE_CLOSE_ARM;
     let c = rect.center();

@@ -13939,16 +13939,32 @@ mod tests {
         }
     }
 
-    /// **The ✕ does not look like the Delete it sits beside.**
+    /// **The ✕ does not look like the Delete it sits beside -- and is not
+    /// quieter than the controls it sits among.**
     ///
     /// These two controls are 48pt apart -- the kebab is between them, and
     /// inside that kebab is a Delete that arms on its first click and is
     /// permanent on its second. A ✕ drawn in [`theme::ERROR`], or at the
     /// weight of a primary, would be inviting exactly that misclick.
     ///
+    /// **Two assertions, and only the first is the safety property.** This
+    /// test used to pin `close_colour == TEXT_GHOST` alongside
+    /// `close_colour != ERROR`, and the pair reads as if both were about the
+    /// Delete. They are not: resting at the palette's faintest clickable ink
+    /// is far stronger than "not mistakable for an armed delete", and the
+    /// difference is what got reported as "close button feels too gray/thin
+    /// compared to the rest on details screen". `TEXT_SECONDARY` is a neutral
+    /// dark grey with no hue in it; nothing about it makes a ✕ readable as a
+    /// delete. So the second assertion now states the thing that was actually
+    /// wanted -- the ✕ is as legible as the other actions on the strip -- and
+    /// states it by naming one of them rather than by writing a palette
+    /// constant down.
+    ///
     /// Read off the PAINTED stroke colour and not off the source: the point
     /// is what a user sees, and a constant comparison would only restate
-    /// that `theme.rs` says so.
+    /// that `theme.rs` says so. Both sides of the second assertion are read
+    /// off the same frame for the same reason -- it compares two things the
+    /// user is looking at, not two entries in a palette.
     ///
     /// The armed frame is the one that matters, and it is why this drives the
     /// pane twice: an unarmed kebab is grey too, so "the ✕ is not red" is
@@ -13971,11 +13987,24 @@ mod tests {
                  the palette's error red, one control away from a Delete that arms on its \
                  first click"
             );
+            // **The relationship, not the constant.** This used to read
+            // `assert_eq!(close_colour, theme::TEXT_GHOST)` -- a photograph of
+            // one palette entry, which pinned the ✕ at the faintest ink this
+            // palette has and made "it looks disabled" a test failure rather
+            // than a bug report. What the strip actually needs is that the ✕
+            // is as legible as the other ACTIONS on it, and that is stated by
+            // naming one of them.
+            //
+            // The ✉ is the reference rather than the ★: a star that is not a
+            // favourite is a toggle in its OFF state and is quieter on
+            // purpose, so matching it would be matching a different kind of
+            // thing.
+            let (_, envelope_colour) = frame.envelope();
             assert_eq!(
-                close_colour,
-                theme::TEXT_GHOST,
-                "the close ✕ is not resting at the palette's faintest clickable ink, so it \
-                 is louder than the control it must not be mistaken for"
+                close_colour, envelope_colour,
+                "with delete_pending={delete_pending} the close ✕ rests at {close_colour:?} \
+                 while the ✉ beside it rests at {envelope_colour:?} -- the two are the same \
+                 kind of control on the same strip and one of them is fainter than the other"
             );
         }
 
