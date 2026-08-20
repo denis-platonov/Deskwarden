@@ -26,7 +26,7 @@
 use deskwarden::accounts::{self, account_label, Account};
 use deskwarden::app::{
     fill_from_vault, handle_locked, handle_match, handle_no_match, match_entries,
-    pump_windows_messages, HasPasswordField, Matched, Open,
+    pump_windows_messages, HasPasswordField, Matched, NoMatchFollowUp, Open,
 };
 use deskwarden::backend_policy;
 use deskwarden::bw_path;
@@ -1613,6 +1613,25 @@ fn main() {
     // nothing.
     let mut field_probe_memo = deskwarden::app::PasswordFieldProbe::new();
 
+    // **What the overlay's 3a card asked for, waiting for the loop's own
+    // door.** `Some` only after *Search vault* was clicked; see
+    // `deskwarden::app::NoMatchFollowUp`.
+    //
+    // It is a variable rather than a call at the point the card closes,
+    // because `process_foreground_event` borrows `estate.cache` and
+    // `estate.engine` for the duration of that call and `open_vault_window`
+    // takes the estate BY VALUE. Held for a beat and acted on at the top of
+    // the next pass, the borrows are over and the window opens through the
+    // same three lines the tray's two doors use -- `open_vault_window`,
+    // `rebuild_after_vault_window`, sweep the queue -- rather than through a
+    // fourth copy of them.
+    //
+    // Both call sites below write it and the one door reads it, which is why
+    // the seeding call (before the loop, where there is no `open_vault_window`
+    // to reach) does not need a second handler of its own: a card answered
+    // while seeding is honoured on the loop's first pass.
+    let mut pending_vault_search: Option<String> = None;
+
     // The process id of the last real (not our own) foreground window, kept
     // up to date alongside every event below. "Add app..." defaults its
     // process picker to this -- the app the user was just in -- rather than
@@ -1633,7 +1652,7 @@ fn main() {
         if event.pid != own_pid {
             last_active_pid = Some(event.pid);
         }
-        process_foreground_event(
+        pending_vault_search = search_asked_for(process_foreground_event(
             &event,
             &estate.cache,
             &injector,
@@ -1646,7 +1665,7 @@ fn main() {
             &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
             &deskwarden::injector::sequence::REAL_NOTIFIER,
             &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
-        );
+        ));
     }
 
     // Tray menu clicks that arrived while one of this app's blocking windows
@@ -1696,6 +1715,9 @@ fn main() {
             &backend_op_rx,
             // The one caller that hands an outcome in.
             startup_vault.take(),
+            // The startup window was not opened by anything the user searched
+            // for.
+            None,
         );
         rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
         // The third door into the vault window, swept exactly like the other
@@ -1709,6 +1731,54 @@ fn main() {
     }
 
     loop {
+        // **The overlay's fourth door into the vault window**, and it is the
+        // same three lines as the other three: open it, rebuild the tray's
+        // account menu, drop the vault requests the user queued at the tray
+        // while it was up. The only difference is the query it opens with.
+        //
+        // Taken, so a card answered once opens one window. See
+        // `pending_vault_search` and `deskwarden::app::NoMatchFollowUp`.
+        if let Some(query) = pending_vault_search.take() {
+            log::info!("the no-match card asked to search the vault for {query:?}");
+            estate = open_vault_window(
+                estate,
+                VaultDeps {
+                    fill_stats: &fill_stats,
+                    job: &job,
+                    schedule: &schedule,
+                    icon_cache_dir: &icon_cache_dir,
+                    config_dir: &config_dir,
+                    settings_path: &settings_path,
+                    first_run_account: first_run_account.as_ref(),
+                    backend_op_tx: &backend_op_tx,
+                },
+                &tray,
+                &backend_op_rx,
+                // This door opens its own window; there is no outcome to hand
+                // it.
+                None,
+                Some(query),
+            );
+            rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
+            drop_vault_requests_queued_behind_the_window(
+                &mut pending_menu_events,
+                &tray.open_vault_id,
+            );
+            // **`last_dispatched_hwnd` is deliberately NOT reset here, which
+            // is the one line where this door differs from the other three.**
+            //
+            // They reset it because the window they opened has nothing to do
+            // with whichever app is in front, so the next foreground event
+            // deserves a fresh answer. This one was opened *by* a card about
+            // that app, and closing it hands the foreground straight back to
+            // it. Clearing the suppression would re-dispatch the very window
+            // whose card was just answered -- and the probe's memo would still
+            // be inside its TTL, so the answer would be the same and 3a would
+            // come back up over the vault window the user had just used. That
+            // is `dispatch::should_dispatch`'s original defect ("Dismiss never
+            // dismissed") reintroduced through a new door.
+        }
+
         // **The pump is where a workstation lock is noticed**, because both
         // messages land in this thread's queue and this call is what drains
         // it. See `app::pump_windows_messages` and `away_lock`'s module doc:
@@ -1790,6 +1860,8 @@ fn main() {
                     &backend_op_rx,
                     // This door opens its own window; there is no outcome to
                     // hand it.
+                    None,
+                    // The tray menu asked for the vault, not for a search.
                     None,
                 );
                 rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
@@ -2301,6 +2373,8 @@ fn main() {
                 // This door opens its own window; there is no outcome to hand
                 // it.
                 None,
+                // A tray click asked for the vault, not for a search.
+                None,
             );
             rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
             // The second door into the same window, swept the same way and
@@ -2542,7 +2616,7 @@ fn main() {
             if event.pid != own_pid {
                 last_active_pid = Some(event.pid);
             }
-            process_foreground_event(
+            pending_vault_search = search_asked_for(process_foreground_event(
                 &event,
                 &estate.cache,
                 &injector,
@@ -2555,8 +2629,23 @@ fn main() {
                 &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
                 &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
-            );
+            ));
         }
+    }
+}
+
+/// The search query a [`NoMatchFollowUp`] asks for, if it asks for one.
+///
+/// A named function and not an inline `match`, because it is called at both of
+/// `process_foreground_event`'s call sites -- the seeding one before the loop
+/// and the one inside it -- and two inline copies of the same three lines is
+/// how the two ends of a decision drift apart. `run` is not reachable from any
+/// test in this crate, so this is also the only part of that wiring a test can
+/// hold; see `a_follow_up_that_asks_for_nothing_opens_no_window`.
+fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
+    match follow_up {
+        NoMatchFollowUp::SearchVault(query) => Some(query),
+        NoMatchFollowUp::Nothing => None,
     }
 }
 
@@ -3056,7 +3145,13 @@ struct NoMatchEnv<'a> {
     /// It takes the cache now, because 3a's *New login* button leads to design
     /// 3c and 3c ends in `VaultCache::create_item` -- see `app::handle_no_match`
     /// for what that widening does and does not buy.
-    show: fn(&VaultCache, &window_watch::ForegroundEvent),
+    ///
+    /// **It answers now**, with [`NoMatchFollowUp`]: 3a's *Search vault*
+    /// button has to open the vault window, and the route back to the one
+    /// place that opens one is this return value. The seam keeps its shape --
+    /// a test still substitutes a recorder for it and can now say what the
+    /// card asked for as well as that it was shown.
+    show: fn(&VaultCache, &window_watch::ForegroundEvent) -> NoMatchFollowUp,
     /// Asked to put design 3b on screen: the same window, focused while the
     /// vault cannot be read. Its own `fn` pointer rather than a flag on
     /// `show`, for the reason `PromptPresenter::show_locked` gives -- and so
@@ -3107,7 +3202,17 @@ const REAL_PASSWORD_FIELD_PROBE: fn(isize) -> HasPasswordField = real_password_f
 /// `REAL_PASSWORD_FIELD_PROBE` above and `app::REAL_OVERLAY` in the library.
 /// `handle_no_match` takes only the window, so there is no argument here for a
 /// mutation to hide in.
-const REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = handle_no_match;
+const REAL_NO_MATCH_CARD: NoMatchCard = handle_no_match;
+
+/// The shape of the 3a seam, as a name.
+///
+/// **An alias so the binding above fits on one line**, which is not cosmetic:
+/// `the_production_seam_wires_each_no_item_card_to_its_own_function` pins that
+/// binding by its source text, and its own comment records why the needle may
+/// not contain a newline (it would pass on an LF checkout and fail on a CRLF
+/// one). Spelling the whole `fn` type inline pushed the binding onto two lines
+/// the moment it grew a return type.
+type NoMatchCard = fn(&VaultCache, &window_watch::ForegroundEvent) -> NoMatchFollowUp;
 
 /// The production 3b card, named and not called -- the same shape, and the
 /// same reason, as [`REAL_NO_MATCH_CARD`] directly above.
@@ -3167,14 +3272,14 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // than owned here: the proof it carries has to outlive this call for
     // `reprompt::PROOF_LASTS` to mean anything. See `run`'s `fill_proof`.
     reprompt: &mut deskwarden::app::Reprompt<'_>,
-) {
+) -> NoMatchFollowUp {
     // Our own windows (prompt overlay, process picker, login) are focused,
     // always-on-top windows, so showing one fires EVENT_SYSTEM_FOREGROUND for
     // this process. Those are not app switches: ignore them entirely, without
     // even invalidating a pending hotkey fill (the target hasn't changed --
     // we just temporarily covered it).
     if dispatch::is_own_process(event.pid) {
-        return;
+        return NoMatchFollowUp::Nothing;
     }
 
     // Any foreground-window change invalidates a pending hotkey
@@ -3198,7 +3303,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             event.hwnd,
             event.exe_name
         );
-        return;
+        return NoMatchFollowUp::Nothing;
     }
     *last_dispatched_hwnd = Some(event.hwnd);
 
@@ -3276,24 +3381,30 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             {
                 *pending_hotkey_fill = Some(armed);
             }
+            // A matched window's card has no *Search vault* button and never
+            // could: it is showing the item the search would have found.
+            NoMatchFollowUp::Nothing
         }
         Open::NoMatch => {
             log::info!(
                 "no vault item matches {}, and it has a password field",
                 deskwarden::app::window_label(&event.exe_name, &event.title)
             );
-            // Nothing is armed and nothing is typed, and the signature is what
-            // says so: `handle_no_match` returns nothing, so there is no
-            // `pending_hotkey_fill` to set, and it is handed no cache, no
-            // injector and no `reprompt` -- a gate defined over an existing
-            // item, which this path does not have. See
+            // Nothing is armed and nothing is typed, and the signature is
+            // still what says so: `handle_no_match` answers a
+            // `NoMatchFollowUp` and nothing else, so there is no
+            // `pending_hotkey_fill` to set, and it is handed no injector and
+            // no `reprompt` -- a gate defined over an existing item, which
+            // this path does not have. What the answer CAN ask for is one
+            // window, at a door `run`'s loop already owns; it cannot type,
+            // cannot arm and cannot name an item. See
             // `an_unmatched_window_with_a_password_field_arms_nothing_and_types_nothing`.
             //
             // Through the seam, not by naming `handle_no_match` here: the real
             // one opens a frameless always-on-top window, which no test in
             // this crate may do -- and which, called directly on this line,
             // would make those tests hang rather than fail.
-            (field_probe.show)(cache, event);
+            (field_probe.show)(cache, event)
         }
         Open::Locked => {
             log::info!(
@@ -3306,8 +3417,12 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // path is handed no item because there provably is not one to be
             // had -- the engine that would name it is what the lock cleared.
             (field_probe.show_locked)(event);
+            // 3b carries no buttons at all, so there is nothing for it to ask
+            // for -- and in particular not a search of a vault that cannot be
+            // read. See `overlay_ui::SEARCH_VAULT_LABEL`.
+            NoMatchFollowUp::Nothing
         }
-        Open::Nothing => {}
+        Open::Nothing => NoMatchFollowUp::Nothing,
     }
 }
 
@@ -4466,6 +4581,23 @@ trait VaultOps {
 struct RealVaultOps<'a> {
     tray: &'a tray::AppTray,
     backend_op_rx: &'a Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    /// What the vault window's search box opens with, **taken on the first
+    /// window this ops object builds and never again**.
+    ///
+    /// `Some` from exactly one caller: the overlay's 3a card answered *Search
+    /// vault*, and the query is the app name the card was showing (see
+    /// `app::NoMatchFollowUp`).
+    ///
+    /// It is a field here rather than a parameter of `open_window` because
+    /// `run_vault_loop` reopens the window -- a lock recovery, an account
+    /// switch, a trip to Preferences -- and re-applying the query on the way
+    /// back would silently undo a search the user had cleared, or filter a
+    /// freshly switched account's vault by the name of an app that has nothing
+    /// to do with it. `Option::take` on a field the loop owns is what makes
+    /// "once" a property of the type rather than of a flag someone must
+    /// remember to clear. This is not on the `VaultOps` trait for the same
+    /// reason: no decision in `run_vault_loop` reads it.
+    initial_search: Option<String>,
 }
 
 /// What one vault window session produced.
@@ -4796,7 +4928,7 @@ impl VaultOps for RealVaultOps<'_> {
         // when the user locks: the whole feature is that the vault, the
         // spinner and the sign-in card are one window. So the frame is built
         // here and `app_window::run_from_vault` owns the loop around it.
-        let (options, vault_frame, handles) = vault_window::build_frame(
+        let (options, vault_frame, handles) = vault_window::build_frame_with_search(
             est.cache.clone(),
             deps.fill_stats.clone(),
             details,
@@ -4814,6 +4946,11 @@ impl VaultOps for RealVaultOps<'_> {
             // fonts, rounds the corners and raises it.
             false,
             vault_window::VaultFrameEnv::production(),
+            // **Taken, so only the first window of this session gets it.** See
+            // `RealVaultOps::initial_search`: every later pass of
+            // `run_vault_loop` reopens the window with an empty box, which is
+            // what any other route into this window has always given.
+            self.initial_search.take().unwrap_or_default(),
         );
 
         // **Everything the off-thread closures need, taken BEFORE the estate
@@ -5629,12 +5766,18 @@ fn open_vault_window(
     // is what keeps `resettle_session` reached from one place and keeps the
     // switch/add/remove wiring the tray's guards pin the only wiring there is.
     first_result: Option<vault_window::VaultWindowResult>,
+    // What the first window's search box opens with, and `None` from every
+    // door but one: the overlay's 3a card answered *Search vault*. See
+    // `RealVaultOps::initial_search` for why it is taken once rather than
+    // re-applied to every window this call may open, and
+    // `overlay_ui::SEARCH_VAULT_LABEL` for how the answer got here.
+    initial_search: Option<String>,
 ) -> SessionEstate {
     // A four-line constructor. Everything this function used to do is now
     // either in `RealVaultOps` (the window, the teardown, the dialogs) or in
     // `run_vault_loop` (every decision), and the split is what makes the
     // second half reachable from a test at all.
-    let mut ops = RealVaultOps { tray, backend_op_rx };
+    let mut ops = RealVaultOps { tray, backend_op_rx, initial_search };
     run_vault_loop(estate, &deps, &mut ops, first_result)
 }
 
@@ -20992,7 +21135,10 @@ mod tests {
         /// frameless always-on-top window. A test that reached it would not
         /// fail -- it would HANG, on a window with no title bar in a run with
         /// no user.
-        fn record_no_match(_cache: &VaultCache, window: &window_watch::ForegroundEvent) {
+        fn record_no_match(
+            _cache: &VaultCache,
+            window: &window_watch::ForegroundEvent,
+        ) -> NoMatchFollowUp {
             NO_MATCH_SHOWN.with(|s| {
                 // The EVENT, not a label computed here: the label is
                 // `no_match_arm`'s to compute, and a recorder that computed it
@@ -21001,6 +21147,11 @@ mod tests {
                 // _exe_name` is where that claim lives.
                 s.borrow_mut().push((window.exe_name.clone(), window.hwnd))
             });
+            // The card these tests drive is dismissed. What a *Search vault*
+            // answer makes the loop do is
+            // `a_search_vault_answer_is_carried_out_of_the_event_handler`'s
+            // question, through its own recorder.
+            NoMatchFollowUp::Nothing
         }
 
         /// Empties the recorder and returns what was in it.
@@ -21066,16 +21217,17 @@ mod tests {
             // Split literals on one line, in this crate's idiom: a whole
             // needle would match its own declaration, and a needle with a
             // newline in it passes on an LF checkout and fails on a CRLF one.
-            let no_match_const =
-                concat!("REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = ", "handle_no_match;");
+            // Through the `NoMatchCard` alias, which is what keeps this
+            // binding on one line now that it has a return type -- see the
+            // alias's own doc for why a one-line binding matters here.
+            let no_match_const = concat!("REAL_NO_MATCH_CARD: NoMatchCard = ", "handle_no_match;");
             let locked_const =
                 concat!("REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
             let no_match_field = concat!("show: ", "REAL_NO_MATCH_CARD,");
             let locked_field = concat!("show_locked: ", "REAL_LOCKED_CARD ");
 
             // The counter is shown to notice each swap before it is trusted.
-            let swapped_const =
-                concat!("REAL_NO_MATCH_CARD: fn(&VaultCache, &window_watch::ForegroundEvent) = ", "handle_locked;");
+            let swapped_const = concat!("REAL_NO_MATCH_CARD: NoMatchCard = ", "handle_locked;");
             assert_eq!(swapped_const.matches(no_match_const).count(), 0);
             let swapped_field = concat!("show: ", "REAL_LOCKED_CARD,");
             assert_eq!(swapped_field.matches(no_match_field).count(), 0);
@@ -21277,6 +21429,113 @@ mod tests {
                  about a literal it either excludes nothing -- the no-match card back in \
                  every browser, where no saved login can ever make it stop -- or excludes \
                  everything, which silences the card for every native app there is"
+            );
+        }
+
+        /// **What 3a's *Search vault* button makes `run` do, end to end
+        /// through the seam.**
+        ///
+        /// The button's whole risk is that it does nothing: it is a control on
+        /// a frameless, always-on-top card, and a click that is swallowed
+        /// between the card and `run`'s loop is exactly the "is this thing
+        /// working?" the card exists to answer. So the card is answered by a
+        /// stub here and the assertion is that the request comes back OUT of
+        /// `process_foreground_event`, carrying the query, where the loop's
+        /// one door is waiting for it.
+        ///
+        /// It is paired: an unmatched window whose card asked for nothing must
+        /// hand back nothing, or the button would be indistinguishable from
+        /// the dismissal beside it and every no-match card would open a
+        /// window.
+        #[test]
+        fn a_search_vault_answer_is_carried_out_of_the_event_handler() {
+            /// The 3a stub that clicks *Search vault*. It answers the label
+            /// the real `handle_no_match` answers -- `window_label`'s -- so
+            /// what this test reads is the query a user would really get.
+            fn asks_to_search(
+                _cache: &VaultCache,
+                window: &window_watch::ForegroundEvent,
+            ) -> NoMatchFollowUp {
+                deskwarden::app::no_match_follow_up(
+                    deskwarden::overlay_ui::NoMatchAnswer::SearchVault,
+                    deskwarden::app::window_label(&window.exe_name, &window.title),
+                )
+            }
+
+            let asked = |show: NoMatchCard| {
+                let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+                let filled = Filled::default();
+                let (stats, _path) = scratch_fill_stats();
+                let mut pending_hotkey_fill = None;
+                let mut last_dispatched_hwnd = None;
+                let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+                let follow_up = process_foreground_event(
+                    &window("Atlas Licence.exe", "Atlas Licence -- Sign in", 0x5150),
+                    &cache,
+                    &recording_injector(&filled),
+                    &stats,
+                    // Empty: nothing may match, or 3a is not the card.
+                    &engine_with(&[]),
+                    true,
+                    deskwarden::app::VaultAvailability::Readable,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                    &mut NoMatchEnv {
+                        memo: &mut probe_memo,
+                        ask: has_password_field,
+                        show,
+                        show_locked: record_locked,
+                    },
+                    &recorder(),
+                    &mut no_reprompt(),
+                );
+                assert!(
+                    filled.seen().is_empty() && pending_hotkey_fill.is_none(),
+                    "the no-match path typed or armed something. There is no item behind \
+                     this card, so whatever that was came from somewhere it must not"
+                );
+                follow_up
+            };
+
+            let _ = take_no_match_shown();
+            assert_eq!(
+                asked(asks_to_search),
+                NoMatchFollowUp::SearchVault("Atlas Licence".to_string()),
+                "clicking `Search vault` on 3a asked `run` for nothing. The button is inert, \
+                 which is worse than not drawing it -- and the query must be built from \
+                 `window_label`'s answer, without the `.exe` (see `app::search_query`)"
+            );
+            assert_eq!(
+                asked(record_no_match),
+                NoMatchFollowUp::Nothing,
+                "control: a dismissed 3a card ALSO asks for a window. Every unmatched \
+                 window would open the vault, and the assertion above would be reading a \
+                 constant rather than the button"
+            );
+            assert_eq!(
+                take_no_match_shown().len(),
+                1,
+                "control: the dismissing stub was never reached, so the pair above is not \
+                 two answers of the same card"
+            );
+        }
+
+        /// The last three lines of the wiring `run` itself is not reachable to
+        /// test: what the loop takes out of a [`NoMatchFollowUp`].
+        ///
+        /// Trivial, and asserted anyway, because it is the join between the
+        /// card's answer and the door that opens a window -- a `Some` for
+        /// `Nothing` would open the vault on every unmatched window a user
+        /// dismissed, which is the loudest possible failure on the surface
+        /// least able to carry one.
+        #[test]
+        fn a_follow_up_that_asks_for_nothing_opens_no_window() {
+            assert_eq!(search_asked_for(NoMatchFollowUp::Nothing), None);
+            assert_eq!(
+                search_asked_for(NoMatchFollowUp::SearchVault("Ledgerline".to_string())),
+                Some("Ledgerline".to_string()),
+                "the query was dropped between the card and the window, so the search box \
+                 opens empty and the user retypes the name the card just showed them"
             );
         }
 
