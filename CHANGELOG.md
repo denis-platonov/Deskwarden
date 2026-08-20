@@ -10,6 +10,19 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Preferences is now a mixer mark
+
+Reported as "also settings glyph I prefer to have vertical with just cross
+bars like a DJ mixer, maybe".
+
+- **Three vertical faders**, each a full-height track with a filled block
+  riding it, replacing the two horizontal slider rows.
+- **The blocks sit at three clearly different heights**, which is what makes
+  it read as a mixing desk rather than as a fence.
+- **It is more legible than what it replaces**, not just different: the old
+  ring knobs were small enough at this size to blur into their own lines,
+  and a solid cap does not.
+
 ### The favourite star is lighter, rounder and no longer the loudest mark
 
 Reported as "Star (fav) glyph looks too bold now compared to the other
