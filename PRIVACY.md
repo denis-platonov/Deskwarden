@@ -111,17 +111,19 @@ There are **two** ways this request is made, and the setting governs one of
 them.
 
 **The automatic check** runs once at startup and once a day thereafter. This
-is what Preferences → General → *Check for updates* switches off. It is on by
+is what Preferences → Updates → *Check for updates automatically* switches
+off. It is on by
 default, because an app that quietly stops telling you a security fix exists
 is a worse outcome than the IP address the check discloses — and one you
 would have no way to notice.
 
 **The manual check** is the *Check for updates* button on Preferences →
-About. **It works whether or not the automatic check is switched off**, and
+Updates, on the same page and directly below that switch. **It works whether
+or not the automatic check is switched off**, and
 it makes the same request to the same address. Switching the setting off asks
 Deskwarden not to contact GitHub on its own; pressing this button is you
-asking it to contact GitHub now. The About page says so, next to the button,
-so this is not a behaviour you have to come here to discover.
+asking it to contact GitHub now. The page says so, between the switch and the
+button, so this is not a behaviour you have to come here to discover.
 
 **Neither check downloads anything.** A check reads the latest release's
 version number and its release notes and stops there. The installer is
@@ -219,7 +221,8 @@ It collects no personal information from anyone, of any age.
   third party. That is a weaker reason to ask first than breach checking's,
   not no reason, which is why the switch is there.
 - **The update check is on by default and can be turned off** —
-  Preferences → General → *Check for updates*. On rather than off for the
+  Preferences → Updates → *Check for updates automatically*. On rather than
+  off for the
   reason given above: the disclosure is an IP address, and the cost of the
   other default is a user who is never told about a security fix and has no
   symptom to notice.

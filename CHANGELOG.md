@@ -10,12 +10,41 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Updates has a Preferences page of its own, and About is simple again
+
+Everything about updating was split across two pages: the switch that decides
+whether Deskwarden looks for a release by itself sat at the foot of
+**General**, while the *Check for updates* button, the release notes, the
+download, the progress bar and *Restart to install* were all a card at the
+bottom of **About**. Neither page told you the whole story, and About — the
+page that says which build you are running — had grown into the page that
+installs a different one.
+
+- **A new Updates page** carries both halves: the automatic-check switch, and
+  directly below it the check, the notes, the download and the restart. This
+  is the arrangement the Breaches page already uses for the same reason. The
+  button deliberately works whether or not the switch is on, because pressing
+  it is you asking; that sentence only reads as honest with the switch in the
+  same glance, which it now is.
+- **The switch is called "Check for updates automatically"**, not "Check for
+  updates". The button one card below says exactly that, and two identical
+  labels — one a switch, one a control the switch does not govern — would have
+  erased the distinction the page exists to make.
+- **About is two facts and nothing that acts**: which build this is, and which
+  Bitwarden account the vault comes from. The version stays there, because
+  that is what an About page is for; nothing that *does* something about the
+  version does.
+- Nothing about how updating works changed. A download you start keeps running
+  if you click to another section, and reports where it actually got to when
+  you come back.
+
 ### Fixed: Preferences said this build could not scan or check for updates
 
 Opening **Preferences** from inside the vault window showed *"This build
 cannot scan: nothing set the scan up when Deskwarden started"* on the Breaches
 page and *"This build cannot check for updates. Please report it — it is a
-defect, not a setting"* on About. Both buttons did nothing.
+defect, not a setting"* on Updates (the About page, before the entry above
+moved it). Both buttons did nothing.
 
 **Your build was fine.** Both messages were honest reports of a real missing
 piece, and the missing piece was ordering: two things Deskwarden sets up at

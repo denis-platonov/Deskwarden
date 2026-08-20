@@ -202,33 +202,48 @@ enum Surface {
     /// because "looks disabled" is precisely the claim a picture can check
     /// and a `contains` assertion cannot.
     PrefsClipboardOff,
-    /// **The About page's update card, checked and current.** The state the
+    /// **The About page, which is now two facts and nothing that acts.**
+    ///
+    /// Its own surface, and a new one: About used to be inseparable from the
+    /// update card below it, so every "About" picture in this directory was
+    /// really a picture of the update flow with a version row on top. The
+    /// card left for `Section::Updates`; this is what is left, and whether
+    /// what is left reads as a finished identity page or as an emptied one is
+    /// exactly the question only a picture answers.
+    ///
+    /// Drawn with a signed-in account from a fixture, because the version row
+    /// alone would not show whether the second row balances the card.
+    PrefsAbout,
+    /// **The Updates page's flow card, checked and current.** The state the
     /// tray item this replaced could not express at all: that item was created
     /// as a disabled `MenuItem::new("Update available", ..)`, so "there is no
     /// update" was rendered as a permanent claim that there was one. That this
     /// picture exists, and reads "This is the latest release", is the review.
     ///
-    /// Drawn with automatic checks OFF as well, so the note saying the button
-    /// still works is in the picture rather than only in a string constant.
-    PrefsAboutNoUpdate,
+    /// Drawn with automatic checks OFF as well -- and since the switch is now
+    /// the card directly above, this one picture carries the whole consent
+    /// argument: the pill off, the button offered anyway, and the sentence
+    /// saying which of the two the preference governs, all in one glance.
+    /// That glance is the reason the page exists and it is not assertable.
+    PrefsUpdatesNoUpdate,
     /// The same card with a release found: the version, the download button,
     /// and the release notes below. The notes fixture is deliberately longer
     /// than its region, so the PNG shows the region *scrolling* rather than
     /// growing -- the layout claim that matters, this window being unresizable
     /// and this crate having pushed a control out of reach before.
-    PrefsAboutUpdateAvailable,
+    PrefsUpdatesAvailable,
     /// **The same card with notes that FIT.** Its whole point is the absence
     /// of a scrollbar: the region reserves the bar's lane either way, so this
-    /// picture beside `prefs_about_update_available` is the review of "the
+    /// picture beside `prefs_updates_available` is the review of "the
     /// cue appears only when something is actually clipped, and the card's
     /// right edge does not move when it does".
-    PrefsAboutUpdateShortNotes,
+    PrefsUpdatesShortNotes,
     /// **The card for a user several releases behind**, whose notes are the
     /// union of every release they skipped, newest first, each under its own
     /// version heading. The case the panel was reading one release's worth of
     /// for, and the case where a scrollbar is legitimately wanted -- so this
     /// picture is the review of both halves at once.
-    PrefsAboutUpdateManyReleases,
+    PrefsUpdatesManyReleases,
     /// **The preferences WINDOW, chrome included**, rather than its body.
     ///
     /// Every other prefs surface draws `draw_prefs_body` at the size the
@@ -241,11 +256,11 @@ enum Surface {
     /// readable underneath. Its own surface because "is the bar there and does
     /// the card still fit" is exactly what a picture answers and an assertion
     /// does not.
-    PrefsAboutDownloading,
+    PrefsUpdatesDownloading,
     /// A failed download, with the reason on the page and a retry beside it.
     /// The old flow's failure went to a tray tooltip, visible only to someone
     /// already hovering a 16px icon.
-    PrefsAboutFailed,
+    PrefsUpdatesFailed,
     /// **The Breaches page, before anything has been asked for.** The consent
     /// pill, the scan button, the sentence saying the button ignores the
     /// pill, and an empty history that says so in words rather than being a
@@ -409,13 +424,14 @@ const ALL: &[Surface] = &[
     Surface::PreflightRefused,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
-    Surface::PrefsAboutNoUpdate,
-    Surface::PrefsAboutUpdateAvailable,
-    Surface::PrefsAboutUpdateShortNotes,
-    Surface::PrefsAboutUpdateManyReleases,
+    Surface::PrefsAbout,
+    Surface::PrefsUpdatesNoUpdate,
+    Surface::PrefsUpdatesAvailable,
+    Surface::PrefsUpdatesShortNotes,
+    Surface::PrefsUpdatesManyReleases,
     Surface::PrefsWindowChrome,
-    Surface::PrefsAboutDownloading,
-    Surface::PrefsAboutFailed,
+    Surface::PrefsUpdatesDownloading,
+    Surface::PrefsUpdatesFailed,
     Surface::PrefsBreachesIdle,
     Surface::PrefsBreachesRunning,
     Surface::PrefsBreachesFailed,
@@ -457,13 +473,20 @@ impl Surface {
             Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
-            Surface::PrefsAboutNoUpdate => "prefs_about_no_update",
-            Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
-            Surface::PrefsAboutUpdateShortNotes => "prefs_about_update_short_notes",
-            Surface::PrefsAboutUpdateManyReleases => "prefs_about_update_many_releases",
+            // **Renamed from `prefs_about_*`, not merely re-pointed.** The
+            // card these show moved to `Section::Updates`; a picture called
+            // `prefs_about_downloading` that draws the Updates page is a file
+            // name that lies about which page is under review, and the whole
+            // value of this directory is that the name says what you are
+            // looking at.
+            Surface::PrefsAbout => "prefs_about",
+            Surface::PrefsUpdatesNoUpdate => "prefs_updates_no_update",
+            Surface::PrefsUpdatesAvailable => "prefs_updates_available",
+            Surface::PrefsUpdatesShortNotes => "prefs_updates_short_notes",
+            Surface::PrefsUpdatesManyReleases => "prefs_updates_many_releases",
             Surface::PrefsWindowChrome => "prefs_window_chrome",
-            Surface::PrefsAboutDownloading => "prefs_about_downloading",
-            Surface::PrefsAboutFailed => "prefs_about_failed",
+            Surface::PrefsUpdatesDownloading => "prefs_updates_downloading",
+            Surface::PrefsUpdatesFailed => "prefs_updates_failed",
             Surface::PrefsBreachesIdle => "prefs_breaches_idle",
             Surface::PrefsBreachesRunning => "prefs_breaches_running",
             Surface::PrefsBreachesFailed => "prefs_breaches_failed",
@@ -530,12 +553,13 @@ impl Surface {
             // page lays out against exactly the width it has in the app.
             Surface::PrefsClipboard
             | Surface::PrefsClipboardOff
-            | Surface::PrefsAboutNoUpdate
-            | Surface::PrefsAboutUpdateAvailable
-            | Surface::PrefsAboutUpdateShortNotes
-            | Surface::PrefsAboutUpdateManyReleases
-            | Surface::PrefsAboutDownloading
-            | Surface::PrefsAboutFailed
+            | Surface::PrefsAbout
+            | Surface::PrefsUpdatesNoUpdate
+            | Surface::PrefsUpdatesAvailable
+            | Surface::PrefsUpdatesShortNotes
+            | Surface::PrefsUpdatesManyReleases
+            | Surface::PrefsUpdatesDownloading
+            | Surface::PrefsUpdatesFailed
             | Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
             | Surface::PrefsBreachesFailed
@@ -892,12 +916,13 @@ impl eframe::App for Preview {
             Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
-            Surface::PrefsAboutNoUpdate
-            | Surface::PrefsAboutUpdateAvailable
-            | Surface::PrefsAboutUpdateShortNotes
-            | Surface::PrefsAboutUpdateManyReleases
-            | Surface::PrefsAboutDownloading
-            | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
+            Surface::PrefsAbout => self.draw_prefs_about(root),
+            Surface::PrefsUpdatesNoUpdate
+            | Surface::PrefsUpdatesAvailable
+            | Surface::PrefsUpdatesShortNotes
+            | Surface::PrefsUpdatesManyReleases
+            | Surface::PrefsUpdatesDownloading
+            | Surface::PrefsUpdatesFailed => self.draw_prefs_updates(root, self.current()),
             Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
             | Surface::PrefsBreachesFailed
@@ -1261,7 +1286,29 @@ impl Preview {
         let _ = prefs_ui::draw_prefs_window(root, &mut state);
     }
 
-    fn draw_prefs_about(&mut self, root: &mut egui::Ui, surface: Surface) {
+    /// **The About page on its own**, now that there is an "on its own" to
+    /// draw: two rows of fact, and nothing that can be pressed.
+    ///
+    /// The account comes from a fixture for the same reason the Updates
+    /// surfaces park their stage -- this example publishes nothing, installs
+    /// no process globals, and must not go anywhere near `bw` or
+    /// `%APPDATA%\Deskwarden`.
+    fn draw_prefs_about(&mut self, root: &mut egui::Ui) {
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+        state.show(prefs_ui::Section::About);
+        state.show_account_source(|| {
+            Some(prefs_ui::AccountStatus::SignedIn {
+                email: Some("someone@example.invalid".to_string()),
+                server: Some("https://vault.example.invalid/api".to_string()),
+            })
+        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
+    }
+
+    fn draw_prefs_updates(&mut self, root: &mut egui::Ui, surface: Surface) {
         use deskwarden::update_panel::UpdateStage;
         use deskwarden::updater::ReleaseInfo;
 
@@ -1309,13 +1356,13 @@ impl Preview {
         };
 
         let stage = match surface {
-            Surface::PrefsAboutUpdateAvailable => UpdateStage::Available(release),
+            Surface::PrefsUpdatesAvailable => UpdateStage::Available(release),
             // Short enough to fit the region with room to spare, which is the
             // state whose review is that there is NO bar beside it -- and,
             // since these lines are the ones that stay above the fold, where
             // the link and the inline code are put so a reviewer can see
             // what they look like without scrolling a screenshot.
-            Surface::PrefsAboutUpdateShortNotes => UpdateStage::Available(ReleaseInfo {
+            Surface::PrefsUpdatesShortNotes => UpdateStage::Available(ReleaseInfo {
                 body: concat!(
                     "### Fixed\n",
                     "- The vault window remembers its size, via `settings.json`.\n",
@@ -1332,7 +1379,7 @@ impl Preview {
             // with a hole in it is not a range. This is also the case where
             // a scrollbar is legitimately wanted, so one picture reviews
             // both halves.
-            Surface::PrefsAboutUpdateManyReleases => UpdateStage::Available(ReleaseInfo {
+            Surface::PrefsUpdatesManyReleases => UpdateStage::Available(ReleaseInfo {
                 body: concat!(
                     "## Deskwarden 0.9.0\n",
                     "- Release notes now cover **every** version you skipped.\n",
@@ -1348,12 +1395,12 @@ impl Preview {
                 .to_string(),
                 ..release
             }),
-            Surface::PrefsAboutDownloading => UpdateStage::Downloading {
+            Surface::PrefsUpdatesDownloading => UpdateStage::Downloading {
                 release,
                 done: 2_400_000,
                 total: Some(6_291_456),
             },
-            Surface::PrefsAboutFailed => UpdateStage::Failed {
+            Surface::PrefsUpdatesFailed => UpdateStage::Failed {
                 message: "failed to download installer: connection closed".to_string(),
                 release: Some(release),
             },
@@ -1369,18 +1416,8 @@ impl Preview {
             check_for_updates: false,
             ..deskwarden::settings::Settings::default()
         });
-        state.show(prefs_ui::Section::About);
+        state.show(prefs_ui::Section::Updates);
         state.show_update_stage(stage);
-        // **A signed-in account, from a fixture rather than from the process.**
-        // The row reads a published value in the app; this example publishes
-        // nothing and installs its own source, so the picture shows the state
-        // a real user is in without a `bw` anywhere near it.
-        state.show_account_source(|| {
-            Some(prefs_ui::AccountStatus::SignedIn {
-                email: Some("someone@example.invalid".to_string()),
-                server: Some("https://vault.example.invalid/api".to_string()),
-            })
-        });
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
