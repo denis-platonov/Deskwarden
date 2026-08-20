@@ -1464,8 +1464,17 @@ const ENVELOPE_HALF_HEIGHT: f32 = 6.5;
 /// [`the_drawn_close_marks_do_not_share_an_extent`] is the live guard.
 const PANE_CLOSE_ARM: f32 = 7.05;
 
-/// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
-const EYE_PUPIL_RADIUS: f32 = 2.4;
+/// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there, and not
+/// [`TUNE_KNOB_RADIUS`]'s 3.0 for the same reason.
+///
+/// **It was 2.4, against an almond 10.0 tall**: the pupil filled 48% of the
+/// eye's height and left barely a pixel of white above and below it, which
+/// is the cramped middle the old mark had. The almond is 12.8 tall now
+/// ([`eye_toggle`]'s `HALF_H`), and a pupil left at 2.4 would have rattled
+/// around inside it -- so this grows with it, to 2.9, which holds the same
+/// share of a taller eye and keeps a clear 2.85pt of white between the
+/// pupil's edge and the lid's inner face.
+const EYE_PUPIL_RADIUS: f32 = 2.9;
 
 /// The clock face of [`add_totp_button`], as a radius.
 ///
@@ -2188,16 +2197,48 @@ pub fn account_switcher_button(ui: &mut Ui) -> Response {
     response.on_hover_text("Switch account")
 }
 
-/// The eye's almond outline: two parabolic lids meeting at the corners.
+/// How full each of the eye's lids is, as the exponent on `1 - t²`.
+///
+/// **It was 1.0 -- a plain parabola -- and that is what "eye glyphs, bit
+/// taller / more rounded" was a report of.** A parabolic lid is flat across
+/// the middle and then dives at the ends: at 90% of the way to the corner it
+/// has already given up 81% of its height, so the almond's belly is thin
+/// everywhere except dead centre and the mark reads as a squashed oval
+/// rather than as an eye.
+///
+/// The exponent is the direct control on that, and it runs the useful way
+/// round: 1.0 is the parabola, 0.5 is an exact ellipse, and anything between
+/// is fuller than the one and less mechanical than the other. 0.72 keeps
+/// 74% of the height at that same 90% mark -- an almond with a body -- while
+/// staying off the ellipse, which at this size reads as a circle squashed by
+/// a layout rather than as a drawn shape.
+///
+/// Below 1.0 the lids also meet the corners with a vertical tangent instead
+/// of a shallow one, which is what gives the almond its two points. That is
+/// the shape's own doing and not a separate treatment.
+const EYE_LID_FULLNESS: f32 = 0.72;
+
+/// The eye's almond outline: two lids meeting at the corners.
+///
+/// **Sampled by ANGLE, not by x.** The lids are walked as `t = sin(u)` with
+/// `u` sweeping corner to corner, so the samples bunch where the curve turns
+/// hardest and spread where it runs straight. Stepping `t` uniformly -- what
+/// this did while the lids were parabolas, when it hardly mattered -- puts
+/// the same number of points along the flat middle as along the corner, and
+/// [`EYE_LID_FULLNESS`] below 1.0 turns the corner sharply enough that the
+/// faceting shows at 28px. The point count is unchanged; only where they sit
+/// is.
 fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
-    let lid = |t: f32, sign: f32| {
-        center + Vec2::new(t * half_w, sign * half_h * (1.0 - t * t))
+    let lid = |i: usize, sign: f32| {
+        let sweep = std::f32::consts::PI * i as f32 / EYE_LID_SEGMENTS as f32;
+        let t = (sweep - std::f32::consts::FRAC_PI_2).sin();
+        let height = (1.0 - t * t).max(0.0).powf(EYE_LID_FULLNESS);
+        center + Vec2::new(t * half_w, sign * half_h * height)
     };
-    let step = |i: usize| -1.0 + 2.0 * i as f32 / EYE_LID_SEGMENTS as f32;
-    let mut points: Vec<Pos2> = (0..=EYE_LID_SEGMENTS).map(|i| lid(step(i), -1.0)).collect();
+    let mut points: Vec<Pos2> = (0..=EYE_LID_SEGMENTS).map(|i| lid(i, -1.0)).collect();
     // The lower lid, back from just inside the right corner to just inside
     // the left one -- the corners themselves are already in the list.
-    points.extend((1..EYE_LID_SEGMENTS).rev().map(|i| lid(step(i), 1.0)));
+    points.extend((1..EYE_LID_SEGMENTS).rev().map(|i| lid(i, 1.0)));
     debug_assert_eq!(points.len(), EYE_VERTICES);
     points
 }
@@ -2220,8 +2261,17 @@ pub const EYE_TOGGLE_SIZE: f32 = 28.0;
 /// now the only thing on that line: the `CTRL+B` text that used to sit beside
 /// it moved into the row's hover tooltip.
 pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
+    /// Half the almond's width. Unchanged: the eye's width is what
+    /// `detail.rs`'s `masked_row` budgets a row's controls against, and
+    /// nothing about it was reported.
     const HALF_W: f32 = 8.5;
-    const HALF_H: f32 = 5.0;
+    /// Half the almond's height. **It was 5.0**, which with a parabolic lid
+    /// put the mark at 17.0 x 10.0 -- a 1.7:1 letterbox, and the "bit
+    /// taller" half of the report. 6.4 makes it 17.0 x 12.8, a 1.33:1
+    /// almond, which is where an eye stops reading as an oval somebody sat
+    /// on. The 28px hit target ([`EYE_TOGGLE_SIZE`]) is nowhere near
+    /// troubled by it, and the strike below still clears the lids.
+    const HALF_H: f32 = 6.4;
 
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(EYE_TOGGLE_SIZE), Sense::click());
     if response.hovered() {

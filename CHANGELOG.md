@@ -29,6 +29,18 @@ bit more modern".
 - **The filled star no longer shows seams through itself.** It was drawn as a
   fan of separately anti-aliased triangles; it is one mesh.
 
+### The reveal eye is taller and rounder
+
+Reported as "same for eye glyphs - bit taller\more rounded".
+
+- **17.0 x 10.0 becomes 17.0 x 12.8** -- a 1.7:1 letterbox becomes a 1.33:1
+  almond. The width is untouched, because a masked row budgets its controls
+  against it.
+- **The lids are fuller across their whole length**, not just at the centre,
+  so the eye has a body rather than a thin crescent at each end.
+- **The pupil grows with the eye**, from 2.4 to 2.9, so the middle of the
+  mark is neither cramped nor rattling around.
+
 ### Browsers no longer get the "no saved login" card
 
 In a browser that card could never be right. Every sign-in page has a password
