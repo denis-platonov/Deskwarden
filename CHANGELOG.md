@@ -10,6 +10,52 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Fixed: Preferences said this build could not scan or check for updates
+
+Opening **Preferences** from inside the vault window showed *"This build
+cannot scan: nothing set the scan up when Deskwarden started"* on the Breaches
+page and *"This build cannot check for updates. Please report it — it is a
+defect, not a setting"* on About. Both buttons did nothing.
+
+**Your build was fine.** Both messages were honest reports of a real missing
+piece, and the missing piece was ordering: two things Deskwarden sets up at
+startup were being set up *after* the first vault window opened, and that
+window blocks until you close it. Preferences reached from the tray icon —
+the same pages, a different route in — worked normally throughout, which is
+why this went unnoticed.
+
+Both are now set up before any window opens, so both routes behave the same.
+The messages themselves stay: an app that genuinely cannot do something should
+say so plainly, and these two are the reason this was diagnosable at all. If
+you reported this — thank you, and sorry for the alarm.
+
+### Starting Deskwarden while an older copy is running now works
+
+Launching a new build while an older one was running showed *"Deskwarden is
+already running on this PC"* and quit. The older copy predates the handover
+mechanism, so there was nobody to ask it to close — and rather than run two
+copies at once, the new one refused. From your side you double-clicked
+Deskwarden and got nothing.
+
+The new copy now takes over regardless.
+
+- **Asking still comes first, and is still the normal path.** A running
+  Deskwarden that can be asked to stand down is asked, and closes through its
+  own door: vault cache wiped, copied password taken back off the clipboard,
+  backend shut down. Nothing about an ordinary relaunch changes.
+- **Only when there is nobody to ask, or no answer within five seconds**, is
+  the running copy ended outright — and only a process running the same
+  program, signed in as you, in your own session. Another signed-in user's
+  Deskwarden is never touched, and neither is an installer applying an update.
+- **What ending it costs, stated plainly.** The backend still shuts down with
+  it, so nothing is left holding your unlocked vault. But a password that copy
+  had copied can stay on the clipboard until its own clipboard timer clears it
+  — the new copy cannot clear a clipboard it cannot prove is Deskwarden's, and
+  quietly emptying yours would be a bug of its own.
+- **If it still cannot be closed**, you get the same message and the same
+  advice as before — quit it from its tray icon — rather than two Deskwardens
+  running at once. Everything the new copy did, and why, is in the log.
+
 ### Card network marks can be the networks' own logos
 
 **Preferences → General → Show card network logos**, off unless you turn it
