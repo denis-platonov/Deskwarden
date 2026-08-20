@@ -420,6 +420,27 @@ const UPDATE_NOTES_EMPTY: &str = "This release came with no notes.";
 /// same guarantee, covering layout cost rather than reach.
 const UPDATE_NOTES_HEIGHT: f32 = 128.0;
 
+/// Vertical distance between two lines of the notes, and between two
+/// paragraphs of them.
+///
+/// The first is a line gap rather than the card's `ROW_TEXT_GAP`, because a
+/// release body's lines are prose: a row's worth of air between every bullet
+/// reads as a list of paragraphs rather than as a list. The second is what a
+/// blank source line is painted as, and the reason it is a real number is
+/// that the gap between "Added" and "Fixed" is information the author put
+/// there.
+const UPDATE_NOTES_LINE_GAP: f32 = 2.0;
+const UPDATE_NOTES_PARAGRAPH_GAP: f32 = 6.0;
+
+/// How far one level of bullet nesting insets a line, and the glyph that
+/// replaces the source's `-`.
+///
+/// The nesting depth this is multiplied by is bounded in
+/// `updater::MAX_BULLET_DEPTH`, because the leading spaces that produce it
+/// are chosen by whoever wrote the release.
+const UPDATE_NOTES_BULLET_STEP: f32 = 12.0;
+const UPDATE_NOTES_BULLET_GLYPH: &str = "•  ";
+
 /// The notes scrollbar's width and the gap either side of it. Named, because
 /// the region's content width is this much less than the row's and the two
 /// numbers have to be the same ones -- a mismatch shows as this card being a
@@ -1761,27 +1782,30 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
     });
 }
 
-/// The notes region: a heading, then the release body as **plain text** inside
-/// a fixed-height scroll area.
+/// The notes region: a heading, then the release body rendered through the
+/// bounded Markdown subset in `updater`, inside a fixed-height scroll area.
 ///
-/// Three things this deliberately does not do, all for the same reason -- the
-/// string arrived over the network and is data:
+/// Two things this deliberately does not do:
 ///
-/// * It does not parse markdown, so `#`, `*` and `[..](..)` paint as the
-///   characters they are.
-/// * It does not extract links or make anything clickable. Nothing on this
-///   page can navigate anywhere a release author chose.
+/// * **Nothing here is clickable.** A link's words and its destination are
+///   painted; neither is a widget, and no click on this page can navigate
+///   anywhere a release author chose. The argument for drawing that line
+///   exactly there is in `updater`'s subset header, next to the parser it
+///   governs.
 /// * It does not size itself to its content. The height is
 ///   [`UPDATE_NOTES_HEIGHT`] whatever arrives, and the overflow scrolls, so
 ///   no release body can push the buttons above it off a window that cannot
 ///   be resized.
 ///
-/// The string has already been through `updater::release_notes_for_display`,
-/// which strips control and invisible-formatting characters and bounds the
-/// length. Called here rather than at parse time so the untouched body stays
-/// on `ReleaseInfo` -- there is exactly one place that decides what is safe to
+/// The body has already been through `updater::release_notes_blocks`, which
+/// runs `release_notes_for_display` -- control characters, bidi overrides,
+/// zero-widths, and the length bound -- BEFORE it looks at a single markup
+/// character, and whose spans are all slices of that cleaned string. Called
+/// here rather than at parse time so the untouched body stays on
+/// `ReleaseInfo`: there is exactly one place that decides what is safe to
 /// paint, and this is its only caller.
 fn release_notes(ui: &mut Ui, body: &str) {
+    let blocks = crate::updater::release_notes_blocks(body);
     let shown = crate::updater::release_notes_for_display(body);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
@@ -1862,19 +1886,158 @@ fn release_notes(ui: &mut Ui, body: &str) {
                 // it -- the mismatch the bar constants' comment warns about,
                 // in the direction nobody notices until they measure.
                 ui.set_width(ui.available_width());
-                // `Label::wrap`, not a `TextEdit` and not rich text: one
-                // galley of plain characters, wrapped to the card.
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(shown).size(12.0).color(theme::TEXT_MUTED),
-                    )
-                    .wrap(),
-                );
+                notes_body(ui, &blocks);
             });
         remember_notes_overflow(
             ui,
             scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
         );
+    });
+}
+
+/// Paints the parsed release notes, one line per block.
+///
+/// **`Label`s, not a `TextEdit` and not a widget of any kind.** A label is
+/// text egui has laid out; it takes no click, holds no focus, and has no
+/// action. That is the property that keeps a link's words from becoming a
+/// link's behaviour, and it is why the styled runs go into a `LayoutJob` --
+/// which is still one galley of text -- rather than into per-span widgets.
+fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
+    use crate::updater::NotesBlock;
+
+    // Lines of one body sit at a line's distance from each other, not at the
+    // card's row spacing: this is prose, and `ROW_TEXT_GAP` between every
+    // line of a bulleted list reads as a list of paragraphs.
+    ui.spacing_mut().item_spacing.y = UPDATE_NOTES_LINE_GAP;
+    for (n, block) in blocks.iter().enumerate() {
+        // A heading opens a section, so it gets the paragraph's air above it
+        // -- except at the very top, where there is nothing to be separated
+        // from and the gap would just push the notes down the region.
+        let opening = n == 0;
+        match block {
+            // The paragraph break, painted as the space it is. Without this
+            // the blank line between two sections of a release body would
+            // vanish and the sections would run together -- which is half of
+            // what "new lines seems like [gone]" was reporting.
+            NotesBlock::Blank => ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP),
+            NotesBlock::Heading { level, spans } => {
+                if !opening {
+                    ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP);
+                }
+                notes_line(ui, spans, 0.0, Some(*level));
+            }
+            NotesBlock::Bullet { depth, spans } => {
+                // The glyph joins the line's own runs rather than being a
+                // second widget beside them, so a bullet whose text wraps
+                // wraps under its own text and not under the glyph.
+                let mut with_glyph = vec![crate::updater::NotesSpan {
+                    text: UPDATE_NOTES_BULLET_GLYPH.to_string(),
+                    style: crate::updater::NotesStyle::Plain,
+                }];
+                with_glyph.extend_from_slice(spans);
+                let inset = *depth as f32 * UPDATE_NOTES_BULLET_STEP;
+                notes_line(ui, &with_glyph, inset, None);
+            }
+            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None),
+        }
+    }
+}
+
+/// One line: its runs laid out into a single wrapped galley, inset for a
+/// bullet's depth.
+///
+/// A bullet's glyph and its text share the galley rather than being two
+/// widgets side by side, so a bullet whose text wraps wraps under itself the
+/// way the rest of the line does. `wrap.max_width` is set from the width the
+/// region actually has, minus the inset -- not from a constant, because this
+/// card is drawn at two different widths by the window shell and the vault
+/// modal.
+fn notes_line(
+    ui: &mut Ui,
+    spans: &[crate::updater::NotesSpan],
+    inset: f32,
+    heading: Option<u8>,
+) {
+    use crate::updater::NotesStyle;
+    use egui::text::{LayoutJob, TextFormat};
+    use egui::{FontFamily, FontId};
+
+    if spans.is_empty() {
+        return;
+    }
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = (ui.available_width() - inset).max(1.0);
+
+    if let Some(level) = heading {
+        // Two sizes, not six. A release body's headings are section names
+        // ("Added", "Fixed"); a scale with six steps inside a 128pt region
+        // would be a hierarchy nobody can see.
+        let size = if level <= 2 { 13.0 } else { 12.0 };
+        for span in spans {
+            job.append(
+                &span.text,
+                0.0,
+                TextFormat {
+                    font_id: FontId::new(size, FontFamily::Name(theme::SEMIBOLD.into())),
+                    color: theme::INK,
+                    ..Default::default()
+                },
+            );
+        }
+    } else {
+        for span in spans {
+            let format = match span.style {
+                NotesStyle::Plain => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::TEXT_MUTED,
+                    ..Default::default()
+                },
+                NotesStyle::Strong => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+                    color: theme::TEXT_SECONDARY,
+                    ..Default::default()
+                },
+                // egui skews the glyphs rather than swapping the face: this
+                // app's font stack is Archivo weights and carries no italic
+                // one, and a real italic is not worth a fifth embedded font
+                // for a release note.
+                NotesStyle::Emphasis => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::TEXT_MUTED,
+                    italics: true,
+                    ..Default::default()
+                },
+                NotesStyle::Code => TextFormat {
+                    font_id: FontId::new(11.0, FontFamily::Monospace),
+                    color: theme::TEXT_SECONDARY,
+                    background: theme::CANVAS,
+                    ..Default::default()
+                },
+                // Underlined and in the page's blue, which is what a link
+                // looks like -- and then it does nothing, because it is
+                // text. The destination beside it is the honest half: the
+                // user can see and copy where these words point, which a
+                // clickable link that hid its URL would not give them.
+                NotesStyle::LinkText => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::BLUE,
+                    underline: egui::Stroke::new(1.0, theme::BLUE),
+                    ..Default::default()
+                },
+                NotesStyle::LinkUrl => TextFormat {
+                    font_id: FontId::new(11.0, FontFamily::Proportional),
+                    color: theme::TEXT_FAINT,
+                    ..Default::default()
+                },
+            };
+            job.append(&span.text, 0.0, format);
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(inset);
+        ui.add(egui::Label::new(job));
     });
 }
 
@@ -4355,29 +4518,154 @@ mod tests {
         assert!(painted.contains(UPDATE_DOWNLOAD_BUTTON));
     }
 
-    /// **Release notes are painted as text, not interpreted.**
-    ///
-    /// The body is chosen by whoever cut the release. This asserts on the
-    /// rendered galley -- `TextInk::rendered` is what egui actually laid out
-    /// -- so a future change that started parsing markdown, or turned a URL
-    /// into a link, would show up as the literal characters no longer being
-    /// there.
-    #[test]
-    fn release_notes_are_painted_as_the_literal_characters_they_are() {
-        let hostile = "<b>bold?</b> [link](https://evil.example) # heading?";
+    /// Every run of ink the notes region painted, joined.
+    fn painted_notes(body: &str) -> String {
         let painted = paint_about(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
-                body: hostile.to_string(),
+                body: body.to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        painted
+            .ink
+            .iter()
+            .map(|i| i.rendered.clone())
+            .collect::<Vec<_>>()
+            .join("\u{1}")
+    }
+
+    /// **Markup is rendered; the characters that made it are not painted.**
+    ///
+    /// This asserts on the rendered galley -- `TextInk::rendered` is what
+    /// egui actually laid out -- so the old behaviour, `**` on screen as two
+    /// asterisks, fails it.
+    #[test]
+    fn release_notes_render_the_bounded_markdown_subset() {
+        let painted = painted_notes(
+            "# Fixed\n- a **bold** word, an *italic* one and some `code`\n",
+        );
+
+        assert!(painted.contains("Fixed"), "got {painted:?}");
+        assert!(painted.contains("bold"), "got {painted:?}");
+        assert!(painted.contains("italic"), "got {painted:?}");
+        assert!(painted.contains("code"), "got {painted:?}");
+        assert!(
+            !painted.contains('*') && !painted.contains('#') && !painted.contains('`'),
+            "the markup characters are still on screen, so nothing was rendered: {painted:?}"
+        );
+    }
+
+    /// **What is outside the subset is painted as the characters it is.**
+    ///
+    /// The floor the parser falls through to, and the reason a malformed
+    /// body is not a defect: raw HTML is not markup here, and an unclosed
+    /// emphasis is two asterisks somebody typed.
+    #[test]
+    fn what_the_subset_excludes_is_painted_literally() {
+        let painted = painted_notes("<b>bold?</b> and **unclosed and #1234 issues");
+
+        assert!(painted.contains("<b>bold?</b>"), "got {painted:?}");
+        assert!(painted.contains("**unclosed"), "got {painted:?}");
+        assert!(
+            painted.contains("#1234"),
+            "a hash with no space after it is an issue number, not a heading: {painted:?}"
+        );
+    }
+
+    /// **A link's words and its destination are painted, and nothing is
+    /// clickable.**
+    ///
+    /// The click is the exclusion that matters: this text arrives over the
+    /// network onto the page that says what is about to be installed, so a
+    /// link there is the one element that could turn misleading styling into
+    /// a place the user can be sent. A `Label` is not egui's link widget and
+    /// takes no action; showing the URL keeps the information without the
+    /// path.
+    #[test]
+    fn a_link_shows_its_words_and_its_destination_and_opens_nothing() {
+        let painted = painted_notes("See [the release page](https://example.invalid/r) for more.");
+
+        assert!(painted.contains("the release page"), "got {painted:?}");
+        assert!(
+            painted.contains("https://example.invalid/r"),
+            "the destination must be readable, so a user can decide about it: {painted:?}"
+        );
+        assert!(
+            !painted.contains("[the release page]"),
+            "the brackets are still on screen: {painted:?}"
+        );
+        // A source-text guard beside the paint one: a `Label` cannot navigate
+        // anywhere, and these are the two ways one could be replaced by
+        // something that can. Split so this assertion does not match itself.
+        let source = include_str!("prefs_ui.rs");
+        for forbidden in [concat!("Hyper", "link"), concat!("open_", "url")] {
+            assert!(
+                !source.contains(forbidden),
+                "{forbidden:?} is in this page: nothing here may navigate anywhere a \
+                 release author chose"
+            );
+        }
+    }
+
+    /// An image is stripped to its alt text: rendering it would mean fetching
+    /// it, and this page makes no request it was not asked for.
+    #[test]
+    fn an_image_is_reduced_to_its_alt_text() {
+        let painted = painted_notes("Look: ![a screenshot](https://example.invalid/x.png) here.");
+
+        assert!(painted.contains("a screenshot"), "got {painted:?}");
+        assert!(
+            !painted.contains("example.invalid"),
+            "an image URL is a fetch this page must not invite: {painted:?}"
+        );
+    }
+
+    /// **The sanitisation survives the parser.**
+    ///
+    /// A bidi override can make a painted line read backwards from its bytes,
+    /// on the page whose job is saying what is about to be installed. The
+    /// markdown work must not have moved the parse in front of the strip.
+    #[test]
+    fn the_invisible_characters_are_still_stripped_under_markdown() {
+        let painted = painted_notes("- **safe\u{202e}txet**\u{200b} here");
+
+        assert!(
+            !painted.contains('\u{202e}') && !painted.contains('\u{200b}'),
+            "an invisible formatting character reached the screen: {painted:?}"
+        );
+    }
+
+    /// **Blank lines are space, not nothing.**
+    ///
+    /// Reported as "new lines seems like [gone]": a body whose sections ran
+    /// together into a wall. Two paragraphs of the same characters must be
+    /// taller than one, which is a claim about the gap rather than about any
+    /// particular number of points.
+    #[test]
+    fn a_body_with_a_paragraph_break_paints_taller_than_one_without() {
+        let flowing = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: "alpha\nbeta".to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        let broken = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: "alpha\n\nbeta".to_string(),
                 ..a_release()
             }),
             Settings::default(),
         );
 
+        let bottom = |p: &Painted| p.rect_of("beta").bottom();
         assert!(
-            painted.ink.iter().any(|i| i.rendered.contains(hostile)),
-            "the notes were transformed on their way to the screen; they must be painted \
-             verbatim and interpreted as nothing. Painted: {:?}",
-            painted.ink.iter().map(|i| i.rendered.clone()).collect::<Vec<_>>()
+            bottom(&broken) > bottom(&flowing) + 1.0,
+            "the blank line between two sections was painted as nothing: with break {}, \
+             without {}",
+            bottom(&broken),
+            bottom(&flowing)
         );
     }
 

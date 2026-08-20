@@ -1092,20 +1092,29 @@ impl Preview {
                 "a".repeat(64)
             ))
             .unwrap(),
+            // **Markdown, because a real GitHub release body is.** Every
+            // construct in the rendered subset is in here on purpose, so one
+            // picture is the review of all of them: headings, bullets and
+            // their nesting, bold, italic, inline code, a link (whose words
+            // are styled and whose destination is beside them, and which
+            // opens nothing), and -- at the end -- the things that are
+            // deliberately NOT in the subset, painted as the characters they
+            // are.
             body: concat!(
-                "Added\n",
-                "- The update flow moved out of the tray and onto this page.\n",
-                "- Release notes are shown before anything is downloaded.\n",
+                "## Added\n",
+                "- The update flow moved out of the tray and onto **this page**.\n",
+                "- Release notes are shown *before* anything is downloaded.\n",
+                "  - Including the ones from releases you skipped.\n",
                 "- The download reports its progress where you started it.\n",
                 "\n",
-                "Fixed\n",
+                "## Fixed\n",
                 "- The tray no longer claims an update exists when none does.\n",
                 "- A failed update says why, on a page rather than in a tooltip.\n",
+                "- `release_notes_for_display` still strips what it stripped.\n",
                 "\n",
-                "Notes\n",
-                "- This text comes from the GitHub release body and is rendered\n",
-                "  as plain text. Nothing in it is a link, and nothing in it is\n",
-                "  markup: <b>this stays literal</b>, and so does [this](url).\n",
+                "## Notes\n",
+                "- The full list is on [the releases page](https://example.invalid/r).\n",
+                "- Raw HTML is not in the subset: <b>this stays literal</b>.\n",
                 "- It is deliberately long here so this screenshot shows the\n",
                 "  region scrolling rather than pushing the buttons off the\n",
                 "  page.\n",
@@ -1116,9 +1125,18 @@ impl Preview {
         let stage = match surface {
             Surface::PrefsAboutUpdateAvailable => UpdateStage::Available(release),
             // Short enough to fit the region with room to spare, which is the
-            // state whose review is that there is NO bar beside it.
+            // state whose review is that there is NO bar beside it -- and,
+            // since these lines are the ones that stay above the fold, where
+            // the link and the inline code are put so a reviewer can see
+            // what they look like without scrolling a screenshot.
             Surface::PrefsAboutUpdateShortNotes => UpdateStage::Available(ReleaseInfo {
-                body: "Fixed\n- The vault window remembers its size between runs.".to_string(),
+                body: concat!(
+                    "### Fixed\n",
+                    "- The vault window remembers its size, via `settings.json`.\n",
+                    "- Details on [the release page](https://example.invalid/r).\n",
+                    "- Raw HTML stays literal: <b>not bold</b>.\n",
+                )
+                .to_string(),
                 ..release
             }),
             Surface::PrefsAboutDownloading => UpdateStage::Downloading {
