@@ -128,6 +128,14 @@ check comes back **in addition to** this one, not instead of it. See
   adds one is **Add a TOTP**. The qualifiers stay on purpose — the pane can
   show a live code and its seed one above the other, and two rows with the
   same label are two rows you cannot tell apart.
+- **The live TOTP code sits on the row's line.** It was painted 1.5pt high —
+  the code, its countdown bar and the seconds beside it are three type sizes
+  on one line, and each was centred in its own box rather than on a shared
+  baseline, which reads as the digits floating above everything next to them
+  ("TOTP code itself not in the center vertically"). The seconds were 0.5pt
+  high for the same reason and have moved with it. Both now use the same
+  measurement the card-number rows have used since they were reported for
+  exactly this, so the three digit rows and the code cannot drift apart.
 
 ## 0.8.3 - 2026-08-19
 

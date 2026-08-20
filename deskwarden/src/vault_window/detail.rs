@@ -6047,11 +6047,52 @@ fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
     // egui breaks at word boundaries, and neither a bullet run nor a card
     // number has any.
     job.wrap.break_anywhere = true;
+    paint_on_the_value_baseline(ui, job, theme::INK);
+}
+
+/// Allocate a run's box the way `Label` would and paint it on the baseline
+/// [`digits_baseline_drop`] chose, rather than at the top of that box.
+///
+/// The body of what [`paint_digits`] used to be, lifted out when the live
+/// TOTP code turned out to need exactly it. **Nothing here is about digits**
+/// -- `digits_baseline_drop` reads the two galleys' heights and first
+/// baselines and knows nothing about their strings, and neither does this.
+/// The name is about the rule ("put this run where an ordinary value goes"),
+/// which is the thing three rows on this pane now share.
+///
+/// The colour is a parameter because the runs that need this are no longer
+/// all [`theme::INK`]: the countdown beside the code is
+/// [`theme::TEXT_FAINT`], and a helper that repainted it in the value colour
+/// would be a placement fix that also changed the design.
+fn paint_on_the_value_baseline(
+    ui: &mut egui::Ui,
+    job: egui::text::LayoutJob,
+    color: egui::Color32,
+) {
     let galley = ui.painter().layout_job(job);
     let drop = digits_baseline_drop(&galley, &ordinary_value_galley(ui));
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     ui.painter()
-        .galley(egui::pos2(rect.left(), rect.top() + drop), galley, theme::INK);
+        .galley(egui::pos2(rect.left(), rect.top() + drop), galley, color);
+}
+
+/// A plain run in one size and colour, as a [`LayoutJob`] rather than a
+/// `RichText` -- so it can go through [`paint_on_the_value_baseline`], which
+/// needs a job it can lay out itself.
+///
+/// [`egui::text::LayoutJob`]: egui::text::LayoutJob
+fn plain_job(text: &str, size: f32, color: egui::Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+            color,
+            ..Default::default()
+        },
+    );
+    job
 }
 
 /// A row whose value is DIGITS and is **not a secret**: the card's expiry.
@@ -7074,12 +7115,29 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
         |ui| {
             // The design lays these three out along one centred line, `gap:
             // 12px` apart: the code, a 96x4 track, then the seconds left.
-            ui.label(theme::letterspaced_mono(
-                code,
-                TOTP_CODE_SIZE,
-                TOTP_CODE_TRACKING,
+            //
+            // **`paint_on_the_value_baseline`, not `ui.label`, and that is
+            // the whole of the "the code is not centred" repair.** Reported
+            // as "TOTP code itself not in the center vertically": three runs
+            // at three sizes share one `Align::Center` band, egui centres
+            // each one's BOX, and the monospace face puts its baseline
+            // further up inside its box than the proportional faces beside it
+            // do. Measured on this row before the fix, as the drop from a
+            // label's centre to the value's ink: the code sat 1.5pt high and
+            // the countdown 0.5pt.
+            //
+            // The offset is `digits_baseline_drop`'s, derived from these two
+            // galleys -- see that function, which insists on exactly this
+            // rather than a written-down constant "nobody could later
+            // justify, and one that would go stale the moment either type
+            // size moved". It is the card rows' mechanism unchanged: nothing
+            // in it is about digits or about 15px, so a 17px monospace code
+            // needs no second rule.
+            paint_on_the_value_baseline(
+                ui,
+                theme::letterspaced_mono(code, TOTP_CODE_SIZE, TOTP_CODE_TRACKING, theme::INK),
                 theme::INK,
-            ));
+            );
             ui.add_space(TOTP_GAP);
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(TOTP_BAR_WIDTH, TOTP_BAR_HEIGHT),
@@ -7095,10 +7153,16 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
             ui.painter()
                 .rect_filled(filled, CornerRadius::same(2), theme::BLUE);
             ui.add_space(TOTP_GAP);
-            ui.label(
-                RichText::new(totp_countdown_text(seconds_left))
-                    .size(ROW_HINT_SIZE)
-                    .color(theme::TEXT_FAINT),
+            // The same placement as the code, for the same reason and by the
+            // same function. An 11px run's box is SHORTER than an ordinary
+            // value's rather than taller, so it was off in the other
+            // direction and by less -- 0.5pt -- but "less" is not "not", and
+            // a row centred by one rule everywhere is worth more than a row
+            // with one run exempted because its error was small.
+            paint_on_the_value_baseline(
+                ui,
+                plain_job(&totp_countdown_text(seconds_left), ROW_HINT_SIZE, theme::TEXT_FAINT),
+                theme::TEXT_FAINT,
             );
         },
         |_ui| {},
@@ -16543,6 +16607,20 @@ mod tests {
         item: &VaultItem,
         reveal: RevealState,
     ) -> Vec<(String, egui::FontId, f32, egui::Rect, egui::Rect)> {
+        painted_ink_showing(item, &TotpState::NoSecret, reveal)
+    }
+
+    /// [`painted_ink`] for a pane that is showing a live code.
+    ///
+    /// The split exists because the TOTP row's typography is the one thing on
+    /// this pane a card fixture cannot reach: `painted_ink`'s callers are all
+    /// card rows and all want the row absent, and the code row only paints
+    /// under [`TotpState::Code`].
+    fn painted_ink_showing(
+        item: &VaultItem,
+        totp: &TotpState,
+        reveal: RevealState,
+    ) -> Vec<(String, egui::FontId, f32, egui::Rect, egui::Rect)> {
         fn walk(
             shape: &egui::Shape,
             out: &mut Vec<(String, egui::FontId, f32, egui::Rect, egui::Rect)>,
@@ -16571,7 +16649,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        for clipped in &frame_shapes(item, &TotpState::NoSecret, reveal) {
+        for clipped in &frame_shapes(item, totp, reveal) {
             walk(&clipped.shape, &mut out);
         }
         out
@@ -16730,6 +16808,158 @@ mod tests {
                  where an ordinary row paints its own {ordinary}pt below -- the value is \
                  {}pt off the pane's line: {drops:?}",
                 ordinary - drop
+            );
+        }
+    }
+
+    /// The reference value the TOTP tests measure against: an ordinary
+    /// proportional value beside an ordinary label.
+    ///
+    /// **Not `a_login`'s own `a.novak@ledgerline.com`, and the difference is
+    /// the whole reason this exists.** These tests read a baseline off the
+    /// bottom of a run's ink, which is only the baseline for a run with no
+    /// descender -- and `ledgerline` has a `g`. The same care
+    /// `a_card_whose_every_value_sits_on_the_baseline` takes, for the same
+    /// reason.
+    const NO_DESCENDER_USERNAME: &str = "anna.novak";
+
+    /// The fixture the TOTP row's typography is measured on: a login with a
+    /// seed, so the pane will draw the row at all, and a username that can
+    /// serve as the reference baseline.
+    fn a_login_showing_a_code() -> VaultItem {
+        let mut item = a_login();
+        let login = item.login.as_mut().expect("a_login has login data");
+        login.totp = Some("seed".to_string().into());
+        login.username = Some(NO_DESCENDER_USERNAME.to_string());
+        item
+    }
+
+    /// The live code and the seconds this fixture is drawn at. Digits only,
+    /// so the code's ink bottom is its baseline too.
+    const SHOWN_CODE: &str = "418902";
+    const SHOWN_SECONDS: u8 = 19;
+
+    /// **The live code sits on the pane's line, exactly as a card number
+    /// does.**
+    ///
+    /// Reported as "TOTP code itself not in the center vertically". The row
+    /// paints three runs at three different sizes along one
+    /// `Align::Center` band -- a 17px monospace code, a 96x4 track, and an
+    /// 11px countdown -- and egui centres each one's BOX. The code's box is
+    /// the tallest and the monospace face puts its baseline further up inside
+    /// that box than the proportional faces around it do, so the digits
+    /// landed high while the two things beside them did not.
+    ///
+    /// **This is the identical defect the card rows had**, and it is fixed by
+    /// the identical mechanism: [`digits_baseline_drop`], derived from the two
+    /// galleys rather than written down as a number. Nothing about that
+    /// function is specific to 15px or to the masked face -- it takes the
+    /// heights and first baselines of whatever two galleys it is handed -- so
+    /// the 17px code needs no second constant and no second rule.
+    ///
+    /// Measured the same way `every_card_value_paints_its_ink_on_one_baseline_
+    /// with_its_label` measures, against the same reference: the drop from a
+    /// label's box centre to the value's ink bottom, on a row whose value has
+    /// no descender. The `Username` row is the reference because it is an
+    /// ordinary proportional value beside an ordinary label -- the line the
+    /// whole pane reads on -- and it is NAMED rather than written down, so a
+    /// retuned row height moves this with it.
+    #[test]
+    fn the_live_code_sits_on_the_same_line_an_ordinary_value_does() {
+        let painted = painted_ink_showing(
+            &a_login_showing_a_code(),
+            &TotpState::Code {
+                code: SHOWN_CODE.to_string(),
+                seconds_left: SHOWN_SECONDS,
+            },
+            RevealState::default(),
+        );
+        let drop = |label: &str, value: &str| {
+            let (.., label_box, _) = one_run(&painted, label);
+            let (.., ink) = one_run(&painted, value);
+            ink.bottom() - label_box.center().y
+        };
+        let ordinary = drop("Username", NO_DESCENDER_USERNAME);
+        let code = drop(copy_shortcut_label(CopyShortcut::Totp), SHOWN_CODE);
+        assert!(
+            (code - ordinary).abs() <= 0.25,
+            "the live code paints its ink {code}pt below its label's centre where an \
+             ordinary value paints {ordinary}pt below -- the code is {}pt off the pane's \
+             line",
+            ordinary - code
+        );
+    }
+
+    /// **And the two things beside the code are on that line too.**
+    ///
+    /// Split from the test above deliberately. The report was about the code,
+    /// and the code is what that test is named for; but a row is only centred
+    /// if all of it is, and a fix that moved the digits onto the line while
+    /// leaving the countdown where it was would pass that test and still look
+    /// wrong. The countdown is measured against the same reference and the
+    /// same way -- `19s` has no descender either.
+    ///
+    /// The track is not text and so has no baseline. It is a 4pt bar, and
+    /// what "centred" means for it is that its own middle is on the row's
+    /// middle; it is measured against the code's ink rather than against a
+    /// label so that the assertion is about the three things sharing a line.
+    #[test]
+    fn the_countdown_and_the_track_share_the_codes_line() {
+        let item = a_login_showing_a_code();
+        let totp = TotpState::Code {
+            code: SHOWN_CODE.to_string(),
+            seconds_left: SHOWN_SECONDS,
+        };
+        let painted = painted_ink_showing(&item, &totp, RevealState::default());
+        let drop = |label: &str, value: &str| {
+            let (.., label_box, _) = one_run(&painted, label);
+            let (.., ink) = one_run(&painted, value);
+            ink.bottom() - label_box.center().y
+        };
+        let ordinary = drop("Username", NO_DESCENDER_USERNAME);
+        let countdown = drop(
+            copy_shortcut_label(CopyShortcut::Totp),
+            &totp_countdown_text(SHOWN_SECONDS),
+        );
+        assert!(
+            (countdown - ordinary).abs() <= 0.25,
+            "the countdown paints its ink {countdown}pt below the row's label centre where \
+             an ordinary value paints {ordinary}pt below"
+        );
+
+        // The track: the one filled rect on this row that is
+        // `TOTP_BAR_HEIGHT` tall, found by its own measurements rather than
+        // by position, and checked against the middle of the code's ink.
+        let mut bars: Vec<egui::Rect> = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r)
+                    if (r.rect.height() - TOTP_BAR_HEIGHT).abs() < 0.01
+                        && r.rect.width() > 1.0 =>
+                {
+                    out.push(r.rect)
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &frame_shapes(&item, &totp, RevealState::default()) {
+            walk(&clipped.shape, &mut bars);
+        }
+        // Two: the full-width groove and the filled portion over it. Both
+        // are the track, so both are checked.
+        assert_eq!(bars.len(), 2, "the TOTP track is not two bars: {bars:?}");
+        let (.., code_ink) = one_run(&painted, SHOWN_CODE);
+        for bar in &bars {
+            assert!(
+                (bar.center().y - code_ink.center().y).abs() <= 1.5,
+                "the track's middle is {}pt off the middle of the code's ink: {bar:?} \
+                 against {code_ink:?}",
+                bar.center().y - code_ink.center().y
             );
         }
     }
