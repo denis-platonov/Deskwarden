@@ -78,6 +78,14 @@ windows = { version = "0.58", features = [
     # No window is created for it: the registration goes on the hidden helper
     # window the tray icon already owns.
     "Win32_System_RemoteDesktop",
+    # SystemTimeToTzSpecificLocalTime, plus the FILETIME/SYSTEMTIME round trip
+    # around it (src/local_time.rs). This crate carries no date library and
+    # wants none: its own arithmetic covers the civil calendar, but "was
+    # daylight saving in effect at THAT instant" is a question only the OS can
+    # answer correctly after the binary has shipped, and applying
+    # GetTimeZoneInformation's rule by hand gets the southern hemisphere and
+    # every rescheduled transition wrong.
+    "Win32_System_Time",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -40,6 +40,7 @@
 //! the new link too, but the list is what makes it durable -- which is why a
 //! successful create invalidates the list rather than only reporting.
 
+use crate::local_time::LocalOffset;
 use crate::send::{SendClock, SendError, SendSummary};
 use crate::theme;
 use eframe::egui::{self, CornerRadius};
@@ -704,6 +705,16 @@ pub const SENDS_HEADING: &str = "Sends";
 /// one it is handed. That is the same split every other pane in this window
 /// uses, and it is why a Sends failure is a `NoticeSource` rather than a
 /// widget of its own.
+///
+/// **Eight parameters, and the eighth is the reason for this attribute.**
+/// `zone` joined `now` when the composer's expiry line stopped naming the UTC
+/// day and started naming the user's own. The alternative to passing it is
+/// reading the machine's timezone inside the draw, which is exactly what
+/// `now` is a parameter to avoid: a paint test could then assert the shape of
+/// that sentence and never its content, and would say something different on
+/// a runner in another timezone. Bundling the two into a struct would move
+/// the argument count rather than reduce what this function is handed.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
@@ -722,6 +733,12 @@ pub fn draw_send_pane(
     // the wall clock for itself, or the paint tests could only assert the
     // shape of the sentence and never its content.
     now: &dyn SendClock,
+    // The machine's offset from UTC, for the composer's expiry line. A
+    // parameter beside `now`, and for exactly the same reason: the date under
+    // the lifetime picker is the user's OWN day, and a paint test that read
+    // the offset off the machine running it would assert a different sentence
+    // on a runner in another timezone -- or on the same runner in March.
+    zone: &dyn LocalOffset,
 ) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
@@ -805,7 +822,7 @@ pub fn draw_send_pane(
     // silently does not exist, which is the shape this window keeps having to
     // un-write.
     if composer.open {
-        if let Some(reported) = draw_composer(ui, composer, creating, now) {
+        if let Some(reported) = draw_composer(ui, composer, creating, now, zone) {
             action = reported;
         }
         ui.add_space(12.0);
@@ -1210,6 +1227,7 @@ fn draw_composer(
     composer: &mut SendComposer,
     in_flight: bool,
     now: &dyn SendClock,
+    zone: &dyn LocalOffset,
 ) -> Option<SendUiAction> {
     let mut action = None;
     let enabled = !in_flight;
@@ -1276,10 +1294,16 @@ fn draw_composer(
             // the user can check against a calendar. `expiry_wording` is
             // `send.rs`'s own, so this line and the `deletionDate` in the JSON
             // cannot disagree about what the choice means.
+            //
+            // The date it prints is the user's **local** day: the stored
+            // `deletionDate` is UTC and stays UTC, and a Send that dies at
+            // 00:30 UTC dies the previous evening in the Americas. See
+            // `send::expiry_wording`.
             ui.label(
                 egui::RichText::new(crate::send::expiry_wording(
                     composer.plan.delete_in_days,
                     now,
+                    zone,
                 ))
                 .size(11.0)
                 .color(theme::TEXT_FAINT),
@@ -2275,7 +2299,7 @@ mod verdict_linearity {
                 let _ = ctx.run_ui(Default::default(), |ui| {
                     // Deliberately dropped rather than applied: this is the
                     // shape every measured shadow reduces to.
-                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0));
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0));
                 });
             }),
             1,
@@ -2379,7 +2403,7 @@ mod paint_tests {
 
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            action = draw_send_pane(ui, state, notice, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
 
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
@@ -2551,7 +2575,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -2585,7 +2609,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2597,7 +2621,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         action
     }
@@ -2725,7 +2749,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
         for clipped in &output.shapes {
@@ -2745,7 +2769,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2758,7 +2782,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -2787,7 +2811,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -2802,7 +2826,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -2815,7 +2839,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0)).into_action();
+            action = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
         action
     }
@@ -5658,7 +5682,11 @@ mod source_pins {
         "send.rs: pub trait SendClock {",
         "send.rs: pub struct FixedClock(pub i64);",
         "send.rs: pub struct SystemClock;",
-        "send.rs: pub fn expiry_wording(days: u8, now: &dyn SendClock) -> String {",
+        // `zone` was added beside `now` when the sentence stopped naming the
+        // UTC day and started naming the user's own. Both are injected, and
+        // that is the point of both: nothing in `send.rs` reads the machine's
+        // clock or the machine's timezone for itself.
+        "send.rs: pub fn expiry_wording(days: u8, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
         "send.rs: pub struct SendInvocation {",
         "send.rs: pub fn args(&self) -> &[String] {",
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",
@@ -6230,7 +6258,7 @@ mod source_pins {
         let pane = squashed(concat!(
             "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
              send_delete.view(), &mut send_create.composer, send_create.in_flight, \
-             &crate::send::SystemClock, )"
+             &crate::send::SystemClock, &crate::local_time::SystemZone, )"
         ));
         assert_eq!(
             squashed(&production).matches(pane.as_str()).count(),

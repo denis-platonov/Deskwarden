@@ -270,46 +270,25 @@ impl SendClock for SystemClock {
     }
 }
 
-const MILLIS_PER_DAY: i64 = 86_400_000;
+/// **Re-exported from [`crate::local_time`], not declared here.** The civil
+/// arithmetic this file used to carry -- `MILLIS_PER_DAY`, `MONTH_NAMES`,
+/// `civil_from_days`, `utc_parts` -- was never a Send concept; it is what
+/// "which day is this instant" means, and a second copy of it beside a first
+/// is precisely how two surfaces come to disagree about one moment by a day.
+/// It now lives in one module, with one set of tests, and this file uses it.
+use crate::local_time::{LocalOffset, MILLIS_PER_DAY};
 
-const MONTH_NAMES: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Civil date from a count of days since 1970-01-01, by Howard Hinnant's
-/// `civil_from_days`. Proleptic Gregorian, which is what an ISO 8601 instant
-/// means and what `bw` parses.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (y + i64::from(m <= 2), m, d)
-}
-
-/// Splits a Unix millisecond instant into `(year, month, day, hour, minute,
-/// second, millisecond)`, UTC. Floor division throughout, so instants before
-/// the epoch do not fold the wrong way.
+/// The UTC civil parts of a Unix millisecond instant, in the tuple shape this
+/// file's two formatters read.
+///
+/// A thin adapter over [`crate::local_time::civil_parts`]: the wire format
+/// below is **UTC and must stay UTC** -- `bw` reads `deletionDate` as an ISO
+/// instant with a `Z` on it, and shifting that into the user's zone would
+/// change what is stored rather than what is shown. The half that is shifted
+/// is [`expiry_wording`], and only that half.
 fn utc_parts(millis: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
-    let days = millis.div_euclid(MILLIS_PER_DAY);
-    let rem = millis.rem_euclid(MILLIS_PER_DAY);
-    let (y, m, d) = civil_from_days(days);
-    let ms = (rem % 1000) as u32;
-    let secs = rem / 1000;
-    (
-        y,
-        m,
-        d,
-        (secs / 3600) as u32,
-        ((secs / 60) % 60) as u32,
-        (secs % 60) as u32,
-        ms,
-    )
+    let p = crate::local_time::civil_parts(millis);
+    (p.year, p.month, p.day, p.hour, p.minute, p.second, p.millis)
 }
 
 /// The instant a Send planned `days` from `now` should be deleted, in the
@@ -326,14 +305,37 @@ fn deletion_date(days: u8, now: &dyn SendClock) -> String {
 /// "7 days" is a duration the user has to do arithmetic on; a date is the
 /// thing they can check against a calendar, and this is a publishing action
 /// where being wrong about the lifetime is the harm. Both are given.
-pub fn expiry_wording(days: u8, now: &dyn SendClock) -> String {
-    let (y, mo, d, ..) = utc_parts(now.now_unix_millis() + i64::from(days) * MILLIS_PER_DAY);
-    let month = MONTH_NAMES
-        .get(mo.saturating_sub(1) as usize)
-        .copied()
-        .unwrap_or("???");
+///
+/// # The date is LOCAL, and this used to be the bug
+///
+/// This sentence read `"-- on {d} {month} {y} (UTC)."`, computed from the
+/// UTC instant. That is not a cosmetic difference: a Send created in the
+/// afternoon in New York expires at 00:30 UTC, which is the **previous
+/// evening** where the user is standing -- so the line under the picker named
+/// a day the link would already be dead on, and named it in the one place
+/// this app has where being wrong about a lifetime is the harm.
+///
+/// "(UTC)" did not rescue it. A reader who has never had to think about
+/// timezones reads a parenthesis as noise, not as an instruction to subtract
+/// five hours from a date; and this app's rule is that no label ever says
+/// "UTC" to a user, because a label that has to explain its own timezone is a
+/// label that should have done the conversion.
+///
+/// The stored `deletionDate` is untouched and stays UTC -- see
+/// [`deletion_date`]. Store UTC, display local.
+///
+/// `zone` is injected for the same reason `now` is: nothing in this file
+/// reads the machine's clock or the machine's timezone for itself, so every
+/// assertion about this sentence is exact rather than dependent on where and
+/// when the suite runs.
+pub fn expiry_wording(days: u8, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {
+    let expires_at = now.now_unix_millis() + i64::from(days) * MILLIS_PER_DAY;
+    let parts = crate::local_time::local_parts(expires_at, zone);
     let unit = if days == 1 { "day" } else { "days" };
-    format!("The link stops working after {days} {unit} -- on {d} {month} {y} (UTC).")
+    format!(
+        "The link stops working after {days} {unit} -- on {}.",
+        crate::local_time::format_day(parts)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4262,34 +4264,115 @@ mod tests {
 
     #[test]
     fn the_expiry_wording_names_the_date_and_not_only_the_number_of_days() {
-        let seven = expiry_wording(7, &NOW);
+        // UTC, so that the dates below read as they always have. The
+        // timezone-dependent behaviour has its own tests directly beneath.
+        let utc = crate::local_time::FixedOffset(0);
+        let seven = expiry_wording(7, &NOW, &utc);
         assert!(seven.contains("7 days"), "{seven:?}");
         assert!(
             seven.contains("18 Aug 2026"),
             "the wording gives a duration but not the date it lands on, which is the thing a \
              user can check: {seven:?}"
         );
-        let one = expiry_wording(1, &NOW);
+        let one = expiry_wording(1, &NOW, &utc);
         assert!(one.contains("1 day") && !one.contains("1 days"), "{one:?}");
         assert!(one.contains("12 Aug 2026"), "{one:?}");
         assert!(
-            expiry_wording(30, &NOW).contains("10 Sep 2026"),
+            expiry_wording(30, &NOW, &utc).contains("10 Sep 2026"),
             "{}",
-            expiry_wording(30, &NOW)
+            expiry_wording(30, &NOW, &utc)
         );
         // The wording and the JSON must not disagree about the day; two
         // separate formatters over the same instant is exactly how they would.
+        // At UTC+0 the two are the same instant AND the same reading, which is
+        // the only offset at which this equality is the right assertion --
+        // see `the_wording_is_local_while_the_stored_deletion_date_stays_utc`.
         for days in DELETE_IN_DAYS_CHOICES {
-            let wording = expiry_wording(days, &NOW);
+            let wording = expiry_wording(days, &NOW, &utc);
             let iso = deletion_date(days, &NOW);
             let (y, m, d, ..) =
                 utc_parts(NOW.now_unix_millis() + i64::from(days) * MILLIS_PER_DAY);
             assert!(iso.starts_with(&format!("{y:04}-{m:02}-{d:02}")), "{iso:?}");
             assert!(
-                wording.contains(&format!("{d} {} {y}", MONTH_NAMES[(m - 1) as usize])),
+                wording.contains(&format!(
+                    "{d} {} {y}",
+                    crate::local_time::month_name(m)
+                )),
                 "the wording and the deletion date disagree: {wording:?} vs {iso:?}"
             );
         }
+    }
+
+    /// **The defect this sentence carried, as a test.**
+    ///
+    /// `NOW` plus one day is `2026-08-12T00:43:17.148Z` -- forty-three
+    /// minutes past midnight UTC. Five hours west, that is the evening of the
+    /// **11th**, so the old sentence ("on 12 Aug 2026 (UTC)") named a day on
+    /// which the link would already have been dead for five hours, to a user
+    /// standing in New York.
+    ///
+    /// The offset is injected, so this assertion is exact wherever and
+    /// whenever the suite runs -- which is the other half of the rule: no
+    /// test in this crate may read the machine's clock or its timezone.
+    #[test]
+    fn the_expiry_date_is_the_users_own_day_and_not_the_utc_one() {
+        let new_york = crate::local_time::FixedOffset(-5 * 3_600_000);
+        let wording = expiry_wording(1, &NOW, &new_york);
+        assert!(
+            wording.contains("11 Aug 2026"),
+            "just-past-midnight UTC on the 12th is the evening of the 11th at UTC-5, and the \
+             day the user can check is theirs: {wording:?}"
+        );
+        assert!(
+            !wording.contains("12 Aug 2026"),
+            "the UTC day is still the one being shown: {wording:?}"
+        );
+    }
+
+    /// **No label in this app says "UTC" to a user**, and this is the one
+    /// that used to. A parenthesis naming a timezone is not a fix for a date
+    /// in the wrong timezone; it is an instruction to do arithmetic, aimed at
+    /// a reader who has no reason to know there is arithmetic to do.
+    #[test]
+    fn the_expiry_wording_never_names_a_timezone() {
+        for offset in [-11, -5, 0, 1, 5, 13] {
+            let zone = crate::local_time::FixedOffset(offset * 3_600_000);
+            for days in DELETE_IN_DAYS_CHOICES {
+                let wording = expiry_wording(days, &NOW, &zone);
+                assert!(
+                    !wording.contains("UTC") && !wording.contains("GMT"),
+                    "{wording:?} names a timezone at offset {offset}"
+                );
+            }
+        }
+    }
+
+    /// **Store UTC, display local**, both halves in one assertion: the
+    /// sentence moves with the zone and the stored `deletionDate` does not.
+    ///
+    /// The stored value is what `bw` is handed and what the Bitwarden server
+    /// records. Shifting it would not be a display change -- it would move
+    /// the moment the link actually dies.
+    #[test]
+    fn the_wording_is_local_while_the_stored_deletion_date_stays_utc() {
+        let iso = deletion_date(1, &NOW);
+        assert!(iso.ends_with('Z'), "the stored instant is UTC and says so: {iso:?}");
+        let mut readings = Vec::new();
+        for offset in [-11, -5, 0, 5, 13] {
+            let zone = crate::local_time::FixedOffset(offset * 3_600_000);
+            readings.push(expiry_wording(1, &NOW, &zone));
+            assert_eq!(
+                deletion_date(1, &NOW),
+                iso,
+                "the stored deletion date moved with the display timezone, which would change \
+                 when the link dies rather than how it is described"
+            );
+        }
+        readings.dedup();
+        assert!(
+            readings.len() > 1,
+            "every timezone produced the same sentence, so nothing is being converted: {readings:?}"
+        );
     }
 
     // -- 7. the Zeroizing pin ----------------------------------------------

@@ -3100,6 +3100,7 @@ pub fn build_frame(
                         &mut send_create.composer,
                         send_create.in_flight,
                         &crate::send::SystemClock,
+                        &crate::local_time::SystemZone,
                     );
                 }
                 // Resolved from the list the selection was made in, for the

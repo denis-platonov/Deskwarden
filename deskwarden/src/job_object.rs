@@ -2069,7 +2069,18 @@ mod tests {
             // path or fork appeared, and `[build-dependencies]` still reads
             // exactly `winresource = "0.1"`. 7547 -> 8005 bytes, all of it the
             // feature name and the comment above it.
-            (8005, 0xaa83_97c3_a01c_1f43_u64),
+            //
+            // Re-pinned for a FEATURE edit, not a dependency move: ONE
+            // feature was added to the `windows` dependency that was already
+            // here -- `Win32_System_Time` -- for `src/local_time.rs`, which
+            // calls `SystemTimeToTzSpecificLocalTime` so that a date shown to
+            // the user is the day on the user's own calendar rather than the
+            // UTC one. **No dependency moved**: no name was added, removed or
+            // re-pointed, no `[patch]`/`[replace]` table was introduced, no
+            // path or fork appeared, and `[build-dependencies]` still reads
+            // exactly `winresource = "0.1"`. 8005 -> 8522 bytes, all of it
+            // the feature name and the comment above it.
+            (8522, 0xb549_b838_915f_11fb_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -5990,6 +6001,30 @@ mod tests {
         "crate::bw_path::remember_verified_bw_exe",
         "crate::bw_path::CREATE_NO_WINDOW",
         "crate::bw_path::BW_DATA_DIR_ENV",
+        // ---------------------------------------------------------------
+        // `send.rs`'s calendar. **Added deliberately, which is what this
+        // list is for.**
+        //
+        // `send.rs` has to say which day a Send dies on, in the user's own
+        // timezone, and the civil arithmetic that answers that used to be a
+        // private copy inside `send.rs` itself. Moving it into one module
+        // with one set of tests -- so that two surfaces cannot disagree about
+        // one instant by a day -- is what made these paths appear here.
+        //
+        // Every item below is pure: integers in, a `String` or an `i64` out.
+        // `local_time` holds no `Command`, names nothing in `std::process`,
+        // and its single impure line is a Win32 timezone lookup that takes a
+        // `SYSTEMTIME` and returns a `SYSTEMTIME`. There is no door in it a
+        // jobless `bw` could be started through -- which is the claim this
+        // allowlist exists to make out loud rather than leave assumed.
+        "crate::local_time::LocalOffset",
+        "crate::local_time::MILLIS_PER_DAY",
+        "crate::local_time::civil_parts",
+        "crate::local_time::local_parts",
+        "crate::local_time::format_day",
+        "crate::local_time::month_name",
+        // A test double, named only by `send.rs`'s own test module.
+        "crate::local_time::FixedOffset",
     ];
 
     /// Every distinct name that production `job_object.rs` CALLS, in the
@@ -6847,7 +6882,82 @@ mod tests {
             unsafe_regions: 3,
             below_cut_min_lines: 500,
         },
+        // **`send.rs`'s calendar, fenced because `REACHABLE` names it.**
+        //
+        // It is a leaf: pure integer arithmetic over instants, plus one Win32
+        // timezone lookup that takes a `SYSTEMTIME` and hands back a
+        // `SYSTEMTIME`. It declares no `mod` children, holds no `Command`,
+        // and names nothing out of `std::process` -- which is what the four
+        // lists below say in a form the compiler and this test can both read,
+        // rather than in a sentence a reviewer has to take on trust.
+        Fence {
+            file: "local_time.rs",
+            last_production_item: "UTC everywhere that is not Windows",
+            min_code_len: 1000,
+            callees: LOCAL_TIME_CALLEES,
+            call_sites: 44,
+            macros: LOCAL_TIME_MACROS,
+            imports: LOCAL_TIME_IMPORTS,
+            local_paths: LOCAL_TIME_LOCAL_PATHS,
+            unsafe_regions: 1,
+            below_cut_min_lines: 100,
+        },
     ];
+
+    /// See the `local_time.rs` [`Fence`]. Filled in from what the test
+    /// measures; every entry is arithmetic or formatting.
+    const LOCAL_TIME_CALLEES: &[&str] = &[
+        // Integer arithmetic, `Option` handling, and the module's own
+        // functions calling each other. The only three names here that are
+        // not `std` or local are the Win32 timezone round trip, and each of
+        // those takes a `SYSTEMTIME` or a `FILETIME` and hands one back: no
+        // handle, no path, no `Command`, nothing a child could be started
+        // through.
+        "Some",
+        "cfg",
+        "checked_mul",
+        "civil_from_days",
+        "civil_parts",
+        "copied",
+        "default",
+        "derive",
+        "div_euclid",
+        "fnoffset_millis_at",
+        "get",
+        "ifFileTimeToSystemTime",
+        "ifSystemTimeToFileTime",
+        "ifSystemTimeToTzSpecificLocalTime",
+        "is_err",
+        "let",
+        "local_millis",
+        "month_name",
+        "not",
+        "offset_millis_at",
+        "pubfncivil_from_days",
+        "pubfncivil_parts",
+        "pubfnformat_day",
+        "pubfnformat_day_time",
+        "pubfnlocal_millis",
+        "pubfnlocal_parts",
+        "pubfnmonth_name",
+        "pubstructFixedOffset",
+        "rem_euclid",
+        "saturating_add",
+        "unwrap_or",
+    ];
+    /// The two formatters build their sentence with `format!` and nothing
+    /// else. No logging macro anywhere: a date is not a secret, but a module
+    /// on `REACHABLE` writing to the log is a surface worth not having.
+    const LOCAL_TIME_MACROS: &[&str] = &["format"];
+    /// **Two `use`s, both inside the one `unsafe` function, and both Win32
+    /// time.** Nothing from `std::process`, nothing from this crate, and no
+    /// import at file scope at all -- so there is no name in this module that
+    /// could be re-pointed at something that starts a child.
+    const LOCAL_TIME_IMPORTS: &[&str] = &[
+        "usewindows::Win32::Foundation::{FILETIME,SYSTEMTIME}",
+        "usewindows::Win32::System::Time::{FileTimeToSystemTime,SystemTimeToFileTime,SystemTimeToTzSpecificLocalTime,}",
+    ];
+    const LOCAL_TIME_LOCAL_PATHS: &[&str] = &[];
 
     /// A fenced file, whole, line endings normalised to LF.
     fn fenced_raw(file: &str) -> String {
@@ -6916,8 +7026,13 @@ mod tests {
         );
         assert_eq!(
             reachable_modules,
-            vec!["bw_path", "job_object"],
-            "control: the derivation no longer produces the two modules this fence is known to \
+            // `local_time` joined the list deliberately: `send.rs` has to say
+            // which day a Send dies on in the user's own timezone, and the
+            // civil arithmetic that answers that now lives in one module
+            // instead of a private copy per surface. It carries its own
+            // `Fence` below, which is the price of being on `REACHABLE`.
+            vec!["bw_path", "job_object", "local_time"],
+            "control: the derivation no longer produces the modules this fence is known to \
              cover, so either `REACHABLE` changed (update this deliberately) or `module_of` is \
              broken and the equality above is comparing two wrong lists to each other"
         );

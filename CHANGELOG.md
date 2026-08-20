@@ -50,6 +50,23 @@ the same claim as saying nobody is signed in.
 There was an eight-point strip of window background between the bottom of the
 titlebar and the top of the left-hand navigation column.
 
+### A Send's expiry date is the day on your own calendar
+
+The line under the lifetime picker read "The link stops working after 7 days --
+on 18 Aug 2026 (UTC)." It was computed from the UTC instant, and a Send that
+dies at 00:30 UTC dies the **previous evening** anywhere in the Americas. So
+the one place in this app where being wrong about a lifetime is the harm was
+naming a day the link would already be dead on, and offering "(UTC)" as the
+explanation.
+
+- The date is now converted to this machine's local time, and no label says
+  "UTC" to you. Daylight saving is resolved for the instant in question rather
+  than once at startup, so a date the far side of a clock change is still the
+  right one.
+- **What is stored has not moved.** The `deletionDate` handed to `bw` is UTC
+  and stays UTC: the change is to how the moment is described, never to when
+  the link actually dies.
+
 ### The TOTP-secret setting names a row that exists
 
 The description under "Show TOTP secrets on the details screen" said the

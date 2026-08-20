@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 49] = [
+        const OPENS_NO_WINDOW: [&str; 50] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1100,6 +1100,11 @@ mod tests {
             "injector",
             "job_object",
             "key_sequence",
+            // Civil dates, and the one place a stored UTC instant becomes the
+            // wall clock the user reads. Integer arithmetic plus a single
+            // Win32 timezone lookup that takes a `SYSTEMTIME` and hands back
+            // a `SYSTEMTIME`: it paints nothing and opens nothing.
+            "local_time",
             "logging",
             "match_engine",
             // Parses and renders `otpauth://totp` URIs. A pure string
