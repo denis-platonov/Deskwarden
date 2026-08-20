@@ -1802,7 +1802,7 @@ const LIST_JSON: &str = r#"[
   },
   {
     "id": "list-0005", "type": 3, "name": "Travel card",
-    "card": { "brand": "American Express", "number": "378282246310005",
+    "card": { "brand": "Amex", "number": "378282246310005",
       "expMonth": "07", "expYear": "2027" }
   },
   {
@@ -1824,6 +1824,21 @@ const LIST_JSON: &str = r#"[
     "id": "list-0009", "type": 3, "name": "Shenzhen supplier card",
     "card": { "brand": "UnionPay", "number": "6200000000000005",
       "expMonth": "12", "expYear": "2028" }
+  },
+  {
+    "id": "list-0010", "type": 3, "name": "Berlin contractor card",
+    "card": { "brand": "Maestro", "number": "5018000000000009",
+      "expMonth": "03", "expYear": "2029" }
+  },
+  {
+    "id": "list-0011", "type": 3, "name": "Bengaluru office card",
+    "card": { "brand": "RuPay", "number": "6069000000000009",
+      "expMonth": "08", "expYear": "2030" }
+  },
+  {
+    "id": "list-0012", "type": 3, "name": "Store loyalty card",
+    "card": { "brand": "Other", "number": "9900112233445566",
+      "expMonth": "06", "expYear": "2031" }
   }
 ]"#;
 

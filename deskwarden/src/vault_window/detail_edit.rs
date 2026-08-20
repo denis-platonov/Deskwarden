@@ -2558,8 +2558,12 @@ pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved
 /// that failed to load rather than one nobody has answered.
 pub const BRAND_UNSET: &str = "Not set";
 
-/// Wide enough for the longest row the dropdown offers -- "American Express"
-/// -- so no brand is drawn elided in the box that is supposed to name it.
+/// Wide enough for the longest row the dropdown offers -- "Diners Club",
+/// since American Express is now stored and shown under Bitwarden's own
+/// shorter "Amex" -- so no brand is drawn elided in the box that is supposed
+/// to name it. Left at 160 rather than trimmed to the new longest row: the box
+/// is a fixed control in a column of them, and narrowing it to fit the widest
+/// string exactly would leave no room for a brand Bitwarden adds later.
 const BRAND_COMBO_WIDTH: f32 = 160.0;
 
 /// The label above the card's bank row.
@@ -14087,7 +14091,9 @@ mod card_brand_form_tests {
         draft.set_number("4111111111111111");
         assert_eq!(draft.brand, "Visa");
         draft.set_number("378282246310005");
-        assert_eq!(draft.brand, "American Express", "an unpicked brand stopped following");
+        // `"Amex"`, which is Bitwarden's own string -- see
+        // `CardBrand::canonical`.
+        assert_eq!(draft.brand, "Amex", "an unpicked brand stopped following");
     }
 
     #[test]
@@ -14152,14 +14158,25 @@ mod card_brand_form_tests {
         // later cannot be half-wired.
         let offered: Vec<&str> = CARD_BRANDS.iter().map(|b| b.canonical()).collect();
         for brand in CARD_BRANDS {
+            // `None` for a brand no number can ever suggest. There is exactly
+            // one -- `Other` is the user saying "none of these", so inferring
+            // it from digits would be this app inventing an intention. The
+            // `match` is on the enum rather than over a list written here, so
+            // a brand added later must state which of the two it is.
             let number = match brand {
-                CardBrand::Visa => "4111111111111111",
-                CardBrand::Mastercard => "5555555555554444",
-                CardBrand::AmericanExpress => "378282246310005",
-                CardBrand::Discover => "6011111111111117",
-                CardBrand::Jcb => "3530111333300000",
-                CardBrand::DinersClub => "30569309025904",
-                CardBrand::UnionPay => "6200000000000005",
+                CardBrand::Visa => Some("4111111111111111"),
+                CardBrand::Mastercard => Some("5555555555554444"),
+                CardBrand::AmericanExpress => Some("378282246310005"),
+                CardBrand::Discover => Some("6011111111111117"),
+                CardBrand::DinersClub => Some("30569309025904"),
+                CardBrand::Jcb => Some("3530111333300000"),
+                CardBrand::Maestro => Some("5018000000000009"),
+                CardBrand::UnionPay => Some("6200000000000005"),
+                CardBrand::RuPay => Some("6069000000000009"),
+                CardBrand::Other => None,
+            };
+            let Some(number) = number else {
+                continue;
             };
             let mut draft = card_draft();
             draft.set_number(number);
@@ -14167,6 +14184,40 @@ mod card_brand_form_tests {
             assert!(
                 offered.contains(&draft.brand.as_str()),
                 "{brand:?} suggests {:?}, which the dropdown does not offer",
+                draft.brand
+            );
+        }
+    }
+
+    #[test]
+    fn no_number_at_all_ever_suggests_other() {
+        // The negative of the `None` arm above, from the other side: `Other`
+        // is a choice and not a detection, so no sequence of digits may put it
+        // in the field. Swept over every prefix the table knows plus a handful
+        // it does not, because "no rule names it" is a claim about the whole
+        // table rather than about one number.
+        for number in [
+            "4111111111111111",
+            "5555555555554444",
+            "378282246310005",
+            "6011111111111117",
+            "30569309025904",
+            "3530111333300000",
+            "5018000000000009",
+            "6200000000000005",
+            "6069000000000009",
+            "8100000000000000",
+            "0000000000000000",
+            "9999999999999999",
+            "1",
+            "",
+        ] {
+            let mut draft = card_draft();
+            draft.set_number(number);
+            assert_ne!(
+                draft.brand,
+                CardBrand::Other.canonical(),
+                "{number:?} suggested {:?}, which no number may",
                 draft.brand
             );
         }

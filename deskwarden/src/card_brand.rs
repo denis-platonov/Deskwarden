@@ -6,33 +6,58 @@
 //! which is the mask, which is what tells a user whether the card on screen is
 //! the card in their hand.
 
-/// A card network, in Bitwarden's own enumeration.
+/// A card brand, in Bitwarden's own enumeration -- **one for one, in their
+/// order, under their strings**.
+///
+/// The list is theirs and not this app's: it is read from and written to a
+/// vault every other Bitwarden client also reads and writes, and a value only
+/// this client understands is a value that renders blank everywhere else.
+/// It is `card-details-section.component.ts`'s ten, and the correspondence is
+/// deliberately exact so a user switching clients reads one list.
 ///
 /// Deliberately a plain enum holding nothing: it is derived FROM a card
 /// number and never holds one, so it cannot reach a `Zeroizing` and a derived
 /// `Debug` on it leaks nothing.
+///
+/// [`Other`](Self::Other) is the odd one and is documented as such: it is not
+/// a network, it is the absence of one spelled as a value a user can pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardBrand {
     Visa,
     Mastercard,
     AmericanExpress,
     Discover,
-    Jcb,
     DinersClub,
+    Jcb,
+    Maestro,
     UnionPay,
+    RuPay,
+    /// **Not a network.** Bitwarden offers it so a user can say "this card is
+    /// not one of the above", and it comes back on the wire like any other
+    /// brand string.
+    ///
+    /// It names nothing about the digits, so every decision this module makes
+    /// ABOUT a number -- grouping, masking, security-code length -- must treat
+    /// it exactly as it treats no brand at all. [`Self::network`] is the one
+    /// place that conversion happens, and no prefix rule may produce it (a
+    /// `const` assertion below enforces that at compile time).
+    Other,
 }
 
-/// Every brand, once. The dropdown, the mark table and the round-trip test are
-/// all driven from this rather than from a second hand-written list, so a
-/// brand added later cannot be half-wired.
-pub const CARD_BRANDS: [CardBrand; 7] = [
+/// Every brand, once, **in Bitwarden's order**. The dropdown, the mark table
+/// and the round-trip test are all driven from this rather than from a second
+/// hand-written list, so a brand added later cannot be half-wired.
+pub const CARD_BRANDS: [CardBrand; 10] = [
     CardBrand::Visa,
     CardBrand::Mastercard,
     CardBrand::AmericanExpress,
     CardBrand::Discover,
-    CardBrand::Jcb,
     CardBrand::DinersClub,
+    CardBrand::Jcb,
+    CardBrand::Maestro,
     CardBrand::UnionPay,
+    CardBrand::RuPay,
+    CardBrand::Other,
 ];
 
 impl CardBrand {
@@ -41,15 +66,57 @@ impl CardBrand {
     /// Not a display choice: the web vault renders its own card art from this
     /// string, so `"MC"` or `"MasterCard"` gives a card that looks right here
     /// and blank everywhere else.
+    ///
+    /// **This is the STRICT direction.** Exactly Bitwarden's ten strings and
+    /// nothing else; [`from_canonical`](Self::from_canonical) is the lenient
+    /// one, and the two meanings of "canonical" are spelled out there.
+    ///
+    /// American Express is `"Amex"`, which is what Bitwarden stores. It used
+    /// to be `"American Express"` here -- a string no other client matches, so
+    /// an Amex card created in this app rendered blank in the web vault, and
+    /// one created there came back unrecognised. See
+    /// `amex_is_stored_under_bitwardens_own_string`.
     pub fn canonical(self) -> &'static str {
         match self {
             CardBrand::Visa => "Visa",
             CardBrand::Mastercard => "Mastercard",
-            CardBrand::AmericanExpress => "American Express",
+            CardBrand::AmericanExpress => "Amex",
             CardBrand::Discover => "Discover",
-            CardBrand::Jcb => "JCB",
             CardBrand::DinersClub => "Diners Club",
+            CardBrand::Jcb => "JCB",
+            CardBrand::Maestro => "Maestro",
             CardBrand::UnionPay => "UnionPay",
+            CardBrand::RuPay => "RuPay",
+            CardBrand::Other => "Other",
+        }
+    }
+
+    /// The brand as a NETWORK: `None` for [`Other`](Self::Other), which names
+    /// no network, and `Some(self)` for the nine that do.
+    ///
+    /// **The one conversion, and every number-shaped decision goes through
+    /// it.** `Other` arrives as a brand and must be treated as no brand by
+    /// [`mask_for`], [`grouped_for`] and [`code_mask_for`] -- otherwise a card
+    /// the user labelled "not one of these" would be grouped and dotted as
+    /// though this app knew its network, which is the one thing the mask must
+    /// never claim.
+    pub fn network(self) -> Option<Self> {
+        match self {
+            CardBrand::Other => None,
+            other => Some(other),
+        }
+    }
+
+    /// Spellings this app ACCEPTS for `self` beyond [`canonical`](Self::canonical).
+    ///
+    /// One entry, and it is a migration rather than a convenience: this app
+    /// itself wrote `"American Express"` up to v0.8.4, so vaults in the wild
+    /// contain it. Dropping it on read would blank the mark on cards this app
+    /// created.
+    fn aliases(self) -> &'static [&'static str] {
+        match self {
+            CardBrand::AmericanExpress => &["American Express", "AmericanExpress"],
+            _ => &[],
         }
     }
 
@@ -97,22 +164,43 @@ impl CardBrand {
             CardBrand::Mastercard => "MASTERCARD",
             CardBrand::AmericanExpress => "AMEX",
             CardBrand::Discover => "DISCOVER",
-            CardBrand::Jcb => "JCB",
             CardBrand::DinersClub => "DINERS",
+            CardBrand::Jcb => "JCB",
+            CardBrand::Maestro => "MAESTRO",
             CardBrand::UnionPay => "UNIONPAY",
+            CardBrand::RuPay => "RUPAY",
+            // **A pill, not a blank.** `Other` is something the user chose,
+            // and a row with no pill is indistinguishable from a card whose
+            // brand was never set at all -- so the two states must not paint
+            // the same. The word is deliberately the flattest one available:
+            // it reports the choice without implying this app knows anything
+            // about the digits, which it does not (see `network`).
+            CardBrand::Other => "OTHER",
         }
     }
 
     /// The digit groups the network prints on the plastic.
+    ///
+    /// `Other` has no grouping of its own -- an empty slice, which
+    /// [`group_starts_at`] can never match against a real length, so it always
+    /// takes the fours-from-the-right fallback. It never actually reaches here
+    /// ([`network`](Self::network) strips it first), and the empty slice is
+    /// what makes that belt-and-braces rather than load-bearing.
     pub fn grouping(self) -> &'static [usize] {
         match self {
             CardBrand::AmericanExpress => &[4, 6, 5],
             CardBrand::DinersClub => &[4, 6, 4],
+            CardBrand::Other => &[],
             _ => &[4, 4, 4, 4],
         }
     }
 
     /// Three digits, or Amex's four.
+    ///
+    /// `Other` never reaches here: [`code_mask_for`] strips it through
+    /// [`network`](Self::network) and falls back to the stored code's own
+    /// length, which is the only truth available for a card whose network is
+    /// unnamed.
     pub fn security_code_len(self) -> usize {
         match self {
             CardBrand::AmericanExpress => 4,
@@ -122,14 +210,29 @@ impl CardBrand {
 
     /// Read a `brand` string off the wire.
     ///
+    /// **This is the LENIENT direction, and "canonical" therefore means two
+    /// different things on the two sides of this module.** Writing is exactly
+    /// Bitwarden's ten strings ([`canonical`](Self::canonical)); reading also
+    /// accepts every spelling in [`aliases`](Self::aliases), because this
+    /// function parses data written by other clients and by older versions of
+    /// this one -- including the `"American Express"` this app itself wrote
+    /// until v0.8.4. Being strict on write and lenient on read is what stops a
+    /// corrected string from blanking the marks on cards already in a vault.
+    ///
     /// Case-insensitive because it has to be: `vault_bridge`'s own fixtures
     /// carry both `"Visa"` and `"visa"`, and what other clients write is not
     /// this app's to normalise.
+    ///
+    /// **`"Other"` now answers `Some(CardBrand::Other)`, where it used to
+    /// answer `None`.** That is a real change for every caller that reads
+    /// `None` as "no brand": see [`CardBrand::Other`] for what the difference
+    /// is, and [`network`](Self::network) for where it is collapsed back.
     pub fn from_canonical(s: &str) -> Option<Self> {
         let s = s.trim();
-        CARD_BRANDS
-            .into_iter()
-            .find(|b| b.canonical().eq_ignore_ascii_case(s))
+        CARD_BRANDS.into_iter().find(|b| {
+            b.canonical().eq_ignore_ascii_case(s)
+                || b.aliases().iter().any(|a| a.eq_ignore_ascii_case(s))
+        })
     }
 }
 
@@ -153,6 +256,17 @@ const PREFIX_RULES: &[PrefixRule] = &[
     PrefixRule { len: 4, lo: 3528, hi: 3589, brand: CardBrand::Jcb },
     PrefixRule { len: 4, lo: 6011, hi: 6011, brand: CardBrand::Discover },
     PrefixRule { len: 4, lo: 2221, hi: 2720, brand: CardBrand::Mastercard },
+    // Maestro, four digits, and four digits is the point: `5018`, `5020` and
+    // `5038` sit just under Mastercard's `51-55` and `6304`/`6759`/`6761-6763`
+    // sit among Discover's `65` and UnionPay's `62`. Written at their own
+    // length above every two-digit rule, they are found first by the table's
+    // ordering rather than by anyone remembering to look.
+    PrefixRule { len: 4, lo: 5018, hi: 5018, brand: CardBrand::Maestro },
+    PrefixRule { len: 4, lo: 5020, hi: 5020, brand: CardBrand::Maestro },
+    PrefixRule { len: 4, lo: 5038, hi: 5038, brand: CardBrand::Maestro },
+    PrefixRule { len: 4, lo: 6304, hi: 6304, brand: CardBrand::Maestro },
+    PrefixRule { len: 4, lo: 6759, hi: 6759, brand: CardBrand::Maestro },
+    PrefixRule { len: 4, lo: 6761, hi: 6763, brand: CardBrand::Maestro },
     // Three digits.
     PrefixRule { len: 3, lo: 300, hi: 305, brand: CardBrand::DinersClub },
     PrefixRule { len: 3, lo: 644, hi: 649, brand: CardBrand::Discover },
@@ -162,11 +276,45 @@ const PREFIX_RULES: &[PrefixRule] = &[
     PrefixRule { len: 2, lo: 36, hi: 36, brand: CardBrand::DinersClub },
     PrefixRule { len: 2, lo: 38, hi: 39, brand: CardBrand::DinersClub },
     PrefixRule { len: 2, lo: 51, hi: 55, brand: CardBrand::Mastercard },
+    // RuPay, and **deliberately only these three of the five ranges it is
+    // commonly listed under.** `60` is safe here because Discover's only claim
+    // inside it is `6011`, which is a four-digit rule and therefore consulted
+    // first; `81` and `82` are shared with nothing in this table at all.
+    //
+    // `6521` and `6522` are the two that are LEFT OUT. They sit inside
+    // Discover's `65`, both networks really do issue there, and no prefix of
+    // any length separates them -- so a rule either way silently mis-detects
+    // real cards of the other network, and mis-detection is worse than
+    // silence: it is wrong about the badge, the grouping, the mask and the
+    // security-code length at once. A RuPay card in that block is still
+    // recognised when the vault says so, because a stored brand outranks the
+    // digits at every call site; only inference is declined. See
+    // `rupay_does_not_claim_discovers_65_block`.
+    PrefixRule { len: 2, lo: 60, hi: 60, brand: CardBrand::RuPay },
+    PrefixRule { len: 2, lo: 81, hi: 82, brand: CardBrand::RuPay },
     PrefixRule { len: 2, lo: 62, hi: 62, brand: CardBrand::UnionPay },
     PrefixRule { len: 2, lo: 65, hi: 65, brand: CardBrand::Discover },
     // One digit.
     PrefixRule { len: 1, lo: 4, hi: 4, brand: CardBrand::Visa },
 ];
+
+/// **No prefix rule may name [`CardBrand::Other`]**, checked at compile time
+/// rather than by a test that could be deleted.
+///
+/// `Other` is not a network: nothing about a sequence of digits can imply it,
+/// and [`brand_for_number`] returning it would mean this app had inferred the
+/// user's "none of the above". Reading it off the table is the only way it
+/// could ever get there, and this is that door, shut.
+const _: () = {
+    let mut i = 0;
+    while i < PREFIX_RULES.len() {
+        assert!(
+            !matches!(PREFIX_RULES[i].brand, CardBrand::Other),
+            "`Other` is not a network and no prefix rule may detect it"
+        );
+        i += 1;
+    }
+};
 
 /// The digits of `number`, in order, ignoring the spaces and dashes a card is
 /// commonly typed with.
@@ -264,6 +412,10 @@ pub fn grouped_for(number: &str, brand: Option<CardBrand>) -> String {
 /// bullets with the last four kept, or every digit -- and never in how long
 /// `body` is, which is what makes the two forms line up.
 fn grouped(body: &[char], brand: Option<CardBrand>) -> String {
+    // `Other` is a brand the user picked and NOT a network, so it groups like
+    // no brand at all. Collapsed here, once, rather than at each of the two
+    // public callers -- see `CardBrand::network`.
+    let brand = brand.and_then(CardBrand::network);
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     for (i, c) in body.iter().enumerate() {
         if group_starts_at(i, body.len(), brand) && !out.is_empty() {
@@ -305,7 +457,9 @@ fn group_starts_at(i: usize, len: usize, brand: Option<CardBrand>) -> bool {
 /// stored code's own length is the truth, bounded by the only two lengths a
 /// code has.
 pub fn code_mask_for(code: &str, brand: Option<CardBrand>) -> String {
-    let len = match brand {
+    // `Other` names no network, so it says nothing about how many digits the
+    // code has -- the stored code's own length is the only truth left.
+    let len = match brand.and_then(CardBrand::network) {
         Some(b) => b.security_code_len(),
         None => digits_of(code).len().clamp(3, 4),
     };
@@ -385,11 +539,162 @@ mod tests {
         // Interoperability, not tidiness: `brand` is shared with every other
         // Bitwarden client and the web vault draws its own card art from it.
         // "MC" or "MasterCard" renders here and blank everywhere else.
-        assert_eq!(CardBrand::Mastercard.canonical(), "Mastercard");
-        assert_eq!(CardBrand::AmericanExpress.canonical(), "American Express");
-        assert_eq!(CardBrand::DinersClub.canonical(), "Diners Club");
-        assert_eq!(CardBrand::Jcb.canonical(), "JCB");
-        assert_eq!(CardBrand::UnionPay.canonical(), "UnionPay");
+        // The whole list, in Bitwarden's own order, spelled out here rather
+        // than derived: this is the one assertion that must not be able to
+        // agree with a mistake in the table it is checking.
+        assert_eq!(
+            CARD_BRANDS.map(CardBrand::canonical),
+            [
+                "Visa",
+                "Mastercard",
+                "Amex",
+                "Discover",
+                "Diners Club",
+                "JCB",
+                "Maestro",
+                "UnionPay",
+                "RuPay",
+                "Other",
+            ]
+        );
+    }
+
+    #[test]
+    fn amex_is_stored_under_bitwardens_own_string_and_the_old_one_still_reads() {
+        // THE DEFECT: this app wrote `"American Express"` up to v0.8.4.
+        // Bitwarden's value is `"Amex"`, so an Amex card created here rendered
+        // blank in every other client, and one created THERE came back
+        // unrecognised -- `item_list::card_network` returns whatever
+        // `from_canonical` says about a stored brand and does not fall back to
+        // the digits, so the row wore no mark at all.
+        assert_eq!(CardBrand::AmericanExpress.canonical(), "Amex");
+        assert_eq!(
+            CardBrand::from_canonical("Amex"),
+            Some(CardBrand::AmericanExpress),
+            "a card written by any other Bitwarden client is unreadable"
+        );
+        // ...and the migration half: vaults already contain the old spelling,
+        // written by this app, and it must keep reading. Strict on write,
+        // lenient on read -- see `from_canonical`.
+        for old in ["American Express", "american express", "AmericanExpress"] {
+            assert_eq!(
+                CardBrand::from_canonical(old),
+                Some(CardBrand::AmericanExpress),
+                "{old:?}, which this app itself wrote, stopped being readable"
+            );
+        }
+        // The leniency is bounded: it accepts spellings that were once real,
+        // not anything Amex-shaped.
+        assert_eq!(CardBrand::from_canonical("American"), None);
+        assert_eq!(CardBrand::from_canonical("AMERICAN EXPRESS CARD"), None);
+    }
+
+    #[test]
+    fn other_is_a_brand_on_the_wire_and_no_network_at_all() {
+        // `Other` is the one value that is a brand in one direction and an
+        // absence in the other, so both halves are pinned here.
+        assert_eq!(CardBrand::from_canonical("Other"), Some(CardBrand::Other));
+        assert_eq!(CardBrand::from_canonical("other"), Some(CardBrand::Other));
+        assert_eq!(CardBrand::Other.network(), None, "`Other` is not a network");
+        for b in CARD_BRANDS.into_iter().filter(|b| *b != CardBrand::Other) {
+            assert_eq!(b.network(), Some(b), "{b:?} is a network and must say so");
+        }
+        // And nothing this app INFERS is ever `Other` -- the compile-time
+        // assertion over `PREFIX_RULES` is the real guard; this is the same
+        // claim from the outside, over every prefix the table names.
+        for n in [
+            "4111111111111111",
+            "5555555555554444",
+            "378282246310005",
+            "6011111111111117",
+            "30569309025904",
+            "3530111333300000",
+            "5018000000000009",
+            "6200000000000005",
+            "6069000000000009",
+            "8100000000000000",
+            "7000000000000000",
+            "",
+        ] {
+            assert_ne!(brand_for_number(n), Some(CardBrand::Other), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn an_other_card_is_masked_exactly_as_a_card_with_no_brand_is() {
+        // **The one that would quietly change how real card numbers are
+        // displayed.** `from_canonical("Other")` now answers `Some(..)` where
+        // it used to answer `None`, so every masking call that reads `None` as
+        // "no brand" started receiving a brand instead. `Other` says nothing
+        // about the digits, so it must not group, mask or dot them any
+        // differently from not knowing at all.
+        for n in ["4111111111111111", "378282246310005", "30569309025904", "12345", "123"] {
+            assert_eq!(mask_for(n, Some(CardBrand::Other)), mask_for(n, None), "{n:?}");
+            assert_eq!(grouped_for(n, Some(CardBrand::Other)), grouped_for(n, None), "{n:?}");
+        }
+        for c in ["123", "1234", ""] {
+            assert_eq!(code_mask_for(c, Some(CardBrand::Other)), code_mask_for(c, None), "{c:?}");
+        }
+        // The control: a real network DOES change the answer, so the equality
+        // above is about `Other` and not about masking ignoring its argument.
+        assert_ne!(
+            mask_for("378282246310005", Some(CardBrand::AmericanExpress)),
+            mask_for("378282246310005", None)
+        );
+        assert_ne!(
+            code_mask_for("1234", Some(CardBrand::AmericanExpress)),
+            code_mask_for("1234", Some(CardBrand::Visa))
+        );
+    }
+
+    #[test]
+    fn maestro_is_detected_without_taking_its_neighbours_cards() {
+        // Maestro's ranges sit either side of Mastercard's `51-55` and inside
+        // the `6x` block Discover and UnionPay share, so this is asserted in
+        // both directions: the Maestro number detects as Maestro, AND the
+        // neighbour one digit away still detects as the neighbour.
+        for n in [
+            "5018000000000009",
+            "5020000000000000",
+            "5038000000000000",
+            "6304000000000000",
+            "6759000000000000",
+            "6761000000000000",
+            "6762000000000000",
+            "6763000000000000",
+        ] {
+            assert_eq!(brand_for_number(n), Some(CardBrand::Maestro), "{n:?}");
+        }
+        // The negatives, each one digit from a Maestro rule.
+        assert_eq!(brand_for_number("5100000000000000"), Some(CardBrand::Mastercard));
+        assert_eq!(brand_for_number("5500000000000000"), Some(CardBrand::Mastercard));
+        assert_eq!(brand_for_number("6500000000000002"), Some(CardBrand::Discover));
+        assert_eq!(brand_for_number("6011111111111117"), Some(CardBrand::Discover));
+        assert_eq!(brand_for_number("6200000000000005"), Some(CardBrand::UnionPay));
+        // `6760` and `6764` bracket the `6761-6763` range and belong to
+        // nobody in this table.
+        assert_eq!(brand_for_number("6760000000000000"), None);
+        assert_eq!(brand_for_number("6764000000000000"), None);
+    }
+
+    #[test]
+    fn rupay_does_not_claim_discovers_65_block() {
+        // RuPay is detected where it is unambiguous...
+        assert_eq!(brand_for_number("6069000000000009"), Some(CardBrand::RuPay));
+        assert_eq!(brand_for_number("8100000000000000"), Some(CardBrand::RuPay));
+        assert_eq!(brand_for_number("8200000000000000"), Some(CardBrand::RuPay));
+        // ...and NOT where it would have to guess. `6521`/`6522` are commonly
+        // listed as RuPay and sit inside Discover's `65`; both networks issue
+        // there and no prefix separates them, so this app declines to infer
+        // rather than mis-badge, mis-group and mis-mask a real Discover card.
+        // See the note on `PREFIX_RULES`.
+        assert_eq!(brand_for_number("6521000000000000"), Some(CardBrand::Discover));
+        assert_eq!(brand_for_number("6522000000000000"), Some(CardBrand::Discover));
+        // A stored brand still wins over the digits at every call site, so a
+        // RuPay card in that block is recognised when the vault says so.
+        assert_eq!(CardBrand::from_canonical("RuPay"), Some(CardBrand::RuPay));
+        // `6011` keeps its four-digit rule against RuPay's two-digit `60`.
+        assert_eq!(brand_for_number("6011111111111117"), Some(CardBrand::Discover));
     }
 
     #[test]
@@ -406,8 +711,13 @@ mod tests {
         // cannot be half-wired.
         for b in CARD_BRANDS {
             assert_eq!(CardBrand::from_canonical(b.canonical()), Some(b), "{b:?}");
-            assert!(!b.grouping().is_empty(), "{b:?} has no grouping");
             assert!(matches!(b.security_code_len(), 3 | 4), "{b:?}");
+            // Every NETWORK has a grouping; `Other` deliberately has none,
+            // because it names no network to have one -- see `grouping`.
+            match b.network() {
+                Some(_) => assert!(!b.grouping().is_empty(), "{b:?} has no grouping"),
+                None => assert!(b.grouping().is_empty(), "{b:?} is not a network but groups"),
+            }
         }
     }
 
@@ -420,6 +730,10 @@ mod tests {
             let expected = match b {
                 CardBrand::AmericanExpress => 15,
                 CardBrand::DinersClub => 14,
+                // Not a network, so it has no length to be right or wrong
+                // about -- and the empty grouping is what makes it fall
+                // through to the length-agnostic fallback.
+                CardBrand::Other => 0,
                 _ => 16,
             };
             assert_eq!(total, expected, "{b:?} groups to {total} digits");
