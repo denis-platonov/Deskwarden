@@ -8,6 +8,48 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### "What's new" reads like release notes
+
+The update panel showed a GitHub release body as literal characters, so `**`
+and `#` and `[..](..)` were on screen as themselves, and only the newest
+release's notes were ever fetched.
+
+- **Markdown is rendered**, in a deliberately small subset: headings, bullet
+  lists, bold, italic, inline code, and a link's words with its destination
+  beside them. Nothing on the page is clickable and no image is fetched --
+  release notes arrive over the network onto the page that says what is about
+  to be installed, and that is the one place where a link would turn
+  misleading styling into somewhere the reader can be sent. Anything outside
+  the subset -- raw HTML, tables, an unclosed `**` -- is painted as the
+  characters it is.
+- **Blank lines are space again.** The paragraph breaks between a release's
+  sections no longer collapse into a wall of text.
+- **Every release you skipped is shown**, newest first, each under its own
+  version heading. Updating from 0.8.1 to 0.8.4 now tells you what changed in
+  0.8.2 and 0.8.3 as well. Drafts and prereleases are excluded, and a release
+  that published no notes is named rather than dropped out of the range.
+- **The installer still comes from exactly one release**, the newest, with its
+  download URL and its SHA-256 read from the same asset in the same response.
+  The notes may be a union of several releases; the file being verified and
+  installed is not.
+- **The notes' scrollbar appears only when there is more to read.** It used to
+  be pinned open beside three lines of text. The card is the same width either
+  way.
+
+### The About page says which account is signed in
+
+The "Bitwarden account" row told you to open the vault window to find out,
+while the app already knew. It now shows the signed-in address and the server
+the vault lives on -- and says "Checking..." while it is asking, which is not
+the same claim as saying nobody is signed in.
+
+### The preferences window's nav rail meets the titlebar
+
+There was an eight-point strip of window background between the bottom of the
+titlebar and the top of the left-hand navigation column.
+
 ## 0.8.4 - 2026-08-20
 
 > The manual pre-release checklist was not run for this version either.
