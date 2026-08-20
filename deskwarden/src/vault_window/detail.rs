@@ -21363,17 +21363,135 @@ mod breach_badge_tests {
         painted
     }
 
+    /// How old this fixture's password is, in days. **A duration, never a
+    /// date** -- see [`an_item_that_can_date_its_password`], which is where
+    /// the whole argument for that lives.
+    ///
+    /// 2725 days is a shade over seven and a half years. It is not a round
+    /// number because it is not a chosen one: it is **exactly** how old the
+    /// old `2019-03-04` fixture was on 2026-08-18, the day `f943abc`
+    /// measured the pins below. Taking the age the pins were taken at means
+    /// no geometry constant in this module moved to accommodate this repair
+    /// -- which is the only way to fix a broken measurement without quietly
+    /// re-photographing whatever the code happens to do today.
+    const PASSWORD_AGE_DAYS: i64 = 2725;
+
+    /// Howard Hinnant's civil-from-days: the inverse of [`days_from_civil`],
+    /// which this file already carries.
+    ///
+    /// Here rather than beside it because nothing the app ships needs it --
+    /// production only ever goes date-to-days, and a public function with no
+    /// production caller is a seam waiting to be leaned on.
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
     /// The same fixture with a `creationDate` on it, so its password HAS a
-    /// datable age: a login created in 2019 whose password nobody has ever
-    /// changed. That is the item the age segment was built for and the one
-    /// the old strip could not distinguish from a fresh one.
+    /// datable age: a login whose password nobody has ever changed in seven
+    /// and a half years. That is the item the age segment was built for and
+    /// the one the old strip could not distinguish from a fresh one.
+    ///
+    /// # Why the date is computed and not written down
+    ///
+    /// **It used to be the literal `2019-03-04T05:06:07.000Z`, and that made
+    /// every pixel pinned off this fixture a time bomb.** `days_since` reads
+    /// `SystemTime::now()` -- there is no clock seam, and threading one in
+    /// would have to cross `VaultFrameEnv` and four call sites in `main.rs`
+    /// for a fact production is right to read off the real clock. So a fixed
+    /// date means the age this fixture renders grows by a day every day:
+    /// `password_age_text` said `7y 170d ago` on 2026-08-18 and
+    /// `7y 171d ago` the next day.
+    ///
+    /// **That one digit is enough.** The strip is drawn through
+    /// `horizontal_wrapped`, so the card's height is a step function of the
+    /// run's width, and `1` is narrower than `0` by more than the run had to
+    /// spare. Measured by walking this constant one day at a time: 2725 days
+    /// (`7y 170d ago`) gives a 67pt narrow card and 2726 (`7y 171d ago`)
+    /// gives 54pt. `f943abc` pinned 67 on 2026-08-18 with the fixture 2725
+    /// days old; the pin failed the next day with no code in between. The
+    /// suite went red on the calendar turning over, and would have gone
+    /// green again on its own later -- which is worse, because nobody would
+    /// then have found out why.
+    ///
+    /// **The step is genuinely this close all the way along, and that is
+    /// worth knowing before re-pinning anything here.** Walking the constant
+    /// across the whole plausible range, the narrow card alternates between
+    /// 54 and 67 on single-digit changes (54 at 400, 2200, 2555, 2726 and
+    /// 3000 days; 67 at 1000, 1800, 2700 and 2725). So `67` is a real
+    /// measurement of a real string and is stable now that the string is,
+    /// but it is NOT a property of the segment -- the property, which the
+    /// test below states in prose and `the_age_segment_fits_inside_its_card`
+    /// asserts directly, is that the segment costs at most one wrapped row
+    /// and never leaves the card. A future failure here means the string or
+    /// the typography moved, not that the feature broke.
+    ///
+    /// A duration fixes it at the root rather than re-pinning a number that
+    /// rots again tomorrow: `days_since` subtracts `days_from_civil` of this
+    /// date from today, so a date built as *today minus N* yields exactly N
+    /// on every day this test is ever run, and the string under the pin is
+    /// the same string forever. Pinned by
+    /// [`the_age_fixture_is_the_same_age_on_every_day_it_is_run`].
     fn an_item_that_can_date_its_password() -> VaultItem {
         let mut item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        let today = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is not before the Unix epoch")
+            .as_secs()
+            / 86400) as i64;
+        let (y, m, d) = civil_from_days(today - PASSWORD_AGE_DAYS);
         item.other.insert(
             "creationDate".to_string(),
-            serde_json::Value::String("2019-03-04T05:06:07.000Z".to_string()),
+            serde_json::Value::String(format!("{y:04}-{m:02}-{d:02}T05:06:07.000Z")),
         );
         item
+    }
+
+    /// **The repair itself, asserted rather than described.**
+    ///
+    /// The fixture's `creationDate` is a different string every day, and the
+    /// only thing that matters about it is that everything downstream sees
+    /// the same age regardless. So this checks the two things the pins below
+    /// actually stand on: `days_since` reads exactly
+    /// [`PASSWORD_AGE_DAYS`] back off the item, and `password_age_text`
+    /// renders it as one fixed run of words.
+    ///
+    /// The words are written out rather than re-derived. A test that
+    /// recomputed the expected string through the same two functions it is
+    /// checking would pass on any day and prove nothing, which is the failure
+    /// mode this whole comment exists about.
+    #[test]
+    fn the_age_fixture_is_the_same_age_on_every_day_it_is_run() {
+        let item = an_item_that_can_date_its_password();
+        let created = item
+            .other
+            .get("creationDate")
+            .and_then(|v| v.as_str())
+            .expect("the fixture sets a creationDate");
+        assert_eq!(
+            days_since(created),
+            Some(PASSWORD_AGE_DAYS),
+            "the fixture dated itself {created:?}, which is not \
+             {PASSWORD_AGE_DAYS} days ago"
+        );
+        assert_eq!(
+            password_age_text(Some(PASSWORD_AGE_DAYS)),
+            Some("Password set 7y 170d ago".to_string()),
+            "the run the geometry below is pinned against changed its words"
+        );
+        // And the round trip really is a round trip -- `civil_from_days` is
+        // only worth trusting if it inverts the function the pane parses
+        // with, on this fixture's own day rather than on a chosen one.
+        let (y, m, d) = civil_from_days(days_from_civil(2019, 3, 4));
+        assert_eq!((y, m, d), (2019, 3, 4), "civil_from_days is not the inverse");
     }
 
     /// **Does a fourth fact fit? Measured, not assumed.**
