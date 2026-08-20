@@ -2391,6 +2391,11 @@ mod tests {
                 "assets/fonts/Archivo-ExtraBold.ttf",
                 "assets/fonts/Archivo-Regular.ttf",
                 "assets/fonts/Archivo-SemiBold.ttf",
+                "assets/fonts/NotoSans-Cyrillic-Bold.ttf",
+                "assets/fonts/NotoSans-Cyrillic-ExtraBold.ttf",
+                "assets/fonts/NotoSans-Cyrillic-Regular.ttf",
+                "assets/fonts/NotoSans-Cyrillic-SemiBold.ttf",
+                "assets/fonts/OFL-NotoSans.txt",
                 "assets/fonts/OFL.txt",
                 "assets/generate-icon.py",
                 // NO `assets/marks/`, and no generator for one. The card

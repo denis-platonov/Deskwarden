@@ -10,6 +10,26 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Cyrillic names render in the app's own typeface, at the right weight
+
+Item names, usernames, folder names and notes written in Cyrillic came out in
+a different, lighter typeface than the Latin beside them -- and in the *same*
+typeface at the same weight wherever they appeared, whether the design asked
+for 400, 600, 700 or 800. All four bundled Archivo faces cover no Cyrillic at
+all, so every such string fell through to the one fallback face the UI toolkit
+ships.
+
+- **Four Cyrillic faces are now bundled**, one per weight (Noto Sans' Cyrillic
+  subset, SIL OFL 1.1 -- `deskwarden/assets/fonts/OFL-NotoSans.txt`), each
+  sitting behind its matching Archivo cut and ahead of the toolkit's own
+  fallbacks. 64 KB in total.
+- **Latin is untouched.** The subsets carry no Latin letters whatsoever, so
+  they cannot be reached for Latin text however the fonts are ordered; every
+  existing measurement in the app is unchanged, and that is asserted rather
+  than assumed.
+- Greek, Hebrew, Arabic and CJK still come from the toolkit's fallback; this
+  release fixes Cyrillic only.
+
 ### Deskwarden no longer dies because something else has CTRL+ALT+B
 
 A real session ended with exit code 101, an hour and three quarters in, with a
