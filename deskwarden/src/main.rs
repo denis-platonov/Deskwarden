@@ -7955,18 +7955,25 @@ mod tests {
     /// case for reasons that have nothing to do with the preference.
     #[test]
     fn the_update_check_is_not_made_when_the_setting_is_off() {
-        let body = r#"{
+        // **The LIST endpoint's shape**, which is what `check_for_update`
+        // reads now that the panel shows every release the user skipped. A
+        // fixture in the old single-release shape would fail to parse, and
+        // the "off" half of this test would then pass for a reason that has
+        // nothing to do with the setting -- which is exactly what the live
+        // control below exists to catch.
+        let body = r#"[{
             "tag_name": "v99.0.0",
             "assets": [
                 {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
-        }"#;
+        }]"#;
         let current = Version::parse("1.0.0").unwrap();
 
         // -- off: nothing reaches the wire ---------------------------------
         let mut off_server = mockito::Server::new();
         let off_mock = off_server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();
@@ -7989,7 +7996,8 @@ mod tests {
         // -- on: the SAME request does reach it ----------------------------
         let mut on_server = mockito::Server::new();
         let on_mock = on_server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();

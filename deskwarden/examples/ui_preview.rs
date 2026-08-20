@@ -223,6 +223,12 @@ enum Surface {
     /// cue appears only when something is actually clipped, and the card's
     /// right edge does not move when it does".
     PrefsAboutUpdateShortNotes,
+    /// **The card for a user several releases behind**, whose notes are the
+    /// union of every release they skipped, newest first, each under its own
+    /// version heading. The case the panel was reading one release's worth of
+    /// for, and the case where a scrollbar is legitimately wanted -- so this
+    /// picture is the review of both halves at once.
+    PrefsAboutUpdateManyReleases,
     /// Mid-download: the progress bar, the byte count, and the notes still
     /// readable underneath. Its own surface because "is the bar there and does
     /// the card still fit" is exactly what a picture answers and an assertion
@@ -354,6 +360,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutNoUpdate,
     Surface::PrefsAboutUpdateAvailable,
     Surface::PrefsAboutUpdateShortNotes,
+    Surface::PrefsAboutUpdateManyReleases,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::VaultList,
@@ -391,6 +398,7 @@ impl Surface {
             Surface::PrefsAboutNoUpdate => "prefs_about_no_update",
             Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
             Surface::PrefsAboutUpdateShortNotes => "prefs_about_update_short_notes",
+            Surface::PrefsAboutUpdateManyReleases => "prefs_about_update_many_releases",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
@@ -453,6 +461,7 @@ impl Surface {
             | Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
             | Surface::PrefsAboutUpdateShortNotes
+            | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
             // The list panel's exact shipped width, spelled out for the same
@@ -799,6 +808,7 @@ impl eframe::App for Preview {
             Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
             | Surface::PrefsAboutUpdateShortNotes
+            | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::VaultList => self.draw_vault_list(root),
@@ -1135,6 +1145,29 @@ impl Preview {
                     "- The vault window remembers its size, via `settings.json`.\n",
                     "- Details on [the release page](https://example.invalid/r).\n",
                     "- Raw HTML stays literal: <b>not bold</b>.\n",
+                )
+                .to_string(),
+                ..release
+            }),
+            // **What a user three releases behind is shown.** Built in the
+            // exact shape `updater::notes_across` composes -- one `##`
+            // heading per version, newest first, and the release that
+            // published no notes NAMED rather than missing, because a range
+            // with a hole in it is not a range. This is also the case where
+            // a scrollbar is legitimately wanted, so one picture reviews
+            // both halves.
+            Surface::PrefsAboutUpdateManyReleases => UpdateStage::Available(ReleaseInfo {
+                body: concat!(
+                    "## Deskwarden 0.9.0\n",
+                    "- Release notes now cover **every** version you skipped.\n",
+                    "- The scrollbar appears only when there is more to read.\n",
+                    "\n",
+                    "## Deskwarden 0.8.6\n",
+                    "_This release came with no notes._\n",
+                    "\n",
+                    "## Deskwarden 0.8.5\n",
+                    "- The vault window remembers its size, via `settings.json`.\n",
+                    "- Details on [the release page](https://example.invalid/r).\n",
                 )
                 .to_string(),
                 ..release
