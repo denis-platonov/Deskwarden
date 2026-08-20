@@ -20,9 +20,13 @@ then the network in its pill, then the name and its `(*9988)` suffix.
   abbreviation style -- they were the 32pt tile the badge had to fit inside.
   They are now `MASTERCARD`, `DINERS`, `DISCOVER` and `UNIONPAY`. `AMEX`
   stays as it is: `AMERICAN EXPRESS` measures a third of the row.
-- **The pill is set one step below the name**, at the same size as the
-  username line under it. The card's name is the thing being identified and
-  its network is a qualifier on it, and that is what the type sizes now say.
+- **The pill is set well below the name**, at 9pt against its 13. The card's
+  name is the thing being identified and its network is a qualifier on it,
+  and that is what the type sizes now say. The size was chosen off a rendered
+  ladder of four candidates read unmagnified, not by argument.
+- **The icon, the pill and the name sit on one line** -- their ink, not the
+  boxes their ink sits in, which is what "the same mid line" means to a
+  reader and what the row was missing.
 - **A long name still truncates properly.** The pill is taken out of the
   row's width before the name is laid into what is left, so a name that has
   to be cut is cut a little sooner rather than running underneath the pill.
