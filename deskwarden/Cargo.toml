@@ -22,6 +22,11 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Com",
     "Win32_System_JobObjects",
+    # ProcessIdToSessionId, for src/single_instance.rs. The forced half of a
+    # takeover ends a process ONLY when it is in this logon session, which is
+    # the scope the app mutex is named in; without the check a relaunch could
+    # kill another signed-in user's Deskwarden.
+    "Win32_System_RemoteDesktop",
     "Win32_Security",
     # Rounded corners + shadow for the frameless login window's custom
     # titlebar (login_ui::round_window_corners).

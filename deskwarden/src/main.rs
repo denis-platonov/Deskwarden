@@ -247,16 +247,46 @@ fn main() {
         deskwarden::single_instance::Startup::Sole => {
             log::debug!("app mutex held: the installer can see this process")
         }
-        deskwarden::single_instance::Startup::TookOver { waited } => log::info!(
+        deskwarden::single_instance::Startup::TookOver {
+            waited,
+            how: deskwarden::single_instance::Handover::Asked,
+        } => log::info!(
             "another Deskwarden was running; it stood down in {}ms and this one has taken \
              the app mutex",
+            waited.as_millis()
+        ),
+        // **A forced takeover, said out loud.** At `warn`, and spelling out
+        // what was skipped: a process ended by `TerminateProcess` shows up in
+        // a later investigation as a process that is simply no longer there,
+        // and "why did my Deskwarden vanish" is a question this line has to be
+        // able to answer on its own. What it must NOT do is leave the cost
+        // implicit -- see `single_instance`'s docs for why the clipboard is
+        // named here rather than cleared.
+        deskwarden::single_instance::Startup::TookOver {
+            waited,
+            how: deskwarden::single_instance::Handover::Forced { why, ended },
+        } => log::warn!(
+            "another Deskwarden was running and {}, so this launch ended {ended} process(es) \
+             by force and took the app mutex {}ms later. The outgoing copy ran no shutdown: \
+             its `bw serve` died with it (kill-on-close job object, so no decrypted vault is \
+             left served on localhost), but a password it had copied may still be on the \
+             clipboard -- this process cannot clear a clipboard it cannot show is its own",
+            why.what_happened(),
             waited.as_millis()
         ),
         // Nothing has been shown yet and nothing will be: this launch produced
         // no window, so it says why before it goes. Exit 1, because from the
         // user's side this launch did fail.
+        //
+        // Reached only after BOTH routes have been tried -- asked, and then
+        // ended by force -- which is what makes this exit an honest last word
+        // rather than the premature refusal it used to be.
         deskwarden::single_instance::Startup::GaveUp(gave_up) => {
-            log::error!("another Deskwarden is running and would not stand down ({gave_up:?})");
+            log::error!(
+                "another Deskwarden is running, {}, and could not be ended by force either \
+                 ({gave_up:?}); this launch will not start a second one",
+                gave_up.unasked().what_happened()
+            );
             message_box("Deskwarden", gave_up.message(), MB_ICONWARNING | MB_OK);
             std::process::exit(1);
         }
@@ -601,7 +631,10 @@ fn main() {
     // to protect and before the startup window can put a password on the
     // clipboard -- a handover that skipped this would leave a copied password
     // pasteable and a decrypted cache in freed memory, which is the whole
-    // reason the takeover is a request and not a `TerminateProcess`.
+    // reason the takeover is a request and not a `TerminateProcess` --
+    // and, when there is nobody to ask and `single_instance` falls back to
+    // one, the whole reason that fallback logs a clipboard it could not
+    // clear.
     //
     // The same two effects, in the same order, as the tray's Quit and as the
     // update path's `before_install`; `bw serve` is absent from all three for
