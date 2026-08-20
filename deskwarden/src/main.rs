@@ -215,28 +215,61 @@ fn main() {
         Err(e) => eprintln!("warning: {e}"),
     }
 
-    // Now that there is somewhere to say it, report what the mutex found.
+    // Now that there is somewhere to say it, report what the mutex found --
+    // and act on it.
     //
-    // `AlreadyRunning` is REPORTED AND NOT ACTED ON, deliberately. A second
-    // copy of Deskwarden is arguably already a bug -- its `RegisterHotKey`
-    // cannot succeed while the first copy holds the same combination -- but
-    // making the second copy exit is a behaviour change, not part of fixing
-    // the installer, and it belongs to whoever decides what the second copy
-    // should do instead (raise the first one's vault window, most likely).
-    // This line is the evidence that would justify it.
-    match &mutex_state {
-        Ok(deskwarden::app_mutex::Acquired::First) => {
-            log::debug!("app mutex held: the installer can see this process")
-        }
-        Ok(deskwarden::app_mutex::Acquired::AlreadyRunning) => log::warn!(
-            "another Deskwarden is already running in this session; the global hotkey will \
-             not register in this one"
-        ),
-        Err(e) => log::warn!(
+    // **`AlreadyRunning` used to be reported and no more**, under a log line
+    // that said the global hotkey "will not register in this one". Nothing
+    // implemented that: the registration a thousand lines below ran
+    // unconditionally, `RegisterHotKey` refused because the first copy held
+    // the chord, and the `expect` behind it killed this process with exit 101
+    // -- an hour and a half into a session, from the user's side without a
+    // trace. Two statements that had to agree, in two places, which is how
+    // that pair always ends.
+    //
+    // There is now one place, and it is not this one: `single_instance::
+    // resolve` decides what a duplicate launch means and this block only says
+    // what happened. What it decides is that there is no second copy -- the
+    // newly launched Deskwarden is the one the user just asked for, so the
+    // running one is asked to stand down through its own shutdown path and
+    // this one takes its place. See that module for why the request is a
+    // named event and not a kill.
+    if let Err(e) = &mutex_state {
+        log::warn!(
             "could not create the app mutex ({e}); an installer run while this app is \
              running will not know to ask you to close it"
-        ),
+        );
     }
+    match deskwarden::single_instance::resolve(
+        mutex_state.map_err(|e| e.to_string()),
+        &deskwarden::single_instance::TakeoverEnv::production(),
+    ) {
+        deskwarden::single_instance::Startup::Sole => {
+            log::debug!("app mutex held: the installer can see this process")
+        }
+        deskwarden::single_instance::Startup::TookOver { waited } => log::info!(
+            "another Deskwarden was running; it stood down in {}ms and this one has taken \
+             the app mutex",
+            waited.as_millis()
+        ),
+        // Nothing has been shown yet and nothing will be: this launch produced
+        // no window, so it says why before it goes. Exit 1, because from the
+        // user's side this launch did fail.
+        deskwarden::single_instance::Startup::GaveUp(gave_up) => {
+            log::error!("another Deskwarden is running and would not stand down ({gave_up:?})");
+            message_box("Deskwarden", gave_up.message(), MB_ICONWARNING | MB_OK);
+            std::process::exit(1);
+        }
+    }
+
+    // **The other side of the same handover.** From here on this process is
+    // the one Deskwarden, so it is also the one that has to answer the next
+    // launch's request. The listener is a thread rather than a check in the
+    // main loop because the main loop is a long way off: the reported run
+    // spent 1h43m inside the startup vault window before reaching it, and a
+    // request arriving in that window has to be answered too. What it runs
+    // when it fires is published below, next to the vault cache it zeroizes.
+    deskwarden::single_instance::listen_for_takeover();
 
     // Building with windows_subsystem = "windows" (no console) means a
     // panic's default stderr backtrace goes nowhere -- the process just
@@ -563,6 +596,31 @@ fn main() {
     // periodic match-engine refresh all still want the live server rather
     // than a snapshot that's deliberately not re-fetched on every read.
     let cache = Arc::new(VaultCache::new(vault.clone()));
+    // **What this process does when a newer Deskwarden asks it to stand
+    // down.** Published here, at the first moment there is anything decrypted
+    // to protect and before the startup window can put a password on the
+    // clipboard -- a handover that skipped this would leave a copied password
+    // pasteable and a decrypted cache in freed memory, which is the whole
+    // reason the takeover is a request and not a `TerminateProcess`.
+    //
+    // The same two effects, in the same order, as the tray's Quit and as the
+    // update path's `before_install`; `bw serve` is absent from all three for
+    // one reason, which is that it is a member of the kill-on-close job
+    // object and the kernel takes it down with this process however this
+    // process ends.
+    //
+    // Published rather than borrowed because the listener is a background
+    // thread, which cannot borrow a `main` local -- `update_panel::install_env`
+    // exists in this file for the same reason, three hundred lines below.
+    {
+        let cache_for_takeover = Arc::clone(&cache);
+        deskwarden::single_instance::on_takeover(std::sync::Arc::new(move || {
+            cache_for_takeover.clear();
+            deskwarden::clipboard::clear_if_still_ours_for(
+                deskwarden::clipboard::ClearTrigger::Quit,
+            );
+        }));
+    }
     // Captured here, *before* the readiness probe below, because that probe's
     // own `list_items()` is the fetch whose result seeds the cache further
     // down via `populate_with` -- and the epoch guard can only cover the
@@ -1320,7 +1378,15 @@ fn main() {
     // iteration -- without it, tray clicks and hotkey presses would sit
     // undelivered in the queue forever and `tray::next_menu_event()` /
     // `hotkey::fill_hotkey_pressed()` would never see anything.
-    let fill_hotkey = hotkey::register_fill_hotkey();
+    //
+    // **`mut`, and not fatal.** This used to be two `expect`s, and one of them
+    // ended a real session: any program in this logon session can be holding
+    // `Ctrl+Alt+B` first, and `RegisterHotKey` says so with `AlreadyRegistered`
+    // rather than with a way round it. It now degrades -- the app runs on
+    // without the shortcut, Preferences > Shortcuts says why, and the main
+    // loop re-attempts on `hotkey::RETRY_EVERY` in case whatever holds it
+    // exits, which is what the `mut` is for. See `hotkey`'s module docs.
+    let mut fill_hotkey = hotkey::register_fill_hotkey();
     // `mut`: the "Accounts" submenu is rebuilt in place after every add,
     // removal and switch, and rebuilding mints new `MenuId`s that the tray has
     // to remember.
@@ -2213,6 +2279,14 @@ fn main() {
             );
             last_dispatched_hwnd = None;
         }
+
+        // **A shortcut somebody else was holding can come back.** Paced
+        // inside `hotkey` (one `RegisterHotKey` call every `RETRY_EVERY`, and
+        // only while it is unavailable), and here rather than anywhere else
+        // because `RegisterHotKey` binds to the calling thread and `WM_HOTKEY`
+        // reaches only that thread's queue -- the same reason the first
+        // attempt is on this thread.
+        hotkey::retry_if_unavailable(&mut fill_hotkey, Instant::now());
 
         if hotkey::fill_hotkey_pressed(&fill_hotkey) {
             if let Some((item_id, hwnd)) = pending_hotkey_fill.take() {
@@ -8023,8 +8097,17 @@ mod tests {
     /// The third call in this file is `lock_after_walking_away`'s, and it is
     /// counted here rather than exempted: it is the whole reason the Win+L
     /// lock is not a parallel path. It names `Lock`, and the `Quit` count
-    /// below is what pins that the two shutdown paths did not quietly become
-    /// three by inheriting it.
+    /// below is what pins that the shutdown paths did not quietly acquire
+    /// another by inheriting it.
+    ///
+    /// **The fourth is the takeover's**, published next to the vault cache for
+    /// `single_instance`'s listener thread to run when a newer Deskwarden asks
+    /// this one to stand down. It is a shutdown path in the full sense -- the
+    /// process ends -- so it clears under `Quit` exactly like the other two,
+    /// and it is counted here rather than exempted for the same reason the
+    /// walked-away lock is: a handover that skipped it would leave the
+    /// outgoing instance's copied password pasteable, which is precisely the
+    /// harm that makes the takeover a request instead of a `TerminateProcess`.
     #[test]
     fn both_shutdown_paths_clear_the_clipboard_as_a_quit() {
         let source = include_str!("main.rs");
@@ -8032,13 +8115,13 @@ mod tests {
             source
                 .matches(concat!("clipboard::clear_if_still_ours_", "for("))
                 .count(),
-            3,
-            "expected the tray Quit, the shutdown-for-update path and the walked-away lock, and \
-             no others"
+            4,
+            "expected the tray Quit, the shutdown-for-update path, the takeover handover and \
+             the walked-away lock, and no others"
         );
         assert_eq!(
             source.matches(concat!("clipboard::ClearTrigger::Qu", "it")).count(),
-            2,
+            3,
             "a shutdown path is clearing under some trigger other than `Quit`"
         );
         // **The walked-away lock clears under `Lock`, the same trigger the
@@ -22428,7 +22511,7 @@ mod startup_shape_tests {
                 ),
                 2,
             ),
-            (concat!("let fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
+            (concat!("let mut fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
             (concat!("let mut tray = tray::build", "_tray();"), 1),
             (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),
             (concat!("window_watch::watch_foreground_", "windows("), 1),

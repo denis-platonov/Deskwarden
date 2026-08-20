@@ -10,6 +10,41 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Deskwarden no longer dies because something else has CTRL+ALT+B
+
+A real session ended with exit code 101, an hour and three quarters in, with a
+vault window open. Nothing was shown; the app simply vanished. The cause was
+the global shortcut: `RegisterHotKey` is first-come-first-served across the
+whole logon session, another program held CTRL+ALT+B, and the failure was an
+`expect`.
+
+- **No registration failure ends the app now.** Not the conflict that was
+  reported, not a keyboard hook Windows refuses to give, not anything else
+  `global-hotkey` can return. Deskwarden runs on without the shortcut;
+  everything else -- the tray, the overlay, the vault window, the clipboard,
+  filling from the overlay -- is untouched.
+- **Preferences > Shortcuts says so**, names the shortcut, and says what to do
+  about it. Not a dialog at startup: a shortcut somebody else claimed is a
+  missing convenience, not a failure to start.
+- **It is retried every 30 seconds** while it is unavailable, so closing the
+  program that took the keys gets the shortcut back without restarting
+  Deskwarden. A shortcut that is working never re-attempts anything.
+
+### One Deskwarden per session, and starting it again takes over
+
+Launching Deskwarden while it was already running used to leave two copies
+running, the second of which was the one that died on the shortcut above.
+
+- **The newly launched copy takes over.** It asks the running one to stand
+  down and takes its place -- which is what launching an app you already have
+  running should do.
+- **The outgoing copy leaves through its own door**, not a kill: it zeroizes
+  the decrypted item cache and takes a copied password back off the clipboard
+  before it exits, and `bw serve` goes with it. A forced kill would have left
+  the password pasteable.
+- **If the running copy will not go within five seconds**, the new one says so
+  and stops, rather than starting a second copy or hanging with no window.
+
 ### Password health rows line up with the item list again
 
 The two panes take turns in the same column of the same window, and their rows

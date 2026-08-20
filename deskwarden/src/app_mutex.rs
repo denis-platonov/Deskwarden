@@ -74,9 +74,14 @@ pub enum Acquired {
     /// Nothing else held the name: this is the only Deskwarden running.
     First,
     /// The name already existed, so another Deskwarden is running in this
-    /// logon session. **Reported, not acted on** -- see the module docs of
-    /// `main` and the report for the deliberate decision not to make a second
-    /// instance exit.
+    /// logon session.
+    ///
+    /// **Acted on.** This used to be reported and no more, and the log line
+    /// that reported it claimed the second copy would run without a global
+    /// hotkey -- a claim nothing implemented, which is how a duplicate launch
+    /// came to die on `RegisterHotKey`. [`crate::single_instance::resolve`] is
+    /// now the one place that says what this means: the newly launched copy
+    /// asks the running one to stand down and takes its place.
     AlreadyRunning,
 }
 
@@ -129,6 +134,38 @@ pub fn acquire() -> windows::core::Result<Acquired> {
         *held = Some(handle);
     }
     Ok(acquired)
+}
+
+/// Takes the mutex **only if nothing else holds it**, reporting whether it
+/// did.
+///
+/// [`crate::single_instance`]'s poll, and it has to be this rather than
+/// `acquire` for a reason that is easy to miss: a `CreateMutexW` that finds
+/// the name already there still *opens a handle to it*, and a named object
+/// lives as long as any handle does. An incoming instance that polled with
+/// `acquire` would therefore keep the very name it was waiting to see
+/// disappear alive, and would wait out its whole timeout against itself. So a
+/// losing attempt here drops its handle immediately and stores nothing; only
+/// a winning one is retained.
+///
+/// A creation that fails outright is reported as "not free". The caller's
+/// timeout then decides, which is the right answer: an unexplained refusal to
+/// create the name is not evidence that the other instance has gone.
+pub fn take_if_free() -> bool {
+    match create_named(APP_MUTEX_NAME) {
+        Ok((handle, Acquired::First)) => {
+            if let Ok(mut held) = HELD.lock() {
+                *held = Some(handle);
+            }
+            true
+        }
+        // Dropped here, deliberately -- see above.
+        Ok((_, Acquired::AlreadyRunning)) => false,
+        Err(e) => {
+            log::warn!("could not create the app mutex while waiting for the other copy ({e})");
+            false
+        }
+    }
 }
 
 /// Closes the mutex handle, so the name stops existing.
