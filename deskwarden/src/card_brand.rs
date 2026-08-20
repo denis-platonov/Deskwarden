@@ -53,8 +53,8 @@ impl CardBrand {
         }
     }
 
-    /// The network's name as the badge SETS IT IN TYPE -- `VISA`, `MC`,
-    /// `AMEX`.
+    /// The network's name as the mark SETS IT IN TYPE -- `VISA`,
+    /// `MASTERCARD`, `AMEX`.
     ///
     /// **Words, because this app does not ship the logos.** The network marks
     /// are registered trademarks whose brand guidelines restrict their use to
@@ -63,30 +63,43 @@ impl CardBrand {
     /// network a card belongs to is a statement of fact about the user's own
     /// card, and a word is how a fact is stated.
     ///
-    /// **Four characters, hard.** The badge is drawn inside the list row's
-    /// 32pt tile, which is the whole width there is (see `card_mark`), so the
-    /// cap is not a style preference -- it is the width. Set `DINERS` or
-    /// `UNIONPAY` in that space and the type has to come down to about 4pt a
-    /// glyph, which is a smear rather than a word. So the two long names take
-    /// the short forms those networks are commonly written as: `DC` for Diners
-    /// Club, `UP` for UnionPay. They are the weakest two of the seven, and
-    /// that is an honest cost of not shipping logos -- the alternative, a full
-    /// word nobody can read, names nothing at all.
+    /// **Full words, now that the mark has the row's width and not a tile
+    /// corner's.** These were once capped at four characters -- `MC`, `DC`,
+    /// `UP` -- because the badge was drawn INSIDE the list row's 32pt avatar
+    /// tile and 32pt was the entire width budget. The mark has since moved
+    /// out of the tile and sits beside it, in a pill on the row (see
+    /// `card_mark::MARK_ROW_HEIGHT`), so the budget is now the row's and the
+    /// abbreviations are no longer paying for anything.
+    ///
+    /// Measured, not assumed. At the 11pt the row sets these in, the pills
+    /// come to `JCB` 31pt, `VISA` 35pt, `AMEX` 41pt, `DINERS` 51pt,
+    /// `UNIONPAY` 67pt, `DISCOVER` 67pt, `MASTERCARD` 88pt. The list pane is
+    /// a fixed 390pt (`vault_window::LIST_WIDTH`, not resizable), which leaves
+    /// the title column 301pt before the pill; the widest of these takes 88
+    /// plus the row's 11pt gap and still leaves the name 202pt, well over what
+    /// the name and its `(*9988)` suffix need.
+    ///
+    /// **`AMEX` is the one that stays short, and that is the measurement
+    /// talking.** `AMERICAN EXPRESS` is 125pt -- over a third of the title
+    /// column, for a pill whose job is to annotate the name rather than
+    /// compete with it -- and `AMEX` is what that network's own mark is
+    /// commonly written as anyway. `DINERS` likewise over `DINERS CLUB`
+    /// (84pt).
     ///
     /// Deliberately NOT derived from [`canonical`](Self::canonical) by rule:
-    /// `Mastercard` -> `MC` and `Discover` -> `DISC` are not one abbreviation
+    /// `American Express` -> `AMEX` and `UnionPay` -> `UNIONPAY` are not one
     /// rule, and any rule that produced both would have been fitted to this
     /// table anyway. It is a `match` on the enum, in the one file that names
     /// brands, so a network added later does not compile without one.
     pub fn wordmark(self) -> &'static str {
         match self {
             CardBrand::Visa => "VISA",
-            CardBrand::Mastercard => "MC",
+            CardBrand::Mastercard => "MASTERCARD",
             CardBrand::AmericanExpress => "AMEX",
-            CardBrand::Discover => "DISC",
+            CardBrand::Discover => "DISCOVER",
             CardBrand::Jcb => "JCB",
-            CardBrand::DinersClub => "DC",
-            CardBrand::UnionPay => "UP",
+            CardBrand::DinersClub => "DINERS",
+            CardBrand::UnionPay => "UNIONPAY",
         }
     }
 

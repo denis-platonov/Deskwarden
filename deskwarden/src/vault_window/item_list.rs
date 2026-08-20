@@ -717,53 +717,65 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
 const AVATAR_SIZE: f32 = 32.0;
 
-/// The network badge's height, in points, inside the list tile.
+/// The network mark's height, in points, on a list row.
 ///
-/// [`card_mark::MARK_BADGE_HEIGHT`] and not a number of this module's own:
-/// that constant is the height the wordmarks were sized and measured to fit
-/// this very tile at, so raising it here to make a word clearer would be
-/// widening a badge past the tile it is drawn inside.
-const NETWORK_BADGE_HEIGHT: f32 = card_mark::MARK_BADGE_HEIGHT;
+/// [`card_mark::MARK_ROW_HEIGHT`] and not a number of this module's own: that
+/// constant is pinned to the height at which the mark's type comes out at
+/// [`TITLE_SIZE`], the item name's own size, which is what the owner asked
+/// for. A number written here instead would be a second place to change it.
+const NETWORK_MARK_HEIGHT: f32 = card_mark::MARK_ROW_HEIGHT;
 
-/// The height the mark is drawn at when it is the tile's ONLY content -- a
-/// card whose issuer this app has no icon for.
+/// The narrowest the item name's column may be squeezed to before the network
+/// mark gives up its place on the row.
 ///
-/// **The same height as the corner badge, and that is a measurement rather
-/// than a preference.** A mark alone in the tile has the whole tile to itself,
-/// so the obvious move is to draw it bigger -- but the constraint that binds
-/// is WIDTH, not height, and it is the same 32pt tile either way. `AMEX` is
-/// 30pt wide at 13pt tall; at 14 it is 33 and hangs off the row.
+/// **Not taste -- the truncation budget.** The mark's pill is allocated out of
+/// the same row width the name and its `(*9988)` suffix are laid into, so on a
+/// pane narrow enough the pill would leave the name a single ellipsis and the
+/// suffix nowhere to go, which is the overflow `theme::truncated_galley` was
+/// added to stop one release ago. 120pt is roughly the suffix (about 47pt at
+/// `TITLE_SIZE`), its gap, and enough name to still be a name.
 ///
-/// One height for every network as well, rather than the tallest each could
-/// manage on its own: seven marks at seven sizes down one list is a list that
-/// looks broken.
-/// `every_networks_mark_fits_the_tile_when_it_is_the_only_thing_in_it` holds
-/// this for all seven, `AMEX` included.
-const NETWORK_MARK_ALONE_HEIGHT: f32 = NETWORK_BADGE_HEIGHT;
+/// At the real pane this never binds: the list is
+/// `Panel::exact_size(LIST_WIDTH).resizable(false)` at 390pt, which leaves the
+/// title column 301pt, and the widest mark this app sets is `MASTERCARD` at
+/// 88pt. It binds only under a test pane, and there the answer is the
+/// module's standing one -- draw nothing rather than a mark that costs the row
+/// its name. `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_
+/// both` holds it.
+const NETWORK_MARK_MIN_TITLE_ROOM: f32 = 120.0;
 
-
-/// Paints the network badge into the lower-right corner of `tile`.
+/// Allocates and paints the network mark's pill on the row, immediately after
+/// the avatar tile; returns the rect it took, or `None` when it stood aside.
 ///
-/// **Inside the tile, never beside it.** The badge is anchored to a corner of
-/// a box that is already allocated, so it costs the row no width and no height
-/// and every layout guard over `ROW_TILE_HEIGHT` stays exactly as true as it
-/// was. It overlaps the bank icon's artwork on purpose -- that is the
-/// arrangement of the physical card, and it is why the pairing reads without a
-/// legend.
+/// **Beside the tile, never inside it.** The badge used to be anchored into
+/// the tile's lower-right corner, over the bank's own artwork. The owner asked
+/// for it moved -- "maybe not overlap the icon but place to the right ... then
+/// name with last digits" -- and moving it is what let the wordmarks become
+/// words: the 32pt tile was the four-character cap, and there is no tile
+/// around the mark any more (see `CardBrand::wordmark`).
 ///
-/// **The tile is the badge's whole width budget**, which is what caps
-/// `CardBrand::wordmark` at four characters. `card_mark`'s
-/// `a_wordmark_fits_the_list_tile_at_badge_height` measures every brand
-/// against that; `the_network_badge_stays_inside_the_row_tile` is this side of
-/// the same claim, from painted output.
-fn paint_network_badge(ui: &egui::Ui, tile: egui::Rect, brand: CardBrand) -> egui::Rect {
-    card_mark::paint_mark(
+/// **It is ALLOCATED, which is the whole point.** `allocate_exact_size` in the
+/// row's left-to-right ui advances the cursor by the pill plus the row's
+/// `ROW_GAP_X`, so the `ui.available_width()` the title column is then given
+/// -- and therefore the `room` `theme::truncated_galley` truncates the name
+/// into -- is already net of the pill. Painting it without allocating would
+/// have left the name laying out into room the pill was sitting in.
+fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand) -> Option<egui::Rect> {
+    let width = card_mark::mark_width(ui, brand, NETWORK_MARK_HEIGHT);
+    // The gap is charged twice on purpose: `item_spacing` puts one between the
+    // tile and the pill, and another between the pill and the title column.
+    if ui.available_width() - width - 2.0 * ROW_GAP_X < NETWORK_MARK_MIN_TITLE_ROOM {
+        return None;
+    }
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, NETWORK_MARK_HEIGHT), Sense::hover());
+    Some(card_mark::paint_mark(
         ui,
         brand,
-        NETWORK_BADGE_HEIGHT,
-        egui::Align2::RIGHT_BOTTOM,
-        tile.max,
-    )
+        NETWORK_MARK_HEIGHT,
+        egui::Align2::LEFT_TOP,
+        rect.left_top(),
+    ))
 }
 
 /// Design 2b's row box, in full: `padding: 10px 12px` around a 32px avatar,
@@ -1651,16 +1663,16 @@ fn item_row(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_GAP_X;
-                // A card's network badge, when this app can name the network.
-                // Three rungs, each one step less specific than the last and
-                // none of them a blank tile: the bank's icon with the badge in
-                // its corner, the badge alone where no bank domain is set, and
-                // the monogram every other row already falls back to when the
-                // brand is one we cannot name (or the item is not a card at
-                // all). `None` here is exactly today's rendering.
-                let badge = card_network(item);
-                match (icon, badge) {
-                    (Some(tex), badge) => {
+                // The tile is now ONE decision and the mark is another, which
+                // is what moving the mark off the tile bought. The tile is the
+                // bank's icon when there is one and the name's monogram when
+                // there is not -- the same two rungs every non-card row has
+                // always had, with no card-shaped third. The network's mark
+                // then follows the tile, on the row, for any card whose
+                // network this app can name.
+                let mark = card_network(item);
+                match icon {
+                    Some(tex) => {
                         // The SAME box the monogram fallback draws -- filled,
                         // bordered, 8px radius -- with the artwork FILLING it,
                         // clipped to the tile's own corner radius and with the
@@ -1671,28 +1683,16 @@ fn item_row(
                         // tile.
                         let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
                         theme::avatar_image(ui, tile, tex, selected);
-                        if let Some(brand) = badge {
-                            paint_network_badge(ui, tile, brand);
-                        }
                     }
-                    // No bank domain on the card, so nothing identifies the
-                    // issuer -- but the network still does, and with the tile
-                    // otherwise empty the mark is drawn CENTRED in it at
-                    // [`NETWORK_MARK_ALONE_HEIGHT`] rather than tucked into a
-                    // corner it would be sharing with nothing.
-                    (None, Some(brand)) => {
-                        let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
-                        card_mark::paint_mark(
-                            ui,
-                            brand,
-                            NETWORK_MARK_ALONE_HEIGHT,
-                            egui::Align2::CENTER_CENTER,
-                            tile.center(),
-                        );
-                    }
-                    (None, None) => {
+                    None => {
                         theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected)
                     }
+                }
+                // The mark's pill, after the tile and before the name. It is
+                // allocated, so the room the title column is laid into is
+                // already net of it -- see `paint_network_mark`.
+                if let Some(brand) = mark {
+                    paint_network_mark(ui, brand);
                 }
                 // The design's title column is `flex: 1` with the chips
                 // trailing it. Laid out right-to-left so the chips take their
@@ -4160,7 +4160,7 @@ mod row_tile_tests {
         v
     }
 
-    /// Every network mark painted inside `tile`, with the word on it: a
+    /// Every network mark painted inside `area`, with the word on it: a
     /// `theme::BLUE` ground, and whichever painted text sits inside that
     /// ground. Top to bottom.
     ///
@@ -4168,11 +4168,15 @@ mod row_tile_tests {
     /// used to be textures and were found by being textured; they are drawn
     /// type on a drawn ground now, and a test that looked for "a small rect in
     /// the corner" would pass for any small rect in the corner.
-    fn marks_in(p: &Painted, tile: egui::Rect) -> Vec<(egui::Rect, String)> {
+    ///
+    /// Handed a ROW's rect by most callers now that the mark sits beside the
+    /// avatar tile rather than inside it -- and handed the avatar tile by the
+    /// tests whose claim is that the tile is left alone.
+    fn marks_in(p: &Painted, area: egui::Rect) -> Vec<(egui::Rect, String)> {
         let mut v: Vec<(egui::Rect, String)> = p
             .rects
             .iter()
-            .filter(|r| r.fill == theme::BLUE && tile.contains_rect(r.rect))
+            .filter(|r| r.fill == theme::BLUE && area.contains_rect(r.rect))
             .map(|r| {
                 let word = p
                     .texts
@@ -4208,10 +4212,10 @@ mod row_tile_tests {
             ],
             None,
         );
-        let tiles = avatar_tiles(&p);
-        assert_eq!(tiles.len(), 3, "three card rows, three tiles");
+        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
+        assert_eq!(rows.len(), 3, "three card rows");
         let word = |i: usize| {
-            let marks = marks_in(&p, tiles[i]);
+            let marks = marks_in(&p, rows[i]);
             assert_eq!(marks.len(), 1, "row {i} painted {} marks, expected 1", marks.len());
             marks[0].1.clone()
         };
@@ -4230,59 +4234,94 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn a_card_with_a_bank_icon_wears_its_network_badge_in_the_tiles_lower_right() {
-        // Rung 1, the most specific: the issuer's own icon, with the network
-        // in the corner the plastic puts it in.
+    fn a_card_with_a_bank_icon_wears_its_network_mark_beside_the_tile_and_not_over_it() {
+        // THE REPORT: a bank favicon with `VISA` sitting over the tile's
+        // lower-right corner -- "maybe not overlap the icon but place to the
+        // right ... then name with last digits". This is that arrangement,
+        // asserted from painted geometry: icon, then pill, then name.
         let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
+        let row = row_tiles(&p)[0].rect;
         let tile = square(&p, AVATAR_SIZE).rect;
-        let marks = marks_in(&p, tile);
-        assert_eq!(marks.len(), 1, "expected exactly the badge inside the tile: {marks:?}");
-        let (badge, word) = marks[0].clone();
-        assert_eq!(word, CardBrand::Visa.wordmark(), "the corner badge names the wrong network");
+        let marks = marks_in(&p, row);
+        assert_eq!(marks.len(), 1, "expected exactly the mark on the row: {marks:?}");
+        let (mark, word) = marks[0].clone();
+        assert_eq!(word, CardBrand::Visa.wordmark(), "the mark names the wrong network");
 
-        // The favicon is still there and still fills the tile, so this really
-        // is the COMPOSED rung and not the badge-alone one.
+        // The favicon is still there and still fills the tile, so the tile
+        // really is the icon's and this is not the monogram rung.
         assert!(
             textured(&p).iter().any(|r| r.rect == tile),
-            "no full-tile favicon was painted, so nothing was composed: {:?}",
+            "no full-tile favicon was painted: {:?}",
             textured(&p).iter().map(|r| r.rect).collect::<Vec<_>>()
         );
 
-        // Lower RIGHT, flush into the tile's own corner, at the badge height.
+        // **Nothing is drawn inside the tile any more.** The negative half of
+        // the report, and the one that would silently come back if a future
+        // edit re-added the corner anchor: `marks_in` over the TILE finds
+        // nothing.
         assert!(
-            (badge.right() - tile.right()).abs() < 0.01
-                && (badge.bottom() - tile.bottom()).abs() < 0.01,
-            "the badge at {badge:?} is not flush in the lower right of the {tile:?} tile"
+            marks_in(&p, tile).is_empty(),
+            "a mark is still being painted inside the {tile:?} tile: {:?}",
+            marks_in(&p, tile)
+        );
+
+        // To the RIGHT of the tile, clear of it, one row gap away.
+        assert!(
+            mark.left() >= tile.right(),
+            "the mark at {mark:?} overlaps the {tile:?} tile it is supposed to sit beside"
         );
         assert!(
-            (badge.height() - NETWORK_BADGE_HEIGHT).abs() < 0.01,
-            "the badge is {}pt tall, expected {NETWORK_BADGE_HEIGHT}",
-            badge.height()
+            (mark.left() - tile.right() - ROW_GAP_X).abs() < 0.51,
+            "the mark at {mark:?} is {}pt from the tile's right edge, expected the row's \
+             {ROW_GAP_X}pt gap",
+            mark.left() - tile.right()
         );
-        // The constraint the four-character wordmark cap exists to satisfy --
-        // see `CardBrand::wordmark` and `card_mark`'s own width measurement.
+        // Vertically centred against the tile: the row is `align-items:
+        // center` and a pill hanging off that baseline is the defect the
+        // title column already had to be bounded to avoid.
         assert!(
-            tile.contains_rect(badge),
-            "the badge at {badge:?} escapes the {tile:?} tile it is drawn inside"
+            (mark.center().y - tile.center().y).abs() < 0.51,
+            "the mark at {mark:?} is not centred against the {tile:?} tile"
+        );
+        assert!(
+            (mark.height() - NETWORK_MARK_HEIGHT).abs() < 0.01,
+            "the mark is {}pt tall, expected {NETWORK_MARK_HEIGHT}",
+            mark.height()
+        );
+        // And the name follows the pill rather than starting under it.
+        let name = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "BoA Credit")
+            .map(|(_, r, _)| *r)
+            .expect("the item's name was painted");
+        assert!(
+            name.left() >= mark.right(),
+            "the name at {name:?} starts before the mark at {mark:?} ends"
         );
     }
 
     #[test]
-    fn a_card_with_no_bank_domain_draws_its_network_mark_centred_in_the_tile() {
-        // Rung 2, one step less specific and still not a blank: no issuer to
-        // name, so the network gets the middle of the tile at a bigger size
-        // rather than a corner it would be sharing with nothing.
+    fn a_card_with_no_bank_domain_takes_the_monogram_tile_and_still_wears_its_mark() {
+        // With the mark off the tile, a card with no issuer icon is not a
+        // special case any more: it gets the SAME monogram tile every other
+        // iconless row gets, and the network is named beside it. That is the
+        // whole simplification -- the tile answers "who issued this" and the
+        // pill answers "which network", and neither has to stand in for the
+        // other.
         let p = paint(
             &[card_branded("BoA Credit", "Visa"), card_branded("MC Credit", "Mastercard")],
             None,
         );
+        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
         let tiles = avatar_tiles(&p);
+        assert_eq!(rows.len(), 2);
         assert_eq!(tiles.len(), 2);
-        let marks: Vec<(egui::Rect, String)> = tiles
+        let marks: Vec<(egui::Rect, String)> = rows
             .iter()
-            .map(|t| {
-                let m = marks_in(&p, *t);
-                assert_eq!(m.len(), 1, "exactly the mark, and nothing else, belongs here");
+            .map(|r| {
+                let m = marks_in(&p, *r);
+                assert_eq!(m.len(), 1, "exactly one mark belongs on a row");
                 m.into_iter().next().unwrap()
             })
             .collect();
@@ -4290,61 +4329,202 @@ mod row_tile_tests {
         assert_eq!(marks[1].1, CardBrand::Mastercard.wordmark());
         for (tile, (mark, word)) in tiles.iter().zip(&marks) {
             assert!(
-                (mark.center().x - tile.center().x).abs() < 0.51
-                    && (mark.center().y - tile.center().y).abs() < 0.51,
-                "{word:?} was painted at {mark:?}, which is not centred in its {tile:?} tile"
+                mark.left() >= tile.right(),
+                "{word:?} at {mark:?} overlaps its {tile:?} tile"
             );
             assert!(
-                (mark.height() - NETWORK_MARK_ALONE_HEIGHT).abs() < 0.01,
-                "{word:?} is {}pt tall, expected {NETWORK_MARK_ALONE_HEIGHT}",
+                (mark.height() - NETWORK_MARK_HEIGHT).abs() < 0.01,
+                "{word:?} is {}pt tall, expected {NETWORK_MARK_HEIGHT}",
                 mark.height()
             );
-            // NOT bigger than the corner badge, deliberately: the tile is
-            // 32pt wide in both rungs and `AMEX` at 14pt tall is 33pt wide.
-            // See `NETWORK_MARK_ALONE_HEIGHT`.
-            assert!(
-                (mark.height() - NETWORK_BADGE_HEIGHT).abs() < 0.01,
-                "the two rungs have drifted to two mark sizes"
-            );
-            assert!(
-                tile.contains_rect(*mark),
-                "{word:?} at {mark:?} does not fit its {tile:?} tile"
-            );
         }
-        // And the rung below is genuinely NOT what happened.
+        // The monogram IS what the tile shows -- the rung this used to skip.
         assert!(
-            !p.texts.iter().any(|(t, _, _)| t == "BC"),
-            "the monogram was drawn as well; painted: {:?}",
+            p.texts.iter().any(|(t, _, _)| t == "BC"),
+            "the monogram was not drawn, so the tile is still card-special: {:?}",
             p.texts
         );
     }
 
-    /// Every network's mark fits the tile at the height the badge-alone rung
-    /// draws it -- `AMEX`, the widest, included.
+    /// Every network's mark stays inside its ROW at the real pane width --
+    /// `MASTERCARD`, the widest word this app sets, included.
     ///
-    /// `card_mark` measures the same thing at the CORNER badge's height, which
-    /// is the smaller of the two and therefore not this claim. A mark that
-    /// escapes its tile here is a mark drawn over the row's title.
+    /// `card_mark` measures the same seven against an arithmetic budget; this
+    /// is the same claim from painted output, so a change to the row's padding
+    /// or gap that the arithmetic there does not know about still fails.
     #[test]
-    fn every_networks_mark_fits_the_tile_when_it_is_the_only_thing_in_it() {
+    fn every_networks_mark_stays_inside_its_row_at_the_real_pane_width() {
         for brand in crate::card_brand::CARD_BRANDS {
             let p = paint(&[card_branded("No Bank", brand.canonical())], None);
+            let row = row_tiles(&p)[0].rect;
             let tile = square(&p, AVATAR_SIZE).rect;
-            let marks = marks_in(&p, tile);
+            let marks = marks_in(&p, row);
             assert_eq!(
                 marks.len(),
                 1,
-                "{brand:?} painted {} marks inside its tile -- a mark that escaped the tile is \
+                "{brand:?} painted {} marks inside its row -- a mark that escaped the row is \
                  invisible to `marks_in` and shows up here as zero",
                 marks.len()
             );
             assert_eq!(marks[0].1, brand.wordmark());
+            assert!(
+                marks[0].0.left() >= tile.right(),
+                "{brand:?}'s mark at {:?} overlaps its {tile:?} tile",
+                marks[0].0
+            );
         }
+    }
+
+    /// **The truncation guard, in the form the last release's overflow bug
+    /// took.** The pill is allocated out of the same width the name is laid
+    /// into, so a name long enough to need truncating must truncate SOONER
+    /// with a pill present -- and every glyph of both must still land inside
+    /// the row.
+    #[test]
+    fn a_marked_rows_name_truncates_into_the_room_the_pill_left_it() {
+        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
+        let mut marked = card_branded(LONG, "Mastercard");
+        marked.card.as_mut().unwrap().number =
+            Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
+        // The control: the same item, on a network this app cannot name, so it
+        // gets no pill and the whole column. Same name, same suffix, same
+        // everything else.
+        let mut unmarked = marked.clone();
+        unmarked.card.as_mut().unwrap().brand = Some("Ledger Coin".to_string());
+
+        let with = paint(&[marked], None);
+        let without = paint(&[unmarked], None);
+        assert_eq!(marks_in(&with, row_tiles(&with)[0].rect).len(), 1);
+        assert!(
+            marks_in(&without, row_tiles(&without)[0].rect).is_empty(),
+            "the control row drew a mark, so it is not a control"
+        );
+
+        let name_of = |p: &Painted| {
+            p.texts
+                .iter()
+                .find(|(t, _, _)| t.starts_with("Bank of"))
+                .map(|(t, r, _)| (t.clone(), *r))
+                .expect("the name was painted")
+        };
+        // A truncated galley keeps its ORIGINAL text (that is what
+        // `Galley::text` returns), so truncation is read off the laid-out
+        // WIDTH rather than off a trailing ellipsis in the string.
+        let (_, marked_rect) = name_of(&with);
+        let (plain_name, plain_rect) = name_of(&without);
+        let full = plain_name.chars().count() as f32;
+        assert!(
+            plain_rect.width() < full * TITLE_SIZE,
+            "the control's name is {}pt wide for {full} characters, which is not truncated at \
+             all -- the fixture name is too short to prove anything",
+            plain_rect.width()
+        );
+        // And the pill really cost the name room, rather than the name
+        // overflowing into the pill's place.
+        let pill = marks_in(&with, row_tiles(&with)[0].rect)[0].0.width();
+        assert!(
+            // Within one glyph: truncation lands on a character boundary, so
+            // the name gives up slightly more or less than the pill took.
+            (plain_rect.width() - marked_rect.width() - pill - ROW_GAP_X).abs() < TITLE_SIZE,
+            "the name is {}pt wide beside a {pill}pt pill and {}pt wide without one -- a \
+             difference of {}pt, where the pill plus the row's {ROW_GAP_X}pt gap is {}. The \
+             pill took the wrong amount off the truncation budget, which is the overflow bug \
+             returning.",
+            marked_rect.width(),
+            plain_rect.width(),
+            plain_rect.width() - marked_rect.width(),
+            pill + ROW_GAP_X
+        );
+    }
+
+    /// **Ink inside the row, positively and negatively, narrow and wide.**
+    ///
+    /// The pane really is fixed at `LIST_WIDTH`, but a guard that only ever
+    /// sees one width is a guard that pins a coincidence.
+    #[test]
+    fn a_marked_rows_ink_stays_inside_its_row_at_both_pane_widths() {
+        const NARROW: f32 = 170.0;
+        let item = |brand: &str| {
+            let mut it = card_branded("Bank of America Platinum Debit", brand);
+            it.card.as_mut().unwrap().number =
+                Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
+            it
+        };
+        for width in [NARROW, PANE_WIDTH] {
+            let p = paint_at_width(&[item("Mastercard")], None, width);
+            // `row_tiles` is written against the real pane's width, so the
+            // narrow frame's row is found by the width it actually has.
+            let row = one_tile_of_width(&p, width - 2.0 * LIST_PADDING).rect;
+            // Everything painted on the row's own band -- the toolbar above it
+            // is not this claim -- must land inside the row horizontally.
+            let on_row: Vec<&(String, egui::Rect, egui::Color32)> =
+                p.texts.iter().filter(|(_, r, _)| row.y_range().contains(r.center().y)).collect();
+            assert!(!on_row.is_empty(), "at a {width}pt pane the row painted no text at all");
+            for (text, rect, _) in &on_row {
+                assert!(
+                    row.expand(0.51).contains_rect(*rect),
+                    "at a {width}pt pane, {text:?} was painted at {rect:?}, outside the {row:?} row"
+                );
+            }
+            // The row is still exactly one virtualized pitch tall either way.
+            assert!(
+                (row.height() - ROW_TILE_HEIGHT).abs() < 0.51,
+                "at a {width}pt pane the row is {}pt tall, expected {ROW_TILE_HEIGHT}",
+                row.height()
+            );
+        }
+        // The negative: the guard above can actually SEE ink outside a row.
+        // Measured against a row deliberately given a rect one third its own
+        // width -- if `contains_rect` were vacuously true this would pass too.
+        let p = paint_at_width(&[item("Mastercard")], None, PANE_WIDTH);
+        let row = row_tiles(&p)[0].rect;
+        let clipped = egui::Rect::from_min_size(
+            row.min,
+            egui::vec2(row.width() / 3.0, row.height()),
+        );
+        assert!(
+            p.texts
+                .iter()
+                .filter(|(_, r, _)| row.y_range().contains(r.center().y))
+                .any(|(_, rect, _)| !clipped.contains_rect(*rect)),
+            "no text on the row falls outside a third of it, so the containment check above \
+             proves nothing"
+        );
+    }
+
+    /// **The pill yields to the name rather than crushing it.** See
+    /// `NETWORK_MARK_MIN_TITLE_ROOM`: at the real pane this never fires, and a
+    /// pane narrow enough to fire it gets no pill instead of a one-ellipsis
+    /// name.
+    #[test]
+    fn the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_both() {
+        let card = card_branded("BoA Debit", "Mastercard");
+        // Wide: the pill is there.
+        let wide = paint_at_width(std::slice::from_ref(&card), None, PANE_WIDTH);
+        assert_eq!(
+            marks_in(&wide, row_tiles(&wide)[0].rect).len(),
+            1,
+            "the real pane must draw the mark"
+        );
+        // Narrow: it stands aside, and the NAME is what survives.
+        const NARROW: f32 = 170.0;
+        let narrow = paint_at_width(&[card], None, NARROW);
+        let row = one_tile_of_width(&narrow, NARROW - 2.0 * LIST_PADDING).rect;
+        assert!(
+            marks_in(&narrow, row).is_empty(),
+            "a 170pt pane drew a pill it has no room for: {:?}",
+            marks_in(&narrow, row)
+        );
+        assert!(
+            narrow.texts.iter().any(|(t, _, _)| t.starts_with("BoA")),
+            "the name did not survive either: {:?}",
+            narrow.texts
+        );
     }
 
     #[test]
     fn a_brand_this_app_cannot_name_falls_all_the_way_back_to_the_monogram() {
-        // Rung 3: no badge, no placeholder, no question mark -- the row looks
+        // No mark, no placeholder, no question mark -- the row looks
         // exactly as it did before any of this existed. The fixture also
         // carries a Visa NUMBER, so this pins the decision the spec makes: a
         // card the user labelled "Ledger Coin" is not quietly relabelled a
@@ -4358,37 +4538,39 @@ mod row_tile_tests {
             "the monogram must still be drawn; painted: {:?}",
             p.texts
         );
-        let tile = square(&p, AVATAR_SIZE).rect;
+        let row = row_tiles(&p)[0].rect;
         assert!(
-            marks_in(&p, tile).is_empty(),
+            marks_in(&p, row).is_empty(),
             "an unrecognised brand painted a mark: {:?}",
-            marks_in(&p, tile)
+            marks_in(&p, row)
         );
         // Control: the same fixture with a nameable brand DOES paint one, so
         // the emptiness above is about the brand and not about this harness.
         let named = paint(&[card_branded("Bank Coin", "Visa")], None);
-        assert_eq!(marks_in(&named, square(&named, AVATAR_SIZE).rect).len(), 1);
+        assert_eq!(marks_in(&named, row_tiles(&named)[0].rect).len(), 1);
     }
 
     #[test]
-    fn the_badge_costs_the_row_no_geometry_at_all() {
-        // The constraint the whole composition is built around: cards render
-        // INTO the tile that already exists. Asserted over a badged row so
-        // that the pins elsewhere in this module cannot be the only thing
-        // holding it -- they mostly measure logins.
+    fn the_mark_costs_the_row_no_height_at_all() {
+        // The mark now takes WIDTH off the row -- that is the point of
+        // allocating it -- but it must still cost no HEIGHT, because
+        // `ScrollArea::show_rows` virtualizes against a fixed
+        // `ROW_TILE_HEIGHT` and one taller row slides the whole list out of
+        // register. The pill is 18pt against the tile's 32, so it fits inside
+        // the height the row already had; this is what says so.
         let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
         let row = one_tile_of_width(&p, TILE_WIDTH);
         assert!(
             (row.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
-            "a badged card's row is {}pt tall, expected {ROW_TILE_HEIGHT}",
+            "a marked card's row is {}pt tall, expected {ROW_TILE_HEIGHT}",
             row.rect.height()
         );
-        let tile = square(&p, AVATAR_SIZE).rect;
-        let marks = marks_in(&p, tile);
-        assert_eq!(marks.len(), 1, "the badge is drawn: {marks:?}");
+        let marks = marks_in(&p, row.rect);
+        assert_eq!(marks.len(), 1, "the mark is drawn: {marks:?}");
         assert!(
-            tile.contains_rect(marks[0].0),
-            "the badge at {:?} escapes the {tile:?} tile",
+            marks[0].0.height() < AVATAR_SIZE,
+            "the pill at {:?} is taller than the tile beside it, so it is what sets the row's \
+             height",
             marks[0].0
         );
     }
