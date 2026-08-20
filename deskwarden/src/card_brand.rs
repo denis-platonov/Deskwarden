@@ -53,6 +53,43 @@ impl CardBrand {
         }
     }
 
+    /// The network's name as the badge SETS IT IN TYPE -- `VISA`, `MC`,
+    /// `AMEX`.
+    ///
+    /// **Words, because this app does not ship the logos.** The network marks
+    /// are registered trademarks whose brand guidelines restrict their use to
+    /// licensed issuers and merchants; this is an MIT-licensed community
+    /// project and its author does not want that exposure. Naming which
+    /// network a card belongs to is a statement of fact about the user's own
+    /// card, and a word is how a fact is stated.
+    ///
+    /// **Four characters, hard.** The badge is drawn inside the list row's
+    /// 32pt tile, which is the whole width there is (see `card_mark`), so the
+    /// cap is not a style preference -- it is the width. Set `DINERS` or
+    /// `UNIONPAY` in that space and the type has to come down to about 4pt a
+    /// glyph, which is a smear rather than a word. So the two long names take
+    /// the short forms those networks are commonly written as: `DC` for Diners
+    /// Club, `UP` for UnionPay. They are the weakest two of the seven, and
+    /// that is an honest cost of not shipping logos -- the alternative, a full
+    /// word nobody can read, names nothing at all.
+    ///
+    /// Deliberately NOT derived from [`canonical`](Self::canonical) by rule:
+    /// `Mastercard` -> `MC` and `Discover` -> `DISC` are not one abbreviation
+    /// rule, and any rule that produced both would have been fitted to this
+    /// table anyway. It is a `match` on the enum, in the one file that names
+    /// brands, so a network added later does not compile without one.
+    pub fn wordmark(self) -> &'static str {
+        match self {
+            CardBrand::Visa => "VISA",
+            CardBrand::Mastercard => "MC",
+            CardBrand::AmericanExpress => "AMEX",
+            CardBrand::Discover => "DISC",
+            CardBrand::Jcb => "JCB",
+            CardBrand::DinersClub => "DC",
+            CardBrand::UnionPay => "UP",
+        }
+    }
+
     /// The digit groups the network prints on the plastic.
     pub fn grouping(self) -> &'static [usize] {
         match self {

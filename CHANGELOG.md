@@ -63,6 +63,92 @@ size somewhere else on the screen.
 - **Signing in is unchanged.** That launch has been one window since 0.8.0;
   this is the other launch catching up with it.
 
+### Check for updates actually installs the update now
+
+**The in-app updater has never once applied an update.** It refused every
+release it was ever offered, including all the genuine ones, and the reason
+was a placeholder: it required the downloaded installer to carry an
+Authenticode signature matching a certificate thumbprint that did not exist
+yet, so the check could not pass. If you have been updating Deskwarden, you
+have been downloading the installer from the releases page and running it
+yourself.
+
+It now verifies the installer against a **SHA-256 digest** instead, and that
+check can pass.
+
+- **The digest comes from GitHub, on the same connection as the download
+  link.** The releases API publishes a SHA-256 for each asset alongside its
+  URL; Deskwarden reads both out of the one response it was already making,
+  so there is no second request to fail and no checksum file to fall out of
+  step with the build.
+- **The file is hashed twice**: once when the download finishes, and again
+  immediately before the installer is started. The second one is the one that
+  matters — it closes the gap between "this file was checked" and "this file
+  is running".
+- **Every way of not knowing is a refusal.** A release that publishes no
+  digest is not offered as an update at all. A digest that is malformed, a
+  file whose hash does not match, or a file that cannot be read to hash it
+  stops the update and **deletes the downloaded installer**, so a rejected
+  file is not left in the cache folder where a later run — or you — could
+  run it by hand.
+
+#### What this does and does not protect you from
+
+Being straight about it, because the previous behaviour was not: **this is
+not the same as a signed build, and Deskwarden's releases are still
+unsigned.** What the digest proves is that the bytes that run are the bytes
+GitHub's API described — which catches a corrupted, truncated, or swapped
+download. What it cannot prove is *who built them*: the digest comes from the
+same GitHub account the file does, so anyone who could replace the installer
+could generally replace the digest beside it.
+
+That is the same trust root you were relying on downloading the file by hand.
+The difference is that something now checks it. Code signing is still the
+goal, and is still waiting on a certificate; when it arrives the signature
+check comes back **in addition to** this one, not instead of it. See
+[docs/code-signing-policy.md](docs/code-signing-policy.md).
+### A card's Expires / Code line
+
+- **Clicking anywhere on the line copies its half.** The Expires and Code
+  halves only responded to a strip through the middle of the row — the row's
+  own padding, above and below them and at either end, copied nothing and lit
+  nothing ("Expires\Code - only part in the middle gets it copied and
+  highlighted"). Both halves are now the full band, exactly as the Number row
+  above them has always been.
+- **The Code label is inset inside its half** by the same padding the Expires
+  label has inside the line, so the two read as a matched pair. The hit area
+  still starts at the seam: the padding moved the ink, not the tile.
+
+### The vault window's list and rail
+
+- **A card's network badge says the network's name.** It used to be a
+  geometric placeholder — a play triangle for Visa, a diamond for Mastercard,
+  two bars for American Express, all on the same blue square — which named
+  nothing ("VISA icon supposed to be visa and not some Play sign") and did not
+  tell the seven networks apart either. The badge is now the network set in
+  type: **VISA**, **MC**, **AMEX**, **DISC**, **JCB**, **DC**, **UP**, in the
+  list and on the card's detail pane.
+  - Words rather than logos deliberately: the network marks are registered
+    trademarks whose guidelines restrict them to licensed issuers and
+    merchants, and this is an MIT-licensed community project. Naming the
+    network your own card is on is a statement of fact.
+  - Diners Club and UnionPay get two-letter forms because the badge is drawn
+    inside the row's 32pt tile and a longer word there is an unreadable smear.
+- **A favicon now fills its tile.** It was inset 4pt a side inside a 32pt tile
+  — a 24pt icon in a bordered box, which read as an icon adrift in a frame
+  ("icon is not fully taking the rounded rectangle"). The icon takes the whole
+  32pt tile now, clipped to the tile's own rounded corners so no corner
+  overhangs the curve, with the tile's 1px border drawn back over the top so a
+  pale icon still has the same edge every monogram beside it has.
+- **Sends and Password health are their own group at the foot of the rail**,
+  below the folders and behind a second separator of the same kind as the one
+  above FOLDERS. They used to sit in the middle of the VAULT rows, which are
+  cuts of the item list — something neither of them is.
+- **The rail scrolls.** It never did: a vault with more folders than the window
+  is tall simply had the last ones off the bottom with no way to reach them,
+  and the two rows above would have joined them there. The auto-lock countdown
+  stays pinned to the floor.
+
 ## 0.8.3 - 2026-08-19
 
 > The manual pre-release checklist was not run for this version either. In

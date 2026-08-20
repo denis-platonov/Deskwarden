@@ -979,35 +979,6 @@ fn card_brand_of(fields: &CardFields) -> Option<CardBrand> {
         .or_else(|| fields.number.as_deref().and_then(brand_for_number))
 }
 
-/// The texture for a network's mark, decoded once and kept in egui's own
-/// per-context store.
-///
-/// **Memoised deliberately.** `Context::load_texture` allocates a new texture
-/// every call, and this is reached from inside the pane's draw closure -- so
-/// an unmemoised version would upload a 48x48 image to the GPU on every frame
-/// the user has a card selected, and leak one texture per frame until the
-/// handles dropped. Keyed on the mark's own file stem rather than on the enum,
-/// so two brands could never share an entry silently.
-///
-/// `None` for a brand with no mark and for bytes that will not decode. Both
-/// draw nothing; neither draws a placeholder, which is the rule the whole
-/// badge follows (see `card_mark`'s module note).
-fn brand_mark_texture(ctx: &egui::Context, brand: CardBrand) -> Option<egui::TextureHandle> {
-    let mark = card_mark::mark_for(brand)?;
-    let id = egui::Id::new(("deskwarden-card-mark", mark.key));
-    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return Some(texture);
-    }
-    let (width, height, rgba) = crate::favicon::decode_rgba(mark.png)?;
-    let texture = ctx.load_texture(
-        format!("card-mark-{}", mark.key),
-        egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba),
-        egui::TextureOptions::default(),
-    );
-    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
-    Some(texture)
-}
-
 /// Every value the SSH key pane shows, emptiness-suppressed once.
 ///
 /// The same shape as [`CardFields`], and it exists for the same two findings.
@@ -4729,16 +4700,20 @@ pub struct ResolvedApp<'a> {
 const APP_ICON_SIZE: f32 = 18.0;
 const APP_ICON_GAP: f32 = 8.0;
 
-/// How big the card's network mark is drawn on the detail pane, and the gap
+/// How tall the card's network mark is drawn on the detail pane, and the gap
 /// between it and the digits.
 ///
 /// The same 18pt and 8pt the matched app's icon uses, and deliberately so
-/// rather than by coincidence: both are "a small square identifying the row,
+/// rather than by coincidence: both are "a small thing identifying the row,
 /// immediately before the row's value", and two different sizes for that would
-/// be two answers to one question. The asset is generated at
-/// `card_mark::MARK_DETAIL_PX` (48) and scaled down here, which resamples;
-/// scaling up would show the generator's own pixels.
-const BRAND_MARK_SIZE: f32 = 18.0;
+/// be two answers to one question.
+///
+/// Read off `card_mark` rather than written here, because the mark is a WORD
+/// now and its width follows its height -- a height chosen locally would be a
+/// width nobody measured. Only the height is fixed: `AMEX` is wider than `MC`,
+/// and forcing both into one box would either letterbox one or squeeze the
+/// other.
+const BRAND_MARK_SIZE: f32 = card_mark::MARK_DETAIL_HEIGHT;
 const BRAND_MARK_GAP: f32 = 8.0;
 
 /// The `App` row: the icon, the app's real name, and -- when there is
@@ -5407,13 +5382,17 @@ fn half_tile(
     on_copy: DetailAction,
     action: &mut DetailAction,
 ) {
-    let Half { label, width, label_width, hint, prints_chord, trailing } = half;
+    let Half { label, width, pad, label_width, hint, prints_chord, trailing } = half;
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
-        // The TILE is `width` -- the hover tint and the hit area both come
-        // from this -- while its CONTENTS stop `trailing` short of the far
-        // edge. The two are different on purpose; see [`Half::trailing`].
-        ui.set_width(width);
+        // The TILE is `width` PLUS [`Half::pad`] -- the hover tint and the hit
+        // area both come from this, and the padding is inside it for the same
+        // reason [`row_impl`] senses a full-width row outside its frame:
+        // otherwise the band's own padding is dead to the pointer, which is
+        // the reported defect. Its CONTENTS then stop `trailing` short of the
+        // far edge, which is a different thing again; see [`Half::trailing`].
         let tint = ui.painter().add(egui::Shape::Noop);
+        egui::Frame::new().inner_margin(pad).show(ui, |ui| {
+        ui.set_width(width);
         ui.allocate_ui_with_layout(
             egui::vec2((width - trailing).max(0.0), ROW_CONTENT_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -5465,6 +5444,7 @@ fn half_tile(
                 });
             },
         );
+        });
         tint
     });
     let response = scope.response;
@@ -5491,8 +5471,34 @@ fn half_tile(
 #[derive(Clone, Copy)]
 struct Half<'a> {
     label: &'a str,
-    /// The slice of the line this half occupies.
+    /// The slice of the line this half's CONTENTS occupy, i.e. its tile less
+    /// [`Half::pad`].
     width: f32,
+    /// **The row padding this half owns**, and the reason it owns any.
+    ///
+    /// A full-width row is a `Frame` with `padding: 13px 16px` sensed from
+    /// OUTSIDE that frame ([`row_impl`]), so its hit area and its hover tint
+    /// are the whole band -- padding included. The shared line used to draw
+    /// one such frame and put both halves INSIDE it, which left the 13pt above
+    /// and below them, and the 16pt at either end, sensed by nothing.
+    ///
+    /// THE REPORT: "Also click left of Number - number gets copied and the
+    /// whole row highlighted. Expires\Code - only part in the middle gets it
+    /// copied and highlighted." Exactly right, and the "middle" is vertical:
+    /// the halves were 28pt of a 54pt band. So the padding moved out of the
+    /// line's frame and into the halves, where it is inside what each half
+    /// senses.
+    ///
+    /// Asymmetric on purpose. The horizontal padding belongs at the LINE's two
+    /// ends, so the left half carries it on its left and the right half on its
+    /// right; the two meet at the seam with nothing between them. The right
+    /// half then carries [`CARD_PAD_X`] on its LEFT as well -- which is the
+    /// other half of the report, "Code should have padding for that on the
+    /// left - same as Expires has": the code's label starts the same distance
+    /// inside its half that the expiry's does inside the line. That is INK
+    /// only. The tile still starts at the seam, exactly as
+    /// [`Half::trailing`] moves ink without narrowing a tile.
+    pad: Margin,
     /// The width the label cell takes inside it. **The left half is given
     /// [`ROW_LABEL_WIDTH`]**, so `Expires 08/29` puts its value on exactly the
     /// column every other row on the pane puts its value on; the right half is
@@ -6160,7 +6166,11 @@ struct MaskedFace<'a> {
     revealed_as: Option<&'a str>,
     /// A mark painted immediately before the value, on the same line -- the
     /// card's network badge. `None` draws nothing, never a placeholder.
-    lead: Option<egui::TextureHandle>,
+    ///
+    /// The BRAND, not a picture of one: the mark is drawn from it by
+    /// `card_mark`, so this row cannot be handed a mark that belongs to a
+    /// different network than the digits beside it.
+    lead: Option<CardBrand>,
 }
 
 /// A secret row: monospace, bullets until revealed, with Reveal and Copy.
@@ -6258,7 +6268,9 @@ fn masked_row(
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
         })
-        + if lead.is_some() { BRAND_MARK_SIZE + BRAND_MARK_GAP } else { 0.0 };
+        + lead.map_or(0.0, |brand| {
+            card_mark::mark_width(ui, brand, BRAND_MARK_SIZE) + BRAND_MARK_GAP
+        });
     // Laid out unwrapped, which is the question being asked: how wide does
     // this value WANT to be?
     let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
@@ -6274,13 +6286,25 @@ fn masked_row(
         //
         // The mark, when there is one, is painted first and on the same line,
         // exactly as `app_name_row` paints the matched app's icon before its
-        // name. It is a `TextureHandle`, so a brand with no mark and an item
-        // with no brand are the same case here: nothing is drawn.
+        // name. `None` -- an item with no brand, or a brand this app cannot
+        // name -- draws nothing at all, never a placeholder.
+        //
+        // Its box is ALLOCATED before it is painted, at the width `card_mark`
+        // measured, so the digits that follow start after it rather than under
+        // it; `controls_width` above reserved exactly this.
         |ui| {
-            if let Some(texture) = &lead {
-                ui.add(
-                    egui::Image::new(texture)
-                        .fit_to_exact_size(egui::vec2(BRAND_MARK_SIZE, BRAND_MARK_SIZE)),
+            if let Some(brand) = lead {
+                let width = card_mark::mark_width(ui, brand, BRAND_MARK_SIZE);
+                let (box_, _) = ui.allocate_exact_size(
+                    egui::vec2(width, BRAND_MARK_SIZE),
+                    egui::Sense::hover(),
+                );
+                card_mark::paint_mark(
+                    ui,
+                    brand,
+                    BRAND_MARK_SIZE,
+                    egui::Align2::CENTER_CENTER,
+                    box_.center(),
                 );
                 ui.add_space(BRAND_MARK_GAP);
             }
@@ -6415,7 +6439,7 @@ fn card_rows(
                 revealed_as: Some(&revealed),
                 // **Nothing at all for a brand this app cannot name**, and
                 // nothing for a named brand with no mark. Never a placeholder.
-                lead: brand.and_then(|b| brand_mark_texture(ui.ctx(), b)),
+                lead: brand,
             },
         );
     }
@@ -6558,7 +6582,14 @@ fn card_face_line_fits(ui: &egui::Ui, expiry_natural: f32, code_natural: f32) ->
     // absent, so a chord hint added back here without being paid for in the
     // fit would not compile past this line.
     let left = ROW_LABEL_WIDTH + ROW_GAP + expiry_natural;
-    let right = label_run_width(ui, CODE_LABEL) + ROW_GAP + code_natural + code_half_controls(ui);
+    // **Plus the code half's own left inset.** Its label starts `CARD_PAD_X`
+    // inside its half, matching the expiry's inset from the line's left edge
+    // -- see [`Half::pad`]. Ink that is paid for nowhere is ink that overflows.
+    let right = f32::from(CARD_PAD_X)
+        + label_run_width(ui, CODE_LABEL)
+        + ROW_GAP
+        + code_natural
+        + code_half_controls(ui);
     // **The left half's CONTENTS have to stop a gutter short of the
     // midpoint.** The expiry's last run is right-aligned inside its half and
     // the code's label is left-aligned inside its own, so halves whose
@@ -6688,8 +6719,11 @@ fn card_face_line(
     let left_room =
         (left_width - left_gutter - ROW_LABEL_WIDTH - ROW_GAP).max(1.0);
     let shown = if *revealed { code.to_string() } else { code_mask_for(code, brand) };
+    // **NO padding on this frame**, unlike every other row on the pane. The
+    // two halves carry the row's `padding: 13px 16px` themselves, because each
+    // one senses its own band and a padding outside those bands is a strip of
+    // the row that copies nothing. See [`Half::pad`] and the report it quotes.
     egui::Frame::new()
-        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -6716,8 +6750,16 @@ fn card_face_line(
             // edge `row_body` right-aligns every full-width row's controls to.
             // `the_cards_two_reveal_eyes_stand_in_one_column` is what holds
             // the two edges together.
-            let right_width = (ui.available_width() - left_width).max(1.0);
+            // The row's own horizontal padding is no longer taken off by this
+            // frame, so it comes off here: one [`CARD_PAD_X`] at the line's
+            // left end, which the left half carries, and one at its right,
+            // which the right half does. What is left over after the left
+            // half's contents is the right half's own content width, less the
+            // inset its label now starts at.
+            let pad = f32::from(CARD_PAD_X);
+            let right_width = (ui.available_width() - 2.0 * pad - left_width).max(1.0);
             let right_room = (right_width
+                - pad
                 - label_run_width(ui, CODE_LABEL)
                 - ROW_GAP
                 - code_half_controls(ui))
@@ -6728,6 +6770,16 @@ fn card_face_line(
                     Half {
                         label: EXPIRY_LABEL,
                         width: left_width,
+                        // The line's left end, and the band's full height.
+                        // Nothing on the right: the seam is where this tile
+                        // hands over to its neighbour, with no gap for a
+                        // click to fall down.
+                        pad: Margin {
+                            left: CARD_PAD_X,
+                            right: 0,
+                            top: ROW_PAD_Y,
+                            bottom: ROW_PAD_Y,
+                        },
                         label_width: ROW_LABEL_WIDTH,
                         hint: Some(CopyShortcut::CardExpiry),
                         // Named on hover, never printed. See
@@ -6750,7 +6802,14 @@ fn card_face_line(
                     ui,
                     Half {
                         label: CODE_LABEL,
-                        width: right_width,
+                        width: right_width - f32::from(CARD_PAD_X),
+                        // `CARD_PAD_X` on BOTH sides: the line's right end on
+                        // one, and on the other the inset that makes this half
+                        // read as a matched pair with the expiry -- the code's
+                        // label starts the same distance inside its half that
+                        // the expiry's does inside the line. The tile still
+                        // starts at the seam; only the ink moves.
+                        pad: Margin::symmetric(CARD_PAD_X, ROW_PAD_Y),
                         label_width: label_run_width(ui, CODE_LABEL),
                         hint: Some(CopyShortcut::CardCode),
                         // **Printed**, because nothing is to its right but the
@@ -8305,17 +8364,16 @@ mod tests {
     /// the probe does not go blind if egui changes which of the two it emits;
     /// every caller pairs an emptiness claim with a positive control that
     /// would catch a probe that found nothing either way.
+    /// The pane's texts, plus every NETWORK MARK it painted.
+    ///
+    /// A mark is a `theme::BLUE` ground with a word on it, so that is what this
+    /// looks for -- not "a textured rect", which is what it looked for while
+    /// the marks were PNGs. The pane paints no other blue ground on the rows
+    /// this is used against.
     fn painted_with_marks(item: &VaultItem) -> (Vec<String>, Vec<egui::Rect>) {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
             match shape {
-                egui::Shape::Mesh(mesh) => out.push(mesh.calc_bounds()),
-                egui::Shape::Rect(rect)
-                    if rect.brush.as_ref().is_some_and(|brush| {
-                        brush.fill_texture_id != egui::TextureId::default()
-                    }) =>
-                {
-                    out.push(rect.rect);
-                }
+                egui::Shape::Rect(rect) if rect.fill == theme::BLUE => out.push(rect.rect),
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
                         walk(shape, out);
@@ -12629,9 +12687,16 @@ mod tests {
             visa.len()
         );
         assert_eq!(
-            visa[0].width(),
+            visa[0].height(),
             BRAND_MARK_SIZE,
-            "the network mark is not drawn at the pane's own mark size"
+            "the network mark is not drawn at the pane's own mark height"
+        );
+        // The WORD, which is the whole point of the mark: the pane no longer
+        // draws the brand as a text row, so this mark is the only thing on the
+        // pane that says which network the card is on.
+        assert!(
+            contains(&painted(&a_full_card(), &TotpState::NoSecret), CardBrand::Visa.wordmark()),
+            "the mark did not paint the network's own word"
         );
     }
 
@@ -16119,50 +16184,196 @@ mod tests {
         }
     }
 
-    /// **The shared line is two hit areas that meet, not two labels that
+    /// **The shared line is two hit areas that TILE it, not two labels that
     /// happen to be clickable.**
     ///
     /// [`every_copyable_row_copies_its_own_value`] clicks each label, which
     /// proves the two values are not crossed. It does not prove the halves
-    /// *tile the line*: a pair of tiles the width of their own text would pass
-    /// it while every pixel of the gap between `08/29` and `Code` copied
-    /// nothing at all -- and the pane's promise is that the whole row is the
-    /// affordance, which is what `copy_row`'s tile has always meant.
+    /// cover the line.
     ///
-    /// So this clicks the two points either side of the seam. The row's own
-    /// band is found from a label rather than assumed, and the midpoint from
-    /// the card's geometry, so the test moves with the layout instead of
-    /// pinning a pixel.
+    /// **AND NEITHER DID THIS TEST, under its old name
+    /// `the_shared_line_is_two_hit_areas_that_meet_at_its_middle`.** It clicked
+    /// exactly twice, four points either side of the seam, so it verified that
+    /// the two halves MEET and never that they EXTEND. Two narrow strips
+    /// touching at the midpoint satisfied every assertion in it -- and that is
+    /// very nearly what shipped. THE REPORT: "Also click left of Number -
+    /// number gets copied and the whole row highlighted. Expires\Code - only
+    /// part in the middle gets it copied and highlighted." The "middle" was
+    /// vertical: the halves were laid inside the line's padded `Frame`, so they
+    /// were 28pt of a 54pt band and the row's own `padding: 13px 16px` was
+    /// sensed by nothing. `Half::pad` is the repair; this is the pin that can
+    /// fail for the right reason.
+    ///
+    /// **The `Number` row is the oracle**, because it is the row the user
+    /// compared against and the one that reads correctly. Every extent below is
+    /// asserted against ITS hover tint rather than against a constant, so the
+    /// claim is "the shared line behaves like a full-width row" and not "the
+    /// shared line is at some pixel someone wrote down".
     #[test]
-    fn the_shared_line_is_two_hit_areas_that_meet_at_its_middle() {
+    fn the_shared_lines_two_halves_tile_the_whole_line() {
         let item = a_full_card();
         let mut pane = Pane::new();
         let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let left_label = laid_out.rect_of(EXPIRY_LABEL);
-        let right_label = laid_out.rect_of(CODE_LABEL);
-        // The seam: the right half begins where its label does, and the left
-        // half runs up to it.
-        let seam = right_label.left();
+        let expiry_label = laid_out.rect_of(EXPIRY_LABEL);
+        let code_label = laid_out.rect_of(CODE_LABEL);
+        let number_label = laid_out.rect_of(NUMBER_LABEL);
+        let y = expiry_label.center().y;
+
+        // Each tile, as the pane itself reports it: the hover tint is painted
+        // over `response.rect`, so it IS the hit area -- which is also the
+        // claim the report makes about both together ("copied and
+        // highlighted"), and the reason they are read from one place here.
+        let number = tint_under(&mut pane, &item, number_label.center());
+        let left = tint_under(&mut pane, &item, expiry_label.center());
+        let right = tint_under(&mut pane, &item, code_label.center());
+
+        // 1. THE HALVES MEET. The old assertion, kept: no seam, no gap.
         assert!(
-            seam > left_label.right(),
-            "the two halves overlap, so 'either side of the seam' is meaningless"
+            (left.right() - right.left()).abs() < 0.51,
+            "the halves do not meet: the left ends at {} and the right begins at {}",
+            left.right(),
+            right.left()
         );
-        let y = left_label.center().y;
-        for (name, x, want) in [
+
+        // 2. THE HALVES EXTEND -- the assertion the old pin was missing. The
+        //    line starts and ends exactly where a full-width row's does.
+        assert!(
+            (left.left() - number.left()).abs() < 0.51,
+            "the shared line begins at x={} but the Number row's tile begins at x={} -- the \
+             strip left of the expiry copies nothing",
+            left.left(),
+            number.left()
+        );
+        assert!(
+            (right.right() - number.right()).abs() < 0.51,
+            "the shared line ends at x={} but the Number row's tile ends at x={}",
+            right.right(),
+            number.right()
+        );
+
+        // 3. VERTICALLY TOO, which is what the report was actually about: the
+        //    band is the whole row, padding included, exactly as the Number
+        //    row's is.
+        for (name, half) in [("expiry", left), ("code", right)] {
+            assert!(
+                (half.height() - number.height()).abs() < 0.51,
+                "the {name} half's tile is {}pt tall against the Number row's {}pt -- the row's \
+                 own padding is dead to the pointer, which is the reported defect",
+                half.height(),
+                number.height()
+            );
+        }
+
+        // 4. AND THE CLICKS AGREE WITH THE TINT. A tint is a picture; these
+        //    are the actions. Four points: just inside each outer edge -- the
+        //    two the old pin never took -- and one either side of the seam.
+        let seam = left.right();
+        let expiry = DetailAction::CopyValue("04/23".to_string());
+        for (name, at, want) in [
+            ("just inside the line's left edge", left.left() + 1.0, expiry.clone()),
+            ("just left of the seam", seam - 1.0, expiry.clone()),
+            ("just right of the seam", seam + 1.0, DetailAction::CopyCardCode),
             (
-                "just left of the seam",
-                seam - 4.0,
-                DetailAction::CopyValue("04/23".to_string()),
+                "just inside the line's right edge",
+                right.right() - 1.0,
+                DetailAction::CopyCardCode,
             ),
-            ("just right of the seam", seam + 4.0, DetailAction::CopyCardCode),
         ] {
-            let clicked = pane.click(&item, &TotpState::NoSecret, egui::pos2(x, y));
+            let clicked = pane.click(&item, &TotpState::NoSecret, egui::pos2(at, y));
             assert_eq!(
                 clicked.action, want,
-                "a click {name} reported {:?}",
+                "a click {name} (x={at}) reported {:?}",
                 clicked.action
             );
         }
+
+        // 5. The same at the band's top and bottom edges, since that is the
+        //    axis the report was about and step 4 only walks the middle of it.
+        for (name, at) in [
+            ("the top of the band", left.top() + 1.0),
+            ("the bottom of the band", left.bottom() - 1.0),
+        ] {
+            let clicked =
+                pane.click(&item, &TotpState::NoSecret, egui::pos2(expiry_label.center().x, at));
+            assert_eq!(
+                clicked.action, expiry,
+                "a click at {name} (y={at}) reported {:?}",
+                clicked.action
+            );
+        }
+    }
+
+    /// **The two halves are a matched pair: the code's label starts the same
+    /// distance inside its half as the expiry's does inside the line.**
+    ///
+    /// THE REPORT: "Code should have padding for that on the left - same as
+    /// Expires has." The code's label used to begin flush at the seam while the
+    /// expiry's began a `CARD_PAD_X` inside the card, so the two columns did
+    /// not read as a pair.
+    ///
+    /// **Separate from `the_shared_lines_two_halves_tile_the_whole_line`, and
+    /// they must be able to fail independently**, because they are the two
+    /// halves of one easy mistake: the ink moved and the tile did NOT. So this
+    /// asserts the inset AND re-asserts that the right half's tile still starts
+    /// at the seam despite it -- padding an ink by narrowing its tile would
+    /// pass the first assertion here and put a dead strip back in the middle of
+    /// the line.
+    ///
+    /// Measured on the labels' INK (see `Frame::ink_of`), because an inset a
+    /// reader can see is an inset between the glyphs and the edge.
+    #[test]
+    fn the_codes_label_is_inset_inside_its_half_exactly_as_the_expirys_is() {
+        let item = a_full_card();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let expiry_ink = laid_out.ink_of(EXPIRY_LABEL);
+        let code_ink = laid_out.ink_of(CODE_LABEL);
+        let left = tint_under(&mut pane, &item, laid_out.rect_of(EXPIRY_LABEL).center());
+        let right = tint_under(&mut pane, &item, laid_out.rect_of(CODE_LABEL).center());
+
+        let expiry_inset = expiry_ink.left() - left.left();
+        let code_inset = code_ink.left() - right.left();
+        assert!(
+            (expiry_inset - code_inset).abs() < 0.51,
+            "the expiry's label sits {expiry_inset}pt inside its half and the code's \
+             {code_inset}pt inside its own -- the two halves do not read as a pair"
+        );
+        // Not zero, and not an accident of two labels being equally far from
+        // nothing: it is the card's own row padding.
+        assert!(
+            (code_inset - f32::from(CARD_PAD_X)).abs() < 1.01,
+            "the code's label is inset {code_inset}pt, expected the row's own {CARD_PAD_X}pt"
+        );
+        // ...and the tile did NOT move with the ink. This is the half of the
+        // pair that fails if someone ever pads the code by narrowing its hit
+        // area instead.
+        assert!(
+            (right.left() - left.right()).abs() < 0.51,
+            "the code half's tile now begins at {} while the expiry's ends at {} -- the ink was \
+             padded by shrinking the hit area, which puts dead pixels back on the line",
+            right.left(),
+            left.right()
+        );
+    }
+
+    /// The hover tint painted under `at`, which is the tile that would take a
+    /// click there: `row_impl` and `half_tile` both fill `response.rect` with
+    /// `theme::CARD_TINT` while hovered, so this is the hit area made visible.
+    fn tint_under(pane: &mut Pane, item: &VaultItem, at: egui::Pos2) -> egui::Rect {
+        let hovered = pane.hover(item, &TotpState::NoSecret, at);
+        let tints: Vec<egui::Rect> = hovered
+            .rects
+            .iter()
+            .filter(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(at))
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(
+            tints.len(),
+            1,
+            "hovering {at:?} painted {} hover tints over it, expected exactly one",
+            tints.len()
+        );
+        tints[0]
     }
 
     /// The clear space between the two COLUMNS of the shared line, in pixels

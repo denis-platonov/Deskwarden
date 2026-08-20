@@ -10,6 +10,17 @@
 # the two "Sign ... (SignPath)" steps below are labeled TODO no-ops so the
 # pipeline still runs end to end -- producing an explicitly UNSIGNED build,
 # rather than silently shipping as if it were signed.
+#
+# What the app checks in the meantime, and why this workflow needs no step
+# for it: the self-updater verifies the installer it downloads against the
+# per-asset SHA-256 `digest` field the GitHub releases API already returns
+# alongside `browser_download_url` (updater.rs). GitHub computes that digest
+# from the uploaded bytes, so nothing here has to publish a checksum, and
+# there is deliberately no SHA256SUMS asset to keep in step with the files.
+# That check is NOT a stand-in for signing -- its trust root is this
+# repository's GitHub account, not a publisher certificate -- and it does not
+# reduce the reason the two steps below still say TODO. See
+# docs/code-signing-policy.md.
 name: Release
 
 on:
@@ -118,7 +129,7 @@ jobs:
       # not a placeholder meant to silently stand in for real signing.
       - name: Sign binary (SignPath) [TODO - pending SignPath account approval]
         run: |
-          echo "TODO: wire SignPath signing once the account is approved -- see docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md. This build is UNSIGNED."
+          echo "TODO: wire SignPath signing once the account is approved -- see docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md. This build is UNSIGNED. The updater's SHA-256 digest check is not a substitute; see docs/code-signing-policy.md."
 
       - name: Install Inno Setup
         run: choco install innosetup -y
@@ -130,9 +141,15 @@ jobs:
       # deskwarden/installer/deskwarden-<version>-installer.exe once the
       # SignPath project exists. Same disclosed gap as the binary-signing
       # step above.
+      #
+      # Signing this file would NOT invalidate the updater's digest check:
+      # GitHub computes the published digest from whatever bytes are uploaded
+      # in the step below, so a signed installer simply gets the digest of the
+      # signed file. Adding an Authenticode gate back to updater.rs at that
+      # point is meant to be an ADDITIONAL check, not a replacement.
       - name: Sign installer (SignPath) [TODO - pending SignPath account approval]
         run: |
-          echo "TODO: wire SignPath signing once the account is approved. This installer is UNSIGNED."
+          echo "TODO: wire SignPath signing once the account is approved. This installer is UNSIGNED. The updater's SHA-256 digest check is not a substitute; see docs/code-signing-policy.md."
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -145,3 +162,9 @@ jobs:
             **Note:** this build is unsigned. SignPath code-signing
             integration is pending manual account approval; see
             docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md.
+
+            Deskwarden's in-app updater verifies the installer it downloads
+            against the SHA-256 digest GitHub publishes for the asset, and
+            refuses to run it on any mismatch. That checks the bytes, not the
+            publisher -- it is not equivalent to a signed build. See
+            docs/code-signing-policy.md.

@@ -3919,6 +3919,11 @@ mod tests {
         crate::updater::ReleaseInfo {
             version: semver::Version::parse("9.9.9").unwrap(),
             installer_download_url: "https://example.invalid/x-installer.exe".to_string(),
+            installer_sha256: crate::updater::parse_asset_digest(&format!(
+                "sha256:{}",
+                "9".repeat(64)
+            ))
+            .unwrap(),
             body: "Fixed the thing".to_string(),
         }
     }
