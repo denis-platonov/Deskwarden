@@ -10,6 +10,25 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Fixed: Preferences said this build could not scan or check for updates
+
+Opening **Preferences** from inside the vault window showed *"This build
+cannot scan: nothing set the scan up when Deskwarden started"* on the Breaches
+page and *"This build cannot check for updates. Please report it — it is a
+defect, not a setting"* on About. Both buttons did nothing.
+
+**Your build was fine.** Both messages were honest reports of a real missing
+piece, and the missing piece was ordering: two things Deskwarden sets up at
+startup were being set up *after* the first vault window opened, and that
+window blocks until you close it. Preferences reached from the tray icon —
+the same pages, a different route in — worked normally throughout, which is
+why this went unnoticed.
+
+Both are now set up before any window opens, so both routes behave the same.
+The messages themselves stay: an app that genuinely cannot do something should
+say so plainly, and these two are the reason this was diagnosable at all. If
+you reported this — thank you, and sorry for the alarm.
+
 ### Starting Deskwarden while an older copy is running now works
 
 Launching a new build while an older one was running showed *"Deskwarden is

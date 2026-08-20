@@ -643,8 +643,9 @@ fn main() {
     // process ends.
     //
     // Published rather than borrowed because the listener is a background
-    // thread, which cannot borrow a `main` local -- `update_panel::install_env`
-    // exists in this file for the same reason, three hundred lines below.
+    // thread, which cannot borrow a `main` local -- the two published
+    // environments immediately below exist in this file for a closely related
+    // reason.
     {
         let cache_for_takeover = Arc::clone(&cache);
         deskwarden::single_instance::on_takeover(std::sync::Arc::new(move || {
@@ -654,6 +655,125 @@ fn main() {
             );
         }));
     }
+
+    // =====================================================================
+    // **EVERY PUBLISHED ENVIRONMENT, INSTALLED HERE -- BEFORE ANY WINDOW.**
+    //
+    // These two blocks used to sit six hundred lines below, next to the tray
+    // and the main loop, and both were reported as broken by a user in the
+    // same week: Preferences showed "This build cannot scan: nothing set the
+    // scan up when Deskwarden started" and "This build cannot check for
+    // updates. Please report it -- it is a defect, not a setting."
+    //
+    // The pages were telling the truth. `app_window::run_from_working` below
+    // opens the startup vault window and **blocks for that window's entire
+    // life**, and Preferences reached from inside it is a modal drawn in that
+    // window's own loop (`vault_window`), so the whole first vault window ran
+    // before either environment existed. From the tray -- the other shell for
+    // the same page, reached only after the main loop starts -- both worked.
+    // One fact, established on one path and depended on by another, which is
+    // this file's house defect and the third instance of it this week.
+    //
+    // So they are installed **here**, at the point `cache` is built, which is
+    // the earliest moment either of them has anything to say. Everything else
+    // they need is either a compile-time constant (`current_version`), a
+    // process-wide path decided at startup (`update_download_dir`,
+    // `scan_history::default_path`) or free of dependencies altogether
+    // (`live_check`), so nothing between here and the old site was ever
+    // required.
+    //
+    // **The ordering is enforced, not asserted in prose.**
+    // `every_published_environment_is_installed_before_the_first_window`
+    // reads this file, finds every module in the crate that publishes an
+    // environment, and fails if any of them is installed after the first
+    // window `main` opens -- including one added later that nobody remembers
+    // to move up. A comment here is what the hotkey guard was. (That rule
+    // measures against a needle this comment must therefore not spell, which
+    // is why the host is described rather than named.)
+    //
+    // The `estate` these used to read `cache` from does not exist yet and
+    // cannot: it is built out of what the startup window returns. It carries
+    // this same `Arc`, so `estate.cache.clone()` and `Arc::clone(&cache)` were
+    // always the same handle to the same cache.
+    let current_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
+
+    // **Everything the About page's update flow needs from this process,
+    // handed over once.**
+    //
+    // Installed rather than passed to `prefs_ui::run`, because every field is
+    // a fact about the process, identical at both of that page's two shells
+    // (the tray's Preferences window and the vault window's Preferences
+    // modal), and threading it to the second would mean widening
+    // `vault_window::build_frame`'s closure to carry a value it never uses.
+    // `update_panel`'s header argues the trade-off; the cost is that a build
+    // which failed to do this gets a page that says so, rather than a page
+    // that silently does nothing -- and that page is exactly what made this
+    // defect diagnosable from one screenshot, so it stays.
+    //
+    // `before_install` is the teardown the old tray path ran inline before
+    // `process::exit`, minus `bw serve`: that child is assigned to a
+    // kill-on-close job object (`job_object`), so the kernel takes it down
+    // with this process however this process dies, and the `stop_bw_serve`
+    // call on that path was belt to a kernel-held brace.
+    {
+        let cache_for_install = Arc::clone(&cache);
+        let installed = deskwarden::update_panel::install_env(deskwarden::update_panel::UpdateEnv {
+            current_version: current_version.clone(),
+            api_base: GITHUB_API_BASE.to_string(),
+            download_dir: update_download_dir.clone(),
+            before_install: std::sync::Arc::new(move || {
+                cache_for_install.clear();
+                deskwarden::clipboard::clear_if_still_ours_for(
+                    deskwarden::clipboard::ClearTrigger::Quit,
+                );
+            }),
+        });
+        // One installer, one install. A second would mean two places believe
+        // they own this. Logged as well as `debug_assert`ed: the assertion is
+        // compiled out of the build the user runs, and a shipped binary in
+        // which this went wrong should say so somewhere the user can send us.
+        debug_assert!(installed, "the update environment was installed twice");
+        if !installed {
+            log::error!(
+                "the update environment was already installed; the About page will be driven \
+                 by whichever install won, which is a defect"
+            );
+        }
+    }
+
+    // The breach scan's environment, installed for exactly the reason the
+    // update flow's is: the Preferences page is a blocking window in one shell
+    // and a modal in another, neither owns the vault, and the page that shows
+    // the findings is in a third place. See `breach_scan`'s header.
+    //
+    // **`items` is a closure, not a snapshot.** A vault captured here would
+    // be the vault as it was at startup, and a scan started an hour later
+    // would check passwords the user has since changed. That is also why
+    // installing this before the startup window costs nothing: the closure
+    // reads the cache whenever it is called, not now, and the cache it reads
+    // is the one the window fills.
+    //
+    // `live_check` is named here and nowhere else in this crate. Nothing in
+    // this block starts a scan: `ScanPanel::begin_scan` is behind the one
+    // button on the Breaches page, and `breach_scan`'s own source walk fails
+    // if a second caller ever appears.
+    {
+        let cache_for_scan = Arc::clone(&cache);
+        let installed = deskwarden::breach_scan::install_env(deskwarden::breach_scan::ScanEnv {
+            items: std::sync::Arc::new(move || cache_for_scan.items()),
+            check: deskwarden::breach_scan::live_check(),
+            history_path: deskwarden::scan_history::default_path(),
+        });
+        debug_assert!(installed, "the scan environment was installed twice");
+        if !installed {
+            log::error!(
+                "the scan environment was already installed; the Breaches page will be driven \
+                 by whichever install won, which is a defect"
+            );
+        }
+    }
+    // =====================================================================
     // Captured here, *before* the readiness probe below, because that probe's
     // own `list_items()` is the fetch whose result seeds the cache further
     // down via `populate_with` -- and the epoch guard can only cover the
@@ -1453,9 +1573,6 @@ fn main() {
     // which says so in the menu rather than leaving it empty.
     tray.rebuild_accounts_menu(estate.accounts.as_ref());
 
-    let current_version =
-        Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
-
     // The releases check is a small JSON response bounded by total time; the
     // installer download is a ~6 MB stream bounded by time without progress,
     // and ureq can carry only one kind of bound per agent (see
@@ -1463,65 +1580,6 @@ fn main() {
     // the download's belongs to whoever starts a download, which since the
     // tray item was deleted is `update_panel`, on the About page's own thread.
     let update_check_agent = updater::build_api_agent();
-
-    // **Everything the About page's update flow needs from this process,
-    // handed over once.**
-    //
-    // Installed here rather than passed to `prefs_ui::run`, because every
-    // field is a fact about the process, identical at both of that page's two
-    // shells (the tray's Preferences window and the vault window's Preferences
-    // modal), and threading it to the second would mean widening
-    // `vault_window::build_frame`'s closure to carry a value it never uses.
-    // `update_panel`'s header argues the trade-off; the cost is that a build
-    // which failed to do this gets a page that says so, rather than a page
-    // that silently does nothing.
-    //
-    // `before_install` is the teardown the old tray path ran inline before
-    // `process::exit`, minus `bw serve`: that child is assigned to a
-    // kill-on-close job object (`job_object`), so the kernel takes it down
-    // with this process however this process dies, and the `stop_bw_serve`
-    // call on that path was belt to a kernel-held brace.
-    {
-        let cache_for_install = estate.cache.clone();
-        let installed = deskwarden::update_panel::install_env(deskwarden::update_panel::UpdateEnv {
-            current_version: current_version.clone(),
-            api_base: GITHUB_API_BASE.to_string(),
-            download_dir: update_download_dir.clone(),
-            before_install: std::sync::Arc::new(move || {
-                cache_for_install.clear();
-                deskwarden::clipboard::clear_if_still_ours_for(
-                    deskwarden::clipboard::ClearTrigger::Quit,
-                );
-            }),
-        });
-        // One installer, one install. A second would mean two places believe
-        // they own this.
-        debug_assert!(installed, "the update environment was installed twice");
-    }
-
-    // The breach scan's environment, installed here for exactly the reason
-    // the update flow's is: the Preferences window is a blocking window in
-    // one shell and a modal in another, neither owns the vault, and the page
-    // that shows the findings is in a third place. See `breach_scan`'s
-    // header.
-    //
-    // **`items` is a closure, not a snapshot.** A vault captured here would
-    // be the vault as it was at startup, and a scan started an hour later
-    // would check passwords the user has since changed.
-    //
-    // `live_check` is named here and nowhere else in this crate. Nothing in
-    // this block starts a scan: `ScanPanel::begin_scan` is behind the one
-    // button on the Breaches page, and `breach_scan`'s own source walk fails
-    // if a second caller ever appears.
-    {
-        let cache_for_scan = estate.cache.clone();
-        let installed = deskwarden::breach_scan::install_env(deskwarden::breach_scan::ScanEnv {
-            items: std::sync::Arc::new(move || cache_for_scan.items()),
-            check: deskwarden::breach_scan::live_check(),
-            history_path: deskwarden::scan_history::default_path(),
-        });
-        debug_assert!(installed, "the scan environment was installed twice");
-    }
 
     // The update check talks to an external host and, prior to this fix, ran
     // synchronously here -- before the tray, hotkey, and window-watch thread
@@ -8381,6 +8439,153 @@ mod tests {
             "an ungoverned no-argument clear call is back in main.rs -- every call site \r
              must name the trigger it clears under, or the preferences page cannot \r
              govern it"
+        );
+    }
+
+    /// **Every published environment is installed before the first window
+    /// opens, and this is the rule rather than a list of two.**
+    ///
+    /// # The defect
+    ///
+    /// The About page said *"This build cannot check for updates. Please
+    /// report it -- it is a defect, not a setting"* and the Breaches page said
+    /// *"This build cannot scan: nothing set the scan up when Deskwarden
+    /// started"* -- on a real launch, to a real user, both at once. Both pages
+    /// were telling the truth, and both were reached from the Preferences
+    /// **modal** inside the startup vault window.
+    ///
+    /// `app_window::run_from_working` blocks for the entire life of that
+    /// window, and the modal is drawn in that window's own loop, so the whole
+    /// first vault window ran six hundred lines before either
+    /// `install_env` call. From the tray -- the same page, the other shell --
+    /// both worked. One fact, established on one path and depended on by
+    /// another, twice in one file.
+    ///
+    /// # Why this is a test and not a comment
+    ///
+    /// Moving two calls up fixes two instances. A comment saying "install
+    /// before the window" is exactly what the hotkey guard was: a claim in one
+    /// place that nothing in the other place is obliged to honour. The
+    /// existing `debug_assert!(installed, ..)` catches a DOUBLE install and
+    /// says nothing about a LATE one, and that asymmetry is the gap both these
+    /// bugs fell through.
+    ///
+    /// So this finds every module in the crate that publishes an environment
+    /// -- by looking for the `install_env` entry point, not by naming
+    /// `update_panel` and `breach_scan` -- and requires `main` to install each
+    /// of them before it opens anything. **A third environment added next year
+    /// is covered on the day it is written**, which is the only version of
+    /// this fix worth having.
+    ///
+    /// # Read over code, not over prose
+    ///
+    /// Comment lines are dropped before anything is measured. Both needles
+    /// below are names this file discusses in prose constantly -- there are
+    /// four mentions of the window host in comments inside `fn main` alone --
+    /// and a rule that counted those would fire on an edit to a sentence.
+    /// Needles are additionally split with `concat!` for this file's usual
+    /// reason: written whole, this test's own source would be a later
+    /// occurrence of the very call whose position it is checking.
+    #[test]
+    fn every_published_environment_is_installed_before_the_first_window() {
+        fn without_comments(text: &str) -> String {
+            text.lines()
+                .map(|line| if line.trim_start().starts_with("//") { "" } else { line })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let code = without_comments(include_str!("main.rs"));
+        let body_at = code.find("fn main() {").expect("control: main.rs has no `fn main()`");
+        let body = &code[body_at..];
+
+        // The first window `main` opens. Both spellings -- `run_from_working`
+        // for the warm launch and `run` for the sign-in one -- share this
+        // prefix, so whichever comes first in the file is the one that wins,
+        // and a third host added later needs no edit here.
+        let window_at = body.find(concat!("app_window::", "run")).expect(
+            "control: `fn main` no longer opens a window through `app_window`, so this test \
+             has nothing to measure ordering against",
+        );
+
+        // Every module that publishes an environment, found rather than
+        // listed. `src/` only: `build.rs` is not part of the running app.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut publishers: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = without_comments(&std::fs::read_to_string(&path).unwrap());
+                if !text.contains(concat!("pub fn install_", "env(")) {
+                    continue;
+                }
+                // `src/a/b.rs` publishes as `a::b`, `src/a.rs` as `a`.
+                let module = path
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .with_extension("")
+                    .to_string_lossy()
+                    .replace(['\\', '/'], "::");
+                publishers.push(module);
+            }
+        }
+        publishers.sort();
+        assert!(
+            publishers.len() >= 2,
+            "control: fewer than the two known published environments were found, so the walk \
+             that this whole rule rests on is broken. Found: {publishers:?}"
+        );
+
+        for module in &publishers {
+            let needle = format!("{module}{}", concat!("::install_", "env("));
+            let at = body.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "`{module}` publishes an environment that `fn main` never installs, so \
+                     every page that reads it will draw its \"this build cannot ...\" fallback \
+                     for the whole life of the process"
+                )
+            });
+            assert!(
+                at < window_at,
+                "`{module}`'s environment is installed AFTER `fn main` opens its first window. \
+                 That window blocks for its entire life and hosts the Preferences modal, so \
+                 every page reading this environment draws its \"this build cannot ...\" \
+                 fallback on that route while working perfectly from the tray. Move the \
+                 install up beside the vault cache, where the others are -- do not weaken \
+                 this assertion, and do not weaken the fallback either: it is what made this \
+                 diagnosable from one screenshot"
+            );
+        }
+    }
+
+    /// Control for the rule above: it can actually tell early from late.
+    ///
+    /// Without this, a `body.find` that returned `0` for everything -- or a
+    /// walk that found no publishers at all -- would satisfy every assertion
+    /// in it while proving nothing, which is the failure mode a source-reading
+    /// test is most prone to.
+    #[test]
+    fn the_environment_ordering_rule_can_tell_early_from_late() {
+        let install = concat!("::install_", "env(");
+        let window = concat!("app_window::", "run");
+        let early = format!("fn main() {{ zz{install}); {window}(); }}");
+        let late = format!("fn main() {{ {window}(); zz{install}); }}");
+        let positions =
+            |text: &str| (text.find(install).unwrap(), text.find(window).unwrap());
+        let (install_at, window_at) = positions(&early);
+        assert!(install_at < window_at, "the rule cannot see a correctly ordered `main`");
+        let (install_at, window_at) = positions(&late);
+        assert!(
+            install_at > window_at,
+            "the rule cannot see a `main` that installs after opening a window, which is the \
+             only thing it exists to catch"
         );
     }
 
