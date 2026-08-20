@@ -150,6 +150,22 @@ check comes back **in addition to** this one, not instead of it. See
   favourite ★ was the largest thing on the strip despite being the only one
   that fills in. The ✕ is now drawn at the ⋮'s size and the ★ at the ⏱'s. The
   ✉ and the ⋮ are untouched.
+- **Masked values show one bullet per character.** Every secret used to draw
+  the same ten dots however long it really was, which also meant a card number
+  — which has always masked to its real length — was the odd one out. Now a
+  password, a TOTP secret and a previous password all match the length of what
+  they hide, and if the window is too narrow to show the whole run it is cut
+  to the row rather than wrapped into a block of dots. Nothing is ever pushed
+  off the row: the reveal eye and the copy chord stay where they are at every
+  width.
+  - This does publish a secret's length to anyone looking at your screen,
+    which is why it did not before. It is a deliberate trade, and it is what
+    Bitwarden itself does.
+  - **The SSH private key keeps a fixed ten.** A private key runs to well over
+    a thousand characters, so a true-length run would be cut at every window
+    size there is — a value column filled edge to edge, indistinguishable from
+    a truncated sixty-character password, telling you only "longer than the
+    line". Ten dots at least read honestly as "this is hidden".
 
 ## 0.8.3 - 2026-08-19
 

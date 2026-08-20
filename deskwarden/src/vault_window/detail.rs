@@ -170,22 +170,58 @@ const ROW_VALUE_SIZE: f32 = 14.0;
 /// A masked value: `font-size: 15px; letter-spacing: 0.08em` in monospace.
 const MASKED_SIZE: f32 = 15.0;
 const MASKED_TRACKING: f32 = 1.2;
-/// How many bullets a masked value draws, **whatever its real length**.
+/// How many bullets the **SSH private key** row draws, and it is now the only
+/// row that draws a fixed number of them.
 ///
-/// It was `value.chars().count().max(8)` -- one bullet per character -- and
-/// that is wrong twice over.
+/// # What this used to be
 ///
-/// It **breaks the row**: an SSH private key is ~94 characters, so the value
-/// column claimed the whole row and pushed the Copy and Reveal controls off
-/// the pane. The pane then showed a masked private key with no way to reveal
-/// or copy it, which is the entire point of an SSH key item.
-/// `the_ssh_private_key_is_not_painted_by_default` catches it now; nothing
-/// did before, because the only masked values that existed were a card
-/// number and a security code, both short enough to fit.
+/// Every masked value on this pane, whatever its real length. It had been
+/// `value.chars().count().max(8)` before that, and the change recorded two
+/// reasons:
 ///
-/// It also **published the secret's exact character count** to anyone
-/// glancing at the screen -- a password's length is not the password, but it
-/// is not nothing either, and there is no reason to draw it.
+/// * it **broke the row** -- an SSH private key ran the value column across
+///   the whole row and pushed the Copy and Reveal controls off the pane,
+///   leaving "a masked private key with no way to reveal or copy it, which is
+///   the entire point of an SSH key item";
+/// * it **published the secret's exact character count** to anyone glancing
+///   at the screen.
+///
+/// # Why most rows go back to true length
+///
+/// The owner has decided the trade: "it's OK to always match the length of
+/// **** for pass, secrets etc, unless cuts off if window is too small." The
+/// second reason above is accepted knowingly -- it is what Bitwarden itself
+/// does -- and the first is answered by truncation rather than by a constant:
+/// [`fit_mask`] cuts the run to the room the row actually has, so no mask can
+/// push a control anywhere no matter how long the secret is.
+///
+/// It also settles an inconsistency. A card number has masked to its real
+/// length since the network groupings landed (`card_brand::mask_for`), so the
+/// pane already showed one row telling the truth about its length and three
+/// rows not.
+///
+/// # Why the SSH key does not
+///
+/// **Because for that one row a true-length mask would be a run that conveys
+/// nothing while looking as though it does.** An SSH private key is well over
+/// a thousand characters. It will truncate at every width the window has, on
+/// every machine, always -- so what the user sees is a value column filled
+/// edge to edge with bullets, which is indistinguishable from a truncated
+/// sixty-character password and tells them only "longer than the line". That
+/// is worse than a mask that is openly a placeholder: ten bullets read as
+/// "this is hidden", where a full line reads as a measurement and is not one.
+///
+/// It costs something too. The SSH pane puts this row beside a public key and
+/// a fingerprint, and a full line of bullets is the loudest thing on it while
+/// being the least informative.
+///
+/// And it keeps the original defect impossible rather than merely fixed. The
+/// geometry of the one row that provoked it is byte-for-byte what it is
+/// today, instead of depending on [`fit_mask`]'s arithmetic being right at
+/// every width -- which is a weaker guarantee than not needing it.
+///
+/// It is supplied through [`MaskedFace::mask`], the same door the card's own
+/// mask comes through, so this needs no machinery of its own.
 const MASKED_BULLETS: usize = 10;
 /// A live one-time code: `font-size: 17px; letter-spacing: 0.12em`, then a
 /// `96x4` progress bar and the seconds remaining, `gap: 12px` apart.
@@ -6076,6 +6112,49 @@ fn paint_on_the_value_baseline(
         .galley(egui::pos2(rect.left(), rect.top() + drop), galley, color);
 }
 
+/// Cut a masked run down to what fits `room` on ONE line, returning it
+/// unchanged when it already does.
+///
+/// **Truncation, not wrapping, and the difference is the whole of the
+/// "unless cuts off if window is too small" half of the request.** A mask is
+/// a `LayoutJob` and [`paint_digits`] gives it `break_anywhere`, so a run
+/// that does not fit currently FOLDS -- which is right for a revealed
+/// password, where every character matters and the row is allowed to grow,
+/// and wrong for a mask, where the characters carry nothing individually and
+/// a long secret would turn one row into a paragraph of bullets. A hundred
+/// and forty bullets over four lines is not a longer mask; it is a broken
+/// pane.
+///
+/// **Measured against the same job the row paints**, so the two cannot
+/// disagree about what fits: a mask cut by a width this function guessed and
+/// painted at a width `digits_job` computed is a mask that overhangs by the
+/// difference.
+///
+/// The first guess is proportional -- masks are uniform bullet runs, so
+/// `room / natural` is exact for them and merely close for the card's
+/// grouped mask, which carries spaces. The loop after it is what makes the
+/// answer right rather than close, and it can only ever shorten, so it
+/// terminates.
+///
+/// Returning at least one character rather than an empty string: a row whose
+/// value is empty is a row [`masked_row_visible`] would not have drawn at
+/// all, and a value column too narrow for a single bullet is a pane already
+/// past its own minimum width.
+fn fit_mask(ui: &egui::Ui, mask: &str, room: f32) -> String {
+    let width_of = |text: &str| ui.painter().layout_job(digits_job(text)).size().x;
+    let natural = width_of(mask);
+    if natural <= room {
+        return mask.to_string();
+    }
+    let chars: Vec<char> = mask.chars().collect();
+    let guess = ((chars.len() as f32) * room / natural).floor() as usize;
+    let mut keep = guess.clamp(1, chars.len());
+    while keep > 1 && width_of(&chars[..keep].iter().collect::<String>()) > room {
+        keep -= 1;
+    }
+    chars[..keep].iter().collect()
+}
+
 /// A plain run in one size and colour, as a [`LayoutJob`] rather than a
 /// `RichText` -- so it can go through [`paint_on_the_value_baseline`], which
 /// needs a job it can lay out itself.
@@ -6302,11 +6381,18 @@ fn masked_row(
     // **Both faces are the caller's when it has them**, and the row's defaults
     // otherwise. See [`MaskedFace::mask`] and [`MaskedFace::revealed_as`]:
     // neither is the value the row copies.
+    //
+    // **The default mask is one bullet per character**, which is what the
+    // owner asked for: "it's OK to always match the length of **** for pass,
+    // secrets etc, unless cuts off if window is too small." The cutting off
+    // is `fit_mask`, below, once the row knows how much room it has -- see
+    // [`MASKED_BULLETS`] for what that trades away and for the one row that
+    // opts out of it.
     let shown = match (*revealed, mask, revealed_as) {
         (true, _, Some(face)) => face.to_string(),
         (true, _, None) => value.to_string(),
         (false, Some(mask), _) => mask.to_string(),
-        (false, None, _) => "•".repeat(MASKED_BULLETS),
+        (false, None, _) => "•".repeat(value.chars().count()),
     };
     // What everything on this row's value line *other than the digits* costs:
     // the eye, plus the chord this row paints beside it when it has one, plus
@@ -6328,6 +6414,13 @@ fn masked_row(
     // The same decision, in the same words, as the expiry beside it makes --
     // see [`digits_fit`].
     let (shape, room) = digits_fit(ui, natural, controls_width);
+    // **A mask is cut to the room; a revealed value is not.** `digits_fit`
+    // has already bought the widest line this row can have -- stacking when
+    // the two columns cannot hold it -- so `room` is the real limit and not a
+    // guess. What overflows it is handled differently by design: a revealed
+    // value WRAPS, because every character of it is the point of the row, and
+    // a mask TRUNCATES, because none of them are. See [`fit_mask`].
+    let shown = if *revealed { shown } else { fit_mask(ui, &shown, room) };
     copy_row(
         ui,
         label,
@@ -7035,6 +7128,17 @@ fn ssh_key_rows(
     }
     if let Some(v) = &private_key {
         separate(ui, &mut first);
+        // **The one row that keeps a fixed-length mask**, and the argument for
+        // it is [`MASKED_BULLETS`]'s in full. Briefly: a private key is well
+        // over a thousand characters, so a true-length run truncates at every
+        // width there is and shows a value column filled edge to edge --
+        // indistinguishable from a truncated sixty-character password, and
+        // therefore a measurement that measures nothing.
+        //
+        // Supplied through `MaskedFace::mask`, which is the door the card's
+        // own mask already comes through, so opting out needs no new
+        // machinery and no flag threaded through `masked_row`.
+        let fixed = "\u{2022}".repeat(MASKED_BULLETS);
         masked_row(
             ui,
             "Private key",
@@ -7042,7 +7146,7 @@ fn ssh_key_rows(
             &mut reveal.ssh_private_key,
             action,
             DetailAction::CopySshPrivateKey,
-            MaskedFace::default(),
+            MaskedFace { mask: Some(&fixed), ..MaskedFace::default() },
         );
     }
 }
@@ -10969,9 +11073,15 @@ mod tests {
                     strings.contains(&"Password"),
                     "a real value drew no label: {strings:?}"
                 );
+                // One bullet per character of the value, which is what this
+                // row draws now -- see [`MASKED_BULLETS`]. Derived from the
+                // value rather than written down, so this stays a check that
+                // the row drew ITS mask rather than a check on a number.
+                let mask = "\u{2022}".repeat(value.chars().count());
                 assert!(
-                    strings.contains(&"\u{2022}".repeat(MASKED_BULLETS).as_str()),
-                    "a real value drew no {MASKED_BULLETS}-bullet mask: {strings:?}"
+                    strings.contains(&mask.as_str()),
+                    "a real value drew no {}-bullet mask: {strings:?}",
+                    value.chars().count()
                 );
                 assert_eq!(eyes.len(), 1, "a real value offers no reveal eye");
                 assert!(taken > 0.0, "a real value took no vertical space at all");
@@ -11014,9 +11124,18 @@ mod tests {
             "a real password lost its {label:?} label: {:?}",
             frame.strings()
         );
+        // One bullet per character -- see [`MASKED_BULLETS`] -- read off the
+        // fixture rather than written down.
+        let secret_len = a_login()
+            .login
+            .as_ref()
+            .and_then(|l| l.password.as_ref())
+            .expect("a_login carries a password")
+            .chars()
+            .count();
         assert!(
-            frame.painted(&"\u{2022}".repeat(MASKED_BULLETS)),
-            "a real password draws no {MASKED_BULLETS}-bullet mask: {:?}",
+            frame.painted(&"\u{2022}".repeat(secret_len)),
+            "a real password draws no {secret_len}-bullet mask: {:?}",
             frame.strings()
         );
         assert_eq!(
@@ -12616,47 +12735,87 @@ mod tests {
     /// pass it too. See the positive control below; that exact pair was
     /// required for the card secrets and is required here for the same
     /// reason.
-    /// **A masked row draws the same number of bullets whatever it hides.**
+    /// **A masked row draws one bullet per character of the secret -- and the
+    /// SSH private key does not.**
     ///
-    /// Two things ride on this, and neither had a test. A per-character run
-    /// let a ~94-character SSH private key claim the whole row and push the
-    /// Copy and Reveal controls off the pane -- the pane masked the key and
-    /// then offered no way to see or copy it. It also drew the secret's exact
-    /// length on screen for anyone looking.
+    /// The rule the owner asked for ("it's OK to always match the length of
+    /// **** for pass, secrets etc") and its one exception, asserted together
+    /// so neither can quietly become the other. See [`MASKED_BULLETS`] for
+    /// the argument; briefly, a key of over a thousand characters truncates
+    /// at every width there is, so its true-length run would be a full line
+    /// of bullets that says nothing.
     ///
-    /// Asserted across a login's password and a ~94-character private key,
-    /// and against the constant rather than against each other -- two runs
-    /// that moved together would satisfy an equality check while both being
-    /// wrong.
+    /// Measured on a `PANE`-wide pane, where a password of this length fits
+    /// unwrapped and the count on screen is therefore the count in the
+    /// vault. What happens when it does NOT fit is a different question with
+    /// its own tests -- see
+    /// `a_long_secrets_mask_is_cut_to_the_row_at_every_width`.
     ///
-    /// **The card is deliberately no longer one of the fixtures**, and that is
-    /// the one exception rather than the rule going soft. Design §4: a card's
-    /// number masks in *its own network's grouping* with the last four shown,
-    /// and its security code draws the number of dots that network's code
-    /// really has. Both of those are facts about the network, printed on the
-    /// plastic and asked for by every support line; neither is the "how long
-    /// is the secret" this constant exists to withhold. What the card does
-    /// draw is pinned positively by
-    /// [`a_cards_masks_are_its_own_networks_and_not_the_fixed_run`], so the
-    /// exception is asserted somewhere rather than merely excused here.
+    /// The two halves are asserted against the FIXTURE's own length and
+    /// against `MASKED_BULLETS` respectively, never against each other: two
+    /// runs that moved together would satisfy an equality check while both
+    /// being wrong, which is how the previous version of this test would have
+    /// passed on the defect it was renamed for.
+    ///
+    /// **The card is deliberately not one of the fixtures.** Design §4: a
+    /// card's number masks in *its own network's grouping* with the last four
+    /// shown, and its security code draws the number of dots that network's
+    /// code really has. Those are facts about the network rather than about
+    /// the row's masking rule, and they are pinned positively by
+    /// [`a_cards_masks_are_its_own_networks_and_not_the_fixed_run`].
     #[test]
-    fn a_masked_row_draws_a_fixed_bullet_run_whatever_it_hides() {
-        let expected = "•".repeat(MASKED_BULLETS);
-        for (label, item) in [("login", a_login()), ("ssh key", an_ssh_key_item())] {
-            let texts = painted(&item, &TotpState::NoSecret);
-            let runs: Vec<&String> = texts.iter().filter(|t| t.starts_with('•')).collect();
-            assert!(
-                !runs.is_empty(),
-                "the {label} pane painted no masked row at all, so this proves nothing: {texts:?}"
+    fn a_masked_row_draws_one_bullet_per_character_except_the_private_key() {
+        // The rule. The login's password is `hunter2`, seven characters, and
+        // the length is read off the fixture rather than written down so a
+        // changed fixture cannot leave this asserting the wrong number.
+        let login = a_login();
+        let secret_len = login
+            .login
+            .as_ref()
+            .and_then(|l| l.password.as_ref())
+            .expect("a_login carries a password")
+            .chars()
+            .count();
+        let texts = painted(&login, &TotpState::NoSecret);
+        let runs: Vec<&String> = texts.iter().filter(|t| t.starts_with('•')).collect();
+        assert!(
+            !runs.is_empty(),
+            "the login pane painted no masked row at all, so this proves nothing: {texts:?}"
+        );
+        for run in &runs {
+            assert_eq!(
+                run.chars().count(),
+                secret_len,
+                "a login's masked row drew {} bullets for a {secret_len}-character secret, \
+                 so the mask no longer matches its length: {texts:?}",
+                run.chars().count()
             );
-            for run in runs {
-                assert_eq!(
-                    *run, expected,
-                    "a {label} masked row drew {} bullets instead of {MASKED_BULLETS}, so the \
-                     mask still tracks the secret's length",
-                    run.chars().count()
-                );
-            }
+        }
+        // And it really is a different number from the old fixed run, so the
+        // assertion above is not passing by coincidence.
+        assert_ne!(
+            secret_len, MASKED_BULLETS,
+            "the fixture's password happens to be exactly {MASKED_BULLETS} characters, so \
+             this test cannot tell the true-length rule from the fixed one"
+        );
+
+        // The exception.
+        let ssh = an_ssh_key_item();
+        let ssh_texts = painted(&ssh, &TotpState::NoSecret);
+        let ssh_runs: Vec<&String> = ssh_texts.iter().filter(|t| t.starts_with('•')).collect();
+        assert!(
+            !ssh_runs.is_empty(),
+            "the ssh pane painted no masked row at all: {ssh_texts:?}"
+        );
+        for run in &ssh_runs {
+            assert_eq!(
+                run.chars().count(),
+                MASKED_BULLETS,
+                "the private key's mask drew {} bullets instead of the fixed \
+                 {MASKED_BULLETS} -- see `MASKED_BULLETS` for why this one row opts out: \
+                 {ssh_texts:?}",
+                run.chars().count()
+            );
         }
     }
 
@@ -15219,9 +15378,20 @@ mod tests {
         TotpState::Code { code: "418902".to_string(), seconds_left: 19 }
     }
 
-    /// The bullets `masked_row` paints, as a whole string.
-    fn mask() -> String {
-        "\u{2022}".repeat(MASKED_BULLETS)
+    /// The bullets `masked_row` paints over `secret`, as a whole string.
+    ///
+    /// **It takes the secret now**, because the mask is one bullet per
+    /// character of it -- see [`MASKED_BULLETS`]. It used to take nothing at
+    /// all, which was the point of the fixed run and is exactly what changed.
+    /// Derived here rather than at six call sites so the rule lives in one
+    /// place, and taking the value means a caller cannot ask for "the mask"
+    /// without saying which secret it is over.
+    ///
+    /// This is the SEED rows' mask throughout these tests; the seeds are
+    /// short enough to fit the pane unwrapped, so no truncation is in play
+    /// (that is `a_long_secrets_mask_is_cut_to_the_row_at_every_width`'s).
+    fn mask(secret: &str) -> String {
+        "\u{2022}".repeat(secret.chars().count())
     }
 
     /// The `LOGIN CREDENTIALS` card's own box, so the two passes can be
@@ -15365,11 +15535,18 @@ mod tests {
              pass could not have been seen either"
         );
 
-        // 4. AND NO MASK. The password row paints one bullet run; two would
-        //    be a secret row drawn with its label suppressed.
-        let masks = |frame: &Frame| frame.strings().iter().filter(|t| **t == mask()).count();
-        assert_eq!(masks(&off), 1, "off: {:?}", off.strings());
-        assert_eq!(masks(&on), 2, "on: {:?}", on.strings());
+        // 4. AND NO MASK -- meaning no run of the SEED's own length, which
+        //    would be a secret row drawn with its label suppressed.
+        //
+        //    **Sharper than it was.** While every masked row drew the same
+        //    fixed bullet run, this could only count runs and infer: one was
+        //    the password, two meant a second row had appeared. Now that a
+        //    mask is one bullet per character, the seed's mask and the
+        //    password's are different strings, so this counts the seed's
+        //    directly and 0-against-1 says exactly what it means.
+        let masks = |frame: &Frame| frame.strings().iter().filter(|t| **t == mask(SEED)).count();
+        assert_eq!(masks(&off), 0, "off: {:?}", off.strings());
+        assert_eq!(masks(&on), 1, "on: {:?}", on.strings());
     }
 
     /// **No seed on the item means no row, even with the setting on** -- for
@@ -15478,10 +15655,13 @@ mod tests {
 
         // MASKED, with an eye that is not struck through -- the only visible
         // difference between a masked row and a revealed one.
+        // The seed's own mask, counted by its own length rather than by
+        // "how many bullet runs are on the pane" -- see the note in
+        // `the_secret_row_is_not_drawn_when_the_setting_is_off`.
         assert_eq!(
-            frame.strings().iter().filter(|t| **t == mask()).count(),
-            2,
-            "two bullet runs expected (password and secret); got {:?}",
+            frame.strings().iter().filter(|t| **t == mask(SEED)).count(),
+            1,
+            "the seed's mask is not on the pane exactly once; got {:?}",
             frame.strings()
         );
         assert_eq!(frame.struck_eyes(), 0, "nothing is revealed yet");
@@ -15499,9 +15679,9 @@ mod tests {
             after.strings()
         );
         assert_eq!(
-            after.strings().iter().filter(|t| **t == mask()).count(),
-            1,
-            "the password row's mask should be the only one left; got {:?}",
+            after.strings().iter().filter(|t| **t == mask(SEED)).count(),
+            0,
+            "the seed's mask is still on the pane after it was revealed; got {:?}",
             after.strings()
         );
         assert_eq!(after.struck_eyes(), 1, "exactly one eye is struck through");
@@ -15544,7 +15724,7 @@ mod tests {
         // And the length is not leaked either: the run is `MASKED_BULLETS`
         // long whatever the seed is.
         assert!(
-            masked.strings().iter().any(|t| *t == mask()),
+            masked.strings().iter().any(|t| *t == mask(SEED)),
             "the row painted no mask at all: {:?}",
             masked.strings()
         );
@@ -15630,7 +15810,7 @@ mod tests {
             );
         }
         assert!(
-            next.strings().iter().any(|t| *t == mask()),
+            next.strings().iter().any(|t| *t == mask(SEED)),
             "the second item's secret row is not masked: {:?}",
             next.strings()
         );
@@ -21131,14 +21311,26 @@ mod read_pane_scroll_tests {
         // The rows are really on the pane: five masked runs, and the eyes
         // that go with them. `the_tallest_item` seeds exactly five previous
         // passwords.
-        let masked = "\u{2022}".repeat(MASKED_BULLETS);
-        let runs = shot.runs.iter().filter(|(s, _, _)| *s == masked).count();
+        //
+        // **Found by their FACE, not by a written-down length.** A mask is
+        // one bullet per character now and this pane is the narrowest the
+        // window has, so `fit_mask` cuts these runs to whatever the row can
+        // hold -- a number that belongs to the layout and would be a
+        // photograph if it were pinned here. What this test is about is that
+        // five of them exist and none of them escapes the card.
+        let is_mask = |s: &str| !s.is_empty() && s.chars().all(|c| c == '\u{2022}');
+        let runs = shot.runs.iter().filter(|(s, _, _)| is_mask(s)).count();
         assert_eq!(
             runs, 5,
             "the pane painted {runs} masked runs, not the five previous passwords this \
              item carries -- the emptiness below would be vacuous: {:?}",
             shot.sources()
         );
+        // This fixture's entries are short enough to fit even here, so no
+        // truncation is in play and none is asserted -- what happens when a
+        // secret is too long for the row is
+        // `a_long_secrets_mask_is_cut_to_the_row_at_every_width`'s question,
+        // on a fixture chosen for it.
         // The eyes, counted by DIFFERENCE against the same pane with the
         // history taken away -- the pane's header draws a path of its own, so
         // an absolute count would be pinning a number that belongs to another
@@ -21167,12 +21359,142 @@ mod read_pane_scroll_tests {
         let spilled: Vec<&(String, egui::Rect)> = shot
             .glyphs
             .iter()
-            .filter(|(label, ink)| *label == masked && ink.right() > edge + 0.5)
+            .filter(|(label, ink)| is_mask(label) && ink.right() > edge + 0.5)
             .collect();
         assert!(
             spilled.is_empty(),
             "a masked run still reaches past the cards' right edge at x = {edge}: {spilled:?}"
         );
+    }
+
+    /// **A secret too long for the row is CUT to it, at both ends of the
+    /// window's width range -- and nothing else on the row moves.**
+    ///
+    /// The half of "match the length of **** for pass, secrets etc" that the
+    /// owner put a condition on: "unless cuts off if window is too small".
+    /// A mask is one bullet per character now, so a long secret is exactly
+    /// where that rule could break the pane -- and this pane has been broken
+    /// by a long masked run before, which is the defect `MASKED_BULLETS` was
+    /// introduced for.
+    ///
+    /// **Both widths, because they fail differently.** At [`NARROW`] the
+    /// value column is 44pt and the row STACKS, so the cut is against the
+    /// whole content box; at [`PANE`] the row stays in two columns and the
+    /// cut is against what is left beside the label and the controls. A fix
+    /// that only handled the narrow case would pass a narrow-only test while
+    /// running a 140-bullet run off the side of a wide pane, which is the
+    /// more likely way to ship this wrong -- wide is the width the window
+    /// opens at.
+    ///
+    /// Three things are asserted at each width, and the first two are what
+    /// stop the third from being vacuous:
+    ///
+    /// * the run really was cut -- strictly fewer bullets than the secret has
+    ///   characters, so a mask that happened to fit proves nothing here;
+    /// * every row still has its reveal eye, which is the control the
+    ///   original defect pushed off the pane;
+    /// * no ink -- mask or mark -- reaches past the cards' right edge, held
+    ///   to the CARDS and not the pane's edge for the reason its siblings
+    ///   give: a control that has merely stopped being clipped is still one
+    ///   the user finds under the scroll bar.
+    #[test]
+    fn a_long_secrets_mask_is_cut_to_the_row_at_every_width() {
+        /// The detail pane at the width the vault window OPENS at, which is
+        /// the width nearly every user will read it at. Spelled as the same
+        /// 900 the other modules' `PANE` is, rather than imported, because
+        /// this module has no such constant and adding a `use` for a test
+        /// width would put two names on one number.
+        const WIDE: f32 = 900.0;
+
+        let item = the_tallest_item_with_a_long_history();
+        // `+ 1` for the index each entry's password is suffixed with -- see
+        // `the_tallest_item_with_a_long_history`, which builds them as
+        // `{LONG_HISTORY_PASSWORD}{i}`.
+        let secret_len = LONG_HISTORY_PASSWORD.chars().count() + 1;
+        let is_mask = |s: &str| !s.is_empty() && s.chars().all(|c| c == '\u{2022}');
+
+        // **The two widths expect DIFFERENT things, and that is the rule
+        // rather than a concession.** A 41-character secret fits the value
+        // column at the width the window opens at, so the mask there is the
+        // secret's true length -- which is the whole feature, and a test that
+        // demanded truncation everywhere would forbid it. It does not fit the
+        // narrowest pane the window can be dragged to, so there it is cut.
+        // Asserting "cut" at one width and "not cut" at the other is what
+        // makes this a test of the condition ("unless cuts off if window is
+        // too small") instead of a test of one arm of it.
+        for (label, width, expect_cut) in [
+            ("the narrowest pane", NARROW, true),
+            ("the pane's own width", WIDE, false),
+        ] {
+            let pane = egui::vec2(width, ROOMY);
+            let edge = lane_left(pane);
+            let shot = settled(pane, &item);
+
+            let masks: Vec<&(String, String, egui::Rect)> =
+                shot.runs.iter().filter(|(s, _, _)| is_mask(s)).collect();
+            assert_eq!(
+                masks.len(),
+                5,
+                "{label}: the pane painted {} masked runs, not the five previous passwords \
+                 this item carries -- everything below would be vacuous: {:?}",
+                masks.len(),
+                shot.sources()
+            );
+            for (text, ..) in &masks {
+                let drawn = text.chars().count();
+                if expect_cut {
+                    assert!(
+                        drawn < secret_len,
+                        "{label}: a mask is {drawn} bullets for a {secret_len}-character \
+                         secret, so it was not cut to the row and the run is as wide as the \
+                         secret"
+                    );
+                } else {
+                    assert_eq!(
+                        drawn, secret_len,
+                        "{label}: a mask is {drawn} bullets for a {secret_len}-character \
+                         secret that fits this width, so the run no longer matches the \
+                         secret's length"
+                    );
+                }
+            }
+
+            // The controls are still there. Counted by DIFFERENCE against the
+            // same pane with the history removed, exactly as this test's
+            // siblings do: the card header draws a path of its own, so an
+            // absolute count would pin a number belonging to another control.
+            let paths =
+                |shot: &Shot| shot.marks.iter().filter(|(kind, _)| *kind == "a path").count();
+            let mut without = item.clone();
+            without.other.remove("passwordHistory");
+            let eyes = paths(&shot) - paths(&settled(pane, &without));
+            assert_eq!(
+                eyes, 5,
+                "{label}: the previous-password rows contribute {eyes} reveal eyes, not five \
+                 -- a long mask has pushed the controls off the row again"
+            );
+
+            // And nothing left the cards.
+            let past: Vec<&(&str, egui::Rect)> = shot
+                .marks
+                .iter()
+                .filter(|(_, ink)| ink.right() > edge + 0.5)
+                .collect();
+            assert!(
+                past.is_empty(),
+                "{label}: a mark reaches past the cards' right edge at x = {edge}: {past:?}"
+            );
+            let spilled: Vec<&(String, egui::Rect)> = shot
+                .glyphs
+                .iter()
+                .filter(|(text, ink)| is_mask(text) && ink.right() > edge + 0.5)
+                .collect();
+            assert!(
+                spilled.is_empty(),
+                "{label}: a masked run reaches past the cards' right edge at x = {edge}: \
+                 {spilled:?}"
+            );
+        }
     }
 
     /// **A previous password long enough to need the wrap, REVEALED.**
@@ -21305,11 +21627,16 @@ mod read_pane_scroll_tests {
         // wrap and not about a value that happened to fit. Measured against
         // the height of the masked run on the same pane, which is one line by
         // construction.
-        let masked = "\u{2022}".repeat(MASKED_BULLETS);
+        // Found by its face rather than by a length: a mask is one bullet per
+        // character and `fit_mask` cuts it to the row, so how many bullets
+        // land here is the layout's answer and not a number to write down.
+        // Whatever it comes to, it is one line -- which is the only property
+        // this measurement needs.
+        let is_mask = |s: &str| !s.is_empty() && s.chars().all(|c| c == '\u{2022}');
         let one_line = settled(pane, &item)
             .glyphs
             .iter()
-            .filter(|(label, _)| *label == masked)
+            .filter(|(label, _)| is_mask(label))
             .map(|(_, ink)| ink.height())
             .fold(0.0_f32, f32::max);
         assert!(
