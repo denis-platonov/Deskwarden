@@ -323,7 +323,25 @@ impl ScanResults {
     /// Stored verbatim. An `Unavailable` becomes a stored `Unavailable` and
     /// is never softened into `Safe` on the way in -- the one answer this
     /// feature must never invent.
-    fn record(&mut self, item_ids: &[String], status: BreachStatus) {
+    /// **`pub`, and named distinctly so a guard can find it.**
+    ///
+    /// A scan is not the only thing that has to be able to build a
+    /// `ScanResults`: `password_health`'s tests assert against the answers
+    /// its pane displays, and `examples/ui_preview` photographs a report with
+    /// findings on it. Both must go through the SAME function a scan uses --
+    /// a hand-assembled fixture would go on passing after this shape changed
+    /// -- and `examples/` is a separate crate, so `pub(crate)` is not enough.
+    ///
+    /// The cost is real and is bounded by a rule rather than by hope:
+    /// `only_a_scan_writes_a_finding_in_production` walks this crate's
+    /// production halves and fails if anything outside this file calls it. A
+    /// finding invented by a draw site would be a badge with nothing behind
+    /// it, which is this project's most-repeated defect.
+    ///
+    /// It is not a door to the network either way. A `ScanResults` has no
+    /// channel, no agent and no URL; writing an answer into one is not the
+    /// same as getting one.
+    pub fn set_status(&mut self, item_ids: &[String], status: BreachStatus) {
         for id in item_ids {
             self.by_item.insert(id.clone(), status);
         }
@@ -576,7 +594,7 @@ impl ScanPanel {
             // `UpdatePanel::apply` applies to a late `Progress`.
             return false;
         };
-        self.pending_results.record(&item_ids, status);
+        self.pending_results.set_status(&item_ids, status);
         let next = ScanStage::Running {
             done: done + 1,
             total,
@@ -975,7 +993,7 @@ mod tests {
     #[test]
     fn an_unscanned_item_and_a_failed_one_are_not_the_same_answer() {
         let mut results = ScanResults::default();
-        results.record(&["asked".to_string()], BreachStatus::Unavailable);
+        results.set_status(&["asked".to_string()], BreachStatus::Unavailable);
         assert_eq!(results.status_of("asked"), Some(BreachStatus::Unavailable));
         assert_eq!(results.status_of("not-asked"), None);
     }
@@ -1183,6 +1201,43 @@ mod tests {
                 out.push(path);
             }
         }
+    }
+
+    /// **Only a scan writes a finding in production.**
+    ///
+    /// `ScanResults::set_status` is `pub` because the paint tests and the
+    /// screenshot example -- a separate crate -- have to build the answers
+    /// the health pane displays, through the same function a scan uses. This
+    /// is the rule that bounds that: nothing outside this file may write a
+    /// finding in production code.
+    ///
+    /// A finding invented at a draw site would be a badge with nothing behind
+    /// it, which is this project's most-repeated defect and the one thing a
+    /// screen about breached passwords must not do.
+    #[test]
+    fn only_a_scan_writes_a_finding_in_production() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        assert!(files.len() > 40, "the walk found only {} files", files.len());
+        let needle = concat!(".set_", "status(");
+        let mut writers = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("source is readable");
+            let production = match text.find("#[cfg(test)]") {
+                Some(cut) => &text[..cut],
+                None => &text[..],
+            };
+            let n = production.matches(needle).count();
+            if n > 0 {
+                writers.push((path.file_name().unwrap().to_string_lossy().to_string(), n));
+            }
+        }
+        assert_eq!(
+            writers,
+            vec![("breach_scan.rs".to_string(), 1)],
+            "a finding is written outside the scan that produced it. A badge with nothing              behind it is worse than no badge"
+        );
     }
 
     /// **Nothing in this module logs.** `breach.rs` makes the same

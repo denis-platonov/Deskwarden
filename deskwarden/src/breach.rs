@@ -416,6 +416,18 @@ fn group_thousands(count: u64) -> String {
 /// times" mean the same thing -- the password is on a public list -- and
 /// softening the wording for a small number would invite the user to keep it.
 /// The number is reported because it is real, not because it grades the risk.
+/// Just the magnitude: `"Seen 40,231 times"`.
+///
+/// For a heading over a GROUP of items that share a count, where
+/// [`breach_phrase`]'s advice ("Change this password") would be addressed to
+/// nothing in particular and would then be repeated on every row underneath.
+/// The advice still appears -- on each row -- and it still does not vary by
+/// count; this is the number without it.
+pub fn breach_count_phrase(count: u64) -> String {
+    let times = if count == 1 { "time" } else { "times" };
+    format!("Seen {} {times}", group_thousands(count))
+}
+
 pub fn breach_phrase(count: u64) -> String {
     format!(
         "Found in a known data breach ({} times). Change this password.",
@@ -1970,17 +1982,22 @@ mod tests {
         // The two that cannot be banned, pinned instead.
         assert_eq!(
             source.matches(concat!("forma", "t!")).count(),
-            3,
-            "a new `format!` in breach.rs production code. The three are the range URL, the \
-             breach phrase and `BaseUrl::loopback`, and the thing most worth formatting here is \
-             the hash -- so a fourth has to be added to this count deliberately"
+            4,
+            "a new `format!` in breach.rs production code. The four are the range URL, the \
+             breach phrase, the bare count phrase and `BaseUrl::loopback`, and the thing most \
+             worth formatting here is the hash -- so a fifth has to be added to this count \
+             deliberately"
         );
-        // Each of the three pinned to what it may build, so the count cannot
-        // be satisfied by a *different* three.
+        // Each of the four pinned to what it may build, so the count cannot
+        // be satisfied by a *different* four.
         for target in [
             concat!("format!(\"{}/{}\", base_url.as_str(), ", "prefix.as_str())"),
             concat!("\"Found in a known data breach ({} times).", " Change this password.\","),
             concat!("format!(\"http://127.0.0.1:{port}", "/range\")"),
+            // The magnitude without the advice, for a heading over a group of
+            // items that share a count. Carries the grouped count and nothing
+            // else -- no hash, no suffix, no password.
+            concat!("format!(\"Seen {} {times}\", ", "group_thousands(count))"),
         ] {
             assert!(
                 source.contains(target),

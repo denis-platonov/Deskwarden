@@ -191,6 +191,39 @@ pub struct WeakItem {
     pub classes: CharClasses,
 }
 
+/// A set of items whose passwords are in a breach the same number of times.
+///
+/// # Grouped by COUNT, and what that does and does not mean
+///
+/// The count is what Have I Been Pwned reports for a password, so two items
+/// in one group either share a password or are two different passwords that
+/// happen to have been leaked the same number of times -- and the second is
+/// vanishingly unlikely at any count above a handful.
+///
+/// **This screen does not leave that as an inference.** It already knows the
+/// answer: the reuse grouping above is exact, over SHA-256 digests, so
+/// [`one_password`](Self::one_password) says whether these items really are
+/// one password rather than "almost certainly". A user looking at three rows
+/// under one count needs to know whether that is three passwords to change or
+/// one, and guessing on their behalf -- either way -- is the thing worth not
+/// doing.
+///
+/// It cross-cuts the reuse section deliberately, and the pane says so: a
+/// reused password that is also breached is the most urgent thing in the
+/// vault, and appearing in one list only would bury exactly that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreachGroup {
+    /// How many times the password was seen. Never 0 -- see
+    /// [`crate::breach::parse_range_body`].
+    pub count: u64,
+    /// In vault order, so the group reads the same way twice running.
+    pub items: Vec<FoundItem>,
+    /// Whether these items are **known** to share one password, from the
+    /// reuse grouping rather than from the count. `false` on a group of one,
+    /// and on the rare group whose members' counts agree by coincidence.
+    pub one_password: bool,
+}
+
 /// Everything this screen says about one vault, computed once.
 ///
 /// **No `Zeroizing` anywhere in it, by construction**, which is what makes it
@@ -202,6 +235,28 @@ pub struct HealthReport {
     pub reused: Vec<ReuseGroup>,
     /// Items whose password is weak, in vault order.
     pub weak: Vec<WeakItem>,
+    /// Items whose password a scan found in a breach, **by count,
+    /// descending** -- the worst first, because that is the reading order a
+    /// user wants and because a list sorted by vault position buries the
+    /// 40,000-hit password under three that were seen twice.
+    ///
+    /// Empty when no scan has run. That is not the same as "nothing was
+    /// found", and [`Self::scanned`] is what tells them apart.
+    pub breached: Vec<BreachGroup>,
+    /// Items a scan **asked about and could not find out**, in vault order.
+    ///
+    /// **Listed, never omitted.** A password nobody could check is not a
+    /// password that is fine, and "not shown" reading as "safe" is the
+    /// failure that matters on this screen. See
+    /// [`crate::breach::BreachStatus`], which has no `Default` for the same
+    /// reason.
+    pub unknown: Vec<FoundItem>,
+    /// Whether a scan has covered any of these items at all.
+    ///
+    /// The difference between "no breached passwords" and "nobody has
+    /// looked", which are opposite claims that an empty list cannot tell
+    /// apart. The pane draws two different sentences from this.
+    pub scanned: bool,
     /// How many items carried a non-empty password at all -- the denominator
     /// this report is over.
     ///
@@ -225,11 +280,81 @@ impl HealthReport {
             .iter()
             .flat_map(|group| group.items.iter())
             .chain(self.weak.iter().map(|weak| &weak.item))
+            // **Breached and unknown items count too.** The badge is "how
+            // many items on this screen need attention", and a breached
+            // password that the rail did not count is a finding the user has
+            // no reason to go and look for. `unknown` is on the list for the
+            // harder version of the same reason: an item nobody could check
+            // is an item with an open question against it, and leaving it out
+            // of the badge is the "not shown reads as safe" failure moved up
+            // one level.
+            .chain(self.breached.iter().flat_map(|group| group.items.iter()))
+            .chain(self.unknown.iter())
             .map(|found| found.id.as_str())
             .collect();
         ids.sort_unstable();
         ids.dedup();
         ids.len()
+    }
+
+    /// The findings under one filter, as the count the pane's empty line
+    /// reads. Pure, so "this filter has nothing in it" can be asserted
+    /// without a rendered frame.
+    pub fn shown_under(&self, filter: HealthFilter) -> usize {
+        match filter {
+            HealthFilter::All => self.flagged_items(),
+            HealthFilter::Reused => self.reused.iter().map(|g| g.items.len()).sum(),
+            HealthFilter::Weak => self.weak.len(),
+            HealthFilter::Breached => {
+                self.breached.iter().map(|g| g.items.len()).sum::<usize>() + self.unknown.len()
+            }
+        }
+    }
+}
+
+/// Which findings the pane is showing.
+///
+/// **Only findings are ever listed**, under every filter -- see the module
+/// docs. The filter narrows a list of problems; it never turns this screen
+/// into an inventory of the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthFilter {
+    All,
+    Reused,
+    Weak,
+    Breached,
+}
+
+impl HealthFilter {
+    /// Left to right, in the order the chips are drawn.
+    ///
+    /// `All` first because it is where the screen opens; `Breached` last
+    /// because it is the one that depends on something having been run, and a
+    /// chip that is often empty does not belong where the eye lands first.
+    pub const ALL: [HealthFilter; 4] =
+        [HealthFilter::All, HealthFilter::Reused, HealthFilter::Weak, HealthFilter::Breached];
+
+    /// The chip's word.
+    pub fn label(self) -> &'static str {
+        match self {
+            HealthFilter::All => "All",
+            HealthFilter::Reused => "Reused",
+            HealthFilter::Weak => "Weak",
+            HealthFilter::Breached => "Breached",
+        }
+    }
+
+    /// Whether this filter shows the reuse section.
+    fn shows_reused(self) -> bool {
+        matches!(self, HealthFilter::All | HealthFilter::Reused)
+    }
+
+    fn shows_weak(self) -> bool {
+        matches!(self, HealthFilter::All | HealthFilter::Weak)
+    }
+
+    fn shows_breached(self) -> bool {
+        matches!(self, HealthFilter::All | HealthFilter::Breached)
     }
 }
 
@@ -267,6 +392,34 @@ pub(crate) fn password_of(item: &VaultItem) -> Option<&str> {
 /// `Zeroizing` digests, an index sort, and one linear pass. Nothing here
 /// keeps a plaintext password anywhere but in the borrow it reads.
 pub fn report_for(items: &[VaultItem]) -> HealthReport {
+    report_with_scan(items, &crate::breach_scan::ScanResults::default())
+}
+
+/// The report, plus whatever the last scan found.
+///
+/// # This still makes NO lookup, and the signature is what says so
+///
+/// `scan` is a **map of answers**, not a handle: `ScanResults` has no channel,
+/// no agent, no URL and no way to ask anything. There is no argument to this
+/// function through which a request could be made, and there is no `if` in it
+/// that a future reader could flip -- which is the point. The module docs
+/// argue that opening a report is not consent to hundreds of outbound
+/// requests; that argument is now enforced by the type of this parameter
+/// rather than by a branch somebody could invert.
+///
+/// [`report_for`] is the same call with an empty map, kept so the dozens of
+/// call sites and tests that have nothing to say about breaches do not have
+/// to name one.
+///
+/// # Where the answers come from
+///
+/// A scan the user pressed a button for, in
+/// `Preferences > Breaches`, held in this process only and dropped on lock.
+/// `crate::breach_scan` is where all of that lives.
+pub fn report_with_scan(
+    items: &[VaultItem],
+    scan: &crate::breach_scan::ScanResults,
+) -> HealthReport {
     // (digest, index into `items`). The ONLY place a password-derived value
     // lives, and it dies at the end of this function -- see the module docs.
     let mut keyed: Vec<(Zeroizing<[u8; 32]>, usize)> = Vec::new();
@@ -347,7 +500,66 @@ pub fn report_for(items: &[VaultItem]) -> HealthReport {
             .unwrap_or(usize::MAX)
     });
 
-    HealthReport { reused, weak, with_password }
+    // ------------------------------------------------------------------
+    // The breach half. Reads `scan` and nothing else -- see this function's
+    // doc for why that is a type-level guarantee rather than a convention.
+    // ------------------------------------------------------------------
+    let mut by_count: Vec<(u64, Vec<FoundItem>)> = Vec::new();
+    let mut unknown = Vec::new();
+    for item in items {
+        if password_of(item).is_none() {
+            // Outside the report entirely, exactly as it is for weakness and
+            // reuse. A card is not unknown; there is nothing to know.
+            continue;
+        }
+        match scan.status_of(&item.id) {
+            Some(crate::breach::BreachStatus::Breached(count)) => {
+                match by_count.iter_mut().find(|(seen, _)| *seen == count) {
+                    Some((_, group)) => group.push(found(item)),
+                    None => by_count.push((count, vec![found(item)])),
+                }
+            }
+            // **Asked, and no answer.** Listed rather than dropped: see
+            // `HealthReport::unknown`.
+            Some(crate::breach::BreachStatus::Unavailable) => unknown.push(found(item)),
+            // `Pending` cannot reach here -- a scan reports only settled
+            // answers -- and `None` means this item was not part of any scan,
+            // which is not a finding about it. Neither is `Safe`, which is
+            // the whole reason this screen lists findings only.
+            _ => {}
+        }
+    }
+    // Worst first. A list in vault order buries the 40,000-hit password under
+    // three that were seen twice.
+    by_count.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // **Whether a group really is one password, from the reuse digests rather
+    // than from the count.** See `BreachGroup`: the count alone cannot tell
+    // "one password on three items" from "three passwords leaked the same
+    // number of times", and this screen already knows the answer.
+    let breached: Vec<BreachGroup> = by_count
+        .into_iter()
+        .map(|(count, group)| {
+            let ids: std::collections::BTreeSet<&str> =
+                group.iter().map(|f| f.id.as_str()).collect();
+            let one_password = ids.len() > 1
+                && reused.iter().any(|reuse| {
+                    let members: std::collections::BTreeSet<&str> =
+                        reuse.items.iter().map(|f| f.id.as_str()).collect();
+                    ids.iter().all(|id| members.contains(id))
+                });
+            BreachGroup { count, items: group, one_password }
+        })
+        .collect();
+
+    HealthReport {
+        reused,
+        weak,
+        breached,
+        unknown,
+        scanned: !scan.is_empty(),
+        with_password,
+    }
 }
 
 /// The non-secret half of an item: what a finding row draws and clicks.
@@ -440,24 +652,37 @@ impl Summary {
     }
 }
 
-/// The footer that says what this report could NOT tell you, and where to
-/// change that.
+/// The footer that says where the breach findings on this screen came from,
+/// and what they are not.
 ///
-/// **Both states say something.** "Breach checking is on" is not permission
-/// for this screen to have used it -- see the module docs -- so the on-state
-/// wording says where breach status actually appears instead of leaving its
-/// absence from here looking like an oversight.
+/// # This screen still performs NO lookup, in either state of the setting
+///
+/// That has not changed and is not softened: see the module docs and
+/// [`report_with_scan`], whose `scan` parameter is a map of answers with no
+/// way to ask anything. What has changed is that there is now something to
+/// display -- a scan the user pressed a button for -- so the footer's job is
+/// no longer to explain an absence but to say **when** the findings above it
+/// were gathered and that they are a snapshot, not live.
+///
+/// **Both states of the pill still say something**, and the wording is about
+/// the pill rather than about this screen, because the pill governs the
+/// per-item badge and not the scan. Saying "breach checking is off" over a
+/// list of breach findings would be a contradiction the user would have to
+/// resolve; saying which of the two things the pill decides is not.
 pub fn breach_note(breach_checking_on: bool) -> String {
+    let source = format!(
+        "Breach findings come from the last scan you ran, not from opening this screen -- \
+         nothing here checks anything. Run one in {SCAN_LOCATION}."
+    );
     if breach_checking_on {
         format!(
-            "Breach data is not part of this report. Breach status is checked one password at \
-             a time, on the item's own pane. The setting is {BREACH_SETTING_LOCATION}."
+            "{source} The setting in {BREACH_SETTING_LOCATION} is on, which checks one password \
+             at a time on an item's own pane."
         )
     } else {
         format!(
-            "Breach data is unavailable: checking passwords against known breaches is off, so \
-             nothing here has been compared against a breach list. Turn it on in \
-             {BREACH_SETTING_LOCATION}."
+            "{source} The setting in {BREACH_SETTING_LOCATION} is off, so nothing is checked \
+             automatically when you open an item."
         )
     }
 }
@@ -570,7 +795,9 @@ pub fn draw_password_health(
                 // it a second time.
                 ui.set_width(ui.available_width());
                 draw_summary(ui, report);
-                if !report.reused.is_empty() {
+                let filter = draw_filters(ui);
+
+                if filter.shows_reused() && !report.reused.is_empty() {
                     section_heading(ui, REUSED_HEADING);
                     for group in &report.reused {
                         group_heading(ui, &reuse_group_heading(group));
@@ -582,7 +809,7 @@ pub fn draw_password_health(
                         }
                     }
                 }
-                if !report.weak.is_empty() {
+                if filter.shows_weak() && !report.weak.is_empty() {
                     section_heading(ui, WEAK_HEADING);
                     for weak in &report.weak {
                         let detail = weak_detail(weak);
@@ -592,6 +819,51 @@ pub fn draw_password_health(
                         }
                     }
                 }
+                if filter.shows_breached() {
+                    if !report.breached.is_empty() {
+                        section_heading(ui, BREACHED_HEADING);
+                        for group in &report.breached {
+                            group_heading(ui, &breach_group_heading(group));
+                            for item in &group.items {
+                                // **`breach_phrase`, per row.** The heading
+                                // gives the magnitude and whether these rows
+                                // are one password; the row gives the thing
+                                // to do about it, which does not vary by
+                                // count and is addressed to this item.
+                                let detail = crate::breach::breach_phrase(group.count);
+                                let selected =
+                                    selected_id.as_deref() == Some(item.id.as_str());
+                                if finding_row(ui, &item.name, Some(&detail), selected) {
+                                    *selected_id = Some(item.id.clone());
+                                }
+                            }
+                        }
+                    }
+                    // **Always drawn when there are any, under both filters
+                    // that show breach findings.** An item nobody could check
+                    // is not an item that is fine, and leaving it off the list
+                    // is the one failure this section exists to avoid.
+                    if !report.unknown.is_empty() {
+                        section_heading(ui, UNKNOWN_HEADING);
+                        group_heading(ui, UNKNOWN_NOTE);
+                        for item in &report.unknown {
+                            let selected = selected_id.as_deref() == Some(item.id.as_str());
+                            if finding_row(ui, &item.name, Some(UNKNOWN_ROW_DETAIL), selected) {
+                                *selected_id = Some(item.id.clone());
+                            }
+                        }
+                    }
+                }
+
+                // **An empty filter says so.** A pane that simply stopped
+                // after the chips reads as a screen that failed to load, and
+                // "nothing is wrong" is the answer the user came for -- the
+                // same argument `Summary` makes about the whole report.
+                if report.shown_under(filter) == 0 {
+                    ui.add_space(6.0);
+                    empty_line(ui, &nothing_under(filter, report));
+                }
+
                 ui.add_space(6.0);
                 footer_note(ui, &breach_note(breach_checking_on));
             });
@@ -599,6 +871,127 @@ pub fn draw_password_health(
                 ui,
                 scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
             );
+        });
+}
+
+/// What a row under [`UNKNOWN_HEADING`] says about itself.
+///
+/// Per row as well as in the band's note, because a row is what gets clicked
+/// through to an item and the pane behind it will show an ordinary password
+/// with no badge on it. "Unknown" has to travel with the row.
+pub const UNKNOWN_ROW_DETAIL: &str = "Not checked -- the lookup did not complete.";
+
+/// Height of a filter chip, and the gap between chips.
+const CHIP_HEIGHT: f32 = 26.0;
+const CHIP_GAP: f32 = 6.0;
+const CHIP_PAD_X: f32 = 12.0;
+
+/// The chip row, and the currently selected filter.
+///
+/// # The selection lives in egui's memory, not in the window's state
+///
+/// Deliberately. The vault window owns the vault, the selection and the
+/// screen; which of four cuts of ONE report is on screen is not a fact about
+/// the vault, it does not survive the window, and nothing outside this file
+/// reads it. Threading it through `vault_window::mod` would widen a signature
+/// two call sites away from the only thing that uses it -- and `content_fits`
+/// already keeps this pane's own per-frame memory here, under an `Id`, for
+/// the same reason.
+///
+/// It resets to `All` when the window closes, which is the right default: the
+/// screen opens on everything that is wrong.
+fn draw_filters(ui: &mut egui::Ui) -> HealthFilter {
+    let id = filter_id();
+    let mut chosen = ui
+        .ctx()
+        .data(|d| d.get_temp::<usize>(id))
+        .and_then(|i| HealthFilter::ALL.get(i).copied())
+        .unwrap_or(HealthFilter::All);
+
+    ui.add_space(2.0);
+    let previous_spacing = ui.spacing().item_spacing;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(CHIP_GAP, CHIP_GAP);
+        for filter in HealthFilter::ALL {
+            if chip(ui, filter.label(), filter == chosen) {
+                chosen = filter;
+                let index = HealthFilter::ALL.iter().position(|f| *f == filter).unwrap_or(0);
+                ui.ctx().data_mut(|d| d.insert_temp(id, index));
+            }
+        }
+    });
+    ui.spacing_mut().item_spacing = previous_spacing;
+    ui.add_space(2.0);
+    chosen
+}
+
+/// Where the chip row keeps its selection. One `Id`, named once, so the draw
+/// and [`show_filter`] cannot disagree about which slot they are using.
+fn filter_id() -> egui::Id {
+    egui::Id::new("password_health_filter")
+}
+
+/// Selects `filter`, as pressing its chip would.
+///
+/// For `examples/ui_preview`, which has to photograph each cut of one report
+/// and has no second frame to click on -- a chip's rect is not known until
+/// after the frame that draws it.
+///
+/// **It writes the pane's own storage, not a second copy of it.** There is
+/// one slot, under [`filter_id`], and the chip writes the same one; a
+/// screenshot taken after this call is the screenshot a user pressing that
+/// chip would get, or it is nothing.
+pub fn show_filter(ctx: &egui::Context, filter: HealthFilter) {
+    let index = HealthFilter::ALL.iter().position(|f| *f == filter).unwrap_or(0);
+    ctx.data_mut(|d| d.insert_temp(filter_id(), index));
+}
+
+/// One filter chip. Returns whether it was clicked.
+///
+/// The selected chip is the pane's own `BLUE_WASH` on `BLUE_DEEP`, which is
+/// what a selected finding row already uses -- so "this is the thing you are
+/// looking at" means one thing on this screen rather than two.
+fn chip(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::new(11.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::INK,
+    );
+    let width = galley.size().x + CHIP_PAD_X * 2.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, CHIP_HEIGHT), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(CHIP_HEIGHT as u8 / 2),
+        if selected {
+            theme::BLUE_WASH
+        } else if response.hovered() {
+            theme::CARD_TINT
+        } else {
+            theme::CARD
+        },
+    );
+    let at = egui::Pos2::new(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    let colour = if selected { theme::BLUE_DEEP } else { theme::TEXT_SECONDARY };
+    ui.painter().galley(at, galley, colour);
+    response.clicked()
+}
+
+/// The "nothing under this filter" line. On the pane's canvas rather than on
+/// a card, so it reads as an answer about the list and not as another finding.
+fn empty_line(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(theme::CANVAS)
+        .inner_margin(Margin::symmetric(2, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(text).size(12.0).color(theme::TEXT_SECONDARY));
         });
 }
 
@@ -652,6 +1045,66 @@ fn overflow_id() -> egui::Id {
 /// the pane that paints them cannot drift.
 pub const REUSED_HEADING: &str = "REUSED";
 pub const WEAK_HEADING: &str = "WEAK";
+/// The breach section's band. **"Found in breaches", not "BREACHED"**: the
+/// other two bands name a property of the password, and this one names
+/// something that happened to it somewhere else.
+pub const BREACHED_HEADING: &str = "FOUND IN BREACHES";
+/// The band over the passwords a scan asked about and could not settle.
+pub const UNKNOWN_HEADING: &str = "COULD NOT BE CHECKED";
+/// The line under that band, said once rather than per row.
+///
+/// **It says what the rows are NOT.** A list under a grey heading reads as a
+/// list of lesser problems; these are items with no answer at all, and the
+/// sentence has to rule out the reading that they came back clean.
+pub const UNKNOWN_NOTE: &str =
+    "The check for these did not complete, so nothing is known about them either way. Run the \
+     scan again.";
+/// What the pane says when the active filter has nothing in it.
+///
+/// **A result, not a blank space** -- `Summary`'s argument exactly. Four of
+/// these rather than one, because "no reused passwords" and "nothing has been
+/// scanned" are different answers and a single wording would have to be vague
+/// enough to cover both.
+pub fn nothing_under(filter: HealthFilter, report: &HealthReport) -> String {
+    match filter {
+        HealthFilter::All => "No reused, weak or breached passwords.".to_string(),
+        HealthFilter::Reused => "No password in this vault is used twice.".to_string(),
+        HealthFilter::Weak => "No password in this vault is weak.".to_string(),
+        // **The one filter whose empty state has two meanings**, and they are
+        // opposite claims: nothing was found, or nothing was looked at. An
+        // empty list cannot tell them apart, so the sentence does.
+        HealthFilter::Breached if !report.scanned => format!(
+            "No scan has been run, so nothing here has been compared against a breach list. \
+             The scan is in {SCAN_LOCATION}."
+        ),
+        HealthFilter::Breached => {
+            "None of the passwords the last scan checked was found in a breach.".to_string()
+        }
+    }
+}
+
+/// Where the scan button lives, named the way the user will find it.
+///
+/// Spelled here as its own literal for [`BREACH_SETTING_LOCATION`]'s reason,
+/// and pinned against `prefs_ui.rs` by the same test.
+pub const SCAN_LOCATION: &str = "Preferences > Breaches > \"Scan all passwords now\"";
+
+/// The heading over one breach group.
+///
+/// **Says whether these rows are one password or several**, from the reuse
+/// digests rather than from the count -- see [`BreachGroup`]. Three rows
+/// under one number is a different job of work depending on the answer, and
+/// this screen already knows it.
+pub fn breach_group_heading(group: &BreachGroup) -> String {
+    let times = crate::breach::breach_count_phrase(group.count);
+    match (group.items.len(), group.one_password) {
+        (1, _) => times,
+        (n, true) => format!("{times} -- one password, {n} items"),
+        // Same count, different passwords. Rare above a handful, and stated
+        // as the fact it is rather than as a guess either way.
+        (n, false) => format!("{times} -- {n} items, different passwords"),
+    }
+}
 
 /// The headline block. Drawn on a card in ordinary ink, exactly as a block
 /// with findings is -- an all-clear vault gets a result, not a grey
@@ -1322,10 +1775,32 @@ mod tests {
             concat!("eprintln", "!"),
             concat!("dbg", "!"),
             concat!("http", "_agent"),
-            concat!("brea", "ch::"),
             concat!("ureq", ""),
             concat!("Command", "::new"),
             concat!("std::fs", ""),
+            // **The four doors out of `crate::breach`, named one by one
+            // instead of banning the module.**
+            //
+            // The old needle was `breach::`, which was right while this
+            // screen displayed nothing from that module. It now displays
+            // breach findings -- from a scan the user pressed a button for,
+            // handed in as DATA -- so it legitimately names
+            // `breach::BreachStatus` and `breach::breach_phrase`, an enum and
+            // a formatter, neither of which can ask anything.
+            //
+            // A module ban would have had to be deleted wholesale to allow
+            // that, which would have left NO rule at all. These four are the
+            // ones that reach the network or hash a password, and each is
+            // banned by name:
+            //
+            //  * `check_prefix` and `build_agent` are the request.
+            //  * `BreachCache` is the request with a map in front of it.
+            //  * `split_hash` is the only way to build a `Prefix`, so a call
+            //    site with no `Prefix` cannot address the range API at all.
+            concat!("check_", "prefix"),
+            concat!("build_", "agent"),
+            concat!("Breach", "Cache"),
+            concat!("split_", "hash"),
         ] {
             assert!(
                 !source.contains(banned),
@@ -1338,6 +1813,20 @@ mod tests {
             source.contains("fn report_for"),
             "control: the production half was not read, so every needle above matched nothing"
         );
+        // The positive control on the four names above: they are real items
+        // in `crate::breach`, so banning them means something. A needle that
+        // had drifted would ban nothing and this guard would be vacuous.
+        let breach = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/breach.rs"),
+        )
+        .expect("breach.rs is readable");
+        for real in ["fn check_prefix", "fn build_agent", "struct BreachCache", "fn split_hash"] {
+            assert!(
+                breach.contains(real),
+                "`breach.rs` no longer declares `{real}`, so the ban on it above is a ban on \
+                 nothing"
+            );
+        }
     }
 
     /// This file's production half -- everything above the `#[cfg(test)]`
@@ -1430,6 +1919,313 @@ mod tests {
     }
 
     // ==================================================================
+    // Breach findings
+    // ==================================================================
+
+    /// A `ScanResults` holding exactly these answers.
+    ///
+    /// **Built through `breach_scan`'s own recorder**, not by reaching into a
+    /// private map: a fixture assembled by hand here would go on passing
+    /// after a scan stopped producing this shape. `ScanResults` cannot ask
+    /// anything -- it has no channel, no agent and no URL -- so nothing in
+    /// this file touches the network by writing into one.
+    fn scan_of(
+        answers: &[(&str, crate::breach::BreachStatus)],
+    ) -> crate::breach_scan::ScanResults {
+        let mut out = crate::breach_scan::ScanResults::default();
+        for (id, status) in answers {
+            out.set_status(&[(*id).to_string()], *status);
+        }
+        out
+    }
+
+    /// **Grouped by count, worst first.** A list in vault order buries the
+    /// 40,000-hit password under three that were seen twice.
+    #[test]
+    fn breach_findings_are_grouped_by_count_worst_first() {
+        let items = vec![
+            login("a", "Small", Some(STRONG_A)),
+            login("b", "Huge", Some(STRONG_B)),
+            login("c", "Middling", Some(STRONG_C)),
+        ];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[
+                ("a", crate::breach::BreachStatus::Breached(2)),
+                ("b", crate::breach::BreachStatus::Breached(40_231)),
+                ("c", crate::breach::BreachStatus::Breached(90)),
+            ]),
+        );
+        assert_eq!(
+            report.breached.iter().map(|g| g.count).collect::<Vec<_>>(),
+            vec![40_231, 90, 2],
+            "the groups are not worst-first"
+        );
+        assert!(report.scanned);
+    }
+
+    /// **Whether two items in one count group are one password is a FACT
+    /// here, not a guess.** The count alone cannot tell them apart; the reuse
+    /// digests can, and this screen has already computed them.
+    #[test]
+    fn a_group_says_whether_its_items_are_one_password() {
+        let shared = vec![
+            login("a", "Bank", Some(STRONG_A)),
+            login("b", "Shop", Some(STRONG_A)),
+        ];
+        let report = report_with_scan(
+            &shared,
+            &scan_of(&[
+                ("a", crate::breach::BreachStatus::Breached(7)),
+                ("b", crate::breach::BreachStatus::Breached(7)),
+            ]),
+        );
+        assert_eq!(report.breached.len(), 1);
+        assert!(
+            report.breached[0].one_password,
+            "two items on ONE password were reported as two passwords"
+        );
+        assert!(breach_group_heading(&report.breached[0]).contains("one password"));
+
+        // The coincidence: two DIFFERENT passwords with the same count. Rare
+        // above a handful, and stated as the fact it is rather than guessed.
+        let distinct = vec![
+            login("a", "Bank", Some(STRONG_A)),
+            login("b", "Shop", Some(STRONG_B)),
+        ];
+        let report = report_with_scan(
+            &distinct,
+            &scan_of(&[
+                ("a", crate::breach::BreachStatus::Breached(7)),
+                ("b", crate::breach::BreachStatus::Breached(7)),
+            ]),
+        );
+        assert_eq!(report.breached.len(), 1);
+        assert!(
+            !report.breached[0].one_password,
+            "two different passwords sharing a count were reported as one password"
+        );
+        assert!(breach_group_heading(&report.breached[0]).contains("different passwords"));
+
+        // A group of one claims neither way.
+        let single = report_with_scan(
+            &[login("a", "Bank", Some(STRONG_A))],
+            &scan_of(&[("a", crate::breach::BreachStatus::Breached(7))]),
+        );
+        assert!(!single.breached[0].one_password);
+        let heading = breach_group_heading(&single.breached[0]);
+        assert!(
+            !heading.contains("password"),
+            "a group of one made a claim about reuse: {heading}"
+        );
+    }
+
+    /// Each row carries `breach_phrase`, which is the thing to DO about it.
+    #[test]
+    fn a_breach_row_carries_the_phrase_and_the_heading_carries_the_count() {
+        let items = vec![login("a", "Bank", Some(STRONG_A))];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[("a", crate::breach::BreachStatus::Breached(40_231))]),
+        );
+        let ctx = styled_context();
+        let mut selected = None;
+        let frame = painted(&ctx, &report, &mut selected, false, None);
+        let strings = texts(&frame);
+        assert!(strings.contains(&BREACHED_HEADING), "got {strings:?}");
+        assert!(
+            strings.contains(&crate::breach::breach_phrase(40_231).as_str()),
+            "the row does not carry its breach phrase: {strings:?}"
+        );
+        assert!(
+            strings.iter().any(|t| t.contains("40,231")),
+            "the count is not grouped by thousands anywhere on screen: {strings:?}"
+        );
+    }
+
+    /// **A password that could not be checked is LISTED, never omitted.**
+    /// "Not shown" reading as "safe" is the failure that matters here.
+    #[test]
+    fn a_password_that_could_not_be_checked_shows_as_unknown() {
+        let items = vec![
+            login("a", "Bank", Some(STRONG_A)),
+            login("b", "Shop", Some(STRONG_B)),
+        ];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[
+                ("a", crate::breach::BreachStatus::Unavailable),
+                ("b", crate::breach::BreachStatus::Safe),
+            ]),
+        );
+        assert_eq!(
+            report.unknown.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Bank"],
+            "the item nobody could check is not on the list, so its absence reads as safe"
+        );
+        assert!(report.breached.is_empty());
+        // And it counts toward the rail's badge, for the same reason.
+        assert_eq!(report.flagged_items(), 1);
+
+        let ctx = styled_context();
+        let mut selected = None;
+        let frame = painted(&ctx, &report, &mut selected, false, None);
+        let strings = texts(&frame);
+        assert!(strings.contains(&UNKNOWN_HEADING), "got {strings:?}");
+        assert!(strings.contains(&"Bank"), "got {strings:?}");
+        assert!(strings.contains(&UNKNOWN_ROW_DETAIL), "got {strings:?}");
+        assert!(
+            !strings.contains(&"Shop"),
+            "a password that came back SAFE was listed; only findings belong on this screen"
+        );
+    }
+
+    /// Only findings are listed, in every state: a vault of clean logins
+    /// paints no rows at all, and says so.
+    #[test]
+    fn a_clean_scan_lists_nothing_and_says_so() {
+        let items = vec![
+            login("a", "Bank", Some(STRONG_A)),
+            login("b", "Shop", Some(STRONG_B)),
+        ];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[
+                ("a", crate::breach::BreachStatus::Safe),
+                ("b", crate::breach::BreachStatus::Safe),
+            ]),
+        );
+        assert!(report.breached.is_empty() && report.unknown.is_empty());
+        assert_eq!(report.flagged_items(), 0);
+        let ctx = styled_context();
+        let mut selected = None;
+        let frame = painted(&ctx, &report, &mut selected, false, None);
+        assert!(
+            texts(&frame).contains(&nothing_under(HealthFilter::All, &report).as_str()),
+            "got {:?}",
+            texts(&frame)
+        );
+    }
+
+    /// **"Nothing was found" and "nobody looked" are opposite claims**, and
+    /// an empty list cannot tell them apart -- so the sentence does.
+    #[test]
+    fn an_unscanned_vault_and_a_clean_scan_say_different_things() {
+        let items = vec![login("a", "Bank", Some(STRONG_A))];
+        let unscanned = report_for(&items);
+        let clean =
+            report_with_scan(&items, &scan_of(&[("a", crate::breach::BreachStatus::Safe)]));
+        assert!(!unscanned.scanned && clean.scanned);
+        let never = nothing_under(HealthFilter::Breached, &unscanned);
+        let ran = nothing_under(HealthFilter::Breached, &clean);
+        assert_ne!(never, ran);
+        assert!(never.contains("No scan has been run"), "{never}");
+        assert!(
+            never.contains(SCAN_LOCATION),
+            "the empty state does not say where the scan is: {never}"
+        );
+        assert!(ran.contains("None of the passwords"), "{ran}");
+    }
+
+    /// Items with no password stay outside the report, exactly as they do for
+    /// reuse and weakness. A card is not "unknown"; there is nothing to know.
+    #[test]
+    fn an_item_with_no_password_is_never_unknown() {
+        let items = vec![bare("card", "A card"), login("empty", "Blank", Some(""))];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[
+                ("card", crate::breach::BreachStatus::Unavailable),
+                ("empty", crate::breach::BreachStatus::Unavailable),
+            ]),
+        );
+        assert!(report.unknown.is_empty(), "got {:?}", report.unknown);
+    }
+
+    // -- the filters -------------------------------------------------------
+
+    /// Each filter narrows to its own findings and `All` is the union.
+    /// Asserted on the pure counter, so the four cuts are checked without
+    /// four rendered frames.
+    #[test]
+    fn each_filter_shows_its_own_findings_and_all_shows_every_one() {
+        let items = vec![
+            login("a", "Bank", Some(STRONG_A)),
+            login("b", "Shop", Some(STRONG_A)),
+            login("c", "Weak", Some("abc")),
+            login("d", "Breached", Some(STRONG_B)),
+            login("e", "Unknown", Some(STRONG_C)),
+        ];
+        let report = report_with_scan(
+            &items,
+            &scan_of(&[
+                ("d", crate::breach::BreachStatus::Breached(9)),
+                ("e", crate::breach::BreachStatus::Unavailable),
+            ]),
+        );
+        assert_eq!(report.shown_under(HealthFilter::Reused), 2);
+        assert_eq!(report.shown_under(HealthFilter::Weak), 1);
+        assert_eq!(
+            report.shown_under(HealthFilter::Breached),
+            2,
+            "the breached filter shows the found AND the unchecked"
+        );
+        assert_eq!(
+            report.shown_under(HealthFilter::All),
+            5,
+            "`All` is every distinct flagged item"
+        );
+    }
+
+    /// The chips are painted, clicking one narrows the list, and a filter
+    /// with nothing in it says so rather than leaving a blank pane.
+    #[test]
+    fn clicking_a_filter_chip_narrows_the_list() {
+        let items = vec![
+            login("a", "Reused One", Some(STRONG_A)),
+            login("b", "Reused Two", Some(STRONG_A)),
+            login("c", "Weak One", Some("abc")),
+        ];
+        let report = report_for(&items);
+        let ctx = styled_context();
+        let mut selected = None;
+
+        let first = painted(&ctx, &report, &mut selected, false, None);
+        for chip in HealthFilter::ALL {
+            assert!(
+                texts(&first).contains(&chip.label()),
+                "chip {:?} is missing: {:?}",
+                chip.label(),
+                texts(&first)
+            );
+        }
+        assert!(texts(&first).contains(&"Reused One"));
+        assert!(texts(&first).contains(&"Weak One"));
+
+        // Press "Weak".
+        let at = locate(&first, HealthFilter::Weak.label());
+        let narrowed = painted(&ctx, &report, &mut selected, false, Some(at));
+        assert!(texts(&narrowed).contains(&"Weak One"), "got {:?}", texts(&narrowed));
+        assert!(
+            !texts(&narrowed).contains(&"Reused One"),
+            "the Weak filter still lists the reuse findings: {:?}",
+            texts(&narrowed)
+        );
+        assert!(!texts(&narrowed).contains(&REUSED_HEADING));
+
+        // Press "Breached", which has nothing in it under this vault.
+        let at = locate(&narrowed, HealthFilter::Breached.label());
+        let empty = painted(&ctx, &report, &mut selected, false, Some(at));
+        assert!(!texts(&empty).contains(&"Weak One"), "got {:?}", texts(&empty));
+        assert!(
+            texts(&empty).contains(&nothing_under(HealthFilter::Breached, &report).as_str()),
+            "an empty filter drew nothing at all, which reads as a screen that failed to load: \
+             {:?}",
+            texts(&empty)
+        );
+    }
+
+    // ==================================================================
     // Breach data being off
     // ==================================================================
 
@@ -1440,12 +2236,25 @@ mod tests {
         let off = breach_note(false);
         let on = breach_note(true);
         assert_ne!(off, on, "the note says the same thing whether or not the setting is on");
-        assert!(off.contains("unavailable"), "{off}");
-        assert!(!on.contains("unavailable"), "{on}");
+        assert!(off.contains("is off"), "{off}");
+        assert!(on.contains("is on"), "{on}");
         for note in [&off, &on] {
             assert!(
                 note.contains(BREACH_SETTING_LOCATION),
                 "the note does not say where the setting is: {note}"
+            );
+            // **Both states say where the findings came from**, which is the
+            // half that matters now that there ARE findings: a list of
+            // breached items over a footer that did not say they came from a
+            // scan the user ran would read as this screen having checked
+            // them.
+            assert!(
+                note.contains(SCAN_LOCATION),
+                "the note does not say where the scan is: {note}"
+            );
+            assert!(
+                note.contains("nothing here checks anything"),
+                "the note stopped saying that this screen makes no lookup: {note}"
             );
         }
     }
@@ -1499,10 +2308,16 @@ mod tests {
         ];
         let report = report_for(&items);
         assert_eq!(report.reused.len(), 1, "control: the report really did run");
-        // `report_for` takes no network handle, no `BreachCache` and no
-        // setting, so there is no argument through which a lookup could be
-        // made. The source pin above is the other half of this claim.
-        assert!(breach_note(true).contains("not part of this report"));
+        // Neither entry point takes a network handle, an agent or a setting.
+        // `report_with_scan`'s only breach-shaped parameter is a
+        // `ScanResults` -- a map of answers with no channel, no URL and no
+        // way to ask anything -- so there is no argument through which a
+        // lookup could be made and no branch a future reader could flip. The
+        // source pin above is the other half of this claim.
+        let scanned = report_with_scan(&items, &crate::breach_scan::ScanResults::default());
+        assert_eq!(scanned, report, "an empty scan is exactly the plain report");
+        assert!(!scanned.scanned, "an empty map is not a scan that ran");
+        assert!(breach_note(true).contains("nothing here checks anything"));
     }
 
     // ==================================================================

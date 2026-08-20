@@ -2117,7 +2117,13 @@ pub fn build_frame(
         // per password-bearing item plus an O(n log n) index sort -- see
         // `password_health`'s own complexity note -- against a window whose
         // ambient repaint cadence is `FRAME_INTERVAL`.
-        let health = password_health::report_for(&items);
+        // **The scan's findings are DATA, handed in.** `report_with_scan`
+        // takes a map of answers, not a network handle -- there is no
+        // argument to it through which a lookup could be made, which is what
+        // keeps "this screen checks nothing" structural rather than a branch
+        // someone could flip. See `password_health`'s module header.
+        let health =
+            password_health::report_with_scan(&items, &crate::breach_scan::results());
         // **The refetch policy.** Leaving the Sends screen drops the list, so
         // the next visit asks the server again. Both halves of that -- the
         // rule and the remembering -- live in `SendFetch::note_screen`, where

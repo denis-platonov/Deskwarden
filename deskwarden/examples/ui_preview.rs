@@ -269,6 +269,25 @@ enum Surface {
     /// local timestamp and outcome -- including one that failed, so the two
     /// inks are in one picture.
     PrefsBreachesHistory,
+    /// **The Password health screen with breach findings on it**, All filter.
+    ///
+    /// The state the whole breach half exists for, and the one no rect
+    /// assertion answers: whether four bands of findings in one column read
+    /// as four groups or as one long run -- and whether the reused password
+    /// that is ALSO breached is visibly the same item in two lists rather
+    /// than looking like two problems.
+    VaultHealthBreached,
+    /// The same report under **Reused**, **Weak** and **Breached**. Three
+    /// pictures rather than one, because the thing being reviewed is what a
+    /// narrowed list looks like -- including a band that is the only thing on
+    /// the page.
+    VaultHealthReusedOnly,
+    VaultHealthWeakOnly,
+    VaultHealthBreachedOnly,
+    /// **The Password health screen with a filter that has nothing in it.**
+    /// The empty line is a result and not a blank pane, and this is where
+    /// that is looked at.
+    VaultHealthEmptyFilter,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -404,6 +423,11 @@ const ALL: &[Surface] = &[
     Surface::VaultList,
     Surface::VaultRail,
     Surface::VaultHealth,
+    Surface::VaultHealthBreached,
+    Surface::VaultHealthReusedOnly,
+    Surface::VaultHealthWeakOnly,
+    Surface::VaultHealthBreachedOnly,
+    Surface::VaultHealthEmptyFilter,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
 ];
@@ -447,6 +471,11 @@ impl Surface {
             Surface::VaultList => "vault_item_list",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
+            Surface::VaultHealthBreached => "vault_password_health_breached",
+            Surface::VaultHealthReusedOnly => "vault_password_health_reused",
+            Surface::VaultHealthWeakOnly => "vault_password_health_weak",
+            Surface::VaultHealthBreachedOnly => "vault_password_health_breached_only",
+            Surface::VaultHealthEmptyFilter => "vault_password_health_empty_filter",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
         }
@@ -533,7 +562,12 @@ impl Surface {
             // other width is a picture of a pane nobody ships -- and this
             // surface is entirely about what happens at the column's right
             // edge.
-            Surface::VaultHealth => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            Surface::VaultHealth
+            | Surface::VaultHealthBreached
+            | Surface::VaultHealthReusedOnly
+            | Surface::VaultHealthWeakOnly
+            | Surface::VaultHealthBreachedOnly
+            | Surface::VaultHealthEmptyFilter => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -871,7 +905,14 @@ impl eframe::App for Preview {
             Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
-            Surface::VaultHealth => self.draw_vault_health(root),
+            Surface::VaultHealth
+            | Surface::VaultHealthBreached
+            | Surface::VaultHealthReusedOnly
+            | Surface::VaultHealthWeakOnly
+            | Surface::VaultHealthBreachedOnly
+            | Surface::VaultHealthEmptyFilter => {
+                self.draw_vault_health(root, self.current())
+            }
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
         }
@@ -1431,8 +1472,62 @@ impl Preview {
     /// alone, and a weak finding, whose row is a name over a detail line.
     /// They are the two different vertical layouts the row has, and the long
     /// name is in both.
-    fn draw_vault_health(&mut self, root: &mut egui::Ui) {
-        let report = password_health::report_for(&self.fixtures.health);
+    /// The Password health screen, with and without a scan behind it, and
+    /// under each of its four filters.
+    ///
+    /// **Nothing here reaches the network, and the type says so**:
+    /// `report_with_scan` takes a `ScanResults` -- a map of answers with no
+    /// channel, no agent and no URL -- and the answers below are stated
+    /// outright rather than looked up.
+    ///
+    /// The filter is egui memory under an `Id`, which is where the pane keeps
+    /// it, so it is set the way a click sets it: by pressing the chip. That
+    /// is deliberately not a back door into the pane's state -- the picture
+    /// shows what a user pressing that chip would see, or it shows nothing.
+    fn draw_vault_health(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::breach::BreachStatus;
+        use deskwarden::breach_scan::ScanResults;
+
+        let mut scan = ScanResults::default();
+        if !matches!(surface, Surface::VaultHealth) {
+            // `health-long` is one of the pair on a reused password, so the
+            // group it lands in is a REUSED password that is also breached --
+            // the most urgent thing a vault can hold, and the case that
+            // cross-cuts the two sections.
+            scan.set_status(&["health-long".to_string(), "health-short".to_string()],
+                BreachStatus::Breached(40_231));
+            scan.set_status(&["health-breached".to_string()], BreachStatus::Breached(3));
+            // Asked about, no answer. Listed as unknown rather than left out:
+            // "not shown" reading as "safe" is the failure this section is
+            // arranged against.
+            scan.set_status(&["health-unknown".to_string()], BreachStatus::Unavailable);
+            scan.set_status(&["health-weak".to_string()], BreachStatus::Safe);
+        }
+        let report = password_health::report_with_scan(&self.fixtures.health, &scan);
+
+        // Which chip to press, if any. `EmptyFilter` presses Breached over a
+        // report with no scan behind it, which is the state whose whole point
+        // is the sentence it draws instead of a list.
+        let chip = match surface {
+            Surface::VaultHealthReusedOnly => Some(password_health::HealthFilter::Reused),
+            Surface::VaultHealthWeakOnly => Some(password_health::HealthFilter::Weak),
+            Surface::VaultHealthBreachedOnly | Surface::VaultHealthEmptyFilter => {
+                Some(password_health::HealthFilter::Breached)
+            }
+            _ => None,
+        };
+        let report = if matches!(surface, Surface::VaultHealthEmptyFilter) {
+            password_health::report_for(&self.fixtures.health)
+        } else {
+            report
+        };
+
+        // Written into the SAME egui memory the chip writes -- the pane's own
+        // storage, not a second copy of it -- because a chip's rect is not
+        // known until after the frame that draws it, and a screenshot run has
+        // no second frame to click on.
+        password_health::show_filter(root.ctx(), chip.unwrap_or(password_health::HealthFilter::All));
+
         let selected = &mut self.health_selected;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
@@ -1878,6 +1973,14 @@ const HEALTH_JSON: &str = r#"[
     "id": "health-weak", "type": 1,
     "name": "Meridian Freight Bill Pay | Invoices, Statements & Payment History",
     "login": { "username": "anna@northwind.example", "password": "meridian9" }
+  },
+  {
+    "id": "health-breached", "type": 1, "name": "Harbourline Rail",
+    "login": { "username": "anna@northwind.example", "password": "harbour-single-use" }
+  },
+  {
+    "id": "health-unknown", "type": 1, "name": "Cantilever Studio",
+    "login": { "username": "anna@northwind.example", "password": "cantilever-single-use" }
   }
 ]"#;
 

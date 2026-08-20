@@ -50,6 +50,46 @@ the same claim as saying nobody is signed in.
 There was an eight-point strip of window background between the bottom of the
 titlebar and the top of the left-hand navigation column.
 
+### Check every password in the vault against known breaches
+
+A new **Breaches** page in Preferences, with a **Scan all passwords now**
+button on it. The switch that used to sit on General moved here, so the
+setting, the button and the sentence explaining the difference between them
+are readable in one glance.
+
+- **The button always scans, whatever the setting says.** Pressing it is you
+  asking for the check, in the same breath as consenting to it. What the
+  setting governs is what Deskwarden does *on its own* -- the breach badge on
+  an item you open -- and the page says exactly that, under the button.
+- **Nothing scans by itself.** Not on opening the app, not on unlocking, not
+  on a timer, and not when you open the health report. A scan happens because
+  you pressed the button, and there is no other way to start one.
+- **One request per distinct password, not per item.** A vault where the same
+  password is on six logins asks about it once, so a large vault is far fewer
+  requests than it has entries. Four requests at a time, never more: Have I
+  Been Pwned is free and run at somebody else's expense.
+- **A check that fails is counted and shown**, while the scan runs and after
+  it finishes. A run that says "checked 60, found 3" while 40 lookups failed
+  is a lie you would go on trusting, so the failures are the last thing every
+  sentence says. Each lookup is retried twice before it is given up on.
+
+### Password health shows what the scan found
+
+The report gains a **Found in breaches** section, grouped by how many times
+each password was seen, worst first, with the advice on every row.
+
+- **Filters: All, Reused, Weak, Breached.** Only findings are ever listed,
+  under every filter -- a list of two hundred healthy logins buries the six
+  that matter -- and a filter with nothing in it says so instead of leaving a
+  blank pane.
+- **A password that could not be checked is shown as unknown**, never left
+  out. "Not on the list" must never come to mean "fine".
+- **A group of items under one breach count says whether they really are one
+  password.** The report already knows: the reuse grouping is exact, so it is
+  stated as a fact rather than left as an inference.
+- **The screen still checks nothing itself.** It displays what a scan you ran
+  produced, and the footer says so in both states of the setting.
+
 ### Breach scans are recorded, as counts and nothing else
 
 The last twenty scans are kept in `scan_history.json`, beside `settings.json`
