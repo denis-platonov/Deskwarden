@@ -10,6 +10,48 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Card rows name the network beside the icon, not over it
+
+A card row drew its network badge inside the bank icon's tile, overlapping
+the artwork in the lower-right corner. It now sits **beside** the tile: icon,
+then the network in its pill, then the name and its `(*9988)` suffix.
+
+- **The networks are spelled out.** `MC`, `DC`, `DISC` and `UP` were never an
+  abbreviation style -- they were the 32pt tile the badge had to fit inside.
+  They are now `MASTERCARD`, `DINERS`, `DISCOVER` and `UNIONPAY`. `AMEX`
+  stays as it is: `AMERICAN EXPRESS` measures a third of the row.
+- **The pill is set well below the name**, at 9pt against its 13. The card's
+  name is the thing being identified and its network is a qualifier on it,
+  and that is what the type sizes now say. The size was chosen off a rendered
+  ladder of four candidates read unmagnified, not by argument.
+- **The icon, the pill and the name sit on one line** -- their ink, not the
+  boxes their ink sits in, which is what "the same mid line" means to a
+  reader and what the row was missing.
+- **A long name still truncates properly.** The pill is taken out of the
+  row's width before the name is laid into what is left, so a name that has
+  to be cut is cut a little sooner rather than running underneath the pill.
+- A card with no bank icon now shows the same monogram tile every other row
+  without an icon shows, instead of the network filling the tile.
+
+### The card brand list matches Bitwarden's, one for one
+
+- **American Express interoperates again.** This app stored the brand as
+  `American Express`; Bitwarden's value is `Amex`. Cards created here showed
+  no card art in the web vault, and Amex cards created anywhere else showed
+  no network mark in the item list here. Cards already carrying the old
+  spelling keep working.
+- **Maestro and RuPay are recognised**, both as a stored brand and, where the
+  digits are unambiguous, from the number. RuPay numbers in the `6521`/`6522`
+  block are left to Discover rather than guessed at -- picking either way
+  would mis-read real cards of the other network.
+- **`Other` is offered**, as Bitwarden offers it, and shows an `OTHER` mark.
+  It is a brand and not a network: a card marked `Other` is masked and
+  grouped exactly as a card with no brand at all is.
+
+### Smaller things
+
+- The card pane's **"Cardholder name" row is now just "Cardholder"**, and the
+  copy shortcut's description says the same.
 ### "What's new" reads like release notes
 
 The update panel showed a GitHub release body as literal characters, so `**`

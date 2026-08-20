@@ -695,6 +695,27 @@ pub fn truncated_galley(
 /// a full pixel, which is plainly visible when one sits directly above the
 /// other. Painting each at `x - ink_offset_x(galley)` aligns the ink rather
 /// than the origins.
+/// Where a laid-out run's INK is centred, measured down from the top of its
+/// own box.
+///
+/// The vertical companion to [`ink_offset_x`], read off the same `uv_rect`.
+/// A galley's box is ascent plus descent and a reader sees neither: two runs
+/// whose boxes are centred on one another still print visibly apart when
+/// their faces or their sizes differ, which is what "not on the same mid
+/// line" looks like. `None` for a run with no glyphs, where there is no ink
+/// to centre and the caller should leave the box alone.
+pub fn ink_center_y(galley: &egui::Galley) -> Option<f32> {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for row in galley.rows.iter() {
+        for glyph in row.glyphs.iter() {
+            let top = row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+            lo = lo.min(top);
+            hi = hi.max(top + glyph.uv_rect.size.y);
+        }
+    }
+    lo.is_finite().then(|| (lo + hi) / 2.0)
+}
+
 pub fn ink_offset_x(galley: &egui::Galley) -> f32 {
     galley
         .rows
