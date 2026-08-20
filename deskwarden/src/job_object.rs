@@ -2089,7 +2089,21 @@ mod tests {
             // path or fork appeared, and `[build-dependencies]` still reads
             // exactly `winresource = "0.1"`. 8005 -> 8522 bytes, all of it
             // the feature name and the comment above it.
-            (8522, 0xb549_b838_915f_11fb_u64),
+            //
+            // Re-pinned for a FEATURE edit, not a dependency move: ONE
+            // feature was added to the `windows` dependency that was already
+            // here -- `Win32_System_RemoteDesktop` -- for
+            // `src/single_instance.rs`, which calls `ProcessIdToSessionId` so
+            // that the forced half of a takeover ends a process only when it
+            // is in THIS logon session. That is the scope the app mutex is
+            // named in, and without the check a relaunch could terminate
+            // another signed-in user's Deskwarden. **No dependency moved**:
+            // no name was added, removed or re-pointed, no
+            // `[patch]`/`[replace]` table was introduced, no path or fork
+            // appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 8522 -> 8837 bytes, all of it the
+            // feature name and the comment above it.
+            (8837, 0x9868_dead_31f9_cc0c_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
