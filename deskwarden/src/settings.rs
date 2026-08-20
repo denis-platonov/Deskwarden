@@ -744,7 +744,8 @@ pub struct Settings {
     /// vault window is open; reads come from `VaultCache` either way, so
     /// autofill is unaffected.
     pub keep_backend_running: bool,
-    /// Whether focusing a matched window raises the autofill prompt.
+    /// Whether the overlay may raise itself at all -- **for any window, not
+    /// only a matched one**.
     ///
     /// **This is the whole of the automatic half of autofill, and it is one
     /// global switch rather than a choice per vault item.** `true` (the
@@ -753,6 +754,27 @@ pub struct Settings {
     /// nothing is typed until the user clicks Fill on it. `false` means a
     /// match does nothing at all on its own, and the fill hotkey
     /// (`CTRL+ALT+B`) is the only way anything is typed.
+    ///
+    /// **The scope was widened, and the name was not.** As shipped this field
+    /// reached exactly one decision -- [`crate::app::match_disposition`], on
+    /// the matched path -- so turning the prompt off silenced the overlay for
+    /// the apps the user *had* saved a login for and left the no-match card
+    /// (design 3a) and the locked card (3b) appearing for the apps they had
+    /// not. That is backwards, and it is what a user reported. It is now read
+    /// on both paths: [`crate::app::overlay_prompts`] feeds
+    /// [`crate::app::disposition`], which suppresses those two cards, and
+    /// `match_disposition` goes on answering for the matched one. One switch,
+    /// because "disabled in settings" plainly means every pop-up, and because
+    /// a second switch for the unmatched cards would leave a user who had
+    /// already turned this off still being prompted until they found it.
+    ///
+    /// **The identifier and the JSON key both keep the historic name**, which
+    /// now describes less than the field does. That is deliberate: the key is
+    /// in every existing `settings.json`, so leaving it alone means an
+    /// upgrading user's choice survives untouched and a downgrade cannot lose
+    /// it -- and the name is referenced from four other modules' documentation
+    /// besides. The name that a user actually reads is the preferences label,
+    /// and that one was corrected; see `prefs_ui::PROMPT_LABEL`.
     ///
     /// **Neither state fills silently**, which is the reason this replaced
     /// the per-item `AppMatch::trigger`. That enum's `Auto` mode filled the

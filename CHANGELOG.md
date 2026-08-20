@@ -10,6 +10,21 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### The autofill prompt setting now silences every pop-up, not half of them
+
+Turning **Prompt on match** off in Preferences stopped the overlay for apps
+you had saved a login for, and left the "No saved login for <app>" card
+appearing for the apps you had not -- which is the wrong half. The setting is
+now the one switch for every card the overlay raises on its own.
+
+- **Off means nothing opens by itself**: no fill prompt, no "no saved login"
+  card, no "Deskwarden is locked" card. `CTRL+ALT+B` still fills a matched
+  window, exactly as before -- this was never an autofill switch and still is
+  not.
+- **The toggle is called "Show autofill prompts"** now, because "on match" was
+  no longer true of what it governs. Nothing on disk changed: your existing
+  choice is read and written under the same key, so an upgrade keeps it.
+
 ### Starting up is one window now, not two
 
 Launching Deskwarden while it still had a good session showed a small

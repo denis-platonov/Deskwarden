@@ -3023,6 +3023,13 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // every event rather than captured once: the preferences window writes
     // straight back into that binding, so a user who turns the prompt off has
     // it off for the very next window they focus.
+    //
+    // **It now reaches two decisions, not one.** `handle_match` asks
+    // `app::match_disposition` about it for the matched card, and the
+    // `disposition` call below asks `app::overlay_prompts` about it for the
+    // two unmatched ones. Until it did the second, turning the prompt off
+    // silenced the overlay for apps the user had saved a login for and left
+    // the no-match card appearing for the apps they had not.
     prompt_on_match: bool,
     // Whether this process can currently answer for the vault's contents at
     // all, read from `cache.is_populated()` at the ONE call site rather than
@@ -3119,7 +3126,18 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
         deskwarden::app::window_label(&event.exe_name, &event.title),
     );
 
-    match deskwarden::app::disposition(matched, field, vault, never) {
+    // The fifth input, computed inline in the call so that
+    // `the_production_dispatch_gates_the_unmatched_cards` can pin the whole
+    // expression: the setting read out of the path is a mutation no
+    // behavioural test in this crate can see, because every test here drives
+    // `disposition` directly.
+    match deskwarden::app::disposition(
+        matched,
+        field,
+        vault,
+        never,
+        deskwarden::app::overlay_prompts(prompt_on_match),
+    ) {
         Open::Match(item_id) => {
             log::info!(
                 "matched {} to vault item {item_id} ({:?})",
@@ -21076,103 +21094,92 @@ mod tests {
             );
         }
 
-        /// **Finding 1, and the retirement of `Auto`, in one test.**
+        /// **The gate on the unmatched cards reaches `disposition`, on the
+        /// one line no test can execute.**
         ///
-        /// The item's own `trigger` is `Auto` -- the mode that used to type
-        /// the password the instant this window took focus, through a
-        /// `SendInput` fallback that on a real desktop is *always* the path
-        /// taken. With the global prompt off, nothing may be typed: the match
-        /// arms the hotkey and stops. An empty `Filled` here is the whole
-        /// point of the change, and `pending_hotkey_fill` is what proves
-        /// `handle_match` was nonetheless called -- deleting that call leaves
-        /// this `None`.
-        ///
-        /// Nothing here may reach the network: no arm below `false` reads the
-        /// vault, and a bridge pointed at a closed port proves it.
+        /// Every dispatching test in this module drives
+        /// `process_foreground_event` with a literal for the prompt, so what
+        /// nothing here can observe is the production expression: an
+        /// `overlay_prompts(true)` in place of the user's setting puts the
+        /// no-match card back for everyone who switched it off -- the reported
+        /// defect, exactly. That mutant compiles and leaves the whole suite
+        /// green, so it is pinned by source text, as this file already pins
+        /// the notifier and the setting itself.
         #[test]
-        fn a_match_is_never_filled_on_focus_however_its_own_trigger_reads() {
+        fn the_production_dispatch_gates_the_unmatched_cards() {
+            let source = include_str!("main.rs");
+            // Split literals, so this test's own text is not the match.
+            let prompt = concat!("app::overlay_prompts", "(prompt_on_match),");
+            assert_eq!(
+                source.matches(prompt).count(),
+                1,
+                "the unmatched cards are no longer gated on the user's prompt setting: a \
+                 literal in its place means `Prompt on match` silences the overlay for the \
+                 apps the user HAS saved a login for and leaves it popping up for the ones \
+                 they have not, which is the defect this gate exists for"
+            );
+        }
+
+        /// **Defect 1 at the dispatch level, with its own positive control.**
+        ///
+        /// The same fixture twice, one argument apart: with the prompt off no
+        /// card goes up for an unmatched window that has a password field, and
+        /// with it on the very same window still gets design 3a. The second
+        /// half is what stops this test being satisfied by an overlay that
+        /// never opens at all -- which is what every other assertion about
+        /// this fix would accept.
+        ///
+        /// Two separate `last_dispatched_hwnd` bindings, and two hwnds: a
+        /// repeat foreground event for the same window is suppressed by
+        /// `dispatch::should_dispatch` before any of this is reached, so
+        /// re-using one would make the second half assert about an event that
+        /// was thrown away.
+        #[test]
+        fn the_prompt_setting_gates_the_no_match_card_and_leaves_it_working_when_on() {
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
-            let engine = engine_with(&[(
-                "1",
-                AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto),
-            )]);
+            let engine = engine_with(&[]);
             let filled = Filled::default();
             let (stats, _path) = scratch_fill_stats();
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
-            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            assert!(take_no_match_shown().is_empty(), "control: the recorder starts empty");
 
             process_foreground_event(
-                &window("Ledgerline.exe", "Ledgerline -- Invoices", 0x4321),
+                &window("AtlasLicence.exe", "Atlas Licence", 0x901),
                 &cache,
                 &recording_injector(&filled),
                 &stats,
                 &engine,
+                // The user turned `Prompt on match` off in Preferences.
                 false,
                 deskwarden::app::VaultAvailability::Readable,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
-                &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
+                &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
                 &recorder(),
                 &mut no_reprompt(),
             );
 
-            assert!(
-                filled.seen().is_empty(),
-                "a stored `Auto` trigger filled on focus. That mode is retired: with the \
-                 global prompt off NOTHING is typed without the user pressing the fill hotkey, \
-                 and the fill falls back to blind SendInput into whatever holds focus"
-            );
-            assert_eq!(stats.count("1"), 0, "nothing was filled, so nothing is counted");
             assert_eq!(
-                pending_hotkey_fill,
-                Some(("1".to_string(), 0x4321)),
-                "the match must still arm (item, hwnd) for the loop's separate fill-hotkey \
-                 check. `None` means `handle_match` was never called, or its answer is being \
-                 dropped -- either way Ctrl+Alt+B fills nothing and, with the prompt off, \
-                 autofill is switched off entirely"
+                last_dispatched_hwnd,
+                Some(0x901),
+                "control: the event reached the decision rather than being discarded before it"
             );
-            assert_eq!(last_dispatched_hwnd, Some(0x4321));
-        }
-
-        /// **The second trigger, end to end through the real dispatch -- and
-        /// the two things it must NOT touch.**
-        ///
-        /// `disposition`'s own tests hold the decision; this holds the wiring,
-        /// which is the half that has repeatedly been the defect in this file.
-        /// An unmatched window with a password field must reach `Open::NoMatch`
-        /// and, from there:
-        ///
-        /// * **arm nothing.** There is no item, so there is no id for
-        ///   `pending_hotkey_fill` to carry, and a `Some` here would mean a
-        ///   later Ctrl+Alt+B fired at a window with no credentials behind it.
-        /// * **type nothing.** `Filled` empty. The no-match card offers a user
-        ///   a way forward; it never types.
-        /// * **not reach the re-prompt gate at all.** `permitted_by_reprompt`
-        ///   is defined over an existing item and cannot be asked without one.
-        ///   `strict_reprompt()` below is a gate that would REFUSE if it were
-        ///   consulted, and the assertion is that nothing was refused because
-        ///   nothing was asked -- the fill path was never entered.
-        ///
-        /// The bridge is pointed at a closed port, so any arm that read the
-        /// vault would fail rather than silently succeed.
-        #[test]
-        fn an_unmatched_window_with_a_password_field_arms_nothing_and_types_nothing() {
-            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
-            // Deliberately empty: nothing in the vault claims this window.
-            let engine = engine_with(&[]);
-            let filled = Filled::default();
-            let (stats, _path) = scratch_fill_stats();
-            let mut pending_hotkey_fill = None;
-            let mut last_dispatched_hwnd = None;
-            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
             assert!(
                 take_no_match_shown().is_empty(),
-                "control: the recorder starts empty, so the assertion below is about THIS call"
+                "the prompt is off and the no-match card went up anyway -- the reported \
+                 defect: the setting silenced the overlay for apps with a saved login and \
+                 left it popping up for apps without one"
             );
+            assert!(take_locked_shown().is_empty(), "the locked card went up instead");
 
+            // The positive control: the same window, the same probe answer,
+            // the same empty vault -- with the setting on.
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
             process_foreground_event(
-                &window("AtlasLicence.exe", "Atlas Licence", 0x777),
+                &window("AtlasLicence.exe", "Atlas Licence", 0x902),
                 &cache,
                 &recording_injector(&filled),
                 &stats,
@@ -21185,38 +21192,12 @@ mod tests {
                 &recorder(),
                 &mut no_reprompt(),
             );
-
-            assert!(
-                filled.seen().is_empty(),
-                "the no-match path typed something. There is no item behind this window, so \
-                 whatever was typed came from somewhere it should not have"
-            );
-            assert_eq!(
-                pending_hotkey_fill, None,
-                "the no-match path armed the fill hotkey. With no item id there is nothing to \
-                 arm WITH, so a `Some` here is a fabricated or leftover id, and Ctrl+Alt+B \
-                 would later fire at this window carrying it"
-            );
-            assert_eq!(
-                last_dispatched_hwnd,
-                Some(0x777),
-                "control: the event really did get past the dispatch rules and reach the \
-                 decision. Without this, the three assertions above would all pass against an \
-                 event that was discarded before anything ran"
-            );
             assert_eq!(
                 take_no_match_shown(),
-                vec![("AtlasLicence.exe".to_string(), 0x777)],
-                "design 3a was not opened for this window, or was opened for a different one. \
-                 The hwnd is what says WHICH window: this card is placed next to the field the \
-                 user is looking at, and one opened for another window appears somewhere else \
-                 naming something else"
-            );
-            assert!(
-                take_locked_shown().is_empty(),
-                "the LOCKED card was opened for a readable vault. 3a and 3b make opposite \
-                 claims about the vault, so showing 3b here tells a user whose vault is open \
-                 that it is not"
+                vec![("AtlasLicence.exe".to_string(), 0x902)],
+                "with the prompt ON the no-match card no longer appears for an ordinary \
+                 unmatched app, so the gate above has silenced the overlay outright rather \
+                 than obeyed the setting"
             );
         }
 

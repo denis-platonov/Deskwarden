@@ -127,15 +127,24 @@ const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
      while the vault window is open; autofill is unaffected either way.";
 
-const PROMPT_LABEL: &str = "Prompt on match";
+/// **"on match" is gone from the label, because the setting is no longer
+/// about matches.** `Settings::prompt_on_match` governs every card the
+/// overlay raises by itself now -- the fill prompt for a window the vault
+/// knows, and the "no saved login for this app" card for one it does not. A
+/// label that named only matches was a label a user had to disbelieve: they
+/// turned it off, and the card for unmatched apps went on appearing.
+const PROMPT_LABEL: &str = "Show autofill prompts";
 /// **Says what OFF does, because off is the state that changes what the app
 /// does on its own.** The user's own framing: "only shortcuts will work in
 /// that case". Naming the hotkey here is what stops the toggle reading as
 /// "switch autofill off" -- it never is; the hotkey arms for every match in
 /// both states (`app::match_arms_hotkey`).
-const PROMPT_DESCRIPTION: &str = "Offer to fill when an app you have matched comes to the front. \
-     Off means nothing happens on its own and CTRL+ALT+B is the only way to fill. Nothing is \
-     ever typed until you ask for it either way.";
+///
+/// It now says *any* window rather than a matched one, for the reason on
+/// `PROMPT_LABEL` directly above.
+const PROMPT_DESCRIPTION: &str = "Offer to fill, or to save, when a window that wants a password \
+     comes to the front. Off means nothing opens on its own and CTRL+ALT+B is the only way to \
+     fill. Nothing is ever typed until you ask for it either way.";
 
 const BREACH_LABEL: &str = "Check passwords against known breaches";
 /// **Says what leaves the machine, because something does.** Off by default is
