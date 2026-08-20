@@ -738,7 +738,7 @@ const NETWORK_MARK_HEIGHT: f32 = card_mark::MARK_ROW_HEIGHT;
 /// At the real pane this never binds: the list is
 /// `Panel::exact_size(LIST_WIDTH).resizable(false)` at 390pt, which leaves the
 /// title column 301pt, and the widest mark this app sets is `MASTERCARD` at
-/// 88pt. It binds only under a test pane, and there the answer is the
+/// 72pt. It binds only under a test pane, and there the answer is the
 /// module's standing one -- draw nothing rather than a mark that costs the row
 /// its name. `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_
 /// both` holds it.
@@ -760,7 +760,17 @@ const NETWORK_MARK_MIN_TITLE_ROOM: f32 = 120.0;
 /// -- and therefore the `room` `theme::truncated_galley` truncates the name
 /// into -- is already net of the pill. Painting it without allocating would
 /// have left the name laying out into room the pill was sitting in.
-fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand) -> Option<egui::Rect> {
+///
+/// **It is placed on the NAME's baseline, not on the row's box centre.** The
+/// reported defect -- "feels like image, pill and name are not on the same mid
+/// line" -- is what box centring produces when three things of three different
+/// heights share a line: egui centres each BOX, and a box is ascent plus
+/// descent rather than the ink a reader sees. The 32pt tile, the pill (whose
+/// height follows its type size) and the 13pt name each land a fraction off
+/// the others, differently at every size -- which matters here because this
+/// pill's type size has already moved three times. [`mark_ink_drop`]
+/// derives the correction from the two runs actually laid out.
+fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand, selected: bool) -> Option<egui::Rect> {
     let width = card_mark::mark_width(ui, brand, NETWORK_MARK_HEIGHT);
     // The gap is charged twice on purpose: `item_spacing` puts one between the
     // tile and the pill, and another between the pill and the title column.
@@ -769,13 +779,63 @@ fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand) -> Option<egui::Rect>
     }
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(width, NETWORK_MARK_HEIGHT), Sense::hover());
+    let drop = mark_ink_drop(ui, brand, selected);
     Some(card_mark::paint_mark(
         ui,
         brand,
         NETWORK_MARK_HEIGHT,
         egui::Align2::LEFT_TOP,
-        rect.left_top(),
+        egui::pos2(rect.left(), rect.top() + drop),
     ))
+}
+
+/// How far DOWN the pill must move from the box egui centred for it, so that
+/// its word sits on the same line the item name does.
+///
+/// **A pure function of two laid-out runs, and deliberately not a constant.**
+/// `detail`'s `digits_baseline_drop` makes the argument at length and it holds
+/// here twice over: a constant would be one nobody could later justify, and
+/// BOTH of this row's type sizes moved during the work that introduced it.
+///
+/// **Ink centres, not baselines, and not box centres.** Three readings of "the
+/// same mid line" were measured before this one was picked.
+///
+/// * *Box centres* is what egui's `Align::Center` already did, and it is what
+///   was reported as wrong: a box is ascent plus descent, neither of which is
+///   ink.
+/// * *Baselines* is what the runs already shared, exactly -- and it is still
+///   not level, because the name's caps are 9pt tall at 13pt and the word's
+///   are 8pt at 11pt. Two runs of different sizes sitting on one baseline have
+///   their ink centres half a point apart by construction.
+/// * *Ink centres* is what a reader means, and what this returns.
+///
+/// **The name's reference run is a single capital**, not the item's own name,
+/// and that is the load-bearing detail. A name's ink band depends on its
+/// letters -- "Household card" has no descender and "Ledgerline corporate
+/// card" has two -- so aligning to the real string would make the pill sit at
+/// a different height on every row. A capital is the band a reader reads a
+/// title-case run by, it is a property of the face and the size alone, and the
+/// wordmark beside it is all capitals anyway, so this lines cap-height band up
+/// with cap-height band.
+///
+/// Both boxes are centred on the same row centre `C` by the row's
+/// `Align::Center`, and `paint_mark` centres the word's box inside the pill.
+/// So the name's ink sits at `C - name_h/2 + i_name`, the word's at
+/// `C - word_h/2 + i_word`, and the difference is all that is left.
+fn mark_ink_drop(ui: &egui::Ui, brand: CardBrand, selected: bool) -> f32 {
+    let family = if selected { theme::BOLD } else { theme::SEMIBOLD };
+    let name = ui
+        .painter()
+        .layout_job(theme::letterspaced("H", TITLE_SIZE, family, 0.0, theme::INK));
+    let word = card_mark::word_galley(ui, brand, NETWORK_MARK_HEIGHT);
+    let (Some(name_ink), Some(word_ink)) =
+        (theme::ink_center_y(&name), theme::ink_center_y(&word))
+    else {
+        // No glyphs to centre on either side: leave the box where egui put it
+        // rather than move it by a number derived from nothing.
+        return 0.0;
+    };
+    (name_ink - name.size().y / 2.0) - (word_ink - word.size().y / 2.0)
 }
 
 /// Design 2b's row box, in full: `padding: 10px 12px` around a 32px avatar,
@@ -1528,14 +1588,23 @@ fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
 /// Painted at a shared top the suffix would sit visibly high against the name
 /// it qualifies.
 fn suffix_baseline_drop(name: &egui::Galley, suffix: &egui::Galley) -> f32 {
-    fn first_baseline(galley: &egui::Galley) -> f32 {
-        galley
-            .rows
-            .first()
-            .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
-            .unwrap_or(0.0)
-    }
     first_baseline(name) - first_baseline(suffix)
+}
+
+/// Where a laid-out run's first baseline sits, measured down from the top of
+/// its own box.
+///
+/// Hoisted out of [`suffix_baseline_drop`], which used to own it privately,
+/// when the network mark needed the same fact: three runs share this row's
+/// line now -- the name, its `(*4545)` suffix and the pill's wordmark -- and
+/// they sit together only if all three are placed from a baseline that is
+/// measured rather than assumed.
+fn first_baseline(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(0.0)
 }
 
 /// The title line of a CARD row: the item's name, then `(*4545)`.
@@ -1692,7 +1761,7 @@ fn item_row(
                 // allocated, so the room the title column is laid into is
                 // already net of it -- see `paint_network_mark`.
                 if let Some(brand) = mark {
-                    paint_network_mark(ui, brand);
+                    paint_network_mark(ui, brand, selected);
                 }
                 // The design's title column is `flex: 1` with the chips
                 // trailing it. Laid out right-to-left so the chips take their
@@ -2853,6 +2922,11 @@ mod row_tile_tests {
     struct Painted {
         rects: Vec<RectShape>,
         texts: Vec<(String, egui::Rect, egui::Color32)>,
+        /// Every painted run, with the y its box was painted at.
+        ///
+        /// `texts` keeps only the BOX, which is ascent plus descent and not
+        /// what a reader sees; the alignment tests need the glyphs themselves.
+        galleys: Vec<(std::sync::Arc<egui::Galley>, f32)>,
         fonts: Vec<(String, egui::FontId)>,
         visible: Vec<String>,
         /// What `draw_item_list` left `selected_id` at. Read by the
@@ -2889,6 +2963,7 @@ mod row_tile_tests {
                     egui::Rect::from_min_size(text.pos, text.galley.size()),
                     color,
                 ));
+                p.galleys.push((text.galley.clone(), text.pos.y));
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -3071,6 +3146,7 @@ mod row_tile_tests {
         let mut painted = Painted {
             rects: Vec::new(),
             texts: Vec::new(),
+            galleys: Vec::new(),
             fonts: Vec::new(),
             visible,
             selected: selected_id,
@@ -3087,6 +3163,25 @@ mod row_tile_tests {
     /// asserts the fill cannot be the thing that found the rect. The
     /// selected row's drop shadow occupies the same box, so it is excluded by
     /// its blur -- and asserted on separately.
+    /// [`row_tiles`] at a pane that is not the real one.
+    ///
+    /// `row_tiles` measures against `TILE_WIDTH`, which is derived from the
+    /// real `PANE_WIDTH`; a frame painted narrower has narrower rows and that
+    /// function finds none of them.
+    fn row_tiles_of_width(p: &Painted, pane: f32) -> Vec<RectShape> {
+        let want = pane - 2.0 * LIST_PADDING;
+        p.rects
+            .iter()
+            .filter(|r| {
+                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
+                    && r.blur_width == 0.0
+                    && (r.rect.width() - want).abs() < 0.5
+                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
+            })
+            .cloned()
+            .collect()
+    }
+
     fn row_tiles(p: &Painted) -> Vec<RectShape> {
         p.rects
             .iter()
@@ -4192,6 +4287,163 @@ mod row_tile_tests {
         v.sort_by(|a, b| a.0.top().total_cmp(&b.0.top()));
         v
     }
+
+
+    /// The vertical ink of a painted run: where its glyphs really start and
+    /// stop, as opposed to the box egui laid out for them.
+    ///
+    /// **This is what "the same mid line" means.** A galley's box is ascent
+    /// plus descent, and neither is ink; two runs whose BOXES are centred on
+    /// one another still print visibly apart when their faces or sizes differ.
+    /// Read off `uv_rect`, which is the same thing `theme::ink_offset_x` reads
+    /// for the horizontal case.
+    fn ink_y(galley: &egui::Galley, top: f32) -> Option<(f32, f32)> {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for row in galley.rows.iter() {
+            for glyph in row.glyphs.iter() {
+                let at = top + row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                lo = lo.min(at);
+                hi = hi.max(at + glyph.uv_rect.size.y);
+            }
+        }
+        (lo.is_finite()).then_some((lo, hi))
+    }
+
+    /// Every painted run's ink centre, by its text.
+    fn ink_centres(p: &Painted) -> Vec<(String, f32)> {
+        p.galleys
+            .iter()
+            .filter_map(|(g, top)| ink_y(g, *top).map(|(lo, hi)| (g.text().to_string(), (lo + hi) / 2.0)))
+            .collect()
+    }
+
+    fn ink_centre_of(p: &Painted, needle: &str) -> f32 {
+        let hits: Vec<f32> = ink_centres(p)
+            .into_iter()
+            .filter(|(t, _)| t == needle)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one {needle:?}; painted: {:?}", ink_centres(p));
+        hits[0]
+    }
+
+    /// **The reported defect, as geometry.** "Feels like image, pill and name
+    /// are not on the same mid line."
+    ///
+    /// Optical centres, not box centres -- see [`ink_y`]. The claim is that
+    /// the pill's WORD sits on the item NAME's line, and that both sit on the
+    /// tile's. Asserted at both pane widths and at two name lengths, because a
+    /// coincidence at one width and one string is exactly what box centring
+    /// looks like right up until it does not.
+    #[test]
+    fn the_tile_the_pill_and_the_name_sit_on_one_line() {
+        // The pill against the name: this is the pair the fix places by a
+        // derived baseline, so it is held to half a point.
+        const TOGETHER: f32 = 0.5;
+        // Either of them against the TILE: the tile is a 32pt rect and the
+        // runs are text, and `theme::avatar` puts its own monogram on the same
+        // line the name is on rather than on the rect's arithmetic centre. One
+        // point is that difference and not slack.
+        const AGAINST_TILE: f32 = 1.0;
+        for name in ["Household card", "Bank of America Platinum Rewards Debit"] {
+            for width in [170.0f32, PANE_WIDTH] {
+                let mut item = card_branded(name, "Mastercard");
+                item.card.as_mut().unwrap().number =
+                    Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
+                let p = paint_at_width(&[item], None, width);
+                let tile = square(&p, AVATAR_SIZE).rect;
+                let title = ink_centre_of(&p, name);
+                assert!(
+                    (title - tile.center().y).abs() <= AGAINST_TILE,
+                    "at a {width}pt pane the name sits {}pt off the tile",
+                    (title - tile.center().y).abs()
+                );
+                let row = row_tiles_of_width(&p, width)[0].rect;
+                let ground = p
+                    .rects
+                    .iter()
+                    .find(|r| r.fill == theme::BLUE && row.contains_rect(r.rect))
+                    .map(|r| r.rect.center().y);
+                let Some(ground) = ground else {
+                    // At the narrow pane the pill stands aside entirely (see
+                    // `NETWORK_MARK_MIN_TITLE_ROOM`), and a mark that is not
+                    // drawn cannot be misaligned.
+                    assert!(width < PANE_WIDTH, "the real pane must draw the pill");
+                    continue;
+                };
+                let word = ink_centre_of(&p, CardBrand::Mastercard.wordmark());
+                assert!(
+                    (word - title).abs() <= TOGETHER,
+                    "at a {width}pt pane with {name:?}, the pill's word sits at {word} and the                      name at {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
+                    (word - title).abs()
+                );
+                assert!(
+                    (word - tile.center().y).abs() <= AGAINST_TILE,
+                    "the pill's word sits {}pt off the tile's centre",
+                    (word - tile.center().y).abs()
+                );
+                assert!(
+                    (ground - word).abs() <= 0.51,
+                    "the pill's ground at {ground} is not centred on its word at {word}"
+                );
+            }
+        }
+    }
+
+    /// The negative: the check above can really fail.
+    ///
+    /// A guard over numbers that happen to agree proves nothing unless
+    /// disagreement is visible to it, so this nudges each measured value by
+    /// the smallest amount the tolerance forbids and checks the comparison
+    /// rejects it.
+    #[test]
+    fn the_one_line_check_notices_a_nudge() {
+        const TOGETHER: f32 = 0.5;
+        let mut item = card_branded("Household card", "Mastercard");
+        item.card.as_mut().unwrap().number =
+            Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
+        let p = paint(&[item], None);
+        let word = ink_centre_of(&p, CardBrand::Mastercard.wordmark());
+        let title = ink_centre_of(&p, "Household card");
+        assert!((word - title).abs() <= TOGETHER, "as drawn, the row is aligned");
+        for nudge in [-1.0f32, 1.0] {
+            assert!(
+                (word + nudge - title).abs() > TOGETHER,
+                "a {nudge}pt nudge of the pill still reads as aligned, so the tolerance is                  meaningless"
+            );
+            assert!(
+                (word - (title + nudge)).abs() > TOGETHER,
+                "a {nudge}pt nudge of the name still reads as aligned"
+            );
+        }
+    }
+
+    /// **The pill is centred on its own word**, which is a separate claim from
+    /// the row being aligned: uneven padding above and below the word looks
+    /// off-centre however well the row is lined up, and at these type sizes a
+    /// single point is a large fraction of the pill's height.
+    #[test]
+    fn the_pills_ground_is_centred_on_the_word_it_carries() {
+        for brand in crate::card_brand::CARD_BRANDS {
+            let p = paint(&[card_branded("No Bank", brand.canonical())], None);
+            let row = row_tiles(&p)[0].rect;
+            let ground = p
+                .rects
+                .iter()
+                .find(|r| r.fill == theme::BLUE && row.contains_rect(r.rect))
+                .expect("the pill's ground")
+                .rect;
+            let word = ink_centre_of(&p, brand.wordmark());
+            assert!(
+                (word - ground.center().y).abs() <= 0.51,
+                "{brand:?}'s word sits at {word} in a ground centred at {} -- {}pt of the                  pill's {}pt height is padding on one side only",
+                ground.center().y,
+                (word - ground.center().y).abs(),
+                ground.height()
+            );
+        }
+    }
+
 
     #[test]
     fn a_networks_mark_is_the_networks_own_word() {

@@ -37,33 +37,33 @@ pub const MARK_DETAIL_HEIGHT: f32 = 18.0;
 /// The mark's height in an item list row, where it sits BESIDE the avatar
 /// tile rather than inside it.
 ///
-/// **18, because 18 is the height at which [`text_size`] sets the type at
-/// 11pt -- `item_list::SUBTITLE_SIZE`, the row's own secondary size, one step
-/// below the 13pt the item NAME is set at.**
+/// **15, because 15 is the height at which [`text_size`] sets the type at
+/// 9pt** -- four points under the 13pt the item NAME is set at, and two under
+/// the 11pt of the username line below it.
 ///
 /// **The step is the hierarchy, and the hierarchy is the point.** The name is
 /// the thing being identified; the network is a qualifier on it. Type size is
-/// how a reader is told which is which, and a pill set at the name's own size
-/// stops annotating the name and starts competing with it -- two 13pt runs
-/// side by side read as two titles. The owner asked for exactly this, in two
-/// steps: first "same font size as name", then, looking at it, "maybe make
-/// that font smaller for card pills".
+/// how a reader is told which is which, and a pill set near the name's size
+/// stops annotating the name and starts competing with it.
 ///
-/// It is not a size invented for this: 11pt is what the row already sets its
-/// username line in, so the row now has two sizes rather than three.
-/// `a_row_mark_is_set_one_step_below_the_item_name` pins both ends of that
-/// relation, so a later nudge to this constant cannot quietly flatten it.
+/// **Chosen off a rendered ladder, not by argument.** The pill was drawn at
+/// 8, 9, 10 and 11pt and looked at unmagnified, because legibility at 1x is
+/// the whole trade being made -- a wordmark that only resolves under a
+/// magnifier is decoration rather than information. At 11 the pill reads as a
+/// second title; at 8, the size the old corner badge used, the longest word
+/// this app sets (`MASTERCARD`) starts to close up. 9 is the quietest rung on
+/// which all ten wordmarks are still words at 1x.
 ///
-/// And it happens to equal [`MARK_DETAIL_HEIGHT`], which is a convergence
-/// rather than a coincidence: both are "name this row's network, beside
-/// something more important than the mark".
+/// The size also settles the abbreviation question, which is why the two were
+/// decided together: smaller type is what lets `MASTERCARD`, `UNIONPAY`,
+/// `MAESTRO` and `RUPAY` be spelled out at all. `CardBrand::wordmark` carries
+/// those measurements.
 ///
 /// The predecessor of this constant was 13pt tall (8pt type) and existed
 /// because the badge was drawn inside the row's 32pt tile, which was its
 /// entire width budget. Nothing is drawn inside the tile any more, so the
-/// budget is the row's and the wordmarks are full words --
-/// `CardBrand::wordmark` carries the measurements.
-pub const MARK_ROW_HEIGHT: f32 = 18.0;
+/// budget is the row's.
+pub const MARK_ROW_HEIGHT: f32 = 15.0;
 
 /// The type size for a mark drawn `height` tall.
 ///
@@ -89,6 +89,20 @@ fn pad_x(height: f32) -> f32 {
 /// wordmark rather than as a truncated string: the design's own "card header
 /// wordmark" style is `11px / 700 / uppercase / letter-spacing 0.1em`, and
 /// this is that style at whatever size the mark is drawn.
+/// [`galley`], for a caller that has to line the word up against text of its
+/// own.
+///
+/// The item list puts the pill's word on the item NAME's optical line, and
+/// where a run's ink falls is a property of the run laid out rather than a
+/// number anyone can write down -- the same argument `detail`'s
+/// `digits_baseline_drop` makes. Handing out the very galley [`paint_mark`]
+/// paints is what keeps that calculation about the run really drawn: a caller
+/// laying out its own copy could drift from this one the moment the face or
+/// the size moved, and the size here moved three times before it settled.
+pub fn word_galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::Galley> {
+    galley(ui, brand, height)
+}
+
 fn galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::Galley> {
     let job = theme::letterspaced(
         brand.wordmark(),
@@ -214,27 +228,29 @@ mod tests {
     }
 
     /// **The mark is set BELOW the item name, and that is the hierarchy.**
-    /// Both ends are pinned: smaller than the name (or the pill competes with
-    /// the thing it qualifies) and exactly the row's secondary size (so the
-    /// row has two type sizes and not three).
+    /// Both ends are pinned: comfortably smaller than the name, so the pill
+    /// qualifies the thing it sits beside rather than competing with it, and
+    /// not smaller than the corner badge it replaced, which is the size at
+    /// which the longest wordmark stops reading at 1x.
     #[test]
-    fn a_row_mark_is_set_one_step_below_the_item_name() {
+    fn a_row_mark_is_set_well_below_the_item_name() {
         // Spelled as the numbers they are because `item_list::TITLE_SIZE` and
         // `SUBTITLE_SIZE` are private to that module; the row really laying
         // its name out at 13 and its username at 11 is that module's own
         // assertion.
         const TITLE_SIZE: f32 = 13.0;
         const SUBTITLE_SIZE: f32 = 11.0;
+        // The old corner badge's type size -- the floor the rendered ladder
+        // put under this, not a round number.
+        const OLD_BADGE_SIZE: f32 = 8.0;
         let set = text_size(MARK_ROW_HEIGHT);
         assert!(
-            set < TITLE_SIZE,
-            "a {MARK_ROW_HEIGHT}pt mark sets its word at {set}pt, which is not below the item \
-             name's {TITLE_SIZE}pt -- a pill at the name's size is a second title"
+            set < SUBTITLE_SIZE,
+            "a {MARK_ROW_HEIGHT}pt mark sets its word at {set}pt, which is not below even the              row's secondary {SUBTITLE_SIZE}pt, let alone the name's {TITLE_SIZE}pt"
         );
-        assert_eq!(
-            set, SUBTITLE_SIZE,
-            "the mark is set at {set}pt, which is neither the name's {TITLE_SIZE}pt nor the row's \
-             own secondary {SUBTITLE_SIZE}pt -- a third size on one row"
+        assert!(
+            set >= OLD_BADGE_SIZE,
+            "the mark is set at {set}pt, under the {OLD_BADGE_SIZE}pt the corner badge used --              below which `MASTERCARD` stops being a word at 1x"
         );
     }
 

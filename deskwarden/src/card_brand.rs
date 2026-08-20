@@ -138,20 +138,20 @@ impl CardBrand {
     /// `card_mark::MARK_ROW_HEIGHT`), so the budget is now the row's and the
     /// abbreviations are no longer paying for anything.
     ///
-    /// Measured, not assumed. At the 11pt the row sets these in, the pills
-    /// come to `JCB` 31pt, `VISA` 35pt, `AMEX` 41pt, `DINERS` 51pt,
-    /// `UNIONPAY` 67pt, `DISCOVER` 67pt, `MASTERCARD` 88pt. The list pane is
-    /// a fixed 390pt (`vault_window::LIST_WIDTH`, not resizable), which leaves
-    /// the title column 301pt before the pill; the widest of these takes 88
-    /// plus the row's 11pt gap and still leaves the name 202pt, well over what
-    /// the name and its `(*9988)` suffix need.
+    /// Measured, not assumed. At the 9pt the row sets these in, the pills
+    /// come to `JCB` 25pt, `VISA` 28pt, `AMEX` 33pt, `RUPAY` 37pt, `OTHER`
+    /// 38pt, `DINERS` 41pt, `MAESTRO` 52pt, `UNIONPAY` 54pt, `DISCOVER` 54pt,
+    /// `MASTERCARD` 72pt. The list pane is a fixed 390pt
+    /// (`vault_window::LIST_WIDTH`, not resizable), which leaves the title
+    /// column 301pt before the pill; the widest of these takes 72 plus the
+    /// row's 11pt gap and still leaves the name 218pt, well over what the name
+    /// and its `(*9988)` suffix need.
     ///
     /// **`AMEX` is the one that stays short, and that is the measurement
-    /// talking.** `AMERICAN EXPRESS` is 125pt -- over a third of the title
-    /// column, for a pill whose job is to annotate the name rather than
-    /// compete with it -- and `AMEX` is what that network's own mark is
-    /// commonly written as anyway. `DINERS` likewise over `DINERS CLUB`
-    /// (84pt).
+    /// talking.** `AMERICAN EXPRESS` is 102pt -- a third of the title column,
+    /// for a pill whose job is to annotate the name rather than compete with
+    /// it -- and `AMEX` is what that network's own mark is commonly written as
+    /// anyway. `DINERS` likewise over `DINERS CLUB` (68pt).
     ///
     /// Deliberately NOT derived from [`canonical`](Self::canonical) by rule:
     /// `American Express` -> `AMEX` and `UnionPay` -> `UNIONPAY` are not one
