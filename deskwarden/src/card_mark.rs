@@ -83,12 +83,6 @@ fn pad_x(height: f32) -> f32 {
     (height * 0.22).round()
 }
 
-/// The word, laid out at the size a mark of `height` sets it.
-///
-/// Bold and letterspaced, which is what makes a short word read as a
-/// wordmark rather than as a truncated string: the design's own "card header
-/// wordmark" style is `11px / 700 / uppercase / letter-spacing 0.1em`, and
-/// this is that style at whatever size the mark is drawn.
 /// [`galley`], for a caller that has to line the word up against text of its
 /// own.
 ///
@@ -103,6 +97,12 @@ pub fn word_galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::A
     galley(ui, brand, height)
 }
 
+/// The word, laid out at the size a mark of `height` sets it.
+///
+/// Bold and letterspaced, which is what makes a short word read as a
+/// wordmark rather than as a truncated string: the design's own "card header
+/// wordmark" style is `11px / 700 / uppercase / letter-spacing 0.1em`, and
+/// this is that style at whatever size the mark is drawn.
 fn galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::Galley> {
     let job = theme::letterspaced(
         brand.wordmark(),
