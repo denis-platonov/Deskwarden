@@ -62,6 +62,7 @@ use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
+use deskwarden::vault_window::password_health;
 use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
@@ -252,6 +253,17 @@ enum Surface {
     /// bottom of the rail: it is drawn at the shipped window's own height with
     /// a folder list short enough to leave them on screen.
     VaultRail,
+    /// The vault window's **Password health** screen, in the same item-list
+    /// column at the same width as [`Surface::VaultList`] -- so the two can
+    /// be laid side by side and their tiles' left and right edges compared,
+    /// which is the only way to see that one pane's rows line up with the
+    /// other's.
+    ///
+    /// Carries a **pathologically long item name**, which is the other reason
+    /// it is here: a finding row paints its name with `Painter::text`, which
+    /// takes no width, and the name used to be drawn straight out past the
+    /// tile's right edge and over the pane behind it.
+    VaultHealth,
     /// **Design 4d's rehearsal window, finished.** The twelfth surface, and
     /// the one this example exists for: this window shipped as a raw Win32
     /// dialog with none of the app's theme, tokens or type, and no screenshot
@@ -339,6 +351,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsAboutFailed,
     Surface::VaultList,
     Surface::VaultRail,
+    Surface::VaultHealth,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
 ];
@@ -374,6 +387,7 @@ impl Surface {
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
             Surface::VaultRail => "vault_rail",
+            Surface::VaultHealth => "vault_password_health",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
         }
@@ -443,6 +457,12 @@ impl Surface {
             // the rail is measured against the window's floor, so a preview
             // drawn taller would hide exactly the overflow it is here to show.
             Surface::VaultRail => egui::vec2(SIDEBAR_WIDTH, PANE_HEIGHT),
+            // The same column the item list is drawn in, at the same height:
+            // Password health replaces the list in place, so a preview at any
+            // other width is a picture of a pane nobody ships -- and this
+            // surface is entirely about what happens at the column's right
+            // edge.
+            Surface::VaultHealth => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -473,6 +493,7 @@ fn main() -> eframe::Result {
     let login = signin || arg("--login");
     let list = arg("--list");
     let rail = arg("--rail");
+    let health = arg("--health");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -486,6 +507,8 @@ fn main() -> eframe::Result {
         vec![Surface::VaultList]
     } else if rail {
         vec![Surface::VaultRail]
+    } else if health {
+        vec![Surface::VaultHealth]
     } else {
         vec![Surface::Overlay]
     };
@@ -576,6 +599,11 @@ fn main() -> eframe::Result {
                 rail_selected: SidebarFilter::Logins,
                 rail_sends: false,
                 rail_health: false,
+                // The weak finding, so the health shot carries the selected
+                // treatment too -- and it is the row with a detail line
+                // under its name, which is the taller of the row's two
+                // layouts.
+                health_selected: Some("health-weak".to_string()),
                 window_height: 0.0,
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -665,6 +693,8 @@ struct Preview {
     rail_selected: SidebarFilter,
     rail_sends: bool,
     rail_health: bool,
+    /// The Password health shot's own selection state.
+    health_selected: Option<String>,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
@@ -761,6 +791,7 @@ impl eframe::App for Preview {
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
+            Surface::VaultHealth => self.draw_vault_health(root),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
         }
@@ -1169,6 +1200,33 @@ impl Preview {
             });
     }
 
+    /// The vault window's **Password health** screen, drawn in the item-list
+    /// column it really occupies and carrying a **pathologically long item
+    /// name** -- longer than the column can be dragged to at any size.
+    ///
+    /// That name is the whole reason this surface is in the list. A finding
+    /// row paints its name itself rather than through a `Label`, and
+    /// `Painter::text` takes no width: the name used to be laid out at its
+    /// natural width and drawn straight out past the tile's right edge and
+    /// over the pane behind it. There are unit tests for that now, but a
+    /// truncation is a thing somebody has to LOOK at -- whether the ellipsis
+    /// is hung too close to the rounded corner, and whether the row still
+    /// reads as a row, are not questions an assertion answers.
+    ///
+    /// Both bands are in the picture: a reuse group, whose rows are a name
+    /// alone, and a weak finding, whose row is a name over a detail line.
+    /// They are the two different vertical layouts the row has, and the long
+    /// name is in both.
+    fn draw_vault_health(&mut self, root: &mut egui::Ui) {
+        let report = password_health::report_for(&self.fixtures.health);
+        let selected = &mut self.health_selected;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(root, |ui| {
+                password_health::draw_password_health(ui, &report, selected, false);
+            });
+    }
+
     /// The vault window's rail, drawn through `draw_sidebar` itself in the same
     /// `theme::CARD` panel frame `vault_window::mod` hosts it in -- margins
     /// included, because the rail's insets are measured against them.
@@ -1318,6 +1376,8 @@ struct Fixtures {
     refused: PreflightState,
     rehearsal: scratch_window::RehearsalView,
     rehearsal_arrived: String,
+    /// The Password health screen's items -- see [`HEALTH_JSON`].
+    health: Vec<VaultItem>,
 }
 
 impl Fixtures {
@@ -1392,6 +1452,7 @@ impl Fixtures {
             allowed: preflight_state(true, &login, &totp),
             refused: preflight_state(false, &login, &totp),
             rehearsal: rehearsal_view(),
+            health: items(HEALTH_JSON),
             // What a text field really holds after the design's sequence: the
             // Tab arrived as a tab, the Enter as a Windows line ending.
             rehearsal_arrived: format!(
@@ -1578,6 +1639,34 @@ const CARD_JSON: &str = r#"{
 /// digits: `item_list::card_network` prefers a stored brand, which is the path
 /// a real vault takes, and the numbers here are the published test numbers
 /// anyway.
+/// The Password health screen's fixture -- see `draw_vault_health`.
+///
+/// Two items on one password (a reuse group) and one item on a short
+/// single-class one (a weak finding), and **the long name is on one of
+/// each**, because the reuse row and the weak row are different vertical
+/// layouts and the truncation has to be looked at in both.
+///
+/// The long name is the one from the user's report, which is a real page
+/// title -- a product name with the platforms it supports appended after a
+/// pipe. Names like this are what a browser extension saves, so this is the
+/// ordinary case and not a contrived one.
+const HEALTH_JSON: &str = r#"[
+  {
+    "id": "health-long", "type": 1,
+    "name": "Visual Studio App Center | iOS, Android, Xamarin & React Native App Development",
+    "login": { "username": "a.novak@ledgerline.com", "password": "reused-across-two-sites" }
+  },
+  {
+    "id": "health-short", "type": 1, "name": "Northwind Mail",
+    "login": { "username": "anna@northwind.example", "password": "reused-across-two-sites" }
+  },
+  {
+    "id": "health-weak", "type": 1,
+    "name": "Meridian Freight Bill Pay | Invoices, Statements & Payment History",
+    "login": { "username": "anna@northwind.example", "password": "meridian9" }
+  }
+]"#;
+
 const LIST_JSON: &str = r#"[
   {
     "id": "list-0001", "type": 1, "name": "Ledgerline", "folderId": "f-work",

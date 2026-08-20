@@ -10,6 +10,20 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Password health: long item names no longer run off their row
+
+A finding whose item name was wider than the pane -- a saved page title such
+as *"Visual Studio App Center | iOS, Android, Xamarin & React Native App
+Development"* -- had its name painted straight past the right edge of its
+white tile and over the background behind it.
+
+- **The name is now truncated with an ellipsis** at the same 12pt inset from
+  the right edge that it starts at from the left, at every pane width.
+- **A name that fits is untouched** -- nothing gains an ellipsis it does not
+  need.
+- **The weak-password detail line** ("9 characters, lowercase letters and
+  digits") is bounded by the same tile, for the same reason.
+
 ### Browsers no longer get the "no saved login" card
 
 In a browser that card could never be right. Every sign-in page has a password

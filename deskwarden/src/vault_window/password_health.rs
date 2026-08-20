@@ -453,6 +453,11 @@ const ROW_GAP: f32 = 6.0;
 const PANE_PADDING: f32 = 10.0;
 /// Height of one finding row: two text lines plus the design's row padding.
 const ROW_HEIGHT: f32 = 46.0;
+/// How far a finding row's text is inset from the tile's edge, on BOTH sides.
+/// The right-hand one is what stops a long item name being painted out over
+/// the pane behind the tile; it is the same value as the left so a truncated
+/// name's ellipsis is not hung flush against the rounded corner.
+const ROW_TEXT_INSET: f32 = 12.0;
 
 /// The Password health screen, drawn in the item-list column.
 ///
@@ -580,6 +585,16 @@ fn group_heading(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(11.0).color(theme::TEXT_MUTED));
 }
 
+/// Where to paint `galley` so its left edge is at `left` and it is centred on
+/// `centre_y` -- i.e. what `Align2::LEFT_CENTER` did for the `Painter::text`
+/// calls this row used before it had to lay its own galleys out. `Painter::
+/// galley` positions by the galley's top-left corner and offers no alignment,
+/// so the half-height comes off here and the two baselines stay exactly where
+/// the design put them.
+fn centred_left(left: f32, centre_y: f32, galley: &egui::Galley) -> egui::Pos2 {
+    egui::Pos2::new(left, centre_y - galley.size().y / 2.0)
+}
+
 /// One clickable finding. Returns whether it was clicked.
 fn finding_row(ui: &mut egui::Ui, name: &str, detail: Option<&str>, selected: bool) -> bool {
     let width = ui.available_width();
@@ -599,28 +614,48 @@ fn finding_row(ui: &mut egui::Ui, name: &str, detail: Option<&str>, selected: bo
             theme::CARD
         },
     );
-    let left = rect.left() + 12.0;
+    // Both runs are laid into the room the tile actually has BEFORE anything
+    // is painted, because `Painter::text` takes no width and would otherwise
+    // draw a long name straight out past the tile's right edge and over the
+    // pane behind it -- which is exactly the defect this row was reported
+    // for. Nothing at all sits at the right of a finding row (no chevron, no
+    // badge, no count), so the room is the tile less its inset on each side:
+    // the ellipsis lands the same 12pt in from the right edge that the name
+    // starts in from the left, rather than flush against the corner radius.
+    let room = rect.width() - ROW_TEXT_INSET * 2.0;
+    let name_galley = theme::truncated_galley(
+        ui,
+        theme::semibold(name, 13.0)
+            .color(if selected { theme::BLUE_DEEP } else { theme::INK }),
+        room,
+        egui::TextStyle::Body,
+    );
+    // The detail line is ours, not the user's ("9 characters, lowercase
+    // letters and digits"), but it is still longer than a narrow pane at a
+    // long character-class list, so it is bounded by the same room.
+    let detail_galley = detail.map(|detail| {
+        theme::truncated_galley(
+            ui,
+            egui::RichText::new(detail).size(11.0).color(theme::TEXT_SECONDARY),
+            room,
+            egui::TextStyle::Body,
+        )
+    });
+    let left = rect.left() + ROW_TEXT_INSET;
     // With a detail line the name sits on the upper of two baselines; alone,
     // it is centred in the row.
     let name_y = match detail {
         Some(_) => rect.top() + 15.0,
         None => rect.center().y,
     };
-    ui.painter().text(
-        egui::Pos2::new(left, name_y),
-        egui::Align2::LEFT_CENTER,
-        name,
-        egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+    ui.painter().galley(
+        centred_left(left, name_y, &name_galley),
+        name_galley,
         if selected { theme::BLUE_DEEP } else { theme::INK },
     );
-    if let Some(detail) = detail {
-        ui.painter().text(
-            egui::Pos2::new(left, rect.bottom() - 15.0),
-            egui::Align2::LEFT_CENTER,
-            detail,
-            egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            theme::TEXT_SECONDARY,
-        );
+    if let Some(galley) = detail_galley {
+        let y = rect.bottom() - 15.0;
+        ui.painter().galley(centred_left(left, y, &galley), galley, theme::TEXT_SECONDARY);
     }
     response.clicked()
 }
@@ -1539,6 +1574,291 @@ mod tests {
                 "with the setting {on}, the pane never said where the breach setting is: \
                  {joined}"
             );
+        }
+    }
+
+    // ==================================================================
+    // Nothing is painted outside its tile
+    // ==================================================================
+
+    /// A name far longer than any pane this window can be dragged to -- the
+    /// one from the user's screenshot, which ran straight off the right of
+    /// its tile and over the pane behind it.
+    const LONG_NAME: &str =
+        "Visual Studio App Center | iOS, Android, Xamarin & React Native App Development";
+
+    /// A name that comfortably fits even the narrowest pane tested here, so
+    /// the counter-assertion has something real to be about.
+    const SHORT_NAME: &str = "Bank";
+
+    /// One run the pane painted: the string it was HANDED, the characters it
+    /// actually LAID OUT, and where those characters landed.
+    ///
+    /// The first two differ exactly when something was truncated --
+    /// `Galley::text()` reports the source string whatever the wrap mode did
+    /// to it, so a test that only read `text()` could never tell an
+    /// ellipsised run from an intact one, and would pass while the ink still
+    /// hung outside the tile.
+    struct Run {
+        source: String,
+        drawn: String,
+        rect: egui::Rect,
+    }
+
+    /// One frame of the real pane at a chosen pane width, with the finding
+    /// tiles located as well as the text.
+    struct Painted {
+        runs: Vec<Run>,
+        /// The rounded white rectangles `finding_row` allocates, found by
+        /// their exact `ROW_HEIGHT` -- so the summary card and the header
+        /// strip, which are neither this height, are not mistaken for rows.
+        tiles: Vec<egui::Rect>,
+    }
+
+    impl Painted {
+        /// The single run laid out from `source`, and the tile it sits in.
+        ///
+        /// Both halves panic rather than return an `Option`: this crate's
+        /// standing defect is a test that passes because it never reached the
+        /// thing it names, and "no such run" or "no tile around it" must be a
+        /// red test, not a silently skipped assertion.
+        fn run_and_tile(&self, source: &str) -> (&Run, egui::Rect) {
+            let found: Vec<&Run> = self.runs.iter().filter(|r| r.source == source).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one run laid out from {source:?}, found {}; painted: {:?}",
+                found.len(),
+                self.runs.iter().map(|r| r.source.as_str()).collect::<Vec<_>>()
+            );
+            let run = found[0];
+            let tile = self
+                .tiles
+                .iter()
+                .find(|tile| tile.contains(run.rect.left_center()))
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the run from {source:?} at {:?} sits in none of the {} finding tiles \
+                         {:?} -- it was not painted on a finding row at all",
+                        run.rect,
+                        self.tiles.len(),
+                        self.tiles
+                    )
+                });
+            (run, tile)
+        }
+    }
+
+    /// Draws the real pane at `pane_width` and reports every run and tile.
+    ///
+    /// The width is a parameter because the defect is width-dependent: the
+    /// pane is the resizable item-list column, and a name that fits at 420
+    /// overflows at 220.
+    fn painted_at(report: &HealthReport, pane_width: f32) -> Painted {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(pane_width, 700.0),
+            )),
+            ..Default::default()
+        };
+        // The two throwaway frames every harness in this crate runs: a font
+        // set registered during a frame is only usable from the next one.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let mut selected = None;
+        let output = ctx.run_ui(input(), |ui| {
+            draw_password_health(ui, report, &mut selected, false);
+        });
+        let mut painted = Painted { runs: Vec::new(), tiles: Vec::new() };
+        for clipped in &output.shapes {
+            collect_runs(&clipped.shape, &mut painted);
+        }
+        assert!(
+            !painted.tiles.is_empty(),
+            "the pane painted no finding tiles at all at width {pane_width}, so nothing below \
+             is about a finding row"
+        );
+        painted
+    }
+
+    fn collect_runs(shape: &egui::Shape, out: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => out.runs.push(Run {
+                source: text.galley.text().to_string(),
+                drawn: text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect(),
+                rect: text.galley.rect.translate(text.pos.to_vec2()),
+            }),
+            egui::Shape::Rect(rect) if rect.rect.height() == ROW_HEIGHT => {
+                out.tiles.push(rect.rect)
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_runs(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The three pane widths every case below is checked at, including one
+    /// narrower than the window's own default -- the column is resizable and
+    /// the defect only appears once the name is wider than the tile.
+    ///
+    /// Deliberately NOT derived from anything under test, and deliberately
+    /// nothing to do with the clock: a fixture that measured a rendered width
+    /// against a real date is how `main` went red at UTC midnight once
+    /// already.
+    const PANE_WIDTHS: [f32; 3] = [200.0, 320.0, 520.0];
+
+    /// **The reported defect: a long name's ink stays inside its tile.**
+    ///
+    /// Measured as ink against the tile's rect, not as "the string changed",
+    /// because the report is about paint crossing an edge. Both bands are
+    /// covered: a reused finding (name only) and a weak one (name over a
+    /// detail line), which are the two different vertical layouts the row
+    /// has.
+    #[test]
+    fn a_long_finding_name_is_ellipsised_inside_its_tile() {
+        for width in PANE_WIDTHS {
+            for report in [
+                report_for(&[
+                    login("a", LONG_NAME, Some(STRONG_A)),
+                    login("b", "Other", Some(STRONG_A)),
+                ]),
+                report_for(&[login("a", LONG_NAME, Some("abc12345"))]),
+            ] {
+                let painted = painted_at(&report, width);
+                let (run, tile) = painted.run_and_tile(LONG_NAME);
+                assert!(
+                    run.drawn != run.source,
+                    "at width {width} the name was laid out whole ({:?}) -- nothing truncated \
+                     it",
+                    run.drawn
+                );
+                assert!(
+                    run.drawn.ends_with('\u{2026}'),
+                    "at width {width} the name was cut off with no ellipsis: {:?}",
+                    run.drawn
+                );
+                assert!(
+                    run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
+                    "at width {width} the name's ink reaches {} but its tile ends at {} \
+                     (inset {ROW_TEXT_INSET}); drawn: {:?}",
+                    run.rect.right(),
+                    tile.right(),
+                    run.drawn
+                );
+                assert!(
+                    run.rect.left() >= tile.left(),
+                    "at width {width} the name's ink starts left of its own tile"
+                );
+            }
+        }
+    }
+
+    /// **The counter-assertion: a name that fits is left completely alone.**
+    ///
+    /// Without this, ellipsising every row unconditionally would satisfy the
+    /// test above.
+    #[test]
+    fn a_short_finding_name_is_not_touched() {
+        for width in PANE_WIDTHS {
+            let report = report_for(&[
+                login("a", SHORT_NAME, Some(STRONG_A)),
+                login("b", "Other", Some(STRONG_A)),
+            ]);
+            let painted = painted_at(&report, width);
+            let (run, tile) = painted.run_and_tile(SHORT_NAME);
+            assert_eq!(
+                run.drawn, SHORT_NAME,
+                "at width {width} a name that fits was altered anyway"
+            );
+            assert!(
+                !run.drawn.contains('\u{2026}'),
+                "at width {width} a short name was ellipsised: {:?}",
+                run.drawn
+            );
+            assert!(
+                run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
+                "at width {width} even the short name left its tile"
+            );
+        }
+    }
+
+    /// **The weak band's detail line is bounded by the same tile.**
+    ///
+    /// It is our own wording rather than the user's, but "9 characters,
+    /// lowercase letters and digits" is longer than a narrow pane, and it was
+    /// painted by the very same unbounded `Painter::text` call the name was.
+    #[test]
+    fn the_weak_detail_line_stays_inside_its_tile() {
+        let report = report_for(&[login("a", "A", Some("abc12345"))]);
+        let detail = weak_detail(&report.weak[0]);
+        // The fixture is only worth anything if this line really is longer
+        // than the narrowest tile; assert that before asserting about it.
+        let narrow = painted_at(&report, PANE_WIDTHS[0]);
+        let (run, tile) = narrow.run_and_tile(&detail);
+        assert!(
+            run.drawn != detail,
+            "the detail line {detail:?} fits the {}pt pane whole, so this test would pass \
+             without any truncation at all -- it needs a longer fixture",
+            PANE_WIDTHS[0]
+        );
+        assert!(run.drawn.ends_with('\u{2026}'), "the detail line was cut with no ellipsis");
+        assert!(
+            run.rect.right() <= tile.right() - ROW_TEXT_INSET + 0.5,
+            "the detail line's ink reaches {} past a tile ending at {}",
+            run.rect.right(),
+            tile.right()
+        );
+        // ...and at a wide pane the same line is untouched.
+        let wide = painted_at(&report, PANE_WIDTHS[2]);
+        let (run, _) = wide.run_and_tile(&detail);
+        assert_eq!(run.drawn, detail, "a detail line that fits was ellipsised anyway");
+    }
+
+    /// **The group caption cannot overflow, and this is why.**
+    ///
+    /// "One password, 2 items" is drawn with `ui.label`, not `Painter::text`
+    /// -- an egui `Label` in a bounded `Ui` wraps at the available width, so
+    /// it grows downwards and never sideways. Same for the section bands and
+    /// the footer note. Asserted rather than merely reasoned about, because
+    /// "it's a Label" is exactly the kind of claim that stops being true when
+    /// someone adds `.truncate(false)` or an `Extend` wrap mode.
+    #[test]
+    fn every_run_the_pane_paints_stays_within_the_pane() {
+        for width in PANE_WIDTHS {
+            let report = report_for(&[
+                login("a", LONG_NAME, Some(STRONG_A)),
+                login("b", LONG_NAME, Some(STRONG_A)),
+                login("c", "A", Some("abc12345")),
+            ]);
+            let painted = painted_at(&report, width);
+            // The caption really is drawn, so the sweep below is about it.
+            let caption = reuse_group_heading(&report.reused[0]);
+            assert!(
+                painted.runs.iter().any(|r| r.source == caption),
+                "the pane painted no {caption:?} at width {width}: {:?}",
+                painted.runs.iter().map(|r| r.source.as_str()).collect::<Vec<_>>()
+            );
+            for run in &painted.runs {
+                assert!(
+                    run.rect.right() <= width + 0.5,
+                    "at width {width} the run {:?} was painted out to {}, past the pane's own \
+                     right edge",
+                    run.drawn,
+                    run.rect.right()
+                );
+            }
         }
     }
 }

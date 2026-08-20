@@ -1556,11 +1556,13 @@ fn paint_title_with_suffix(ui: &mut egui::Ui, title: RichText, suffix: &str) {
         RichText::new(suffix).size(TITLE_SIZE).color(theme::TEXT_FAINT),
     )
     .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
-    // `max(1.0)`, not `max(0.0)`: egui reads a zero wrap width as "do not
-    // wrap", which is the behaviour this is withdrawing.
-    let room = (ui.available_width() - suffix_galley.size().x - TITLE_SUFFIX_GAP_X).max(1.0);
-    let name_galley = egui::WidgetText::from(title)
-        .into_galley(ui, Some(egui::TextWrapMode::Truncate), room, egui::TextStyle::Body);
+    // The suffix's width comes off FIRST -- see the doc comment above.
+    // `theme::truncated_galley` is where the `max(1.0)` room clamp and the
+    // choice of `Truncate` over `Wrap` live, shared with the finding rows on
+    // the Password health screen, which paint a name into a fixed tile for
+    // the same reason.
+    let room = ui.available_width() - suffix_galley.size().x - TITLE_SUFFIX_GAP_X;
+    let name_galley = theme::truncated_galley(ui, title, room, egui::TextStyle::Body);
     let drop = suffix_baseline_drop(&name_galley, &suffix_galley);
     let width = name_galley.size().x + TITLE_SUFFIX_GAP_X + suffix_galley.size().x;
     let (rect, _) =

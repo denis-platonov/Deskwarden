@@ -567,6 +567,44 @@ pub fn mark_ink_rect(rect: Rect) -> Rect {
     )
 }
 
+/// Lays `text` out into a single line no wider than `room`, ellipsised if it
+/// does not fit.
+///
+/// This exists because `Painter::text` takes no width at all: it lays a
+/// string out at its natural width and draws it wherever that reaches, which
+/// is *outside* the tile it was meant for as soon as the string is longer
+/// than the tile is wide. Any surface that paints a name it did not choose --
+/// a vault item's name is the user's text, not ours -- has to lay it into a
+/// galley against a measured width instead, and this is that step, spelled
+/// once.
+///
+/// Two things it is careful about, which are the whole reason it is a
+/// function and not four lines copied twice:
+///
+/// * **`room` is clamped to `1.0`, never `0.0`.** egui reads a zero wrap
+///   width as "do not wrap", i.e. exactly the unbounded behaviour the caller
+///   is trying to withdraw -- so a pane dragged narrower than its own padding
+///   would spring back to overflowing.
+/// * **`TextWrapMode::Truncate`, not `Wrap`.** These callers paint into
+///   fixed-height tiles; a wrapped second row would be drawn over the row
+///   below rather than growing anything.
+///
+/// `style` is only the fallback face -- a `RichText` carrying its own size,
+/// family and colour (which is what every caller passes) overrides it.
+///
+/// Note that egui truncates at the END of a laid-out run. A caller that
+/// paints a name *and* a trailing suffix must therefore lay them out
+/// separately and take the suffix's width off `room` first, or the suffix is
+/// what disappears; see `item_list::paint_title_with_suffix`.
+pub fn truncated_galley(
+    ui: &Ui,
+    text: impl Into<egui::WidgetText>,
+    room: f32,
+    style: TextStyle,
+) -> Arc<egui::Galley> {
+    text.into().into_galley(ui, Some(egui::TextWrapMode::Truncate), room.max(1.0), style)
+}
+
 /// How far a laid-out run's first visible ink sits from its galley origin.
 ///
 /// egui (like a browser) positions text by its layout origin, but every
