@@ -775,7 +775,7 @@ fn paint_network_badge(ui: &egui::Ui, tile: egui::Rect, brand: CardBrand) -> egu
 /// be the height the rows really paint at; `consecutive_row_tiles_sit_exactly_
 /// one_design_gap_apart_and_span_the_pane` asserts that from painted output
 /// rather than trusting the arithmetic above.
-const ROW_TILE_HEIGHT: f32 = AVATAR_SIZE + 2.0 * ROW_PAD_Y + 2.0 * ROW_BORDER;
+pub(crate) const ROW_TILE_HEIGHT: f32 = AVATAR_SIZE + 2.0 * ROW_PAD_Y + 2.0 * ROW_BORDER;
 const ROW_PAD_Y: f32 = 10.0;
 const ROW_PAD_X: f32 = 12.0;
 const ROW_BORDER: f32 = 1.0;
@@ -784,7 +784,13 @@ const ROW_GAP_X: f32 = 11.0;
 /// The list container's `gap: 6px`.
 const ROW_GAP: f32 = 6.0;
 /// The list container's `padding: 10px`.
-const LIST_PADDING: f32 = 10.0;
+///
+/// `pub(crate)` because the **Password health** screen takes this same column
+/// over and has to be inset by the same amount: two panes that swap places in
+/// one column and each spell their own `10.0` are two numbers that must agree,
+/// which is this codebase's standing defect. See
+/// `password_health::PANE_PADDING`.
+pub(crate) const LIST_PADDING: f32 = 10.0;
 
 /// The search field's own id.
 ///

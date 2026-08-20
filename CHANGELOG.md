@@ -10,6 +10,21 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Password health rows line up with the item list again
+
+The two panes take turns in the same column of the same window, and their rows
+did not start and stop at the same place.
+
+- **The same 10pt inset on both sides**, and the same scrollbar handling: the
+  bar is drawn inside that padding rather than in a lane of its own, so no row
+  changes width when a report starts or stops scrolling, or when the pointer
+  enters the pane. The rows used to shift by 10pt with the pointer.
+- **A report short enough to fit paints no scrollbar**, exactly as a short
+  item list does.
+- **A finding whose item has no name at all now says `[No name]`** instead of
+  showing its grey detail line over blank space. A finding that does not say
+  which item it is about cannot be acted on.
+
 ### Password health: long item names no longer run off their row
 
 A finding whose item name was wider than the pane -- a saved page title such

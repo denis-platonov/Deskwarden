@@ -545,6 +545,8 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_vault_item_list.png")
     } else if rail {
         target_dir().join("ui_preview_vault_rail.png")
+    } else if health {
+        target_dir().join("ui_preview_vault_password_health.png")
     } else {
         target_dir().join("ui_preview_overlay.png")
     };

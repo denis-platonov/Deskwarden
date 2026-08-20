@@ -117,6 +117,7 @@
 //! "breached" being absent from this report is never mistaken for "none of
 //! your passwords are breached". See [`breach_note`].
 
+use super::item_list;
 use super::sidebar;
 use crate::password_strength::{rate, CharClasses, Strength};
 use crate::theme;
@@ -449,8 +450,15 @@ pub fn breach_note(breach_checking_on: bool) -> String {
 
 /// Vertical gap between finding rows, matching the item list's own `gap: 6px`.
 const ROW_GAP: f32 = 6.0;
-/// The pane's padding, matching the item list's `padding: 10px`.
-const PANE_PADDING: f32 = 10.0;
+/// The pane's padding.
+///
+/// **Read off the item list rather than written out again.** This screen
+/// replaces that list in the same column of the same window, so a reader
+/// switching between them sees the two insets side by side in time -- and a
+/// second `10.0` here is a number that has to agree with one over there and
+/// has no mechanism making it. It is also what the scrollbar gutter measures:
+/// see the `scrollbar_in_gutter` call below.
+const PANE_PADDING: f32 = item_list::LIST_PADDING;
 /// Height of one finding row: two text lines plus the design's row padding.
 const ROW_HEIGHT: f32 = 46.0;
 /// How far a finding row's text is inset from the tile's edge, on BOTH sides.
@@ -508,9 +516,45 @@ pub fn draw_password_health(
         })
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_GAP;
+            // **The same three lines the item list uses, and for the same
+            // reason.** These two panes take turns in one column, so a gutter
+            // that is 10pt in one and 20pt in the other is a jump the user
+            // sees as soon as they switch -- which is what was reported
+            // ("paddings in this list don't match all items list (left and
+            // right with scroll)").
+            //
+            // `scrollbar_in_gutter` reserves exactly `PANE_PADDING` and draws
+            // the 6pt bar flush to its outer edge, INSIDE the padding; that
+            // reservation is why the frame above has `right: 0`. It only
+            // works with `AlwaysVisible`: egui lays a floating bar's gutter
+            // out only for a bar it is actually showing, so on the default
+            // `VisibleWhenNeeded` the reservation comes and goes with the
+            // pointer and the content, and the rows breathe in and out by
+            // 10pt with it. This pane used to be on the default and to
+            // subtract `PANE_PADDING` from its own width by hand to make up
+            // for the missing reservation -- which lands on the item list's
+            // geometry on exactly the frames where egui reserves nothing, and
+            // 10pt narrow on every frame where it does.
             theme::scrollbar_in_gutter(ui, PANE_PADDING);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width((ui.available_width() - PANE_PADDING).max(0.0));
+            if content_fits(ui) {
+                // The report that fits paints no bar, exactly as the list
+                // that fits does: `AlwaysVisible` would otherwise run a 6pt
+                // line the whole height of a pane with nothing to scroll,
+                // leaving 2pt of clear space on the right against 10pt on the
+                // left. Only the PAINT is suppressed -- the lane stays
+                // reserved, so no row changes width when the last finding is
+                // fixed.
+                theme::hide_scrollbar(ui);
+            }
+            let scrolled = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                // Required by `scrollbar_in_gutter` -- see above.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+                // The gutter is already reserved out of `available_width`, so
+                // this is the full row width and nothing is subtracted from
+                // it a second time.
+                ui.set_width(ui.available_width());
                 draw_summary(ui, report);
                 if !report.reused.is_empty() {
                     section_heading(ui, REUSED_HEADING);
@@ -537,7 +581,57 @@ pub fn draw_password_health(
                 ui.add_space(6.0);
                 footer_note(ui, &breach_note(breach_checking_on));
             });
+            remember_overflow(
+                ui,
+                scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
+            );
         });
+}
+
+/// Whether the report is short enough that there is nothing to scroll, which
+/// is when the bar is not painted.
+///
+/// **Read back from the LAST frame's scroll area, not predicted from the
+/// contents** -- which is the opposite of what the item list does, and the
+/// difference is worth spelling out. That list is a fixed-pitch virtualized
+/// list: `n * ROW_TILE_HEIGHT + (n - 1) * ROW_GAP` is its exact content
+/// height and can be computed before anything is drawn. This pane has no
+/// pitch at all -- a summary card whose sentence wraps, two section bands, a
+/// group caption per reuse group, rows of two different heights, and a footer
+/// note that wraps against the pane's width. Predicting that height here
+/// would be a second, worse copy of the layout below it, and a copy that
+/// disagreed with the real one would hide a bar on a report that really can
+/// scroll.
+///
+/// The cost is that the verdict is one frame old, so the frame on which a
+/// report first appears -- or changes size -- can paint a bar it is about to
+/// stop painting. [`remember_overflow`] asks for a repaint whenever the
+/// answer changes, so that is exactly one frame and never a bar left standing
+/// on an idle window.
+///
+/// **Nothing about the LAYOUT turns on this.** The lane stays reserved either
+/// way; only the bar's six opacities change. A stale verdict can therefore
+/// never move a row, which is what makes a one-frame lag affordable here at
+/// all.
+fn content_fits(ui: &egui::Ui) -> bool {
+    // Ties go to "can scroll", as they do in the item list: being wrong the
+    // other way hides a bar on a report the user really can move. The first
+    // frame has no memory and so shows the bar.
+    !ui.ctx().data(|d| d.get_temp::<bool>(overflow_id()).unwrap_or(true))
+}
+
+/// Stores what [`content_fits`] reads, and asks for one more frame when the
+/// answer changed -- see there.
+fn remember_overflow(ui: &egui::Ui, overflows: bool) {
+    let previous = ui.ctx().data(|d| d.get_temp::<bool>(overflow_id()));
+    if previous != Some(overflows) {
+        ui.ctx().data_mut(|d| d.insert_temp(overflow_id(), overflows));
+        ui.ctx().request_repaint();
+    }
+}
+
+fn overflow_id() -> egui::Id {
+    egui::Id::new("password_health_overflows")
 }
 
 /// The two section bands, spelled once so the tests that look for them and
@@ -595,6 +689,30 @@ fn centred_left(left: f32, centre_y: f32, galley: &egui::Galley) -> egui::Pos2 {
     egui::Pos2::new(left, centre_y - galley.size().y / 2.0)
 }
 
+/// What a finding row calls an item that has no name of its own.
+///
+/// **A finding that does not say WHICH item is unactionable.** The user
+/// cannot go and change a password they cannot find, and the row's whole job
+/// is to be clicked through to the item. An item with an empty `name` lays
+/// out to no glyphs at all, so without this the row would paint its grey
+/// detail line over blank space -- which reads exactly like a row whose name
+/// failed, and tells the reader nothing either way.
+///
+/// In square brackets and in the pane's own words, so it cannot be mistaken
+/// for an item really called this.
+pub const UNNAMED_ITEM: &str = "[No name]";
+
+/// The name a finding row paints for `name`: the item's own, or
+/// [`UNNAMED_ITEM`] when it has none. Whitespace counts as none -- a name of
+/// three spaces is as blank on screen as an empty one.
+fn finding_name(name: &str) -> &str {
+    if name.trim().is_empty() {
+        UNNAMED_ITEM
+    } else {
+        name
+    }
+}
+
 /// One clickable finding. Returns whether it was clicked.
 fn finding_row(ui: &mut egui::Ui, name: &str, detail: Option<&str>, selected: bool) -> bool {
     let width = ui.available_width();
@@ -625,7 +743,7 @@ fn finding_row(ui: &mut egui::Ui, name: &str, detail: Option<&str>, selected: bo
     let room = rect.width() - ROW_TEXT_INSET * 2.0;
     let name_galley = theme::truncated_galley(
         ui,
-        theme::semibold(name, 13.0)
+        theme::semibold(finding_name(name), 13.0)
             .color(if selected { theme::BLUE_DEEP } else { theme::INK }),
         room,
         egui::TextStyle::Body,
@@ -1860,5 +1978,370 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ==================================================================
+    // The two panes that share one column line up
+    // ==================================================================
+
+    /// The rounded tiles a pane painted, at their exact row height,
+    /// deduplicated by their x extent.
+    ///
+    /// **X extent only.** The question is where a row starts and stops
+    /// horizontally, and a pane that painted its rows at two different widths
+    /// is exactly the defect -- so the answer has to be able to come back as
+    /// more than one value, and an assertion on a one-element vector is what
+    /// says there is only one.
+    fn tile_spans(shapes: &egui::Shape, height: f32, out: &mut Vec<(f32, f32)>) {
+        match shapes {
+            egui::Shape::Rect(rect) if (rect.rect.height() - height).abs() < 0.5 => {
+                let span = (rect.rect.left(), rect.rect.right());
+                if !out.iter().any(|s| (s.0 - span.0).abs() < 0.5 && (s.1 - span.1).abs() < 0.5) {
+                    out.push(span);
+                }
+            }
+            egui::Shape::Vec(inner) => {
+                for shape in inner {
+                    tile_spans(shape, height, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The width the two panes are compared at -- the item-list column's own,
+    /// so neither is drawn at a size the window never gives it.
+    const COLUMN: f32 = 390.0;
+
+    /// Raw input at [`COLUMN`], optionally with the pointer parked inside the
+    /// pane.
+    ///
+    /// **The pointer is the whole reason this parameter exists.** egui lays a
+    /// floating scrollbar's gutter out for a bar it is actually showing, and
+    /// on the default `VisibleWhenNeeded` it shows one only while the pointer
+    /// is in the area. A test run with the pointer permanently off-screen --
+    /// which is what a bare `RawInput` is -- therefore measures the one state
+    /// in which the old code happened to be right, and would have passed
+    /// against the bug it is here to pin.
+    fn column_input(pointer_inside: bool) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(COLUMN, 700.0),
+            )),
+            ..Default::default()
+        };
+        if pointer_inside {
+            input.events.push(egui::Event::PointerMoved(egui::pos2(COLUMN - 4.0, 400.0)));
+        }
+        input
+    }
+
+    fn column_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(column_input(false), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(column_input(false), |_ui| {});
+        ctx
+    }
+
+    /// Where the **Password health** pane puts its finding tiles, with `n`
+    /// weak findings and the pointer where `pointer_inside` says.
+    ///
+    /// Run for three frames so the one-frame-late overflow verdict (see
+    /// [`content_fits`]) has settled -- otherwise the bar's paint, though not
+    /// the layout, would be read mid-settle.
+    fn health_spans(n: usize, pointer_inside: bool) -> Vec<(f32, f32)> {
+        let ctx = column_context();
+        let items: Vec<VaultItem> = (0..n)
+            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some("abc12345")))
+            .collect();
+        let report = report_for(&items);
+        let mut selected = None;
+        let mut spans = Vec::new();
+        for frame in 0..3 {
+            let output = ctx.run_ui(column_input(pointer_inside), |ui| {
+                draw_password_health(ui, &report, &mut selected, false);
+            });
+            if frame == 2 {
+                for clipped in &output.shapes {
+                    tile_spans(&clipped.shape, ROW_HEIGHT, &mut spans);
+                }
+            }
+        }
+        spans
+    }
+
+    /// Where the **item list** puts its row tiles, in the same column, at the
+    /// same width, with the same pointer.
+    fn list_spans(n: usize, pointer_inside: bool) -> Vec<(f32, f32)> {
+        let ctx = column_context();
+        let items: Vec<VaultItem> = (0..n)
+            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some(STRONG_A)))
+            .collect();
+        let icons = item_list::IconCache::default();
+        let (mut search, mut selected, mut visible) = (String::new(), None, Vec::new());
+        let mut spans = Vec::new();
+        for frame in 0..3 {
+            let output = ctx.run_ui(column_input(pointer_inside), |ui| {
+                let _ = item_list::draw_item_list(
+                    ui,
+                    Some(&items),
+                    &[],
+                    &sidebar::SidebarFilter::All,
+                    &mut search,
+                    &mut selected,
+                    None,
+                    &icons,
+                    &mut visible,
+                    None,
+                    false,
+                );
+            });
+            if frame == 2 {
+                for clipped in &output.shapes {
+                    tile_spans(&clipped.shape, item_list::ROW_TILE_HEIGHT, &mut spans);
+                }
+            }
+        }
+        spans
+    }
+
+    /// **The reported defect: the two panes' rows start and stop at the same
+    /// x.**
+    ///
+    /// They take turns in one column of one window, so a reader switching
+    /// between them sees both insets in succession -- *"paddings in this list
+    /// don't match all items list (left and right with scroll)"*.
+    ///
+    /// Checked in four states, because the mismatch was not constant: a short
+    /// report and a long one (the bar's own reservation), each with the
+    /// pointer away and inside the pane (egui only lays a floating bar's
+    /// gutter out for a bar it is showing). The old code matched in exactly
+    /// one of the four.
+    #[test]
+    fn the_health_pane_and_the_item_list_lay_their_rows_out_identically() {
+        for n in [1usize, 40] {
+            for pointer_inside in [false, true] {
+                let health = health_spans(n, pointer_inside);
+                let list = list_spans(n, pointer_inside);
+                assert_eq!(
+                    health.len(),
+                    1,
+                    "with {n} findings and pointer_inside={pointer_inside} the health pane \
+                     painted its rows at {} different x extents: {health:?}",
+                    health.len()
+                );
+                assert_eq!(
+                    list.len(),
+                    1,
+                    "with {n} items and pointer_inside={pointer_inside} the item list painted \
+                     its rows at {} different x extents: {list:?}",
+                    list.len()
+                );
+                assert!(
+                    (health[0].0 - list[0].0).abs() < 0.5
+                        && (health[0].1 - list[0].1).abs() < 0.5,
+                    "with {n} rows and pointer_inside={pointer_inside} the health rows span \
+                     {:?} while the item list rows span {:?}",
+                    health[0],
+                    list[0]
+                );
+                // ...and against the numbers themselves, so a change that
+                // moved BOTH panes together could not pass this quietly.
+                assert!(
+                    (health[0].0 - PANE_PADDING).abs() < 0.5
+                        && (health[0].1 - (COLUMN - PANE_PADDING)).abs() < 0.5,
+                    "the rows span {:?}, not the expected {PANE_PADDING}..{}",
+                    health[0],
+                    COLUMN - PANE_PADDING
+                );
+            }
+        }
+    }
+
+    /// **The health pane's rows are ONE width across every one of those
+    /// states**, which is the constraint the item list already carries: a row
+    /// that resized when the pointer entered, or when the last finding was
+    /// fixed, is the *"window should not shrink/expand if more or less items"*
+    /// report all over again.
+    #[test]
+    fn the_health_pane_s_rows_never_change_width() {
+        let mut seen: Vec<(f32, f32)> = Vec::new();
+        for n in [1usize, 40] {
+            for pointer_inside in [false, true] {
+                for span in health_spans(n, pointer_inside) {
+                    if !seen.iter().any(|s: &(f32, f32)| {
+                        (s.0 - span.0).abs() < 0.5 && (s.1 - span.1).abs() < 0.5
+                    }) {
+                        seen.push(span);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "the finding rows were laid out at {} different x extents across the four \
+             pointer/length states: {seen:?}",
+            seen.len()
+        );
+    }
+
+    // ==================================================================
+    // A finding always says which item it is about
+    // ==================================================================
+
+    /// **A finding with a blank name still names something.**
+    ///
+    /// The reported symptom was a row showing only its grey detail line, with
+    /// no name above it. That one is a row scrolled half under the pane's
+    /// header strip -- the name is the upper of the row's two lines, so a
+    /// part-clipped row shows exactly the lower one, and the pane's own
+    /// `ScrollArea` clips it. But the same picture is reachable for real: an
+    /// item whose `name` is empty lays out to no glyphs at all, so the row
+    /// would paint its detail line and nothing else.
+    ///
+    /// A finding that does not say WHICH item is unactionable -- the user
+    /// cannot fix a password they cannot find -- so the row falls back to a
+    /// stated placeholder rather than to blank space.
+    #[test]
+    fn a_finding_whose_item_has_no_name_still_paints_a_name() {
+        for name in ["", "   "] {
+            let report = report_for(&[login("id", name, Some("abc12345"))]);
+            let painted = painted_at(&report, COLUMN);
+            let (run, tile) = painted.run_and_tile(UNNAMED_ITEM);
+            assert!(!run.drawn.is_empty(), "the fallback name laid out no glyphs at all");
+            assert!(
+                run.rect.top() < tile.center().y,
+                "the fallback name was not painted on the row's upper line"
+            );
+            // The detail line is there too, so this is really the two-line
+            // row and not a row that lost its detail instead.
+            let detail = weak_detail(&report.weak[0]);
+            assert!(
+                painted.runs.iter().any(|r| r.source == detail),
+                "the row painted no detail line for name {name:?}"
+            );
+        }
+    }
+
+    /// The counter-assertion: an item that HAS a name is not given the
+    /// placeholder, and keeps its own name exactly.
+    #[test]
+    fn a_named_finding_is_not_given_the_placeholder() {
+        let report = report_for(&[login("id", "Bank", Some("abc12345"))]);
+        let painted = painted_at(&report, COLUMN);
+        assert!(
+            painted.runs.iter().all(|r| r.source != UNNAMED_ITEM),
+            "a named item was painted as {UNNAMED_ITEM:?}"
+        );
+        let (run, _) = painted.run_and_tile("Bank");
+        assert_eq!(run.drawn, "Bank");
+    }
+
+    /// Every visibly-inked rect the pane painted that is the scrollbar's own
+    /// width, at `settle` frames with the pointer parked over the gutter.
+    ///
+    /// **Keyed on visible ink, not on presence.** `theme::hide_scrollbar`
+    /// leaves the bar's rects being emitted and zeroes their six opacities,
+    /// so a probe that only counted `Shape::Rect`s of the right width would
+    /// find the bar in both states and could never tell them apart. egui also
+    /// fades a floating bar in over several frames, which is why this settles
+    /// rather than reading frame one -- an earlier version of the item list's
+    /// own test read frame one and asserted the placement of a bar that was
+    /// not being drawn yet.
+    fn inked_bars(n: usize, settle: usize) -> Vec<egui::Rect> {
+        let ctx = column_context();
+        let items: Vec<VaultItem> = (0..n)
+            .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some("abc12345")))
+            .collect();
+        let report = report_for(&items);
+        let mut selected = None;
+        let mut bars = Vec::new();
+        for frame in 0..settle {
+            let output = ctx.run_ui(column_input(true), |ui| {
+                draw_password_health(ui, &report, &mut selected, false);
+            });
+            if frame + 1 == settle {
+                for clipped in &output.shapes {
+                    collect_bars(&clipped.shape, &mut bars);
+                }
+            }
+        }
+        bars
+    }
+
+    fn collect_bars(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect)
+                if (rect.rect.width() - theme::SCROLLBAR_WIDTH).abs() < 0.5
+                    && rect.fill.a() > 0 =>
+            {
+                out.push(rect.rect)
+            }
+            egui::Shape::Vec(inner) => {
+                for shape in inner {
+                    collect_bars(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Enough frames for egui's floating-bar fade AND for `content_fits`'
+    /// one-frame-late verdict to settle.
+    const SETTLE_FRAMES: usize = 12;
+
+    /// **The bar lives inside the pane's own 10pt padding, exactly where the
+    /// item list's does** -- flush to the gutter's outer edge, taking no
+    /// width from the rows.
+    ///
+    /// This is the half of "the paddings do not match" that is not about the
+    /// rows: a bar in a lane of its own outside the padding is what the user
+    /// rejected on the item list ("scroll should be included in those 10pt"),
+    /// and the health pane must not reintroduce it next door.
+    #[test]
+    fn a_scrolling_report_draws_its_bar_inside_the_panes_own_padding() {
+        let bars = inked_bars(40, SETTLE_FRAMES);
+        assert!(
+            !bars.is_empty(),
+            "a 40-finding report painted no scrollbar at all, so nothing below is about a bar"
+        );
+        for bar in &bars {
+            assert!(
+                (bar.right() - COLUMN).abs() < 0.5
+                    && (bar.left() - (COLUMN - theme::SCROLLBAR_WIDTH)).abs() < 0.5,
+                "the bar spans {}..{}, expected {}..{COLUMN} -- flush to the outer edge of the \
+                 {PANE_PADDING}pt gutter, as the item list's is",
+                bar.left(),
+                bar.right(),
+                COLUMN - theme::SCROLLBAR_WIDTH
+            );
+        }
+    }
+
+    /// **A report that fits paints no bar at all**, which is the state the
+    /// reserved-lane trick would otherwise get wrong: `AlwaysVisible` is what
+    /// holds the rows at one width, and it would also run a 6pt line the full
+    /// height of a pane with nothing to scroll, leaving 2pt of clear space on
+    /// the right against 10pt on the left.
+    ///
+    /// The rows are asserted not to have moved either -- suppressing the
+    /// PAINT and not the reservation is the whole point, and a fix that
+    /// dropped `AlwaysVisible` instead would pass the first half of this and
+    /// fail the second.
+    #[test]
+    fn a_report_that_fits_paints_no_bar_and_still_does_not_move_its_rows() {
+        assert!(
+            inked_bars(1, SETTLE_FRAMES).is_empty(),
+            "a one-finding report drew a scrollbar down a pane with nothing to scroll: {:?}",
+            inked_bars(1, SETTLE_FRAMES)
+        );
+        assert_eq!(
+            health_spans(1, true),
+            health_spans(40, true),
+            "the rows moved between a report that fits and one that scrolls"
+        );
     }
 }
