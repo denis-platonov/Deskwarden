@@ -50,6 +50,23 @@ the same claim as saying nobody is signed in.
 There was an eight-point strip of window background between the bottom of the
 titlebar and the top of the left-hand navigation column.
 
+### Breach scans are recorded, as counts and nothing else
+
+The last twenty scans are kept in `scan_history.json`, beside `settings.json`
+in `%APPDATA%\Deskwarden` -- a separate file, because a record is not a
+preference.
+
+Each entry is five numbers: when it finished, how many distinct passwords were
+checked, how many items those covered, how many were found, and how many could
+not be checked. **No password, no item name, no item id, no hash, and nothing
+derived from a password ever goes in it.** A per-item history would be a
+genuinely useful feature and it is refused: it would be an unencrypted list of
+which of your entries are compromised, sitting next to your settings, readable
+by anything running as you and surviving every lock.
+
+An older file, a missing one, an empty one and an unreadable one all read as
+"no scans yet", and none of them stops the next scan being recorded.
+
 ### A Send's expiry date is the day on your own calendar
 
 The line under the lifetime picker read "The link stops working after 7 days --

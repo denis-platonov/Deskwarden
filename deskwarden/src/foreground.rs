@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 50] = [
+        const OPENS_NO_WINDOW: [&str; 51] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1122,6 +1122,9 @@ mod tests {
             // with no I/O at all; the surfaces that will draw it are a later
             // step and are not this module.
             "record",
+            // `scan_history.json`: five counts per scan, read and written
+            // through `serde_json`. It touches one file and paints nothing.
+            "scan_history",
             // **Judgement call, recorded rather than assumed**, and the same
             // one `file_picker` above carries. The master-password re-prompt
             // does put a window on screen -- the Windows Hello verification

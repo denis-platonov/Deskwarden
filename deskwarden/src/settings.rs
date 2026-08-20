@@ -730,8 +730,26 @@ pub const SETTINGS_FILE_NAME: &str = "settings.json";
 /// config directory (in which case nothing is persisted -- the same silent
 /// fall-back every other read here makes).
 pub fn default_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
+}
+
+/// The directory `settings.json` lives in, for the other file this app keeps
+/// beside it.
+///
+/// **Extracted so the triple is spelled once inside this crate**, not so that
+/// anything may write anywhere. The only other file in that directory is
+/// [`crate::scan_history`]'s, which is deliberately a separate file rather
+/// than more fields on [`Settings`] -- see that module for why a record is
+/// not a preference. A second copy of `ProjectDirs::from(..)` is exactly how
+/// one of the two would come to be written into a directory the other does
+/// not read.
+///
+/// `None` where the platform has no resolvable config directory, in which
+/// case nothing is persisted -- the same silent fall-back every other read
+/// here makes.
+pub fn config_dir() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORGANIZATION, PROJECT_APPLICATION)
-        .map(|dirs| dirs.config_dir().join(SETTINGS_FILE_NAME))
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
