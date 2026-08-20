@@ -1194,6 +1194,103 @@ pub fn overlay_prompts(prompt_on_match: bool) -> OverlayPrompts {
     }
 }
 
+/// **The image names this build recognises as a web browser, and the single
+/// source of that answer.**
+///
+/// One list, read by one function ([`browser_window`]), consulted at one call
+/// site. This crate keeps finding defects in the shape where two enumerations
+/// must agree, so there is deliberately no second copy: no per-browser
+/// behaviour table, no parallel list in `main`, no string literal anywhere
+/// else. `the_browser_list_is_the_only_place_a_browser_is_named` holds that.
+///
+/// Compared whole and ASCII-case-insensitively against
+/// `window_watch::ForegroundEvent::exe_name`, exactly as
+/// [`never_for_app`] compares its own list, and for the same reason: Windows
+/// hands the same executable back with different capitalisation depending on
+/// how it was launched.
+///
+/// **A browser that is not on this list is treated as an ordinary app**, and
+/// that is the deliberate failure direction. The unrecognised browser gets the
+/// behaviour every native app gets today -- one no-match card, with a *Never
+/// for this app* button on it that silences it permanently (see
+/// [`NeverForApp`]). The opposite default -- guessing at browser-ness from
+/// something softer than the image name -- would silence native apps the user
+/// does want the card for, and a card that never appears cannot be turned back
+/// on from the card.
+///
+/// **UI Automation was considered for this and rejected.** It can report a
+/// window's control pattern and framework, and Chromium and Gecko windows do
+/// identify as such -- but so does every Electron and WebView2 app on the
+/// desktop, which are native apps whose credentials genuinely are keyed on the
+/// executable and which must keep the card. The honest question is not "does
+/// this window render HTML" but "does this app own credentials per site rather
+/// than per executable", and no automation property answers that. A name list
+/// answers it exactly, is wrong only in the recoverable direction above, and
+/// costs no cross-process call on a path that already pays for one.
+pub const BROWSER_IMAGE_NAMES: &[&str] = &[
+    "brave.exe",
+    "chrome.exe",
+    "chromium.exe",
+    "firefox.exe",
+    "floorp.exe",
+    "iexplore.exe",
+    "librewolf.exe",
+    "msedge.exe",
+    "opera.exe",
+    "opera_gx.exe",
+    "thorium.exe",
+    "vivaldi.exe",
+    "waterfox.exe",
+    "zen.exe",
+];
+
+/// Whether the foreground window belongs to a web browser.
+///
+/// **The sixth input to [`disposition`]**, and it exists because the no-match
+/// card is structurally unable to be right in a browser. Every login page has
+/// a password field, so the probe answers `Yes` every time; and Deskwarden's
+/// match table is keyed on **executables** while a browser's credentials
+/// belong to **sites**, so the vault will almost never match. The card is
+/// therefore near-permanent noise there -- "No saved login for <the browser>"
+/// is both true and useless, because a login saved for a site would not make
+/// it stop.
+///
+/// **It suppresses 3a and 3b only.** A browser the user has deliberately
+/// matched to a vault item still raises the fill card: they wrote that rule by
+/// hand against that executable, and refusing to honour it would be this
+/// function deciding it knows better than an explicit instruction. See
+/// [`disposition`]'s `Matched::Yes` arm, which consults none of this.
+///
+/// **There is no preference to override it**, and that is the answer rather
+/// than an omission. The card it suppresses ends in *Save this login for
+/// <app>* -- an app-keyed rule -- which is the one thing that cannot be right
+/// for a browser, so an override would only re-enable a card whose offer is
+/// wrong. The per-app control that does exist ([`NeverForApp`]) can only add
+/// silence; this is the same direction, decided once instead of by every user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserWindow {
+    /// [`BROWSER_IMAGE_NAMES`] contains this image name.
+    Yes,
+    /// It does not -- an ordinary native app, as far as this build can tell.
+    No,
+}
+
+/// [`BrowserWindow`] for one image name, against [`BROWSER_IMAGE_NAMES`].
+///
+/// **The argument is the executable file name, not [`window_label`]'s
+/// answer.** The label falls back to the window *title* for a frame it cannot
+/// attribute, and titles are attacker- and user-controlled text: a document
+/// named after a browser's executable, open in an editor, would otherwise
+/// silence that editor's card.
+/// The image name is the only part of a window that names the program.
+pub fn browser_window(exe_name: &str) -> BrowserWindow {
+    if BROWSER_IMAGE_NAMES.iter().any(|b| b.eq_ignore_ascii_case(exe_name)) {
+        BrowserWindow::Yes
+    } else {
+        BrowserWindow::No
+    }
+}
+
 /// The apps this process has been told *Never* about.
 ///
 /// Seeded once from `settings.json` and appended to by
@@ -1361,10 +1458,18 @@ pub enum Open<'a> {
 /// [`match_disposition`], which is also where the hotkey is armed either way,
 /// so silencing it here would switch autofill off entirely.
 ///
-/// **All three suppressors are read inside the `HasPasswordField::Yes` arm and
+/// # `browser` is the sixth, and it suppresses 3a and 3b too
+///
+/// See [`BrowserWindow`]: in a browser the probe always finds a field and the
+/// executable-keyed vault almost never matches, so the card is noise that no
+/// saved login can stop. A **matched** browser window still prompts -- the
+/// user wrote that rule by hand -- which is again the `Matched::Yes` arm
+/// consulting none of this.
+///
+/// **All four suppressors are read inside the `HasPasswordField::Yes` arm and
 /// nowhere else**, which is what keeps the silence control pure: a window with
 /// no password field and no match is [`Open::Nothing`] for reasons that have
-/// nothing to do with any setting and any list.
+/// nothing to do with any setting, any list and any browser.
 /// `an_ordinary_window_is_still_silence_for_reasons_no_setting_can_change` is
 /// the test that holds it, and
 /// `an_unmatched_native_app_still_gets_the_card_with_the_setting_on` is the
@@ -1376,6 +1481,7 @@ pub fn disposition<'a>(
     vault: VaultAvailability,
     never: NeverForApp,
     prompts: OverlayPrompts,
+    browser: BrowserWindow,
 ) -> Open<'a> {
     match matched {
         // A match is only representable when the engine holds entries, which
@@ -1397,6 +1503,9 @@ pub fn disposition<'a>(
             // `match_disposition`, and it shares a line with the hotkey
             // arming that must survive the prompt being off.
             HasPasswordField::Yes if prompts == OverlayPrompts::Silenced => Open::Nothing,
+            // The browser, last of the three suppressors and the same shape
+            // as the two above: it can only ever turn a card into silence.
+            HasPasswordField::Yes if browser == BrowserWindow::Yes => Open::Nothing,
             HasPasswordField::Yes => match vault {
                 VaultAvailability::Readable => Open::NoMatch,
                 VaultAvailability::Locked => Open::Locked,
@@ -6667,7 +6776,8 @@ mod save_login_tests {
                 HasPasswordField::Yes,
                 VaultAvailability::Readable,
                 NeverForApp::Yes,
-                OverlayPrompts::Shown
+                OverlayPrompts::Shown,
+                BrowserWindow::No
             ),
             Open::Nothing,
             "the user pressed `Never for this app` and the no-match card came back anyway. A \
@@ -6679,7 +6789,8 @@ mod save_login_tests {
                 HasPasswordField::Yes,
                 VaultAvailability::Locked,
                 NeverForApp::Yes,
-                OverlayPrompts::Shown
+                OverlayPrompts::Shown,
+                BrowserWindow::No
             ),
             Open::Nothing,
             "a silenced app started showing the LOCKED card the moment the vault locked. 3b \
@@ -6695,7 +6806,8 @@ mod save_login_tests {
                 HasPasswordField::Yes,
                 VaultAvailability::Readable,
                 NeverForApp::No,
-                OverlayPrompts::Shown
+                OverlayPrompts::Shown,
+                BrowserWindow::No
             ),
             Open::NoMatch
         );
@@ -6705,7 +6817,8 @@ mod save_login_tests {
                 HasPasswordField::Yes,
                 VaultAvailability::Locked,
                 NeverForApp::No,
-                OverlayPrompts::Shown
+                OverlayPrompts::Shown,
+                BrowserWindow::No
             ),
             Open::Locked
         );
@@ -6723,7 +6836,7 @@ mod save_login_tests {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No),
                     Open::Match("42"),
                     "a saved login stopped being offered because the user had once said \
                      `never save a login for this app`. Those are different questions, and \
@@ -6748,7 +6861,7 @@ mod save_login_tests {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 for never in [NeverForApp::Yes, NeverForApp::No] {
                     assert_eq!(
-                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown),
+                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown, BrowserWindow::No),
                         Open::Nothing,
                         "a window with no match and no password field opened a card"
                     );
@@ -6764,8 +6877,8 @@ mod save_login_tests {
         for matched in [Matched::No, Matched::Yes("7")] {
             for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
                 for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
-                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown);
-                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown);
+                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No);
+                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No);
                     assert!(
                         with == Open::Nothing || with == without,
                         "with `never` this window opens {with:?} and without it {without:?}, \
@@ -6882,6 +6995,7 @@ mod disposition_tests {
                     vault,
                     NeverForApp::No,
                     OverlayPrompts::Silenced,
+                    BrowserWindow::No,
                 ),
                 Open::Nothing,
                 "the prompt is off in Preferences and an unmatched window still opened a \
@@ -6903,12 +7017,18 @@ mod disposition_tests {
     #[test]
     fn an_unmatched_native_app_still_gets_the_card_with_the_setting_on() {
         assert_eq!(
+            browser_window("ledgerline.exe"),
+            BrowserWindow::No,
+            "the premise: the app in this test is not a browser"
+        );
+        assert_eq!(
             disposition(
                 Matched::No,
                 HasPasswordField::Yes,
                 VaultAvailability::Readable,
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
+                browser_window("ledgerline.exe"),
             ),
             Open::NoMatch,
             "the no-match card has stopped appearing for the one case it is FOR. Both \
@@ -6923,6 +7043,7 @@ mod disposition_tests {
                 VaultAvailability::Locked,
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
+                browser_window("ledgerline.exe"),
             ),
             Open::Locked
         );
@@ -6945,6 +7066,7 @@ mod disposition_tests {
                 VaultAvailability::Readable,
                 NeverForApp::No,
                 OverlayPrompts::Silenced,
+                BrowserWindow::No,
             ),
             Open::Match("42"),
             "the unmatched-card gate has swallowed the matched arm too, so the hotkey \
@@ -6957,12 +7079,111 @@ mod disposition_tests {
         assert!(match_arms_hotkey(false), "the hotkey must arm with the prompt off");
     }
 
-    /// **The silence control is still pure, and now against three
+    // -- Defect 2: a browser gets no unmatched card ------------------------
+
+    /// **Every name on the list is recognised**, matched whole and
+    /// case-insensitively, and nothing near one is.
+    #[test]
+    fn the_browser_list_is_matched_whole_and_case_insensitively() {
+        assert!(!BROWSER_IMAGE_NAMES.is_empty());
+        for name in BROWSER_IMAGE_NAMES {
+            assert_eq!(browser_window(name), BrowserWindow::Yes, "{name}");
+            assert_eq!(browser_window(&name.to_uppercase()), BrowserWindow::Yes, "{name}");
+        }
+        // Not a substring, not a prefix, not a suffix -- the failure shape
+        // `never_for_app` is written against, for the same reason.
+        for near in ["notfirefox.exe", "firefox.exe.exe", "firefox", "chrome.exe.bak"] {
+            assert_eq!(browser_window(near), BrowserWindow::No, "{near}");
+        }
+        assert_eq!(browser_window(""), BrowserWindow::No);
+    }
+
+    /// **The reported window: a browser with a password field and no match
+    /// gets nothing**, with the setting on and no `never` recorded -- so the
+    /// silence is the browser rule and not one of the other two.
+    #[test]
+    fn a_browser_gets_neither_unmatched_card_even_with_the_prompt_on() {
+        for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    HasPasswordField::Yes,
+                    vault,
+                    never_for_app(&[], "firefox.exe"),
+                    overlay_prompts(true),
+                    browser_window("firefox.exe"),
+                ),
+                Open::Nothing,
+                "a browser opened an unmatched card ({vault:?}). Every login page has a \
+                 password field and the vault is keyed on executables, so this card cannot \
+                 be right there and no saved login would make it stop"
+            );
+        }
+    }
+
+    /// **A browser this build does not recognise is an ordinary app**, and the
+    /// assertion is the whole of what happens to it: it keeps today's
+    /// behaviour, one card with a *Never for this app* button on it.
+    #[test]
+    fn an_unrecognised_browser_is_treated_as_an_ordinary_app() {
+        assert_eq!(browser_window("palemoon.exe"), BrowserWindow::No, "the premise");
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                never_for_app(&[], "palemoon.exe"),
+                overlay_prompts(true),
+                browser_window("palemoon.exe"),
+            ),
+            Open::NoMatch
+        );
+        // And the recourse, which is why that is the safe direction to be
+        // wrong in: the card's own `Never` button silences it for good.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                never_for_app(&["palemoon.exe".to_string()], "palemoon.exe"),
+                overlay_prompts(true),
+                browser_window("palemoon.exe"),
+            ),
+            Open::Nothing
+        );
+    }
+
+    /// **A matched browser window still prompts.**
+    ///
+    /// A rule against a browser in the vault is something the user wrote by
+    /// hand against that executable. Refusing to honour it would be this rule
+    /// deciding it knows better than an explicit instruction, and unlike the
+    /// no-match card there is nothing structurally wrong with the offer: there
+    /// IS an item, and Fill types it into the window in front.
+    #[test]
+    fn a_matched_browser_window_still_prompts() {
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(
+                    Matched::Yes("42"),
+                    field,
+                    VaultAvailability::Readable,
+                    NeverForApp::No,
+                    overlay_prompts(true),
+                    browser_window(BROWSER_IMAGE_NAMES[0]),
+                ),
+                Open::Match("42"),
+                "an app-match rule the user wrote against a browser stopped being honoured"
+            );
+        }
+    }
+
+    /// **The silence control is still pure, and now against four
     /// suppressors.**
     ///
     /// A window with no match and no password field must be silent for reasons
-    /// that have nothing to do with any setting and any list -- and no
-    /// suppressor may ever turn silence INTO a card. Both halves are
+    /// that have nothing to do with any setting, any list and any browser --
+    /// and no suppressor may ever turn silence INTO a card. Both halves are
     /// asserted across the whole cross-product, because the claim is about
     /// every combination rather than about a point.
     #[test]
@@ -6972,20 +7193,22 @@ mod disposition_tests {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 for never in [NeverForApp::Yes, NeverForApp::No] {
                     for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
-                        assert_eq!(
-                            disposition(Matched::No, field, vault, never, prompts),
-                            Open::Nothing,
-                            "a window with no match and no password field opened a card"
-                        );
-                        checked += 1;
+                        for browser in [BrowserWindow::Yes, BrowserWindow::No] {
+                            assert_eq!(
+                                disposition(Matched::No, field, vault, never, prompts, browser),
+                                Open::Nothing,
+                                "a window with no match and no password field opened a card"
+                            );
+                            checked += 1;
+                        }
                     }
                 }
             }
         }
-        assert_eq!(checked, 16, "the loop must have covered every combination");
+        assert_eq!(checked, 32, "the loop must have covered every combination");
 
-        // The setting cannot turn silence into a card, nor swap which card is
-        // shown -- the ordering `never` is already held to.
+        // Neither new input can turn silence into a card, nor swap which card
+        // is shown -- the ordering `never` is already held to.
         for matched in [Matched::No, Matched::Yes("7")] {
             for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
                 for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
@@ -6995,6 +7218,7 @@ mod disposition_tests {
                         vault,
                         NeverForApp::No,
                         OverlayPrompts::Shown,
+                        BrowserWindow::No,
                     );
                     let silenced = disposition(
                         matched,
@@ -7002,8 +7226,19 @@ mod disposition_tests {
                         vault,
                         NeverForApp::No,
                         OverlayPrompts::Silenced,
+                        BrowserWindow::No,
                     );
-                    for (with, what) in [(silenced, "the prompt setting")] {
+                    let browsed = disposition(
+                        matched,
+                        field,
+                        vault,
+                        NeverForApp::No,
+                        OverlayPrompts::Shown,
+                        BrowserWindow::Yes,
+                    );
+                    for (with, what) in
+                        [(silenced, "the prompt setting"), (browsed, "the browser rule")]
+                    {
                         assert!(
                             with == Open::Nothing || with == base,
                             "{what} turned {base:?} into {with:?}, so it is changing WHICH \
@@ -7014,6 +7249,49 @@ mod disposition_tests {
             }
         }
     }
+
+    /// **[`BROWSER_IMAGE_NAMES`] is the only place this crate names a
+    /// browser.**
+    ///
+    /// The "two enumerations that must agree" shape is where this codebase
+    /// keeps finding defects, so the list is pinned as the single source: each
+    /// name appears exactly once in `app.rs` before this block of tests, and
+    /// `main` -- the one call site -- names none of them at all. A second list
+    /// added anywhere would compile, ship, and disagree with this one on the
+    /// first browser either of them forgot.
+    #[test]
+    fn the_browser_list_is_the_only_place_a_browser_is_named() {
+        let source = include_str!("app.rs");
+        // Everything from the first test module on is test text -- other
+        // modules here name browsers as sample windows, quite properly. The
+        // claim is about the half of the file that ships.
+        let boundary = source
+            .find(concat!("mod ", "tests {"))
+            .expect("app.rs's first test module is gone, so this pin no longer knows where                      the shipping half of the file ends");
+        let production = &source[..boundary];
+        assert!(
+            production.contains(concat!("pub fn browser", "_window(exe_name: &str)")),
+            "the boundary landed before `browser_window`, so `production` does not contain              the list this test is about"
+        );
+        for name in BROWSER_IMAGE_NAMES {
+            assert_eq!(
+                production.matches(*name).count(),
+                1,
+                "{name} appears more than once in app.rs outside these tests: the list is \
+                 no longer the single source of what a browser is"
+            );
+        }
+        let main_rs = include_str!("main.rs");
+        for name in BROWSER_IMAGE_NAMES {
+            assert_eq!(
+                main_rs.matches(*name).count(),
+                0,
+                "{name} is named in main.rs, which must ask `app::browser_window` rather \
+                 than keep a second opinion"
+            );
+        }
+    }
+
 
     /// **Written first, and the one that must never be deleted.**
     ///
@@ -7031,13 +7309,13 @@ mod disposition_tests {
     #[test]
     fn an_ordinary_window_with_no_password_field_is_still_silence() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::Nothing,
             "a window the vault does not know and that asks for no password now raises a card. \
              That is every editor, terminal and file manager the user focuses"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::Nothing,
             "a window UI Automation could not answer for is being treated as a login window. \
              `Unknown` is the case with the LEAST evidence, and it is being read as the most"
@@ -7059,7 +7337,7 @@ mod disposition_tests {
         for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
             for field in [HasPasswordField::No, HasPasswordField::Unknown] {
                 assert_eq!(
-                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown),
+                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
                     Open::Nothing,
                     "an ordinary window raised a card with {field:?} and {vault:?}"
                 );
@@ -7074,18 +7352,18 @@ mod disposition_tests {
     #[test]
     fn a_password_field_with_no_match_opens_the_no_match_card() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::NoMatch
         );
         assert_eq!(
-            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::Match("7"),
             "a matched window must still open the matched card -- the item id is what the fill \
              is resolved from"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             "the premise: the password-field answer actually decides something. Equal answers \
              mean the probe is being paid for and ignored"
         );
@@ -7107,14 +7385,14 @@ mod disposition_tests {
     #[test]
     fn a_locked_vault_never_claims_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::Locked,
             "with the vault locked and the engine therefore empty, an unmatched login window \
              still opens the card that asserts there is no saved login for it"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown),
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             "the premise: the vault state actually decides something here. Equal answers mean \
              the third input is accepted and ignored, which is the defect unchanged"
         );
@@ -7132,13 +7410,13 @@ mod disposition_tests {
     #[test]
     fn an_empty_but_readable_vault_still_says_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::NoMatch,
             "a user whose vault genuinely has nothing for this app is now told Deskwarden is \
              locked instead, which is both false and useless to them"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
             Open::Locked
         );
     }
@@ -7170,7 +7448,7 @@ mod disposition_tests {
     fn a_matched_window_ignores_the_field_answer_entirely() {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             assert_eq!(
-                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
                 Open::Match("42"),
                 "a matched window's disposition changed with {field:?}, so the probe cannot be \
                  skipped on that branch after all"
@@ -7194,7 +7472,7 @@ mod disposition_tests {
                 HasPasswordField::Unknown,
             ] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
                     Open::Match("42"),
                     "a matched window's disposition changed with {field:?} and {vault:?}"
                 );
@@ -7211,7 +7489,7 @@ mod disposition_tests {
     fn the_matched_id_is_the_id_that_comes_back_out() {
         for id in ["7", "42", "a-uuid-shaped-thing"] {
             assert_eq!(
-                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown),
+                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
                 Open::Match(id)
             );
         }

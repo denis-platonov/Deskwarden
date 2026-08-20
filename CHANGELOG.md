@@ -10,6 +10,21 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Browsers no longer get the "no saved login" card
+
+In a browser that card could never be right. Every sign-in page has a password
+field, so it appeared on all of them; and Deskwarden matches apps by their
+**executable** while a browser's logins belong to **sites**, so saving one
+would not have made it stop.
+
+- **The unmatched cards are switched off in browsers** -- Firefox, Chrome,
+  Edge, Brave, Opera, Vivaldi, and the other Chromium and Gecko builds
+  Deskwarden knows by name.
+- **A browser Deskwarden does not recognise behaves as it always has**: one
+  card, with *Never for this app* on it, which silences it for good.
+- **A browser you matched to a vault item on purpose still prompts to fill
+  it.** That rule is one you wrote by hand, and it is still obeyed.
+
 ### The autofill prompt setting now silences every pop-up, not half of them
 
 Turning **Prompt on match** off in Preferences stopped the overlay for apps
