@@ -173,7 +173,14 @@ pub struct ReleaseInfo {
     /// invites exactly the lenient branch the paragraph above exists to
     /// prevent.
     pub installer_sha256: Sha256Digest,
-    /// The release's notes, verbatim from the GitHub release body.
+    /// The notes of every release this user skipped, newest first, each under
+    /// its own version heading -- see [`notes_across`].
+    ///
+    /// **A union of several releases, while [`Self::installer_download_url`]
+    /// and [`Self::installer_sha256`] describe exactly one.** That asymmetry
+    /// is the point rather than an oversight: a user on 0.8.1 needs to read
+    /// what changed in 0.8.2 and 0.8.3 as well as 0.8.4, and needs to install
+    /// one file whose digest came from the same object as its URL.
     ///
     /// Kept here rather than fetched separately because the response
     /// [`check_for_update`] already parses for `tag_name` and `assets` carries
@@ -181,12 +188,12 @@ pub struct ReleaseInfo {
     /// second thing to time out.
     ///
     /// **This is network-supplied text and nothing in this crate treats it as
-    /// anything else.** It is never parsed, never rendered as markup, never
-    /// mined for links, and never handed to a shell or a process. Its one
-    /// consumer is the About page, which passes it through
-    /// [`release_notes_for_display`] and paints the result as plain text.
-    /// Empty when the release has no body -- a release with no notes is
-    /// normal, not an error.
+    /// anything else.** It is never mined for links to follow, never fetched
+    /// from, and never handed to a shell or a process. Its one consumer is the
+    /// About page, which passes it through [`release_notes_blocks`] -- the
+    /// strip, then the bounded Markdown subset above -- and paints styled text
+    /// that no click can activate. Empty when no release in the range has a
+    /// body: a release with no notes is normal, not an error.
     pub body: String,
 }
 
@@ -232,6 +239,320 @@ pub fn release_notes_for_display(body: &str) -> String {
     let mut out: String = trimmed.chars().take(MAX_RELEASE_NOTES_CHARS).collect();
     out.push_str(NOTES_TRUNCATION_MARK);
     out
+}
+
+// --- the Markdown subset ---------------------------------------------------
+//
+// **What is in, what is out, and why the line is where it is.**
+//
+// A GitHub release body is Markdown, and painting it as literal characters
+// meant `**` and `-` and `#` on screen as themselves: the notes read as a
+// diff of a document rather than as the document. This renders a subset, and
+// the subset is bounded deliberately rather than by what a parser happened to
+// support.
+//
+// IN: headings (`#`..`######`), bullet lists (`-`/`*`/`+`, one nesting level
+// per two leading spaces), bold (`**`/`__`), italic (`*`/`_`), inline code
+// (`` ` ``), backslash escapes, and a link's TEXT with its destination shown
+// beside it as text.
+//
+// OUT, and each for its own reason:
+//
+//  * **Anything clickable.** A link's words and its URL are rendered; the
+//    result cannot be activated and opens nothing. This is the one exclusion
+//    worth arguing for rather than merely stating. Every other thing in the
+//    subset can only make text LOOK wrong -- egui executes nothing, so a
+//    misparsed emphasis is a cosmetic defect. A link is the single element
+//    that turns styling into a place the user can be SENT, on the one page
+//    whose job is telling them what they are about to download and run, from
+//    text supplied by whoever published the release. Showing the destination
+//    as text keeps the information -- it can be read, and deliberately
+//    copied -- without the one-click path.
+//  * **Images.** `![alt](url)` renders its alt text and drops the URL: an
+//    image is a network fetch, and this page makes no request it was not
+//    asked for.
+//  * **Raw HTML.** Not parsed, and so painted as the characters it is.
+//  * **Tables, block quotes, ordered lists, nested emphasis, and multi-line
+//    fenced code.** Not because they are dangerous but because each is more
+//    parser, and everything unrecognised falls through to being painted as
+//    plain text -- which is the old behaviour, and a perfectly good floor.
+//
+// [`release_notes_for_display`] still runs FIRST and unchanged: control
+// characters, bidi overrides, zero-widths and the length bound are all
+// applied before a single markup character is looked at. Nothing below can
+// reintroduce them, because nothing below invents text -- every span's
+// content is a slice of that already-cleaned string.
+
+/// How one run of release-note text is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesStyle {
+    Plain,
+    /// `**bold**` or `__bold__`.
+    Strong,
+    /// `*italic*` or `_italic_`.
+    Emphasis,
+    /// `` `inline code` ``.
+    Code,
+    /// The words of a link. Styled as a link and **not clickable** -- see the
+    /// section header above.
+    LinkText,
+    /// A link's destination, shown as text beside its words so the user can
+    /// see and copy where it would have gone.
+    LinkUrl,
+}
+
+/// One styled run of text within a line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotesSpan {
+    pub text: String,
+    pub style: NotesStyle,
+}
+
+/// One span, spelled once.
+///
+/// A free function rather than an `impl NotesSpan { fn new(..) -> Self }`,
+/// because `production_is_the_only_updater_env_a_shipping_build_has` counts
+/// `-> Self` over this module's production code to prove `UpdaterEnv` has one
+/// constructor. A convenience constructor for an unrelated type would spend
+/// that budget and read as the guard failing for the reason it exists to
+/// catch.
+fn span(text: impl Into<String>, style: NotesStyle) -> NotesSpan {
+    NotesSpan { text: text.into(), style }
+}
+
+/// One line of release notes, and what kind of line it is.
+///
+/// **One block per SOURCE line, and blank lines kept as blocks of their own.**
+/// This is the half of the subset that answers "new lines seems like [gone]":
+/// a release body is a bulleted list under headings, and a renderer that
+/// joined its lines into flowing paragraphs -- which is what Markdown proper
+/// says to do -- would turn it into a wall. GitHub renders release bodies with
+/// hard breaks on, so line-per-block is also what the author saw when they
+/// wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotesBlock {
+    /// An empty source line: the paragraph break, kept because the gap
+    /// between two sections is information.
+    Blank,
+    /// `#`-prefixed. `level` is 1..=6.
+    Heading { level: u8, spans: Vec<NotesSpan> },
+    /// A `-`/`*`/`+` list item. `depth` is one per two leading spaces.
+    Bullet { depth: usize, spans: Vec<NotesSpan> },
+    /// Anything else, including every construct outside the subset.
+    Paragraph { spans: Vec<NotesSpan> },
+}
+
+/// The deepest bullet indent that changes the painted inset.
+///
+/// Bounded because the indent is multiplied into a layout measurement and the
+/// string is chosen by a remote host: without this, a line of four hundred
+/// spaces before a `-` would push its text off the card.
+pub const MAX_BULLET_DEPTH: usize = 3;
+
+/// [`ReleaseInfo::body`], sanitised and then parsed into the subset above.
+///
+/// **The single entry point the About page uses**, so the sanitisation and
+/// the parse cannot be reached separately or in the wrong order.
+///
+/// Total: every branch below falls back to painting the characters as they
+/// are. Malformed markup -- an unclosed `**`, a `[` with no `]`, a bracket
+/// pair with no parentheses after it -- is not an error, is never dropped,
+/// and cannot panic; it is text.
+pub fn release_notes_blocks(body: &str) -> Vec<NotesBlock> {
+    release_notes_for_display(body)
+        .lines()
+        .map(parse_notes_line)
+        .collect()
+}
+
+/// One source line to one [`NotesBlock`].
+fn parse_notes_line(line: &str) -> NotesBlock {
+    // A hard line break in Markdown is two trailing spaces. Every line is
+    // already its own block here, so the break is honoured by construction
+    // and the spaces themselves are just trailing whitespace.
+    let trimmed_end = line.trim_end();
+    if trimmed_end.trim_start().is_empty() {
+        return NotesBlock::Blank;
+    }
+
+    let indent = trimmed_end.chars().take_while(|c| *c == ' ').count();
+    let rest = &trimmed_end[indent..];
+
+    if let Some(after_hashes) = rest.strip_prefix('#') {
+        let extra = after_hashes.chars().take_while(|c| *c == '#').count();
+        let level = 1 + extra;
+        let body = &after_hashes[extra..];
+        // A space after the hashes is required, as GitHub requires it --
+        // otherwise `#1234` (an issue number, which release notes are full
+        // of) would become a heading reading "1234".
+        if level <= 6 && body.starts_with(' ') {
+            return NotesBlock::Heading {
+                level: level as u8,
+                spans: inline_spans(body.trim_start()),
+            };
+        }
+    }
+
+    for marker in ['-', '*', '+'] {
+        if let Some(body) = rest.strip_prefix(marker) {
+            if body.starts_with(' ') {
+                return NotesBlock::Bullet {
+                    depth: (indent / 2).min(MAX_BULLET_DEPTH),
+                    spans: inline_spans(body.trim_start()),
+                };
+            }
+        }
+    }
+
+    NotesBlock::Paragraph { spans: inline_spans(rest) }
+}
+
+/// One line's inline markup to styled runs.
+///
+/// **Flat, not recursive, and that is a decision rather than a limitation.**
+/// The contents of a `**bold**` run are not parsed again, so `**a *b* c**` is
+/// bold text containing literal asterisks. Recursion here would need a depth
+/// bound, because the input is chosen by a remote host and nesting is free to
+/// write; a parser with no stack cannot be given one to overflow. The cost is
+/// a construct nobody puts in a release note rendering slightly plainly.
+fn inline_spans(line: &str) -> Vec<NotesSpan> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans: Vec<NotesSpan> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // A backslash escapes the next character, whatever it is, so a
+        // release note can say `**` and mean it.
+        if c == '\\' && i + 1 < chars.len() {
+            plain.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        if c == '`' {
+            if let Some(close) = find_char(&chars, i + 1, '`') {
+                flush(&mut spans, &mut plain);
+                spans.push(span(
+                    chars[i + 1..close].iter().collect::<String>(),
+                    NotesStyle::Code,
+                ));
+                i = close + 1;
+                continue;
+            }
+        }
+
+        // An image is recognised only to be STRIPPED: its alt text is kept
+        // as ordinary words and its URL is dropped, because rendering it
+        // would mean fetching it.
+        if c == '!' && chars.get(i + 1) == Some(&'[') {
+            if let Some((text, _url, next)) = parse_link(&chars, i + 1) {
+                flush(&mut spans, &mut plain);
+                if !text.is_empty() {
+                    spans.push(span(text, NotesStyle::Plain));
+                }
+                i = next;
+                continue;
+            }
+        }
+
+        if c == '[' {
+            if let Some((text, url, next)) = parse_link(&chars, i) {
+                flush(&mut spans, &mut plain);
+                // The words, then the destination. Both are text; neither is
+                // a widget anything can click.
+                spans.push(span(
+                    if text.is_empty() { url.clone() } else { text },
+                    NotesStyle::LinkText,
+                ));
+                spans.push(span(format!(" ({url})"), NotesStyle::LinkUrl));
+                i = next;
+                continue;
+            }
+        }
+
+        if c == '*' || c == '_' {
+            let doubled = chars.get(i + 1) == Some(&c);
+            let run = if doubled { 2 } else { 1 };
+            if let Some(close) = find_run(&chars, i + run, c, run) {
+                let inner: String = chars[i + run..close].iter().collect();
+                // An empty run (`****`) is not emphasis of nothing; it is
+                // four asterisks somebody typed.
+                if !inner.is_empty() {
+                    flush(&mut spans, &mut plain);
+                    spans.push(span(
+                        inner,
+                        if doubled { NotesStyle::Strong } else { NotesStyle::Emphasis },
+                    ));
+                    i = close + run;
+                    continue;
+                }
+            }
+        }
+
+        plain.push(c);
+        i += 1;
+    }
+
+    flush(&mut spans, &mut plain);
+    spans
+}
+
+/// Moves whatever has accumulated as unstyled text into a span.
+fn flush(spans: &mut Vec<NotesSpan>, plain: &mut String) {
+    if !plain.is_empty() {
+        spans.push(span(std::mem::take(plain), NotesStyle::Plain));
+    }
+}
+
+/// Index of the next `needle` at or after `from`, or `None`.
+fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    (from..chars.len()).find(|&i| chars[i] == needle)
+}
+
+/// Index of the next run of exactly `len` `needle`s at or after `from`.
+///
+/// "Exactly" matters for the single-character case: the `**` closing a bold
+/// run must not be mistaken for the `*` closing an italic one.
+fn find_run(chars: &[char], from: usize, needle: char, len: usize) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] == needle {
+            let run = chars[i..].iter().take_while(|c| **c == needle).count();
+            if run == len {
+                return Some(i);
+            }
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Parses `[text](url)` starting at the `[`.
+///
+/// Returns the text, the destination, and the index just past the `)`.
+/// `None` for anything that is not the whole shape, which is then painted as
+/// the characters it is. Neither half may contain a newline (there are none
+/// -- this runs per line) and the URL may not contain whitespace or a nested
+/// bracket, which is what keeps a stray `(` in prose from swallowing a line.
+fn parse_link(chars: &[char], open: usize) -> Option<(String, String, usize)> {
+    if chars.get(open) != Some(&'[') {
+        return None;
+    }
+    let close = find_char(chars, open + 1, ']')?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = find_char(chars, close + 2, ')')?;
+    let url: String = chars[close + 2..end].iter().collect();
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c == '(' || c == '[') {
+        return None;
+    }
+    Some((chars[open + 1..close].iter().collect(), url, end + 1))
 }
 
 /// Characters that paint as nothing but change what the text around them
@@ -310,12 +631,60 @@ pub fn build_download_agent() -> crate::http_agent::StallBounded {
     crate::http_agent::bounded_stall(CONNECT_TIMEOUT, DOWNLOAD_STALL_TIMEOUT)
 }
 
+/// How many releases one page of the list endpoint is asked for.
+///
+/// GitHub's maximum, and deliberately ONE page: `Link`-header pagination
+/// would make the check an unbounded number of requests driven by a remote
+/// host's `rel="next"`, on a background thread at startup, to answer a
+/// question ("is there something newer") that the first page always answers
+/// -- the endpoint returns releases newest first. A user more than this many
+/// releases behind still gets the right installer and the newest hundred sets
+/// of notes; what they lose is prose about versions from a year ago.
+const RELEASES_PER_PAGE: usize = 100;
+
+/// The most releases whose notes are joined into one panel.
+///
+/// Separate from [`RELEASES_PER_PAGE`] because it bounds a different thing:
+/// not how much is fetched but how much is composed into a string that a
+/// fixed-height region then lays out. `release_notes_for_display`'s character
+/// bound is the backstop, and this keeps the work before that bound from
+/// being a hundred bodies' worth of allocation for text nobody scrolls to.
+const MAX_NOTES_RELEASES: usize = 20;
+
+/// Checks for a newer release, and collects the notes of EVERY release the
+/// user skipped.
+///
+/// # Why the list, not `/releases/latest`
+///
+/// A user on 0.8.1 updating to 0.8.4 was shown 0.8.4's notes and nothing
+/// else, so two releases' worth of "what changed" was unreachable from the
+/// page whose job is to say what changed. This reads the list and takes every
+/// release newer than the running version, newest first.
+///
+/// # The artefact still comes from exactly ONE release
+///
+/// **This is the security-relevant half and it is deliberately narrow.** The
+/// notes may be a union of several releases; the installer is not. The URL
+/// and the SHA-256 both come from one asset object, of the one release with
+/// the highest version -- the same single-object rule the old code had, moved
+/// into [`installer_from`] so there is one place that reads a pair and no way
+/// to read the halves from different releases. A list of releases must not
+/// become ambiguity about which file is being verified and launched, so the
+/// other releases in the range contribute prose and nothing else.
+///
+/// # What the list endpoint returns that `latest` did not
+///
+/// Drafts and prereleases. `latest` filtered them out server-side; this
+/// filters them out here, before a version comparison is made, so neither can
+/// be offered as an update nor contribute notes.
 pub fn check_for_update(
     base_url: &str,
     current_version: &Version,
     agent: &crate::http_agent::TotalBounded,
 ) -> Result<Option<ReleaseInfo>, String> {
-    let url = format!("{base_url}/repos/denis-platonov/deskwarden/releases/latest");
+    let url = format!(
+        "{base_url}/repos/denis-platonov/deskwarden/releases?per_page={RELEASES_PER_PAGE}"
+    );
     let body: serde_json::Value = agent
         .get(&url)
         .call()
@@ -323,19 +692,62 @@ pub fn check_for_update(
         .into_json()
         .map_err(|e| format!("failed to parse releases response: {e}"))?;
 
-    let tag = body["tag_name"]
-        .as_str()
-        .ok_or("release response missing tag_name")?;
-    let version_str = tag.strip_prefix('v').unwrap_or(tag);
-    let latest_version =
-        Version::parse(version_str).map_err(|e| format!("release tag '{tag}' is not valid semver: {e}"))?;
+    let listed = body
+        .as_array()
+        .ok_or("releases response is not a list of releases")?;
 
-    // The asset object is bound ONCE and both the URL and the digest are read
-    // out of it. Deliberately not two independent searches through `assets`:
-    // two searches can disagree about which asset they found, and a digest
-    // taken from a different asset than the URL is a check that passes on the
-    // wrong file or fails on the right one. One object, one pair.
-    let asset = body["assets"]
+    // Every newer, published release, newest first.
+    //
+    // A tag that is not semver is SKIPPED rather than fatal, which is the one
+    // deliberate loosening against the old code. `latest` returned a single
+    // release, so a malformed tag there meant the check had no answer at all;
+    // in a list of a hundred, one odd historical tag would otherwise take the
+    // whole update down with it.
+    let mut newer: Vec<(Version, &serde_json::Value)> = listed
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter(|r| !r["prerelease"].as_bool().unwrap_or(false))
+        .filter_map(|r| Some((release_version(r)?, r)))
+        .filter(|(v, _)| v > current_version)
+        .collect();
+    newer.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Nothing newer: either this build is current, or it is a local build
+    // whose version is ahead of everything published. Both are "no update",
+    // and both were before -- a local build simply finds nothing above it in
+    // the list rather than nothing above it in one release.
+    let Some((newest_version, newest)) = newer.first() else {
+        return Ok(None);
+    };
+
+    let (installer_url, installer_sha256) = installer_from(newest)?;
+
+    Ok(Some(ReleaseInfo {
+        version: newest_version.clone(),
+        installer_download_url: installer_url,
+        installer_sha256,
+        body: notes_across(&newer),
+    }))
+}
+
+/// A release's version from its `tag_name`, or `None` for a tag this build
+/// cannot read as a version. See [`check_for_update`] for why that is a skip.
+fn release_version(release: &serde_json::Value) -> Option<Version> {
+    let tag = release["tag_name"].as_str()?;
+    Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
+}
+
+/// The installer asset's download URL and digest, read out of ONE asset
+/// object of ONE release.
+///
+/// The asset is bound once and both fields are read from it. Deliberately not
+/// two independent searches through `assets`: two searches can disagree about
+/// which asset they found, and a digest taken from a different asset than the
+/// URL is a check that passes on the wrong file or fails on the right one.
+/// One object, one pair -- and, now that the caller has a list of releases in
+/// hand, one release.
+fn installer_from(release: &serde_json::Value) -> Result<(String, Sha256Digest), String> {
+    let asset = release["assets"]
         .as_array()
         .and_then(|assets| {
             assets
@@ -349,9 +761,9 @@ pub fn check_for_update(
         .ok_or("release installer asset has no download URL")?
         .to_string();
 
-    // Absent is an ERROR, unlike `body` below. A release whose installer
-    // carries no digest is one this build has no way to check, and the whole
-    // shape of this module is that such a release is not offered rather than
+    // Absent is an ERROR, unlike the notes. A release whose installer carries
+    // no digest is one this build has no way to check, and the whole shape of
+    // this module is that such a release is not offered rather than
     // offered-and-trusted. The message names the asset so the failure is
     // actionable rather than mysterious.
     let digest_field = asset["digest"].as_str().ok_or_else(|| {
@@ -361,24 +773,58 @@ pub fn check_for_update(
             asset["name"].as_str().unwrap_or("<unnamed>")
         )
     })?;
-    let installer_sha256 = parse_asset_digest(digest_field)?;
 
-    // Absent, null, or a non-string are all one case here: a release with no
-    // notes. Not an error -- a release genuinely may have an empty body, and
-    // failing the whole check over missing prose would turn "no notes" into
-    // "no update".
-    let notes = body["body"].as_str().unwrap_or_default().to_string();
+    Ok((installer_url, parse_asset_digest(digest_field)?))
+}
 
-    if latest_version > *current_version {
-        Ok(Some(ReleaseInfo {
-            version: latest_version,
-            installer_download_url: installer_url,
-            installer_sha256,
-            body: notes,
-        }))
-    } else {
-        Ok(None)
+/// Heading a release's notes are filed under in the joined body.
+fn notes_heading(version: &Version) -> String {
+    format!("## Deskwarden {version}")
+}
+
+/// Stands in for a release in the range that published no notes.
+///
+/// **A version with nothing under it is not omitted.** The panel is claiming
+/// to cover a RANGE, so a release that silently vanished from the list would
+/// make the range a lie -- and "this one came with none" is a different fact
+/// from "this one is not in your update", told here rather than left to the
+/// reader to infer from a gap in the numbers.
+const NO_NOTES_FOR_RELEASE: &str = "_This release came with no notes._";
+
+/// Joins the notes of every skipped release, newest first, each under its own
+/// version heading.
+///
+/// The heading is Markdown, which the About page renders (see the subset in
+/// this module): the versions are the structure of this document and they
+/// should read as headings rather than as a run-on of somebody else's
+/// paragraphs.
+///
+/// Bounded twice over -- [`MAX_NOTES_RELEASES`] here, and
+/// [`release_notes_for_display`]'s character cut at paint time -- and the cut
+/// is named in the text rather than silent, because notes that stop without
+/// saying so read as notes that ended.
+fn notes_across(releases: &[(Version, &serde_json::Value)]) -> String {
+    let mut out = String::new();
+    for (version, release) in releases.iter().take(MAX_NOTES_RELEASES) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&notes_heading(version));
+        out.push('\n');
+        // Absent, null, or a non-string are all one case: a release with no
+        // notes. Not an error -- a release genuinely may have an empty body,
+        // and failing over missing prose would turn "no notes" into "no
+        // update".
+        let notes = release["body"].as_str().unwrap_or_default().trim();
+        out.push_str(if notes.is_empty() { NO_NOTES_FOR_RELEASE } else { notes });
     }
+    if releases.len() > MAX_NOTES_RELEASES {
+        out.push_str(&format!(
+            "\n\n_And {} earlier releases, whose notes are on GitHub._",
+            releases.len() - MAX_NOTES_RELEASES
+        ));
+    }
+    out
 }
 
 /// File name a downloaded installer for `version` is stored under. Shared by
@@ -904,6 +1350,25 @@ mod tests {
     use super::*;
     use semver::Version;
 
+    /// The path [`check_for_update`] asks for, spelled once.
+    ///
+    /// The LIST endpoint, not `/releases/latest`: the panel shows every
+    /// release the user skipped, so one release's worth of response is no
+    /// longer what the check reads. mockito matches the path and leaves the
+    /// query to `Matcher::Any`, so the `?per_page=` is not restated here.
+    const RELEASES_PATH: &str = "/repos/denis-platonov/deskwarden/releases";
+
+    /// Wraps a one-release fixture in the array the list endpoint returns.
+    ///
+    /// The fixtures below are still written as single releases, because what
+    /// most of them are about -- which asset the digest came from, what a
+    /// malformed digest does, what an absent one does -- is a property of ONE
+    /// release and reads better as one. The tests that are about the range
+    /// build their own arrays.
+    fn release_list(release: &str) -> String {
+        format!("[{release}]")
+    }
+
     #[test]
     fn reports_a_newer_release_as_available() {
         let mut server = mockito::Server::new();
@@ -914,9 +1379,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -932,8 +1398,10 @@ mod tests {
             "the digest the asset published did not come back with the URL it describes"
         );
         assert_eq!(
-            release.body, "",
-            "a release whose JSON carries no `body` must read as empty notes, not as junk"
+            release.body,
+            format!("{}\n{NO_NOTES_FOR_RELEASE}", notes_heading(&release.version)),
+            "a release whose JSON carries no `body` must be named and said to have none, \
+             rather than dropped out of a range the panel claims to cover"
         );
     }
 
@@ -956,9 +1424,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -966,13 +1435,20 @@ mod tests {
             .unwrap()
             .expect("expected an available update");
 
-        assert_eq!(release.body, "Fixed\n- the overlay no longer lies");
+        assert_eq!(
+            release.body,
+            "## Deskwarden 1.2.0\nFixed\n- the overlay no longer lies",
+            "the notes must be the release's own prose, under a heading naming which \
+             release they belong to"
+        );
     }
 
-    /// The notes are DATA. Everything markup-shaped in them survives verbatim
-    /// -- because nothing interprets it -- and everything control-shaped in
-    /// them does not, because a text layout engine is the last place a remote
-    /// host's control characters should arrive.
+    /// The notes are DATA. Everything markup-shaped in them survives this
+    /// step verbatim -- this function interprets nothing, and is the gate
+    /// [`release_notes_blocks`] runs BEFORE it looks at a markup character --
+    /// and everything control-shaped in them does not, because a text layout
+    /// engine is the last place a remote host's control characters should
+    /// arrive.
     #[test]
     fn release_notes_are_stripped_of_control_characters_and_never_interpreted() {
         let hostile = "line one\r\n<script>alert(1)</script>\r\n[click](http://evil.example)\u{202e}\u{200b}\u{0007}end";
@@ -1011,6 +1487,403 @@ mod tests {
         // The real proof that the cut respected codepoints: every character is
         // still the one that went in, so nothing was sliced in half.
         assert!(shown.trim_end_matches(NOTES_TRUNCATION_MARK).chars().all(|c| c == '\u{00e9}'));
+    }
+
+    // -- the range of skipped releases --------------------------------------
+
+    /// One release object, with whatever installer digest byte is given.
+    fn a_release_json(tag: &str, notes: &str, extra: &str) -> String {
+        format!(
+            r#"{{"tag_name": "{tag}", "body": "{notes}", {extra}
+               "assets": [{{"name": "deskwarden-installer.exe",
+                 "browser_download_url": "https://example.com/{tag}-installer.exe",
+                 "digest": "sha256:{}"}}]}}"#,
+            "1".repeat(64)
+        )
+    }
+
+    /// Serves `releases` from the list endpoint and runs the check.
+    fn check_against(releases: &[String], current: &str) -> Result<Option<ReleaseInfo>, String> {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!("[{}]", releases.join(",")))
+            .create();
+
+        check_for_update(&server.url(), &Version::parse(current).unwrap(), &build_api_agent())
+    }
+
+    /// **The reported defect: a user two releases behind saw one release's
+    /// notes.**
+    ///
+    /// Newest first, because the first thing on screen should be the thing
+    /// being installed, and every skipped release named -- the range is the
+    /// answer to "what changed", and a range missing its middle is not one.
+    #[test]
+    fn the_notes_cover_every_release_the_user_skipped_newest_first() {
+        let releases = [
+            a_release_json("v0.8.4", "the newest thing", ""),
+            a_release_json("v0.8.3", "the middle thing", ""),
+            a_release_json("v0.8.2", "the oldest thing", ""),
+            a_release_json("v0.8.1", "already installed", ""),
+        ];
+
+        let release = check_against(&releases, "0.8.1").unwrap().expect("an update");
+
+        for expected in ["0.8.4", "0.8.3", "0.8.2", "the newest thing", "the oldest thing"] {
+            assert!(release.body.contains(expected), "{expected:?} missing: {:?}", release.body);
+        }
+        assert!(
+            !release.body.contains("already installed"),
+            "a release the user is already running is not something they skipped: {:?}",
+            release.body
+        );
+        let newest = release.body.find("0.8.4").unwrap();
+        let oldest = release.body.find("0.8.2").unwrap();
+        assert!(newest < oldest, "the range is not newest-first: {:?}", release.body);
+    }
+
+    /// **The artefact comes from ONE release, and it is the newest.**
+    ///
+    /// The whole risk in reading a LIST is that the file being verified and
+    /// the file being launched stop being obviously the same one. The notes
+    /// are a union; the URL and the digest are not, and they come from the
+    /// same asset object of the same release. The fixture gives the older
+    /// releases their own installer URLs precisely so a parse that took the
+    /// wrong one is visible rather than coincidentally right.
+    #[test]
+    fn the_installer_and_its_digest_come_from_the_newest_release_alone() {
+        let releases = [
+            a_release_json("v0.8.2", "older", ""),
+            a_release_json("v0.8.4", "newest", ""),
+            a_release_json("v0.8.3", "middle", ""),
+        ];
+
+        let release = check_against(&releases, "0.8.1").unwrap().expect("an update");
+
+        assert_eq!(release.version, Version::parse("0.8.4").unwrap());
+        assert_eq!(
+            release.installer_download_url, "https://example.com/v0.8.4-installer.exe",
+            "the installer must be the newest release's, whatever order the list arrived in"
+        );
+    }
+
+    /// **Drafts and prereleases are not updates.**
+    ///
+    /// `/releases/latest` filtered these out server-side and the list endpoint
+    /// does not, so the filter had to be brought here -- and it runs before
+    /// the version comparison, so neither can be offered NOR contribute a
+    /// line of notes.
+    #[test]
+    fn drafts_and_prereleases_are_excluded_from_the_range() {
+        let releases = [
+            a_release_json("v0.9.0", "a draft", r#""draft": true,"#),
+            a_release_json("v0.8.9", "a prerelease", r#""prerelease": true,"#),
+            a_release_json("v0.8.4", "the real one", ""),
+        ];
+
+        let release = check_against(&releases, "0.8.1").unwrap().expect("an update");
+
+        assert_eq!(release.version, Version::parse("0.8.4").unwrap());
+        assert!(
+            !release.body.contains("a draft") && !release.body.contains("a prerelease"),
+            "an unpublished release contributed notes: {:?}",
+            release.body
+        );
+    }
+
+    /// A local build whose version is ahead of everything published finds
+    /// nothing above it and reports no update -- the same answer it got from
+    /// `/releases/latest`, reached by the same comparison.
+    #[test]
+    fn a_build_newer_than_anything_published_is_offered_nothing() {
+        let releases = [a_release_json("v0.8.4", "shipped", "")];
+
+        assert!(check_against(&releases, "0.9.0-dev").unwrap().is_none());
+        assert!(check_against(&[], "0.8.1").unwrap().is_none(), "an empty list is no update");
+    }
+
+    /// **A release in the range with no notes is named, not skipped.**
+    ///
+    /// The panel claims to cover a range of versions. A release that vanished
+    /// from it would make that claim false, and leave the reader to infer
+    /// from a gap in the numbers what the page could simply say.
+    #[test]
+    fn a_release_with_no_notes_is_still_named_in_the_range() {
+        let releases = [
+            a_release_json("v0.8.4", "the newest thing", ""),
+            a_release_json("v0.8.3", "", ""),
+        ];
+
+        let release = check_against(&releases, "0.8.2").unwrap().expect("an update");
+
+        assert!(release.body.contains("0.8.3"), "got {:?}", release.body);
+        assert!(release.body.contains(NO_NOTES_FOR_RELEASE), "got {:?}", release.body);
+    }
+
+    /// **A tag this build cannot read is skipped, not fatal.**
+    ///
+    /// The one deliberate loosening against the old code, and it is a
+    /// consequence of reading a list: `latest` returned one release, so a
+    /// malformed tag there meant the check had no answer. In a list of a
+    /// hundred, one odd historical tag would otherwise take the whole update
+    /// down with it.
+    #[test]
+    fn a_tag_that_is_not_a_version_is_skipped_rather_than_fatal() {
+        let releases = [
+            a_release_json("nightly", "not a version", ""),
+            a_release_json("v0.8.4", "the real one", ""),
+        ];
+
+        let release = check_against(&releases, "0.8.1").unwrap().expect("an update");
+
+        assert_eq!(release.version, Version::parse("0.8.4").unwrap());
+    }
+
+    /// **The joined notes are bounded before they are ever laid out.**
+    ///
+    /// A user a very long way behind is the case this pairs with -- it is
+    /// also the case that legitimately wants the scrollbar -- but "every
+    /// release you skipped" must not become an unbounded string built from a
+    /// remote host's list. Bounded here at [`MAX_NOTES_RELEASES`], and the
+    /// cut is NAMED: notes that stop without saying so read as notes that
+    /// ended.
+    #[test]
+    fn a_very_long_range_is_cut_and_says_that_it_was() {
+        let releases: Vec<String> = (1..=MAX_NOTES_RELEASES + 5)
+            .rev()
+            .map(|n| a_release_json(&format!("v0.{n}.0"), &format!("release {n}"), ""))
+            .collect();
+
+        let release = check_against(&releases, "0.0.1").unwrap().expect("an update");
+
+        assert!(
+            release.body.contains("earlier releases"),
+            "the cut is silent, so the notes look like they simply ended: {:?}",
+            release.body
+        );
+        assert!(
+            !release.body.contains("release 1\n") && !release.body.contains("release 2\n"),
+            "the oldest releases were not cut: {:?}",
+            release.body
+        );
+    }
+
+    /// **One page, and the request says so.**
+    ///
+    /// `Link`-header pagination would make a startup check an unbounded
+    /// number of requests driven by a remote host's `rel="next"`. This pins
+    /// that the check asks for one page of a stated size -- a mock that
+    /// matches ONLY that query, so a request without it 501s rather than
+    /// passing.
+    #[test]
+    fn the_check_asks_for_exactly_one_page_of_a_stated_size() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                RELEASES_PER_PAGE.to_string(),
+            ))
+            .with_status(200)
+            .with_body(release_list(&a_release_json("v0.8.4", "shipped", "")))
+            .create();
+
+        let current = Version::parse("0.8.1").unwrap();
+        let release = check_for_update(&server.url(), &current, &build_api_agent())
+            .expect("the check did not ask for the page it says it asks for")
+            .expect("an update");
+
+        assert_eq!(release.version, Version::parse("0.8.4").unwrap());
+    }
+
+    // -- the Markdown subset ------------------------------------------------
+
+    /// The spans of the one block a body parses to, for the tests that are
+    /// about inline markup rather than about block structure.
+    fn spans_of(body: &str) -> Vec<NotesSpan> {
+        match release_notes_blocks(body).into_iter().next() {
+            Some(NotesBlock::Paragraph { spans })
+            | Some(NotesBlock::Heading { spans, .. })
+            | Some(NotesBlock::Bullet { spans, .. }) => spans,
+            other => panic!("expected one block with spans, got {other:?}"),
+        }
+    }
+
+    /// Everything a set of spans would paint, markup characters excluded by
+    /// construction -- if a delimiter is in here, it was not consumed.
+    fn text_of(spans: &[NotesSpan]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn the_subset_recognises_headings_bullets_and_their_nesting() {
+        let blocks = release_notes_blocks("## Fixed\n- one\n  - nested\nplain\n");
+
+        assert!(matches!(blocks[0], NotesBlock::Heading { level: 2, .. }));
+        assert!(matches!(blocks[1], NotesBlock::Bullet { depth: 0, .. }));
+        assert!(matches!(blocks[2], NotesBlock::Bullet { depth: 1, .. }));
+        assert!(matches!(blocks[3], NotesBlock::Paragraph { .. }));
+    }
+
+    /// **A bullet's indent is a remote host's number, so it is bounded.**
+    ///
+    /// The depth is multiplied into a layout inset by the page; four hundred
+    /// leading spaces would otherwise push a line off the card.
+    #[test]
+    fn a_deeply_indented_bullet_stops_at_the_bounded_depth() {
+        // Not the first line: `release_notes_for_display` trims the body, so
+        // leading spaces on line one are gone before the parser sees them.
+        let blocks = release_notes_blocks(&format!("top\n{}- far\n", " ".repeat(400)));
+
+        assert!(
+            matches!(blocks[1], NotesBlock::Bullet { depth: MAX_BULLET_DEPTH, .. }),
+            "got {:?}",
+            blocks[1]
+        );
+    }
+
+    /// **Blank lines are kept as blocks**, because the gap between two
+    /// sections of a release body is something its author put there. The page
+    /// paints them as space; dropping them here is what would make the notes
+    /// a wall.
+    #[test]
+    fn a_blank_line_survives_as_a_block_of_its_own() {
+        let blocks = release_notes_blocks("alpha\n\nbeta");
+
+        assert_eq!(blocks.len(), 3, "got {blocks:?}");
+        assert!(matches!(blocks[1], NotesBlock::Blank));
+    }
+
+    #[test]
+    fn bold_italic_and_code_become_styles_and_lose_their_delimiters() {
+        let spans = spans_of("a **strong** and *soft* and `literal` word");
+
+        assert!(spans.iter().any(|s| s.style == NotesStyle::Strong && s.text == "strong"));
+        assert!(spans.iter().any(|s| s.style == NotesStyle::Emphasis && s.text == "soft"));
+        assert!(spans.iter().any(|s| s.style == NotesStyle::Code && s.text == "literal"));
+        assert!(
+            !text_of(&spans).contains('*') && !text_of(&spans).contains('`'),
+            "a delimiter survived into the painted text: {spans:?}"
+        );
+    }
+
+    /// **A link's words and its destination, and no way to follow it.**
+    ///
+    /// The parse produces text, never an action -- there is no variant of
+    /// [`NotesSpan`] a caller could turn into a click without deciding to.
+    /// The reason that line is drawn here rather than left to taste is in the
+    /// subset header: everything else in this parser can only make text look
+    /// wrong, while a link is the one element that can send someone
+    /// somewhere, from a string chosen by whoever published the release, on
+    /// the page that says what is about to be installed and run.
+    #[test]
+    fn a_link_keeps_its_words_and_shows_its_destination_as_text() {
+        let spans = spans_of("see [the notes](https://example.invalid/x) please");
+
+        assert!(spans.iter().any(|s| s.style == NotesStyle::LinkText && s.text == "the notes"));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.style == NotesStyle::LinkUrl
+                    && s.text.contains("https://example.invalid/x")),
+            "the destination must be readable rather than hidden behind words: {spans:?}"
+        );
+        assert!(!text_of(&spans).contains('['), "got {spans:?}");
+    }
+
+    /// An image keeps its alt text and loses its URL: rendering it is a
+    /// network fetch, and this page makes none it was not asked for.
+    #[test]
+    fn an_image_keeps_its_alt_text_and_drops_its_source() {
+        let spans = spans_of("look ![a shot](https://example.invalid/x.png) here");
+
+        assert!(text_of(&spans).contains("a shot"), "got {spans:?}");
+        assert!(!text_of(&spans).contains("example.invalid"), "got {spans:?}");
+    }
+
+    /// **Malformed markup is text, never a panic and never a loss.**
+    ///
+    /// The input is chosen by a remote host, so "total" is the requirement
+    /// rather than a nicety: every unrecognised or unterminated construct
+    /// falls through to being painted as the characters it is, which is
+    /// exactly the behaviour this page had before there was a parser at all.
+    #[test]
+    fn malformed_markup_is_painted_as_the_characters_it_is() {
+        for body in [
+            "**unclosed",
+            "`unclosed",
+            "[text](no-close",
+            "[text] (spaced)",
+            "![alt](",
+            "****",
+            "_",
+            "#nospace",
+            "#",
+            "-",
+            "*",
+            "a ) stray ( paren",
+            "\\**escaped\\**",
+            "\u{00e9}**\u{00e9}**\u{00e9}",
+        ] {
+            let blocks = release_notes_blocks(body);
+            let painted: String = blocks
+                .iter()
+                .map(|b| match b {
+                    NotesBlock::Blank => String::new(),
+                    NotesBlock::Heading { spans, .. }
+                    | NotesBlock::Bullet { spans, .. }
+                    | NotesBlock::Paragraph { spans } => text_of(spans),
+                })
+                .collect();
+            assert!(
+                !painted.is_empty() || body.trim().is_empty(),
+                "{body:?} was dropped entirely rather than painted as text"
+            );
+        }
+    }
+
+    /// **Nothing the parser produces was invented by the parser.**
+    ///
+    /// Every span's text is a slice of the sanitised string, which is what
+    /// makes "the strip still runs" a property of the shape rather than a
+    /// habit: a bidi override cannot reappear downstream of a function that
+    /// only ever copies characters that survived the strip.
+    #[test]
+    fn the_strip_runs_before_the_parse_and_the_parse_adds_nothing() {
+        let hostile = "**safe\u{202e}txet**\u{200b}\u{0007}\r\n- [x](http://e.example)\u{feff}";
+        let blocks = release_notes_blocks(hostile);
+        let painted: String = blocks
+            .iter()
+            .map(|b| match b {
+                NotesBlock::Blank => String::new(),
+                NotesBlock::Heading { spans, .. }
+                | NotesBlock::Bullet { spans, .. }
+                | NotesBlock::Paragraph { spans } => text_of(spans),
+            })
+            .collect();
+
+        for bad in ['\u{202e}', '\u{200b}', '\u{0007}', '\u{feff}', '\r'] {
+            assert!(!painted.contains(bad), "{bad:?} reached the page: {painted:?}");
+        }
+    }
+
+    /// The length bound is the sanitiser's and the parser does not escape it:
+    /// a body chosen by a remote host cannot become an unbounded number of
+    /// blocks, because every block comes from a line of an already-cut
+    /// string.
+    #[test]
+    fn the_parsed_blocks_are_bounded_by_the_sanitisers_cut() {
+        let huge = "- x\n".repeat(MAX_RELEASE_NOTES_CHARS);
+        let blocks = release_notes_blocks(&huge);
+
+        assert!(
+            blocks.len() <= MAX_RELEASE_NOTES_CHARS,
+            "the parse outran the cut: {} blocks",
+            blocks.len()
+        );
     }
 
     /// **The last progress report is the whole file.**
@@ -1079,9 +1952,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -1120,9 +1994,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -1161,9 +2036,10 @@ mod tests {
                    "digest": "{bad}"}}]}}"#
             );
             let _m = server
-                .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+                .mock("GET", RELEASES_PATH)
+                .match_query(mockito::Matcher::Any)
                 .with_status(200)
-                .with_body(body)
+                .with_body(release_list(&body))
                 .create();
 
             let current = Version::parse("1.1.0").unwrap();
@@ -1342,9 +2218,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -1364,9 +2241,10 @@ mod tests {
             ]
         }"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
@@ -1444,9 +2322,10 @@ mod tests {
         let mut server = mockito::Server::new();
         let body = r#"{"tag_name": "v1.2.0", "assets": []}"#;
         let _m = server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", RELEASES_PATH)
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(body)
+            .with_body(release_list(body))
             .create();
 
         let current = Version::parse("1.1.0").unwrap();

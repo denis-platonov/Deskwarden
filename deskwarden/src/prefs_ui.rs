@@ -345,18 +345,70 @@ const FILL_HOTKEY_DESCRIPTION: &str =
 /// produced it rather than here.
 const FILL_HOTKEY_UNAVAILABLE_LABEL: &str = "Fill the focused app — shortcut not working";
 
-/// What the About page can say about the account, which is nothing.
+/// What the About page says about the account when nobody has published one.
 ///
-/// 3e's nav footer reads "Bitwarden account linked", and this window has no
-/// way to know that. The status lives in `main.rs`'s
-/// `cached_status_details: Option<login_ui::BwStatusDetails>` -- which is in
-/// scope at the `prefs_ui::run(settings.clone())` call site -- and getting it
-/// here means widening this function's signature, i.e. editing `main.rs`.
-/// Until that happens the page says where the answer actually is rather than
-/// asserting a link that may not exist; re-running `bw status` from this
-/// window to find out would be a blocking subprocess call on the UI thread for
-/// a decorative line.
+/// **Kept, and it is the floor rather than the answer.** The page now shows
+/// the signed-in address when the app knows it (see [`AccountStatus`]), and
+/// this is what the row says when no shell has published anything at all --
+/// `examples/ui_preview`, a test, and any future entry point that draws this
+/// page without going through `main`. The row is never blank in any of them,
+/// which is the property the original constant existed for: a label with an
+/// empty right-hand column reads as a field that failed to load.
 const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account.";
+
+/// The row's label, and the three things it can say about a known account.
+const ACCOUNT_LABEL: &str = "Bitwarden account";
+/// While the lookup is in flight.
+///
+/// **Deliberately not the same words as [`ACCOUNT_SIGNED_OUT`].** The answer
+/// took 2.8 seconds to arrive on the machine this was reported from, so the
+/// waiting state is one a user will really see -- and "we have not asked yet"
+/// and "nobody is signed in" are opposite facts. A row that showed the same
+/// thing for both would make the page assert the second one for three seconds
+/// every time it is opened.
+const ACCOUNT_CHECKING: &str = "Checking...";
+const ACCOUNT_CHECKING_NOTE: &str = "Asking the Bitwarden CLI which account is signed in.";
+const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
+/// **One sentence for two situations, because this build cannot tell them
+/// apart.** `login_ui::unknown_status_details` returns the same value for a
+/// CLI that could not be spawned, one that answered nothing usable, and one
+/// that answered honestly that nobody is signed in. Saying only "not signed
+/// in" would be a claim this page cannot support; saying both is the honest
+/// width of what is known.
+const ACCOUNT_SIGNED_OUT_NOTE: &str =
+    "No account is signed in, or the Bitwarden CLI could not be reached to ask.";
+/// A signed-in account whose address the CLI did not report. Not blank, and
+/// not silently "signed in" either -- the row promises to say WHICH account.
+const ACCOUNT_NO_EMAIL: &str = "Signed in";
+const ACCOUNT_NO_EMAIL_NOTE: &str = "The Bitwarden CLI did not report the address.";
+/// Under a known address: which server this vault lives on.
+const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
+
+/// What the About page knows about the signed-in account.
+///
+/// # Why the email is on this page at all
+///
+/// It is a personal identifier arriving on a screen that had none, so the
+/// call is made deliberately rather than by default. It is the user's own
+/// address, on their own machine, in a window they opened -- and it is the
+/// one fact that answers "which account is this vault", which the row has
+/// promised to answer since it was written. It goes nowhere: it is painted,
+/// never logged (`vault_window` logs only whether an email was *present*),
+/// never copied, and never sent. The alternative -- a row that says an
+/// account is linked without saying which -- is the state the user reported
+/// as "empty but we know it for sure".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountStatus {
+    /// A `bw status` is in flight and has not answered yet.
+    Checking,
+    /// The CLI reported a signed-in account. `email` is `None` when it
+    /// reported one without an address; `server` is `None` for Bitwarden's
+    /// own cloud, which is the CLI's default.
+    SignedIn { email: Option<String>, server: Option<String> },
+    /// The CLI reported nobody signed in -- or could not be asked. See
+    /// [`ACCOUNT_SIGNED_OUT_NOTE`].
+    SignedOut,
+}
 
 // --- About: the update flow -----------------------------------------------
 //
@@ -419,6 +471,27 @@ const UPDATE_NOTES_EMPTY: &str = "This release came with no notes.";
 /// bound in `updater::release_notes_for_display` is the second half of the
 /// same guarantee, covering layout cost rather than reach.
 const UPDATE_NOTES_HEIGHT: f32 = 128.0;
+
+/// Vertical distance between two lines of the notes, and between two
+/// paragraphs of them.
+///
+/// The first is a line gap rather than the card's `ROW_TEXT_GAP`, because a
+/// release body's lines are prose: a row's worth of air between every bullet
+/// reads as a list of paragraphs rather than as a list. The second is what a
+/// blank source line is painted as, and the reason it is a real number is
+/// that the gap between "Added" and "Fixed" is information the author put
+/// there.
+const UPDATE_NOTES_LINE_GAP: f32 = 2.0;
+const UPDATE_NOTES_PARAGRAPH_GAP: f32 = 6.0;
+
+/// How far one level of bullet nesting insets a line, and the glyph that
+/// replaces the source's `-`.
+///
+/// The nesting depth this is multiplied by is bounded in
+/// `updater::MAX_BULLET_DEPTH`, because the leading spaces that produce it
+/// are chosen by whoever wrote the release.
+const UPDATE_NOTES_BULLET_STEP: f32 = 12.0;
+const UPDATE_NOTES_BULLET_GLYPH: &str = "•  ";
 
 /// The notes scrollbar's width and the gap either side of it. Named, because
 /// the region's content width is this much less than the row's and the two
@@ -557,6 +630,85 @@ pub struct PrefsState {
     /// screenshot example holds its `PrefsState` for the update surfaces where
     /// it rebuilds it for the clipboard ones.
     update: crate::update_panel::UpdatePanel,
+    /// Where the About page reads the account from, **as a function pointer
+    /// read every frame** rather than a value captured when the window
+    /// opened.
+    ///
+    /// Both halves matter. Every frame, because the answer arrives late --
+    /// 2.8 seconds after the window on the machine this was reported from --
+    /// so a value snapshotted in `new` would show "Checking..." for the whole
+    /// life of a window opened during the lookup. A seam, because the default
+    /// reads a process-wide published value, and a test that drove that
+    /// global would leave the next test's page describing an account nobody
+    /// set: the tests and `examples/ui_preview` install their own `fn` and
+    /// touch no shared state at all.
+    account_source: fn() -> Option<AccountStatus>,
+}
+
+/// The account the shells publish and the About page reads.
+///
+/// # Why a published value rather than a parameter
+///
+/// The same two-shells problem `update_panel::install_env` solves, and the
+/// same answer for the same reason: `prefs_ui::run` is entered from `main`
+/// and `PrefsState::new` from inside `vault_window::build_frame`'s closure,
+/// so a parameter would have to be threaded through `run`, `PrefsState::new`
+/// and that closure -- a signature change two call sites away from the row
+/// that uses it, in two shells that must not disagree.
+///
+/// # Why an `RwLock` and not a `OnceLock`
+///
+/// This is where it deliberately differs from `install_env`, which was
+/// flagged as the decision most worth overruling. An update environment is
+/// fixed at startup; an ACCOUNT is not. This app switches accounts
+/// (`accounts.rs`), signs out, and learns the address several seconds after
+/// launch. A `OnceLock` would pin whichever answer landed first -- most often
+/// `Checking` -- and the row would then be wrong for the rest of the session
+/// with no way to correct it. So the value is republished whenever it
+/// changes, and the last publisher wins.
+static PUBLISHED_ACCOUNT: std::sync::RwLock<Option<AccountStatus>> =
+    std::sync::RwLock::new(None);
+
+/// Publishes what the app now knows about the signed-in account.
+///
+/// Called by the shells at the moments the answer changes: when the startup
+/// lookup is spawned, when it lands, and when a vault window receives details
+/// of its own. Cheap and idempotent -- publishing the same value again is a
+/// write of a value that was already there.
+///
+/// A poisoned lock is ignored rather than propagated: this is a decorative
+/// row on an About page, and panicking a caller mid-startup over it would be
+/// a much worse failure than a row that is one publish out of date.
+pub fn publish_account_status(status: AccountStatus) {
+    if let Ok(mut slot) = PUBLISHED_ACCOUNT.write() {
+        *slot = Some(status);
+    }
+}
+
+/// What was last published, or `None` where nothing ever was -- the
+/// screenshot example, and any test.
+pub fn published_account_status() -> Option<AccountStatus> {
+    PUBLISHED_ACCOUNT.read().ok().and_then(|slot| slot.clone())
+}
+
+/// A `bw status` answer as this page understands it.
+///
+/// **One mapping, here, for both publishers.** `main`'s startup drain and
+/// `vault_window`'s late arrival both hold a `BwStatusDetails` and both feed
+/// this row; two conversions would be two chances for the same CLI answer to
+/// reach the page as two different sentences.
+pub fn account_status_of(details: &crate::login_ui::BwStatusDetails) -> AccountStatus {
+    match details.status {
+        // `Unauthenticated` is also what a CLI that could not be spawned or
+        // could not be parsed comes back as -- see
+        // `login_ui::unknown_status_details` -- which is why the row's
+        // wording for this case covers both.
+        crate::login_ui::BwStatus::Unauthenticated => AccountStatus::SignedOut,
+        _ => AccountStatus::SignedIn {
+            email: details.user_email.clone(),
+            server: details.server_url.clone(),
+        },
+    }
 }
 
 impl PrefsState {
@@ -594,6 +746,7 @@ impl PrefsState {
             clipboard_interval_text: interval.as_minutes_text(),
             clipboard_entry_error: None,
             update: crate::update_panel::UpdatePanel::default(),
+            account_source: published_account_status,
         }
     }
 
@@ -614,6 +767,17 @@ impl PrefsState {
     /// even by accident.
     pub fn show_update_stage(&mut self, stage: crate::update_panel::UpdateStage) {
         self.update = crate::update_panel::UpdatePanel::parked(stage);
+    }
+
+    /// Points the About page's account row at `source` instead of at the
+    /// process-wide published value.
+    ///
+    /// For `examples/ui_preview` and for tests, and a function pointer rather
+    /// than a value for the reason [`PrefsState::account_source`] gives: the
+    /// row is read every frame, and nothing here may write the global that
+    /// the rest of the process -- and the next test -- reads.
+    pub fn show_account_source(&mut self, source: fn() -> Option<AccountStatus>) {
+        self.account_source = source;
     }
 }
 
@@ -1620,6 +1784,55 @@ fn draw_shortcuts(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
     });
 }
 
+/// The account row: which Bitwarden account this vault is, and where it
+/// lives.
+///
+/// **Never blank in any state**, which is the property the row had when it
+/// could say nothing at all and had to keep when it could say something: an
+/// empty right-hand column reads as a field that failed to load, and this
+/// page is read by someone checking whether their app is working.
+fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
+    let (description, value) = account_row_text(status.as_ref());
+    match value {
+        // Nothing published: the old sentence, in the old shape. A row with
+        // no value is honest here because there is no value -- as opposed to
+        // a row with an empty one, which claims there should be.
+        None => card_row(ui, |ui| row_text(ui, ACCOUNT_LABEL, &description)),
+        Some(value) => value_row(ui, ACCOUNT_LABEL, &description, &value),
+    }
+}
+
+/// What the account row says, as a pure function of what is known.
+///
+/// Split out so every state's wording is testable without a window, and so
+/// the four cases are visible in one place rather than spread through a draw.
+fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) {
+    match status {
+        None => (ACCOUNT_STATUS.to_string(), None),
+        Some(AccountStatus::Checking) => {
+            (ACCOUNT_CHECKING_NOTE.to_string(), Some(ACCOUNT_CHECKING.to_string()))
+        }
+        Some(AccountStatus::SignedOut) => {
+            (ACCOUNT_SIGNED_OUT_NOTE.to_string(), Some(ACCOUNT_SIGNED_OUT.to_string()))
+        }
+        Some(AccountStatus::SignedIn { email, server }) => {
+            // `server_host` is `login_ui`'s, so the address here reads
+            // exactly as it does in the login window's footer -- one app
+            // naming one server one way -- and `None` renders as Bitwarden's
+            // own cloud, which is what the CLI's default means.
+            let where_it_lives =
+                format!("{ACCOUNT_SERVER_PREFIX}{}.", crate::login_ui::server_host(server.as_deref()));
+            match email {
+                Some(email) => (where_it_lives, Some(email.clone())),
+                None => (
+                    format!("{where_it_lives} {ACCOUNT_NO_EMAIL_NOTE}"),
+                    Some(ACCOUNT_NO_EMAIL.to_string()),
+                ),
+            }
+        }
+    }
+}
+
 fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         value_row(
@@ -1629,10 +1842,7 @@ fn draw_about(ui: &mut Ui, state: &mut PrefsState) {
             &version_line(),
         );
         row_separator(ui);
-        // No trailing value, because there is no value to put there -- see
-        // `ACCOUNT_STATUS`. A row with an empty right-hand column would read
-        // as a field that failed to load.
-        card_row(ui, |ui| row_text(ui, "Bitwarden account", ACCOUNT_STATUS));
+        account_row(ui, (state.account_source)());
     });
 
     draw_update_card(ui, state);
@@ -1761,27 +1971,30 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
     });
 }
 
-/// The notes region: a heading, then the release body as **plain text** inside
-/// a fixed-height scroll area.
+/// The notes region: a heading, then the release body rendered through the
+/// bounded Markdown subset in `updater`, inside a fixed-height scroll area.
 ///
-/// Three things this deliberately does not do, all for the same reason -- the
-/// string arrived over the network and is data:
+/// Two things this deliberately does not do:
 ///
-/// * It does not parse markdown, so `#`, `*` and `[..](..)` paint as the
-///   characters they are.
-/// * It does not extract links or make anything clickable. Nothing on this
-///   page can navigate anywhere a release author chose.
+/// * **Nothing here is clickable.** A link's words and its destination are
+///   painted; neither is a widget, and no click on this page can navigate
+///   anywhere a release author chose. The argument for drawing that line
+///   exactly there is in `updater`'s subset header, next to the parser it
+///   governs.
 /// * It does not size itself to its content. The height is
 ///   [`UPDATE_NOTES_HEIGHT`] whatever arrives, and the overflow scrolls, so
 ///   no release body can push the buttons above it off a window that cannot
 ///   be resized.
 ///
-/// The string has already been through `updater::release_notes_for_display`,
-/// which strips control and invisible-formatting characters and bounds the
-/// length. Called here rather than at parse time so the untouched body stays
-/// on `ReleaseInfo` -- there is exactly one place that decides what is safe to
+/// The body has already been through `updater::release_notes_blocks`, which
+/// runs `release_notes_for_display` -- control characters, bidi overrides,
+/// zero-widths, and the length bound -- BEFORE it looks at a single markup
+/// character, and whose spans are all slices of that cleaned string. Called
+/// here rather than at parse time so the untouched body stays on
+/// `ReleaseInfo`: there is exactly one place that decides what is safe to
 /// paint, and this is its only caller.
 fn release_notes(ui: &mut Ui, body: &str) {
+    let blocks = crate::updater::release_notes_blocks(body);
     let shown = crate::updater::release_notes_for_display(body);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
@@ -1790,13 +2003,25 @@ fn release_notes(ui: &mut Ui, body: &str) {
             ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).color(theme::TEXT_FAINT));
             return;
         }
-        let width = ui.available_width();
-        // egui's default scrollbar floats over the content and is painted in
-        // its own light grey, which on this card's white is very nearly
-        // nothing. Pinned open at a real width and given the page's own
-        // border colour, so the cue that there is more to read is a cue
-        // someone can see.
-        ui.spacing_mut().scroll.floating = false;
+        // egui's default scrollbar is painted in its own light grey, which on
+        // this card's white is very nearly nothing. Given a real width and
+        // the page's own border colour, so the cue that there is more to read
+        // is a cue someone can see.
+        //
+        // **Floating, with the lane allocated** -- the item list's and the
+        // health pane's arrangement (`theme::scrollbar_in_gutter`), reached
+        // here from the other side. This region used to pin a NON-floating
+        // bar open and subtract its width from the content by hand, and that
+        // hand-subtraction is what made the notes that fit and the notes that
+        // scroll indistinguishable: a non-floating bar's paint cannot be
+        // suppressed without also giving up its lane. `floating_allocated_
+        // width` reserves the lane from `AlwaysVisible` alone, unconditionally
+        // and independently of whether anything is drawn in it, which is what
+        // lets `notes_fit` below change the paint and nothing else.
+        ui.spacing_mut().scroll.floating = true;
+        ui.spacing_mut().scroll.floating_width = UPDATE_NOTES_BAR_WIDTH;
+        ui.spacing_mut().scroll.floating_allocated_width =
+            UPDATE_NOTES_BAR_WIDTH + UPDATE_NOTES_BAR_MARGIN * 2.0;
         ui.spacing_mut().scroll.bar_width = UPDATE_NOTES_BAR_WIDTH;
         ui.spacing_mut().scroll.bar_inner_margin = UPDATE_NOTES_BAR_MARGIN;
         ui.spacing_mut().scroll.bar_outer_margin = 0.0;
@@ -1804,7 +2029,27 @@ fn release_notes(ui: &mut Ui, body: &str) {
         ui.visuals_mut().widgets.hovered.bg_fill = theme::TEXT_SECONDARY;
         ui.visuals_mut().widgets.active.bg_fill = theme::TEXT_SECONDARY;
         ui.visuals_mut().extreme_bg_color = theme::CANVAS;
-        egui::ScrollArea::vertical()
+        if notes_fit(ui) {
+            // Notes that fit paint no bar at all: a line down the side of a
+            // region with nothing to scroll points at nothing. Only the PAINT
+            // is suppressed -- see `notes_fit`.
+            theme::hide_scrollbar(ui);
+        } else {
+            // **Fully opaque, not egui's dormant defaults.** A floating bar
+            // is normally faint until the pointer comes near it, which is the
+            // same "cue behind an action nobody takes" the visibility comment
+            // below rejects, only spelled in alpha rather than in a mode.
+            // Clipped notes get a bar at full strength with the pointer
+            // nowhere near the card.
+            let scroll = &mut ui.spacing_mut().scroll;
+            scroll.dormant_background_opacity = 1.0;
+            scroll.active_background_opacity = 1.0;
+            scroll.interact_background_opacity = 1.0;
+            scroll.dormant_handle_opacity = 1.0;
+            scroll.active_handle_opacity = 1.0;
+            scroll.interact_handle_opacity = 1.0;
+        }
+        let scrolled = egui::ScrollArea::vertical()
             .max_height(UPDATE_NOTES_HEIGHT)
             .auto_shrink([false, true])
             // **Always visible, never on hover.** Long notes are clipped at
@@ -1813,24 +2058,213 @@ fn release_notes(ui: &mut Ui, body: &str) {
             // egui's default hides the bar until the pointer is inside the
             // region, which puts the only cue that there is more to read
             // behind an action nobody takes without the cue.
+            //
+            // This stays `AlwaysVisible` for the notes that fit as well, and
+            // that is the load-bearing half: it is also what makes egui
+            // RESERVE the bar's lane. On the default `VisibleWhenNeeded` the
+            // reservation would come and go with the content, and this card
+            // would change width as the notes got longer -- the defect
+            // `password_health` was just fixed for, in mirror image.
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
-                // The bar is not floating, so it takes width from the row
-                // rather than sitting over it. Subtracted here rather than
-                // left to egui, which would otherwise let the region grow
-                // wider than the card and leave this card's right edge a few
-                // points past the Version card's directly above it.
-                ui.set_width(width - UPDATE_NOTES_BAR_WIDTH - UPDATE_NOTES_BAR_MARGIN * 2.0);
-                // `Label::wrap`, not a `TextEdit` and not rich text: one
-                // galley of plain characters, wrapped to the card.
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(shown).size(12.0).color(theme::TEXT_MUTED),
-                    )
-                    .wrap(),
-                );
+                // The lane is already reserved out of `available_width` by
+                // `floating_allocated_width` above, so this is the content's
+                // full width and nothing is subtracted from it a second time.
+                // Subtracting again is what would leave this card's right
+                // edge a few points shy of the Version card's directly above
+                // it -- the mismatch the bar constants' comment warns about,
+                // in the direction nobody notices until they measure.
+                ui.set_width(ui.available_width());
+                notes_body(ui, &blocks);
             });
+        remember_notes_overflow(
+            ui,
+            scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
+        );
     });
+}
+
+/// Paints the parsed release notes, one line per block.
+///
+/// **`Label`s, not a `TextEdit` and not a widget of any kind.** A label is
+/// text egui has laid out; it takes no click, holds no focus, and has no
+/// action. That is the property that keeps a link's words from becoming a
+/// link's behaviour, and it is why the styled runs go into a `LayoutJob` --
+/// which is still one galley of text -- rather than into per-span widgets.
+fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
+    use crate::updater::NotesBlock;
+
+    // Lines of one body sit at a line's distance from each other, not at the
+    // card's row spacing: this is prose, and `ROW_TEXT_GAP` between every
+    // line of a bulleted list reads as a list of paragraphs.
+    ui.spacing_mut().item_spacing.y = UPDATE_NOTES_LINE_GAP;
+    for (n, block) in blocks.iter().enumerate() {
+        // A heading opens a section, so it gets the paragraph's air above it
+        // -- except at the very top, where there is nothing to be separated
+        // from and the gap would just push the notes down the region.
+        let opening = n == 0;
+        match block {
+            // The paragraph break, painted as the space it is. Without this
+            // the blank line between two sections of a release body would
+            // vanish and the sections would run together -- which is half of
+            // what "new lines seems like [gone]" was reporting.
+            NotesBlock::Blank => ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP),
+            NotesBlock::Heading { level, spans } => {
+                if !opening {
+                    ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP);
+                }
+                notes_line(ui, spans, 0.0, Some(*level));
+            }
+            NotesBlock::Bullet { depth, spans } => {
+                // The glyph joins the line's own runs rather than being a
+                // second widget beside them, so a bullet whose text wraps
+                // wraps under its own text and not under the glyph.
+                let mut with_glyph = vec![crate::updater::NotesSpan {
+                    text: UPDATE_NOTES_BULLET_GLYPH.to_string(),
+                    style: crate::updater::NotesStyle::Plain,
+                }];
+                with_glyph.extend_from_slice(spans);
+                let inset = *depth as f32 * UPDATE_NOTES_BULLET_STEP;
+                notes_line(ui, &with_glyph, inset, None);
+            }
+            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None),
+        }
+    }
+}
+
+/// One line: its runs laid out into a single wrapped galley, inset for a
+/// bullet's depth.
+///
+/// A bullet's glyph and its text share the galley rather than being two
+/// widgets side by side, so a bullet whose text wraps wraps under itself the
+/// way the rest of the line does. `wrap.max_width` is set from the width the
+/// region actually has, minus the inset -- not from a constant, because this
+/// card is drawn at two different widths by the window shell and the vault
+/// modal.
+fn notes_line(
+    ui: &mut Ui,
+    spans: &[crate::updater::NotesSpan],
+    inset: f32,
+    heading: Option<u8>,
+) {
+    use crate::updater::NotesStyle;
+    use egui::text::{LayoutJob, TextFormat};
+    use egui::{FontFamily, FontId};
+
+    if spans.is_empty() {
+        return;
+    }
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = (ui.available_width() - inset).max(1.0);
+
+    if let Some(level) = heading {
+        // Two sizes, not six. A release body's headings are section names
+        // ("Added", "Fixed"); a scale with six steps inside a 128pt region
+        // would be a hierarchy nobody can see.
+        let size = if level <= 2 { 13.0 } else { 12.0 };
+        for span in spans {
+            job.append(
+                &span.text,
+                0.0,
+                TextFormat {
+                    font_id: FontId::new(size, FontFamily::Name(theme::SEMIBOLD.into())),
+                    color: theme::INK,
+                    ..Default::default()
+                },
+            );
+        }
+    } else {
+        for span in spans {
+            let format = match span.style {
+                NotesStyle::Plain => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::TEXT_MUTED,
+                    ..Default::default()
+                },
+                NotesStyle::Strong => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+                    color: theme::TEXT_SECONDARY,
+                    ..Default::default()
+                },
+                // egui skews the glyphs rather than swapping the face: this
+                // app's font stack is Archivo weights and carries no italic
+                // one, and a real italic is not worth a fifth embedded font
+                // for a release note.
+                NotesStyle::Emphasis => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::TEXT_MUTED,
+                    italics: true,
+                    ..Default::default()
+                },
+                NotesStyle::Code => TextFormat {
+                    font_id: FontId::new(11.0, FontFamily::Monospace),
+                    color: theme::TEXT_SECONDARY,
+                    background: theme::CANVAS,
+                    ..Default::default()
+                },
+                // Underlined and in the page's blue, which is what a link
+                // looks like -- and then it does nothing, because it is
+                // text. The destination beside it is the honest half: the
+                // user can see and copy where these words point, which a
+                // clickable link that hid its URL would not give them.
+                NotesStyle::LinkText => TextFormat {
+                    font_id: FontId::new(12.0, FontFamily::Proportional),
+                    color: theme::BLUE,
+                    underline: egui::Stroke::new(1.0, theme::BLUE),
+                    ..Default::default()
+                },
+                NotesStyle::LinkUrl => TextFormat {
+                    font_id: FontId::new(11.0, FontFamily::Proportional),
+                    color: theme::TEXT_FAINT,
+                    ..Default::default()
+                },
+            };
+            job.append(&span.text, 0.0, format);
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(inset);
+        ui.add(egui::Label::new(job));
+    });
+}
+
+/// Whether the notes are short enough that there is nothing to scroll, which
+/// is when the bar is not painted.
+///
+/// **Read back from the LAST frame's scroll area rather than predicted from
+/// the text**, for the reason `password_health::content_fits` gives at
+/// length: predicting the height would mean laying the wrapped, styled notes
+/// out a second time here, and a second layout that disagreed with the real
+/// one would hide the bar on notes that really do continue.
+///
+/// **Nothing about the LAYOUT turns on this.** The bar's lane is reserved in
+/// both states -- `AlwaysVisible` above reserves it, and the width
+/// subtraction inside the region is unconditional -- so only the bar's six
+/// opacities change. A verdict that is one frame stale therefore cannot move
+/// the card's edge by a single point; it can only paint a bar one frame
+/// longer than needed, and [`remember_notes_overflow`] asks for the repaint
+/// that ends it.
+fn notes_fit(ui: &Ui) -> bool {
+    // Ties go to "can scroll", as they do in the health pane: being wrong the
+    // other way hides the cue on notes the user really can move. The first
+    // frame has no memory and so shows the bar.
+    !ui.ctx().data(|d| d.get_temp::<bool>(notes_overflow_id()).unwrap_or(true))
+}
+
+/// Stores what [`notes_fit`] reads, and asks for one more frame when the
+/// answer changed -- see there.
+fn remember_notes_overflow(ui: &Ui, overflows: bool) {
+    let previous = ui.ctx().data(|d| d.get_temp::<bool>(notes_overflow_id()));
+    if previous != Some(overflows) {
+        ui.ctx().data_mut(|d| d.insert_temp(notes_overflow_id(), overflows));
+        ui.ctx().request_repaint();
+    }
+}
+
+fn notes_overflow_id() -> egui::Id {
+    egui::Id::new("update_notes_overflows")
 }
 
 /// The download's progress: a bar and a byte count.
@@ -1932,6 +2366,56 @@ fn draw_not_yet(ui: &mut Ui, detail: &str) {
 /// `keep_backend_running`, `prompt_on_match`, `auto_lock_enabled` and
 /// `auto_lock_minutes` -- the four fields `Settings::persist_preferences` owns. `vault_window` is carried through
 /// untouched, which is what makes `main.rs`'s stale copy of it harmless.
+/// The window shell: the titlebar, and the one form directly under it.
+///
+/// **Split out of [`run`] so the geometry can be asserted**, which is the
+/// whole reason it exists as a function. `run` opens an OS window and blocks;
+/// "does the rail start where the chrome ends" is a question about a frame,
+/// and a frame is what this is.
+///
+/// **The body is given an explicit rect rather than taking the cursor's.**
+/// `draw_window_chrome` ends in `ui.advance_cursor_after_rect(bar)`, and
+/// egui's `advance_cursor_after_rect` leaves the cursor at the rect's bottom
+/// PLUS `item_spacing.y` -- the ambient 8 points. That was the reported gap:
+/// a strip of window background between the titlebar's hairline and the top
+/// of the nav rail, on a page where the rail is meant to read as continuing
+/// the chrome. Deliberately fixed by naming where the body starts rather than
+/// by subtracting 8 somewhere, because a negative offset cancelling a
+/// positive one is two numbers that were never meant to relate, and the next
+/// person to change the bar's height would be debugging both.
+///
+/// The rect is computed the same way [`modal_body_rect`] computes the modal's
+/// -- the window's full area, minus the header's height, from the top -- so
+/// the two shells now space the body by the same rule instead of one
+/// measuring and one inheriting.
+///
+/// **Public for the screenshot job** (`examples/ui_preview`), for the same
+/// reason [`draw_prefs_body`] is: the other prefs surfaces draw the body
+/// alone, so the seam between the chrome and the rail -- which is what was
+/// reported -- appears in no picture unless something can draw the shell.
+pub fn draw_prefs_window(ui: &mut Ui, state: &mut PrefsState) -> ChromeAction {
+    let full = ui.max_rect();
+    let action = draw_window_chrome(ui, WINDOW_TITLE);
+
+    let body = Rect::from_min_max(
+        Pos2::new(full.min.x, (full.min.y + CHROME_BAR_HEIGHT).min(full.max.y)),
+        full.max,
+    );
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    draw_prefs_body(&mut body_ui, state);
+
+    action
+}
+
+/// Height of the titlebar [`draw_window_chrome`] paints.
+///
+/// Read off `ChromeMetrics::LOGIN`, which is the metrics that function uses,
+/// rather than written out again: this number decides where the body starts,
+/// and a second `40.0` here would be a value that has to agree with one over
+/// there with no mechanism making it -- the defect this constant's neighbours
+/// in this file keep being written to avoid.
+const CHROME_BAR_HEIGHT: f32 = crate::login_ui::ChromeMetrics::LOGIN.bar_height;
+
 pub fn run(settings: Settings) -> Settings {
     let state = Rc::new(RefCell::new(PrefsState::new(settings)));
     let state_for_closure = state.clone();
@@ -1968,7 +2452,7 @@ pub fn run(settings: Settings) -> Settings {
             return;
         }
 
-        match draw_window_chrome(ui, WINDOW_TITLE) {
+        match draw_prefs_window(ui, &mut state_for_closure.borrow_mut()) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             // The chrome paints a - control whether or not anyone listens for
             // it; this window used to draw it and drop the action, so the
@@ -1978,12 +2462,6 @@ pub fn run(settings: Settings) -> Settings {
                 .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
         }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(ui, |ui| {
-                draw_prefs_body(ui, &mut state_for_closure.borrow_mut());
-            });
     });
 
     let edited = state.borrow().settings.clone();
@@ -4104,6 +4582,355 @@ mod tests {
         }
     }
 
+    // -- where the body starts, in both shells -------------------------------
+
+    /// The top edge of the nav rail, found by its own fill.
+    ///
+    /// The rail is the full-height `theme::CARD` rectangle at the left of the
+    /// body, `NAV_WIDTH` wide -- located by shape rather than by index
+    /// because this page paints several white rectangles and their order is
+    /// not this test's business.
+    fn rail_top(painted: &Painted) -> f32 {
+        painted
+            .rects
+            .iter()
+            .filter(|r| {
+                r.fill == theme::CARD && (r.rect.width() - NAV_WIDTH).abs() < 0.5
+            })
+            .map(|r| r.rect.top())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// **The window shell: the rail starts where the titlebar ends.**
+    ///
+    /// The reported defect -- "there is a gap between window title panel and
+    /// left nav panel on settings screen" -- was a strip of window background
+    /// between the chrome's hairline and the top of the rail.
+    /// `draw_window_chrome` ends in `advance_cursor_after_rect`, which leaves
+    /// the cursor a whole `item_spacing.y` BELOW the bar, and the body used
+    /// to start from that cursor.
+    ///
+    /// Its own test, separate from the modal's below, because a single
+    /// assertion over "the page looks right" would pass while one of the two
+    /// shells drifted.
+    #[test]
+    fn the_nav_rail_starts_exactly_where_the_window_chrome_ends() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            draw_prefs_window(ui, &mut state);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+
+        assert!(
+            (rail_top(&painted) - CHROME_BAR_HEIGHT).abs() < 0.5,
+            "the rail starts at {} and the titlebar ends at {CHROME_BAR_HEIGHT}: the strip \
+             between them is the reported gap",
+            rail_top(&painted)
+        );
+    }
+
+    /// **The modal shell: the same claim, asserted separately.**
+    ///
+    /// This shell computes its body rect rather than inheriting a cursor, so
+    /// it was already right -- which is what identified the window shell as
+    /// the one at fault. Pinned anyway: the fix made the two shells space the
+    /// body by the same rule, and a rule that holds in one place and not the
+    /// other is how they came to differ in the first place.
+    #[test]
+    fn the_modal_body_starts_exactly_where_its_header_ends() {
+        let card = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0));
+
+        let body = modal_body_rect(card);
+
+        assert!(
+            (body.top() - (card.top() + MODAL_HEADER_HEIGHT)).abs() < 0.5,
+            "the modal's body starts at {} and its header ends at {}",
+            body.top(),
+            card.top() + MODAL_HEADER_HEIGHT
+        );
+    }
+
+    // -- the account row ----------------------------------------------------
+
+    /// The About page with the account row pointed at `source`.
+    ///
+    /// **Never at the published global.** A test that published would leave
+    /// the next test's About page describing an account nobody set, and these
+    /// run in one process in parallel; `show_account_source` is the seam that
+    /// exists so no test has to.
+    fn paint_about_account(source: fn() -> Option<AccountStatus>) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::About;
+        state.show_account_source(source);
+        frame(&ctx, &mut state, &[])
+    }
+
+    fn a_signed_in_account() -> Option<AccountStatus> {
+        Some(AccountStatus::SignedIn {
+            email: Some("someone@example.invalid".to_string()),
+            server: Some("https://vault.example.invalid/api".to_string()),
+        })
+    }
+
+    /// **The reported defect: "Bitwarden account is empty but we know it for
+    /// sure".**
+    ///
+    /// The app had the address -- `vault_window` logs its arrival -- and this
+    /// page said to go and look somewhere else for it.
+    #[test]
+    fn the_about_page_names_the_signed_in_account_and_its_server() {
+        let painted = paint_about_account(a_signed_in_account);
+
+        assert!(painted.contains(ACCOUNT_LABEL));
+        assert!(
+            painted.contains("someone@example.invalid"),
+            "the page knows the address and still will not say it: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("vault.example.invalid"),
+            "which server this vault lives on is half of which account it is: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.contains(ACCOUNT_STATUS),
+            "the page is still pointing at the vault window for an answer it has: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **Waiting and signed-out must not look alike.**
+    ///
+    /// The lookup landed 2.8 seconds after the window on the machine this was
+    /// reported from, so the waiting state is one users really see -- and
+    /// "we have not asked yet" and "nobody is signed in" are opposite claims.
+    #[test]
+    fn checking_and_signed_out_say_different_things() {
+        let checking = paint_about_account(|| Some(AccountStatus::Checking));
+        let signed_out = paint_about_account(|| Some(AccountStatus::SignedOut));
+
+        assert!(checking.contains(ACCOUNT_CHECKING), "got {:?}", checking.strings());
+        assert!(signed_out.contains(ACCOUNT_SIGNED_OUT), "got {:?}", signed_out.strings());
+        assert!(
+            !checking.contains(ACCOUNT_SIGNED_OUT),
+            "a page that has not asked yet must not assert that nobody is signed in: {:?}",
+            checking.strings()
+        );
+    }
+
+    /// **The row is never blank, in any state.**
+    ///
+    /// The property the old constant existed for and the one this change had
+    /// to keep: an empty right-hand column reads as a field that failed to
+    /// load, on the page someone opens to check whether their app is working.
+    #[test]
+    fn the_account_row_always_says_something() {
+        let states = [
+            None,
+            Some(AccountStatus::Checking),
+            Some(AccountStatus::SignedOut),
+            Some(AccountStatus::SignedIn { email: None, server: None }),
+            Some(AccountStatus::SignedIn {
+                email: Some("a@b.invalid".to_string()),
+                server: None,
+            }),
+        ];
+
+        for state in states {
+            let (description, value) = account_row_text(state.as_ref());
+            assert!(!description.trim().is_empty(), "{state:?} paints no description");
+            assert!(
+                value.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(true),
+                "{state:?} paints an EMPTY value, which reads as a field that failed to load; \
+                 a state with nothing to say must carry no value at all"
+            );
+        }
+    }
+
+    /// A signed-in account whose address the CLI did not report still says
+    /// which of the two facts is missing, rather than silently reading as an
+    /// account with no name.
+    #[test]
+    fn a_signed_in_account_with_no_address_says_so() {
+        let (description, value) = account_row_text(Some(&AccountStatus::SignedIn {
+            email: None,
+            server: None,
+        }));
+
+        assert_eq!(value.as_deref(), Some(ACCOUNT_NO_EMAIL));
+        assert!(description.contains(ACCOUNT_NO_EMAIL_NOTE), "got {description:?}");
+    }
+
+    /// **A `bw status` answer becomes one sentence, in one place.**
+    ///
+    /// Two publishers feed this row -- `main`'s startup drain and
+    /// `vault_window`'s late arrival -- and both go through
+    /// `account_status_of`, so one CLI answer cannot reach the page as two
+    /// different claims.
+    #[test]
+    fn a_cli_answer_maps_to_the_state_it_describes() {
+        use crate::login_ui::{BwStatus, BwStatusDetails};
+
+        let unlocked = account_status_of(&BwStatusDetails {
+            status: BwStatus::Unlocked,
+            user_email: Some("who@example.invalid".to_string()),
+            server_url: None,
+        });
+        assert_eq!(
+            unlocked,
+            AccountStatus::SignedIn {
+                email: Some("who@example.invalid".to_string()),
+                server: None
+            }
+        );
+
+        // A locked vault is still a signed-in account: the row answers "which
+        // account", not "is it open".
+        let locked = account_status_of(&BwStatusDetails {
+            status: BwStatus::Locked,
+            user_email: Some("who@example.invalid".to_string()),
+            server_url: None,
+        });
+        assert!(matches!(locked, AccountStatus::SignedIn { .. }));
+
+        // And the value a failed or unparseable `bw status` comes back as.
+        assert_eq!(
+            account_status_of(&crate::login_ui::unknown_status_details()),
+            AccountStatus::SignedOut
+        );
+    }
+
+    /// Two frames of the About page in one `Context`, and the SECOND one's
+    /// paint.
+    ///
+    /// The notes region's `notes_fit` reads the previous frame's overflow
+    /// (see there), so the first frame of a fresh context is deliberately the
+    /// pessimistic one -- it shows the bar. Anything asserting on the settled
+    /// verdict has to run the frame that has a memory to read, and this is
+    /// that helper rather than an extra `frame` call copied into each test.
+    fn paint_about_settled(
+        stage: crate::update_panel::UpdateStage,
+        settings: Settings,
+    ) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(settings);
+        state.section = Section::About;
+        state.show_update_stage(stage);
+        let _first = frame(&ctx, &mut state, &[]);
+        frame(&ctx, &mut state, &[])
+    }
+
+    /// A release body far longer than [`UPDATE_NOTES_HEIGHT`] can show.
+    fn notes_that_overflow() -> String {
+        (0..60)
+            .map(|n| format!("line {n} of a release note that keeps going"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The white card the notes heading is painted on, found by containment
+    /// rather than by index -- the About page has several cards and their
+    /// order is not this test's business.
+    fn notes_card_rect(painted: &Painted) -> Rect {
+        let heading = painted.rect_of(UPDATE_NOTES_LABEL);
+        painted
+            .rects
+            .iter()
+            .map(|r| r.rect)
+            .filter(|r| r.contains(heading.center()) && r.width() > heading.width())
+            .min_by(|a, b| a.width().partial_cmp(&b.width()).unwrap())
+            .expect("the notes heading is painted on no card at all")
+    }
+
+    /// Is a scrollbar-width rectangle painted in ink anyone can see?
+    ///
+    /// Colour, not geometry, is the question: `theme::hide_scrollbar` works by
+    /// taking the bar's opacities to zero, and a bar at alpha 0 still occupies
+    /// a perfectly reasonable rectangle. A test reading only rectangles would
+    /// pass whether the bar was suppressed or not.
+    fn paints_a_visible_scrollbar(painted: &Painted) -> bool {
+        painted.rects.iter().any(|r| {
+            (r.rect.width() - UPDATE_NOTES_BAR_WIDTH).abs() < 0.5
+                && r.rect.height() > UPDATE_NOTES_BAR_WIDTH
+                && r.fill.a() > 0
+        })
+    }
+
+    /// **The bar appears only when something is actually clipped.**
+    ///
+    /// The reported defect: a pinned-open scrollbar down the side of three
+    /// lines of notes, pointing at nothing. The cue is worth its space when
+    /// the text continues past the region and is noise when it does not.
+    #[test]
+    fn short_notes_paint_no_scrollbar_and_long_notes_do() {
+        let short = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let long = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: notes_that_overflow(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        assert!(
+            !paints_a_visible_scrollbar(&short),
+            "notes that fit inside the region are not clipped, so a scrollbar beside them \
+             is a cue pointing at nothing. Bar-width rectangles painted: {:?}",
+            short
+                .rects
+                .iter()
+                .filter(|r| (r.rect.width() - UPDATE_NOTES_BAR_WIDTH).abs() < 0.5)
+                .map(|r| (r.rect, r.fill))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            paints_a_visible_scrollbar(&long),
+            "notes clipped at UPDATE_NOTES_HEIGHT with no bar read as text that failed to \
+             load rather than as text that continues -- and the bar must be there WITHOUT \
+             the pointer, which this frame has nowhere near the region"
+        );
+    }
+
+    /// **The bar's lane is reserved whether or not the bar is painted.**
+    ///
+    /// This is the half that `password_health` was just fixed for in mirror
+    /// image: `AlwaysVisible` is what makes egui lay the gutter out, and the
+    /// width subtracted inside the region is unconditional, so suppressing
+    /// the PAINT cannot move the card's edge. If the reservation were made to
+    /// follow the bar's visibility instead, this card would grow and shrink
+    /// as release notes got longer -- next to a Version card that does not.
+    #[test]
+    fn the_notes_card_is_the_same_width_short_or_long() {
+        let short = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let long = paint_about_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: notes_that_overflow(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        let short_card = notes_card_rect(&short);
+        let long_card = notes_card_rect(&long);
+        assert!(
+            (short_card.width() - long_card.width()).abs() < 0.5
+                && (short_card.left() - long_card.left()).abs() < 0.5,
+            "the card moved with the length of its notes: short {short_card:?}, long \
+             {long_card:?}"
+        );
+    }
+
     /// **The state the tray could not express.**
     ///
     /// The control this page replaced was `MenuItem::new("Update available",
@@ -4147,29 +4974,154 @@ mod tests {
         assert!(painted.contains(UPDATE_DOWNLOAD_BUTTON));
     }
 
-    /// **Release notes are painted as text, not interpreted.**
-    ///
-    /// The body is chosen by whoever cut the release. This asserts on the
-    /// rendered galley -- `TextInk::rendered` is what egui actually laid out
-    /// -- so a future change that started parsing markdown, or turned a URL
-    /// into a link, would show up as the literal characters no longer being
-    /// there.
-    #[test]
-    fn release_notes_are_painted_as_the_literal_characters_they_are() {
-        let hostile = "<b>bold?</b> [link](https://evil.example) # heading?";
+    /// Every run of ink the notes region painted, joined.
+    fn painted_notes(body: &str) -> String {
         let painted = paint_about(
             crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
-                body: hostile.to_string(),
+                body: body.to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        painted
+            .ink
+            .iter()
+            .map(|i| i.rendered.clone())
+            .collect::<Vec<_>>()
+            .join("\u{1}")
+    }
+
+    /// **Markup is rendered; the characters that made it are not painted.**
+    ///
+    /// This asserts on the rendered galley -- `TextInk::rendered` is what
+    /// egui actually laid out -- so the old behaviour, `**` on screen as two
+    /// asterisks, fails it.
+    #[test]
+    fn release_notes_render_the_bounded_markdown_subset() {
+        let painted = painted_notes(
+            "# Fixed\n- a **bold** word, an *italic* one and some `code`\n",
+        );
+
+        assert!(painted.contains("Fixed"), "got {painted:?}");
+        assert!(painted.contains("bold"), "got {painted:?}");
+        assert!(painted.contains("italic"), "got {painted:?}");
+        assert!(painted.contains("code"), "got {painted:?}");
+        assert!(
+            !painted.contains('*') && !painted.contains('#') && !painted.contains('`'),
+            "the markup characters are still on screen, so nothing was rendered: {painted:?}"
+        );
+    }
+
+    /// **What is outside the subset is painted as the characters it is.**
+    ///
+    /// The floor the parser falls through to, and the reason a malformed
+    /// body is not a defect: raw HTML is not markup here, and an unclosed
+    /// emphasis is two asterisks somebody typed.
+    #[test]
+    fn what_the_subset_excludes_is_painted_literally() {
+        let painted = painted_notes("<b>bold?</b> and **unclosed and #1234 issues");
+
+        assert!(painted.contains("<b>bold?</b>"), "got {painted:?}");
+        assert!(painted.contains("**unclosed"), "got {painted:?}");
+        assert!(
+            painted.contains("#1234"),
+            "a hash with no space after it is an issue number, not a heading: {painted:?}"
+        );
+    }
+
+    /// **A link's words and its destination are painted, and nothing is
+    /// clickable.**
+    ///
+    /// The click is the exclusion that matters: this text arrives over the
+    /// network onto the page that says what is about to be installed, so a
+    /// link there is the one element that could turn misleading styling into
+    /// a place the user can be sent. A `Label` is not egui's link widget and
+    /// takes no action; showing the URL keeps the information without the
+    /// path.
+    #[test]
+    fn a_link_shows_its_words_and_its_destination_and_opens_nothing() {
+        let painted = painted_notes("See [the release page](https://example.invalid/r) for more.");
+
+        assert!(painted.contains("the release page"), "got {painted:?}");
+        assert!(
+            painted.contains("https://example.invalid/r"),
+            "the destination must be readable, so a user can decide about it: {painted:?}"
+        );
+        assert!(
+            !painted.contains("[the release page]"),
+            "the brackets are still on screen: {painted:?}"
+        );
+        // A source-text guard beside the paint one: a `Label` cannot navigate
+        // anywhere, and these are the two ways one could be replaced by
+        // something that can. Split so this assertion does not match itself.
+        let source = include_str!("prefs_ui.rs");
+        for forbidden in [concat!("Hyper", "link"), concat!("open_", "url")] {
+            assert!(
+                !source.contains(forbidden),
+                "{forbidden:?} is in this page: nothing here may navigate anywhere a \
+                 release author chose"
+            );
+        }
+    }
+
+    /// An image is stripped to its alt text: rendering it would mean fetching
+    /// it, and this page makes no request it was not asked for.
+    #[test]
+    fn an_image_is_reduced_to_its_alt_text() {
+        let painted = painted_notes("Look: ![a screenshot](https://example.invalid/x.png) here.");
+
+        assert!(painted.contains("a screenshot"), "got {painted:?}");
+        assert!(
+            !painted.contains("example.invalid"),
+            "an image URL is a fetch this page must not invite: {painted:?}"
+        );
+    }
+
+    /// **The sanitisation survives the parser.**
+    ///
+    /// A bidi override can make a painted line read backwards from its bytes,
+    /// on the page whose job is saying what is about to be installed. The
+    /// markdown work must not have moved the parse in front of the strip.
+    #[test]
+    fn the_invisible_characters_are_still_stripped_under_markdown() {
+        let painted = painted_notes("- **safe\u{202e}txet**\u{200b} here");
+
+        assert!(
+            !painted.contains('\u{202e}') && !painted.contains('\u{200b}'),
+            "an invisible formatting character reached the screen: {painted:?}"
+        );
+    }
+
+    /// **Blank lines are space, not nothing.**
+    ///
+    /// Reported as "new lines seems like [gone]": a body whose sections ran
+    /// together into a wall. Two paragraphs of the same characters must be
+    /// taller than one, which is a claim about the gap rather than about any
+    /// particular number of points.
+    #[test]
+    fn a_body_with_a_paragraph_break_paints_taller_than_one_without() {
+        let flowing = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: "alpha\nbeta".to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        let broken = paint_about(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: "alpha\n\nbeta".to_string(),
                 ..a_release()
             }),
             Settings::default(),
         );
 
+        let bottom = |p: &Painted| p.rect_of("beta").bottom();
         assert!(
-            painted.ink.iter().any(|i| i.rendered.contains(hostile)),
-            "the notes were transformed on their way to the screen; they must be painted \
-             verbatim and interpreted as nothing. Painted: {:?}",
-            painted.ink.iter().map(|i| i.rendered.clone()).collect::<Vec<_>>()
+            bottom(&broken) > bottom(&flowing) + 1.0,
+            "the blank line between two sections was painted as nothing: with break {}, \
+             without {}",
+            bottom(&broken),
+            bottom(&flowing)
         );
     }
 

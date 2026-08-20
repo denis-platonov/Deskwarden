@@ -1389,6 +1389,13 @@ pub fn build_frame(
                 if details.user_email.is_some() { "present" } else { "absent" },
                 if details.server_url.is_some() { "present" } else { "absent" },
             );
+            // **The About page is reachable as a modal over THIS window**,
+            // and reads a published value rather than a parameter -- see
+            // `prefs_ui::publish_account_status`. Published from here, where
+            // the answer lands, so that modal names the account this window
+            // is already showing instead of the "Checking..." startup put up
+            // seconds ago.
+            crate::prefs_ui::publish_account_status(crate::prefs_ui::account_status_of(&details));
             server_url = details.server_url.clone();
             account_email = details.user_email.clone();
             *account_details_for_closure.borrow_mut() = Some(details);

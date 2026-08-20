@@ -1539,6 +1539,12 @@ fn main() {
     let prefetch_for = estate.active_account.as_ref().map(|a| a.id.clone());
     let (status_details_tx, status_details_rx) =
         mpsc::channel::<(Option<accounts::AccountId>, login_ui::BwStatusDetails)>();
+    // Published BEFORE the thread starts, so a Preferences window opened
+    // during the lookup says "Checking..." rather than "Not signed in". The
+    // answer took 2.8 seconds to arrive on the machine this row was reported
+    // from, so that window is not hypothetical -- and the two states are
+    // opposite claims, not shades of the same one.
+    prefs_ui::publish_account_status(prefs_ui::AccountStatus::Checking);
     {
         let tx = status_details_tx.clone();
         std::thread::spawn(move || {
@@ -2479,6 +2485,13 @@ fn main() {
                 about.as_ref(),
                 details,
             ) {
+                // Published only from the ADOPTED answer, never from the raw
+                // one: `adopt_startup_prefetch` returns `None` when the
+                // prefetch describes the account this app started on rather
+                // than the one it is on now, and an email under the wrong
+                // account is the same wrong claim on this page that it is in
+                // `settings.json`.
+                prefs_ui::publish_account_status(prefs_ui::account_status_of(&adopted));
                 estate.details = Some(adopted);
             }
         }
@@ -7910,7 +7923,14 @@ fn account_details_source(
     spawn: impl FnOnce(mpsc::Sender<login_ui::BwStatusDetails>),
 ) -> vault_window::AccountDetails {
     match cached {
-        Some(details) => vault_window::AccountDetails::Ready(details),
+        Some(details) => {
+            // The warm-cache path: the vault window will paint these details
+            // immediately, so the About page -- reachable as a modal over
+            // that very window -- must not still be showing whatever was
+            // published at startup.
+            prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
+            vault_window::AccountDetails::Ready(details)
+        }
         None => {
             log::info!(
                 "vault window: account details were not prefetched; fetching them on a thread \
@@ -7955,18 +7975,25 @@ mod tests {
     /// case for reasons that have nothing to do with the preference.
     #[test]
     fn the_update_check_is_not_made_when_the_setting_is_off() {
-        let body = r#"{
+        // **The LIST endpoint's shape**, which is what `check_for_update`
+        // reads now that the panel shows every release the user skipped. A
+        // fixture in the old single-release shape would fail to parse, and
+        // the "off" half of this test would then pass for a reason that has
+        // nothing to do with the setting -- which is exactly what the live
+        // control below exists to catch.
+        let body = r#"[{
             "tag_name": "v99.0.0",
             "assets": [
                 {"name": "deskwarden-installer.exe", "browser_download_url": "https://example.com/deskwarden-installer.exe", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
             ]
-        }"#;
+        }]"#;
         let current = Version::parse("1.0.0").unwrap();
 
         // -- off: nothing reaches the wire ---------------------------------
         let mut off_server = mockito::Server::new();
         let off_mock = off_server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();
@@ -7989,7 +8016,8 @@ mod tests {
         // -- on: the SAME request does reach it ----------------------------
         let mut on_server = mockito::Server::new();
         let on_mock = on_server
-            .mock("GET", "/repos/denis-platonov/deskwarden/releases/latest")
+            .mock("GET", "/repos/denis-platonov/deskwarden/releases")
+            .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();

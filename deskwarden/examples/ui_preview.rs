@@ -217,6 +217,26 @@ enum Surface {
     /// growing -- the layout claim that matters, this window being unresizable
     /// and this crate having pushed a control out of reach before.
     PrefsAboutUpdateAvailable,
+    /// **The same card with notes that FIT.** Its whole point is the absence
+    /// of a scrollbar: the region reserves the bar's lane either way, so this
+    /// picture beside `prefs_about_update_available` is the review of "the
+    /// cue appears only when something is actually clipped, and the card's
+    /// right edge does not move when it does".
+    PrefsAboutUpdateShortNotes,
+    /// **The card for a user several releases behind**, whose notes are the
+    /// union of every release they skipped, newest first, each under its own
+    /// version heading. The case the panel was reading one release's worth of
+    /// for, and the case where a scrollbar is legitimately wanted -- so this
+    /// picture is the review of both halves at once.
+    PrefsAboutUpdateManyReleases,
+    /// **The preferences WINDOW, chrome included**, rather than its body.
+    ///
+    /// Every other prefs surface draws `draw_prefs_body` at the size the
+    /// window gives it, which is the right frame for the pages -- and means
+    /// the seam between the titlebar and the top of the nav rail appears in
+    /// no picture at all. That seam is what was reported ("there is a gap
+    /// between window title panel and left nav panel"), so it gets a surface.
+    PrefsWindowChrome,
     /// Mid-download: the progress bar, the byte count, and the notes still
     /// readable underneath. Its own surface because "is the bar there and does
     /// the card still fit" is exactly what a picture answers and an assertion
@@ -312,7 +332,9 @@ const PANE_HEIGHT: f32 = 740.0;
 /// rather than imported for the same reason [`PANE_WIDTH`] is -- an example is
 /// a separate crate and `WINDOW_SIZE` is private to `prefs_ui`.
 const PREFS_BODY_WIDTH: f32 = 1000.0;
-const PREFS_BODY_HEIGHT: f32 = 780.0 - 40.0;
+const PREFS_BODY_HEIGHT: f32 = 780.0 - PREFS_CHROME_HEIGHT;
+/// The titlebar's height, which is `ChromeMetrics::LOGIN`'s.
+const PREFS_CHROME_HEIGHT: f32 = 40.0;
 
 /// The detail pane's own frame, copied from the `CentralPanel` in
 /// `vault_window::mod` that hosts it: `theme::CANVAS` and
@@ -347,6 +369,9 @@ const ALL: &[Surface] = &[
     Surface::PrefsClipboardOff,
     Surface::PrefsAboutNoUpdate,
     Surface::PrefsAboutUpdateAvailable,
+    Surface::PrefsAboutUpdateShortNotes,
+    Surface::PrefsAboutUpdateManyReleases,
+    Surface::PrefsWindowChrome,
     Surface::PrefsAboutDownloading,
     Surface::PrefsAboutFailed,
     Surface::VaultList,
@@ -383,6 +408,9 @@ impl Surface {
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
             Surface::PrefsAboutNoUpdate => "prefs_about_no_update",
             Surface::PrefsAboutUpdateAvailable => "prefs_about_update_available",
+            Surface::PrefsAboutUpdateShortNotes => "prefs_about_update_short_notes",
+            Surface::PrefsAboutUpdateManyReleases => "prefs_about_update_many_releases",
+            Surface::PrefsWindowChrome => "prefs_window_chrome",
             Surface::PrefsAboutDownloading => "prefs_about_downloading",
             Surface::PrefsAboutFailed => "prefs_about_failed",
             Surface::VaultList => "vault_item_list",
@@ -444,8 +472,16 @@ impl Surface {
             | Surface::PrefsClipboardOff
             | Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutUpdateShortNotes
+            | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
+            // The WHOLE window, chrome included -- the one prefs surface that
+            // is not the body alone, because the seam it exists to show is
+            // between the two.
+            Surface::PrefsWindowChrome => {
+                egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT + PREFS_CHROME_HEIGHT)
+            }
             // The list panel's exact shipped width, spelled out for the same
             // reason [`PANE_WIDTH`] is: `vault_window::mod`'s `LIST_WIDTH` is
             // `pub(crate)` and an example is a separate crate. A list drawn
@@ -789,8 +825,11 @@ impl eframe::App for Preview {
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
             Surface::PrefsAboutNoUpdate
             | Surface::PrefsAboutUpdateAvailable
+            | Surface::PrefsAboutUpdateShortNotes
+            | Surface::PrefsAboutUpdateManyReleases
             | Surface::PrefsAboutDownloading
             | Surface::PrefsAboutFailed => self.draw_prefs_about(root, self.current()),
+            Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
             Surface::VaultHealth => self.draw_vault_health(root),
@@ -1065,6 +1104,19 @@ impl Preview {
     /// The state is rebuilt each frame, as `draw_prefs` rebuilds its own:
     /// there is nothing here to carry between frames, because every stage
     /// these surfaces show is stated outright rather than arrived at.
+    /// The preferences window as the OS shows it: the titlebar this app
+    /// paints itself, and the form directly under it.
+    ///
+    /// `prefs_ui::draw_prefs_window` is the exact function `run` calls every
+    /// frame, so what this picture says about the seam between the chrome and
+    /// the rail is what the real window says.
+    fn draw_prefs_window(&mut self, root: &mut egui::Ui) {
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+        state.show(prefs_ui::Section::About);
+        let _ = prefs_ui::draw_prefs_window(root, &mut state);
+    }
+
     fn draw_prefs_about(&mut self, root: &mut egui::Ui, surface: Surface) {
         use deskwarden::update_panel::UpdateStage;
         use deskwarden::updater::ReleaseInfo;
@@ -1082,20 +1134,29 @@ impl Preview {
                 "a".repeat(64)
             ))
             .unwrap(),
+            // **Markdown, because a real GitHub release body is.** Every
+            // construct in the rendered subset is in here on purpose, so one
+            // picture is the review of all of them: headings, bullets and
+            // their nesting, bold, italic, inline code, a link (whose words
+            // are styled and whose destination is beside them, and which
+            // opens nothing), and -- at the end -- the things that are
+            // deliberately NOT in the subset, painted as the characters they
+            // are.
             body: concat!(
-                "Added\n",
-                "- The update flow moved out of the tray and onto this page.\n",
-                "- Release notes are shown before anything is downloaded.\n",
+                "## Added\n",
+                "- The update flow moved out of the tray and onto **this page**.\n",
+                "- Release notes are shown *before* anything is downloaded.\n",
+                "  - Including the ones from releases you skipped.\n",
                 "- The download reports its progress where you started it.\n",
                 "\n",
-                "Fixed\n",
+                "## Fixed\n",
                 "- The tray no longer claims an update exists when none does.\n",
                 "- A failed update says why, on a page rather than in a tooltip.\n",
+                "- `release_notes_for_display` still strips what it stripped.\n",
                 "\n",
-                "Notes\n",
-                "- This text comes from the GitHub release body and is rendered\n",
-                "  as plain text. Nothing in it is a link, and nothing in it is\n",
-                "  markup: <b>this stays literal</b>, and so does [this](url).\n",
+                "## Notes\n",
+                "- The full list is on [the releases page](https://example.invalid/r).\n",
+                "- Raw HTML is not in the subset: <b>this stays literal</b>.\n",
                 "- It is deliberately long here so this screenshot shows the\n",
                 "  region scrolling rather than pushing the buttons off the\n",
                 "  page.\n",
@@ -1105,6 +1166,44 @@ impl Preview {
 
         let stage = match surface {
             Surface::PrefsAboutUpdateAvailable => UpdateStage::Available(release),
+            // Short enough to fit the region with room to spare, which is the
+            // state whose review is that there is NO bar beside it -- and,
+            // since these lines are the ones that stay above the fold, where
+            // the link and the inline code are put so a reviewer can see
+            // what they look like without scrolling a screenshot.
+            Surface::PrefsAboutUpdateShortNotes => UpdateStage::Available(ReleaseInfo {
+                body: concat!(
+                    "### Fixed\n",
+                    "- The vault window remembers its size, via `settings.json`.\n",
+                    "- Details on [the release page](https://example.invalid/r).\n",
+                    "- Raw HTML stays literal: <b>not bold</b>.\n",
+                )
+                .to_string(),
+                ..release
+            }),
+            // **What a user three releases behind is shown.** Built in the
+            // exact shape `updater::notes_across` composes -- one `##`
+            // heading per version, newest first, and the release that
+            // published no notes NAMED rather than missing, because a range
+            // with a hole in it is not a range. This is also the case where
+            // a scrollbar is legitimately wanted, so one picture reviews
+            // both halves.
+            Surface::PrefsAboutUpdateManyReleases => UpdateStage::Available(ReleaseInfo {
+                body: concat!(
+                    "## Deskwarden 0.9.0\n",
+                    "- Release notes now cover **every** version you skipped.\n",
+                    "- The scrollbar appears only when there is more to read.\n",
+                    "\n",
+                    "## Deskwarden 0.8.6\n",
+                    "_This release came with no notes._\n",
+                    "\n",
+                    "## Deskwarden 0.8.5\n",
+                    "- The vault window remembers its size, via `settings.json`.\n",
+                    "- Details on [the release page](https://example.invalid/r).\n",
+                )
+                .to_string(),
+                ..release
+            }),
             Surface::PrefsAboutDownloading => UpdateStage::Downloading {
                 release,
                 done: 2_400_000,
@@ -1128,6 +1227,16 @@ impl Preview {
         });
         state.show(prefs_ui::Section::About);
         state.show_update_stage(stage);
+        // **A signed-in account, from a fixture rather than from the process.**
+        // The row reads a published value in the app; this example publishes
+        // nothing and installs its own source, so the picture shows the state
+        // a real user is in without a `bw` anywhere near it.
+        state.show_account_source(|| {
+            Some(prefs_ui::AccountStatus::SignedIn {
+                email: Some("someone@example.invalid".to_string()),
+                server: Some("https://vault.example.invalid/api".to_string()),
+            })
+        });
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
