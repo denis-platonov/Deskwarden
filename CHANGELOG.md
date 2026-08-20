@@ -50,6 +50,14 @@ the same claim as saying nobody is signed in.
 There was an eight-point strip of window background between the bottom of the
 titlebar and the top of the left-hand navigation column.
 
+### The TOTP-secret setting names a row that exists
+
+The description under "Show TOTP secrets on the details screen" said the
+secret appears "under its one-time code". That row is labelled **TOTP** on the
+details screen and has been since it was renamed, so the copy sent you looking
+for something the app does not paint -- which reads as the setting not having
+worked.
+
 ## 0.8.4 - 2026-08-20
 
 > The manual pre-release checklist was not run for this version either.

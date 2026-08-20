@@ -190,9 +190,16 @@ const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// until its eye is clicked -- turning this on does not put a seed on screen,
 /// it puts a row there. And the reason to leave it off is named rather than
 /// implied: the six-digit code expires, the seed it comes from does not.
+///
+/// **It names the row the way the details screen labels it, which is "TOTP".**
+/// This sentence said "under its one-time code" long after that row's own
+/// label became `TOTP` (`vault_window::detail`'s `totp_row`), so the copy sent
+/// the user looking for a row with that name and there is not one. A
+/// description that names a label the app does not paint is worse than a
+/// vague one: the user concludes the setting did not work.
 const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP secret appears \
-     as an extra masked row under its one-time code, revealed by clicking the eye. The code \
-     expires in 30 seconds; the secret behind it never does.";
+     on the details screen as an extra masked row under its TOTP code, revealed by clicking \
+     the eye. The code expires in 30 seconds; the secret behind it never does.";
 
 const UPDATE_CHECK_LABEL: &str = "Check for updates";
 /// **Says what the request discloses and, unusually, argues for leaving it
@@ -3759,8 +3766,22 @@ mod tests {
             "turning this on adds a MASKED row; copy that implied a seed appears in the clear would be wrong"
         );
         assert!(
-            TOTP_SECRET_DESCRIPTION.contains("details screen") || TOTP_SECRET_DESCRIPTION.contains("one-time code"),
+            TOTP_SECRET_DESCRIPTION.contains("details screen"),
             "the copy has to say WHERE the row appears"
+        );
+        // **The row is labelled `TOTP` on that screen, and the copy said
+        // "one-time code" for as long as the two disagreed.** The `||` that
+        // used to be on the assertion above accepted either wording, so the
+        // stale one passed. Naming a label the app does not paint is the
+        // failure this pins: the user goes looking for a row called "one-time
+        // code", does not find one, and concludes the pill did nothing.
+        assert!(
+            !TOTP_SECRET_DESCRIPTION.to_ascii_lowercase().contains("one-time code"),
+            "the details screen labels that row \"TOTP\", not \"one-time code\": {TOTP_SECRET_DESCRIPTION:?}"
+        );
+        assert!(
+            TOTP_SECRET_DESCRIPTION.contains("TOTP code"),
+            "the copy has to name the row it appears under, as that row is labelled"
         );
         // The instrument: an ink lookup that panics on a double paint, with a
         // real rect, so "contains" above is not reading a zero-size ghost.
