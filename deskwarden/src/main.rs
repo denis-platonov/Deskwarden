@@ -1764,10 +1764,19 @@ fn main() {
                 &mut pending_menu_events,
                 &tray.open_vault_id,
             );
-            // The same reset the other three doors make: closing our own
-            // window hands the foreground back to the app the card was about,
-            // and without this the card would come straight back up.
-            last_dispatched_hwnd = None;
+            // **`last_dispatched_hwnd` is deliberately NOT reset here, which
+            // is the one line where this door differs from the other three.**
+            //
+            // They reset it because the window they opened has nothing to do
+            // with whichever app is in front, so the next foreground event
+            // deserves a fresh answer. This one was opened *by* a card about
+            // that app, and closing it hands the foreground straight back to
+            // it. Clearing the suppression would re-dispatch the very window
+            // whose card was just answered -- and the probe's memo would still
+            // be inside its TTL, so the answer would be the same and 3a would
+            // come back up over the vault window the user had just used. That
+            // is `dispatch::should_dispatch`'s original defect ("Dismiss never
+            // dismissed") reintroduced through a new door.
         }
 
         // **The pump is where a workstation lock is noticed**, because both
