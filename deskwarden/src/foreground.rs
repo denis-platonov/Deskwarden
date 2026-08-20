@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 48] = [
+        const OPENS_NO_WINDOW: [&str; 49] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1147,6 +1147,15 @@ mod tests {
             "session_store",
             "settings",
             "signature",
+            // **Kernel objects and a wait, and no UI at all.** It creates a
+            // named event and waits on it from a thread of its own; when a
+            // newer Deskwarden signals it, this process runs its teardown and
+            // exits. The two windows that belong to that handover are
+            // elsewhere on purpose: the "already running" message box is
+            // `main`'s, on the incoming side, and the window that
+            // DISAPPEARS on the outgoing side is whichever one that process
+            // already had. This module opens none and raises none.
+            "single_instance",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker

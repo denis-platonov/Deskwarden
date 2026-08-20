@@ -335,6 +335,15 @@ const FILL_HOTKEY: &str = "CTRL+ALT+B";
 const FILL_HOTKEY_LABEL: &str = "Fill the focused app";
 const FILL_HOTKEY_DESCRIPTION: &str =
     "The only shortcut Deskwarden registers. It cannot be changed yet.";
+/// The label the row takes when the chord could not be registered.
+///
+/// It says *not working* in the label rather than only in the description,
+/// because the label is the line a user scans: a row still headed "Fill the
+/// focused app" over a greyed chip is a row that can be read as working. The
+/// reason -- and what to do about it -- comes from
+/// `hotkey::Unavailable::message`, which is authored next to the decision that
+/// produced it rather than here.
+const FILL_HOTKEY_UNAVAILABLE_LABEL: &str = "Fill the focused app — shortcut not working";
 
 /// What the About page can say about the account, which is nothing.
 ///
@@ -948,7 +957,9 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             "Auto-lock is on the General page. Nothing else here is configurable yet.",
         ),
         Section::Clipboard => draw_clipboard(ui, state),
-        Section::Shortcuts => draw_shortcuts(ui),
+        // The one read of the published status -- see `hotkey::availability`, and
+        // `draw_shortcuts` for why it is a parameter from here down.
+        Section::Shortcuts => draw_shortcuts(ui, crate::hotkey::availability()),
         Section::SyncAndAccount => draw_not_yet(
             ui,
             "Signing in, syncing and locking are all done from the vault window.",
@@ -1561,14 +1572,51 @@ fn reset_button(ui: &mut Ui) -> bool {
     response.clicked()
 }
 
-fn draw_shortcuts(ui: &mut Ui) {
-    card(ui, |ui| {
+/// **Where a user finds out the shortcut is not working.**
+///
+/// It is here and not in a startup dialog, and the difference matters. A
+/// shortcut another program got to first is a degraded convenience, not a
+/// failure to start: everything else Deskwarden does works. A modal at launch
+/// over a keyboard chord would interrupt every single launch for as long as
+/// the conflict lasted, would arrive before the user had asked anything, and
+/// would be the second most annoying thing this app could do after vanishing.
+///
+/// But it must be said *somewhere*, because a shortcut that silently does
+/// nothing is its own confusing failure -- the user presses CTRL+ALT+B, some
+/// other program answers or nothing does, and Deskwarden looks broken. This is
+/// the page a user comes to in order to ask that exact question, which makes
+/// it the right place for the answer, and it is the same page in both shells
+/// (the tray's Preferences window and the vault window's Preferences modal).
+///
+/// The status is a parameter rather than read from `hotkey::status()` in here,
+/// so that the painting can be driven from a test without a process-wide value
+/// another test may be reading at the same moment; [`draw_section`] is the one
+/// place that reads it.
+fn draw_shortcuts(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
+    card(ui, |ui| match status {
         // `kbd_chip`'s grey-on-canvas treatment, not `kbd_chip_on_card`'s: the
         // latter is a *white* chip, made for 3h's blue-washed panel, and it
         // would be invisible on this white card.
-        control_row(ui, FILL_HOTKEY_LABEL, FILL_HOTKEY_DESCRIPTION, |ui| {
-            theme::kbd_chip(ui, FILL_HOTKEY, false)
-        });
+        crate::hotkey::HotkeyStatus::Armed => {
+            control_row(ui, FILL_HOTKEY_LABEL, FILL_HOTKEY_DESCRIPTION, |ui| {
+                theme::kbd_chip(ui, FILL_HOTKEY, false)
+            });
+        }
+        // Ghosted, which is the treatment this file already gives a control
+        // that is present and not currently doing anything -- the disabled
+        // toggle and the disabled stepper. It reads as "off", which is
+        // accurate, where a normal chip would read as "working" and an absent
+        // row would read as "this feature does not exist".
+        //
+        // The reason replaces the description rather than being added under
+        // it: the description says the shortcut is the only one and cannot be
+        // changed, which is exactly what a user staring at a shortcut that is
+        // not working does not need told.
+        crate::hotkey::HotkeyStatus::Unavailable(reason) => {
+            control_row_ghosted(ui, FILL_HOTKEY_UNAVAILABLE_LABEL, reason.message(), |ui| {
+                theme::kbd_chip(ui, FILL_HOTKEY, false)
+            });
+        }
     });
 }
 
@@ -2234,6 +2282,14 @@ mod tests {
             self.texts.iter().any(|(t, _)| t == needle)
         }
 
+        /// [`Self::contains`]'s loose twin, for the lines that are whole
+        /// sentences rather than labels: a description is painted as one
+        /// string, and asserting on the whole of it would pin its wording
+        /// rather than its content.
+        fn any_containing(&self, needle: &str) -> bool {
+            self.texts.iter().any(|(t, _)| t.contains(needle))
+        }
+
         fn rect_of(&self, needle: &str) -> Rect {
             self.texts
                 .iter()
@@ -2450,6 +2506,67 @@ mod tests {
             walk(&clipped.shape, &mut painted);
         }
         painted
+    }
+
+    /// One frame of the Shortcuts card at a given hotkey status.
+    ///
+    /// Drives [`draw_shortcuts`] directly rather than going through
+    /// [`paint`]'s `draw_section`, because the status `draw_section` reads is
+    /// process-wide (`hotkey::availability`) and the tests in this binary run in
+    /// parallel: a test that set it would be setting it for whatever else was
+    /// painting a Shortcuts page at that instant.
+    fn paint_shortcuts_at(status: crate::hotkey::HotkeyStatus) -> Painted {
+        let ctx = styled_context();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY_SIZE)),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| draw_shortcuts(ui, status));
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// `settings.rs`'s walk, over a file with one test module.
+    ///
+    /// A line that is exactly a `cfg(test)` gate followed by a column-0 module
+    /// opener starts a skip that runs to the next column-0 `}`; inside a
+    /// module every item is indented, so that brace is the module's own.
+    /// Line-ending agnostic, for the reason the original gives: `lines()`
+    /// strips the carriage return, so this reads the same on a CRLF working
+    /// tree and an LF checkout.
+    fn production_half(source: &str) -> (String, usize) {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut cut = 0usize;
+        let mut gated = false;
+        let mut skipping = false;
+        for line in source.lines() {
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            if gated && line.starts_with("mod ") {
+                // The gate line was pushed on the previous turn; it belongs to
+                // the module being cut.
+                kept.pop();
+                skipping = true;
+                cut += 1;
+                gated = false;
+                continue;
+            }
+            gated = line.trim() == concat!("#[cfg(", "test)]");
+            kept.push(line);
+        }
+        assert!(
+            !skipping,
+            "a test module was opened and never closed by a column-0 brace, so the rest of the \
+             file was dropped and every needle counted over this reads nothing"
+        );
+        (kept.join("\n"), cut)
     }
 
     fn paint_settings(section: Section, settings: Settings) -> Painted {
@@ -3820,13 +3937,68 @@ mod tests {
 
     #[test]
     fn shortcuts_reports_the_one_shortcut_that_exists() {
-        let painted = paint(Section::Shortcuts);
+        // At `Armed`, supplied, rather than through `paint(Section::Shortcuts)`
+        // and the process-wide `hotkey::availability()` it reads: the tests in
+        // this binary run in parallel, and a page whose content depends on a
+        // static another test can write is a page whose test fails on somebody
+        // else's schedule.
+        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Armed);
         assert!(painted.contains("Fill the focused app"));
         assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
             0,
             "a shortcut is reported here, not rebound"
+        );
+    }
+
+    /// **The page is where the user finds out the shortcut is not working.**
+    ///
+    /// The crash this replaced was a process that vanished; the fix that
+    /// replaced it must not be a shortcut that silently does nothing, which
+    /// is a second invisible failure wearing the first one's clothes. So the
+    /// unavailable page has to name the state and the way out of it.
+    #[test]
+    fn a_shortcut_another_program_took_is_reported_on_the_page() {
+        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Unavailable(
+            crate::hotkey::Unavailable::TakenByAnotherProgram,
+        ));
+        assert!(
+            painted.any_containing("shortcut not working"),
+            "the Shortcuts page paints an unavailable hotkey as though it worked: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("Another program on this PC is already using CTRL+ALT+B"),
+            "the page says the shortcut is off without saying what to do about it: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("Close that program"),
+            "the page names no way out of the conflict: {:?}",
+            painted.strings()
+        );
+        // Still names the chord, so a user can tell WHICH shortcut is gone --
+        // and see what to stop another program from using.
+        assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
+    }
+
+    /// And the ordinary page says none of that. Without this, a page that
+    /// warned unconditionally would pass the test above.
+    #[test]
+    fn a_working_shortcut_is_reported_without_a_warning() {
+        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Armed);
+        assert!(painted.contains(FILL_HOTKEY_LABEL));
+        assert!(painted.contains("CTRL+ALT+B"));
+        assert!(
+            !painted.any_containing("shortcut not working"),
+            "a registered shortcut is being reported as broken: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.any_containing("Another program"),
+            "a registered shortcut is being blamed on another program: {:?}",
+            painted.strings()
         );
     }
 
@@ -3838,22 +4010,26 @@ mod tests {
         // `hotkey::register_fill_hotkey`, so changing the registered chord
         // would otherwise leave this window confidently naming the old one.
         assert_eq!(FILL_HOTKEY, "CTRL+ALT+B");
-        // **Read whole, and that is checked, not assumed.** `settings.rs` and
-        // `item_list.rs` count their cross-file needles over the read file's
-        // production half, because a fixture in another module's test code
-        // can satisfy a presence pin that production has stopped satisfying.
-        // `hotkey.rs` has no test code at all -- 27 lines, no `cfg(test)`
-        // anywhere -- so there is no fixture here to be fooled by, and a walk
-        // that cut test modules out would cut nothing. The assertion below
-        // keeps that true: the day `hotkey.rs` grows a test module, this
-        // fires and these two pins should move to a production half.
-        let hotkey_rs = include_str!("hotkey.rs");
+        // **Read over the production half, not the whole file**, because
+        // `settings.rs` and `item_list.rs` count their cross-file needles that
+        // way for a reason that has now arrived here: a fixture in another
+        // module's test code can satisfy a presence pin that production has
+        // stopped satisfying. When this pin was written `hotkey.rs` had no
+        // test code at all and said so; it has since grown a test module whose
+        // fixtures build the very chord these two needles look for, so a
+        // whole-file read would go green over a `register_fill_hotkey` that
+        // had stopped registering anything.
+        let (hotkey_rs, cut) = production_half(include_str!("hotkey.rs"));
+        assert_eq!(
+            cut, 1,
+            "`hotkey.rs` no longer has exactly the one test module this walk was measured \
+             against, so what it cut is not what it thinks it cut"
+        );
         assert_eq!(
             hotkey_rs.matches(concat!("cfg(", "test)")).count(),
             0,
-            "`hotkey.rs` has grown test code, so the two whole-file presence pins below can now \
-             be satisfied by a fixture instead of by the registration they guard -- read its \
-             production half, the way `settings.rs` reads `main.rs`"
+            "a `cfg(test)` gate survived the cut, so the needles below can be satisfied by \
+             test code instead of by the registration they guard"
         );
         assert!(
             hotkey_rs.contains("Modifiers::CONTROL | Modifiers::ALT"),

@@ -78,6 +78,7 @@ pub mod send;
 pub mod session_store;
 pub mod settings;
 pub mod signature;
+pub mod single_instance;
 pub mod theme;
 pub mod tray;
 pub mod update_panel;
