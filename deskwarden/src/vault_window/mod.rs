@@ -9734,7 +9734,11 @@ fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
 /// sync this process performed, while this one describes a FILE and is the
 /// number that can be days old. `last_sync_at` stays per-session exactly as
 /// its comment says; conflating the two is how the pill starts lying again.
-fn cache_age_text(age: Duration) -> String {
+///
+/// `pub(crate)` since design 7's offline affordances landed: `loading_ui`'s
+/// "last synced" line describes the same file, in the same window, minutes
+/// before this pill does. Two formatters would be two ways of naming one age.
+pub(crate) fn cache_age_text(age: Duration) -> String {
     let secs = age.as_secs();
     if secs < 60 {
         "just written".to_string()

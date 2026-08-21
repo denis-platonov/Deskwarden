@@ -368,14 +368,30 @@ enum Surface {
     /// The same window three seconds later, saying what is slow and how long
     /// it has been.
     FirstWindowSlow,
-    /// The failure, in the window rather than in a message box -- with the
-    /// Retry it can actually offer, and without the *Continue offline* the
-    /// design draws, which needs a vault disk cache this crate has not got.
+    /// The same wait with an encrypted copy on this machine: design 7b's
+    /// *Open the local copy*, under the line that says how old opening it
+    /// would leave you.
+    FirstWindowSlowLocalCopy,
+    /// The failure, in the window rather than in a message box, with the
+    /// Retry it can actually offer -- and **nothing else**, because this
+    /// machine has no copy of the vault to continue offline from.
     FirstWindowUnreachable,
+    /// The same failure with a copy on this machine: Retry keeps the weight,
+    /// *Continue offline* sits under it as a secondary.
+    FirstWindowUnreachableLocalCopy,
     /// The same failure with its retries spent: the button is GONE rather
     /// than greyed, which is the half of this state a picture is the only way
     /// to check.
     FirstWindowUnreachableSpent,
+    /// Retries spent **and** a copy on this machine -- so there is exactly one
+    /// button left, and it is the primary. The picture is how "the last thing
+    /// on this screen is not a footnote" gets checked.
+    FirstWindowUnreachableSpentLocalCopy,
+    /// A copy is on this machine and this session dismissed the Hello prompt,
+    /// so its age is unknown. The button is still offered -- the file really
+    /// is there -- and the line under the copy says what pressing it costs
+    /// instead of inventing a date.
+    FirstWindowUnreachableDeclinedCopy,
     /// **The lock screen while the master password is with the server.**
     ///
     /// The owner named this one -- "Locking - same" -- and it was the
@@ -482,8 +498,12 @@ const ALL: &[Surface] = &[
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
     Surface::FirstWindowSlow,
+    Surface::FirstWindowSlowLocalCopy,
     Surface::FirstWindowUnreachable,
+    Surface::FirstWindowUnreachableLocalCopy,
     Surface::FirstWindowUnreachableSpent,
+    Surface::FirstWindowUnreachableSpentLocalCopy,
+    Surface::FirstWindowUnreachableDeclinedCopy,
     Surface::LoginUnlockBusy,
     Surface::ProgressBarCycle,
 ];
@@ -543,8 +563,16 @@ impl Surface {
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
             Surface::FirstWindowSlow => "first_window_slow",
+            Surface::FirstWindowSlowLocalCopy => "first_window_slow_local_copy",
             Surface::FirstWindowUnreachable => "first_window_unreachable",
+            Surface::FirstWindowUnreachableLocalCopy => "first_window_unreachable_local_copy",
             Surface::FirstWindowUnreachableSpent => "first_window_unreachable_spent",
+            Surface::FirstWindowUnreachableSpentLocalCopy => {
+                "first_window_unreachable_spent_local_copy"
+            }
+            Surface::FirstWindowUnreachableDeclinedCopy => {
+                "first_window_unreachable_declined_copy"
+            }
             Surface::LoginUnlockBusy => "login_unlock_busy",
             Surface::ProgressBarCycle => "progress_bar_cycle",
         }
@@ -664,7 +692,11 @@ impl Surface {
             Surface::FirstWindowLoading
             | Surface::FirstWindowSlow
             | Surface::FirstWindowUnreachable
-            | Surface::FirstWindowUnreachableSpent => egui::vec2(1240.0, 740.0),
+            | Surface::FirstWindowSlowLocalCopy
+            | Surface::FirstWindowUnreachableLocalCopy
+            | Surface::FirstWindowUnreachableSpent
+            | Surface::FirstWindowUnreachableSpentLocalCopy
+            | Surface::FirstWindowUnreachableDeclinedCopy => egui::vec2(1240.0, 740.0),
         }
     }
 
@@ -1008,7 +1040,11 @@ impl eframe::App for Preview {
             Surface::FirstWindowLoading
             | Surface::FirstWindowSlow
             | Surface::FirstWindowUnreachable
-            | Surface::FirstWindowUnreachableSpent => {
+            | Surface::FirstWindowSlowLocalCopy
+            | Surface::FirstWindowUnreachableLocalCopy
+            | Surface::FirstWindowUnreachableSpent
+            | Surface::FirstWindowUnreachableSpentLocalCopy
+            | Surface::FirstWindowUnreachableDeclinedCopy => {
                 self.draw_first_window(root, self.current())
             }
         }
@@ -1542,21 +1578,42 @@ impl Preview {
     /// so that is the line the real window shows -- and a preview showing
     /// `Armed` here would be a picture of a claim the app does not make.
     fn draw_first_window(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::loading_ui::{FirstWindowBody, LocalCopy, RetryOffer};
+        // **A `Duration` and not a date.** The age these bodies render is an
+        // elapsed span the host has already worked out, so these pictures are
+        // the same pixels in a year's time as today -- see `LocalCopy`.
+        const THREE_HOURS: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+        let here = LocalCopy::Here { synced: Some(THREE_HOURS) };
         let body = match surface {
-            Surface::FirstWindowSlow => deskwarden::loading_ui::FirstWindowBody::Slow {
-                seconds: 12,
+            Surface::FirstWindowSlow => {
+                FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }
+            }
+            Surface::FirstWindowSlowLocalCopy => {
+                FirstWindowBody::Slow { seconds: 12, local: here }
+            }
+            Surface::FirstWindowUnreachable => FirstWindowBody::Unreachable {
+                retry: RetryOffer::Offered,
+                local: LocalCopy::None,
             },
-            Surface::FirstWindowUnreachable => {
-                deskwarden::loading_ui::FirstWindowBody::Unreachable {
-                    retry: deskwarden::loading_ui::RetryOffer::Offered,
-                }
-            }
-            Surface::FirstWindowUnreachableSpent => {
-                deskwarden::loading_ui::FirstWindowBody::Unreachable {
-                    retry: deskwarden::loading_ui::RetryOffer::Spent,
-                }
-            }
-            _ => deskwarden::loading_ui::FirstWindowBody::Loading,
+            Surface::FirstWindowUnreachableLocalCopy => FirstWindowBody::Unreachable {
+                retry: RetryOffer::Offered,
+                local: here,
+            },
+            Surface::FirstWindowUnreachableSpent => FirstWindowBody::Unreachable {
+                retry: RetryOffer::Spent,
+                local: LocalCopy::None,
+            },
+            Surface::FirstWindowUnreachableSpentLocalCopy => FirstWindowBody::Unreachable {
+                retry: RetryOffer::Spent,
+                local: here,
+            },
+            // The copy is there; its age is not, because this session never
+            // got the key to read the file's header with.
+            Surface::FirstWindowUnreachableDeclinedCopy => FirstWindowBody::Unreachable {
+                retry: RetryOffer::Offered,
+                local: LocalCopy::Here { synced: None },
+            },
+            _ => FirstWindowBody::Loading,
         };
         let _ = deskwarden::loading_ui::draw_first_window_body(
             root,
