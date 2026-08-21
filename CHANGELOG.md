@@ -10,6 +10,24 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Fixed: Delete in an item's ⋮ menu did nothing and did not light up
+
+The first click on **Delete** arms a confirmation -- the entry changes to
+"Delete? Click to confirm" and a second click does the deed. But the menu shut
+itself the instant that first click landed, so the armed entry was never on
+screen to be clicked and the item was never deleted. Reopening the menu did
+not help: every fresh first click simply re-armed. The only sign that anything
+had happened was the ⋮ itself turning red.
+
+The same entry also never lit up under the pointer, while Edit, Clone and
+"Move to folder" above it all did -- which made its row read as a label rather
+than as something you could click.
+
+Both are fixed. A click inside this menu now closes it only when the entry it
+landed on asks to close, and Delete highlights across the full width of the
+menu exactly like its neighbours. Deleting is still two clicks, still a short
+moment apart, and still leaves the item recoverable from bitwarden.com.
+
 ### Keep an encrypted copy of your vault on this PC (off by default)
 
 Deskwarden starts unlocked from a cached session token, but the vault itself
