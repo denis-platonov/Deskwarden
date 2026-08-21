@@ -94,6 +94,11 @@ pub mod session_store;
 pub mod settings;
 pub mod signature;
 pub mod single_instance;
+/// Seeding a [`vault_cache::VaultCache`] for a test with no backend at all --
+/// no `mockito` server, no port, no round-trip. Test-only at the declaration,
+/// exactly like [`below_cut`], so nothing in it can ship.
+#[cfg(test)]
+pub mod test_vault;
 pub mod theme;
 pub mod tray;
 pub mod update_panel;

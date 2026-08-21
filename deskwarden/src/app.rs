@@ -4607,7 +4607,7 @@ mod fill_dispatch_tests {
     use super::*;
     use crate::app_match::{TriggerMode, APP_MATCH_FIELD_NAME};
     use crate::injector::sequence::{Plan, Step};
-    use crate::vault_bridge::{LoginData, VaultBridge, VaultField};
+    use crate::vault_bridge::{LoginData, VaultField};
     use std::sync::{Arc, Mutex};
 
     /// **The username and password disagree, and neither contains the other.**
@@ -5191,23 +5191,24 @@ mod fill_dispatch_tests {
         }
     }
 
-    /// A cache holding exactly `item`.
+    /// A cache holding exactly `item`, **with no backend behind it at all**.
     ///
-    /// The mock server exists only to satisfy `populate_with`'s folder fetch
-    /// and is **dropped before the fill runs**, so a fill that reached for
-    /// the network instead of the in-memory snapshot would fail visibly
-    /// rather than quietly succeed -- which is the property
-    /// `fill_from_vault`'s doc claims and nothing else here checks.
+    /// The bridge points at [`crate::test_vault::UNREACHABLE_URL`], which is
+    /// dead for the whole life of the process. So a fill that reached for the
+    /// network instead of the in-memory snapshot fails visibly rather than
+    /// quietly succeeding -- which is the property `fill_from_vault`'s doc
+    /// claims and nothing else here checks.
+    ///
+    /// **This used to be a `mockito` server dropped before the fill ran**, and
+    /// that no longer proves anything: mockito 1.7 pools its servers, so
+    /// dropping the guard resets the mocks but leaves the port bound and hands
+    /// the server to the next test. A fill that reached for the network got an
+    /// answer from a recycled server instead of an error -- and, worse, raced
+    /// whichever test had since been given that port. A permanently dead
+    /// address is both an honest assertion and a fixture that cannot collide
+    /// with anything.
     fn cache_with(item: VaultItem) -> VaultCache {
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
-        let _ = cache.populate_with(vec![item], cache.epoch()).expect("seeds");
+        let cache = crate::test_vault::cache_with_items(vec![item]);
         assert_eq!(cache.items().len(), 1, "the cache must actually hold the item");
         cache
     }
@@ -5527,9 +5528,13 @@ mod fill_dispatch_tests {
     /// the predicate -- neither is the *act*. This one is: it needs the code
     /// to come off the wire and end up in the plan, so it fails.
     ///
-    /// The mock server is alive for the whole fill here (unlike `fill`'s),
-    /// which is the point -- the fetch is the one part of a fill that is
-    /// deliberately allowed to touch the network.
+    /// The mock server here answers **one** route, `/object/totp/item-1`, and
+    /// is alive for the whole fill -- which is the point: the code fetch is
+    /// the one part of a fill that is deliberately allowed to touch the
+    /// network, so it is the one thing left that a server should serve. The
+    /// cache itself is seeded in memory (see [`crate::test_vault`]), so a mock
+    /// that goes unhit here means the fetch did not happen, not that the
+    /// seeding took a different route.
     #[test]
     fn a_sequence_that_uses_a_one_time_code_fetches_it_and_types_it() {
         // Contends for the same process-global "already typing" flag as the
@@ -5538,12 +5543,6 @@ mod fill_dispatch_tests {
         // happens to be holding a `SequenceGuard`.
         let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
         let totp = server
             .mock("GET", "/object/totp/item-1")
             .with_status(200)
@@ -5551,10 +5550,11 @@ mod fill_dispatch_tests {
             .with_body(r#"{"success":true,"data":{"data":"482913"}}"#)
             .create();
 
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
-        let _ = cache
-            .populate_with(vec![item_with("{USERNAME}{TAB}{TOTP}")], cache.epoch())
-            .expect("seeds");
+        let cache = crate::test_vault::cache_at(
+            server.url(),
+            vec![item_with("{USERNAME}{TAB}{TOTP}")],
+            Vec::new(),
+        );
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
@@ -5595,18 +5595,13 @@ mod fill_dispatch_tests {
         // happens to be holding a `SequenceGuard`.
         let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
         let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
 
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
-        let _ = cache
-            .populate_with(vec![item_with("{USERNAME}{TAB}{PASSWORD}")], cache.epoch())
-            .expect("seeds");
+        let cache = crate::test_vault::cache_at(
+            server.url(),
+            vec![item_with("{USERNAME}{TAB}{PASSWORD}")],
+            Vec::new(),
+        );
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
@@ -5641,12 +5636,6 @@ mod fill_dispatch_tests {
     fn a_choice_that_needs_a_code_is_what_makes_the_fill_fetch_one() {
         let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
         let totp = server
             .mock("GET", "/object/totp/item-1")
             .with_status(200)
@@ -5654,9 +5643,9 @@ mod fill_dispatch_tests {
             .with_body(r#"{"success":true,"data":{"data":"907142"}}"#)
             .create();
 
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
         // Deliberately no stored sequence -- see the doc above.
-        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+        let cache =
+            crate::test_vault::cache_at(server.url(), vec![item_with("")], Vec::new());
         assert!(
             !sequence_needs_a_one_time_code(&item_with("")),
             "the fixture stores a {{TOTP}}, so the old gate would have fetched anyway and this \
@@ -5699,16 +5688,10 @@ mod fill_dispatch_tests {
     fn a_choice_that_needs_no_code_makes_no_totp_request() {
         let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
         let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
 
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
-        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+        let cache =
+            crate::test_vault::cache_at(server.url(), vec![item_with("")], Vec::new());
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
@@ -5763,15 +5746,7 @@ mod fill_dispatch_tests {
         describe: fn() -> Option<crate::injector::target::SendTarget>,
     ) -> (usize, Vec<String>) {
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
-            .create();
-        let cache = VaultCache::new(VaultBridge::new(server.url()));
-        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+        let cache = crate::test_vault::cache_with_items(vec![item_with("")]);
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };

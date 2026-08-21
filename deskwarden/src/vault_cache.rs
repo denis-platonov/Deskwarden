@@ -18,7 +18,8 @@
 //! rather than one per call site -- and, since review 21's Critical, exactly
 //! one place that knows which ids have been written but not yet re-fetched,
 //! so a populate whose fetch predates a write can no longer undo it (see
-//! `populate_with_at_epoch`).
+//! `write_back_at_epoch`, which is the one place a snapshot is replaced
+//! however the vault reached it).
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{
@@ -383,7 +384,7 @@ struct Snapshot {
     /// A populate does NOT prune them: whether a given entry is still newer
     /// truth is a question each populate answers against its OWN mark, and
     /// deleting entries on one populate's behalf is review 23's Critical (see
-    /// `populate_with_at_epoch`). Only `clear` empties them.
+    /// `write_back_at_epoch`). Only `clear` empties them.
     pending_items: Vec<PendingWrite>,
     pending_folders: Vec<PendingWrite>,
     /// Monotonic count of populates that have reached the write-back lock,
@@ -659,7 +660,7 @@ impl VaultCache {
     /// encrypted-disk-cache work will add).
     ///
     /// **Local writes made since `epoch` survive** -- review 21's Critical.
-    /// See [`Self::populate_with_at_epoch`] for the mechanism and for why it
+    /// See [`Self::write_back_at_epoch`] for the mechanism and for why it
     /// re-applies rather than refuses.
     ///
     /// **THE ONE RULE FOR CALLERS, and it is not enforced by the type:**
@@ -714,6 +715,67 @@ impl VaultCache {
         self.populate_with_at_epoch(items, epoch)
     }
 
+    /// [`Self::populate_with`]'s core: fetch the one half the caller does not
+    /// have, then hand both halves to the single write-back.
+    ///
+    /// Everything that makes that write-back safe -- the era guard and the
+    /// replay of local writes -- lives in [`Self::write_back_at_epoch`], so
+    /// that it is shared verbatim with [`Self::populate_with_vault`], which
+    /// fetches nothing at all. What belongs to *this* entry point and to no
+    /// other is the `list_folders` below: a real HTTP round-trip, issued
+    /// after the caller has already fetched its items, and therefore the
+    /// reason the write window the write-back guards against is **never**
+    /// empty for a fetching populate. It is exactly that round-trip that
+    /// [`Self::populate_with_vault`] exists to let a caller skip.
+    fn populate_with_at_epoch(
+        &self,
+        items: Vec<VaultItem>,
+        epoch: VaultEpoch,
+    ) -> Result<PopulateOutcome, VaultError> {
+        let folders = self.bridge.list_folders()?;
+        Ok(self.write_back_at_epoch(items, folders, epoch))
+    }
+
+    /// Writes a **whole vault the caller already holds** -- items *and*
+    /// folders -- back over the snapshot, fetching nothing.
+    ///
+    /// This is [`Self::populate_with`] with its one remaining round-trip
+    /// removed. `populate_with` exists for a caller that has already fetched
+    /// the items, and it still had to fetch the folders itself, because until
+    /// now there was no way to hand both halves in. A caller that holds both
+    /// -- the encrypted disk cache restoring a snapshot from disk
+    /// (`docs/superpowers/plans/2026-07-31-encrypted-vault-disk-cache.md`),
+    /// and every test fixture that wants a populated cache -- had no door,
+    /// and stood up an HTTP server for a fetch whose answer it already knew.
+    ///
+    /// **It is not a second way to write a snapshot.** It is *the* way; the
+    /// fetching entry points are wrappers that decide what to hand it. Every
+    /// rule [`Self::populate_with`] and [`Self::populate`] document holds
+    /// here unchanged, because below this line it is the same code:
+    ///
+    ///  * the era guard is applied exactly once, in
+    ///    [`Self::write_back_at_epoch`], so a [`Self::clear`] since `epoch`
+    ///    was captured discards this populate as
+    ///    [`PopulateOutcome::DiscardedStale`] and leaves the snapshot empty
+    ///    and unpopulated;
+    ///  * local writes newer than `epoch` are replayed over the given data
+    ///    rather than clobbered by it;
+    ///  * nothing here begins an era. [`Self::clear`] remains the only thing
+    ///    that does -- see [`VaultEra`].
+    ///
+    /// **The one rule for callers is the same one, and is likewise not
+    /// enforced by the type**: capture `epoch` from [`Self::epoch`] BEFORE
+    /// whatever produced `vault`. For a disk read that means before the read;
+    /// for a fixture building a literal it is simply `cache.epoch()`, which
+    /// cannot be late because nothing can have happened in between.
+    ///
+    /// It returns a bare [`PopulateOutcome`] rather than a `Result` because
+    /// with nothing fetched there is nothing left that can fail: the only two
+    /// answers are "written" and "discarded as stale".
+    pub fn populate_with_vault(&self, vault: VaultSnapshot, epoch: VaultEpoch) -> PopulateOutcome {
+        self.write_back_at_epoch(vault.items, vault.folders, epoch)
+    }
+
     /// The one place a fetch is written back over the snapshot, and therefore
     /// the one place that can silently undo a local write.
     ///
@@ -766,12 +828,24 @@ impl VaultCache {
     /// either already recorded itself (and is replayed here) or has not yet
     /// touched the snapshot at all (and applies immediately after this
     /// returns, on top of the fetch). There is no third case.
-    fn populate_with_at_epoch(
+    ///
+    /// **Where the fetch is, now that this function does not do one.** The
+    /// `list_folders` this doc keeps referring to moved one level up, into
+    /// [`Self::populate_with_at_epoch`], so that
+    /// [`Self::populate_with_vault`] could reach the write-back without it.
+    /// Nothing above changes: for a *fetching* populate the window described
+    /// here is exactly as wide as it ever was, because the caller's own
+    /// `list_items` and the folder fetch both still happen before this lock.
+    /// For a populate that fetches nothing the window is narrower -- only the
+    /// caller's own read of wherever the vault came from -- and the guard and
+    /// the replay are unchanged, which is the point of there being one
+    /// write-back rather than two.
+    fn write_back_at_epoch(
         &self,
         mut items: Vec<VaultItem>,
+        mut folders: Vec<Folder>,
         epoch: VaultEpoch,
-    ) -> Result<PopulateOutcome, VaultError> {
-        let mut folders = self.bridge.list_folders()?;
+    ) -> PopulateOutcome {
         let mut snapshot = self.lock();
         // Allocated under the lock, before anything can return: it is what
         // orders this populate against every other one in the log, and both
@@ -790,7 +864,7 @@ impl VaultCache {
                 epoch.era(),
                 now
             );
-            return Ok(PopulateOutcome::DiscardedStale);
+            return PopulateOutcome::DiscardedStale;
         }
 
         let replayed_items = replay_writes(
@@ -851,7 +925,7 @@ impl VaultCache {
                 replay_log_line(populate_seq, &replayed_items, &replayed_folders)
             );
         }
-        Ok(PopulateOutcome::Populated)
+        PopulateOutcome::Populated
     }
 
     pub fn is_populated(&self) -> bool {
@@ -1622,6 +1696,36 @@ mod tests {
         r#"{"success":true,"data":{"data":[{"id":"f1","name":"Work"}]}}"#
     }
 
+    /// The list inside one of the `*_body` fixtures above, as values.
+    ///
+    /// Parsed from the very same JSON the mocked routes serve, so a test that
+    /// seeds its cache offline and one that seeds it over HTTP cannot drift
+    /// apart: change `items_body` and both move together.
+    fn body_list<T: serde::de::DeserializeOwned>(body: &str) -> Vec<T> {
+        let envelope: serde_json::Value =
+            serde_json::from_str(body).expect("the fixture body is JSON");
+        serde_json::from_value(envelope["data"]["data"].clone())
+            .expect("the fixture body's `data.data` is a list")
+    }
+
+    /// An **offline** cache already holding the `items_body` items and the
+    /// `folders_body` folder, with a bridge that can never answer.
+    ///
+    /// For the tests below whose subject is what the cache does with a
+    /// snapshot it already has -- the era-checked reads above all -- rather
+    /// than how it got one. They used to stand up a `mockito` server for two
+    /// GETs and then never touch it again, which cost a pooled port for the
+    /// life of the test and, since mockito 1.7 recycles rather than shuts
+    /// down, made them able to disturb whichever unrelated test was handed
+    /// that port next. See [`crate::test_vault`].
+    ///
+    /// Tests that are ABOUT the fetch -- `populate`, the readiness probe, the
+    /// write-through of every mutation -- deliberately keep their servers:
+    /// HTTP is what they are checking.
+    fn seeded_offline_cache() -> VaultCache {
+        crate::test_vault::cache_with(body_list(items_body()), body_list(folders_body()))
+    }
+
     #[test]
     fn populate_fills_the_snapshot_and_reads_come_from_it() {
         let mut server = mockito::Server::new();
@@ -1841,6 +1945,99 @@ mod tests {
         assert!(cache.populate_with(seeded, cache.epoch()).is_err());
         assert!(!cache.is_populated());
         assert!(cache.items().is_empty());
+    }
+
+    /// **`populate_with_vault` asks the bridge for nothing.**
+    ///
+    /// The bridge here can never answer -- see [`crate::test_vault`] -- so a
+    /// door that still fetched its folders, or that had grown any other
+    /// round-trip, could not populate this cache at all. The empty folder
+    /// list is the one the CALLER handed in, which the assertion below
+    /// distinguishes from "the fetch quietly returned nothing" by handing in
+    /// a folder and finding it.
+    #[test]
+    fn populate_with_vault_seeds_both_halves_without_touching_the_bridge() {
+        let cache = VaultCache::new(crate::test_vault::unreachable_bridge());
+        let epoch = cache.epoch();
+
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch
+            ),
+            PopulateOutcome::Populated
+        );
+
+        assert!(cache.is_populated());
+        assert_eq!(cache.items().len(), 2);
+        assert_eq!(
+            cache.folders().into_iter().map(|f| f.name).collect::<Vec<_>>(),
+            vec!["Work".to_string()],
+            "the folders must be the caller's, not an empty list from a fetch that never happened"
+        );
+    }
+
+    /// **The era guard is the same guard**, and the new door is not a way
+    /// around it.
+    ///
+    /// A `clear` between the caller's mark and the write-back means a
+    /// different vault session, so the snapshot must stay empty and
+    /// unpopulated exactly as `populate` and `populate_with` leave it -- see
+    /// `a_populate_whose_epoch_was_bumped_mid_flight_leaves_the_cache_empty`,
+    /// which asserts the same thing through the fetching door. If
+    /// `populate_with_vault` ever grew its own write-back this test is what
+    /// notices.
+    #[test]
+    fn populate_with_vault_discards_a_vault_whose_era_has_been_cleared_away() {
+        let cache = VaultCache::new(crate::test_vault::unreachable_bridge());
+        let epoch = cache.epoch();
+
+        // Stands in for "the caller was reading the vault from disk while the
+        // user locked the app" -- the disk-cache restore this door exists for.
+        cache.clear();
+
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch
+            ),
+            PopulateOutcome::DiscardedStale
+        );
+        assert!(!cache.is_populated(), "a discarded populate must not mark the cache populated");
+        assert!(cache.items().is_empty());
+        assert!(cache.folders().is_empty());
+    }
+
+    /// **And `clear` is still the only thing that begins an era.** A populate
+    /// through the new door leaves the era exactly where it found it, so a
+    /// caller holding an era captured before it can still read the result --
+    /// which is the whole reason [`VaultEra`] is not bumped by writes either.
+    #[test]
+    fn populate_with_vault_does_not_begin_an_era() {
+        let cache = VaultCache::new(crate::test_vault::unreachable_bridge());
+        let era_before = cache.epoch().era();
+
+        let epoch = cache.epoch();
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot { items: body_list(items_body()), folders: Vec::new() },
+                epoch
+            ),
+            PopulateOutcome::Populated
+        );
+
+        assert_eq!(cache.epoch().era(), era_before, "populating started a new era");
+        assert_eq!(
+            cache.snapshot_unless_superseded(era_before).expect("the era still stands").items.len(),
+            2,
+            "a reader holding the pre-populate era must still be able to read the result"
+        );
     }
 
     #[test]
@@ -3021,22 +3218,7 @@ mod tests {
 
     #[test]
     fn snapshot_unless_superseded_hands_back_items_and_folders_of_one_era() {
-        let mut server = mockito::Server::new();
-        let _i = server
-            .mock("GET", "/list/object/items")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(items_body())
-            .create();
-        let _f = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-
-        let cache = cache_for(server.url());
-        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let cache = seeded_offline_cache();
 
         let snapshot = cache
             .snapshot_unless_superseded(cache.epoch().era())
@@ -3053,20 +3235,7 @@ mod tests {
         // must give up) and "nothing has been fetched yet" (a populate is
         // exactly the cure). `picker_ui` paid for that with a whole vault
         // fetch under the spinner before it could answer `VaultLocked`.
-        let mut server = mockito::Server::new();
-        let _i = server
-            .mock("GET", "/list/object/items")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(items_body())
-            .create();
-        let _f = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
+        let cache = VaultCache::new(crate::test_vault::unreachable_bridge());
 
         // A fresh process: era 0, never populated. The era MATCHES, so only
         // the populated flag distinguishes this -- and it must read as
@@ -3077,7 +3246,17 @@ mod tests {
             VaultUnavailable::Unpopulated
         );
 
-        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let epoch = cache.epoch();
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch
+            ),
+            PopulateOutcome::Populated
+        );
         let era = cache.epoch().era();
         cache.clear();
         assert_eq!(
@@ -3101,21 +3280,7 @@ mod tests {
         // WAS (`.map(|s| s.items)`) -- which is the shape any future caller
         // tempted to re-add one would write, and therefore still the tear
         // being exhibited.
-        let mut server = mockito::Server::new();
-        let _i = server
-            .mock("GET", "/list/object/items")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(items_body())
-            .create();
-        let _f = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
-        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let cache = seeded_offline_cache();
         let era = cache.epoch().era();
 
         // The two-call spelling, with the `clear` landing in the window it
