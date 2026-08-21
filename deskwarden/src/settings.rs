@@ -1071,6 +1071,25 @@ pub struct Settings {
     /// No secret is in here -- these are process names -- which is what lets it
     /// past `tests::mentions_a_secret`, the blunt substring scan over the whole
     /// of `settings.json`.
+    /// Whether the vault snapshot is persisted to disk, encrypted under a
+    /// Windows Hello-sealed key.
+    ///
+    /// **Off by default, and every behaviour it enables is inert while it is
+    /// off** -- with the default settings no file is ever created, which is
+    /// asserted against the filesystem rather than against this flag.
+    ///
+    /// On, the file survives a lock. That is the point of it: it exists to
+    /// survive a *restart*, and the vault window locking itself is not the
+    /// account going away. It is deleted on log out, on any master-password
+    /// re-prompt, and when this setting is turned off; and it expires after
+    /// seven days (`vault_disk_cache::EXPIRY_SECS`, which carries the
+    /// justification for the number).
+    ///
+    /// The setting is only offered when Windows Hello is available. There is
+    /// deliberately no DPAPI-only variant: the TPM binding is the entire
+    /// value of the setting, and a weaker file under copy that promises one
+    /// would be a misleading security claim.
+    pub cache_vault_to_disk: bool,
     pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
@@ -1164,6 +1183,7 @@ impl Default for Settings {
             clear_clipboard_on_account_change: true,
             clear_clipboard_on_quit: true,
             clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
+            cache_vault_to_disk: false,
             never_save_for_apps: Vec::new(),
             vault_window: None,
             accounts: Vec::new(),
@@ -1295,6 +1315,7 @@ impl Settings {
             clear_clipboard_on_account_change,
             clear_clipboard_on_quit,
             clear_clipboard_seconds,
+            cache_vault_to_disk,
             // Owned by the overlay, not by the preferences window: it is
             // written by `Self::persist_never_save_for_app` from inside the 3c
             // card, and the copy `main.rs` holds is stale the moment a user
@@ -1324,6 +1345,7 @@ impl Settings {
         on_disk.clear_clipboard_on_account_change = *clear_clipboard_on_account_change;
         on_disk.clear_clipboard_on_quit = *clear_clipboard_on_quit;
         on_disk.clear_clipboard_seconds = *clear_clipboard_seconds;
+        on_disk.cache_vault_to_disk = *cache_vault_to_disk;
         on_disk.save(path)
     }
 
@@ -1591,6 +1613,9 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            // The OPPOSITE of its own default (`false`), for the reason the
+            // fields above give.
+            cache_vault_to_disk: true,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             // Listed rather than `..Settings::default()` so this test keeps
@@ -1602,6 +1627,31 @@ mod tests {
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_disk_cache_is_off_by_default() {
+        assert!(!Settings::default().cache_vault_to_disk);
+    }
+
+    #[test]
+    fn an_older_settings_file_parses_with_the_disk_cache_off() {
+        // The partial-file property this struct's `#[serde(default)]`
+        // already pins, extended to the new field: a settings.json written
+        // by a build that predates this feature must not fail to parse, and
+        // must not accidentally arrive with a decrypted vault being written
+        // to disk.
+        let path = temp_path("partial-disk-cache");
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running": false, "auto_lock_minutes": 5}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.cache_vault_to_disk);
+        assert!(!loaded.keep_backend_running);
+        assert_eq!(loaded.auto_lock_minutes, 5);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1775,6 +1825,7 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            cache_vault_to_disk: true,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             accounts: Vec::new(),
@@ -2341,6 +2392,7 @@ mod tests {
             clear_clipboard_on_account_change: false,
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
+            cache_vault_to_disk: true,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),

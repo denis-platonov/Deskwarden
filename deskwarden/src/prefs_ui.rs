@@ -127,6 +127,51 @@ const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
      while the vault window is open; autofill is unaffected either way.";
 
+/// The encrypted disk cache's label. It names the file rather than the
+/// benefit, because the benefit ("opens instantly") is not the part a user
+/// has to weigh.
+const DISK_CACHE_LABEL: &str = "Keep an encrypted copy of your vault on this PC";
+
+/// The description shown under the disk-cache toggle, in its two states.
+///
+/// **The wording is the requirement here, not an implementation detail**, and
+/// it is a pure function for exactly that reason: this is the text a user
+/// reads before accepting a security tradeoff, so it is asserted by tests
+/// rather than buried in an eframe closure where nothing can reach it.
+///
+/// Four properties the tests below hold, each deliberate:
+///
+///  * it names what is in the file -- "usernames, passwords, notes and
+///    two-factor secrets" -- instead of the euphemism "vault data";
+///  * it states the survives-a-lock behaviour, in the negative, because that
+///    is the part a reasonable person assumes goes the other way;
+///  * it names the residual attacker in plain terms rather than implying the
+///    file is safe from everything;
+///  * it never uses the word "secure". It describes what gates the file.
+fn disk_cache_description(hello_available: bool) -> &'static str {
+    if hello_available {
+        "Deskwarden opens instantly after a restart and autofill works the moment it starts, \
+         instead of waiting about 8 seconds for the Bitwarden backend.\n\n\
+         The copy contains your usernames, passwords, notes and two-factor secrets. It is \
+         encrypted with a key that Windows Hello keeps in this PC's TPM chip, so a copied disk \
+         cannot be read on another machine. It is not deleted when your vault locks — only when \
+         you log out, or after 7 days. Anyone who can run programs as you on this PC and pass \
+         Windows Hello can read it."
+    } else {
+        // Deliberately not a silent downgrade to a DPAPI-only file under this
+        // same label. The TPM binding is the entire value of the setting --
+        // it is the one property that distinguishes it from a plain
+        // DPAPI-wrapped dump, which was considered and rejected -- and a
+        // weaker file offered under copy that promises one would be a
+        // straightforwardly misleading security claim.
+        "Unavailable — needs Windows Hello.\n\n\
+         This copy is protected by a key held in your PC's TPM chip, which only Windows Hello \
+         can release. Without Hello there is no such key, and Deskwarden will not store your \
+         vault on disk under weaker protection than this setting describes. Set Hello up in \
+         Windows Settings → Accounts → Sign-in options."
+    }
+}
+
 /// **"on match" is gone from the label, because the setting is no longer
 /// about matches.** `Settings::prompt_on_match` governs every card the
 /// overlay raises by itself now -- the fill prompt for a window the vault
@@ -811,6 +856,16 @@ pub struct PrefsState {
     /// Read once rather than every frame: it is a file, the page draws at 60
     /// frames a second, and the only thing that changes it is a scan
     /// finishing -- which this window is the one to notice.
+    /// Whether Windows Hello is set up on this machine, **as a function
+    /// pointer** rather than a value, for [`Self::account_source`]'s reason:
+    /// the default reads the OS, and no test in this crate may.
+    ///
+    /// [`PrefsState::new`] -- what the paint tests build -- defaults it to
+    /// "unavailable", which is the inert answer: the disk-cache row renders
+    /// ghosted and nothing can be turned on. The production shells install
+    /// the real probe in [`Self::with_scan_history`], exactly as they are the
+    /// only things that read `scan_history.json`.
+    hello_available: fn() -> bool,
     scan_history: crate::scan_history::ScanHistory,
 }
 
@@ -951,6 +1006,7 @@ impl PrefsState {
             // gets an empty history, which is a state the page renders in
             // words.
             scan_history: crate::scan_history::ScanHistory::default(),
+            hello_available: || false,
         }
     }
 
@@ -985,7 +1041,11 @@ impl PrefsState {
     /// this. `examples/ui_preview` deliberately does not; it supplies its own
     /// entries through [`Self::show_scan_history`].
     pub fn with_scan_history(settings: Settings) -> Self {
-        Self { scan_history: load_scan_history(), ..Self::new(settings) }
+        Self {
+            scan_history: load_scan_history(),
+            hello_available: crate::vault_disk_cache::hello_available,
+            ..Self::new(settings)
+        }
     }
 
     /// Parks the scan flow in a given stage, for
@@ -1020,6 +1080,17 @@ impl PrefsState {
     /// the rest of the process -- and the next test -- reads.
     pub fn show_account_source(&mut self, source: fn() -> Option<AccountStatus>) {
         self.account_source = source;
+    }
+
+    /// Answers the disk-cache row's "is Windows Hello set up?" from `probe`
+    /// instead of from the OS.
+    ///
+    /// For `examples/ui_preview`, which has to draw both states of a row
+    /// whose real answer depends on the machine taking the screenshot, and
+    /// for the tests. A function pointer for
+    /// [`show_account_source`](Self::show_account_source)'s reason exactly.
+    pub fn show_hello_available(&mut self, probe: fn() -> bool) {
+        self.hello_available = probe;
     }
 }
 
@@ -1533,6 +1604,28 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             BACKEND_LABEL,
             BACKEND_DESCRIPTION,
             state.settings.keep_backend_running,
+        );
+        row_separator(ui);
+        // Directly under the backend row because the two are one question
+        // seen from opposite ends: that one decides how much the app pays to
+        // keep `bw serve` warm, and this one is how it stops needing `bw
+        // serve` warm at all. The spec put it here rather than on
+        // `Section::Security` -- which did not exist when it was written and
+        // is still a placeholder -- and it is the one setting on this page
+        // that changes what is written to the user's disk.
+        //
+        // `child_toggle_row` rather than a bespoke unavailable block: with no
+        // Windows Hello the row is ghosted and its description says why,
+        // readable without hovering, and the returned value is the stored one
+        // unchanged so a stray click cannot enable machinery that has no key
+        // to run on.
+        let hello_available = (state.hello_available)();
+        state.settings.cache_vault_to_disk = child_toggle_row(
+            ui,
+            DISK_CACHE_LABEL,
+            disk_cache_description(hello_available),
+            state.settings.cache_vault_to_disk,
+            hello_available,
         );
         row_separator(ui);
         // The one switch that governs what a matched window does. It sits on
@@ -3774,6 +3867,133 @@ mod tests {
         frame(&ctx, &mut state, &[])
     }
 
+    // -- the encrypted disk cache row --------------------------------------
+
+    /// One frame of a page whose Hello answer is `available`, since that is
+    /// the only input to this row and no other harness here can supply it.
+    fn paint_general_with_hello(available: bool) -> Painted {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::General;
+        state.show_hello_available(if available { || true } else { || false });
+        frame(&ctx, &mut state, &[])
+    }
+
+    /// The copy is the requirement, so these assertions exist so that a
+    /// future edit which quietly drops the uncomfortable half of a sentence
+    /// fails a test rather than shipping.
+    #[test]
+    fn the_available_disk_cache_copy_states_the_survives_a_lock_behaviour() {
+        let text = disk_cache_description(true);
+        assert!(text.contains("usernames, passwords, notes and two-factor secrets"));
+        assert!(text.contains("not deleted when your vault locks"));
+        assert!(text.contains("log out"));
+        assert!(text.contains("7 days"));
+        assert!(text.contains("TPM"));
+        assert!(
+            text.contains("Anyone who can run programs as you"),
+            "the copy stopped naming the residual attacker"
+        );
+        assert!(
+            !text.to_lowercase().contains("secure"),
+            "the copy must describe what gates the file, not call it secure"
+        );
+    }
+
+    #[test]
+    fn the_unavailable_disk_cache_copy_explains_why_and_offers_no_weaker_option() {
+        let text = disk_cache_description(false);
+        assert!(text.starts_with("Unavailable"));
+        assert!(text.contains("Windows Hello"));
+        assert!(text.contains("Sign-in options"));
+        assert!(
+            text.contains("weaker protection"),
+            "the copy stopped saying that no lesser file is written instead"
+        );
+        assert!(
+            !text.to_lowercase().contains("secure"),
+            "the copy must describe what gates the file, not call it secure"
+        );
+    }
+
+    #[test]
+    fn general_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
+        let painted = paint_general_with_hello(false);
+        assert!(
+            painted.contains(DISK_CACHE_LABEL),
+            "the disk-cache row is not on General at all: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("Sign-in options"),
+            "the reason a user cannot turn it on is not readable on the page"
+        );
+    }
+
+    #[test]
+    fn a_frame_cannot_turn_the_disk_cache_on_while_hello_is_missing() {
+        // The ghosted row returns the stored value unchanged, so there is no
+        // frame in which the setting reads as on with no key to run on.
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::General;
+        state.show_hello_available(|| false);
+        let _ = frame(&ctx, &mut state, &[]);
+        assert!(!state.settings.cache_vault_to_disk);
+    }
+
+    #[test]
+    fn general_says_what_is_in_the_file_when_hello_is_available() {
+        let painted = paint_general_with_hello(true);
+        assert!(
+            painted.any_containing("usernames, passwords, notes and two-factor secrets"),
+            "the page does not say what is in the file"
+        );
+        assert!(
+            painted.any_containing("not deleted when your vault locks"),
+            "the page does not state the survives-a-lock behaviour"
+        );
+    }
+
+    /// **The disk-cache switch, driven at the pane.** The row exists, it is
+    /// wired to `cache_vault_to_disk`, and it is wired to THAT field and not
+    /// to a neighbour -- which for this row is worth pinning twice over,
+    /// since the neighbour above it decides whether a background process
+    /// runs and this one decides whether a decrypted vault goes on the disk.
+    #[test]
+    fn clicking_the_disk_cache_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.show_hello_available(|| true);
+        assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
+
+        let first = frame(&ctx, &mut state, &[]);
+        // SECOND pill down: directly under the backend row.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.cache_vault_to_disk,
+            "the disk-cache toggle did not turn on -- the row is painted but its value is \
+             never written back, so the pill is decoration"
+        );
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.cache_vault_to_disk, "and back off again");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+    }
+
+    #[test]
+    fn a_paint_state_reaches_no_windows_hello_probe_of_its_own() {
+        // `PrefsState::new` is what roughly forty tests build, and the real
+        // probe is an OS call. The default has to be the inert answer, not
+        // whatever this machine happens to say.
+        let state = PrefsState::new(Settings::default());
+        assert!(!(state.hello_available)());
+    }
+
     // -- the shell ---------------------------------------------------------
 
     #[test]
@@ -3909,13 +4129,17 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_six_toggles_and_one_stepper() {
+    fn general_paints_exactly_seven_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            6,
-            "six 40x22 pills: `keep_backend_running`, `prompt_on_match`, `fetch_icons`, \
+            7,
+            "seven 40x22 pills: `keep_backend_running`, `cache_vault_to_disk`, \
+             `prompt_on_match`, `fetch_icons`, \
              `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
+             The disk-cache pill is painted whether or not Windows Hello is available -- \
+             ghosted and inert when it is not -- so this count does not depend on the machine \
+             running the test. \
              TWO settings are no longer here and both left for the same reason -- \
              `check_breaches` moved to Breaches and `check_for_updates` moved to Updates, each \
              to sit beside the button it does NOT govern; see `draw_breaches` and `draw_updates`"
@@ -3976,8 +4200,9 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the default: a match prompts");
 
         let first = frame(&ctx, &mut state, &[]);
-        // Second pill down, between the backend row and the auto-lock one.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        // THIRD pill down now: the encrypted disk cache's row sits between
+        // this one and the backend row.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
@@ -4455,12 +4680,12 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // THIRD pill down now: backend, prompt, site icons, network logos,
-        // TOTP secret, auto-lock. The breach row that used to sit second is
-        // on the Breaches page, and the update row that used to sit last is
-        // on the Updates page.
-        let pill = pills[2].center();
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // FOURTH pill down now: backend, disk cache, prompt, site icons,
+        // network logos, TOTP secret, auto-lock. The breach row that used to
+        // sit second is on the Breaches page, and the update row that used to
+        // sit last is on the Updates page.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4503,10 +4728,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // FOURTH pill down: backend, prompt, site icons, network logos, TOTP
-        // secret, auto-lock.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // FIFTH pill down: backend, disk cache, prompt, site icons, network
+        // logos, TOTP secret, auto-lock.
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4747,10 +4972,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        // FIFTH pill down now: backend, prompt, site icons, network logos,
-        // TOTP secret, auto-lock.
-        let pill = pills[4].center();
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
+        // SIXTH pill down now: backend, disk cache, prompt, site icons,
+        // network logos, TOTP secret, auto-lock.
+        let pill = pills[5].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -4799,15 +5024,15 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 7);
+        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[5].top() < pills[6].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[4].top() > breach.bottom(),
+            pills[5].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[4].bottom() < auto_lock.top(),
+            pills[5].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -4864,19 +5089,22 @@ mod tests {
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the SIXTH pill down is the one wired to it -- `prompt_on_match`,
-        // `fetch_icons`, `use_brand_logos` and `reveal_totp_seed` sit between
-        // it and the backend row. It was the fifth until the network-logos row
-        // was inserted, and the sixth before `check_breaches` moved to its own
-        // page.
+        // the SEVENTH pill down is the one wired to it --
+        // `cache_vault_to_disk`, `prompt_on_match`, `fetch_icons`,
+        // `use_brand_logos` and `reveal_totp_seed` sit between it and the
+        // backend row. It was the fifth until the network-logos row was
+        // inserted, the sixth before `check_breaches` moved to its own page,
+        // and the seventh since the encrypted disk cache took the row
+        // directly under the backend one.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[5].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[6].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
+        assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
