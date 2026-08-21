@@ -102,7 +102,27 @@ Name: "{group}\Deskwarden"; Filename: "{app}\deskwarden.exe"
 ; HKCU, not HKLM: this is a per-user install with no admin rights, and
 ; autostart should only apply to the user who installed it. Uninstall
 ; removes this value automatically via uninsdeletevalue.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Deskwarden"; ValueData: """{app}\deskwarden.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+;
+; `--autostart` is how the app tells a LOGIN start from a DOUBLE-CLICK. The
+; owner: "if user launched it - it should show up (not go to tray), if it
+; autostart with minimized - it goes to tray." Without an argument the two
+; launches are byte-identical -- same exe, same empty command line, same
+; working directory -- so there is nothing for the app to decide on. `main`'s
+; `launch_intent` reads it; `AUTOSTART_FLAG` there is the same spelling and
+; `the_installers_run_entry_passes_the_flag_the_app_reads` holds the two
+; together by reading THIS FILE, so the spelling cannot drift.
+;
+; **Existing installs do not have it, and that is handled by the app rather
+; than here.** This line only runs when the `autostart` task is selected, and
+; a self-update deliberately passes /MERGETASKS=!autostart (see [Tasks]
+; below), so an upgrade never rewrites a Run value that is already there. A
+; user who does not reinstall keeps a bare `deskwarden.exe` indefinitely.
+; `launch_intent` therefore reads a missing flag as a USER launch: that is
+; what those installs do today, so nothing about them changes, and of the two
+; ways to be wrong -- showing a window nobody asked for, or silently going to
+; the tray when somebody double-clicked -- only the first is recoverable by
+; the user. See `launch_intent`'s own doc for the whole argument.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Deskwarden"; ValueData: """{app}\deskwarden.exe"" --autostart"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Tasks]
 ; No `checkedonce`: this task is checked by default on EVERY interactive

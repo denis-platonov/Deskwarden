@@ -10,6 +10,25 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### A login start goes to the tray; a double-click shows the window
+
+Deskwarden could not tell the two apart. The installer's autostart entry ran
+`deskwarden.exe` with no arguments, so a start at sign-in and a double-click
+arrived identically -- and both opened a full-size window, on every boot.
+
+The autostart entry now passes `--autostart`, and a launch that carries it
+stays in the tray: the vault loads in the background, autofill, the tray icon,
+the global shortcut and background sync all come up as usual, and no window is
+ever shown. You may not open one until your next reboot, which is the point.
+
+If that background load fails, the window appears and says so -- the same
+"Couldn't reach Bitwarden" screen a visible launch would have shown, with the
+same Retry. A silent launch is silent only while it is working.
+
+Installs made before this release keep their existing autostart entry until
+they are reinstalled, and go on showing the window at sign-in exactly as they
+do today. Nothing about them changes.
+
 ### Waiting is a sliding bar, not a spinning disc
 
 Every screen shown before the vault list -- the launch's loading and slow
