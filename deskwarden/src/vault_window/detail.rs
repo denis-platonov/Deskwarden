@@ -3061,7 +3061,29 @@ pub fn draw_detail_read(
                 // it is still `kind_offers_edit`'s decision.
                 let kebab = theme::kebab_button(ui, delete_pending)
                     .on_hover_text("More actions for this item");
-                egui::Popup::menu(&kebab).show(|ui| {
+                // **A click inside this menu closes it only when an entry
+                // says so.** egui's menus default to
+                // `PopupCloseBehavior::CloseOnClick`, which shuts the popup
+                // on ANY click in its body, whatever the entry did -- and
+                // every entry below that wants to close already calls
+                // `ui.close()` itself, so that default was never what made
+                // Edit or Clone dismiss the menu. What it did do was take
+                // the one entry that deliberately does NOT close: the first
+                // click on Delete arms the confirm and the menu vanished
+                // under the pointer, so the user saw a click do nothing and
+                // the second click of a two-click confirm had nothing left
+                // to land on. That is the "item is not deleted" half of the
+                // report, and it is why the comment on that entry claiming
+                // "no `ui.close()` on the arming click" was true and still
+                // not enough.
+                //
+                // `CloseOnClickOutside` keeps the dismissal a user expects
+                // -- click anywhere off the menu and it goes -- and hands
+                // the inside back to the entries, which is where this file
+                // already expresses the decision.
+                let menu = egui::Popup::menu(&kebab)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+                menu.show(|ui| {
                     if kind_offers_edit(kind) && ui.button("Edit").clicked() {
                         action = DetailAction::Edit;
                         ui.close();
@@ -3156,10 +3178,25 @@ pub fn draw_detail_read(
                     } else {
                         ("Delete", "Delete this item")
                     };
-                    let delete = ui.add(
-                        egui::Button::new(RichText::new(delete_label).color(theme::ERROR))
-                            .fill(theme::CARD),
-                    );
+                    //
+                    // **The red is on the WORDS and nothing else.** This
+                    // entry used to carry `.fill(theme::CARD)`, which is the
+                    // background the header strip's Delete button sat on
+                    // before the entry moved in here -- and inside a menu it
+                    // did two things, neither of them wanted. `Button::fill`
+                    // is documented to "override any on-hover effects", so
+                    // the theme's `widgets.hovered.bg_fill` never reached
+                    // this row: Edit, Clone and Move to folder each lit up
+                    // under the pointer and Delete alone stayed flat, which
+                    // is the "delete item doesn't get hovered in menu"
+                    // half of the report. And `CARD` is the menu's own
+                    // background colour, so the fill it pinned was
+                    // invisible -- it cost the hover and bought nothing.
+                    // Dropping it leaves an `ui.add(Button)` that is
+                    // `ui.button` with a coloured label, which is what every
+                    // sibling above already is.
+                    let delete = ui
+                        .add(egui::Button::new(RichText::new(delete_label).color(theme::ERROR)));
                     if delete.on_hover_text(delete_hover).clicked() {
                         action = DetailAction::Delete;
                     }
@@ -8318,6 +8355,40 @@ mod tests {
             found[0]
         }
 
+        /// The **box a menu entry occupies**, with the colour it was filled
+        /// in -- which is the rectangle a click has to land in, and is not
+        /// [`rect_of`](Self::rect_of)'s box.
+        ///
+        /// `rect_of` answers about the run of glyphs. A menu lays its entries
+        /// out justified, so every row is as wide as the widest one and a row
+        /// reaches far to the right of the word printed in it. Asking
+        /// `rect_of` "is Delete's hit area the width of the menu" therefore
+        /// asks about a rectangle nobody can click on either side of.
+        ///
+        /// The row is found as the SMALLEST painted rect that contains the
+        /// label's glyphs: the menu's own background contains them too, and
+        /// is the next one up. Every entry paints one even when its fill is
+        /// fully transparent, which is the resting state of an unhovered
+        /// `ui.button` -- so this also answers "what colour is it right
+        /// now", the other half of a hover.
+        fn menu_row_of(&self, label: &str) -> (egui::Rect, egui::Color32) {
+            let text = self.rect_of(label);
+            let mut boxes: Vec<(egui::Rect, egui::Color32)> = self
+                .rects
+                .iter()
+                .copied()
+                .filter(|(rect, _)| rect.contains_rect(text))
+                .collect();
+            boxes.sort_by(|(a, _), (b, _)| {
+                (a.width() * a.height())
+                    .partial_cmp(&(b.width() * b.height()))
+                    .expect("widget rects are finite")
+            });
+            *boxes.first().unwrap_or_else(|| {
+                panic!("nothing was painted behind {label:?}; the pane painted: {:?}", self.strings())
+            })
+        }
+
         /// The header's favourite star. Exactly one, in either state.
         fn star(&self) -> theme::icon_probe::Star {
             assert_eq!(
@@ -9096,6 +9167,232 @@ mod tests {
                 contains(&texts, "LOGIN CREDENTIALS"),
                 expected,
                 "{kind:?}: wrong LOGIN CREDENTIALS presence"
+            );
+        }
+    }
+
+    /// The kebab's Delete row is **as wide as the menu**, and so is the row
+    /// above it.
+    ///
+    /// The user's words were "hover area is around text but should cover the
+    /// whole item end-to-end". Two rows, not one: the assertion is that
+    /// Delete and Edit AGREE, so it cannot be satisfied by pinning a number
+    /// that a later change to the menu's padding or font would invalidate,
+    /// and it fails the same way whether Delete shrank or a sibling did.
+    ///
+    /// The width is also compared against Delete's own GLYPHS, because
+    /// "these two rows are equal" would still pass on a menu where every row
+    /// had collapsed onto its word.
+    #[test]
+    fn every_kebab_entry_is_as_wide_as_the_menu_not_as_wide_as_its_word() {
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            let (delete, _) = open.menu_row_of("Delete");
+            let (sibling, _) = open.menu_row_of(crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            assert!(
+                (delete.width() - sibling.width()).abs() < 0.5,
+                "{kind:?}: Delete's row is {} wide and Move to folder's is {} -- the entries \
+                 of one menu do not agree on their hit area",
+                delete.width(),
+                sibling.width()
+            );
+            assert!(
+                delete.width() > open.rect_of("Delete").width() + 20.0,
+                "{kind:?}: Delete's row is {} wide and the word inside it is {} -- the row has \
+                 collapsed onto its text",
+                delete.width(),
+                open.rect_of("Delete").width()
+            );
+            // And the far end of that row really answers a click. The width
+            // above is a painted rectangle; this is the sense behind it.
+            let far = egui::pos2(delete.right() - 4.0, delete.center().y);
+            let clicked = pane.click(&item, &TotpState::NoSecret, far);
+            assert_eq!(
+                clicked.action,
+                DetailAction::Delete,
+                "{kind:?}: clicking the right-hand end of the Delete row reported {:?}",
+                clicked.action
+            );
+        }
+    }
+
+    /// The resting fill of a kebab entry and the fill it takes under the
+    /// pointer, run for a fixed number of frames so the popup's fade-in has
+    /// finished and the two colours are comparable.
+    ///
+    /// Ten idle frames, not [`Pane::hover_settled`]'s forty: the popup
+    /// reaches full opacity in a handful and the tooltip delay is half a
+    /// second, so this rests the pointer long enough to be opaque and not
+    /// long enough to paint a tooltip over the row being measured.
+    fn menu_row_colours(kind: ItemKind, label: &str) -> (egui::Color32, egui::Color32) {
+        let item = an_item(item_type_for(kind));
+        let mut pane = Pane::new();
+        let mut frame = pane.open_kebab(&item, &TotpState::NoSecret);
+        for _ in 0..10 {
+            frame = pane.idle(&item, &TotpState::NoSecret);
+        }
+        let resting = frame.menu_row_of(label).1;
+        let at = frame.menu_row_of(label).0.center();
+        let mut frame = pane.hover(&item, &TotpState::NoSecret, at);
+        for _ in 0..10 {
+            frame = pane.idle(&item, &TotpState::NoSecret);
+        }
+        (resting, frame.menu_row_of(label).1)
+    }
+
+    /// "Delete item doesn't get hovered in menu on a card."
+    ///
+    /// The pointer on the Delete row changes the colour that row is painted
+    /// in, and changes it to the same colour the pointer on a sibling row
+    /// produces. Both halves are needed: a row that lit up in some private
+    /// shade of its own would pass the first and still be the odd one out,
+    /// and this is the assertion that `Button::fill` -- which egui documents
+    /// as overriding on-hover effects -- cannot satisfy.
+    ///
+    /// Every kind, because the report named a card and the code that draws
+    /// this row has never known what kind it is drawing.
+    #[test]
+    fn the_pointer_tints_the_kebabs_delete_the_way_it_tints_its_siblings() {
+        for kind in EVERY_KIND {
+            let (resting, hovered) = menu_row_colours(kind, "Delete");
+            assert_ne!(
+                resting, hovered,
+                "{kind:?}: the Delete row is painted {resting:?} whether the pointer is on it \
+                 or not, so it has no hover at all"
+            );
+            let (_, sibling) = menu_row_colours(kind, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+            assert_eq!(
+                hovered, sibling,
+                "{kind:?}: hovering Delete paints {hovered:?} but hovering Move to folder \
+                 paints {sibling:?} -- one menu, two hover treatments"
+            );
+        }
+    }
+
+    /// **The report, reproduced end to end**: the kebab's Delete really
+    /// deletes on the second click, and really does not on the first.
+    ///
+    /// Both clicks are pressed at the coordinates the pane painted, on the
+    /// menu the pane really opened, and each is fed to `vault_window::mod`'s
+    /// own [`crate::vault_window::confirm_click_at`] -- the gate that decides whether a
+    /// reported `DetailAction::Delete` becomes a deletion. Driving that
+    /// function rather than reimplementing its rule is the point: this fails
+    /// if the entry stops reporting, if the menu shuts itself between the
+    /// clicks, if the armed label stops being drawn, or if the confirm gate
+    /// changes its mind.
+    ///
+    /// `gap` is the wait between the two clicks, as a synthetic `Instant`
+    /// offset -- no sleeping, and no real date anywhere near it.
+    fn delete_through_the_kebab(kind: ItemKind, gap: std::time::Duration) -> bool {
+        let item = an_item(item_type_for(kind));
+        let mut pane = Pane::new();
+        let mut pending: Option<(String, std::time::Instant)> = None;
+        let armed_at = std::time::Instant::now();
+
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let entry = open.menu_row_of("Delete").0;
+        let first = pane.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(
+            first.action,
+            DetailAction::Delete,
+            "{kind:?}: the first click on the Delete row reported {:?}",
+            first.action
+        );
+        assert!(
+            !crate::vault_window::confirm_click_at(&mut pending, &item.id, armed_at),
+            "{kind:?}: one click deleted the item"
+        );
+
+        // What the window does next frame: the item is armed, so the pane is
+        // drawn armed. The menu must still be open -- nothing closed it.
+        let then = armed_at + gap;
+        pane.delete_pending = crate::vault_window::is_armed_at(&mut pending, &item.id, then);
+        assert!(pane.delete_pending, "{kind:?}: the first click armed nothing");
+        let armed = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            armed.painted("Delete? Click to confirm"),
+            "{kind:?}: the menu closed or lost its armed label after the first click; it \
+             painted: {:?}",
+            armed.strings()
+        );
+
+        let row = armed.menu_row_of("Delete? Click to confirm").0;
+        let second = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert_eq!(
+            second.action,
+            DetailAction::Delete,
+            "{kind:?}: the second click on the armed row reported {:?}",
+            second.action
+        );
+        crate::vault_window::confirm_click_at(&mut pending, &item.id, then)
+    }
+
+    /// Two clicks a comfortable moment apart delete the item -- on a card,
+    /// which is what the report was filed against, and on the other kinds,
+    /// because nothing in this row has ever been kind-specific.
+    #[test]
+    fn two_clicks_on_the_kebabs_delete_really_delete_the_item() {
+        for kind in EVERY_KIND {
+            assert!(
+                delete_through_the_kebab(kind, std::time::Duration::from_millis(600)),
+                "{kind:?}: two clicks through the kebab did not delete the item"
+            );
+        }
+    }
+
+    /// The other side of `CloseOnClickOutside`: the entries that DO close the
+    /// menu still close it, and a click off the menu still dismisses it.
+    ///
+    /// Delete is the exception in this menu, not the rule, and handing the
+    /// close decision to the entries is only safe if the entries make it.
+    /// Without this, "the menu stays open on Delete" could be satisfied by a
+    /// menu that never closes at all -- which is a worse defect than the one
+    /// being fixed, and one no other test here would see.
+    #[test]
+    fn the_kebabs_other_entries_still_close_the_menu_behind_them() {
+        let item = a_login();
+        for label in ["Edit", "Clone"] {
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            let entry = open.menu_row_of(label).0;
+            let _ = pane.click(&item, &TotpState::NoSecret, entry.center());
+            let after = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                !after.painted("Delete"),
+                "the kebab menu is still open after {label:?}; it painted: {:?}",
+                after.strings()
+            );
+        }
+        // And a click on the pane, away from the menu, closes it too --
+        // which is the whole behaviour `CloseOnClickOutside` is named for.
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let menu = open.menu_row_of("Delete").0;
+        let elsewhere = egui::pos2(menu.left() / 2.0, menu.bottom() + 200.0);
+        let _ = pane.click(&item, &TotpState::NoSecret, elsewhere);
+        let after = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !after.painted("Delete"),
+            "clicking outside the kebab menu left it open; the pane painted: {:?}",
+            after.strings()
+        );
+    }
+
+    /// And two clicks arriving faster than the confirm dwell do not.
+    ///
+    /// This is the guard on the other side of the test above, and the reason
+    /// the dwell exists: a double-click landing on a freshly-opened menu must
+    /// not be able to delete an item by accident. It is asserted per kind
+    /// alongside the positive case so that "deleting works" can never be made
+    /// to pass by removing the floor.
+    #[test]
+    fn a_double_click_on_the_kebabs_delete_does_not_delete_the_item() {
+        for kind in EVERY_KIND {
+            assert!(
+                !delete_through_the_kebab(kind, std::time::Duration::from_millis(50)),
+                "{kind:?}: two clicks 50ms apart deleted the item; the confirm dwell is gone"
             );
         }
     }
