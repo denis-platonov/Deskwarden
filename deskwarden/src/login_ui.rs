@@ -149,6 +149,24 @@ pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
         .unwrap_or(BwStatus::Unauthenticated)
 }
 
+/// [`check_bw_status_with_session`] plus the account email and server URL.
+///
+/// Exists so that startup gets the status **and** the account identity out of
+/// a single `bw status` spawn. The identity is what
+/// [`crate::vault_disk_cache::account_fingerprint`] hashes into the encrypted
+/// disk cache's header; a second spawn to learn it would cost the launch
+/// another one to three seconds, on the one path whose entire purpose is to
+/// be fast.
+pub fn check_bw_status_details_with_session(session_token: Option<&str>) -> BwStatusDetails {
+    bw_status_stdout(session_token)
+        .map(|stdout| parse_bw_status_details(&stdout))
+        .unwrap_or(BwStatusDetails {
+            status: BwStatus::Unauthenticated,
+            user_email: None,
+            server_url: None,
+        })
+}
+
 /// [`check_bw_status`] plus the account email and server URL, for the login
 /// window's 3h chrome.
 pub fn check_bw_status_details() -> BwStatusDetails {
@@ -2512,8 +2530,18 @@ pub fn build_login_frame(
                             // enrollment with the account. THIS account's
                             // only -- logging out here says nothing about
                             // any other account's enrollment.
+                            // And the encrypted copy of that account's vault,
+                            // in the same breath and for the stronger version
+                            // of the same reason. It survives a lock -- that
+                            // is the whole point of it -- but a log out is not
+                            // a lock: it means the account is gone from this
+                            // machine, and a decrypted dump of its vault is a
+                            // larger liability than a sealed password.
                             if let Some((config_dir, id)) = &hello_scope {
                                 hello::unenroll_for(config_dir, id);
+                                crate::vault_disk_cache::forget_for(
+                                    &crate::accounts::data_dir_for(config_dir, id),
+                                );
                             }
                             hello_state = probe_hello(&hello_scope);
                             status = BwStatus::Unauthenticated;

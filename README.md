@@ -49,8 +49,14 @@ open.
 - **Nothing here re-implements vault security.** Credentials originate only
   from the official Bitwarden CLI's local `bw serve` bridge, and all writes
   and sync go through it; reads are served from an in-memory snapshot of what
-  the CLI returned, held only while the vault is unlocked. deskwarden never
-  touches encryption, key derivation, or sync logic itself.
+  the CLI returned. deskwarden never touches encryption, key derivation, or
+  sync logic itself. That snapshot is memory-only unless you turn on
+  **"Keep an encrypted copy of your vault on this PC"** (off by default), which
+  also writes it to a file encrypted under a key Windows Hello holds in this
+  PC's TPM, so a copied disk cannot be read on another machine. That file
+  survives the vault locking — it exists to survive a restart — and is deleted
+  when you log out, when you are asked for your master password again, or after
+  seven days.
 
 ## Stack, and why
 
@@ -99,7 +105,11 @@ gap a shared-memory-inflated number would suggest. If idle RAM is a concern,
 the `bw serve` backend can be shut down via a setting in Preferences (tray →
 Preferences → General → "Keep the Bitwarden backend running"); autofill stays
 instant because vault data is served from an in-memory cache, and the backend
-is started again when needed. The default keeps it running. Where deskwarden
+is started again when needed. The default keeps it running. Turning that
+setting off used to mean the first operation after a restart paid the backend's
+~8 s cold start to rebuild the snapshot; with the encrypted disk copy turned on
+as well it does not, because the snapshot is already there. The two settings
+were built for each other. Where deskwarden
 actually wins clearly is disk footprint and its own process's isolated cost;
 RAM parity mostly comes from a Node.js CLI dependency neither app's own UI code
 controls.

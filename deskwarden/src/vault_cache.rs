@@ -5,13 +5,24 @@
 //! vault window's list and the autofill match path -- never touch it, so
 //! the backend is only needed for sync, writes and TOTP.
 //!
-//! **Memory only, by design.** Nothing here is written to disk: decrypted
-//! vault data at rest would contradict the README's claim that deskwarden
-//! never touches encryption or storage. `clear` drops everything; `main`
-//! calls it whenever the current snapshot might outlive the session it was
-//! built from -- the vault window locking itself, re-authenticating into a
-//! possibly different account, and quitting -- so idle never holds stale or
-//! leftover vault contents.
+//! **Memory by default; optionally also on disk.** Nothing is written to
+//! disk unless `Settings::cache_vault_to_disk` is on, in which case the same
+//! snapshot is persisted through [`crate::vault_disk_cache`], encrypted
+//! under a Windows Hello-sealed key. `clear` drops the in-memory copy;
+//! `main` calls it whenever the current snapshot might outlive the session
+//! it was built from -- the vault window locking itself, re-authenticating
+//! into a possibly different account, and quitting -- so idle never holds
+//! stale or leftover vault contents.
+//!
+//! `clear` deliberately **leaves the file alone**. Surviving a lock and a
+//! restart is the entire reason that file exists, and quit calls `clear`
+//! too. Deleting it is a separate, explicit act ([`VaultCache::forget_disk_copy`]),
+//! used on re-authentication and on log out.
+//!
+//! **This is the only module that touches that file.** No call site
+//! persists, deletes, or reasons about it directly, for the same reason
+//! every write already routes through here: there is exactly one place that
+//! can be wrong.
 //!
 //! **All writes go through here.** Each write updates the snapshot on
 //! success, so there is exactly one place that can leave the cache stale
@@ -26,7 +37,9 @@ use crate::vault_bridge::{
     with_favorite, without_deleted_date, Folder, NewItem, VaultBridge,
     VaultError, VaultItem,
 };
+use crate::vault_disk_cache::{DiskCache, DiskCacheLoad};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Which *era* of the snapshot a caller is talking about.
 ///
@@ -435,6 +448,57 @@ impl Snapshot {
 pub struct VaultCache {
     bridge: VaultBridge,
     snapshot: Mutex<Snapshot>,
+    /// The encrypted file, when there is a directory to put one in. `None`
+    /// in the fixtures and in any use that has no business writing to disk;
+    /// the methods below are then inert rather than conditional at every
+    /// call site.
+    disk: Option<DiskCache>,
+    /// Guards `enabled`, the account fingerprint and `loaded_from_disk_at`
+    /// together with the file itself, so a populate racing a "disable"
+    /// cannot write the file back after the delete, and a write racing an
+    /// account switch cannot key one account's vault under another's name.
+    disk_state: Mutex<DiskState>,
+}
+
+#[derive(Default)]
+struct DiskState {
+    /// `Settings::cache_vault_to_disk`, as it stands now. Held here rather
+    /// than read from a `Settings` copy so that turning the setting off and
+    /// deleting the file are one ordered act -- see
+    /// [`VaultCache::disable_disk_persistence`].
+    enabled: bool,
+    /// [`crate::vault_disk_cache::account_fingerprint`] for the account this
+    /// cache is currently serving. Re-pointed by an account switch alongside
+    /// the file's path; a stale one costs one wasted cold start, because
+    /// `check_header` refuses it, and never wrong data.
+    fingerprint: String,
+    /// When the currently-held snapshot was written to disk, if it came from
+    /// the file. Cleared the moment real data arrives from the backend in
+    /// this session -- see [`VaultCache::loaded_from_disk_at`], which the
+    /// vault window's toolbar pill reads so it reports an age instead of
+    /// claiming a sync that never happened.
+    loaded_from_disk_at: Option<SystemTime>,
+}
+
+/// Where a write-back's data came from, which decides two things that always
+/// move together and must therefore never be set independently.
+///
+/// [`Source::Backend`] is new truth: the from-disk age stops applying, and
+/// the file is rewritten. [`Source::DiskCache`] is the file's own contents
+/// coming back in: the age becomes the file's own `written_at`, and
+/// **nothing is written**. Rewriting on a restore would stamp `written_at`
+/// with the current time at every launch, so the seven-day expiry would
+/// never fire and the pill would report a vault that was always "just
+/// written" however old it really was.
+/// No `Debug`, deliberately. It carries an instant and nothing else, so it
+/// could not print a secret -- but `debug_leak_guard` flags a derived `Debug`
+/// on any type declared in a file that can reach one, and the honest answer
+/// to that flag here is not an exemption with a paragraph of reasoning
+/// attached: it is that nothing prints this and nothing needs to.
+#[derive(Clone, Copy)]
+enum Source {
+    Backend,
+    DiskCache(SystemTime),
 }
 
 /// What a populate actually did. Returned instead of a bare `Ok(())` because
@@ -470,10 +534,38 @@ pub enum PopulateOutcome {
 }
 
 impl VaultCache {
+    /// A cache that holds the vault in memory only. Nothing it does can
+    /// reach the disk, because it has no file to reach.
     pub fn new(bridge: VaultBridge) -> Self {
         Self {
             bridge,
             snapshot: Mutex::new(Snapshot::default()),
+            disk: None,
+            disk_state: Mutex::new(DiskState::default()),
+        }
+    }
+
+    /// The same, plus the optional encrypted file.
+    ///
+    /// `enabled` is `Settings::cache_vault_to_disk`. With it `false` this is
+    /// [`Self::new`] with a file it never touches -- not a weaker version of
+    /// the persisting cache, an inert one: every method below returns early,
+    /// and the test that says so asserts on the filesystem.
+    pub fn with_disk_cache(
+        bridge: VaultBridge,
+        disk: DiskCache,
+        fingerprint: String,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            bridge,
+            snapshot: Mutex::new(Snapshot::default()),
+            disk: Some(disk),
+            disk_state: Mutex::new(DiskState {
+                enabled,
+                fingerprint,
+                loaded_from_disk_at: None,
+            }),
         }
     }
 
@@ -733,7 +825,7 @@ impl VaultCache {
         epoch: VaultEpoch,
     ) -> Result<PopulateOutcome, VaultError> {
         let folders = self.bridge.list_folders()?;
-        Ok(self.write_back_at_epoch(items, folders, epoch))
+        Ok(self.write_back_at_epoch(items, folders, epoch, Source::Backend))
     }
 
     /// Writes a **whole vault the caller already holds** -- items *and*
@@ -773,7 +865,7 @@ impl VaultCache {
     /// with nothing fetched there is nothing left that can fail: the only two
     /// answers are "written" and "discarded as stale".
     pub fn populate_with_vault(&self, vault: VaultSnapshot, epoch: VaultEpoch) -> PopulateOutcome {
-        self.write_back_at_epoch(vault.items, vault.folders, epoch)
+        self.write_back_at_epoch(vault.items, vault.folders, epoch, Source::Backend)
     }
 
     /// The one place a fetch is written back over the snapshot, and therefore
@@ -845,6 +937,7 @@ impl VaultCache {
         mut items: Vec<VaultItem>,
         mut folders: Vec<Folder>,
         epoch: VaultEpoch,
+        source: Source,
     ) -> PopulateOutcome {
         let mut snapshot = self.lock();
         // Allocated under the lock, before anything can return: it is what
@@ -925,6 +1018,22 @@ impl VaultCache {
                 replay_log_line(populate_seq, &replayed_items, &replayed_folders)
             );
         }
+
+        // AFTER the guard is dropped, and only on the branch that actually
+        // adopted the snapshot. Persisting a DISCARDED populate would write
+        // the previous account's vault to disk -- the same bug the era guard
+        // exists to stop, one layer down -- and clearing the from-disk age
+        // there would tell the pill a refresh had landed when the whole
+        // point of that branch is that none did.
+        match source {
+            Source::Backend => {
+                self.lock_disk().loaded_from_disk_at = None;
+                self.persist();
+            }
+            Source::DiskCache(written_at) => {
+                self.lock_disk().loaded_from_disk_at = Some(written_at);
+            }
+        }
         PopulateOutcome::Populated
     }
 
@@ -941,6 +1050,16 @@ impl VaultCache {
     }
 
     /// Drops everything. Called on lock and on quit.
+    ///
+    /// **Does not touch the encrypted disk file, deliberately.** Surviving a
+    /// lock and a restart is the entire reason that file exists, and quit
+    /// calls this too, so a `clear` that deleted it would leave the feature
+    /// with nothing to do. Deleting it is [`Self::forget_disk_copy`], which
+    /// the re-authentication and log-out paths call explicitly.
+    ///
+    /// The from-disk *age* does go, because that describes the snapshot this
+    /// call is dropping and not the file: an age left behind would have the
+    /// toolbar pill dating an empty cache.
     ///
     /// Also begins a new era, which is what makes this actually stick against
     /// a populate that is already in flight -- see [`Self::populate`]. It is
@@ -966,9 +1085,18 @@ impl VaultCache {
         snapshot.pending_folders.shrink_to_fit();
         snapshot.populated = false;
         snapshot.era = snapshot.era.wrapping_add(1);
+        drop(snapshot);
+        self.lock_disk().loaded_from_disk_at = None;
     }
 
     pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.create_item_writing(new_item))
+    }
+
+    /// [`Self::create_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn create_item_writing(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
         let created = self.bridge.create_item(new_item)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -985,6 +1113,13 @@ impl VaultCache {
     /// superseded, so the next write of that item is refused with a 400. See
     /// `vault_bridge`'s `REVISION_DATE_KEY`.
     pub fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.update_item_writing(item))
+    }
+
+    /// [`Self::update_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn update_item_writing(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         let saved = self.bridge.update_item(item)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1056,11 +1191,14 @@ impl VaultCache {
     ///    miss there is a feature that visibly does nothing. Both of their
     ///    call sites live in `vault_window/`, which neither pass owned;
     ///    changing their return types stays a recorded follow-up.
-    pub fn set_app_match(
-        &self,
-        item: &VaultItem,
-        m: &AppMatch,
-    ) -> Result<AppMatchWrite, VaultError> {
+    pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<AppMatchWrite, VaultError> {
+        self.persisting(|| self.set_app_match_writing(item, m))
+    }
+
+    /// [`Self::set_app_match`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn set_app_match_writing(&self, item: &VaultItem, m: &AppMatch) -> Result<AppMatchWrite, VaultError> {
         // The SERVER's copy, not `with_app_match(item, m)`. The two agree on
         // every field the app cares about, and differ on the one that decides
         // whether the NEXT write of this item is accepted at all -- see
@@ -1142,11 +1280,14 @@ impl VaultCache {
     /// If the UI half finds a consumer this trace missed -- an inline "this
     /// window's copy is behind" notice, say -- the change is an enum and one
     /// `match` at one call site.
-    pub fn move_item_to_folder(
-        &self,
-        item: &VaultItem,
-        folder_id: Option<&str>,
-    ) -> Result<VaultItem, VaultError> {
+    pub fn move_item_to_folder(&self, item: &VaultItem, folder_id: Option<&str>) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.move_item_to_folder_writing(item, folder_id))
+    }
+
+    /// [`Self::move_item_to_folder`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn move_item_to_folder_writing(&self, item: &VaultItem, folder_id: Option<&str>) -> Result<VaultItem, VaultError> {
         // Bridge call BEFORE `self.lock()`, like every other write here: no
         // lock may be held across HTTP.
         //
@@ -1217,6 +1358,13 @@ impl VaultCache {
     /// with a named front door, and it is the front door that is worth
     /// having.
     pub fn set_favorite(&self, item: &VaultItem, favorite: bool) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.set_favorite_writing(item, favorite))
+    }
+
+    /// [`Self::set_favorite`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn set_favorite_writing(&self, item: &VaultItem, favorite: bool) -> Result<VaultItem, VaultError> {
         // The SERVER's answer, not the locally built `with_favorite(..)`
         // value that was sent. They agree on `favorite`; they differ on
         // `revisionDate`, which the write has just bumped and which the NEXT
@@ -1260,6 +1408,13 @@ impl VaultCache {
     }
 
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
+        self.persisting(|| self.delete_item_writing(id))
+    }
+
+    /// [`Self::delete_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn delete_item_writing(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_item(id)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1423,6 +1578,13 @@ impl VaultCache {
     /// caller would then undo a correct archive. The next ordinary refresh
     /// reconciles instead.
     pub fn archive_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+        self.persisting(|| self.archive_item_writing(item))
+    }
+
+    /// [`Self::archive_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn archive_item_writing(&self, item: &VaultItem) -> Result<(), VaultError> {
         // Bridge call BEFORE `self.lock()`: no lock may be held across HTTP.
         self.bridge.archive_item(&item.id)?;
         let mut snapshot = self.lock();
@@ -1458,6 +1620,13 @@ impl VaultCache {
     /// put a superseded revision token back in front of the next write. See
     /// [`Self::current_revision_of`].
     pub fn unarchive_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.unarchive_item_writing(item))
+    }
+
+    /// [`Self::unarchive_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn unarchive_item_writing(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         self.bridge.unarchive_item(&item.id)?;
         // Both bridge calls BEFORE `self.lock()`: no lock may be held across
         // HTTP, and this one is HTTP too.
@@ -1572,6 +1741,13 @@ impl VaultCache {
     /// Nothing arms itself from an item's trashed-ness, so neither case leaves
     /// a consumer acting on a claim the vault does not support.
     pub fn restore_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+        self.persisting(|| self.restore_item_writing(item))
+    }
+
+    /// [`Self::restore_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn restore_item_writing(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         // Bridge call BEFORE `self.lock()`, like every other write here: no
         // lock may be held across HTTP -- and `current_revision_of` is a
         // second HTTP call, so it goes here too and not below the lock.
@@ -1618,6 +1794,13 @@ impl VaultCache {
     /// [`Self::list_trash_unless_superseded`] for why that is the point rather
     /// than an omission.
     pub fn purge_item(&self, id: &str) -> Result<(), VaultError> {
+        self.persisting(|| self.purge_item_writing(id))
+    }
+
+    /// [`Self::purge_item`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn purge_item_writing(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.purge_item(id)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1628,6 +1811,13 @@ impl VaultCache {
     }
 
     pub fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+        self.persisting(|| self.create_folder_writing(name))
+    }
+
+    /// [`Self::create_folder`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn create_folder_writing(&self, name: &str) -> Result<Folder, VaultError> {
         let created = self.bridge.create_folder(name)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1638,6 +1828,13 @@ impl VaultCache {
     }
 
     pub fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
+        self.persisting(|| self.update_folder_writing(id, name))
+    }
+
+    /// [`Self::update_folder`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn update_folder_writing(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
         let updated = self.bridge.update_folder(id, name)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1650,6 +1847,13 @@ impl VaultCache {
     }
 
     pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
+        self.persisting(|| self.delete_folder_writing(id))
+    }
+
+    /// [`Self::delete_folder`]'s body. Separated only so that the disk
+    /// rewrite happens after this returns and therefore after the
+    /// snapshot guard below is released -- see [`Self::persisting`].
+    fn delete_folder_writing(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_folder(id)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1657,6 +1861,238 @@ impl VaultCache {
             snapshot.note_folder_write(id, true);
         }
         Ok(())
+    }
+
+    // -- the optional encrypted file --------------------------------------
+    //
+    // Everything about that file lives behind this type, for the reason
+    // every vault write already routes through here: there is exactly one
+    // place that can be wrong. No call site persists, deletes, or reasons
+    // about it directly.
+
+    /// Rewrites the file from the current snapshot.
+    ///
+    /// **Best-effort by design.** The in-memory cache is authoritative and
+    /// the app is fully functional without the file, so a disk-full,
+    /// permission-denied or antivirus-locked write is a `warn` and nothing
+    /// more. It never surfaces a modal; the only cost of a failed write is a
+    /// slower next launch.
+    ///
+    /// Deliberately takes no arguments and reads the snapshot itself: every
+    /// caller is "the snapshot just changed", and passing the data in would
+    /// create a second place that could pass the wrong data.
+    ///
+    /// **Lock ordering, and it is not optional:** `disk_state` first, then
+    /// `snapshot`, and the snapshot guard is released before the write. The
+    /// write is ~1 MB of AES plus a file rename, and holding the snapshot
+    /// mutex across it would block every read in the app -- autofill's
+    /// included -- for the duration. Every other method here takes the two in
+    /// that same order, or takes only one.
+    fn persist(&self) {
+        let Some(disk) = self.disk.as_ref() else {
+            return;
+        };
+        let fingerprint = {
+            let state = self.lock_disk();
+            if !state.enabled {
+                return;
+            }
+            state.fingerprint.clone()
+        };
+        let (items, folders) = {
+            let snapshot = self.lock();
+            if !snapshot.populated {
+                return;
+            }
+            (snapshot.items.clone(), snapshot.folders.clone())
+        };
+        if let Err(e) = disk.write(&fingerprint, &items, &folders) {
+            log::warn!("could not write the encrypted vault cache: {e}");
+        }
+    }
+
+    /// Runs a snapshot-mutating write and rewrites the file if it succeeded.
+    ///
+    /// **Every mutating door on this type goes through here**, which is what
+    /// keeps "the file is rewritten after every successful mutation" one fact
+    /// rather than thirteen. It is also why each of those doors is a
+    /// one-line wrapper over a `_writing` body: the body holds the snapshot
+    /// guard to its last statement, and [`Self::persist`] must not be called
+    /// while that guard is alive. Running the body to completion first is the
+    /// lock-ordering rule enforced by construction rather than remembered.
+    ///
+    /// A failed write is not persisted, which is the whole reason the check
+    /// is on the `Result` and not on "we got here": the bridge call comes
+    /// first in every body, so an error means the server refused and the
+    /// snapshot was never touched.
+    fn persisting<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
+        let outcome = write();
+        if outcome.is_ok() {
+            self.persist();
+        }
+        outcome
+    }
+
+    /// Populates the snapshot from the file, if there is a usable one.
+    ///
+    /// The caller gets the full outcome rather than a `bool`, because "no
+    /// file", "rejected and deleted", "Hello declined" and "corrupt" call for
+    /// different logging and different next steps -- and because three of
+    /// them have already left the file in different states by the time this
+    /// returns.
+    ///
+    /// **It restores through [`Self::populate_with_vault`]**, so the era
+    /// guard, the replay of local writes and the `DiscardedStale` answer are
+    /// the same code the network path runs. A restore that had its own
+    /// write-back would be a second place those rules could drift; the
+    /// only thing this path adds is [`Source::DiskCache`], which records the
+    /// file's age instead of clearing it and writes nothing back.
+    ///
+    /// The epoch is captured **before** the read, as
+    /// [`Self::populate_with_vault`] requires: the read is file I/O and can
+    /// be preceded by a Hello prompt the user takes seconds over, and a
+    /// `clear` in that window must discard this restore rather than resurrect
+    /// a locked vault.
+    pub fn load_from_disk(&self) -> DiskCacheLoad {
+        let Some(disk) = self.disk.as_ref() else {
+            return DiskCacheLoad::Absent;
+        };
+        let fingerprint = {
+            let state = self.lock_disk();
+            if !state.enabled {
+                return DiskCacheLoad::Absent;
+            }
+            state.fingerprint.clone()
+        };
+        let epoch = self.epoch();
+        let outcome = disk.load(&fingerprint);
+        if let DiskCacheLoad::Loaded {
+            items,
+            folders,
+            written_at,
+        } = &outcome
+        {
+            let vault = VaultSnapshot {
+                items: items.clone(),
+                folders: folders.clone(),
+            };
+            match self.write_back_at_epoch(
+                vault.items,
+                vault.folders,
+                epoch,
+                Source::DiskCache(*written_at),
+            ) {
+                PopulateOutcome::Populated => {}
+                PopulateOutcome::DiscardedStale => log::info!(
+                    "the vault was cleared while the encrypted disk cache was being read; \
+                     the restore was discarded and the snapshot stays empty"
+                ),
+            }
+        }
+        outcome
+    }
+
+    /// When the currently-held snapshot was written to disk, if it came from
+    /// the file and nothing has refreshed it from the backend since.
+    ///
+    /// The vault window's toolbar pill reads this so it reports an age
+    /// instead of claiming a sync that never happened in this session. This
+    /// codebase has already shipped that bug once in a narrower form; a disk
+    /// cache makes the possible gap days wide rather than one sync interval.
+    pub fn loaded_from_disk_at(&self) -> Option<SystemTime> {
+        self.lock_disk().loaded_from_disk_at
+    }
+
+    /// Turns persistence on: acquires the Windows Hello key -- **this is the
+    /// prompt the user sees, and it doubles as the confirmation gesture, so
+    /// there is no separate modal** -- and writes the first file from the
+    /// snapshot already in memory.
+    ///
+    /// The key comes first and the flag second, so a refused or failed
+    /// acquisition leaves the setting exactly as it was. A cache that
+    /// reported itself enabled with no key to run on would render as on while
+    /// nothing was ever written.
+    pub fn enable_disk_persistence(&self) -> Result<(), String> {
+        let disk = self
+            .disk
+            .as_ref()
+            .ok_or_else(|| "there is no directory to keep the vault copy in".to_string())?;
+        disk.acquire_key()?;
+        self.lock_disk().enabled = true;
+        self.persist();
+        Ok(())
+    }
+
+    /// Turns persistence off and deletes the file.
+    ///
+    /// The flag is cleared **before** the delete, so a populate racing this
+    /// cannot write the file back immediately after it is removed. The error
+    /// is returned rather than logged because this is the one disk-cache
+    /// failure worth surfacing: the user asked for the file to be gone and it
+    /// is not.
+    pub fn disable_disk_persistence(&self) -> Result<(), String> {
+        {
+            let mut state = self.lock_disk();
+            state.enabled = false;
+            state.loaded_from_disk_at = None;
+        }
+        match self.disk.as_ref() {
+            Some(disk) => disk.delete(),
+            None => Ok(()),
+        }
+    }
+
+    /// Deletes the file while leaving persistence enabled.
+    ///
+    /// Used on **re-authentication** -- any master-password prompt, which is
+    /// a superset of the master-password change we cannot detect directly,
+    /// since `bw status` exposes no key fingerprint and the session token
+    /// changes on every unlock -- and on **log out**. The next successful
+    /// populate writes a fresh one, which costs nothing at either moment
+    /// because the backend is already up and the snapshot is already being
+    /// rebuilt.
+    ///
+    /// **Not what lock and quit do.** Those call [`Self::clear`], which
+    /// leaves the file alone.
+    pub fn forget_disk_copy(&self) -> Result<(), String> {
+        self.lock_disk().loaded_from_disk_at = None;
+        match self.disk.as_ref() {
+            Some(disk) => disk.delete(),
+            None => Ok(()),
+        }
+    }
+
+    /// Points this cache's file and fingerprint at a different account.
+    ///
+    /// Called by the account switch **before** it authenticates, for the
+    /// reason `SessionStore::path` gives about its own re-point: a write
+    /// issued after the switch has begun but against the outgoing account's
+    /// path is a mutation no end-state assertion catches. Here it would key
+    /// the incoming account's vault under the outgoing account's fingerprint,
+    /// in the outgoing account's directory.
+    ///
+    /// The from-disk age goes with them: whatever the pill was reporting was
+    /// about a file this cache no longer addresses.
+    pub fn repoint_disk_cache(&self, dir: &std::path::Path, fingerprint: String) {
+        let mut state = self.lock_disk();
+        state.fingerprint = fingerprint;
+        state.loaded_from_disk_at = None;
+        if let Some(disk) = self.disk.as_ref() {
+            disk.repoint(dir);
+        }
+    }
+
+    /// The file this cache would read and write, if it has one. For the
+    /// startup log and for the tests that assert on the filesystem.
+    pub fn disk_cache_path(&self) -> Option<std::path::PathBuf> {
+        self.disk.as_ref().map(|disk| disk.path())
+    }
+
+    fn lock_disk(&self) -> std::sync::MutexGuard<'_, DiskState> {
+        self.disk_state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A poisoned lock means another thread panicked mid-update, which
@@ -4582,5 +5018,408 @@ mod tests {
             "a custom field's NAME is being zeroized: the change over-applied, and every reader \
              of `f.name` now pays for a wipe a field label does not need"
         );
+    }
+    // -- the optional encrypted file --------------------------------------
+    //
+    // **No `mockito` anywhere below, deliberately.** Every one of these is
+    // about what reaches the *disk*, so the bridge is
+    // `test_vault::unreachable_bridge` -- which carries a free assertion:
+    // a persist path that went to the network instead of to the snapshot
+    // fails visibly. See `test_vault`'s module doc for what pooled mockito
+    // servers cost the tests that did not need them.
+
+    use crate::vault_disk_cache::tests::{cache_with_key, temp_dir_for};
+    use crate::vault_disk_cache::DiskCacheLoad;
+
+    /// A cache over its own scratch directory, with the Hello step already
+    /// satisfied by the substituted key -- which is the state a real session
+    /// is in after the startup load or after the toggle was switched on.
+    fn cache_with_disk(name: &str, enabled: bool) -> (VaultCache, std::path::PathBuf) {
+        let dir = temp_dir_for(name);
+        let disk = cache_with_key(&dir);
+        let cache = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            disk,
+            "fp".to_string(),
+            enabled,
+        );
+        (cache, dir)
+    }
+
+    /// Seeds `cache` with the `items_body` vault the way a populate would,
+    /// through the one write-back every populate uses.
+    ///
+    /// It asserts that the populate landed rather than returning the
+    /// outcome: a fixture that silently seeded nothing is how a test passes
+    /// for the wrong reason, and every caller below wants the same answer.
+    fn seed(cache: &VaultCache) {
+        let epoch = cache.epoch();
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch,
+            ),
+            PopulateOutcome::Populated,
+            "the fixture cache did not actually get populated"
+        );
+    }
+
+    fn cache_file(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("vault-cache.bin")
+    }
+
+    #[test]
+    fn with_the_setting_off_no_file_is_ever_created() {
+        // **Asserted on the filesystem, not on a flag.** "Off by default" has
+        // to mean nothing is written, not that a boolean says so -- and the
+        // directory is read back whole, so a file under any name counts.
+        let (cache, dir) = cache_with_disk("disabled", false);
+        seed(&cache);
+        let item = cache.items().into_iter().next().unwrap();
+        let _ = cache.set_favorite(&item, true);
+        let _ = cache.delete_item("1");
+        cache.clear();
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "a file was created with the setting off: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_with_no_disk_at_all_is_inert_rather_than_a_panic() {
+        // `VaultCache::new` is what every other fixture in this suite builds.
+        // Each of these has to be a no-op on it, not an unwrap on `None`.
+        let cache = crate::test_vault::cache_with_items(body_list(items_body()));
+        assert!(cache.disk_cache_path().is_none());
+        assert!(matches!(cache.load_from_disk(), DiskCacheLoad::Absent));
+        assert!(cache.loaded_from_disk_at().is_none());
+        assert!(cache.forget_disk_copy().is_ok());
+        assert!(cache.disable_disk_persistence().is_ok());
+        assert!(cache.enable_disk_persistence().is_err());
+    }
+
+    #[test]
+    fn a_successful_populate_writes_the_file() {
+        let (cache, dir) = cache_with_disk("populate-writes", true);
+        assert!(!cache_file(&dir).exists());
+        seed(&cache);
+        assert!(cache_file(&dir).exists());
+    }
+
+    #[test]
+    fn a_failed_populate_does_not_write_a_file() {
+        // The bridge is unreachable, so `populate` fails at its first call.
+        let (cache, dir) = cache_with_disk("failed-populate", true);
+        assert!(cache.populate().is_err());
+        assert!(!cache_file(&dir).exists());
+    }
+
+    #[test]
+    fn a_populate_discarded_as_stale_leaves_no_file_on_disk() {
+        // The era guard, one layer down. A populate whose era was bumped
+        // mid-flight is the previous vault session's data; persisting it
+        // would write the account being left to the disk of the account
+        // arriving, which is the very bug the guard exists to stop.
+        let (cache, dir) = cache_with_disk("discarded", true);
+        let epoch = cache.epoch();
+        cache.clear();
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch,
+            ),
+            PopulateOutcome::DiscardedStale
+        );
+        assert!(!cache.is_populated());
+        assert!(
+            !cache_file(&dir).exists(),
+            "a discarded populate wrote its stale snapshot to disk"
+        );
+    }
+
+    /// **The one test down here that needs a server**, because a mutation is
+    /// by definition a write the backend accepted first. Seeding still costs
+    /// no round-trip; only the `DELETE` does.
+    #[test]
+    fn a_successful_mutation_rewrites_the_file() {
+        let dir = temp_dir_for("mutation-rewrites");
+        let mut server = mockito::Server::new();
+        let _d = server
+            .mock("DELETE", "/object/item/1")
+            .with_status(200)
+            .create();
+        let cache = VaultCache::with_disk_cache(
+            VaultBridge::new(server.url()),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        seed(&cache);
+        cache.delete_item("1").unwrap();
+
+        // Reload the file and confirm the deletion is IN it, rather than
+        // checking that its mtime moved: a rewrite of the pre-delete snapshot
+        // would pass the weaker assertion.
+        let reloaded = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        match reloaded.load_from_disk() {
+            DiskCacheLoad::Loaded { items, folders, .. } => {
+                let ids: Vec<String> = items.into_iter().map(|i| i.id).collect();
+                assert_eq!(ids, vec!["2".to_string()]);
+                assert_eq!(folders[0].name, "Work");
+            }
+            other => panic!("expected a loaded snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mutation_the_server_refused_does_not_rewrite_the_file() {
+        // Every mutating door does its HTTP first, so an unreachable bridge
+        // means the snapshot was never touched -- and `persisting` must not
+        // write on that path.
+        let (cache, dir) = cache_with_disk("failed-mutation", true);
+        seed(&cache);
+        let before = std::fs::read(cache_file(&dir)).unwrap();
+
+        assert!(cache.delete_item("1").is_err());
+        assert_eq!(cache.items().len(), 2, "a refused delete reached the snapshot");
+        assert_eq!(
+            std::fs::read(cache_file(&dir)).unwrap(),
+            before,
+            "a refused delete was persisted anyway"
+        );
+    }
+
+    #[test]
+    fn clear_empties_memory_and_leaves_the_file() {
+        // The load-bearing lifecycle rule. Lock and quit both call `clear`;
+        // if either deleted the file the feature would stop working, since
+        // surviving a restart is the entire point.
+        let (cache, dir) = cache_with_disk("clear-keeps-file", true);
+        seed(&cache);
+        cache.clear();
+
+        assert!(cache.items().is_empty());
+        assert!(!cache.is_populated());
+        assert!(cache_file(&dir).exists(), "clear() deleted the file");
+        assert!(
+            cache.loaded_from_disk_at().is_none(),
+            "clear() left an age describing a snapshot it had just dropped"
+        );
+    }
+
+    #[test]
+    fn forget_disk_copy_deletes_the_file() {
+        let (cache, dir) = cache_with_disk("forget", true);
+        seed(&cache);
+        assert!(cache_file(&dir).exists());
+        cache.forget_disk_copy().unwrap();
+        assert!(!cache_file(&dir).exists());
+    }
+
+    #[test]
+    fn disabling_persistence_deletes_the_file_and_stops_writing() {
+        let (cache, dir) = cache_with_disk("disable", true);
+        seed(&cache);
+        assert!(cache_file(&dir).exists());
+
+        cache.disable_disk_persistence().unwrap();
+        assert!(!cache_file(&dir).exists());
+
+        seed(&cache);
+        assert!(
+            !cache_file(&dir).exists(),
+            "a populate after disabling wrote the file back"
+        );
+        let item = cache.items().into_iter().next().unwrap();
+        let _ = cache.set_favorite(&item, true);
+        assert!(
+            !cache_file(&dir).exists(),
+            "a mutation after disabling wrote the file back"
+        );
+    }
+
+    #[test]
+    fn enabling_persistence_writes_the_snapshot_already_in_memory() {
+        // Turning the setting on is the Hello prompt plus the first write,
+        // with no separate confirmation and no wait for the next sync.
+        let (cache, dir) = cache_with_disk("enable", false);
+        seed(&cache);
+        assert!(!cache_file(&dir).exists());
+        cache.enable_disk_persistence().unwrap();
+        assert!(cache_file(&dir).exists());
+    }
+
+    #[test]
+    fn loading_from_disk_populates_the_snapshot_and_records_its_age() {
+        let (writer, dir) = cache_with_disk("load-populates", true);
+        seed(&writer);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(!reader.is_populated());
+        assert!(matches!(
+            reader.load_from_disk(),
+            DiskCacheLoad::Loaded { .. }
+        ));
+        assert!(reader.is_populated());
+        assert_eq!(reader.items().len(), 2);
+        assert!(reader.loaded_from_disk_at().is_some());
+    }
+
+    #[test]
+    fn a_restore_does_not_rewrite_the_file_it_just_read() {
+        // If it did, `written_at` would be stamped with the current time at
+        // every launch, so the seven-day expiry would never fire and the
+        // toolbar pill would report a vault that was always "just written"
+        // however old it really was.
+        let (writer, dir) = cache_with_disk("restore-no-rewrite", true);
+        seed(&writer);
+        let before = std::fs::read(cache_file(&dir)).unwrap();
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(matches!(
+            reader.load_from_disk(),
+            DiskCacheLoad::Loaded { .. }
+        ));
+        assert_eq!(
+            std::fs::read(cache_file(&dir)).unwrap(),
+            before,
+            "the restore rewrote the file, so its age is now a lie"
+        );
+    }
+
+    #[test]
+    fn a_rejected_load_leaves_the_cache_unpopulated_and_records_no_age() {
+        let (cache, _dir) = cache_with_disk("load-absent", true);
+        assert!(matches!(cache.load_from_disk(), DiskCacheLoad::Absent));
+        assert!(!cache.is_populated());
+        assert!(cache.loaded_from_disk_at().is_none());
+    }
+
+    #[test]
+    fn a_disabled_cache_reads_nothing_even_when_a_file_is_there() {
+        // Somebody turned the setting off by hand in settings.json while a
+        // file from a previous enablement was still on disk. Nothing may be
+        // read from it.
+        let (writer, dir) = cache_with_disk("disabled-read", true);
+        seed(&writer);
+        assert!(cache_file(&dir).exists());
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            false,
+        );
+        assert!(matches!(reader.load_from_disk(), DiskCacheLoad::Absent));
+        assert!(!reader.is_populated());
+    }
+
+    #[test]
+    fn a_backend_populate_clears_the_from_disk_age() {
+        // Once real data has arrived in this session the snapshot is no
+        // longer "loaded from a file written N hours ago", and the toolbar
+        // pill must stop saying so.
+        let (writer, dir) = cache_with_disk("age-cleared", true);
+        seed(&writer);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        reader.load_from_disk();
+        assert!(reader.loaded_from_disk_at().is_some());
+        seed(&reader);
+        assert!(reader.loaded_from_disk_at().is_none());
+    }
+
+    #[test]
+    fn a_restore_discarded_as_stale_populates_nothing_and_records_no_age() {
+        // The era guard covers the disk path too, because the restore goes
+        // through the same write-back: a `clear` between the epoch capture
+        // and the write-back means a different vault session, and a locked
+        // vault must not be repopulated from a file.
+        let (writer, dir) = cache_with_disk("restore-stale", true);
+        seed(&writer);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        // The same shape the guard sees in production: an epoch captured
+        // before the read, and a `clear` in between.
+        let epoch = reader.epoch();
+        reader.clear();
+        let vault = match cache_with_key(&dir).load("fp") {
+            DiskCacheLoad::Loaded { items, folders, .. } => VaultSnapshot { items, folders },
+            other => panic!("expected a loaded snapshot, got {other:?}"),
+        };
+        assert_eq!(
+            reader.populate_with_vault(vault, epoch),
+            PopulateOutcome::DiscardedStale
+        );
+        assert!(!reader.is_populated());
+        assert!(reader.loaded_from_disk_at().is_none());
+    }
+
+    #[test]
+    fn a_repoint_moves_the_file_and_the_fingerprint_together() {
+        let (cache, first) = cache_with_disk("repoint-first", true);
+        seed(&cache);
+        assert!(cache_file(&first).exists());
+        let before = std::fs::read(cache_file(&first)).unwrap();
+
+        let second = temp_dir_for("repoint-second");
+        cache.repoint_disk_cache(&second, "fp-b".to_string());
+        assert!(cache.loaded_from_disk_at().is_none());
+        seed(&cache);
+        assert!(cache_file(&second).exists());
+        assert_eq!(
+            std::fs::read(cache_file(&first)).unwrap(),
+            before,
+            "a write after the switch reached the account being left"
+        );
+
+        // And the new file is keyed to the new account: read back under the
+        // old fingerprint it is refused, not accepted.
+        let stale = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&second),
+            "fp".to_string(),
+            true,
+        );
+        assert!(matches!(
+            stale.load_from_disk(),
+            DiskCacheLoad::Rejected(crate::vault_disk_cache::RejectReason::ForeignAccount)
+        ));
     }
 }
