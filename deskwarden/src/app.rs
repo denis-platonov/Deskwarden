@@ -212,7 +212,6 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 /// alternative would have added a turbofish-shaped burden to every one of this
 /// function's and [`handle_match`]'s call sites for nothing.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
     injector: &Injector<A, B>,
