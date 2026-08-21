@@ -3476,6 +3476,201 @@ mod tests {
         ]
     }
 
+    // ## The two id diagnostics, and why only one of them is asserted on
+    //
+    // egui draws two different red warnings in a debug build, and they are
+    // not the same claim. Neither reaches a release build, so a user is
+    // told nothing either way:
+    //
+    // * **`warn_on_id_clash`** (`Context::check_for_id_clash`) fires when
+    //   one id is used at two different rects *within a pass*, and paints a
+    //   thin outline **plus a `🔥` text label**. This is the one worth
+    //   guarding: two widgets sharing an id share state, so focus lands on
+    //   the wrong row and a click registers against a neighbour. In release
+    //   there is no outline, no log line, and nothing else in this suite
+    //   that would notice.
+    // * **`warn_if_rect_changes_id`** fires when a rect keeps its geometry
+    //   *between passes* while its id changes, and paints a bare 2px
+    //   `Color32::RED` outline with **no text at all**. That text -- rather,
+    //   its absence -- is the only thing telling the two apart on screen.
+    //
+    // The second one **does** fire here, and it is benign and known:
+    // switching pages lands one page's [`row_separator`] on the rect the
+    // previous page's separator held, and separators carry egui's
+    // positional auto-ids. A separator is `Sense::hover()` decoration --
+    // it holds no focus, no drag and no scroll memory, so nothing can be
+    // keyed to the id it did not keep. Re-keying it would be a change to
+    // shipping code made to quiet a diagnostic that is telling the truth
+    // about something harmless, so it is left alone and named here instead.
+    //
+    // [`rect_id_changes`] therefore exists only so the positive control can
+    // prove the harness would see that shape of defect at all.
+
+    /// Every **id clash** egui drew into `shape`, appended to `out`.
+    ///
+    /// Shared with [`super::modal_tests`], so the modal and the body cannot
+    /// come to disagree about what a clash looks like.
+    pub(super) fn id_clashes(shape: &egui::Shape, out: &mut Vec<String>, at: &str) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().contains('\u{1f525}') => {
+                out.push(format!("{at}: ID CLASH {}", text.galley.text()));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    id_clashes(shape, out, at);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every **rect that changed id between passes**. See the note above:
+    /// collected for the positive control, not asserted on by the guards.
+    fn rect_id_changes(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Rect(rect)
+                if rect.stroke.color == egui::Color32::RED
+                    && (rect.stroke.width - 2.0).abs() < 0.01 =>
+            {
+                out.push(format!("RECT CHANGED ID {:?}", rect.rect));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    rect_id_changes(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **The control that stops every id guard here from passing vacuously.**
+    ///
+    /// Both checks are egui's, not this crate's, and both are switched on by
+    /// a *default*: `warn_on_id_clash` and
+    /// `style().debug.warn_if_rect_changes_id` are each
+    /// `cfg!(debug_assertions)` out of the box. So the guards assert on a
+    /// diagnostic nobody in this crate turns on -- which is precisely how
+    /// this kind of test dies quietly. An egui release that flips a default,
+    /// renames a field, moves the painting to another layer or drops the
+    /// `🔥` prefix would leave every guard green while checking nothing.
+    ///
+    /// This hands egui one defect of each kind and insists both are
+    /// reported, so that day is a failing test rather than a silent hole.
+    #[test]
+    fn the_id_diagnostics_are_reported_when_egui_is_handed_one_of_each() {
+        let ctx = styled_context();
+        let one = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(20.0));
+        let two = Rect::from_min_size(Pos2::new(90.0, 90.0), Vec2::splat(20.0));
+
+        // A CLASH: one id at two rects inside a single pass.
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            let _ = ui.interact(one, egui::Id::new("control-clash"), Sense::click());
+            let _ = ui.interact(two, egui::Id::new("control-clash"), Sense::click());
+        });
+        let mut hits = Vec::new();
+        for clipped in &output.shapes {
+            id_clashes(&clipped.shape, &mut hits, "clash control");
+        }
+        assert!(
+            !hits.is_empty(),
+            "egui reported no clash for two widgets sharing one id"
+        );
+
+        // A RECT THAT CHANGED ID: one rect, a different id on the next pass.
+        let go = |name: &'static str| {
+            ctx.run_ui(raw_input(&[]), |ui| {
+                let _ = ui.interact(one, egui::Id::new(name), Sense::click());
+            })
+        };
+        let _ = go("control-a");
+        let output = go("control-b");
+        let mut hits = Vec::new();
+        for clipped in &output.shapes {
+            rect_id_changes(&clipped.shape, &mut hits);
+        }
+        assert!(
+            !hits.is_empty(),
+            "egui reported no id change for a rect that kept its geometry"
+        );
+    }
+
+    /// One frame of the body as the *raw shapes* egui emitted.
+    ///
+    /// [`Painted`] flattens a frame into texts and rectangles and drops
+    /// everything else, which is the right shape for the layout assertions
+    /// and the wrong one here: [`id_clashes`] has to walk the tree as
+    /// egui built it, including the nested `Shape::Vec`s a debug painter
+    /// contributes.
+    fn body_shapes(
+        ctx: &egui::Context,
+        state: &mut PrefsState,
+        events: &[egui::Event],
+    ) -> Vec<egui::Shape> {
+        ctx.run_ui(raw_input(events), |ui| draw_prefs_body(ui, state))
+            .shapes
+            .into_iter()
+            .map(|clipped| clipped.shape)
+            .collect()
+    }
+
+    /// **No page of Preferences reports an id clash as it is drawn.**
+    ///
+    /// Neither check reaches a release build, which is what makes this worth
+    /// running: an id clash means two widgets share state, and in release
+    /// there is no outline, no log line, and nothing else in this suite that
+    /// would notice a settings row answering for its neighbour.
+    ///
+    /// Two frames per page, not one. An `Area` that centres itself paints
+    /// nothing on its first frame (see
+    /// `an_anchored_area_paints_nothing_on_its_first_frame`), so a guard
+    /// reading frame 1 would be asserting about a page that had not been
+    /// drawn yet -- and passing for the wrong reason.
+    #[test]
+    fn no_id_diagnostic_on_any_preferences_page() {
+        let mut hits = Vec::new();
+        for section in Section::ALL {
+            let ctx = styled_context();
+            let mut state = PrefsState::new(Settings::default());
+            state.section = section;
+            let _ = body_shapes(&ctx, &mut state, &[]);
+            for shape in body_shapes(&ctx, &mut state, &[]) {
+                id_clashes(&shape, &mut hits, &format!("{section:?}"));
+            }
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
+    /// **Nor does clicking through the nav, one page to the next.**
+    ///
+    /// One context for the whole walk, and a settle frame after each click.
+    /// A click is *reported* on the frame it completes on, but the page it
+    /// selects is only drawn on the frame after, so a guard that read the
+    /// click frame alone would never look at nine of the ten pages it
+    /// believes it visited.
+    #[test]
+    fn no_id_diagnostic_while_the_nav_rows_are_clicked_through() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let first = frame(&ctx, &mut state, &[]);
+        let targets: Vec<(String, Pos2)> = Section::ALL
+            .iter()
+            .map(|section| {
+                let label = section.label().to_string();
+                let centre = first.nav_ink_of(&label).rect.center();
+                (label, centre)
+            })
+            .collect();
+        let mut hits = Vec::new();
+        for (label, pos) in targets {
+            for (what, events) in [("clicking", click(pos)), ("settling after", Vec::new())] {
+                for shape in body_shapes(&ctx, &mut state, &events) {
+                    id_clashes(&shape, &mut hits, &format!("{what} {label:?}"));
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
     /// One frame of a fresh window on `section`.
     fn paint(section: Section) -> Painted {
         paint_settings(section, Settings::default())
@@ -6465,6 +6660,70 @@ mod modal_tests {
         (shot, action, behind)
     }
 
+    /// **The modal, over a live vault control, reports no id clash.**
+    ///
+    /// The body's own guards (`no_id_diagnostic_on_any_preferences_page` and
+    /// its nav walk) draw the pages alone. This is the arrangement the user
+    /// actually gets: the window behind, the scrim, the card, and the nav
+    /// inside it -- three surfaces in one pass, which is the composition an
+    /// id clash between them would need in order to happen at all.
+    ///
+    /// A nav walk rather than a click sweep. A sweep across the whole pane
+    /// costs tens of seconds here for no more coverage than this: the rows
+    /// are what change the pane behind them, and a guard slow enough to be
+    /// resented is a guard that gets deleted.
+    #[test]
+    fn no_id_diagnostic_while_the_modal_is_open_and_walked() {
+        let mut hits: Vec<String> = Vec::new();
+        let ctx = styled_context();
+        let mut state = a_state();
+        // Not [`frame`]: `Shot` flattens a pass into texts and fills, and
+        // `id_clashes` has to walk the shapes as egui emitted them,
+        // nested `Shape::Vec`s and all. The stand-in vault control is drawn
+        // first, exactly as `frame` draws it and as the real window's panels
+        // are, so the modal is measured over something rather than alone.
+        let mut run = |events: &[egui::Event], at: String, hits: &mut Vec<String>| -> Shot {
+            let output = ctx.run_ui(raw_input(events), |ui| {
+                let _ = ui.put(BEHIND, egui::Button::new("a vault control"));
+                let _ = draw_prefs_modal(ui.ctx(), &mut state);
+            });
+            let mut shot = Shot::default();
+            for clipped in &output.shapes {
+                super::tests::id_clashes(&clipped.shape, hits, &at);
+                walk(&clipped.shape, &mut shot);
+            }
+            shot
+        };
+        let _ = run(&[], "warm-up".into(), &mut hits);
+        let opened = run(&[], "open".into(), &mut hits);
+        // The nav rows, located by name. Each section's label is painted
+        // twice -- once in the nav and once as the page heading -- so the
+        // leftmost of the two is the row, which is also what `nav_ink_of`
+        // means by "in the nav" for the body's own harness.
+        let rows: Vec<(String, Pos2)> = Section::ALL
+            .iter()
+            .map(|section| {
+                let label = section.label().to_string();
+                let mut found: Vec<Rect> = opened
+                    .texts
+                    .iter()
+                    .filter(|(text, _, _)| *text == label)
+                    .map(|(_, _, rect)| *rect)
+                    .collect();
+                found.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+                let row = *found
+                    .first()
+                    .unwrap_or_else(|| panic!("{label:?} was never painted in the modal"));
+                (label, row.center())
+            })
+            .collect();
+        for (label, pos) in rows {
+            let _ = run(&click(pos), format!("clicking {label:?}"), &mut hits);
+            let _ = run(&[], format!("settling after {label:?}"), &mut hits);
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
     /// Whether each stand-in vault control took a click on this frame.
     #[derive(Default)]
     struct Behind {
@@ -6884,13 +7143,14 @@ mod modal_tests {
     fn exactly_one_place_in_this_program_draws_the_settings_form() {
         let source = include_str!("prefs_ui.rs");
         let body_calls = concat!("draw_prefs_", "body(");
-        // The definition, `run`'s call, the modal's call, and `tests`' two
-        // harnesses -- `frame`, and `paint_general_at`, which is the same
-        // frame on a pane of a chosen width. Both are tests; the production
-        // callers are still the two shells.
+        // The definition, `run`'s call, the modal's call, and `tests`' three
+        // harnesses -- `frame`; `paint_general_at`, which is the same frame
+        // on a pane of a chosen width; and `body_shapes`, which is the same
+        // frame again returned as raw shapes for the id-clash guards. All
+        // three are tests; the production callers are still the two shells.
         assert_eq!(
             source.match_indices(body_calls).count(),
-            5,
+            6,
             "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
              was added, confirm it is a shell and not a second form"
         );

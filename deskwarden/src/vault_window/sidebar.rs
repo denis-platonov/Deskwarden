@@ -1490,6 +1490,351 @@ mod drag_and_drop_tests {
         )
     }
 
+    // ## The two id diagnostics, and why only one of them is asserted on
+    //
+    // egui draws two different red warnings in a debug build, and they are
+    // not the same claim. Neither reaches a release build, so a user is told
+    // nothing either way:
+    //
+    // * **`warn_on_id_clash`** (`Context::check_for_id_clash`) fires when one
+    //   id is used at two different rects *within a pass*, and paints a thin
+    //   `error_fg_color` outline **plus a `🔥` text label**. This is the one
+    //   worth guarding: two widgets sharing an id share state, so focus lands
+    //   on the wrong row and a click registers against a neighbour. In
+    //   release there is no outline, no log line, and nothing else in this
+    //   suite that would notice.
+    // * **`warn_if_rect_changes_id`** fires when a rect keeps its geometry
+    //   *between passes* while its id changes, and paints a bare 2px
+    //   `Color32::RED` outline with **no text at all**. That absence of text
+    //   is the only thing telling the two apart on screen.
+    //
+    // The rail and the list are clean of both, but only the clash is
+    // asserted on, matching `prefs_ui`'s guards -- where the second one does
+    // fire, benignly, on a decorative separator. One rule across both
+    // surfaces is easier to trust than two thresholds that have to be
+    // remembered. [`rect_id_changes`] therefore exists only so the positive
+    // control can prove the harness would see that shape of defect at all.
+
+    /// Every **id clash** egui drew on a frame, read back off the shapes.
+    fn id_clashes(run: &Run, out: &mut Vec<String>, at: &str) {
+        for (text, _) in &run.texts {
+            if text.contains('\u{1f525}') {
+                out.push(format!("{at}: ID CLASH {text}"));
+            }
+        }
+    }
+
+    /// Every **rect that changed id between passes**. See the note above:
+    /// collected for the positive control, not asserted on by the guards.
+    fn rect_id_changes(run: &Run) -> Vec<String> {
+        run.strokes
+            .iter()
+            .filter(|(_, stroke)| {
+                stroke.color == egui::Color32::RED && (stroke.width - 2.0).abs() < 0.01
+            })
+            .map(|(rect, _)| format!("RECT CHANGED ID {rect:?}"))
+            .collect()
+    }
+
+    /// Collect a frame's shapes into a bare [`Run`] -- only the texts and
+    /// strokes the id guards read. The action and selection the gesture
+    /// tests care about are not what these guards assert on.
+    fn painted(output: &egui::FullOutput) -> Run {
+        let mut run = Run {
+            action: SidebarAction::None,
+            texts: Vec::new(),
+            strokes: Vec::new(),
+            selected: None,
+        };
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut run);
+        }
+        run
+    }
+
+    /// **No id clash as the vault changes underneath the rail.**
+    ///
+    /// The case the click sweep cannot reach. Sidebar rows carry egui's
+    /// positional auto-ids, so inserting a row *above* another shifts every
+    /// id below it while the rects can stay put -- which is exactly the
+    /// shape `warn_if_rect_changes_id` looks for. This walks the transitions
+    /// the real window makes: an empty vault filling in, folders arriving,
+    /// the countdown ticking, the filter moving, and both screen flags
+    /// toggling.
+    #[test]
+    fn no_id_diagnostic_as_the_vault_folders_and_screens_change_underneath() {
+        let (items, folders) = a_vault();
+        let more_folders = {
+            let mut f = folders.clone();
+            f.push(folder("f3", "Receipts"));
+            f.push(folder("f4", "Travel"));
+            f
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(SIDEBAR_WIDTH + LIST_WIDTH, HEIGHT),
+        );
+        let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut search = String::new();
+        let mut selected_id: Option<String> = None;
+        let icons = IconCache::default();
+        let mut visible = Vec::new();
+        let mut hits: Vec<String> = Vec::new();
+
+        let step = |loaded: bool,
+                        folders: &[Folder],
+                        countdown: &str,
+                        filter: &mut SidebarFilter,
+                        sends: &mut bool,
+                        health: &mut bool,
+                        search: &mut String,
+                        selected_id: &mut Option<String>,
+                        visible: &mut Vec<String>,
+                        hits: &mut Vec<String>,
+                        at: String| {
+            let output = ctx.run_ui(input(), |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIDEBAR_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let lists = if loaded {
+                                VaultLists::live_only(&items)
+                            } else {
+                                VaultLists::live_only(&[])
+                            };
+                            let _ = draw_sidebar(
+                                ui,
+                                lists,
+                                folders,
+                                filter,
+                                Screens { sends, health },
+                                countdown,
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LIST_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            draw_item_list(
+                                ui,
+                                if loaded { Some(&items) } else { None },
+                                folders,
+                                &SidebarFilter::All,
+                                search,
+                                selected_id,
+                                None,
+                                &icons,
+                                visible,
+                                None,
+                                false,
+                            );
+                        },
+                    );
+                });
+            });
+            id_clashes(&painted(&output), hits, &at);
+        };
+
+        let plan: Vec<(bool, bool, &str, SidebarFilter, bool, bool)> = vec![
+            (false, false, "Locks in 11:42", SidebarFilter::All, false, false),
+            (true, false, "Locks in 11:41", SidebarFilter::All, false, false),
+            (true, true, "Locks in 11:40", SidebarFilter::All, false, false),
+            (true, true, "Locks in 9:59", SidebarFilter::Cards, false, false),
+            (true, true, "Locks in 9:58", SidebarFilter::Cards, true, false),
+            (true, false, "Locks in 9:57", SidebarFilter::Cards, false, true),
+            (true, false, "Locks in 9:56", SidebarFilter::Trash, false, false),
+            (false, false, "Locks in 9:55", SidebarFilter::All, false, false),
+        ];
+        for (loaded, many, countdown, want, s, h) in plan {
+            // Per step, not carried across: what the rail is *shown* is the
+            // input under test here, and letting a click on one frame decide
+            // the next would make the sequence depend on where the pointer
+            // happened to be rather than on the transition being exercised.
+            let mut filter = want;
+            let mut sends = s;
+            let mut health = h;
+            let f: &[Folder] = if many { &more_folders } else { &folders };
+            step(
+                loaded,
+                f,
+                countdown,
+                &mut filter,
+                &mut sends,
+                &mut health,
+                &mut search,
+                &mut selected_id,
+                &mut visible,
+                &mut hits,
+                format!("loaded={loaded} many={many} {countdown}"),
+            );
+        }
+        hits.sort();
+        hits.dedup();
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
+    /// **The control that stops every guard above from passing vacuously.**
+    ///
+    /// Both checks are egui's, not this crate's, and both are switched on by
+    /// a *default* -- `warn_on_id_clash` and
+    /// `style().debug.warn_if_rect_changes_id` are each `cfg!(debug_assertions)`
+    /// out of the box. So the guards above assert on a diagnostic nobody in
+    /// this crate turns on, which is precisely how this kind of test dies
+    /// quietly: an egui release that flips a default, renames a field, moves
+    /// the painting to another layer, or drops the `🔥` prefix would leave
+    /// every one of them green while checking nothing at all.
+    ///
+    /// This hands egui one of each defect and insists it is reported, so
+    /// that day is a failing test rather than a silent hole.
+    #[test]
+    fn the_id_diagnostics_are_reported_when_egui_is_handed_one_of_each() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let one = egui::Rect::from_min_size(egui::Pos2::new(10.0, 10.0), egui::vec2(20.0, 20.0));
+        let two = egui::Rect::from_min_size(egui::Pos2::new(90.0, 90.0), egui::vec2(20.0, 20.0));
+
+        // A CLASH: one id at two rects inside a single pass.
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = ui.interact(one, egui::Id::new("control-clash"), egui::Sense::click());
+            let _ = ui.interact(two, egui::Id::new("control-clash"), egui::Sense::click());
+        });
+        let mut hits = Vec::new();
+        id_clashes(&painted(&output), &mut hits, "clash control");
+        assert!(
+            !hits.is_empty(),
+            "egui reported no clash for two widgets sharing one id"
+        );
+
+        // A RECT THAT CHANGED ID: one rect, a different id on the next pass.
+        let go = |name: &'static str| {
+            ctx.run_ui(input(), |ui| {
+                let _ = ui.interact(one, egui::Id::new(name), egui::Sense::click());
+            })
+        };
+        let _ = go("control-a");
+        let output = go("control-b");
+        assert!(
+            !rect_id_changes(&painted(&output)).is_empty(),
+            "egui reported no id change for a rect that kept its geometry"
+        );
+    }
+
+    /// **The rail and the list, clicked all over, report no id clash.**
+    ///
+    /// The report this exists for was a red flash on clicking "somewhere",
+    /// so the gesture is swept across the whole pane rather than aimed only
+    /// at the rows a fix would have been written for. Every click is
+    /// followed by a settle frame: a click is reported on the frame it
+    /// completes on, but what it selected is not drawn until the frame
+    /// after, and that later frame is the one a mis-keyed row would show up
+    /// on.
+    ///
+    /// This costs a couple of seconds and is worth them: see the note above
+    /// [`id_clashes`] for why a clash that reaches a release build is
+    /// invisible to the user and to every other test here.
+    #[test]
+    fn no_id_diagnostic_while_the_rail_and_the_list_are_clicked_all_over() {
+        let (items, folders) = a_vault();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(SIDEBAR_WIDTH + LIST_WIDTH, HEIGHT),
+        );
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+
+        let mut filter = SidebarFilter::All;
+        let mut search = String::new();
+        let mut selected_id: Option<String> = None;
+        let icons = IconCache::default();
+        let mut visible = Vec::new();
+        let mut hits: Vec<String> = Vec::new();
+        let mut draw = |events: Vec<egui::Event>, hits: &mut Vec<String>, at: String| {
+            let output = ctx.run_ui(input(events), |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIDEBAR_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let _ = draw_sidebar(
+                                ui,
+                                VaultLists::live_only(&items),
+                                &folders,
+                                &mut filter,
+                                Screens { sends: &mut false, health: &mut false },
+                                "Locks in 11:42",
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LIST_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            draw_item_list(
+                                ui,
+                                Some(&items),
+                                &folders,
+                                &SidebarFilter::All,
+                                &mut search,
+                                &mut selected_id,
+                                None,
+                                &icons,
+                                &mut visible,
+                                None,
+                                false,
+                            );
+                        },
+                    );
+                });
+            });
+            id_clashes(&painted(&output), hits, &at);
+        };
+        // One settle frame before the sweep, so the first click lands on a
+        // pane that has already been laid out once rather than on frame 1 of
+        // a fresh context.
+        draw(Vec::new(), &mut hits, "warm-up".into());
+        let mut y = 8.0;
+        while y < HEIGHT {
+            let mut x = 8.0;
+            while x < SIDEBAR_WIDTH + LIST_WIDTH {
+                let pos = egui::Pos2::new(x, y);
+                let button = |pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                draw(
+                    vec![egui::Event::PointerMoved(pos), button(true), button(false)],
+                    &mut hits,
+                    format!("click {pos:?}"),
+                );
+                draw(Vec::new(), &mut hits, format!("after {pos:?}"));
+                x += 28.0;
+            }
+            y += 18.0;
+        }
+        hits.sort();
+        hits.dedup();
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
     #[test]
     fn dropping_an_item_on_a_real_folder_asks_for_that_move() {
         let (items, folders) = a_vault();
