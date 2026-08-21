@@ -105,6 +105,7 @@ pub mod update_panel;
 pub mod updater;
 pub mod vault_bridge;
 pub mod vault_cache;
+pub mod vault_disk_cache;
 pub mod vault_export;
 pub mod vault_window;
 pub mod window_list;

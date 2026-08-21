@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 54] = [
+        const OPENS_NO_WINDOW: [&str; 55] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1189,6 +1189,17 @@ mod tests {
             "updater",
             "vault_bridge",
             "vault_cache",
+            // **Judgement call, recorded rather than assumed**, and exactly
+            // `hello`'s and `reprompt`'s: acquiring the key for the encrypted
+            // disk cache does put a window on screen -- the Windows Hello
+            // verification dialog -- but it is not a window THIS crate opens.
+            // It belongs to the OS, which foregrounds and destroys it, and
+            // this module has no title constant and no `run_ui_native` call
+            // for `RAISING_SITES` to find. What it does have, for the same
+            // reported symptom ("Windows PIN screen launches in background"),
+            // is `foreground::raise_this_process` immediately before each
+            // call that can show one.
+            "vault_disk_cache",
             // Plans an export, builds the `bw export` command and
             // classifies the result. The save dialog it is pointed at
             // is the shell's, opened elsewhere; this module draws
