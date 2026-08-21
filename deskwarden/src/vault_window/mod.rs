@@ -2065,6 +2065,11 @@ pub fn build_frame_with_search(
                     sync_status.as_ref(),
                     vault_load_error.as_deref(),
                     last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
+                    // The snapshot's age when it came off disk, and `None`
+                    // the moment a populate in THIS session replaced it --
+                    // `VaultCache` clears it there, so the pill cannot go on
+                    // dating a snapshot that has since been refreshed.
+                    cache.loaded_from_disk_at().and_then(|t| t.elapsed().ok()),
                 );
                 if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                     sync_in_progress = true;
@@ -9684,6 +9689,7 @@ fn sync_pill(
     sync_status: Option<&Result<(), String>>,
     vault_load_error: Option<&str>,
     since_last_sync: Duration,
+    from_disk_age: Option<Duration>,
 ) -> (egui::Color32, String) {
     if sync_in_progress {
         return (theme::TEXT_GHOST, "Syncing…".to_string());
@@ -9693,10 +9699,51 @@ fn sync_pill(
     // for actual errors"), the design's error red for failure, and a neutral
     // ghost dot before the first sync has reported anything.
     match (sync_status, vault_load_error) {
-        (Some(Err(_)), _) => (theme::ERROR, "Sync failed".to_string()),
-        (_, Some(_)) => (theme::ERROR, VAULT_NOT_REFRESHED_PILL.to_string()),
+        (Some(Err(_)), _) => (theme::ERROR, with_age("Sync failed", from_disk_age)),
+        (_, Some(_)) => (theme::ERROR, with_age(VAULT_NOT_REFRESHED_PILL, from_disk_age)),
         (Some(Ok(())), None) => (theme::BLUE, format!("Synced {}", synced_ago_text(since_last_sync))),
-        (None, None) => (theme::TEXT_GHOST, "Sync".to_string()),
+        (None, None) => match from_disk_age {
+            Some(age) => (
+                theme::TEXT_GHOST,
+                format!("Loaded from cache · {}", cache_age_text(age)),
+            ),
+            None => (theme::TEXT_GHOST, "Sync".to_string()),
+        },
+    }
+}
+
+/// Appends the cached snapshot's age to a failure label, when there is one.
+///
+/// A failure must never take the age off the screen. The bug this codebase
+/// already shipped once was a pill claiming freshness over data a sync had
+/// failed to refresh; the same shape with a disk cache behind it is a pill
+/// that says only "Sync failed" over a vault that is four days old, which
+/// tells the user their refresh failed and not that what they are reading
+/// predates the weekend.
+fn with_age(label: &str, from_disk_age: Option<Duration>) -> String {
+    match from_disk_age {
+        Some(age) => format!("{label} · {}", cache_age_text(age)),
+        None => label.to_string(),
+    }
+}
+
+/// The encrypted disk cache's age, in the largest unit that reads honestly.
+///
+/// Coarser than [`synced_ago_text`]'s wording on purpose, and a separate
+/// function rather than a reuse: that value is per-session and describes a
+/// sync this process performed, while this one describes a FILE and is the
+/// number that can be days old. `last_sync_at` stays per-session exactly as
+/// its comment says; conflating the two is how the pill starts lying again.
+fn cache_age_text(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        "just written".to_string()
+    } else if secs < 3600 {
+        format!("{} min old", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} h old", secs / 3600)
+    } else {
+        format!("{} d old", secs / 86_400)
     }
 }
 
@@ -14604,8 +14651,11 @@ mod sync_pill_tests {
     // spelled for the user, and until this function existed the wording was
     // an `if` chain inside a 3000-line `eframe` closure that nothing could
     // call.
-    use super::{sync_pill, theme, VAULT_NOT_REFRESHED_PILL};
+    use super::{cache_age_text, sync_pill, theme, VAULT_NOT_REFRESHED_PILL};
     use std::time::Duration;
+
+    /// Three hours, as a snapshot that came off the encrypted disk cache.
+    const THREE_HOURS: Option<Duration> = Some(Duration::from_secs(3 * 3600));
 
     #[test]
     fn a_give_up_after_a_successful_sync_reads_as_neither_success_nor_a_failed_sync() {
@@ -14614,6 +14664,7 @@ mod sync_pill_tests {
             Some(&Ok(())),
             Some("the vault was locked before this load could read it"),
             Duration::ZERO,
+            None,
         );
         assert_eq!(
             label, VAULT_NOT_REFRESHED_PILL,
@@ -14625,7 +14676,8 @@ mod sync_pill_tests {
 
     #[test]
     fn a_real_sync_failure_still_says_so() {
-        let (dot, label) = sync_pill(false, Some(&Err("boom".to_string())), None, Duration::ZERO);
+        let (dot, label) =
+            sync_pill(false, Some(&Err("boom".to_string())), None, Duration::ZERO, None);
         assert_eq!(label, "Sync failed");
         assert_eq!(dot, theme::ERROR);
     }
@@ -14634,29 +14686,125 @@ mod sync_pill_tests {
     fn a_sync_failure_outranks_a_load_failure_that_followed_it() {
         // The sync is the thing the user started, and its failure is the
         // stronger and more actionable statement.
-        let (_, label) = sync_pill(false, Some(&Err("boom".to_string())), Some("also this"), Duration::ZERO);
+        let (_, label) = sync_pill(
+            false,
+            Some(&Err("boom".to_string())),
+            Some("also this"),
+            Duration::ZERO,
+            None,
+        );
         assert_eq!(label, "Sync failed");
     }
 
     #[test]
     fn an_in_flight_sync_outranks_every_finished_one() {
-        let (dot, label) = sync_pill(true, Some(&Err("boom".to_string())), Some("also this"), Duration::ZERO);
+        let (dot, label) = sync_pill(
+            true,
+            Some(&Err("boom".to_string())),
+            Some("also this"),
+            Duration::ZERO,
+            THREE_HOURS,
+        );
         assert_eq!(label, "Syncing…");
         assert_eq!(dot, theme::TEXT_GHOST);
     }
 
     #[test]
     fn a_clean_success_still_reads_as_one() {
-        let (dot, label) = sync_pill(false, Some(&Ok(())), None, Duration::from_secs(120));
+        let (dot, label) =
+            sync_pill(false, Some(&Ok(())), None, Duration::from_secs(120), None);
         assert_eq!(label, "Synced 2m ago");
         assert_eq!(dot, theme::BLUE);
     }
 
     #[test]
     fn nothing_reported_yet_is_neutral() {
-        let (dot, label) = sync_pill(false, None, None, Duration::ZERO);
+        let (dot, label) = sync_pill(false, None, None, Duration::ZERO, None);
         assert_eq!(label, "Sync");
         assert_eq!(dot, theme::TEXT_GHOST);
+    }
+
+    // -- a snapshot that came off the encrypted disk cache ------------------
+    //
+    // The highest-likelihood defect in that whole feature, because it is a
+    // bug this codebase has already shipped once in a narrower form: the pill
+    // read "Synced just now" over a snapshot the sync had failed to refresh.
+    // With a file behind it the same lie can now be days wide instead of one
+    // sync interval, so the rule is asserted from both ends -- only a sync
+    // that succeeded IN THIS SESSION may say "Synced", and no failure may
+    // take the age off the screen.
+
+    #[test]
+    fn a_disk_loaded_snapshot_reports_its_age_rather_than_a_sync() {
+        let (dot, label) = sync_pill(false, None, None, Duration::ZERO, THREE_HOURS);
+        assert_eq!(label, "Loaded from cache · 3 h old");
+        assert_eq!(dot, theme::TEXT_GHOST);
+    }
+
+    #[test]
+    fn a_failed_refresh_never_takes_the_age_off_the_screen() {
+        let (dot, label) = sync_pill(
+            false,
+            Some(&Err("connection refused".to_string())),
+            None,
+            Duration::ZERO,
+            Some(Duration::from_secs(86_400 * 2)),
+        );
+        assert_eq!(dot, theme::ERROR);
+        assert_eq!(label, "Sync failed · 2 d old");
+    }
+
+    #[test]
+    fn a_give_up_over_a_disk_loaded_snapshot_keeps_the_age_too() {
+        let (_, label) = sync_pill(false, Some(&Ok(())), Some("locked"), Duration::ZERO, THREE_HOURS);
+        assert_eq!(label, "Vault not refreshed · 3 h old");
+    }
+
+    #[test]
+    fn a_successful_sync_in_this_session_replaces_the_age_wording() {
+        // Belt and braces: `VaultCache` clears `loaded_from_disk_at` on a
+        // populate, so in practice the age is already `None` here. The pill
+        // must not depend on that ordering to stop dating the file.
+        let (dot, label) = sync_pill(false, Some(&Ok(())), None, Duration::ZERO, THREE_HOURS);
+        assert_eq!(label, "Synced just now");
+        assert_eq!(dot, theme::BLUE);
+    }
+
+    #[test]
+    fn a_memory_only_session_reads_exactly_as_it_did_before() {
+        // Every state, with no file behind it, unchanged -- the feature is
+        // off by default and must be invisible when it is.
+        assert_eq!(sync_pill(false, None, None, Duration::ZERO, None).1, "Sync");
+        assert_eq!(
+            sync_pill(false, Some(&Ok(())), None, Duration::ZERO, None).1,
+            "Synced just now"
+        );
+        assert_eq!(
+            sync_pill(false, Some(&Err("x".to_string())), None, Duration::ZERO, None).1,
+            "Sync failed"
+        );
+        assert_eq!(
+            sync_pill(false, Some(&Ok(())), Some("locked"), Duration::ZERO, None).1,
+            VAULT_NOT_REFRESHED_PILL
+        );
+    }
+
+    #[test]
+    fn cache_age_wording_units() {
+        assert_eq!(cache_age_text(Duration::from_secs(0)), "just written");
+        assert_eq!(cache_age_text(Duration::from_secs(59)), "just written");
+        assert_eq!(cache_age_text(Duration::from_secs(60)), "1 min old");
+        assert_eq!(cache_age_text(Duration::from_secs(600)), "10 min old");
+        assert_eq!(cache_age_text(Duration::from_secs(3600)), "1 h old");
+        assert_eq!(cache_age_text(Duration::from_secs(3 * 3600)), "3 h old");
+        assert_eq!(cache_age_text(Duration::from_secs(86_399)), "23 h old");
+        assert_eq!(cache_age_text(Duration::from_secs(50 * 3600)), "2 d old");
+        // The oldest a file can be and still load, so the wording has to
+        // read sensibly there rather than only near zero.
+        assert_eq!(
+            cache_age_text(Duration::from_secs(crate::vault_disk_cache::EXPIRY_SECS)),
+            "7 d old"
+        );
     }
 }
 
