@@ -728,38 +728,52 @@ const NETWORK_MARK_HEIGHT: f32 = card_mark::MARK_ROW_HEIGHT;
 /// The narrowest the item name's column may be squeezed to before the network
 /// mark gives up its place on the row.
 ///
-/// **Not taste -- the truncation budget.** The mark's pill is allocated out of
-/// the same row width the name and its `(*9988)` suffix are laid into, so on a
-/// pane narrow enough the pill would leave the name a single ellipsis and the
+/// **Not taste -- the truncation budget.** The mark is allocated out of the
+/// same row width the name and its `(*9988)` suffix are laid into, so on a
+/// pane narrow enough the mark would leave the name a single ellipsis and the
 /// suffix nowhere to go, which is the overflow `theme::truncated_galley` was
 /// added to stop one release ago. 120pt is roughly the suffix (about 47pt at
 /// `TITLE_SIZE`), its gap, and enough name to still be a name.
 ///
+/// **The number is unchanged by the move to the trailing edge; the
+/// measurement it is compared against is not** -- see `paint_network_mark`.
+/// 120pt was always a claim about the TITLE, and the title's room is a
+/// property of the row and not of where on it the mark sits. What changed is
+/// that the comparison is now made from inside the trailing run, so it is the
+/// room the title really gets.
+///
 /// At the real pane this never binds: the list is
 /// `Panel::exact_size(LIST_WIDTH).resizable(false)` at 390pt, which leaves the
-/// title column 301pt, and the widest mark this app sets is `MASTERCARD` at
-/// 72pt. It binds only under a test pane, and there the answer is the
-/// module's standing one -- draw nothing rather than a mark that costs the row
-/// its name. `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_
-/// both` holds it.
+/// trailing run 301pt, and the widest mark this app sets is `MASTERCARD` at
+/// 72pt. It binds only under a test pane, and there the answer is the module's
+/// standing one -- draw nothing rather than a mark that costs the row its
+/// name. `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_both`
+/// holds it, and
+/// `the_network_mark_yields_sooner_when_the_row_also_carries_a_chip` holds the
+/// half that only the move made observable.
 const NETWORK_MARK_MIN_TITLE_ROOM: f32 = 120.0;
 
-/// Allocates and paints the network mark's pill on the row, immediately after
-/// the avatar tile; returns the rect it took, or `None` when it stood aside.
+/// Allocates and paints the network mark in the row's TRAILING chip run,
+/// innermost of the three; returns the rect it took, or `None` when it stood
+/// aside.
 ///
-/// **Beside the tile, never inside it.** The badge used to be anchored into
-/// the tile's lower-right corner, over the bank's own artwork. The owner asked
-/// for it moved -- "maybe not overlap the icon but place to the right ... then
-/// name with last digits" -- and moving it is what let the wordmarks become
-/// words: the 32pt tile was the four-character cap, and there is no tile
-/// around the mark any more (see `CardBrand::wordmark`).
+/// **Never inside the tile, and no longer beside it.** The badge was first
+/// anchored into the tile's lower-right corner, over the bank's own artwork;
+/// the owner asked for it moved out -- "maybe not overlap the icon but place
+/// to the right ... then name with last digits" -- and moving it is what let
+/// the wordmarks become words, since the 32pt tile was the four-character cap
+/// (see `CardBrand::wordmark`). It then sat between the tile and the name, and
+/// the owner asked again: "lets also move pill to the right - similar to our
+/// mfa/app pills". So it is now allocated in the same right-to-left run those
+/// chips are drawn in -- though, as the call site records, it does not share a
+/// row with them on anything a vault produces.
 ///
 /// **It is ALLOCATED, which is the whole point.** `allocate_exact_size` in the
-/// row's left-to-right ui advances the cursor by the pill plus the row's
-/// `ROW_GAP_X`, so the `ui.available_width()` the title column is then given
-/// -- and therefore the `room` `theme::truncated_galley` truncates the name
-/// into -- is already net of the pill. Painting it without allocating would
-/// have left the name laying out into room the pill was sitting in.
+/// trailing run advances that ui's cursor by the mark, and the title column is
+/// then handed whatever `ui.available_width()` is left -- so the `room`
+/// `theme::truncated_galley` truncates the name into is already net of the
+/// mark. Painting it without allocating would have left the name laying out
+/// into room the mark was sitting in.
 ///
 /// **It is placed on the NAME's baseline, not on the row's box centre.** The
 /// reported defect -- "feels like image, pill and name are not on the same mid
@@ -772,9 +786,24 @@ const NETWORK_MARK_MIN_TITLE_ROOM: f32 = 120.0;
 /// derives the correction from the two runs actually laid out.
 fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand, selected: bool) -> Option<egui::Rect> {
     let width = card_mark::mark_width(ui, brand, NETWORK_MARK_HEIGHT);
-    // The gap is charged twice on purpose: `item_spacing` puts one between the
-    // tile and the pill, and another between the pill and the title column.
-    if ui.available_width() - width - 2.0 * ROW_GAP_X < NETWORK_MARK_MIN_TITLE_ROOM {
+    // **The room the title column will really be handed, derived rather than
+    // estimated.** This ui is the trailing run and it is walked right to left,
+    // so by the time we are called anything else in that run has already been
+    // allocated and `available_width` is net of it and of the gap beside it.
+    // What this call would then cost the title is the mark itself plus exactly
+    // ONE `ROW_GAP_X`: egui charges `item_spacing` before the NEXT widget, so
+    // any gap to the right of the mark has already come out of
+    // `available_width`, and the one remaining is the gap between the mark and
+    // the title column that follows it. (Measured: at the real pane a card row
+    // sees 301pt here and its title column is handed 262.25 beside a 27.75pt
+    // `VISA` -- one 11pt gap, not two.)
+    //
+    // Two gaps is what the old leading-run version subtracted, and it was
+    // conservative by one of them -- it described a layout where the mark had
+    // the tile on one side and the title on the other, which is not where the
+    // mark is any more. It was also blind to the trailing run, which in the
+    // leading run had not been allocated yet.
+    if ui.available_width() - width - ROW_GAP_X < NETWORK_MARK_MIN_TITLE_ROOM {
         return None;
     }
     let (rect, _) =
@@ -1732,14 +1761,13 @@ fn item_row(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_GAP_X;
-                // The tile is now ONE decision and the mark is another, which
-                // is what moving the mark off the tile bought. The tile is the
-                // bank's icon when there is one and the name's monogram when
-                // there is not -- the same two rungs every non-card row has
-                // always had, with no card-shaped third. The network's mark
-                // then follows the tile, on the row, for any card whose
-                // network this app can name.
-                let mark = card_network(item);
+                // NOTHING SHARES THE LEADING RUN WITH THE TILE. The tile is
+                // the bank's icon when there is one and the name's monogram
+                // when there is not -- the same two rungs every non-card row
+                // has always had, with no card-shaped third and, since the
+                // mark moved to the trailing edge, no fourth element beside
+                // it either. The row now reads tile, then text, then the
+                // trailing chips, on every row of every kind.
                 match icon {
                     Some(tex) => {
                         // The SAME box the monogram fallback draws -- filled,
@@ -1756,12 +1784,6 @@ fn item_row(
                     None => {
                         theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected)
                     }
-                }
-                // The mark's pill, after the tile and before the name. It is
-                // allocated, so the room the title column is laid into is
-                // already net of it -- see `paint_network_mark`.
-                if let Some(brand) = mark {
-                    paint_network_mark(ui, brand, selected);
                 }
                 // The design's title column is `flex: 1` with the chips
                 // trailing it. Laid out right-to-left so the chips take their
@@ -1806,6 +1828,32 @@ fn item_row(
                     // in `vault_window::mod` and cannot get there.
                     for chip in chips.iter().rev().flatten() {
                         row_badge(ui, chip, selected);
+                    }
+                    // The network mark shares this trailing run -- "lets also
+                    // move pill to the right - similar to our mfa/app pills".
+                    //
+                    // **It does not share it with the chips, on any row a
+                    // vault produces.** "2FA" is read off `item.login.totp`
+                    // and a card has no login block; `card_network` answers
+                    // for cards alone. So the mark and "2FA" are mutually
+                    // exclusive by the item's KIND, and there is no ordering
+                    // between three trailing things to design, because there
+                    // is never a third. The row shows a mark or it shows
+                    // chips.
+                    //
+                    // The ONE overlap that is reachable is the "app" chip: it
+                    // comes from a `deskwarden:app-match` CUSTOM field, and
+                    // nothing confines a custom field to a login -- see
+                    // `card_bound_to_an_app`. That is why this is drawn after
+                    // the loop rather than before it. Not a precedence rule
+                    // anybody chose: it is where a `card_mark` has to go,
+                    // since it is not a text chip and cannot be an entry in
+                    // `chips`, and the resulting order is the one that costs
+                    // nothing -- the chip keeps the trailing edge it holds on
+                    // every login row, and the mark takes its room from the
+                    // title it qualifies.
+                    if let Some(brand) = card_network(item) {
+                        paint_network_mark(ui, brand, selected);
                     }
                     // Sized to its OWN content height, not to the available
                     // height: `ui.vertical` would take the full 32 and
@@ -4517,11 +4565,14 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn a_card_with_a_bank_icon_wears_its_network_mark_beside_the_tile_and_not_over_it() {
-        // THE REPORT: a bank favicon with `VISA` sitting over the tile's
-        // lower-right corner -- "maybe not overlap the icon but place to the
-        // right ... then name with last digits". This is that arrangement,
-        // asserted from painted geometry: icon, then pill, then name.
+    fn a_card_with_a_bank_icon_wears_its_network_mark_at_the_trailing_edge_and_not_over_it() {
+        // TWO REPORTS, and this is the arrangement they arrive at, asserted
+        // from painted geometry: tile, then name, then the mark at the
+        // trailing edge. The first was a bank favicon with `VISA` sitting over
+        // the tile's lower-right corner -- "maybe not overlap the icon but
+        // place to the right"; the second, once it stood between tile and
+        // name, was "lets also move pill to the right - similar to our mfa/app
+        // pills".
         let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
         let row = row_tiles(&p)[0].rect;
         let tile = square(&p, AVATAR_SIZE).rect;
@@ -4548,16 +4599,45 @@ mod row_tile_tests {
             marks_in(&p, tile)
         );
 
-        // To the RIGHT of the tile, clear of it, one row gap away.
+        // **The trailing edge, one row gap in from the row's own padding** --
+        // the position "app" and "2FA" take on a row that has them, which is
+        // what "similar to our mfa/app pills" asked for. Read as an absolute
+        // distance from the row's right edge, not as "somewhere to the right",
+        // because the second is true of the old arrangement too.
+        // `row` is the tile's OUTER rect, so the content edge is its own 1pt
+        // stroke plus the frame's horizontal padding in from it.
         assert!(
-            mark.left() >= tile.right(),
-            "the mark at {mark:?} overlaps the {tile:?} tile it is supposed to sit beside"
+            (row.right() - ROW_BORDER - ROW_PAD_X - mark.right()).abs() < 0.51,
+            "the mark at {mark:?} is {}pt in from the {row:?} row's right edge, expected the \
+             row's own {ROW_BORDER}pt border and {ROW_PAD_X}pt padding and nothing else",
+            row.right() - mark.right()
+        );
+        // **And the NAME now comes first**, which is the whole move: the mark
+        // used to start before the name and now ends after it. Both halves
+        // asserted, so a mark that simply vanished could not pass this.
+        let name = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "BoA Credit")
+            .map(|(_, r, _)| *r)
+            .expect("the item's name was painted");
+        assert!(
+            name.right() <= mark.left(),
+            "the name at {name:?} runs past the mark at {mark:?}, which now follows it"
         );
         assert!(
-            (mark.left() - tile.right() - ROW_GAP_X).abs() < 0.51,
-            "the mark at {mark:?} is {}pt from the tile's right edge, expected the row's \
-             {ROW_GAP_X}pt gap",
-            mark.left() - tile.right()
+            name.left() >= tile.right(),
+            "the name at {name:?} overlaps the {tile:?} tile"
+        );
+        // NOTHING now stands between the tile and the name: the leading run is
+        // the tile alone, so the name starts exactly one row gap past it. This
+        // is the negative of the old arrangement, and it is what would fail if
+        // the mark were drawn in both places.
+        assert!(
+            (name.left() - tile.right() - ROW_GAP_X).abs() < 0.51,
+            "the name at {name:?} is {}pt from the tile's right edge, expected the row's \
+             {ROW_GAP_X}pt gap and nothing standing in between",
+            name.left() - tile.right()
         );
         // Vertically centred against the tile: the row is `align-items:
         // center` and a pill hanging off that baseline is the defect the
@@ -4570,17 +4650,6 @@ mod row_tile_tests {
             (mark.height() - NETWORK_MARK_HEIGHT).abs() < 0.01,
             "the mark is {}pt tall, expected {NETWORK_MARK_HEIGHT}",
             mark.height()
-        );
-        // And the name follows the pill rather than starting under it.
-        let name = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "BoA Credit")
-            .map(|(_, r, _)| *r)
-            .expect("the item's name was painted");
-        assert!(
-            name.left() >= mark.right(),
-            "the name at {name:?} starts before the mark at {mark:?} ends"
         );
     }
 
@@ -5246,6 +5315,15 @@ mod row_tile_tests {
         // that keeps every row exactly `ROW_TILE_HEIGHT` tall and the
         // virtualized list in register. Asserted at a pane less than half the
         // real one, where the two chips plus the avatar leave almost nothing.
+        //
+        // **A LOGIN, and two is all this row can ever show.** The network mark
+        // joined this trailing run, but it cannot join THIS row: `card_network`
+        // answers for cards alone, so the mark and the "2FA" chip are mutually
+        // exclusive by the item's kind. The card side of the invariant is
+        // `a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_
+        // squeezes_the_title_instead`, and the one overlap that is reachable
+        // at all is `a_card_bound_to_an_app_puts_its_mark_inside_the_chip_and_
+        // still_fits_the_row`.
         let items = [with_totp(with_app_match(login(
             "A Very Long Item Name Indeed",
             "someone@example.com",
@@ -5266,6 +5344,272 @@ mod row_tile_tests {
              out of register with the pitch `show_rows` scrolls by",
             tile.rect.height()
         );
+    }
+
+    /// **The card half of the invariant above**, and the shape the mark's move
+    /// to the trailing edge actually produces: a card row, a long name, and a
+    /// network mark alone in the trailing run.
+    ///
+    /// Run over BOTH kinds of mark, because they are two different risks. The
+    /// word's width is this app's own and bounded by `MASTERCARD`; a logo's is
+    /// a stranger's, read off a file the user dropped into a folder, and the
+    /// fixture here is deliberately 10:1 so `card_mark::MAX_LOGO_ASPECT` is
+    /// the only thing standing between the row and a mark 150pt wide.
+    #[test]
+    fn a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_squeezes_the_title_instead()
+    {
+        const NARROW: f32 = 170.0;
+        const NAME: &str = "A Very Long Item Name Indeed";
+        let wide_logo = crate::brand_mark::tests::on_ground_png(1000, 100, 46);
+
+        for (label, p) in [
+            ("a word mark", paint_at_width(&[card_branded(NAME, "Mastercard")], None, NARROW)),
+            ("a wide logo", {
+                let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo.clone())]);
+                paint_with_marks(&[card_branded(NAME, "Mastercard")], NARROW, dir)
+            }),
+        ] {
+            let tile = one_tile_of_width(&p, NARROW - 2.0 * LIST_PADDING);
+            // The mark either fits inside the row or stood aside entirely --
+            // `NETWORK_MARK_MIN_TITLE_ROOM` permits the second and
+            // `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_
+            // both` is about it. What it may never do is hang out of the tile.
+            for mark in marks_in(&p, tile.rect)
+                .into_iter()
+                .map(|(r, _)| r)
+                .chain(logos_in(&p, tile.rect))
+            {
+                assert!(
+                    tile.rect.contains_rect(mark),
+                    "with {label}, the network mark at {mark:?} has escaped its row tile {:?}",
+                    tile.rect
+                );
+            }
+            assert!(
+                (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
+                "with {label}, the row grew to {} tall on a narrow pane, which would slide the \
+                 virtualized list out of register with the pitch `show_rows` scrolls by",
+                tile.rect.height()
+            );
+            // The squeeze landed on the TITLE: the name is still drawn, and
+            // drawn narrower than the string could possibly need.
+            let name = p
+                .texts
+                .iter()
+                .find(|(t, _, _)| t.starts_with("A Very Long"))
+                .map(|(_, r, _)| *r)
+                .unwrap_or_else(|| panic!("with {label}, the name was not painted at all"));
+            assert!(
+                name.width() < NAME.chars().count() as f32 * TITLE_SIZE * 0.5,
+                "with {label}, the name is {}pt wide, which is not truncated -- the row absorbed \
+                 the squeeze somewhere else",
+                name.width()
+            );
+        }
+
+        // **The wide logo really was capped**, or the case above proves
+        // nothing about `MAX_LOGO_ASPECT`: a 1000x100 file fitted into a
+        // 15pt-tall box would be 150pt wide uncapped, which is most of that
+        // pane. At the REAL pane, where the mark is drawn rather than stood
+        // aside, it comes out at 4x the height and no more.
+        let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo)]);
+        let real = paint_with_marks(&[card_branded(NAME, "Mastercard")], PANE_WIDTH, dir);
+        let row = row_tiles(&real)[0].rect;
+        let logo = logos_in(&real, row);
+        assert_eq!(logo.len(), 1, "the real pane must draw the logo: {logo:?}");
+        assert!(
+            logo[0].width() <= 4.0 * NETWORK_MARK_HEIGHT + 0.51,
+            "a 10:1 file drew {}pt wide beside a {NETWORK_MARK_HEIGHT}pt-tall box -- \
+             `card_mark::MAX_LOGO_ASPECT` did not cap it, so a user's file can take the row",
+            logo[0].width()
+        );
+        assert!(
+            row.contains_rect(logo[0]),
+            "the capped logo at {:?} still escaped its {row:?} row",
+            logo[0]
+        );
+    }
+
+    /// A card carrying a `deskwarden:app-match` custom field.
+    ///
+    /// **Rare but genuinely reachable, which is why it is a fixture and not a
+    /// fiction.** The field is a custom field, and nothing confines a custom
+    /// field to a login: `extract_app_match` reads `item.fields` for any kind,
+    /// `detail_edit::app_match_edit` has no kind gate, and `detail`'s
+    /// `app_card_visible` was deliberately narrowed to `has_field` alone --
+    /// its comment records that asking the kind "hid the card outright on a
+    /// non-fillable kind", leaving a binding the user could see in every other
+    /// Bitwarden client and not clear from here. So a card can wear the "app"
+    /// chip beside its network mark, and the row must simply cope.
+    ///
+    /// The "2FA" chip is a different matter and is NOT reachable this way: it
+    /// is read off `item.login.totp`, and a card has no login block. A card
+    /// with one is a hand-built item, not a shape the vault produces.
+    fn card_bound_to_an_app(name: &str, brand: &str) -> VaultItem {
+        with_app_match(card_branded(name, brand))
+    }
+
+    /// **The one overlap that is reachable: a mark and the "app" chip.**
+    ///
+    /// Not a design with an ordering to defend -- there is no row on which a
+    /// reader chooses between three trailing things, because the mark is a
+    /// card's and "2FA" is a login's. This is the rare case laid out so that
+    /// it cannot overflow, and it pins the one ordering consequence that does
+    /// follow from drawing the mark after the chip loop: the mark ends up
+    /// INSIDE the chip, nearest the name it qualifies, and the chip keeps the
+    /// trailing edge it has on every other row.
+    #[test]
+    fn a_card_bound_to_an_app_puts_its_mark_inside_the_chip_and_still_fits_the_row() {
+        let p = paint(&[card_bound_to_an_app("BoA Credit", "Visa")], None);
+        let row = row_tiles(&p)[0].rect;
+        let marks = marks_in(&p, row);
+        assert_eq!(marks.len(), 1, "expected one network mark on the row: {marks:?}");
+        let (mark, word) = marks[0].clone();
+        assert_eq!(word, CardBrand::Visa.wordmark(), "the mark names the wrong network");
+        let name = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "BoA Credit")
+            .map(|(_, r, _)| *r)
+            .expect("the item's name was painted");
+        let app = chip_rect(&p, "app");
+        for (a_name, a, b_name, b) in [
+            ("the name", name, "the mark", mark),
+            ("the mark", mark, "\"app\"", app),
+        ] {
+            assert!(
+                a.right() <= b.left() + 0.01,
+                "{a_name} at {a:?} does not come before {b_name} at {b:?}; the row reads \
+                 name={name:?} mark={mark:?} app={app:?}"
+            );
+        }
+        // On one line and inside the row -- a wrapped mark is a taller row and
+        // a virtualized list out of register.
+        assert!(
+            (mark.center().y - app.center().y).abs() < 1.01,
+            "the mark at {mark:?} is on a different line from \"app\" at {app:?}"
+        );
+        assert!(row.contains_rect(mark), "the mark at {mark:?} escaped its {row:?} row");
+        assert!(row.contains_rect(app), "the \"app\" chip at {app:?} escaped its {row:?} row");
+        // The chip sits exactly where it sits on a login row: the mark took
+        // its room from the TITLE, not from the trailing edge.
+        let bare = chip_rect(&paint(&[with_app_match(login("BoA Credit", "a@b.c"))], None), "app");
+        assert!(
+            (app.left() - bare.left()).abs() < 0.01,
+            "the \"app\" chip moved from {bare:?} to {app:?} when a network mark joined the row"
+        );
+    }
+
+    /// **The re-derived truncation budget, in the one form that can be
+    /// observed.** The guard is now applied inside the trailing run, AFTER
+    /// anything else in it has taken its width, so a card that carries the
+    /// "app" chip yields its mark at a wider pane than a card that does not.
+    ///
+    /// The old leading-run guard ran before the trailing run existed and could
+    /// not see into it, so both rows below would have kept their mark and the
+    /// chipped one's title would have been squeezed by the chip's width on top
+    /// of the mark's. This is the positive and the negative of that at ONE
+    /// pane width, so the difference cannot be a coincidence of two
+    /// thresholds.
+    #[test]
+    fn the_network_mark_yields_sooner_when_the_row_also_carries_a_chip() {
+        // Chosen by measurement, not by argument. A bare card needs about
+        // 292pt of pane for `MASTERCARD` to clear the 120pt title floor; the
+        // "app" chip plus its gap is about 40pt more. 310 is inside that
+        // window, and the two assertions below are what prove it really is --
+        // a width outside it fails one of them rather than passing vacuously.
+        const BETWEEN: f32 = 310.0;
+        let bare = paint_at_width(&[card_branded("BoA Debit", "Mastercard")], None, BETWEEN);
+        let chipped =
+            paint_at_width(&[card_bound_to_an_app("BoA Debit", "Mastercard")], None, BETWEEN);
+        let row = |p: &Painted| one_tile_of_width(p, BETWEEN - 2.0 * LIST_PADDING).rect;
+        assert_eq!(
+            marks_in(&bare, row(&bare)).len(),
+            1,
+            "at a {BETWEEN}pt pane a card with no chip has room for its mark, so this width \
+             says nothing about the chip: {:?}",
+            marks_in(&bare, row(&bare))
+        );
+        assert!(
+            marks_in(&chipped, row(&chipped)).is_empty(),
+            "the same card wearing the \"app\" chip drew its mark anyway at a {BETWEEN}pt pane, \
+             so the guard is still blind to the trailing run: {:?}",
+            marks_in(&chipped, row(&chipped))
+        );
+        // The name is what both were protecting, and the chip is untouched --
+        // yielding is the MARK's job.
+        for p in [&bare, &chipped] {
+            assert!(
+                p.texts.iter().any(|(t, _, _)| t.starts_with("BoA")),
+                "the name did not survive: {:?}",
+                p.texts
+            );
+        }
+        let chip = chip_rect(&chipped, "app");
+        assert!(
+            row(&chipped).contains_rect(chip),
+            "the \"app\" chip at {chip:?} escaped its row when the mark stood aside"
+        );
+    }
+
+    /// **A long card name beside its mark still truncates cleanly and keeps
+    /// its `(*1234)` suffix**, at the narrow pane and at the real one.
+    ///
+    /// The suffix is the point: two cards from one bank differ only by those
+    /// four digits, so a budget that let the suffix be the thing that got cut
+    /// would leave two identical rows. `paint_title_with_suffix` takes the
+    /// suffix's width off first, and this is that promise held against the
+    /// tightest card row this list produces -- which is now a row whose mark
+    /// is on the far side of the name rather than between it and the tile.
+    #[test]
+    fn a_long_card_name_beside_its_mark_still_keeps_its_digits() {
+        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
+        for width in [170.0f32, PANE_WIDTH] {
+            let mut card = card_branded(LONG, "Mastercard");
+            card.card.as_mut().unwrap().number =
+                Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
+            let p = paint_at_width(&[card], None, width);
+            let row = one_tile_of_width(&p, width - 2.0 * LIST_PADDING).rect;
+            let suffix = p
+                .texts
+                .iter()
+                .find(|(t, _, _)| t == "(*2222)")
+                .map(|(_, r, _)| *r)
+                .unwrap_or_else(|| {
+                    panic!("at a {width}pt pane the suffix was cut: {:?}", p.texts)
+                });
+            assert!(
+                row.expand(0.51).contains_rect(suffix),
+                "at a {width}pt pane the suffix at {suffix:?} spilled out of its {row:?} row"
+            );
+            // Truncated, not wrapped, and the row kept its pitch.
+            assert!(
+                (row.height() - ROW_TILE_HEIGHT).abs() < 0.51,
+                "at a {width}pt pane the row is {}pt tall, expected {ROW_TILE_HEIGHT}",
+                row.height()
+            );
+            let name = p
+                .texts
+                .iter()
+                .find(|(t, _, _)| t.starts_with("Bank of"))
+                .map(|(_, r, _)| *r)
+                .expect("the name was painted");
+            assert!(
+                name.right() <= suffix.left() + 0.01,
+                "at a {width}pt pane the name at {name:?} ran into its suffix at {suffix:?}"
+            );
+            assert!(
+                row.expand(0.51).contains_rect(name),
+                "at a {width}pt pane the name at {name:?} spilled out of its {row:?} row"
+            );
+            // The negative: the name really was cut down, so "it fits" is not
+            // just "the pane was wide enough all along".
+            assert!(
+                name.width() < LONG.chars().count() as f32 * TITLE_SIZE * 0.5,
+                "at a {width}pt pane the name is {}pt wide and was never truncated",
+                name.width()
+            );
+        }
     }
 
     #[test]

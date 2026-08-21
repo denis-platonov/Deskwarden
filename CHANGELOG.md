@@ -10,6 +10,25 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### A card's network mark moved to the right-hand edge of its list row
+
+`VISA`, `MASTERCARD` and the rest used to sit between the item's icon and its
+name, which put a piece of secondary information in the middle of the run a
+reader scans a list by. The mark is now at the trailing edge of the row, where
+the `app` and `2FA` chips already sit, so every row's leading run is just the
+icon and the name, and the marks line up in one column down the right-hand
+side.
+
+The mark is drawn exactly as it was — same size, same treatment, same support
+for a supplied logo. Only its place on the row changed.
+
+The room the item's name is truncated into is derived again from where the mark
+now sits, rather than adjusted: it is measured from inside the row's trailing
+run, after anything else there has taken its width. The old calculation
+described a mark with the icon on one side and the name on the other, reserved
+one gap too many, and could not see the trailing chips at all. A long card name
+on a narrow pane still loses its tail and keeps its `(*1234)`.
+
 ### Preferences no longer says the fill shortcut works before anything has tried it
 
 Preferences ▸ Shortcuts read a process-wide status whose starting value was
