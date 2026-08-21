@@ -8,7 +8,14 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.8.5 - 2026-08-21
+
+> The manual pre-release checklist was not run for this version either.
+> This is the first release whose own updater can install the next one, so
+> a failure in Preferences > Updates now costs every future release rather
+> than one. The first window's three states and the forced single-instance
+> takeover have also never run outside a test. If an update, a launch or a
+> takeover misbehaves, please open an issue.
 
 ### The recovery no longer opens small windows of its own
 
