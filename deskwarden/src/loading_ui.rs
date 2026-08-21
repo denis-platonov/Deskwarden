@@ -54,9 +54,9 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// caller must now decide for itself what "the user closed this" means
 /// (abandon quietly, treat as a failure, etc.) rather than that decision
 /// being made for it by a crash.
-/// The spinner itself: **this app's window heading**, and under it a spinner
-/// and one line of prose centred on a flat [`theme::CANVAS`] panel that fills
-/// whatever is left.
+/// The wait itself: **this app's window heading**, and under it design turn
+/// 7's sliding bar and one line of prose, centred on a flat [`theme::CANVAS`]
+/// panel that fills whatever is left.
 ///
 /// The heading is the same [`draw_window_chrome_with_extra`] every other window
 /// in this app draws, not a second titlebar -- there was no chrome here at all
@@ -66,10 +66,15 @@ const WINDOW_TITLE: &str = "Deskwarden";
 ///
 /// Under it, the treatment is the vault window's OWN loading body
 /// (`vault_window`'s `VaultBodyState::Loading`), which is the screen this one
-/// hands over to: a 28px [`theme::BLUE`] spinner over one line of 13px prose.
-/// Matched rather than re-proportioned, because the two are seen seconds apart
-/// in the same window and the second must not look like a different app's idea
-/// of waiting. The mark that used to sit above the spinner is gone with it --
+/// hands over to: [`theme::progress_bar`] over one line of 13px prose. **Both
+/// were a 28px rotating disc until design turn 7**, whose two waiting bodies
+/// are drawn as a bar sliding in a track and which references the rotating
+/// keyframe nowhere; the owner's report was that these screens still had the
+/// "old design with round spinner". Matched rather than re-proportioned,
+/// because the two are seen seconds apart in the same window and the second
+/// must not look like a different app's idea of waiting -- which is also why
+/// the widget itself lives in [`theme`] rather than being drawn twice here.
+/// The mark that used to sit above the indicator is gone with it --
 /// the heading already carries the wordmark, so drawing it a second time in the
 /// middle of the screen was saying the app's name twice on a screen that has
 /// one thing to say.
@@ -125,8 +130,8 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
             let leftover = ui.available_height() - CONTENT_HEIGHT;
             ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| {
-                ui.add(egui::Spinner::new().size(SPINNER_SIZE).color(theme::BLUE));
-                ui.add_space(SPINNER_TO_LABEL);
+                theme::progress_bar(ui, NARROW_BAR);
+                ui.add_space(BAR_TO_LABEL);
                 ui.label(theme::semibold(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
             });
         });
@@ -142,12 +147,23 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
 /// shared at all: two hosts, one look.
 const HEADING: ChromeMetrics = ChromeMetrics::VAULT;
 
-/// Sized from the vault window's own loading body (28px spinner, 12px gap, 13px
-/// label), which is the screen this one hands over to. The user asked for the
-/// spinner to be bigger and the mark to go; this is the size the app already
-/// uses for exactly this wait, rather than a third number invented here.
-const SPINNER_SIZE: f32 = 28.0;
-const SPINNER_TO_LABEL: f32 = 12.0;
+/// **The design's two track widths**, which differ by how much room the body
+/// has rather than by which body it is: 260px in design 7a's full frame, 200px
+/// in 7b's half-width card.
+///
+/// [`draw_first_window_body`] always draws in the vault window's own 1240px
+/// frame, so it takes the wide one; [`draw_spinner_body`] is drawn in
+/// [`show_while`]'s 360px window as well, where 260px would leave 26px of
+/// margin either side, so it takes the narrow one. Neither is invented here --
+/// they are the two the design already uses.
+const WIDE_BAR: f32 = 260.0;
+const NARROW_BAR: f32 = 200.0;
+
+/// The gap between the bar and the text under it -- design 7a's own 22px, and
+/// bigger than the 12px the disc had because the bar is 3px tall rather than
+/// 28px and a tight gap under it reads as an underline on the heading.
+const BAR_TO_LABEL: f32 = 22.0;
+
 const LABEL_SIZE: f32 = 13.0;
 
 /// What [`draw_spinner_body`]'s stack occupies, used to centre it.
@@ -158,7 +174,7 @@ const LABEL_SIZE: f32 = 13.0;
 /// label's line box is its font size times egui's default line height for
 /// this face; being a pixel or two out is invisible in a centring, whereas
 /// the top-anchored version this replaces was out by hundreds.
-const CONTENT_HEIGHT: f32 = SPINNER_SIZE + SPINNER_TO_LABEL + LABEL_SIZE * 1.4;
+const CONTENT_HEIGHT: f32 = theme::BAR_HEIGHT + BAR_TO_LABEL + LABEL_SIZE * 1.4;
 
 /// This window GREW when the heading arrived: 320×150 had exactly enough room
 /// for a mark, a 22px spinner and a line of text, and none at all for a 46px bar
@@ -421,6 +437,13 @@ const WARN_EDGE: egui::Color32 = egui::Color32::from_rgb(0xf2, 0xd9, 0x9b);
 const WARN_INK: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x5a, 0x06);
 
 const BADGE_SIZE: f32 = 38.0;
+
+/// The unreachable body's badge-to-text gap -- design 7b's own 16px, and its
+/// own constant rather than [`BAR_TO_LABEL`] because the two head very
+/// different things: a 3px rail that needs air under it, and a 38px disc that
+/// does not.
+const BADGE_TO_LABEL: f32 = 16.0;
+
 const TITLE_SIZE: f32 = 17.0;
 const SUB_SIZE: f32 = 13.0;
 const FOOT_SIZE: f32 = 12.0;
@@ -475,8 +498,8 @@ pub fn draw_first_window_body(
             ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| match body {
                 FirstWindowBody::Loading => {
-                    ui.add(egui::Spinner::new().size(SPINNER_SIZE).color(theme::BLUE));
-                    ui.add_space(SPINNER_TO_LABEL);
+                    theme::progress_bar(ui, WIDE_BAR);
+                    ui.add_space(BAR_TO_LABEL);
                     ui.label(theme::semibold("Loading your vault", TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     ui.label(
@@ -485,8 +508,8 @@ pub fn draw_first_window_body(
                     );
                 }
                 FirstWindowBody::Slow { seconds } => {
-                    ui.add(egui::Spinner::new().size(SPINNER_SIZE).color(theme::BLUE));
-                    ui.add_space(SPINNER_TO_LABEL);
+                    theme::progress_bar(ui, WIDE_BAR);
+                    ui.add_space(BAR_TO_LABEL);
                     ui.label(
                         theme::semibold("Still syncing with Bitwarden", TITLE_SIZE)
                             .color(theme::INK),
@@ -496,7 +519,7 @@ pub fn draw_first_window_body(
                 }
                 FirstWindowBody::Unreachable { retry: offer } => {
                     draw_warning_badge(ui);
-                    ui.add_space(SPINNER_TO_LABEL);
+                    ui.add_space(BADGE_TO_LABEL);
                     ui.label(theme::semibold(UNREACHABLE_TITLE, TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     let copy = match offer {
@@ -538,11 +561,13 @@ pub fn slow_line(seconds: u64) -> String {
 /// What the stack in the middle occupies, summed from its own pieces rather
 /// than written as a total, for the reason [`CONTENT_HEIGHT`] gives.
 fn content_height(body: FirstWindowBody) -> f32 {
+    // Head and gap together, because the bar and the badge differ in both:
+    // 3px over 22px of air, or 38px over 16px.
     let head = match body {
-        FirstWindowBody::Loading | FirstWindowBody::Slow { .. } => SPINNER_SIZE,
-        FirstWindowBody::Unreachable { .. } => BADGE_SIZE,
+        FirstWindowBody::Loading | FirstWindowBody::Slow { .. } => theme::BAR_HEIGHT + BAR_TO_LABEL,
+        FirstWindowBody::Unreachable { .. } => BADGE_SIZE + BADGE_TO_LABEL,
     };
-    let mut height = head + SPINNER_TO_LABEL + TITLE_SIZE * 1.4 + TITLE_TO_SUB + SUB_SIZE * 1.4;
+    let mut height = head + TITLE_SIZE * 1.4 + TITLE_TO_SUB + SUB_SIZE * 1.4;
     if let FirstWindowBody::Unreachable { retry } = body {
         // The copy is two or three wrapped lines rather than one.
         height += SUB_SIZE * 1.4 * 2.0;
@@ -860,17 +885,18 @@ mod spinner_centring_tests {
         );
     }
 
-    /// **No logo above the spinner.** The user: "no need for logo in the middle
-    /// of the screen - just bigger spinner".
+    /// **No logo above the indicator.** The user: "no need for logo in the
+    /// middle of the screen - just bigger spinner".
     ///
     /// Measured rather than asserted about the source, because "the mark is
-    /// gone" is a claim about the screen. A 28px spinner over one 13px line is
-    /// about 58px tall; the mark that used to sit above it was 32px with a 14px
-    /// gap under it, so restoring it takes the stack past 100. The heading's own
-    /// wordmark is excluded by `painted_span_below_the_heading`, which is the
-    /// point -- the app's name is drawn once, up there.
+    /// gone" is a claim about the screen. Design 7's 3px bar over 22px of air
+    /// over one 13px line is about 43px tall; the mark that used to sit above
+    /// it was 32px with a 14px gap under it, so restoring it takes the stack
+    /// past 90. The heading's own wordmark is excluded by
+    /// `painted_span_below_the_heading`, which is the point -- the app's name
+    /// is drawn once, up there.
     #[test]
-    fn the_stack_is_a_spinner_and_a_line_of_text_and_not_a_logo_as_well() {
+    fn the_stack_is_an_indicator_and_a_line_of_text_and_not_a_logo_as_well() {
         let output = spinner_frame(600.0);
         let (top, bottom) = painted_span_below_the_heading(&output)
             .expect("the spinner body painted nothing below the heading at all");
@@ -1364,5 +1390,101 @@ mod first_window_body_tests {
             !painted.contains("items"),
             "the loading body counts items it has not received yet: {painted:?}"
         );
+    }
+    /// **The indicator is design 7's sliding bar, and no longer a disc.**
+    ///
+    /// The owner's report was that these screens still had the "old design
+    /// with round spinner". A test that only checked something blue was
+    /// painted would pass for either, so this asserts the shape the design
+    /// actually specifies: a `WIDE_BAR`-wide, `theme::BAR_HEIGHT`-tall track
+    /// filled with the hairline grey, and inside it a knob of the design's
+    /// 32%. `egui::Spinner` paints an arc -- a `Shape::Path` -- and no rect at
+    /// all, so neither of these can be satisfied by the thing this replaces.
+    ///
+    /// Rendered a quarter of the way through the cycle rather than at t=0.
+    /// Design 7's own first keyframe is `translateX(-100%)`, which puts the
+    /// knob entirely outside the track, and `paint_progress_bar` clips it --
+    /// so at t=0 there is honestly nothing blue to find. That is a fact about
+    /// the animation and not a bug, and it is why the preview draws its still
+    /// frames off the clock rather than at zero.
+    #[test]
+    fn the_waiting_bodies_draw_the_designs_bar_and_not_a_disc() {
+        for body in [FirstWindowBody::Loading, FirstWindowBody::Slow { seconds: 12 }] {
+            let ctx = styled_ctx();
+            let input = egui::RawInput {
+                time: Some(f64::from(crate::theme::BAR_PERIOD) / 4.0),
+                ..raw_input()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                draw_first_window_body(
+                    ui,
+                    body,
+                    FirstWindowFooter {
+                        account: None,
+                        hotkey: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+                    },
+                    CloseControl::Active,
+                );
+            });
+            let filled = filled_rects(&output);
+            let bar = |want_w: f32, fill: egui::Color32| {
+                filled.iter().any(|(rect, colour): &(egui::Rect, egui::Color32)| {
+                    *colour == fill
+                        && (rect.width() - want_w).abs() < 0.6
+                        && (rect.height() - crate::theme::BAR_HEIGHT).abs() < 0.6
+                })
+            };
+            assert!(
+                bar(WIDE_BAR, crate::theme::HAIRLINE),
+                "{body:?} paints no {WIDE_BAR}x{}px hairline track, so the design's rail is not \
+                 on screen: {filled:?}",
+                crate::theme::BAR_HEIGHT
+            );
+            assert!(
+                bar(WIDE_BAR * 0.32, crate::theme::BLUE),
+                "{body:?} paints no blue knob a third of the track wide, so what is moving in \
+                 the middle of this window is not design 7's bar: {filled:?}"
+            );
+        }
+    }
+
+    /// Control on the test above: the UNREACHABLE body is not a wait and must
+    /// draw no bar at all. Without this, a `draw_first_window_body` that
+    /// painted the bar unconditionally -- under the failure copy, where it
+    /// would say the app is still trying when it has stopped -- would pass
+    /// every assertion there.
+    #[test]
+    fn the_unreachable_body_draws_no_bar_because_nothing_is_running() {
+        let output = frame(FirstWindowBody::Unreachable { retry: RetryOffer::Offered });
+        let filled = filled_rects(&output);
+        assert!(
+            !filled.iter().any(|(rect, colour)| *colour == crate::theme::HAIRLINE
+                && (rect.height() - crate::theme::BAR_HEIGHT).abs() < 0.6
+                && rect.width() > 100.0),
+            "the unreachable body draws a progress track under a message that says the app has \
+             given up: {filled:?}"
+        );
+    }
+
+    /// Every filled rect with its colour, unrounded -- the bar's own
+    /// assertions are about a 3px height and a 32% width, which rounding to
+    /// whole pixels would blur.
+    fn filled_rects(output: &egui::FullOutput) -> Vec<(egui::Rect, egui::Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 }

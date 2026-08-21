@@ -8,6 +8,18 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### Waiting is a sliding bar, not a spinning disc
+
+Every screen shown before the vault list -- the launch's loading and slow
+bodies, the standalone setup wait, the sign-in card while your password is with
+the server, and the vault window's own first load -- drew a rotating disc.
+Design turn 7 draws the same wait as a short bar sliding inside a track, and
+that is what all of them draw now: one widget in the shared theme rather than
+five hand-drawn copies, at the design's own proportions (a 32% knob, 3px tall,
+one 1.4s eased cycle).
+
 ## 0.8.5 - 2026-08-21
 
 > The manual pre-release checklist was not run for this version either.
