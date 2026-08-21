@@ -490,7 +490,12 @@ struct DiskState {
 /// with the current time at every launch, so the seven-day expiry would
 /// never fire and the pill would report a vault that was always "just
 /// written" however old it really was.
-#[derive(Debug, Clone, Copy)]
+/// No `Debug`, deliberately. It carries an instant and nothing else, so it
+/// could not print a secret -- but `debug_leak_guard` flags a derived `Debug`
+/// on any type declared in a file that can reach one, and the honest answer
+/// to that flag here is not an exemption with a paragraph of reasoning
+/// attached: it is that nothing prints this and nothing needs to.
+#[derive(Clone, Copy)]
 enum Source {
     Backend,
     DiskCache(SystemTime),
@@ -1858,9 +1863,6 @@ impl VaultCache {
         Ok(())
     }
 
-    /// A poisoned lock means another thread panicked mid-update, which
-    /// cannot corrupt anything here worse than a stale snapshot -- recover
-    /// rather than propagating a panic into the UI thread.
     // -- the optional encrypted file --------------------------------------
     //
     // Everything about that file lives behind this type, for the reason
@@ -2093,6 +2095,9 @@ impl VaultCache {
         self.disk_state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A poisoned lock means another thread panicked mid-update, which
+    /// cannot corrupt anything here worse than a stale snapshot -- recover
+    /// rather than propagating a panic into the UI thread.
     fn lock(&self) -> std::sync::MutexGuard<'_, Snapshot> {
         self.snapshot.lock().unwrap_or_else(|e| e.into_inner())
     }
