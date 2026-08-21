@@ -824,8 +824,12 @@ fn derive_key(signature: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(hasher.finalize().into())
 }
 
+/// `pub(crate)` so `vault_cache`'s own disk tests can build a [`DiskCache`]
+/// through the same substituted seams rather than growing a second set --
+/// `cache_with_key` and `temp_dir_for` below. Nothing here reaches a release
+/// build.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::vault_bridge::{Folder, VaultItem};
 
