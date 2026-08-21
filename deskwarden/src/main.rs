@@ -57,7 +57,7 @@ use deskwarden::vault_cache::{
 use deskwarden::app_match::AppMatch;
 use deskwarden::app_window;
 use deskwarden::{
-    fill_stats, hotkey, job_object, logging, login_ui, picker_ui,
+    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui,
     prefs_ui, session_store, settings, tray, vault_disk_cache, vault_window,
     window_watch,
 };
@@ -1051,7 +1051,15 @@ fn main() {
     // same `arm_autofill_and_seed_cache` the visible path calls.
     let account = login.account.map(|(_, account)| account.email.clone());
     let items = match settle_a_tray_launch(|window| {
-        wait_for_the_vault(&vault, &schedule, window, account.clone())
+        wait_for_the_vault(
+            &vault,
+            &schedule,
+            window,
+            account.clone(),
+            // Only the `InAWindow` retry can reach these; the silent probe
+            // this launch opens with draws no body and presses nothing.
+            OfflineCopy::over(&cache),
+        )
     }) {
         TrayLaunchEnd::Ready(items) => items,
         // The window has already said this, in design 7's own unreachable
@@ -6236,7 +6244,15 @@ fn resettle_session(
         cached_status_details,
         session_token,
         authenticate,
-        move |window| wait_for_the_vault(cache.bridge(), schedule, window, account.clone()),
+        move |window| {
+            wait_for_the_vault(
+                cache.bridge(),
+                schedule,
+                window,
+                account.clone(),
+                OfflineCopy::over(cache),
+            )
+        },
         &mut tray_effects,
     );
     // Labels, applied on the thread that owns the tray. Nothing reads them
@@ -8115,20 +8131,161 @@ fn wait_for_the_vault(
     schedule: &[Duration],
     window: ProbeWindow,
     account: Option<String>,
+    offline: OfflineCopy,
 ) -> VaultReadyOutcome {
     let worker_vault = vault.clone();
     let worker_schedule = schedule.to_vec();
     let probe = move || wait_for_vault_ready(&worker_vault, &worker_schedule);
     match window {
+        // **`offline` is unread on this arm, and that is the rule and not an
+        // omission.** A silent wait draws no body, so there is no button to
+        // press; opening the local copy is something a user *asks* for, and
+        // an autostart that quietly served a cached vault instead of the one
+        // it was told to fetch would be doing that on nobody's behalf.
         ProbeWindow::Silent => match probe() {
             Ok(items) => VaultReadyOutcome::Ready(items),
             Err(e) => VaultReadyOutcome::Failed(e),
         },
-        ProbeWindow::InAWindow => match app_window::run_recovery(account, probe) {
-            app_window::RecoveryOutcome::Ready(items) => VaultReadyOutcome::Ready(items),
-            app_window::RecoveryOutcome::Abandoned => VaultReadyOutcome::Dismissed,
-            app_window::RecoveryOutcome::Unreachable(e) => VaultReadyOutcome::Failed(e),
-        },
+        ProbeWindow::InAWindow => {
+            let OfflineCopy { offer, open } = offline;
+            match app_window::run_recovery(account, probe, move || offer()) {
+                app_window::RecoveryOutcome::Ready(items) => VaultReadyOutcome::Ready(items),
+                app_window::RecoveryOutcome::Abandoned => VaultReadyOutcome::Dismissed,
+                app_window::RecoveryOutcome::Unreachable(e) => VaultReadyOutcome::Failed(e),
+                // The window has closed by now; whatever the copy costs to
+                // open -- including a Hello prompt -- is spent here, with no
+                // frame closure to block.
+                app_window::RecoveryOutcome::OpenLocalCopy => match open() {
+                    Ok(items) => {
+                        log::info!(
+                            "the local copy of the vault was opened at the user's request; \
+                             {} items, and the backend was not waited for",
+                            items.len()
+                        );
+                        VaultReadyOutcome::Ready(items)
+                    }
+                    // **Reported as the failure it is**, rather than falling
+                    // back to the wait the user just left. They asked for the
+                    // copy, the copy did not open, and the caller's own
+                    // recovery is the honest next step.
+                    Err(why) => VaultReadyOutcome::Failed(why),
+                },
+            }
+        }
+    }
+}
+
+/// **What the launch can offer instead of the backend**, for design 7's
+/// *Open the local copy* and *Continue offline*.
+///
+/// Two closures and not a `&VaultCache`, because one call site has no cache to
+/// give: [`recover_from_failed_vault_wait`] runs after the master-password
+/// prompt, and re-authentication has already called
+/// `VaultCache::forget_disk_copy` and deleted the file. It passes
+/// [`OfflineCopy::none`], which is the truth about that moment rather than a
+/// borrow it does not have.
+///
+/// `offer` is read every frame by the window; `open` at most once, after it
+/// has closed. Separate for that reason -- one is cheap and repeated, the
+/// other pops a biometric prompt.
+///
+/// **Owned and `'static`**, which is not a style choice: `offer` is handed to
+/// `app_window::run_recovery`, which moves it into an `eframe` frame closure,
+/// and that closure outlives every stack frame here as far as the compiler is
+/// concerned. The call sites clone the `Arc<VaultCache>` they already hold.
+struct OfflineCopy {
+    /// Whether either body draws its button at all, and what the "last
+    /// synced" line says. See [`loading_ui::LocalCopy`].
+    offer: Box<dyn Fn() -> loading_ui::LocalCopy>,
+    /// Opens it. `Err` carries words fit for the log and for
+    /// [`VaultReadyOutcome::Failed`].
+    open: Box<dyn Fn() -> Result<Vec<deskwarden::vault_bridge::VaultItem>, String>>,
+}
+
+impl OfflineCopy {
+    /// No copy, and no way to open one. Drawn as nothing at all, per
+    /// [`loading_ui::LocalCopy::None`].
+    fn none() -> Self {
+        Self {
+            offer: Box::new(|| loading_ui::LocalCopy::None),
+            open: Box::new(|| Err("there is no local copy of the vault to open".to_string())),
+        }
+    }
+
+    /// The two questions asked of the cache the launch is already holding.
+    ///
+    /// The `Arc` is cloned, twice, rather than borrowed -- see the struct's
+    /// own note on why these have to outlive this stack frame.
+    fn over(cache: &Arc<VaultCache>) -> Self {
+        let for_offer = Arc::clone(cache);
+        let for_open = Arc::clone(cache);
+        Self {
+            offer: Box::new(move || local_copy_offer(&for_offer)),
+            open: Box::new(move || open_local_copy(&for_open)),
+        }
+    }
+}
+
+/// What the two offline bodies should offer, read off the cache **now**.
+///
+/// The three answers, and the five states behind them:
+///
+/// * The snapshot already came from the file this session -- a cache-first
+///   restore that the readiness wait is still running on top of. The age is
+///   the file's own `written_at`, so the line reads like the toolbar pill will
+///   read a moment later.
+/// * The file is there and this session declined the Hello prompt. Offered
+///   with **no age**, because none has been read; pressing the button asks for
+///   the key again (see [`deskwarden::vault_cache::VaultCache::open_disk_copy`]).
+/// * Nothing usable: the setting is off, no file was ever written, or the file
+///   was rejected on its header and deleted. Nothing is drawn.
+fn local_copy_offer(cache: &deskwarden::vault_cache::VaultCache) -> loading_ui::LocalCopy {
+    if let Some(written_at) = cache.loaded_from_disk_at() {
+        // `elapsed` is `Err` on a file stamped in the future -- a clock that
+        // moved backwards. No age rather than a wrong one; the copy is still
+        // offered, because the file is still readable.
+        return loading_ui::LocalCopy::Here { synced: written_at.elapsed().ok() };
+    }
+    if cache.disk_copy_awaiting_key() {
+        return loading_ui::LocalCopy::Here { synced: None };
+    }
+    loading_ui::LocalCopy::None
+}
+
+/// Opens the copy the user just asked for, and hands back its items.
+///
+/// The already-restored case costs nothing and asks for nothing: the snapshot
+/// is in memory, and re-reading the file would be a second Hello prompt for
+/// data this process is already holding.
+fn open_local_copy(
+    cache: &deskwarden::vault_cache::VaultCache,
+) -> Result<Vec<deskwarden::vault_bridge::VaultItem>, String> {
+    if cache.is_populated() {
+        return Ok(cache.items());
+    }
+    match cache.open_disk_copy() {
+        deskwarden::vault_disk_cache::DiskCacheLoad::Loaded { items, .. } => Ok(items),
+        other => Err(format!(
+            "the local copy of the vault could not be opened ({})",
+            offline_open_failure(&other)
+        )),
+    }
+}
+
+/// One line about why a requested restore did not produce a vault.
+///
+/// Its own function so the four outcomes are named in one place, in words a
+/// user's log can carry. `Loaded` is unreachable here -- the caller matched it
+/// -- and is answered rather than `unreachable!()`, for the reason
+/// [`settle_a_tray_launch`]'s own impossible arm gives.
+fn offline_open_failure(load: &deskwarden::vault_disk_cache::DiskCacheLoad) -> &'static str {
+    use deskwarden::vault_disk_cache::DiskCacheLoad;
+    match load {
+        DiskCacheLoad::Loaded { .. } => "it opened, and this line should not have been reached",
+        DiskCacheLoad::Absent => "there is no copy on this machine",
+        DiskCacheLoad::Rejected(reason) => reason.as_str(),
+        DiskCacheLoad::Unavailable(_) => "Windows Hello did not unlock it",
+        DiskCacheLoad::Corrupt(_) => "the file on this machine could not be decrypted",
     }
 }
 
@@ -8185,7 +8342,18 @@ fn recover_from_failed_vault_wait(
     // The address the footer names: the account the user has just signed
     // in to, which this call site is the one that actually knows.
     let account = login.account.map(|(_, account)| account.email.clone());
-    match wait_for_the_vault(vault, schedule, ProbeWindow::InAWindow, account) {
+    // **No local copy to offer here, and that is a fact about this path.**
+    // Getting this far means the master-password prompt above has run, and
+    // re-authentication calls `VaultCache::forget_disk_copy` -- the file is
+    // gone by now. There is also no cache in scope to ask, which is the same
+    // fact in the type system.
+    match wait_for_the_vault(
+        vault,
+        schedule,
+        ProbeWindow::InAWindow,
+        account,
+        OfflineCopy::none(),
+    ) {
         VaultReadyOutcome::Ready(items) => items,
         // **No message box on either of these** -- design turn 7, and the
         // half of the owner's report that hurt most. What used to happen here

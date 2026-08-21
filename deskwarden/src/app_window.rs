@@ -2427,10 +2427,34 @@ where
 /// what the merged-window work already fixed once. A close is
 /// [`RecoveryOutcome::Abandoned`] -- "stop showing me a window", not "the
 /// backend is broken" -- and callers answer the two differently.
-pub fn run_recovery<T, F>(account: Option<String>, probe: F) -> RecoveryOutcome<T>
+///
+/// # The way out that is not the backend
+///
+/// `local_copy` is asked, **every frame**, whether there is an encrypted copy
+/// of the vault on this machine. Design 7's slow and unreachable bodies both
+/// draw a way into it -- *Open the local copy*, *Continue offline* -- and
+/// [`loading_ui::LocalCopy`] is what decides whether either is drawn at all.
+///
+/// A closure and not a value, for the same reason the footer's hotkey line is
+/// read per frame: the answer changes under this window. A user who cancelled
+/// the Hello prompt at startup has a copy sitting there and no key for it;
+/// that copy is offered, pressing the button asks for the key again, and the
+/// answer this closure gives afterwards is a different one. A `LocalCopy`
+/// captured once at the top would be a claim about the disk made before any
+/// of that happened.
+///
+/// Pressing it ends the window with [`RecoveryOutcome::OpenLocalCopy`]. This
+/// host does not open anything itself -- it has no vault, only a `probe` that
+/// produces one -- and the caller, which has the cache, does.
+pub fn run_recovery<T, F, L>(
+    account: Option<String>,
+    probe: F,
+    local_copy: L,
+) -> RecoveryOutcome<T>
 where
     T: Send + 'static,
     F: Fn() -> Result<T, String> + Send + Clone + 'static,
+    L: Fn() -> loading_ui::LocalCopy + 'static,
 {
     fn spawn_probe<T, F>(probe: &F) -> mpsc::Receiver<Result<T, String>>
     where
@@ -2460,7 +2484,13 @@ where
     let mut failure: Option<String> = None;
     let mut closing = Closing::not_yet();
 
+    let offline = Rc::new(RefCell::new(false));
+    let offline_cell = offline.clone();
+
     run_the_one_window(the_vault_windows_viewport(), move |ui, _frame| {
+        // Asked here, once per frame, so both bodies are told the same thing
+        // on the same frame and neither can be drawn from a stale answer.
+        let local = local_copy();
         let body = match failure {
             Some(_) => loading_ui::FirstWindowBody::Unreachable {
                 retry: if attempts_used < RECOVERY_ATTEMPTS {
@@ -2468,11 +2498,12 @@ where
                 } else {
                     loading_ui::RetryOffer::Spent
                 },
+                local,
             },
             // **The threshold is `loading_ui`'s, applied to a real
             // `Instant`.** A body picked here from a literal would be a
             // second copy of the rule the design states once.
-            None => loading_ui::waiting_body(attempt_started.elapsed()),
+            None => loading_ui::waiting_body(attempt_started.elapsed(), local),
         };
 
         let outcome = loading_ui::draw_first_window_body(
@@ -2507,6 +2538,23 @@ where
         // `refuse_close_while_working` is deliberately not called here.
         if !closing.decided() && ui.ctx().input(|i| i.viewport().close_requested()) {
             close_this_window(ui.ctx(), &mut closing);
+        }
+
+        // **Before Retry**, and before the channel is polled: a user who
+        // asked for the local copy has stopped waiting for the backend, and a
+        // probe answering on the same frame must not overrule them.
+        if outcome.open_local_copy && !closing.decided() {
+            log::info!(
+                "the recovery window was asked to open the local copy of the vault instead of \
+                 waiting for the backend; the readiness attempt in flight is abandoned and its \
+                 result will be dropped unheard"
+            );
+            *offline_cell.borrow_mut() = true;
+            // Retracted with it, so a failure already on screen is not also
+            // reported as the reason this window ended.
+            *unreachable_cell.borrow_mut() = None;
+            close_this_window(ui.ctx(), &mut closing);
+            return;
         }
 
         if outcome.retry && !closing.decided() {
@@ -2559,6 +2607,13 @@ where
     if let Some(value) = ready.borrow_mut().take() {
         return RecoveryOutcome::Ready(value);
     }
+    // **Above the failure**, deliberately: a window that ended because the
+    // user chose the local copy did so with a failure on screen more often
+    // than not, and reporting that failure would send the caller down the
+    // recovery path the user just declined.
+    if *offline.borrow() {
+        return RecoveryOutcome::OpenLocalCopy;
+    }
     // The window's last failure, if it ended on one. Taken from the outer
     // handle: the closure's clone went with the closure when the event loop
     // returned.
@@ -2597,6 +2652,18 @@ pub enum RecoveryOutcome<T> {
     /// Every attempt was spent, or the user closed the window with a failure
     /// on screen. Carries the last failure's own words.
     Unreachable(String),
+    /// The user pressed *Open the local copy* / *Continue offline*.
+    ///
+    /// **Not a failure**, even though the window was usually showing one when
+    /// it was pressed: it is an instruction about where to get the vault
+    /// from, and a caller that folded it into [`Self::Unreachable`] would run
+    /// the kill-and-reauthenticate recovery over a user who just said they
+    /// want what is already on the disk.
+    ///
+    /// Carries nothing. This host has no vault and no cache -- only a `probe`
+    /// it has been told to stop waiting on. The caller owns the copy and
+    /// opens it.
+    OpenLocalCopy,
 }
 
 #[cfg(test)]
@@ -6359,11 +6426,18 @@ mod recovery_host_tests {
     /// last item in the file.
     fn host() -> String {
         let production = code(production());
+        // `<T, F, L>` and not `<T, F>` since design 7's offline affordances:
+        // `L` is the per-frame local-copy question. The needle carries all
+        // three deliberately -- a host that lost `L` would be a host drawing
+        // both bodies from one answer captured before the window opened,
+        // which is the stale claim `run_recovery`'s own doc refuses.
         let at = production
-            .find(concat!("pub fn run_", "recovery<T, F>("))
+            .find(concat!("pub fn run_", "recovery<T, F, L>("))
             .expect(
-                "the recovery host is gone entirely -- the recovery is back to \
-                 `loading_ui::show_while`'s own 360x220 window, which is the owner's report",
+                "the recovery host is gone entirely, or no longer asks about the local copy \
+                 -- either the recovery is back to `loading_ui::show_while`'s own 360x220 \
+                 window, which is the owner's report, or design 7b's `Continue offline` has \
+                 lost the answer it is drawn from",
             );
         let host = production[at..].to_string();
         assert!(
@@ -6440,7 +6514,7 @@ mod recovery_host_tests {
              blank: {host}"
         );
         assert!(
-            host.contains(concat!("waiting_body(attempt_started.", "elapsed())")),
+            host.contains(concat!("waiting_body(attempt_started.", "elapsed(), local)")),
             "the recovery host no longer picks its body from how long THIS attempt has \
              actually been running, so `Taking longer than usual` is either always on screen \
              or never is: {host}"
@@ -6449,6 +6523,69 @@ mod recovery_host_tests {
             host.contains(concat!("hotkey::", "availability()")),
             "the recovery host no longer reads the shortcut's real status, so the footer is \
              back to asserting a hotkey nothing has registered: {host}"
+        );
+    }
+
+    /// **The local copy is asked about once per frame, and choosing it is not
+    /// a failure** -- design 7b's *Open the local copy* / *Continue offline*.
+    ///
+    /// Three properties, all of them things a transition table cannot state
+    /// and all of them ways this host has a real chance of going wrong:
+    ///
+    /// * The answer is read **inside** the frame closure. A `local_copy()`
+    ///   hoisted above `run_the_one_window` would be one answer captured
+    ///   before the window opened, so a user who dismissed the Hello prompt
+    ///   and then pressed the button would be told for the rest of the window
+    ///   that the copy they just opened is not there.
+    /// * The press is answered **before** Retry and before the probe channel
+    ///   is drained. A user who asked for the copy has stopped waiting, and a
+    ///   probe answering on the same frame must not overrule them.
+    /// * It leaves as [`RecoveryOutcome::OpenLocalCopy`] and clears the
+    ///   recorded failure. Reported as `Unreachable` instead, it would send
+    ///   the caller into the kill-and-reauthenticate recovery -- which deletes
+    ///   the very file the user asked to open.
+    #[test]
+    fn the_local_copy_is_read_per_frame_and_choosing_it_is_not_a_failure() {
+        let host = host();
+        let call = host
+            .find(concat!("let local = local_", "copy();"))
+            .expect(concat!(
+                "the recovery host does not ask for the local copy once per frame, so both ",
+                "design 7b bodies are drawn from whatever was true before the window opened: ",
+                "a dismissed Hello prompt would then hide the copy for the rest of the window"
+            ));
+        let window = host
+            .find(concat!("run_the_one_", "window("))
+            .expect("the recovery host no longer opens a window at all");
+        assert!(
+            call > window,
+            "the local-copy answer is read above the frame closure, which makes it one \
+             captured claim rather than a live one: {host}"
+        );
+
+        let pressed = host
+            .find(concat!("outcome.open_local_", "copy &&"))
+            .expect(
+                "the recovery host never acts on the offline button, so *Continue offline* is \
+                 drawn and does nothing -- the exact treatment `RetryOffer::Spent` refuses",
+            );
+        let retry = host
+            .find(concat!("outcome.", "retry &&"))
+            .expect("the recovery host no longer acts on Retry");
+        let drain = host
+            .find(concat!("rx.try_", "recv()"))
+            .expect("the recovery host no longer polls its probe");
+        assert!(
+            pressed < retry && pressed < drain,
+            "the offline press is answered after Retry or after the probe is drained, so a \
+             probe landing on the same frame can overrule a user who has stopped waiting: \
+             {host}"
+        );
+        assert!(
+            host.contains(concat!("RecoveryOutcome::Open", "LocalCopy")),
+            "the recovery host never leaves by the offline door, so pressing the button is \
+             reported as the failure that was on screen -- and the caller's recovery deletes \
+             the file the user asked to open: {host}"
         );
     }
 

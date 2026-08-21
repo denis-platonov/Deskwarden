@@ -2006,6 +2006,46 @@ impl VaultCache {
         self.lock_disk().loaded_from_disk_at
     }
 
+    /// Whether there is a local copy this session declined to open, because
+    /// the Windows Hello prompt was cancelled or failed.
+    ///
+    /// [`Self::load_from_disk`] answers [`DiskCacheLoad::Unavailable`] in that
+    /// case and leaves the file exactly where it is, so nothing in the outcome
+    /// says a copy is sitting there. The offline affordances need to know,
+    /// because "there is no copy of your vault on this machine" and "you
+    /// dismissed a fingerprint prompt" must not look the same on screen.
+    ///
+    /// Gated on `enabled` for the reason every other disk method here is: with
+    /// the setting off this cache is inert, and a file left behind by a
+    /// session that had it on is not something to offer.
+    pub fn disk_copy_awaiting_key(&self) -> bool {
+        if !self.lock_disk().enabled {
+            return false;
+        }
+        self.disk
+            .as_ref()
+            .is_some_and(|disk| disk.declined_copy_on_disk())
+    }
+
+    /// Restores from the file **at the user's own request**, after they
+    /// pressed *Open the local copy* / *Continue offline*.
+    ///
+    /// [`Self::load_from_disk`] with one thing added: a session that already
+    /// refused a Hello prompt is allowed one more. That refusal is normally
+    /// final for the session, so the next write does not pop a biometric out
+    /// of nowhere -- see `DiskCache::allow_one_more_key_attempt` for why a
+    /// button press is the one gesture that reasoning was never about.
+    ///
+    /// Nothing else differs. In particular it is still `Source::DiskCache`
+    /// underneath, so opening the copy does not stamp the file with the
+    /// current time and does not reset its seven-day expiry.
+    pub fn open_disk_copy(&self) -> DiskCacheLoad {
+        if let Some(disk) = self.disk.as_ref() {
+            disk.allow_one_more_key_attempt();
+        }
+        self.load_from_disk()
+    }
+
     /// Turns persistence on: acquires the Windows Hello key -- **this is the
     /// prompt the user sees, and it doubles as the confirmation gesture, so
     /// there is no separate modal** -- and writes the first file from the
@@ -5311,6 +5351,86 @@ mod tests {
             before,
             "the restore rewrote the file, so its age is now a lie"
         );
+    }
+
+    /// **A cancelled prompt leaves a copy that the app can still see.**
+    ///
+    /// `load_from_disk` answers `Unavailable` and the file stays put, so
+    /// nothing in that outcome distinguishes it from a machine with no copy at
+    /// all. `disk_copy_awaiting_key` is what the offline screens ask instead.
+    #[test]
+    fn a_copy_left_by_a_cancelled_prompt_is_still_reported_as_being_there() {
+        let (writer, dir) = cache_with_disk("awaiting-key", true);
+        seed(&writer);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            crate::vault_disk_cache::tests::cache_that_declines_hello(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(matches!(
+            reader.load_from_disk(),
+            DiskCacheLoad::Unavailable(_)
+        ));
+        assert!(!reader.is_populated());
+        assert!(
+            reader.loaded_from_disk_at().is_none(),
+            "an age was recorded for a file nothing read"
+        );
+        assert!(
+            reader.disk_copy_awaiting_key(),
+            "the copy is on the disk and the app cannot tell, so the offline screens would \
+             tell the user it does not exist"
+        );
+    }
+
+    /// The same file, with the setting off: inert, and offered to nobody.
+    #[test]
+    fn a_disabled_cache_offers_no_copy_even_when_a_declined_one_is_there() {
+        let (writer, dir) = cache_with_disk("awaiting-key-off", true);
+        seed(&writer);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            crate::vault_disk_cache::tests::cache_that_declines_hello(&dir),
+            "fp".to_string(),
+            false,
+        );
+        assert!(matches!(reader.load_from_disk(), DiskCacheLoad::Absent));
+        assert!(
+            !reader.disk_copy_awaiting_key(),
+            "a cache the user turned off offered its leftover file anyway"
+        );
+    }
+
+    /// **Opening the copy on request does not rewrite it**, which is the same
+    /// rule `a_restore_does_not_rewrite_the_file_it_just_read` pins for the
+    /// startup path -- asserted again here because `open_disk_copy` is a
+    /// second entry into it and a second chance to get it wrong.
+    #[test]
+    fn opening_the_copy_on_request_still_does_not_stamp_the_file() {
+        let (writer, dir) = cache_with_disk("open-no-rewrite", true);
+        seed(&writer);
+        let before = std::fs::read(cache_file(&dir)).unwrap();
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(matches!(
+            reader.open_disk_copy(),
+            DiskCacheLoad::Loaded { .. }
+        ));
+        assert!(reader.is_populated());
+        assert_eq!(
+            std::fs::read(cache_file(&dir)).unwrap(),
+            before,
+            "opening the copy at the user's request rewrote it, so its age is now a lie"
+        );
+        assert!(reader.loaded_from_disk_at().is_some());
     }
 
     #[test]

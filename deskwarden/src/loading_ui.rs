@@ -16,6 +16,7 @@ use eframe::egui::{self, Margin};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 /// Named rather than inlined at the `run_ui_native` call, because
 /// `foreground::raise_window` finds this window BY this title -- one
@@ -285,9 +286,51 @@ pub enum FirstWindowBody {
     /// 7b left. The same wait, still going after [`SLOW_AFTER`], now saying so
     /// with the real number of seconds it has been -- see [`waiting_body`],
     /// which is where that number comes from.
-    Slow { seconds: u64 },
+    ///
+    /// `local` is design 7b's *Open the local copy*: a wait that is dragging
+    /// has somewhere else to go, when there is a copy to go to.
+    Slow { seconds: u64, local: LocalCopy },
     /// 7b right. The probe answered with a failure, or spent its deadline.
-    Unreachable { retry: RetryOffer },
+    ///
+    /// `local` is design 7b's *Continue offline*, and the line under the copy
+    /// that says how old the local vault is.
+    Unreachable { retry: RetryOffer, local: LocalCopy },
+}
+
+/// **What the encrypted copy on this machine can offer this screen** --
+/// design 7b's *Open the local copy* and *Continue offline*.
+///
+/// Both bodies used to say there was no such thing, in as many words, and it
+/// was true: there was no `vault_disk_cache` module to open a copy from.
+/// There is one now, so the two buttons the design drew can be drawn -- but
+/// only where they would really work, which is what these two values
+/// separate.
+///
+/// **[`LocalCopy::None`] draws no button at all**, not a disabled one and not
+/// a "coming soon". That is this crate's recorded decision, in
+/// `prefs_ui::draw_not_yet`: all three of those treatments "look like a
+/// feature that is present and broken". It covers every way there is nothing
+/// to open -- the setting is off, no file was ever written, or the file was
+/// rejected on its header and deleted before any key was derived.
+///
+/// `synced` is the copy's age. **`Option`, because a copy that has not been
+/// opened has no age to report**: a session whose Hello prompt was cancelled
+/// knows the file is on the disk and knows nothing about what is inside it,
+/// including when it was written. A screen that filled that in -- with a
+/// placeholder, or with "just written" -- would be inventing the one number
+/// the user is being asked to trust. The button is still offered, because the
+/// copy really is there and asking for the key again really can open it.
+///
+/// A [`Duration`] and not a `SystemTime`, so nothing on this screen depends on
+/// what day it is: the host does the subtraction once, and this module renders
+/// the same pixels forever for the same age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalCopy {
+    /// Nothing usable is on this machine. No button.
+    None,
+    /// A copy is here and can be opened. `synced` is its age, when this
+    /// session has actually read the file and so knows one.
+    Here { synced: Option<Duration> },
 }
 
 /// Whether the unreachable body still has a retry to offer.
@@ -325,11 +368,17 @@ pub const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 /// is one testable rule rather than a comparison written into a frame closure
 /// where nothing can reach it. The seconds it reports are the elapsed time
 /// TRUNCATED, so the screen never claims a second that has not finished.
-pub fn waiting_body(elapsed: std::time::Duration) -> FirstWindowBody {
+///
+/// `local` rides along rather than being decided here: whether there is a
+/// copy on this machine has nothing to do with how long this attempt has
+/// been running, and the ordinary body offers nothing either way -- design 7a
+/// draws no button, and a wait that is one second old has no business telling
+/// the user to give up on it.
+pub fn waiting_body(elapsed: Duration, local: LocalCopy) -> FirstWindowBody {
     if elapsed < SLOW_AFTER {
         FirstWindowBody::Loading
     } else {
-        FirstWindowBody::Slow { seconds: elapsed.as_secs() }
+        FirstWindowBody::Slow { seconds: elapsed.as_secs(), local }
     }
 }
 
@@ -394,22 +443,34 @@ pub struct FirstWindowOutcome {
     pub chrome: ChromeAction,
     /// The unreachable body's Retry was pressed this frame.
     pub retry: bool,
+    /// *Open the local copy* / *Continue offline* was pressed this frame.
+    ///
+    /// **One field for the two buttons**, because they are one request: stop
+    /// waiting for Bitwarden and open what is on this machine. The two labels
+    /// differ because the sentences around them do -- one interrupts a wait
+    /// that could still succeed, the other answers a wait that failed -- but
+    /// the host does the same thing for both, and a second field would be a
+    /// second chance for the two paths to diverge.
+    ///
+    /// Never `true` when the body it came from was drawn with
+    /// [`LocalCopy::None`]: there is no button on those frames to press.
+    pub open_local_copy: bool,
 }
 
 /// The unreachable body's heading.
 ///
 /// Design 7b's failure card also offers *Continue offline* and says "your
 /// vault opened from the copy on this machine, last synced 2 h ago". Both
-/// describe the encrypted vault disk cache, which does not exist: it is a plan
-/// (`docs/superpowers/plans/2026-07-31-encrypted-vault-disk-cache.md`) and
-/// there is no `vault_disk_cache` module to open a copy from. So there is no
-/// *Continue offline* here, no greyed one, and no "coming soon" -- this crate
-/// has already decided that question once, in `prefs_ui::draw_not_yet`: all
-/// three of those treatments "look like a feature that is present and broken".
+/// describe the encrypted vault disk cache, which **did not exist** when this
+/// screen was first drawn -- it was a plan, with no `vault_disk_cache` module
+/// to open a copy from -- so neither was drawn, not greyed and not as a
+/// "coming soon": `prefs_ui::draw_not_yet` had already settled that all three
+/// treatments "look like a feature that is present and broken".
 ///
-/// What is left is honest and is most of the value: the failure is stated in
-/// the window the user is already looking at, with a Retry that really
-/// retries, instead of the modal error box that used to end the process here.
+/// The module exists now, and so does the button. What has not changed is the
+/// rule: it is drawn only where it would really work, and where it would not
+/// there is still nothing at all. See [`LocalCopy`], which is the whole of
+/// that decision, and [`offline_line`], which is the "last synced" half.
 const UNREACHABLE_TITLE: &str = "Couldn't reach Bitwarden";
 const UNREACHABLE_OFFERED: &str =
     "Deskwarden can't open your vault until Bitwarden answers. Nothing has been lost — your \
@@ -418,6 +479,42 @@ const UNREACHABLE_SPENT: &str =
     "Bitwarden still isn't answering. Closing this window leaves your vault locked; nothing \
      has been lost, and opening Deskwarden again once you're back online picks up where this \
      left off.";
+
+/// The label on the slow body's way out: design 7b's own *Open the local
+/// copy*.
+const OPEN_LOCAL_LABEL: &str = "Open the local copy";
+
+/// The label on the unreachable body's: design 7b's own *Continue offline*.
+///
+/// A different word for the same act, because the sentence above it is
+/// different -- one interrupts a wait that could still succeed, the other
+/// answers a wait that has failed. Both report through
+/// [`FirstWindowOutcome::open_local_copy`], which is the one field the host
+/// acts on.
+const CONTINUE_OFFLINE_LABEL: &str = "Continue offline";
+
+/// **"last synced 2 h ago"** -- design 7b's line about the local copy, with
+/// this app's own words for the age.
+///
+/// The age wording is [`crate::vault_window::cache_age_text`], which is what
+/// the vault window's toolbar pill says over a restored vault ("Loaded from
+/// cache · 3 h old"). One formatter and not two: the user meets both within
+/// seconds of each other in the same window, and a second way of saying the
+/// same age is a second chance for the two to disagree about it.
+///
+/// With no age -- the file is there but this session never opened it, so
+/// there is no `written_at` to have read -- the line says what is actually
+/// known, which is that a copy exists and that opening it needs the prompt
+/// again. See [`LocalCopy`] on why that is not filled in with a placeholder.
+fn offline_line(synced: Option<Duration>) -> String {
+    match synced {
+        Some(age) => format!(
+            "Your copy on this machine · {}",
+            crate::vault_window::cache_age_text(age)
+        ),
+        None => "There's a copy on this machine. Opening it asks Windows Hello again.".to_string(),
+    }
+}
 
 /// The footer strip's height -- design 7a's own 40px bar.
 const FOOTER_HEIGHT: f32 = 40.0;
@@ -450,6 +547,12 @@ const FOOT_SIZE: f32 = 12.0;
 const TITLE_TO_SUB: f32 = 7.0;
 const BLOCK_GAP: f32 = 18.0;
 
+/// Between two stacked buttons -- tighter than [`BLOCK_GAP`], which separates
+/// the copy from the controls under it. Retry and *Continue offline* are two
+/// answers to one question and read as a pair; the design's own 18px between
+/// them would read as two unrelated blocks.
+const BUTTON_GAP: f32 = 10.0;
+
 /// The measure the unreachable copy wraps into -- design 7b's own `40ch`, at
 /// this app's 13px face.
 const COPY_WIDTH: f32 = 380.0;
@@ -481,6 +584,7 @@ pub fn draw_first_window_body(
 
     let full = ui.max_rect();
     let mut retry = false;
+    let mut open_local_copy = false;
 
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
@@ -507,7 +611,7 @@ pub fn draw_first_window_body(
                             .color(theme::TEXT_FAINT),
                     );
                 }
-                FirstWindowBody::Slow { seconds } => {
+                FirstWindowBody::Slow { seconds, local } => {
                     theme::progress_bar(ui, WIDE_BAR);
                     ui.add_space(BAR_TO_LABEL);
                     ui.label(
@@ -516,8 +620,18 @@ pub fn draw_first_window_body(
                     );
                     ui.add_space(TITLE_TO_SUB);
                     ui.label(theme::semibold(slow_line(seconds), SUB_SIZE).color(theme::TEXT_FAINT));
+                    // **Secondary here and primary on the failure body**, and
+                    // that is the whole difference: this wait can still
+                    // succeed on its own, so leaving it is an option and not
+                    // the thing to do. The bar above is still moving.
+                    if let LocalCopy::Here { synced } = local {
+                        ui.add_space(TITLE_TO_SUB);
+                        ui.label(theme::semibold(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
+                        ui.add_space(BLOCK_GAP);
+                        open_local_copy |= theme::secondary_button(ui, OPEN_LOCAL_LABEL).clicked();
+                    }
                 }
-                FirstWindowBody::Unreachable { retry: offer } => {
+                FirstWindowBody::Unreachable { retry: offer, local } => {
                     draw_warning_badge(ui);
                     ui.add_space(BADGE_TO_LABEL);
                     ui.label(theme::semibold(UNREACHABLE_TITLE, TITLE_SIZE).color(theme::INK));
@@ -536,9 +650,42 @@ pub fn draw_first_window_body(
                             ui.label(theme::semibold(copy, SUB_SIZE).color(theme::TEXT_FAINT));
                         },
                     );
+                    if let LocalCopy::Here { synced } = local {
+                        ui.add_space(TITLE_TO_SUB);
+                        ui.label(
+                            theme::semibold(offline_line(synced), SUB_SIZE)
+                                .color(theme::TEXT_GHOST),
+                        );
+                    }
                     if offer == RetryOffer::Offered {
                         ui.add_space(BLOCK_GAP);
                         retry = theme::primary_button(ui, "Retry", None).clicked();
+                    }
+                    if let LocalCopy::Here { .. } = local {
+                        // Stacked under the Retry when there is one -- a
+                        // button-to-button gap; standing alone under the copy
+                        // when there is not -- the same block gap the Retry
+                        // would have had.
+                        ui.add_space(match offer {
+                            RetryOffer::Offered => BUTTON_GAP,
+                            RetryOffer::Spent => BLOCK_GAP,
+                        });
+                        // **Primary exactly when it is the only thing left.**
+                        // With a Retry still on offer, trying Bitwarden again
+                        // is the better outcome and keeps the weight; once the
+                        // attempts are spent, the alternative to this button
+                        // is closing the window, and a lone secondary control
+                        // reads as a footnote to a screen that has no main
+                        // action left.
+                        let pressed = match offer {
+                            RetryOffer::Offered => {
+                                theme::secondary_button(ui, CONTINUE_OFFLINE_LABEL).clicked()
+                            }
+                            RetryOffer::Spent => {
+                                theme::primary_button(ui, CONTINUE_OFFLINE_LABEL, None).clicked()
+                            }
+                        };
+                        open_local_copy |= pressed;
                     }
                 }
             });
@@ -546,7 +693,7 @@ pub fn draw_first_window_body(
 
     draw_footer(ui, full, &footer);
 
-    FirstWindowOutcome { chrome, retry }
+    FirstWindowOutcome { chrome, retry, open_local_copy }
 }
 
 /// "Taking longer than usual — 12 s", with a real number in it.
@@ -568,11 +715,29 @@ fn content_height(body: FirstWindowBody) -> f32 {
         FirstWindowBody::Unreachable { .. } => BADGE_SIZE + BADGE_TO_LABEL,
     };
     let mut height = head + TITLE_SIZE * 1.4 + TITLE_TO_SUB + SUB_SIZE * 1.4;
-    if let FirstWindowBody::Unreachable { retry } = body {
+    // The line about the local copy, on whichever body is offering it. One
+    // wrapped line either way -- both forms fit [`COPY_WIDTH`] at 13px.
+    if matches!(
+        body,
+        FirstWindowBody::Slow { local: LocalCopy::Here { .. }, .. }
+            | FirstWindowBody::Unreachable { local: LocalCopy::Here { .. }, .. }
+    ) {
+        height += TITLE_TO_SUB + SUB_SIZE * 1.4;
+    }
+    if let FirstWindowBody::Slow { local: LocalCopy::Here { .. }, .. } = body {
+        height += BLOCK_GAP + theme::BUTTON_HEIGHT;
+    }
+    if let FirstWindowBody::Unreachable { retry, local } = body {
         // The copy is two or three wrapped lines rather than one.
         height += SUB_SIZE * 1.4 * 2.0;
         if retry == RetryOffer::Offered {
             height += BLOCK_GAP + theme::BUTTON_HEIGHT;
+        }
+        if local != LocalCopy::None {
+            height += match retry {
+                RetryOffer::Offered => BUTTON_GAP,
+                RetryOffer::Spent => BLOCK_GAP,
+            } + theme::BUTTON_HEIGHT;
         }
     }
     height
@@ -1081,13 +1246,34 @@ mod first_window_body_tests {
         out
     }
 
-    /// The bodies this window can show, in the order it can show them.
-    fn all_bodies() -> [FirstWindowBody; 4] {
+    /// Three hours, as an elapsed span. **Never a date**: the age these
+    /// bodies render is a `Duration` the host has already worked out, so a
+    /// fixture cannot rot into a different picture next year.
+    const THREE_HOURS: Duration = Duration::from_secs(3 * 3600);
+
+    /// A copy on this machine whose age is known.
+    const COPY_HERE: LocalCopy = LocalCopy::Here { synced: Some(THREE_HOURS) };
+
+    /// The bodies this window can show, in the order it can show them --
+    /// **each with and without a local copy**, because the offline
+    /// affordances change the height of the stack and the whole-frame
+    /// assertions below are about a stack that fits.
+    fn all_bodies() -> [FirstWindowBody; 8] {
         [
             FirstWindowBody::Loading,
-            FirstWindowBody::Slow { seconds: 12 },
-            FirstWindowBody::Unreachable { retry: RetryOffer::Offered },
-            FirstWindowBody::Unreachable { retry: RetryOffer::Spent },
+            FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None },
+            FirstWindowBody::Slow { seconds: 12, local: COPY_HERE },
+            FirstWindowBody::Unreachable {
+                retry: RetryOffer::Offered,
+                local: LocalCopy::None,
+            },
+            FirstWindowBody::Unreachable { retry: RetryOffer::Offered, local: COPY_HERE },
+            FirstWindowBody::Unreachable { retry: RetryOffer::Spent, local: LocalCopy::None },
+            FirstWindowBody::Unreachable { retry: RetryOffer::Spent, local: COPY_HERE },
+            FirstWindowBody::Unreachable {
+                retry: RetryOffer::Offered,
+                local: LocalCopy::Here { synced: None },
+            },
         ]
     }
 
@@ -1100,22 +1286,50 @@ mod first_window_body_tests {
     #[test]
     fn the_slow_body_waits_for_the_threshold() {
         assert_eq!(
-            waiting_body(std::time::Duration::ZERO),
+            waiting_body(Duration::ZERO, LocalCopy::None),
             FirstWindowBody::Loading,
             "the first frame already claims the wait is unusual"
         );
         assert_eq!(
-            waiting_body(SLOW_AFTER - std::time::Duration::from_millis(1)),
+            waiting_body(SLOW_AFTER - Duration::from_millis(1), LocalCopy::None),
             FirstWindowBody::Loading,
             "the threshold fires early"
         );
         assert_eq!(
-            waiting_body(SLOW_AFTER),
-            FirstWindowBody::Slow { seconds: 3 },
+            waiting_body(SLOW_AFTER, LocalCopy::None),
+            FirstWindowBody::Slow { seconds: 3, local: LocalCopy::None },
             "the threshold never fires, so a wedged launch shows `Loading your vault` for the \
              whole readiness deadline and says nothing about why"
         );
-        assert_eq!(SLOW_AFTER, std::time::Duration::from_secs(3));
+        assert_eq!(SLOW_AFTER, Duration::from_secs(3));
+    }
+
+    /// **The threshold does not consult the disk, and the ordinary body
+    /// offers nothing.**
+    ///
+    /// `waiting_body` carries `local` through untouched: a copy on this
+    /// machine is not a reason to call a one-second wait slow, and a wait that
+    /// has only just started must not already be telling the user to give up
+    /// on it. Design 7a draws no button, whatever is on the disk.
+    #[test]
+    fn a_local_copy_does_not_move_the_threshold_and_7a_still_offers_nothing() {
+        assert_eq!(
+            waiting_body(Duration::ZERO, COPY_HERE),
+            FirstWindowBody::Loading,
+            "a copy on the disk made the ordinary wait skip straight to the slow body"
+        );
+        assert_eq!(
+            waiting_body(SLOW_AFTER, COPY_HERE),
+            FirstWindowBody::Slow { seconds: 3, local: COPY_HERE },
+            "the slow body was handed a different local-copy answer than it was given"
+        );
+        let painted = rendered(&frame(FirstWindowBody::Loading));
+        for absent in [OPEN_LOCAL_LABEL, CONTINUE_OFFLINE_LABEL] {
+            assert!(
+                !painted.contains(absent),
+                "the ordinary loading body offers {absent:?} on its first frame: {painted:?}"
+            );
+        }
     }
 
     /// **The number is the elapsed time, not decoration.**
@@ -1128,12 +1342,13 @@ mod first_window_body_tests {
     fn the_seconds_shown_are_the_seconds_elapsed() {
         for (millis, want) in [(3_000u64, 3u64), (3_999, 3), (12_400, 12), (61_000, 61)] {
             assert_eq!(
-                waiting_body(std::time::Duration::from_millis(millis)),
-                FirstWindowBody::Slow { seconds: want },
+                waiting_body(Duration::from_millis(millis), LocalCopy::None),
+                FirstWindowBody::Slow { seconds: want, local: LocalCopy::None },
                 "{millis}ms is reported as something other than {want} s"
             );
         }
-        let painted = rendered(&frame(FirstWindowBody::Slow { seconds: 12 }));
+        let painted =
+            rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }));
         assert!(
             painted.contains("12 s"),
             "the slow body renders no elapsed time at all, so the one number on the screen \
@@ -1256,18 +1471,21 @@ mod first_window_body_tests {
         );
     }
 
-    /// **What the unreachable body offers, and what it must not pretend to.**
+    /// **What the unreachable body offers with nothing on the disk, and what
+    /// it must not pretend to.**
     ///
-    /// Design 7b draws *Continue offline* and "last synced 2 h ago". Both need
-    /// the encrypted vault disk cache, which is a plan and not a module. This
-    /// screen therefore offers Retry and says plainly that the vault cannot be
-    /// opened -- rather than a greyed *Continue offline*, which
-    /// `prefs_ui::draw_not_yet` records as looking "like a feature that is
-    /// present and broken".
+    /// Design 7b draws *Continue offline* and "last synced 2 h ago", and both
+    /// describe a file. When there is no usable file -- the setting is off, or
+    /// none was ever written, or one was rejected on its header and deleted --
+    /// this screen offers Retry and **nothing else**: not a greyed *Continue
+    /// offline*, which `prefs_ui::draw_not_yet` records as looking "like a
+    /// feature that is present and broken", and not a "last synced" line over
+    /// a copy that is not there.
     #[test]
-    fn the_unreachable_body_offers_only_what_this_app_can_actually_do() {
+    fn with_no_local_copy_the_unreachable_body_offers_only_retry() {
         let painted = rendered(&frame(FirstWindowBody::Unreachable {
             retry: RetryOffer::Offered,
+            local: LocalCopy::None,
         }));
         assert!(
             painted.contains("reach Bitwarden"),
@@ -1278,12 +1496,73 @@ mod first_window_body_tests {
             "the unreachable body has no Retry, which is the only thing this screen can \
              actually do about the failure it is reporting: {painted:?}"
         );
-        for absent in ["Continue offline", "local copy", "last synced", "offline"] {
+        for absent in [CONTINUE_OFFLINE_LABEL, OPEN_LOCAL_LABEL, "this machine"] {
             assert!(
                 !painted.contains(absent),
-                "the unreachable body says {absent:?}. There is no vault disk cache in this \
-                 crate -- it is a plan -- so every one of these is a promise the app cannot \
-                 keep: {painted:?}"
+                "the unreachable body says {absent:?} with no copy on this machine to open. \
+                 Every one of these is a promise the app cannot keep: {painted:?}"
+            );
+        }
+    }
+
+    /// **The copy is offered, and its age is the vault window's own wording.**
+    ///
+    /// Design 7b's "last synced 2 h ago", drawn from the file's real age.
+    /// The wording is `vault_window::cache_age_text`, which is what the
+    /// toolbar pill says over the same file a moment later -- asserted here
+    /// against the formatter rather than against a literal, so the two cannot
+    /// be changed apart.
+    #[test]
+    fn a_local_copy_is_offered_with_the_age_the_vault_window_would_report() {
+        let painted = rendered(&frame(FirstWindowBody::Unreachable {
+            retry: RetryOffer::Offered,
+            local: COPY_HERE,
+        }));
+        assert!(
+            painted.contains(CONTINUE_OFFLINE_LABEL),
+            "there is a readable copy on this machine and the failure body does not offer it, \
+             which is the whole of what the disk cache bought this screen: {painted:?}"
+        );
+        assert!(
+            painted.contains("Retry"),
+            "offering the copy took away the Retry, so a user whose network came back has no \
+             way to ask again: {painted:?}"
+        );
+        let age = crate::vault_window::cache_age_text(THREE_HOURS);
+        assert!(
+            painted.contains(&age),
+            "the copy's age is not on screen as {age:?}, so the user is asked to open a vault \
+             without being told how old it is: {painted:?}"
+        );
+    }
+
+    /// **A copy whose age is unknown is still offered, and no age is
+    /// invented.**
+    ///
+    /// The cancelled-Hello state: the file is there, this session never read
+    /// its header, so there is no `written_at` to report. The button stays --
+    /// pressing it asks for the key again -- and the line says what that
+    /// costs instead of guessing a number.
+    #[test]
+    fn a_copy_with_no_known_age_is_offered_without_one_being_made_up() {
+        let painted = rendered(&frame(FirstWindowBody::Unreachable {
+            retry: RetryOffer::Offered,
+            local: LocalCopy::Here { synced: None },
+        }));
+        assert!(
+            painted.contains(CONTINUE_OFFLINE_LABEL),
+            "a dismissed fingerprint prompt hid the local copy the user still has, which is \
+             the accident this state exists for: {painted:?}"
+        );
+        assert!(
+            painted.contains("Windows Hello"),
+            "nothing says why this one needs a prompt: {painted:?}"
+        );
+        for invented in ["just written", "old", "ago"] {
+            assert!(
+                !painted.contains(invented),
+                "an age was rendered as {invented:?} for a file whose header this session \
+                 never read: {painted:?}"
             );
         }
     }
@@ -1293,6 +1572,7 @@ mod first_window_body_tests {
     fn a_spent_retry_leaves_no_button_behind() {
         let painted = rendered(&frame(FirstWindowBody::Unreachable {
             retry: RetryOffer::Spent,
+            local: LocalCopy::None,
         }));
         assert!(
             !painted.contains("Retry"),
@@ -1302,6 +1582,56 @@ mod first_window_body_tests {
         assert!(
             painted.contains("reach Bitwarden"),
             "and the screen still has to say what happened: {painted:?}"
+        );
+    }
+
+    /// **With the retries spent and a copy on the disk, exactly one button is
+    /// left.**
+    ///
+    /// The other half of the state above: "no button at all" was the honest
+    /// answer while there was nothing else this screen could do, and it stops
+    /// being the answer the moment there is. Retry is still gone -- its
+    /// attempts really are spent -- and *Continue offline* is what is left.
+    #[test]
+    fn a_spent_retry_over_a_local_copy_leaves_the_copy() {
+        let painted = rendered(&frame(FirstWindowBody::Unreachable {
+            retry: RetryOffer::Spent,
+            local: COPY_HERE,
+        }));
+        assert!(
+            !painted.contains("Retry"),
+            "a spent Retry came back because a copy was on the disk: {painted:?}"
+        );
+        assert!(
+            painted.contains(CONTINUE_OFFLINE_LABEL),
+            "every attempt is spent and there is a readable copy on this machine, and the \
+             screen's only advice is to close the window: {painted:?}"
+        );
+    }
+
+    /// **The slow body's own way out** -- design 7b's *Open the local copy*,
+    /// under a bar that is still moving.
+    ///
+    /// Its own label and not *Continue offline*: this wait has not failed, so
+    /// leaving it is a choice and not a consolation. Both report through the
+    /// one [`FirstWindowOutcome::open_local_copy`] field.
+    #[test]
+    fn the_slow_body_offers_the_copy_only_when_there_is_one() {
+        let with = rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: COPY_HERE }));
+        assert!(
+            with.contains(OPEN_LOCAL_LABEL),
+            "a wait that has been going twelve seconds over a readable local copy offers no \
+             way into it: {with:?}"
+        );
+        assert!(
+            with.contains("12 s"),
+            "and it still has to say how long it has been: {with:?}"
+        );
+        let without =
+            rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }));
+        assert!(
+            !without.contains(OPEN_LOCAL_LABEL),
+            "the slow body offers a local copy that is not on this machine: {without:?}"
         );
     }
 
@@ -1409,7 +1739,10 @@ mod first_window_body_tests {
     /// frames off the clock rather than at zero.
     #[test]
     fn the_waiting_bodies_draw_the_designs_bar_and_not_a_disc() {
-        for body in [FirstWindowBody::Loading, FirstWindowBody::Slow { seconds: 12 }] {
+        for body in [
+            FirstWindowBody::Loading,
+            FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None },
+        ] {
             let ctx = styled_ctx();
             let input = egui::RawInput {
                 time: Some(f64::from(crate::theme::BAR_PERIOD) / 4.0),
@@ -1455,7 +1788,10 @@ mod first_window_body_tests {
     /// every assertion there.
     #[test]
     fn the_unreachable_body_draws_no_bar_because_nothing_is_running() {
-        let output = frame(FirstWindowBody::Unreachable { retry: RetryOffer::Offered });
+        let output = frame(FirstWindowBody::Unreachable {
+            retry: RetryOffer::Offered,
+            local: LocalCopy::None,
+        });
         let filled = filled_rects(&output);
         assert!(
             !filled.iter().any(|(rect, colour)| *colour == crate::theme::HAIRLINE

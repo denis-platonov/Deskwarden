@@ -70,6 +70,26 @@ This also finishes the job the save-memory setting started. With both on,
 turning the backend off no longer means the first operation after a restart
 pays that eight-second cold start.
 
+### The waiting screens can now open that copy
+
+When the backend is slow to answer, the "Still syncing with Bitwarden" screen
+offers **Open the local copy**; when it does not answer at all, the
+"Couldn't reach Bitwarden" screen offers **Continue offline**. Both say how
+old the copy is, in the same words the vault window's own pill uses -- "Your
+copy on this machine - 3 h old" -- so you are told what you are opening before
+you open it. Retry is still there and still comes first while it has attempts
+left; once they are spent, continuing offline is what is left.
+
+If you dismissed the Windows Hello prompt earlier in the session, the copy is
+still offered: the file has not been touched, and the button asks for the
+prompt again rather than pretending the copy is gone. That is the only place a
+dismissed prompt is re-asked, and only because you pressed the button.
+Opening the copy this way does not rewrite it, so its age stays honest.
+
+Where there is genuinely nothing to open -- the setting is off, no copy has
+been written yet, or one was refused and deleted -- **no button is drawn at
+all**. Not a greyed one, and not a "coming soon".
+
 ### A login start goes to the tray; a double-click shows the window
 
 Deskwarden could not tell the two apart. The installer's autostart entry ran

@@ -551,6 +551,50 @@ impl DiskCache {
         self.lock_key().key.is_some()
     }
 
+    /// **Whether a copy is sitting on this machine that this session declined
+    /// to open.**
+    ///
+    /// The one state [`DiskCacheLoad`] cannot express. A cancelled Hello
+    /// prompt answers [`DiskCacheLoad::Unavailable`] and sets `given_up`, and
+    /// the file is still there, untouched -- unlike
+    /// [`DiskCacheLoad::Rejected`], which has already deleted it, and unlike
+    /// [`DiskCacheLoad::Absent`], where there was never one. A caller that
+    /// reads only the load outcome therefore cannot tell "there is no local
+    /// copy" from "there is one and you dismissed the fingerprint prompt",
+    /// and the offline screens would tell a user who fumbled a prompt that
+    /// their vault copy does not exist.
+    ///
+    /// `given_up` **and** the file, both: `given_up` alone would answer `true`
+    /// on a machine with no file at all, which is the same lie in the other
+    /// direction. The key is never re-derived on its own (see `KeyState`'s
+    /// "not retried for the rest of the session"), so this stays `true` until
+    /// something asks for the key again on the user's behalf -- which is
+    /// exactly what the button this feeds does.
+    pub fn declined_copy_on_disk(&self) -> bool {
+        self.lock_key().given_up && self.lock_paths().file.exists()
+    }
+
+    /// **Lets one more Hello prompt happen**, after a cancelled or failed one.
+    ///
+    /// `given_up` exists so a refusal is never retried *on its own* -- see
+    /// `KeyState`: a retry at the next write would pop a biometric prompt out
+    /// of nowhere while the user was editing an item. That reasoning is about
+    /// prompts nobody asked for, and it is the only reasoning `given_up`
+    /// carries. It says nothing about a user pressing a button labelled
+    /// *Continue offline*, which is a request for exactly this prompt, at
+    /// exactly this moment.
+    ///
+    /// So this is not a loosening of that rule: it is the one gesture the rule
+    /// was never about. Without it, a fingerprint prompt dismissed by accident
+    /// would put the local copy out of reach for the rest of the session while
+    /// the screen went on offering it -- a button that does nothing, which is
+    /// the treatment `prefs_ui::draw_not_yet` refuses.
+    ///
+    /// Only ever called from a user's own press.
+    pub fn allow_one_more_key_attempt(&self) {
+        self.lock_key().given_up = false;
+    }
+
     fn ensure_key(&self, state: &mut KeyState) -> Result<[u8; 32], String> {
         if let Some(key) = state.key {
             return Ok(key);
@@ -866,6 +910,7 @@ fn derive_key(signature: &[u8]) -> Zeroizing<[u8; 32]> {
 pub(crate) mod tests {
     use super::*;
     use crate::vault_bridge::{Folder, VaultItem};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn key(seed: u8) -> [u8; 32] {
         [seed; 32]
@@ -904,6 +949,13 @@ pub(crate) mod tests {
         let cache = DiskCache::new(dir, env(key_seven));
         cache.acquire_key().expect("the substituted Hello step cannot fail");
         cache
+    }
+
+    /// A cache over `dir` whose Hello step always refuses -- the shape of a
+    /// session where the user cancelled the prompt. Nothing it does derives a
+    /// key, so no test using it can reach a real biometric.
+    pub(crate) fn cache_that_declines_hello(dir: &Path) -> DiskCache {
+        DiskCache::new(dir, env(hello_cancelled))
     }
 
     fn item(id: &str) -> VaultItem {
@@ -1426,6 +1478,99 @@ pub(crate) mod tests {
         assert!(
             second.contains("earlier in this session"),
             "a refused acquisition was retried: {second}"
+        );
+    }
+
+    /// **The state `DiskCacheLoad` cannot express**, which is what the offline
+    /// screens read: the prompt was declined and the file is still there.
+    ///
+    /// Driven through the same seam as the test above, because the two are
+    /// one situation: `Unavailable` is what the *load* says, and this is what
+    /// is left on the disk afterwards.
+    #[test]
+    fn a_declined_prompt_over_a_real_file_is_visible_as_a_copy_that_is_still_there() {
+        let dir = temp_dir_for("declined");
+        let snap = snapshot();
+        write_file_with_key(
+            &dir,
+            &key(7),
+            &header_at(now_unix(), "fp", FORMAT_VERSION),
+            &snap,
+        );
+
+        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        assert!(
+            !cache.declined_copy_on_disk(),
+            "a copy was reported as declined before anything had asked for a key"
+        );
+        assert!(matches!(cache.load("fp"), DiskCacheLoad::Unavailable(_)));
+        assert!(
+            cache.declined_copy_on_disk(),
+            "the user's copy is sitting on the disk after a cancelled prompt and nothing says \
+             so, which is how a fumbled fingerprint becomes `there is no local copy`"
+        );
+    }
+
+    /// **Both halves are required**, and this is the other one: a session that
+    /// gave up on a machine with no file has no copy to offer.
+    #[test]
+    fn a_declined_prompt_with_no_file_offers_nothing() {
+        let dir = temp_dir_for("declined-nofile");
+        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        assert!(cache.acquire_key().is_err());
+        assert!(
+            !cache.declined_copy_on_disk(),
+            "a refused prompt on a machine with no cache file was reported as a local copy"
+        );
+    }
+
+    /// **One more attempt, and only when something asks for it.**
+    ///
+    /// `given_up` is not retried on its own -- the test above pins that. This
+    /// pins the other half: the user pressing *Continue offline* is allowed to
+    /// spend one more prompt, and a copy that then opens really opens.
+    #[test]
+    fn a_refusal_can_be_taken_back_by_an_explicit_request() {
+        let dir = temp_dir_for("retry-key");
+        let snap = snapshot();
+        write_file_with_key(
+            &dir,
+            &key(7),
+            &header_at(now_unix(), "fp", FORMAT_VERSION),
+            &snap,
+        );
+
+        // Refuses once, then answers -- the shape of a user who cancelled the
+        // prompt and then asked for the copy. A `static` counter rather than a
+        // capturing closure, because the seam is an `fn` pointer.
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        fn once_refusing() -> Result<Zeroizing<[u8; 32]>, String> {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("Windows Hello was cancelled.".to_string());
+            }
+            key_seven()
+        }
+
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        let cache = DiskCache::new(&dir, env(once_refusing));
+        assert!(matches!(cache.load("fp"), DiskCacheLoad::Unavailable(_)));
+        assert!(cache.declined_copy_on_disk());
+
+        // Without this the second load never reaches the seam at all.
+        cache.allow_one_more_key_attempt();
+        match cache.load("fp") {
+            DiskCacheLoad::Loaded { items, .. } => assert_eq!(items.len(), 1),
+            other => panic!("the copy did not open after the user asked again: {other:?}"),
+        }
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            2,
+            "the second attempt did not reach Windows Hello, so the button would have done \
+             nothing"
+        );
+        assert!(
+            !cache.declined_copy_on_disk(),
+            "the copy still reports itself as declined after it opened"
         );
     }
 
