@@ -16,8 +16,9 @@ keystroke fallback for windows that don't expose a usable automation tree). It
 never touches your vault's encryption: credentials originate only from the
 official Bitwarden CLI's local `bw serve` HTTP bridge, running as a separate
 process on your own machine, and all writes and sync go through it; reads are
-served from an in-memory snapshot of what the CLI returned, held only while
-the vault is unlocked.
+served from an in-memory snapshot of what the CLI returned. That snapshot is
+memory-only unless you turn on the encrypted disk copy described under
+**Security notes** below, which is off by default.
 
 ## Requirements
 
@@ -111,6 +112,22 @@ a previous run).
   read (which returns your whole vault in one payload). None of these are
   wiped after use, and the memory they occupied can persist until the process
   exits.
+- **Off by default:** "Keep an encrypted copy of your vault on this PC"
+  (Preferences → General) also writes that snapshot to `vault-cache.bin`, in
+  the active account's own directory beside its `session.bin` and `hello.bin`.
+  The file holds your usernames, passwords, notes and two-factor secrets. A
+  random content key encrypts it with AES-256-GCM; that key is sealed under a
+  key derived from a Windows Hello signature, whose private half lives in this
+  PC's TPM, and the whole thing is DPAPI-wrapped for this Windows user as
+  `session.bin` and `hello.bin` are. The TPM binding is what DPAPI alone
+  cannot give: a copied disk plus your Windows account password yields the
+  file's header and two ciphertexts and nothing else. Anything running as you
+  on this PC that can pass Windows Hello can read it. It is **not** deleted
+  when the vault locks — surviving a restart is what it is for — and is
+  deleted on log out, on any master-password re-prompt, and when the setting
+  is turned off. It is refused and deleted after seven days, on a change of
+  account, or if it cannot be opened. The setting is unavailable without
+  Windows Hello, and no weaker file is written instead.
 - `bw serve` binds only to localhost and is placed in a Windows job object that
   terminates it if this app exits for any reason — including a crash — so an
   unlocked vault is never left served in the background.

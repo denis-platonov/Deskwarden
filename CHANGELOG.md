@@ -10,6 +10,48 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Keep an encrypted copy of your vault on this PC (off by default)
+
+Deskwarden starts unlocked from a cached session token, but the vault itself
+is rebuilt on every launch by asking the Bitwarden backend for it -- and that
+backend is a bundled Node process whose cold start is about eight seconds.
+Autofill is dead for those eight seconds; so is the vault window's content.
+
+A new setting, **Preferences -> General -> "Keep an encrypted copy of your
+vault on this PC"**, keeps that snapshot in a file so the next launch reads it
+in milliseconds instead. It is **off by default**, and with it off no file is
+written at all.
+
+What gates the file, because that is the part worth reading before turning it
+on. The copy holds your usernames, passwords, notes and two-factor secrets. A
+random key encrypts it; that key is sealed under a key only a Windows Hello
+verification can produce, whose private half lives in this PC's TPM chip; and
+the whole thing is wrapped for your Windows account exactly as the cached
+session token already is. So a copied or stolen disk cannot be read on another
+machine even with your Windows password -- which is the one thing the wrapping
+alone could not promise, and the whole reason the setting exists in this shape.
+Anything running as you on this PC that can pass Windows Hello can read it.
+
+It is **not** deleted when your vault locks: surviving a restart is what it is
+for. It is deleted when you log out, whenever you are asked for your master
+password again, and when you turn the setting off; and it is refused and
+deleted if it is more than seven days old, belongs to a different account, was
+written by a different version, or cannot be opened. Each of those is decided
+before Windows Hello is asked for anything, so a file Deskwarden is about to
+throw away never costs you a fingerprint.
+
+Without Windows Hello the setting is unavailable and says why. Deskwarden does
+not offer a weaker file under the same description.
+
+The vault window's sync pill knows the difference between a snapshot and a
+sync: a vault restored from the file reads "Loaded from cache - 3 h old" until
+a sync actually succeeds in that session, and a failed sync keeps the age in
+view rather than collapsing to a bare failure.
+
+This also finishes the job the save-memory setting started. With both on,
+turning the backend off no longer means the first operation after a restart
+pays that eight-second cold start.
+
 ### A login start goes to the tray; a double-click shows the window
 
 Deskwarden could not tell the two apart. The installer's autostart entry ran
