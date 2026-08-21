@@ -10,6 +10,30 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### A vault snapshot can be restored without asking the backend for it
+
+`VaultCache` gained `populate_with_vault`: a caller that already holds the
+whole vault — items *and* folders — can write it into the cache with no HTTP
+round-trip at all. Until now the closest door, `populate_with`, still fetched
+the folders itself, so "seed this cache with what I already have" was
+impossible to say. The encrypted disk cache needs exactly this to restore a
+snapshot from disk at startup, and the test suite needed it sooner: every
+fixture that wanted a populated cache was standing up a local HTTP server for
+one folder request whose answer it already knew.
+
+Nothing about the cache's rules changed. There is still exactly one place a
+snapshot is written back, the era guard and the replay of newer local writes
+still run there, and `clear` is still the only thing that begins an era — the
+fetching entry points are now thin wrappers over that one place rather than
+being it.
+
+The visible effect is a test suite that no longer flakes on the network in
+places that never had anything to do with the network. Several fixtures now
+point the cache at an address that is dead for the life of the process, which
+turns "this code path reads the in-memory snapshot and does not call the
+backend" from a comment into something that fails loudly when it stops being
+true.
+
 ### Updates has a Preferences page of its own, and About is simple again
 
 Everything about updating was split across two pages: the switch that decides

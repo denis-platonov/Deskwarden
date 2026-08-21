@@ -1609,23 +1609,21 @@ mod tests {
 
     #[test]
     fn load_items_for_picker_reads_a_populated_cache_without_touching_the_backend() {
-        // Only `/list/object/folders` is mocked, for `populate_with`'s own
-        // setup call below -- `/list/object/items` deliberately is not: if
-        // `load_items_for_picker` fell back to a live populate instead of
-        // trusting the already-populated cache, that unmocked request would
-        // come back as an error and the assertion below would fail.
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
-        assert_eq!(
-            cache.populate_with(vec![item("Alpha")], cache.epoch()).unwrap(),
-            PopulateOutcome::Populated
-        );
+        // NOTHING is mocked, because there is no server: the cache is seeded
+        // in memory and its bridge points at a permanently dead address (see
+        // `crate::test_vault`). If `load_items_for_picker` fell back to a
+        // live populate instead of trusting the already-populated cache, that
+        // request would fail and the assertion below would fail with it.
+        //
+        // This test used to mock `/list/object/folders` alone, for the
+        // seeding populate's own folder fetch, and rely on
+        // `/list/object/items` being left unmocked. That is weaker than it
+        // looks once a server exists at all: an unmocked route on a live
+        // mockito server answers 501 rather than refusing, and mockito 1.7
+        // pools its servers, so the port is shared with the rest of the
+        // suite. A dead address removes both problems and makes the name of
+        // this test literally true.
+        let cache = crate::test_vault::cache_with_items(vec![item("Alpha")]);
 
         let result = load_items_for_picker(&cache, cache.epoch().era());
 
@@ -1700,18 +1698,7 @@ mod tests {
         // The other half of the Minor 5 fix: a populated cache with zero
         // items (new user, healthy backend) must not be conflated with the
         // backend-unreachable case above.
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
-        assert_eq!(
-            cache.populate_with(vec![], cache.epoch()).unwrap(),
-            PopulateOutcome::Populated
-        );
+        let cache = crate::test_vault::cache_with_items(vec![]);
 
         let result = load_items_for_picker(&cache, cache.epoch().era());
 
@@ -1728,23 +1715,10 @@ mod tests {
         // vault, and saying "your vault doesn't have any items yet" about a
         // vault full of items would be a fresh instance of the exact
         // misdiagnosis reviews 10 and 14 removed from this very function.
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
-        assert_eq!(
-            cache
-                .populate_with(
-                    vec![item_of_type("Wifi", Some(2)), item_of_type("Visa", Some(3))],
-                    cache.epoch()
-                )
-                .unwrap(),
-            PopulateOutcome::Populated
-        );
+        let cache = crate::test_vault::cache_with_items(vec![
+            item_of_type("Wifi", Some(2)),
+            item_of_type("Visa", Some(3)),
+        ]);
 
         let result = load_items_for_picker(&cache, cache.epoch().era());
 
@@ -1760,23 +1734,10 @@ mod tests {
         // list, not merely available as a helper nothing calls -- this
         // plan's recurring failure shape is a change correct in isolation
         // that never reaches the behaviour it claims.
-        let mut server = mockito::Server::new();
-        let _folders = server
-            .mock("GET", "/list/object/folders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(folders_body())
-            .create();
-        let cache = cache_for(server.url());
-        assert_eq!(
-            cache
-                .populate_with(
-                    vec![item_of_type("Wifi", Some(2)), item_of_type("Site", Some(1))],
-                    cache.epoch()
-                )
-                .unwrap(),
-            PopulateOutcome::Populated
-        );
+        let cache = crate::test_vault::cache_with_items(vec![
+            item_of_type("Wifi", Some(2)),
+            item_of_type("Site", Some(1)),
+        ]);
 
         match load_items_for_picker(&cache, cache.epoch().era()) {
             PickerItemsResult::Items(items) => {

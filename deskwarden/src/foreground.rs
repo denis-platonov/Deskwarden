@@ -1030,7 +1030,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 53] = [
+        const OPENS_NO_WINDOW: [&str; 54] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1172,6 +1172,11 @@ mod tests {
             // DISAPPEARS on the outgoing side is whichever one that process
             // already had. This module opens none and raises none.
             "single_instance",
+            // Test-only at its declaration in `lib.rs`, like `below_cut`, and
+            // four functions long: it builds a `VaultCache` and writes a
+            // snapshot the caller already holds into it. It draws nothing,
+            // owns no window, and cannot ship.
+            "test_vault",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker
