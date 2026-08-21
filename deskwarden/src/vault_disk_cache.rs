@@ -726,6 +726,40 @@ impl DiskCache {
     }
 }
 
+/// Removes the encrypted copy in `dir`, for an account that is **logging
+/// out**.
+///
+/// The exact twin of `hello::unenroll_for`, called in the same breath and for
+/// the stronger version of its reason: a sealed master password for an
+/// account the CLI no longer knows is a liability, and a decrypted dump of
+/// that same account's vault is a larger one. Log out is not lock -- it means
+/// the account is gone from this machine -- so this is one of the two places
+/// the file is deleted rather than left.
+///
+/// **A free function, and the only one here that does not go through
+/// [`DiskCache`].** The rule that keeps this feature honest is that exactly
+/// one place *reasons about* the file -- what it holds, when it is written,
+/// whether it may still be read -- and `VaultCache` is still that place. The
+/// login window has no `VaultCache` and cannot be given one without threading
+/// a vault through a window whose entire subject is not having a session yet;
+/// what it does have is the account it is logging out, which is all removing
+/// a file needs. Errors are logged rather than returned for the same reason
+/// `unenroll_for` returns nothing: the account is going either way, and the
+/// window that would show the error is about to be replaced by a sign-in
+/// card.
+pub fn forget_for(dir: &Path) {
+    for name in [FILE_NAME, TMP_FILE_NAME] {
+        if let Err(e) = std::fs::remove_file(dir.join(name)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::error!(
+                    "could not delete the encrypted vault copy at {}: {e}",
+                    dir.join(name).display()
+                );
+            }
+        }
+    }
+}
+
 /// Runs the Hello-gated signature and derives this module's AES key from it.
 /// This is the step that pops the OS verification dialog.
 ///
@@ -1490,6 +1524,36 @@ pub(crate) mod tests {
         cache.delete().unwrap();
         assert!(!second.join(FILE_NAME).exists());
         assert!(first.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn forgetting_an_account_removes_its_copy_and_touches_no_other() {
+        // The log-out path. It takes a directory rather than a `DiskCache`
+        // because the login window has an account and no vault -- and the
+        // directory it is given had better be the only one it reaches.
+        let doomed = temp_dir_for("forget-doomed");
+        let survivor = temp_dir_for("forget-survivor");
+        let snap = snapshot();
+        let cache = cache_with_key(&doomed);
+        cache.write("fp", &snap.items, &snap.folders).unwrap();
+        let survivors_cache = cache_with_key(&survivor);
+        survivors_cache.write("fp2", &snap.items, &snap.folders).unwrap();
+        std::fs::write(doomed.join(TMP_FILE_NAME), b"a crash left this").unwrap();
+
+        forget_for(&doomed);
+        assert!(!doomed.join(FILE_NAME).exists());
+        assert!(
+            !doomed.join(TMP_FILE_NAME).exists(),
+            "a half-written copy of the logged-out account's vault was left behind"
+        );
+        assert!(
+            survivor.join(FILE_NAME).exists(),
+            "logging one account out deleted another account's copy"
+        );
+
+        // Idempotent: an account with no copy is not an error.
+        forget_for(&doomed);
+        assert!(!doomed.join(FILE_NAME).exists());
     }
 
     #[test]

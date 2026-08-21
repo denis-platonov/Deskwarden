@@ -58,7 +58,8 @@ use deskwarden::app_match::AppMatch;
 use deskwarden::app_window;
 use deskwarden::{
     fill_stats, hotkey, job_object, logging, login_ui, picker_ui,
-    prefs_ui, session_store, settings, tray, vault_window, window_watch,
+    prefs_ui, session_store, settings, tray, vault_disk_cache, vault_window,
+    window_watch,
 };
 use semver::Version;
 use std::cell::RefCell;
@@ -625,7 +626,51 @@ fn main() {
     // directly: startup's readiness check, the picker's item list, and the
     // periodic match-engine refresh all still want the live server rather
     // than a snapshot that's deliberately not re-fetched on every read.
-    let cache = Arc::new(VaultCache::new(vault.clone()));
+    //
+    // **With the optional encrypted disk file**, which is inert unless
+    // `Settings::cache_vault_to_disk` is on -- see `vault_disk_cache`. It
+    // lives inside the active account's own directory, beside that account's
+    // `session.bin` and `hello.bin`, never in the shared config root: one
+    // file per account, so a switch cannot have one account's vault written
+    // over another's.
+    let cache = Arc::new(VaultCache::with_disk_cache(
+        vault.clone(),
+        vault_disk_cache::DiskCache::new(
+            &disk_cache_dir(&config_dir, active_account.as_ref()),
+            vault_disk_cache::DiskCacheEnv::production(),
+        ),
+        disk_cache_fingerprint(active_account.as_ref()),
+        settings.cache_vault_to_disk,
+    ));
+    // **Before anything spawns `bw serve`.** A usable file means the vault
+    // window has something to paint and the match engine has something to
+    // arm from in milliseconds, instead of after the backend's ~8 s cold
+    // start. Every failure mode here falls through to exactly the path that
+    // existed before this feature; none of them is a reason the app cannot
+    // start, and none of them blocks.
+    //
+    // The outcomes are logged rather than collapsed to a bool because they
+    // are not the same event and they have already left the file in
+    // different states by the time this returns: `Rejected` and `Corrupt`
+    // deleted it, `Unavailable` deliberately did not.
+    match cache.load_from_disk() {
+        vault_disk_cache::DiskCacheLoad::Loaded { written_at, .. } => log::info!(
+            "the vault was restored from the encrypted disk cache ({} item(s), written {} ago)",
+            cache.items().len(),
+            vault_window::relative_time::ago(written_at.elapsed().unwrap_or_default())
+        ),
+        vault_disk_cache::DiskCacheLoad::Absent => {}
+        vault_disk_cache::DiskCacheLoad::Rejected(reason) => log::info!(
+            "the encrypted vault cache was discarded and deleted: it is {}",
+            reason.as_str()
+        ),
+        vault_disk_cache::DiskCacheLoad::Unavailable(e) => log::info!(
+            "not using the encrypted vault cache this session ({e}); the file is left in place"
+        ),
+        vault_disk_cache::DiskCacheLoad::Corrupt(e) => {
+            log::warn!("the encrypted vault cache could not be opened ({e}); it was deleted")
+        }
+    }
     // **What this process does when a newer Deskwarden asks it to stand
     // down.** Published here, at the first moment there is anything decrypted
     // to protect and before the startup window can put a password on the
@@ -2061,7 +2106,25 @@ fn main() {
                 // next iteration rather than waiting for the next launch.
                 let edited = prefs_ui::run(estate.settings.clone());
                 if edited != estate.settings {
-                    estate.settings = edited;
+                    // Before the save, and it can refuse: see
+                    // `apply_disk_cache_change`. Nothing else in this block
+                    // has a side effect that has to happen in a particular
+                    // order relative to the write, which is why this is the
+                    // only one hoisted above it.
+                    if !apply_disk_cache_change(
+                        &estate.cache,
+                        estate.settings.cache_vault_to_disk,
+                        edited.cache_vault_to_disk,
+                    ) {
+                        estate.settings.cache_vault_to_disk = false;
+                    } else {
+                        estate.settings.cache_vault_to_disk = edited.cache_vault_to_disk;
+                    }
+                    let keep_disk_cache = estate.settings.cache_vault_to_disk;
+                    estate.settings = settings::Settings {
+                        cache_vault_to_disk: keep_disk_cache,
+                        ..edited
+                    };
                     // `persist_preferences`, never a whole-struct save: this
                     // binding's `vault_window` is whatever was on disk at
                     // startup, and `vault_window::run` has been writing a
@@ -2121,6 +2184,19 @@ fn main() {
                     // prompt up for the wrong account and seal the Windows
                     // Hello blob under the wrong id.
                     let login = login_context(config_dir, Some(to), first_run_account.as_ref());
+                    // **Before `resettle_session`, which repopulates and
+                    // therefore writes.** Re-pointed for the same reason the
+                    // `SessionStore` above it is: a cache still addressing the
+                    // account being left would key the incoming account's
+                    // vault under the outgoing account's fingerprint, inside
+                    // the outgoing account's directory. `resettle_session`
+                    // deletes the file at the new location a line later --
+                    // this is a re-authentication -- so the switch reads
+                    // nothing stale either.
+                    estate.cache.repoint_disk_cache(
+                        &disk_cache_dir(config_dir, Some(to)),
+                        disk_cache_fingerprint(Some(to)),
+                    );
                     let mut declined = false;
                     let outcome = resettle_session(
                         &estate.cache,
@@ -5785,7 +5861,20 @@ fn run_vault_loop(
         // is what decides what happens next, and it does not read this field.
         if let Some(edited) = result.edited_settings.clone() {
             if edited != est.settings {
-                est.settings = edited;
+                // The gear inside the vault window is the SECOND shell for
+                // the same page, and it owes the disk cache the same side
+                // effect the tray's handler performs -- see
+                // `apply_disk_cache_change`. Wiring it into one shell only is
+                // this file's house defect.
+                let keep_disk_cache = apply_disk_cache_change(
+                    &est.cache,
+                    est.settings.cache_vault_to_disk,
+                    edited.cache_vault_to_disk,
+                ) && edited.cache_vault_to_disk;
+                est.settings = settings::Settings {
+                    cache_vault_to_disk: keep_disk_cache,
+                    ..edited
+                };
                 // `persist_preferences`, never a whole-struct `save`. This
                 // struct's `vault_window` field is whatever was on disk when
                 // `main` loaded it at startup, and `vault_window::run` has just
@@ -6298,6 +6387,23 @@ fn resettle_session_with(
     // passwords under the new session, indefinitely if `bw sync` then
     // fails offline.
     cache.clear();
+    // **And the encrypted copy on disk, which `clear` deliberately does not
+    // touch.** This is the re-authentication path -- the one that prompts for
+    // a master password -- and that prompt is a superset of the case the spec
+    // actually cares about: a master-password CHANGE cannot be detected
+    // directly, because `bw status` exposes no key fingerprint and the
+    // session token that does change is regenerated on every unlock. What a
+    // change always does is invalidate the session and force exactly this
+    // prompt, so deleting here covers it, and covers a plain session expiry
+    // besides. It costs nothing: the backend is coming up and the snapshot is
+    // being rebuilt at this very moment, so the file is rewritten from fresh
+    // data a second later.
+    //
+    // Deliberately NOT beside the `clear` calls on lock and on quit. Those
+    // are the ones the file exists to survive.
+    if let Err(e) = cache.forget_disk_copy() {
+        log::warn!("could not delete the encrypted vault copy on re-authentication: {e}");
+    }
     // The scan findings go with it, and for the stronger version of the same
     // reason: they are keyed on THIS account's item ids, and the next unlock
     // may be a different account entirely. See `breach_scan::clear`.
@@ -8164,6 +8270,120 @@ struct LoginContext<'a> {
 /// there for -- no call site can quietly go back to passing `None` for the
 /// account and losing Windows Hello quick unlock, because none of them says
 /// `None` at all.
+/// Where this account's `vault-cache.bin` lives.
+///
+/// **Inside the active account's own directory**, beside its `session.bin`
+/// and `hello.bin`, and never in the shared config root -- the same layout
+/// rule `accounts::session_path_for` states for the token, and for the same
+/// reason: one file per account, so a switch cannot leave one account's vault
+/// where another account will find, overwrite, or delete it. The account
+/// fingerprint in the file's own header is the second line of that defence,
+/// not the first.
+///
+/// The `None` arm is the pre-accounts layout, which `session_path_for`'s own
+/// fallback keeps working: a single-account install whose files sit directly
+/// in the config directory.
+/// Applies a change to `Settings::cache_vault_to_disk`, and answers whether
+/// the new value may be saved.
+///
+/// **Both of the two places a preference edit lands call this**, for the same
+/// reason both re-install the clipboard configuration: the Preferences page
+/// has two shells -- the tray's window and the vault window's modal -- and a
+/// side effect wired into one of them takes effect only when the user
+/// happened to reach the page the other way.
+///
+/// Turning it **on** acquires the Windows Hello key, which is the prompt the
+/// user sees and doubles as the confirmation gesture, and writes the first
+/// file from the snapshot already in memory. If that fails the change is
+/// **refused** (`false`): a setting saved as on with no key behind it renders
+/// as on while nothing is ever written, which is the worst of the three
+/// possible states.
+///
+/// Turning it **off** deletes the file *before* the settings are saved, so a
+/// failed delete cannot leave a file behind under a setting that says there
+/// is none. That failure is the one disk-cache failure worth surfacing rather
+/// than only logging -- the user asked for the file to be gone and it is not
+/// -- and it does not refuse the change: the setting really is off from now
+/// on, and what is left is a stale file that will be refused on its own
+/// merits at the next launch.
+#[must_use]
+fn apply_disk_cache_change(cache: &VaultCache, before: bool, after: bool) -> bool {
+    match (before, after) {
+        (false, true) => match cache.enable_disk_persistence() {
+            Ok(()) => {
+                log::info!(
+                    "the encrypted vault copy is now kept at {}",
+                    cache
+                        .disk_cache_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<nowhere>".to_string())
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("could not start keeping an encrypted vault copy: {e}");
+                message_box(
+                    "Deskwarden",
+                    &format!(
+                        "Deskwarden could not start keeping an encrypted copy of your vault:\n\n\
+                         {e}\n\nThe setting has been left off."
+                    ),
+                    MB_ICONWARNING | MB_OK,
+                );
+                false
+            }
+        },
+        (true, false) => {
+            if let Err(e) = cache.disable_disk_persistence() {
+                log::error!("could not delete the encrypted vault copy: {e}");
+                message_box(
+                    "Deskwarden",
+                    &format!(
+                        "The encrypted copy of your vault could not be deleted:\n\n{e}\n\n\
+                         It is still on disk at that location."
+                    ),
+                    MB_ICONERROR | MB_OK,
+                );
+            } else {
+                log::info!("the encrypted vault copy has been deleted");
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn disk_cache_dir(config_dir: &Path, active_account: Option<&Account>) -> std::path::PathBuf {
+    match active_account {
+        Some(account) => accounts::data_dir_for(config_dir, &account.id),
+        None => config_dir.to_path_buf(),
+    }
+}
+
+/// The account fingerprint the encrypted disk cache stamps into its header.
+///
+/// **From [`Account`] rather than from a fresh `bw status`**, which is where
+/// the two fields it hashes came from in the first place -- `Account::email`
+/// is the `userEmail` the CLI reported when the account was added, and
+/// `Account::server_url` is the `serverUrl` it reported alongside it (`None`
+/// meaning bitwarden.com). Reading them back off the account record instead
+/// of spawning `bw status` again matters twice: startup gets its fingerprint
+/// for free on the path whose entire purpose is to be quick, and -- the part
+/// that is not merely an optimisation -- an account **switch** can compute
+/// the incoming account's fingerprint *before* it authenticates, which is
+/// the only moment at which re-pointing the file is safe. A fingerprint that
+/// could only be derived from a `bw status` the switch has not run yet could
+/// only be applied after the switch had already written.
+///
+/// The `None` arm is the pre-accounts layout, and hashes a stable pair of
+/// empty strings: one install, one account, one directory.
+fn disk_cache_fingerprint(active_account: Option<&Account>) -> String {
+    vault_disk_cache::account_fingerprint(
+        active_account.map(|a| a.email.as_str()),
+        active_account.and_then(|a| a.server_url.as_deref()),
+    )
+}
+
 fn login_context<'a>(
     config_dir: &'a Path,
     active_account: Option<&'a Account>,
@@ -21234,6 +21454,82 @@ mod tests {
         // carried, so the assertions above are not all reading a context that
         // was never built.
         assert!(login_context(cfg, Some(&minted), None).account.is_some());
+    }
+
+    /// **The encrypted vault copy is per-account, inside that account's own
+    /// directory**, beside its `session.bin` and `hello.bin` -- never in the
+    /// shared config root, where two accounts would find, overwrite and
+    /// delete each other's.
+    #[test]
+    fn the_encrypted_vault_copy_lives_in_the_active_accounts_own_directory() {
+        let cfg = Path::new(r"C:\cfg");
+        let a = Account {
+            id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
+            email: "ana@example.com".to_string(),
+            server_url: None,
+        };
+        let b = Account {
+            id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
+            email: "ben@example.com".to_string(),
+            server_url: None,
+        };
+
+        // The layout is not re-spelled here: it is asserted to be the SAME
+        // one the session token uses, which is the property that matters and
+        // the one that would break if either moved.
+        assert_eq!(
+            disk_cache_dir(cfg, Some(&a)),
+            accounts::session_path_for(cfg, &a.id).parent().unwrap(),
+            "the vault copy is not beside that account's session token"
+        );
+        assert_ne!(disk_cache_dir(cfg, Some(&a)), disk_cache_dir(cfg, Some(&b)));
+        assert_ne!(
+            disk_cache_dir(cfg, Some(&a)),
+            cfg.to_path_buf(),
+            "an account's vault copy is in the shared config root"
+        );
+        // The pre-accounts layout: one install, one directory.
+        assert_eq!(disk_cache_dir(cfg, None), cfg.to_path_buf());
+    }
+
+    /// The header's fingerprint separates accounts too, and does it without
+    /// putting either account's address in the file.
+    #[test]
+    fn the_disk_cache_fingerprint_separates_accounts_and_names_neither() {
+        let a = Account {
+            id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
+            email: "ana@example.com".to_string(),
+            server_url: None,
+        };
+        let b = Account {
+            id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
+            email: "ben@example.com".to_string(),
+            server_url: None,
+        };
+        // Same address, different server: still two different files.
+        let self_hosted = Account {
+            server_url: Some("https://vault.example.internal".to_string()),
+            ..a.clone()
+        };
+
+        assert_ne!(disk_cache_fingerprint(Some(&a)), disk_cache_fingerprint(Some(&b)));
+        assert_ne!(
+            disk_cache_fingerprint(Some(&a)),
+            disk_cache_fingerprint(Some(&self_hosted)),
+            "the same address on two servers is the same vault, which it is not"
+        );
+        assert_ne!(disk_cache_fingerprint(Some(&a)), disk_cache_fingerprint(None));
+        // Stable, so a relaunch reads back the file the last one wrote.
+        assert_eq!(
+            disk_cache_fingerprint(Some(&a)),
+            disk_cache_fingerprint(Some(&a.clone()))
+        );
+        let fp = disk_cache_fingerprint(Some(&a));
+        assert_eq!(fp.len(), 64, "expected hex SHA-256");
+        assert!(
+            !fp.contains("ana") && !fp.contains("example"),
+            "the fingerprint leaks the account it belongs to: {fp}"
+        );
     }
 
     /// The app's worst survivable startup does not happen in silence.
