@@ -1372,9 +1372,57 @@ pub fn strip_segment(status: BreachStatus) -> Option<String> {
         // times" mean the same thing and get the same sentence. Reused, never
         // restated: a second copy here would be a second place for the advice
         // to soften.
-        BreachStatus::Breached(count) => format!("\u{b7} {}", breach_phrase(count)),
+        //
+        // **No leading "\u{b7} ".** This one does not join the run: it is
+        // painted on its own line under the strip (see
+        // [`segment_placement`]), and a separator at the start of a line is
+        // a bullet with nothing in front of it.
+        BreachStatus::Breached(count) => breach_phrase(count),
         BreachStatus::Unavailable => "\u{b7} Breach check unavailable".to_string(),
     })
+}
+
+/// Where the segment goes: after the strip's last fact, or under the whole
+/// strip.
+///
+/// The strip's four segments -- updated, password age, fill count, strength
+/// -- are *facts*, and so are three of the four breach statuses: `Pending`,
+/// `Safe` and `Unavailable` are reports on the check itself, and a report
+/// reads perfectly well as a fifth `\u{b7}`-separated segment among them.
+///
+/// **`Breached` is the only one that is a warning with an instruction
+/// attached**, and it is the only one painted in [`theme::ERROR`]. Flowed
+/// into the same run it wrapped wherever the pane happened to run out of
+/// width -- the reported screenshot broke it after "Found in a" -- so the
+/// most urgent thing on the pane was placed by an accident of the column's
+/// width. A deliberate second line is what its content already implies.
+///
+/// **The neutral strip keeps no trailing separator.** It ends on
+/// "Strength: Weak" exactly as it does with the feature off, and the warning
+/// starts a sentence of its own on the next line; a `\u{b7}` left hanging at
+/// the end of the first line would be a separator between a line and a line
+/// break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentPlacement {
+    /// Appended to the strip's run, separated by the `\u{b7}` the segment
+    /// carries itself.
+    Inline,
+    /// Its own line beneath the strip.
+    OwnLine,
+}
+
+/// **The same predicate that decides the colour decides the line.**
+///
+/// Written in terms of [`segment_is_urgent`] rather than matching
+/// `BreachStatus` a second time, so a fifth status cannot come out red in
+/// the middle of the strip or faint on a line of its own: the ink and the
+/// position are one decision with one spelling.
+pub fn segment_placement(status: BreachStatus) -> SegmentPlacement {
+    if segment_is_urgent(status) {
+        SegmentPlacement::OwnLine
+    } else {
+        SegmentPlacement::Inline
+    }
 }
 
 /// Whether the segment is the one that must be RED.
@@ -1401,8 +1449,11 @@ pub fn segment_color(status: BreachStatus) -> egui::Color32 {
     }
 }
 
-/// The badge as the pane needs it: the text and the colour, or `None` for
-/// "this strip is what it always was".
+/// The badge as the pane needs it: the text, the colour and the line it goes
+/// on -- or `None` for "this strip is what it always was".
+///
+/// The three travel together because they are three faces of one status, and
+/// the paint site below has no `BreachStatus` to ask a fourth question of.
 ///
 /// The **only** place the cache is asked anything. Everything above it is
 /// pure; `BreachCache::status` answers from the map or starts one worker and
@@ -1414,12 +1465,13 @@ fn breach_segment(
     kind: ItemKind,
     password: &str,
     breaches: &mut BreachCache,
-) -> Option<(String, egui::Color32)> {
+) -> Option<(String, egui::Color32, SegmentPlacement)> {
     if !should_check(enabled, kind, password) {
         return None;
     }
     let status = breaches.status(ctx, password);
-    strip_segment(status).map(|text| (text, segment_color(status)))
+    strip_segment(status)
+        .map(|text| (text, segment_color(status), segment_placement(status)))
 }
 
 /// What the detail pane says about an item that is in the Trash or the
@@ -3705,7 +3757,7 @@ pub fn draw_detail_read(
                 // strip must be byte-identical AND pixel-identical, and the
                 // only way to be sure of that is to run the same code.
                 None => card_text(ui, strip),
-                Some((text, color)) => card_text_pair(
+                Some((text, color, SegmentPlacement::Inline)) => card_text_pair(
                     ui,
                     strip,
                     // The leading space is the separator: `card_text_pair`
@@ -3716,6 +3768,13 @@ pub fn draw_detail_read(
                     RichText::new(format!(" {text}"))
                         .size(ROW_LABEL_SIZE)
                         .color(color),
+                ),
+                // No leading space and no separator: this run starts a line,
+                // and `strip_segment`'s `Breached` arm carries neither.
+                Some((text, color, SegmentPlacement::OwnLine)) => card_text_stacked(
+                    ui,
+                    strip,
+                    RichText::new(text).size(ROW_LABEL_SIZE).color(color),
                 ),
             }
         });
@@ -5925,6 +5984,44 @@ fn card_text_pair(ui: &mut egui::Ui, first: RichText, second: RichText) {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(first);
+                ui.label(second);
+            });
+        });
+}
+
+/// [`card_text_pair`]'s two runs stacked instead of flowed: the same frame,
+/// the same margin, the same width, with `second` on **its own line beneath**
+/// `first`. The metadata strip's breach WARNING is the only caller -- see
+/// [`SegmentPlacement`] for why that one status and not the other three.
+///
+/// # Why not `card_text_pair` with a `\n` in the string
+///
+/// Because the two runs are two colours, which is the same reason
+/// `card_text_pair` exists: one `RichText` cannot be faint on its first line
+/// and red on its second. Two labels stacked vertically is the only shape
+/// that gives each run its own ink AND its own line.
+///
+/// # Why `vertical` and not two bare `ui.label`s
+///
+/// A default `Ui` here is already vertical, but its `item_spacing.y` would
+/// open a gap between the strip and the warning that no other card on this
+/// pane has. Zeroed, the two lines sit exactly one line-height apart -- the
+/// warning reads as the strip's next line rather than as a second tile
+/// crammed into the first one's frame, and the card grows by exactly the
+/// 13pt row the warning needs.
+///
+/// Each label still wraps on its own: at the detail column's minimum width
+/// the strip takes two rows and the warning takes two more, and the card is
+/// sized to all four. Nothing is clipped and nothing is pushed past the
+/// right edge, which is the failure `card_text_pair`'s doc records.
+fn card_text_stacked(ui: &mut egui::Ui, first: RichText, second: RichText) {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(first);
                 ui.label(second);
             });
@@ -22634,8 +22731,12 @@ mod breach_badge_tests {
                 }
             }
         }
-        // The strip is one of those neighbours, and it is the one the badge
-        // shares a line with -- so the loop above is not vacuous.
+        // The strip is one of those neighbours, and it is the one directly
+        // above the badge -- so the loop above is not vacuous. (It used to
+        // be the one the badge shared a LINE with; the warning now has its
+        // own, which makes a collision less likely and this loop no less
+        // worth running: "one line below" is exactly the distance a stray
+        // half-line of leading would eat.)
         assert!(!strip.glyphs.is_empty(), "the strip laid out no glyphs to collide with");
         assert!(
             compared >= strip.glyphs.len() * seg.glyphs.len(),
@@ -22653,6 +22754,235 @@ mod breach_badge_tests {
             card.height(),
             BASELINE_CARD_NARROW.1
         );
+    }
+
+    /// **The change itself: the warning is on its own line and the three
+    /// reports are not** -- at both widths, out of one loop over one code
+    /// path, so neither case can be a photograph of a different renderer.
+    ///
+    /// "Its own line" is asserted as vertical separation of the INK rather
+    /// than by counting galley rows: a `\n` inside one run, a second label,
+    /// or a second frame would all satisfy a row count, and only one of them
+    /// puts a red sentence a full line under a faint one. What a reader sees
+    /// is that no part of the warning is level with any part of the strip,
+    /// and that is what this measures.
+    ///
+    /// The inverse half matters just as much. If `Safe` also dropped to a
+    /// second line, the un-breached pane would have gained a row it never
+    /// asked for, so each of the three reports is checked to still overlap
+    /// the strip's last line vertically -- i.e. to still be flowing in the
+    /// same run.
+    #[test]
+    fn only_the_breach_warning_takes_a_line_of_its_own() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        // Both widths, so the answer cannot be an artifact of a run that
+        // happened to fit. `NARROW` is where the strip already wraps by
+        // itself, and it is the width the reported screenshot was near.
+        for (width, label) in [(PANE, "wide"), (NARROW, "narrow")] {
+            for status in [
+                BreachStatus::Pending,
+                BreachStatus::Safe,
+                BreachStatus::Unavailable,
+                BreachStatus::Breached(1_644_583),
+            ] {
+                // `Pending` is what the FIRST frame says, so it must not be
+                // settled for -- `painted` would spin 600 frames waiting for
+                // an answer that is already on screen.
+                let settle = !matches!(status, BreachStatus::Pending);
+                let frame = painted(&item, true, status, width, settle);
+                let want = strip_segment(status).expect("every status has a segment");
+                let seg = frame.only(&want);
+                let strip = frame.only(&strip_text());
+
+                // Real ink on both, first: two runs that laid out nothing
+                // are trivially not level with each other.
+                assert!(!seg.rendered.is_empty(), "{label}/{status:?}: the segment laid out nothing");
+                assert!(!strip.rendered.is_empty(), "{label}/{status:?}: the strip laid out nothing");
+
+                // **Half a point of slack, for the same reason `Run::glyphs`
+                // exists.** A glyph's box is taller than the line it sits on
+                // -- ascender to descender -- so two runs a full line apart
+                // still report boxes that graze each other by a tenth of a
+                // point. Measured here: the strip's ink ends at y=310.1 and
+                // the warning's begins at y=310.0, one 13pt line below it.
+                // Real sharing of a line is 13pt of overlap, not 0.1.
+                let overlap = seg.ink.min.y.max(strip.ink.min.y);
+                let overlap = seg.ink.max.y.min(strip.ink.max.y) - overlap;
+                let own_line = overlap <= 0.5;
+                assert_eq!(
+                    own_line,
+                    segment_placement(status) == SegmentPlacement::OwnLine,
+                    "{label}/{status:?}: the segment's ink {:?} against the strip's {:?} says \
+                     own_line={own_line}, but `segment_placement` says {:?}",
+                    seg.ink,
+                    strip.ink,
+                    segment_placement(status)
+                );
+
+                // **The visual distinction is the point of the change**, so
+                // the ink is asserted in the same breath as the line, off
+                // the shape the tessellator was handed rather than off the
+                // `RichText` this file built.
+                if own_line {
+                    assert_eq!(
+                        seg.color, theme::ERROR,
+                        "{label}: the warning on its own line is not the palette's red"
+                    );
+                    assert_eq!(seg.color.a(), 255, "{label}: an alarm at alpha {}", seg.color.a());
+                } else {
+                    assert_eq!(
+                        seg.color, theme::TEXT_FAINT,
+                        "{label}/{status:?}: a report in the run is painted as a warning"
+                    );
+                }
+                // And the neutral facts are never the warning's ink, in any
+                // of the four cases -- so the assertion above is about the
+                // segment and not about a card that turned red wholesale.
+                assert_eq!(
+                    strip.color, theme::TEXT_FAINT,
+                    "{label}/{status:?}: the neutral facts changed colour"
+                );
+                assert_ne!(strip.color, theme::ERROR);
+
+                // The warning starts a line, so it carries no separator --
+                // a "\u{b7}" with nothing in front of it is the defect this
+                // would look like.
+                assert_eq!(
+                    want.starts_with('\u{b7}'),
+                    !own_line,
+                    "{label}/{status:?}: separator and placement disagree: {want:?}"
+                );
+                // Nor did the neutral strip grow a trailing one to point at
+                // the line below.
+                assert!(
+                    !strip.text.trim_end().ends_with('\u{b7}'),
+                    "{label}/{status:?}: the strip ends on a hanging separator: {:?}",
+                    strip.text
+                );
+            }
+        }
+    }
+
+    /// The metadata card in the BREACHED case, both widths, **measured after
+    /// the warning moved to its own line, against the same card measured on
+    /// `f2556b8` before it did.** Both halves of each pair are real
+    /// measurements; the before-numbers were taken by driving this same
+    /// harness on a detached worktree of that commit.
+    ///
+    /// **Wide, 900pt pane: 852x46 -> 852x54.** Before, the whole thing was
+    /// one `horizontal_wrapped` row 18pt tall and the warning simply ran on
+    /// after "Strength: Weak" -- it fit, at this width, on this day, with
+    /// this count. Now it is two stacked 13pt labels: 26pt of text against
+    /// 18, inside the card's unchanged 28pt of vertical padding. **8pt is
+    /// the entire cost of the change at the width the window opens at**, and
+    /// what it buys is a warning whose position no longer depends on whether
+    /// the sentence happened to fit.
+    ///
+    /// **Narrow, `NARROW` (the detail column's 298pt minimum): 251x85 ->
+    /// 251x93.** `BASELINE_CARD_NARROW` is 251x54, the strip with no segment
+    /// at all. Before: the strip and the warning reflowed together into one
+    /// run of 57pt. Now: the strip wraps to two 13pt rows and the warning,
+    /// 68 characters into 219pt of room, wraps to three of its own -- five
+    /// rows, 65pt, +8pt again. The card is taller at the narrowest width the
+    /// window can be dragged to and the pane scrolls; nothing is clipped and
+    /// nothing is a control, which is the distinction `f67bf42` is about.
+    ///
+    /// Recorded, not argued. If either grows, a rewording has cost a row; if
+    /// the wide one drops back to 46 the warning has rejoined the run.
+    const BREACHED_CARD: (f32, f32) = (852.0, 54.0);
+    const BREACHED_CARD_NARROW: (f32, f32) = (251.0, 93.0);
+
+    /// **The un-breached card, unmoved.** 852x46 and 251x72 are what this
+    /// same fixture measured on `f2556b8` with a `Safe` answer, and they are
+    /// what it measures now: the report still flows in the strip's run, so
+    /// there is no second line, no gap where the warning would be, and not
+    /// one point of height between the two trees.
+    ///
+    /// They are taller than `BASELINE_CARD`'s 41 and `BASELINE_CARD_NARROW`'s
+    /// 54 because *any* segment moves the strip from a plain `ui.label` into
+    /// `card_text_pair`'s `horizontal_wrapped`, whose first row is 18pt
+    /// rather than 13. That difference is the badge's, it predates this
+    /// change, and the test below pins the feature-OFF card against the
+    /// original two so both facts are stated rather than conflated.
+    const SAFE_CARD: (f32, f32) = (852.0, 46.0);
+    const SAFE_CARD_NARROW: (f32, f32) = (251.0, 72.0);
+
+    /// **Two lines breached, one line clean -- as card heights**, which is
+    /// the half of "its own line" a reader feels rather than measures.
+    ///
+    /// The un-breached case is pinned to the numbers the strip has had since
+    /// before any of this existed (`BASELINE_CARD` / `BASELINE_CARD_NARROW`
+    /// plus the report's own inline segment, which costs nothing at 900pt
+    /// and nothing at `NARROW` either). **That is the requirement that a
+    /// pane with nothing to warn about looks exactly as it does today**: not
+    /// merely "no empty label" but no pixel of extra height where the
+    /// warning would go.
+    #[test]
+    fn the_breached_card_is_a_line_taller_and_the_safe_card_is_not() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        for (width, breached, safe, off_pin, label) in [
+            (PANE, BREACHED_CARD, SAFE_CARD, BASELINE_CARD, "wide"),
+            (
+                NARROW,
+                BREACHED_CARD_NARROW,
+                SAFE_CARD_NARROW,
+                BASELINE_CARD_NARROW,
+                "narrow",
+            ),
+        ] {
+            let clean = painted(&item, true, BreachStatus::Safe, width, true);
+            let clean_card = clean.card_around(clean.only(&strip_text()));
+            assert_eq!(
+                (clean_card.width(), clean_card.height()),
+                safe,
+                "{label}: the un-breached metadata card moved; it was {safe:?}"
+            );
+
+            // And with the feature OFF the card is the size it was before
+            // any of this existed -- the pin taken on `a506592`.
+            let off = painted(&item, false, BreachStatus::Safe, width, false);
+            let off_card = off.card_around(off.only(&strip_text()));
+            assert_eq!(
+                (off_card.width(), off_card.height()),
+                off_pin,
+                "{label}: the card with the check off is not the card from before the badge"
+            );
+
+            let hit = painted(&item, true, BreachStatus::Breached(1_644_583), width, true);
+            let hit_card = hit.card_around(hit.only(&strip_text()));
+            assert_eq!(
+                (hit_card.width(), hit_card.height()),
+                breached,
+                "{label}: the breached metadata card moved; it was {breached:?}"
+            );
+            assert_eq!(
+                hit_card.width(),
+                clean_card.width(),
+                "{label}: the warning made the card wider, not taller"
+            );
+            assert!(
+                hit_card.height() > clean_card.height(),
+                "{label}: the breached card is {}pt and the clean one {}pt, so the warning \
+                 is being drawn in space the strip already had",
+                hit_card.height(),
+                clean_card.height()
+            );
+
+            // **Nothing left the tile**, at either width -- the narrow case
+            // is four wrapped rows and it is the one that would overflow.
+            let warning = hit.only(&strip_segment(BreachStatus::Breached(1_644_583)).unwrap());
+            assert!(
+                hit_card.expand(0.5).contains_rect(warning.ink),
+                "{label}: the warning {:?} is outside its card {hit_card:?}",
+                warning.ink
+            );
+            assert!(
+                warning.ink.min.x >= 0.0 && warning.ink.max.x <= width,
+                "{label}: the warning runs from {} to {} on a {width}pt pane",
+                warning.ink.min.x,
+                warning.ink.max.x
+            );
+        }
     }
 
     /// This module's own source, scanned to EOF: no test here builds the live

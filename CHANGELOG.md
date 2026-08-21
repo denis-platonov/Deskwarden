@@ -8,6 +8,29 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### The breach warning gets its own line
+
+An item's detail pane ends in a strip of facts: when it was updated, how old
+its password is, how many times it has been filled, how strong it is. When the
+breach check is on and the password turns up on a public list, the warning —
+"Found in a known data breach (1,644,583 times). Change this password." — was
+appended to that same run and wrapped wherever the pane happened to run out of
+width. In a reported screenshot it broke after "Found in a", so the most urgent
+sentence on the pane was positioned by an accident of the column's width.
+
+It is now painted on its own line beneath the strip, still in the palette's
+red, while the facts above it stay grey. The neutral strip ends cleanly on
+"Strength: …" — no separator left hanging at the end of the line.
+
+Only the warning moved. "Breach check: checking…", "Not in any known breach"
+and "Breach check unavailable" are reports on the check rather than warnings
+about the password, and they still flow in the strip as another
+`·`-separated segment; a pane with nothing to warn about is unchanged, down to
+the pixel. The Password Health pane already gave the same sentence a line of
+its own under each item's name, and was left alone.
+
 ## 0.8.5 - 2026-08-21
 
 > The manual pre-release checklist was not run for this version either.
