@@ -90,6 +90,36 @@ Where there is genuinely nothing to open -- the setting is off, no copy has
 been written yet, or one was refused and deleted -- **no button is drawn at
 all**. Not a greyed one, and not a "coming soon".
 
+### A login start with a copy on disk reaches the tray immediately
+
+With the encrypted copy turned on, a sign-in start had the whole vault in
+memory within milliseconds -- and then sat there for about eight seconds
+anyway, waiting for the Bitwarden backend to finish starting before it put its
+icon in the tray. For that stretch there was no tray icon to click, the
+Ctrl+Alt+B shortcut was not claimed, and autofill matched nothing, on a launch
+that had everything it needed to do all three.
+
+It no longer waits. When a login start restores a usable copy, the tray icon,
+the global shortcut and autofill come up straight away, filling from that
+copy. The backend starts behind them, and when it answers, its vault replaces
+the restored one: an item you edited on your phone shows its new name, an item
+you deleted elsewhere disappears, and a vault you emptied empties here too.
+The sync pill stops saying "Loaded from cache" at the same moment, because by
+then it is not.
+
+**Until the backend answers, Deskwarden can read but not write.** Editing,
+deleting, favouriting and moving an item all need the backend, and they say so
+rather than appearing to work -- there is no state in which a change looks
+saved and quietly is not. If the backend never comes up at all, the tray's
+**Sync** entry says so and offers a retry; everything that only reads keeps
+working from the copy for as long as you leave the app running.
+
+Restoring the copy this way does not rewrite it or reset its age, so a launch
+that fetched nothing does not come up claiming a fresh vault.
+
+This changes nothing for a launch with no copy to restore, and nothing for a
+double-click, which still shows its window.
+
 ### A login start goes to the tray; a double-click shows the window
 
 Deskwarden could not tell the two apart. The installer's autostart entry ran
