@@ -175,6 +175,16 @@ fn galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::
 /// cost the name more room than this app's own widest wordmark does. A file
 /// wider than this is not refused -- it is fitted to the cap, which costs it
 /// some ink height and keeps it a mark rather than making it a word.
+///
+/// **The cap was chosen while the mark LED the row, and it survives the mark
+/// moving to the trailing edge unchanged** -- every term above is about width
+/// taken out of the name's budget, and none of them is about which side of the
+/// name it is taken from. The row allocates the same box out of the same total
+/// either way. `item_list`'s `a_marked_card_on_a_narrow_pane_keeps_its_mark_
+/// inside_the_tile_and_squeezes_the_title_instead` now drives a deliberately
+/// 10:1 file through the moved layout and reads the cap back off the painted
+/// image, so this is pinned by what is drawn rather than by the arithmetic
+/// here.
 const MAX_LOGO_ASPECT: f32 = 4.0;
 
 /// How long a brand whose file was NOT FOUND is left alone before the
