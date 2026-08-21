@@ -57,7 +57,7 @@ use deskwarden::vault_cache::{
 use deskwarden::app_match::AppMatch;
 use deskwarden::app_window;
 use deskwarden::{
-    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui,
+    fill_stats, hotkey, job_object, logging, login_ui, picker_ui,
     prefs_ui, session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
@@ -1071,8 +1071,8 @@ fn main() {
             // recovery.
             //
             // **And that retry shows no window.** It used to reopen the spinner
-            // with different wording (`SETUP_RETRY_MESSAGE`, review 13's Minor
-            // 4) so the user could tell it apart from the one they had just
+            // with different wording (`SETUP_RETRY_MESSAGE`, deleted with
+            // design turn 7) so the user could tell it apart from the one just
             // closed. Inside one window there is nothing to tell apart: a
             // window the user has just closed reopening at all is the two-window
             // flow this change removes, only worse for having been asked to go
@@ -3727,7 +3727,7 @@ fn restart_backend_after_unlock(
 /// probe -> optional retry -> repopulate or stand down) is what the tests
 /// drive, rather than a reimplementation of it beside the live one. `probe`
 /// is the readiness wait, taking the message its spinner should show; the
-/// only caller passes `wait_for_vault_ready_with_spinner`.
+/// only caller passes `wait_for_the_vault`.
 ///
 /// **Review 17's Critical.** Before this, a `Dismissed` here went straight to
 /// `engine.clear()`, and the warn it logged advised the user to "open it
@@ -3744,14 +3744,21 @@ fn restart_backend_after_unlock(
 /// gesture must not be destructive.
 ///
 /// So a dismissal now buys ONE free readiness probe before anything
-/// destructive happens, exactly as startup's own dismissal does
-/// (`SETUP_RETRY_MESSAGE`). That matters beyond politeness:
-/// `wait_for_vault_ready_with_spinner`'s worker is DETACHED and still
+/// destructive happens, exactly as startup's own dismissal does. That matters
+/// beyond politeness: the recovery window's worker is DETACHED and still
 /// running at that moment, so the vault is very likely ready a second later
 /// and the retry simply takes the ordinary `Ready` path -- engine armed from
 /// the probe's own items, cache seeded from the same ones. It is bounded the
 /// same way startup's is, and structurally rather than by a counter: two
 /// `probe` calls appear in this function and there is no loop.
+///
+/// **And that retry shows NO WINDOW** ([`ProbeWindow::Silent`]) -- design turn
+/// 7. It used to reopen the spinner with different wording
+/// (`SETUP_RETRY_MESSAGE`), which is one of the two windows the owner
+/// reported. The first probe's window already offered the user a bounded Retry
+/// of its own; a user who closed it past that has said what they want, and
+/// answering by opening the window again is the flow this work exists to
+/// remove. `main`'s warm launch answers a dismissal exactly this way already.
 ///
 /// A `Failed` -- the ~30s readiness deadline expiring -- does not retry. It
 /// has already spent that deadline, and startup's `Failed` arm does not
@@ -3761,9 +3768,9 @@ fn settle_vault_after_unlock(
     cache: &VaultCache,
     engine: &mut MatchEngine,
     epoch: VaultEpoch,
-    mut probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+    mut probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome,
 ) {
-    match probe(SETUP_MESSAGE) {
+    match probe(ProbeWindow::InAWindow) {
         VaultReadyOutcome::Ready(items) => {
             repopulate_and_refresh_after_unlock(cache, engine, items, epoch)
         }
@@ -3773,17 +3780,23 @@ fn settle_vault_after_unlock(
             // built on. Nothing is killed, nothing is re-authenticated: the
             // still-running backend gets one more honest look.
             log::info!(
-                "setup window closed before the vault backend was confirmed ready after \
-                 unlocking; probing readiness once more before standing autofill down"
+                "the recovery window was closed before the vault backend was confirmed ready \
+                 after unlocking; probing readiness once more, WITHOUT a window, before \
+                 standing autofill down"
             );
-            match probe(SETUP_RETRY_MESSAGE) {
+            match probe(ProbeWindow::Silent) {
                 VaultReadyOutcome::Ready(items) => {
                     repopulate_and_refresh_after_unlock(cache, engine, items, epoch)
                 }
+                // **Not reachable through the production probe**, which shows
+                // no window on this arm and therefore has nothing to dismiss.
+                // Answered rather than `unreachable!()`: this is a `FnMut`
+                // parameter, the enum is exhaustive, and a panic here would be
+                // a crash the day someone gives the silent probe a window.
                 VaultReadyOutcome::Dismissed => stand_down_after_unlock(
                     engine,
-                    "the setup window was closed a second time without the vault backend \
-                     becoming ready after unlocking",
+                    "the windowless readiness retry after unlocking reported a dismissal, \
+                     which it has no window to have been dismissed from",
                 ),
                 VaultReadyOutcome::Failed(e) => stand_down_after_unlock(
                     engine,
@@ -4097,7 +4110,7 @@ fn drain_requests_queued_behind_a_window(pending: &mut VecDeque<MenuEvent>, sati
 /// Shared by both ways of asking for it -- the tray menu's "Open Vault" item
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
 /// the startup retry path: `stop_bw_serve` on the old child ->
-/// `reauthenticate` -> `try_start_backend` -> `wait_for_vault_ready_with_spinner`
+/// `reauthenticate` -> `try_start_backend` -> `wait_for_the_vault`
 /// -> rebuild the match engine) exists in exactly one place.
 ///
 /// Does **not** decide whether `bw serve` should keep running once the
@@ -4817,12 +4830,12 @@ fn run_the_in_window_teardown(
                     Some(produced)
                 },
                 // **The spinner-less probe.** `resettle_session`'s own
-                // probe is `wait_for_vault_ready_with_spinner`, which
+                // probe is `wait_for_the_vault`, which
                 // opens an eframe window of its own; the spinner is
                 // already on screen here -- it is this window's
                 // `Working` stage -- and a worker thread may not open
                 // one at all. Same wait, same schedule, no window.
-                |_message| match wait_for_vault_ready(est.cache.bridge(), schedule) {
+                |_window| match wait_for_vault_ready(est.cache.bridge(), schedule) {
                     Ok(items) => VaultReadyOutcome::Ready(items),
                     Err(e) => VaultReadyOutcome::Failed(e),
                 },
@@ -6048,6 +6061,15 @@ fn resettle_session(
     // that opens a spinner window of its own. Both are supplied HERE and
     // nowhere below, which is what leaves the body movable.
     let mut tray_effects = Vec::new();
+    // **The address design 7's footer names**, read here because this is where
+    // the app knows it: `cached_status_details` is what `bw status` filled in
+    // for the vault window's toolbar, and it is the same account the recovery
+    // is trying to reach. Cloned per attempt because the probe is `FnMut`;
+    // `None` when nothing has answered `bw status` yet, which draws no line at
+    // all rather than a placeholder.
+    let account = cached_status_details
+        .as_ref()
+        .and_then(|details| details.user_email.clone());
     let outcome = resettle_session_reporting_tray(
         cache,
         engine,
@@ -6058,7 +6080,7 @@ fn resettle_session(
         cached_status_details,
         session_token,
         authenticate,
-        |message| wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message),
+        move |window| wait_for_the_vault(cache.bridge(), schedule, window, account.clone()),
         &mut tray_effects,
     );
     // Labels, applied on the thread that owns the tray. Nothing reads them
@@ -6077,7 +6099,7 @@ fn resettle_session(
 /// that was in `resettle_session`, unchanged and in the same order.
 ///
 /// **Why the probe had to move at the same time as the tray.** A body that
-/// still named `wait_for_vault_ready_with_spinner` would be `Send` in its
+/// still named `wait_for_the_vault` would be `Send` in its
 /// captures and a lie in its behaviour: that function opens an `eframe`
 /// window, and a worker thread may not. Lifting only the tray would produce
 /// a signature that compiles on a worker and deadlocks or panics the first
@@ -6099,7 +6121,7 @@ fn resettle_session_reporting_tray(
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
     session_token: &mut String,
     authenticate: impl FnOnce() -> Option<String>,
-    probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+    probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome,
     tray_effects: &mut Vec<TrayEffect>,
 ) -> ResettleOutcome {
     // A backend operation kicked off above (or a tray Sync click that
@@ -6199,7 +6221,7 @@ fn resettle_session_with(
     session_token: &mut String,
     authenticate: impl FnOnce() -> Option<String>,
     start: impl FnOnce(&str) -> Result<Child, BackendStartError>,
-    probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+    probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome,
 ) -> ResettleOutcome {
     // The account the *next* unlock lands on may not be this one (a
     // "Log out" followed by a different sign-in), so the snapshot built
@@ -7649,29 +7671,31 @@ fn sync_outcome_from(
     }
 }
 
-/// What the readiness spinner says the first time it is shown for a given
-/// attempt at getting the vault ready.
+/// What the merged launch window's working stage says while `bw serve` comes
+/// up.
+///
+/// **The only surviving one of three.** `SETUP_RETRY_MESSAGE` ("Still not
+/// ready -- trying once more...") and `SETUP_AFTER_SIGN_IN_MESSAGE` ("Signed
+/// in -- starting your vault...") existed because the retries each opened
+/// ANOTHER small window and had to be told apart from the one the user had
+/// just closed. Those are the two windows the owner reported, in that order.
+/// Neither retry opens a window of its own any more -- the silent one shows
+/// nothing, and the recovery's retry happens inside the recovery window -- so
+/// there is nothing left for either message to distinguish.
 const SETUP_MESSAGE: &str = "Setting up your vault...";
 
-/// What it says when it comes back after the user closed it (review 13's
-/// Minor 4). Closing the window used to bring an apparently identical one
-/// straight back with nothing to distinguish it, so the retry read as the
-/// app ignoring the click rather than as a deliberate second attempt. Kept
-/// short: this is a 320px-wide window with one line of text.
-const SETUP_RETRY_MESSAGE: &str = "Still not ready -- trying once more...";
-
-/// What it says on the wait that follows a fresh master-password sign-in
-/// (`recover_from_failed_vault_wait`).
+/// What the IN-WINDOW working stage says after a lock's fresh sign-in
+/// (`app_window::run_from_vault`).
 ///
-/// Its own message rather than `SETUP_RETRY_MESSAGE` (review 14's nit):
-/// "Still not ready -- trying once more..." describes a retry of something
-/// the user watched fail, but from *this* window's point of view the user
-/// has just typed their master password into a fresh login and nothing has
-/// been tried since. What is actually happening is a backend that was just
-/// restarted under a new session coming up.
+/// It survives because that stage is not a window of its own: it is the vault
+/// window the user is already looking at, showing a spinner where the item
+/// list was. From its point of view the user has just typed their master
+/// password and a backend is coming up under a new session, which is what it
+/// says. The two messages deleted beside it were captions on separate
+/// windows -- see [`SETUP_MESSAGE`].
 const SETUP_AFTER_SIGN_IN_MESSAGE: &str = "Signed in -- starting your vault...";
 
-/// Outcome of [`wait_for_vault_ready_with_spinner`].
+/// Outcome of [`wait_for_the_vault`].
 ///
 /// Review 12's Critical: a user closing the "setting up" window and the
 /// readiness probe itself genuinely failing used to both collapse into the
@@ -7691,42 +7715,64 @@ enum VaultReadyOutcome {
     Failed(String),
 }
 
-/// Same as `wait_for_vault_ready`, but shows a spinner window for the
-/// duration instead of blocking with nothing on screen.
+/// **Whether a readiness wait puts a window on screen at all.**
 ///
-/// The worker runs fully detached (`std::thread::spawn`, not a
-/// `thread::scope`d one this function has to join before returning) --
-/// review 12's Important 2. With a `thread::scope`d worker, closing the
-/// spinner early (`show_while` returning `None`) still left this function's
-/// caller blocked -- with no window on screen at all, the exact silence this
-/// module's spinner exists to prevent -- until the probe finished on its
-/// own, up to the rest of `schedule`'s ~30s deadline; the probe's own
-/// eventual result then had nowhere to go (the receiver had already been
-/// dropped) and was thrown away regardless of whether it was actually `Ok`.
-/// `vault`/`schedule` are cloned into the worker rather than borrowed for
-/// the same reason: a detached thread can't borrow the caller's stack.
-/// `message` is what the spinner says. It is a parameter rather than a
-/// constant because the retry after a dismissal has to look *different* from
-/// the window the user just closed (review 13's Minor 4): re-running this
-/// with the identical wording made closing the window pop an apparently
-/// identical one straight back, with nothing to explain why, and closing
-/// that one jumped to a master-password prompt with no explanation either.
-/// The bounded retry itself is correct and stays; only its wording changes.
-fn wait_for_vault_ready_with_spinner(
+/// This used to be a `&'static str` -- the message the spinner window should
+/// show -- and every value it took was a way of telling one small window apart
+/// from the small window before it. Design turn 7 removes the small window, so
+/// what is left to say about a wait is the only thing that was ever load-
+/// bearing: does the user see it happening, or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeWindow {
+    /// The recovery window: the vault window's own frame, showing design 7's
+    /// bodies, with its own bounded Retry.
+    InAWindow,
+    /// No window at all. The free retry a *dismissal* buys: a user who has
+    /// just closed a window is telling this app to stop showing them one, and
+    /// reopening it -- which is exactly what `SETUP_RETRY_MESSAGE` used to do
+    /// -- is the two-window flow this work removes, only worse for having been
+    /// asked to go away first. `main`'s warm launch already answers a
+    /// dismissal this way; this is the same answer at the other call site.
+    Silent,
+}
+
+/// Waits for the vault, showing design turn 7's window while it waits -- or
+/// nothing at all, per [`ProbeWindow`].
+///
+/// **The one place `loading_ui::show_while` used to be reached from.** That
+/// call is what put a 360x220 window on screen in the middle of a recovery,
+/// and it is gone from this path: `InAWindow` now means
+/// `app_window::run_recovery`, at the vault window's own geometry, hosting the
+/// whole sequence -- load, slow, unreachable, Retry -- rather than one spinner
+/// per attempt.
+///
+/// `vault`/`schedule` are cloned into the probe closure rather than borrowed,
+/// because the host runs it on a detached worker thread per attempt, and a
+/// detached thread can't borrow this stack. That detachment is review 12's
+/// Important 2 and is unchanged: a user closing the window returns here
+/// immediately, and the worker finishes on its own with its result dropped
+/// unheard.
+///
+/// `account` is the address the footer names, when the caller has one.
+fn wait_for_the_vault(
     vault: &VaultBridge,
     schedule: &[Duration],
-    message: &str,
+    window: ProbeWindow,
+    account: Option<String>,
 ) -> VaultReadyOutcome {
-    let (tx, rx) = mpsc::channel();
     let worker_vault = vault.clone();
     let worker_schedule = schedule.to_vec();
-    std::thread::spawn(move || {
-        let _ = tx.send(wait_for_vault_ready(&worker_vault, &worker_schedule));
-    });
-    match loading_ui::show_while(message, rx) {
-        Some(Ok(items)) => VaultReadyOutcome::Ready(items),
-        Some(Err(e)) => VaultReadyOutcome::Failed(e),
-        None => VaultReadyOutcome::Dismissed,
+    let probe = move || wait_for_vault_ready(&worker_vault, &worker_schedule);
+    match window {
+        ProbeWindow::Silent => match probe() {
+            Ok(items) => VaultReadyOutcome::Ready(items),
+            Err(e) => VaultReadyOutcome::Failed(e),
+        },
+        ProbeWindow::InAWindow => match app_window::run_recovery(account, probe) {
+            app_window::RecoveryOutcome::Ready(items) => VaultReadyOutcome::Ready(items),
+            app_window::RecoveryOutcome::Abandoned => VaultReadyOutcome::Dismissed,
+            app_window::RecoveryOutcome::Unreachable(e) => VaultReadyOutcome::Failed(e),
+        },
     }
 }
 
@@ -7780,31 +7826,59 @@ fn recover_from_failed_vault_wait(
         }
     };
 
-    match wait_for_vault_ready_with_spinner(vault, schedule, SETUP_AFTER_SIGN_IN_MESSAGE) {
+    // The address the footer names: the account the user has just signed
+    // in to, which this call site is the one that actually knows.
+    let account = login.account.map(|(_, account)| account.email.clone());
+    match wait_for_the_vault(vault, schedule, ProbeWindow::InAWindow, account) {
         VaultReadyOutcome::Ready(items) => items,
+        // **No message box on either of these** -- design turn 7, and the
+        // half of the owner's report that hurt most. What used to happen here
+        // was a modal "Deskwarden cannot start" over a window that had already
+        // gone, with an OK button whose only effect was to end the process. It
+        // is now the last thing the RECOVERY WINDOW said: the unreachable body
+        // named the failure, offered its bounded Retry, and the user closed it
+        // having read that. Repeating it in a dialog is telling somebody
+        // something they have just been told, in a worse place.
+        //
+        // The log still gets the whole of it, and the exit is the same exit:
+        // at this point in the launch the tray, hotkey and window-watch thread
+        // do not exist yet, so unlike the lock recovery there is no
+        // already-running app for this process to stay alive for.
         VaultReadyOutcome::Dismissed => {
             if let Some(child) = bw_serve_child.as_mut() {
                 bw_serve::stop_bw_serve(child);
             }
-            fatal_startup_error(
-                "Deskwarden's Bitwarden backend restarted after you signed back in, but the \
-                 setup window was closed again before it was confirmed ready.\n\nRelaunch \
-                 Deskwarden and give the setup window a little longer to finish.",
+            give_up_after_the_window_explained(
+                "the recovery window was closed after the fresh sign-in without the vault \
+                 backend being confirmed ready",
             );
         }
         VaultReadyOutcome::Failed(e) => {
-            log::error!("{e}");
             if let Some(child) = bw_serve_child.as_mut() {
                 bw_serve::stop_bw_serve(child);
             }
-            fatal_startup_error(&format!(
-                "Deskwarden's Bitwarden backend started but never became usable, so \
-                 there is nothing to match your apps against.\n\n{e}\n\nFull details \
-                 are in:\n{}",
+            give_up_after_the_window_explained(&format!(
+                "the Bitwarden backend started but never became usable after the fresh \
+                 sign-in ({e}); the recovery window has already said so and its retries are \
+                 spent. Full details are in: {}",
                 logging::log_file_path(config_dir).display()
             ));
         }
     }
+}
+
+/// Ends the launch **without a dialog**, because a window has just explained
+/// itself.
+///
+/// The sibling of [`fatal_startup_error`], and the difference is the whole
+/// point: that one is for a failure nothing has shown the user, so it must put
+/// the message somewhere they will see it. This one is for a failure design
+/// turn 7's unreachable body has already stated, in the app's own frame, with
+/// a Retry the user declined or spent. A modal after that is a second telling
+/// with an OK button, which is what the owner met at the end of their launch.
+fn give_up_after_the_window_explained(reason: &str) -> ! {
+    log::error!("giving up on this launch: {}", reason.replace('\n', " "));
+    std::process::exit(1);
 }
 
 /// Runs the login/unlock UI and persists the resulting session token.
@@ -10291,17 +10365,17 @@ mod tests {
         items.assert();
     }
 
-    /// A scripted stand-in for `wait_for_vault_ready_with_spinner`, recording
-    /// the message each probe was asked to show so a test can assert both
-    /// HOW MANY probes ran and that the retry looked different from the
-    /// window the user just closed.
+    /// A scripted stand-in for `wait_for_the_vault`, recording whether each
+    /// probe was asked to put a WINDOW on screen -- so a test can assert both
+    /// how many probes ran and that the retry after a dismissal opens
+    /// nothing, which is the defect design turn 7 is about.
     fn scripted_probe<'a>(
         script: Vec<VaultReadyOutcome>,
-        seen: &'a std::cell::RefCell<Vec<&'static str>>,
-    ) -> impl FnMut(&'static str) -> VaultReadyOutcome + 'a {
+        seen: &'a std::cell::RefCell<Vec<ProbeWindow>>,
+    ) -> impl FnMut(ProbeWindow) -> VaultReadyOutcome + 'a {
         let mut remaining = script.into_iter();
-        move |message| {
-            seen.borrow_mut().push(message);
+        move |window| {
+            seen.borrow_mut().push(window);
             remaining
                 .next()
                 .expect("the lock recovery must not probe more times than the script allows")
@@ -10312,9 +10386,9 @@ mod tests {
     /// the gesture review 12 already ruled must not be destructive, and it
     /// used to disarm autofill for the rest of the session -- the detached
     /// readiness worker was very likely about to answer `Ok(items)`, and
-    /// that answer was thrown away. Startup gives a dismissal one free probe
-    /// (`SETUP_RETRY_MESSAGE`); this site now gives the same one, and a
-    /// probe that then succeeds takes the ordinary `Ready` path.
+    /// that answer was thrown away. Startup gives a dismissal one free,
+    /// WINDOWLESS probe; this site now gives the same one, and a probe that
+    /// then succeeds takes the ordinary `Ready` path.
     #[test]
     fn a_dismissed_spinner_after_unlock_gets_one_free_readiness_retry() {
         let mut server = mockito::Server::new();
@@ -10355,9 +10429,10 @@ mod tests {
         );
         assert_eq!(
             *seen.borrow(),
-            vec![SETUP_MESSAGE, SETUP_RETRY_MESSAGE],
-            "the retry has to look different from the window the user just closed \
-             (review 13's Minor 4)"
+            vec![ProbeWindow::InAWindow, ProbeWindow::Silent],
+            "the free retry a dismissal buys must show NO window. Reopening one is the \
+             two-window recovery the owner reported, and doing it to a user who has just \
+             closed the first window is worse than the flow it replaced"
         );
     }
 
@@ -12527,7 +12602,7 @@ mod tests {
             for named in [
                 concat!("vault_window::", "run"),
                 concat!("reauthen", "ticate"),
-                concat!("wait_for_vault_ready_with_", "spinner"),
+                concat!("wait_for_the_", "vault"),
             ] {
                 assert!(
                     raw.contains(named),
@@ -17425,7 +17500,7 @@ mod tests {
 
         for needle in [
             concat!("try_start_", "backend("),
-            concat!("wait_for_vault_ready_", "with_spinner("),
+            concat!("wait_for_the_", "vault("),
             concat!("apply_backend_", "op("),
         ] {
             assert!(
@@ -17456,8 +17531,8 @@ mod tests {
         // The wrapper is where the two unmovable things are supplied, and the
         // only place the tray is touched at all.
         assert!(
-            wrapper.contains(concat!("wait_for_vault_ready_", "with_spinner(")),
-            "the real spinner probe must be supplied by the wrapper -- it opens an eframe \
+            wrapper.contains(concat!("wait_for_the_", "vault(")),
+            "the real windowed probe must be supplied by the wrapper -- it opens an eframe \
              window, so it is exactly what the lifted body may not name"
         );
         assert!(
@@ -23017,23 +23092,26 @@ mod startup_shape_tests {
             "the launch that already has a session shows no window of its own any more, so \
              the user watches nothing at all for the eight seconds `bw serve` takes: {arm:?}"
         );
-        // And the separate spinner window is gone from this arm, which is the
-        // report itself.
+        // **And the separate spinner window is gone from the WHOLE FILE**,
+        // which is the report itself. This used to be a claim about this arm
+        // only, with a control saying the small window was still opened
+        // elsewhere -- and "elsewhere" was the recovery, which is where the
+        // owner met it: a 360x220 window captioned "Setting up your vault...",
+        // then a second one, then a message box. Design turn 7 moved that wait
+        // into `app_window::run_recovery`, so there is no launch path left
+        // that opens one.
         assert!(
-            !arm.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
-            "the launch that already has a session opens the separate 360x220 setup window \
-             again -- \"another window Setting up your vault and then actual window loads\" \
-             verbatim: {arm:?}"
+            !production().contains(concat!("loading_ui::show_", "while(")),
+            "the launch opens `loading_ui::show_while`'s own 360x220 window again -- \
+             \"another window Setting up your vault and then actual window loads\" verbatim"
         );
-        // Positive control on that last needle: the separate spinner window is
-        // still a real thing this file opens elsewhere (the wait after a fresh
-        // master-password sign-in, which has no window of its own to put a
-        // spinner in), so the negative above is about this arm rather than
-        // about a needle that no longer matches anything anywhere.
+        // Positive control on that needle's SHAPE: this arm really does reach
+        // a host that opens a window, so the negative above is about which
+        // window rather than about a file that opens none.
         assert!(
-            production().contains(concat!("wait_for_vault_ready_with_", "spinner(")),
-            "control: the separate spinner window is gone from the whole file, so the \
-             assertion above is vacuous"
+            production().contains(concat!("app_window::run_", "recovery(")),
+            "control: nothing in this file opens the recovery's window either, so the launch \
+             has no window for its waits at all"
         );
     }
 

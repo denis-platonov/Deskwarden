@@ -361,6 +361,21 @@ enum Surface {
     /// rather than lost in it, and whether the control that closes it is
     /// visibly there.
     VaultSetupSpinner,
+    /// **Design turn 7's first window, loading.** The body the recovery
+    /// window opens on, at the vault window's own size, with a live close
+    /// control and the footer strip under it.
+    FirstWindowLoading,
+    /// The same window three seconds later, saying what is slow and how long
+    /// it has been.
+    FirstWindowSlow,
+    /// The failure, in the window rather than in a message box -- with the
+    /// Retry it can actually offer, and without the *Continue offline* the
+    /// design draws, which needs a vault disk cache this crate has not got.
+    FirstWindowUnreachable,
+    /// The same failure with its retries spent: the button is GONE rather
+    /// than greyed, which is the half of this state a picture is the only way
+    /// to check.
+    FirstWindowUnreachableSpent,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -446,6 +461,10 @@ const ALL: &[Surface] = &[
     Surface::VaultHealthEmptyFilter,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
+    Surface::FirstWindowLoading,
+    Surface::FirstWindowSlow,
+    Surface::FirstWindowUnreachable,
+    Surface::FirstWindowUnreachableSpent,
 ];
 
 impl Surface {
@@ -501,6 +520,10 @@ impl Surface {
             Surface::VaultHealthEmptyFilter => "vault_password_health_empty_filter",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
+            Surface::FirstWindowLoading => "first_window_loading",
+            Surface::FirstWindowSlow => "first_window_slow",
+            Surface::FirstWindowUnreachable => "first_window_unreachable",
+            Surface::FirstWindowUnreachableSpent => "first_window_unreachable_spent",
         }
     }
 
@@ -605,6 +628,14 @@ impl Surface {
             // spinner window used, this picture would answer a question about
             // a window nobody opens any more.
             Surface::VaultSetupSpinner => egui::vec2(1240.0, 740.0),
+            // **The vault window's own size, for all four**, which is the
+            // whole of design turn 7: the frame is decided once and only the
+            // body changes. Rendered at four different sizes these pictures
+            // could not answer the one question they exist for.
+            Surface::FirstWindowLoading
+            | Surface::FirstWindowSlow
+            | Surface::FirstWindowUnreachable
+            | Surface::FirstWindowUnreachableSpent => egui::vec2(1240.0, 740.0),
         }
     }
 
@@ -940,6 +971,12 @@ impl eframe::App for Preview {
             }
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
+            Surface::FirstWindowLoading
+            | Surface::FirstWindowSlow
+            | Surface::FirstWindowUnreachable
+            | Surface::FirstWindowUnreachableSpent => {
+                self.draw_first_window(root, self.current())
+            }
         }
 
         if self.screenshot && !self.done {
@@ -1446,6 +1483,49 @@ impl Preview {
         let _ = deskwarden::loading_ui::draw_spinner_body(
             root,
             "Setting up your vault...",
+            login_ui::CloseControl::Active,
+        );
+    }
+
+    /// **Design turn 7's window before the vault**, drawn through the same
+    /// `draw_first_window_body` the recovery window paints -- so what these
+    /// PNGs show is what a user meets when `bw serve` will not answer.
+    ///
+    /// `CloseControl::Active` because that is the argument the host passes in
+    /// every body: this window may always be left, and the picture is how a
+    /// reviewer sees that the control saying so is drawn live rather than
+    /// ghosted.
+    ///
+    /// The hotkey status is `NotYetAttempted`, which is not a decorative
+    /// choice: on the launch path nothing has tried to register the chord yet,
+    /// so that is the line the real window shows -- and a preview showing
+    /// `Armed` here would be a picture of a claim the app does not make.
+    fn draw_first_window(&mut self, root: &mut egui::Ui, surface: Surface) {
+        let body = match surface {
+            Surface::FirstWindowSlow => deskwarden::loading_ui::FirstWindowBody::Slow {
+                seconds: 12,
+            },
+            Surface::FirstWindowUnreachable => {
+                deskwarden::loading_ui::FirstWindowBody::Unreachable {
+                    retry: deskwarden::loading_ui::RetryOffer::Offered,
+                }
+            }
+            Surface::FirstWindowUnreachableSpent => {
+                deskwarden::loading_ui::FirstWindowBody::Unreachable {
+                    retry: deskwarden::loading_ui::RetryOffer::Spent,
+                }
+            }
+            _ => deskwarden::loading_ui::FirstWindowBody::Loading,
+        };
+        let _ = deskwarden::loading_ui::draw_first_window_body(
+            root,
+            body,
+            deskwarden::loading_ui::FirstWindowFooter {
+                account: Some("a.novak@ledgerline.com"),
+                hotkey: deskwarden::hotkey::HotkeyStatus::Unavailable(
+                    deskwarden::hotkey::Unavailable::NotYetAttempted,
+                ),
+            },
             login_ui::CloseControl::Active,
         );
     }

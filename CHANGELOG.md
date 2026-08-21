@@ -10,6 +10,35 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### The recovery no longer opens small windows of its own
+
+When Deskwarden's Bitwarden backend would not come up, the launch fell back to a
+recovery that put a 360×220 dialog on screen captioned "Setting up your
+vault...", then a second small one captioned "Signed in — starting your
+vault...", and then a modal error box whose OK button ended the app. Every
+ordinary launch had already been merged into one full-size window; the recovery
+was the one path left behind.
+
+The recovery now runs in that same window: the vault window's own size and
+position, from its first frame, with only the middle of it changing. It shows
+what it is doing ("Loading your vault"), admits after three seconds that it is
+slow and says how many seconds it has been, and — when the backend really
+cannot be reached — says so in the window itself, with a **Retry** that runs a
+real readiness probe. Three attempts in all; when they are spent the button is
+removed rather than greyed out, and the window says what closing it means.
+Close and minimise work throughout.
+
+There is no "Open the local copy" and no "Continue offline", because there is no
+offline copy to open yet. The window says what it can actually do.
+
+The footer names the account being opened and says what the autofill shortcut
+is really doing — including "Autofill starts when your vault opens · Ctrl+Alt+B"
+before anything has tried to claim the shortcut, rather than claiming it is
+already listening.
+
+The free retry that closing the window buys now shows nothing at all, instead of
+reopening a differently worded copy of the window you just closed.
+
 ### A card's network mark moved to the right-hand edge of its list row
 
 `VISA`, `MASTERCARD` and the rest used to sit between the item's icon and its

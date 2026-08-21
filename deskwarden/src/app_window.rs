@@ -2377,6 +2377,228 @@ where
     WarmLaunchOutcome { prepared, vault, stages, abandoned }
 }
 
+/// **The fourth host: the recovery, in the window the launch was already
+/// using** -- design turn 7.
+///
+/// # The defect this exists for
+///
+/// The merged launch hosts above fixed the ordinary launches, and one path was
+/// left behind: the recovery. `main`'s `wait_for_vault_ready_with_spinner`
+/// still called `loading_ui::show_while`, which opens a 360x220 window of its
+/// own. The owner ran a launch where `bw serve` never became reachable and got
+/// exactly that -- a small window captioned "Setting up your vault...", then a
+/// second small window captioned "Signed in -- starting your vault...", then a
+/// modal error box that ended the process. Their words: "why this window
+/// again? it should be normal window from the start."
+///
+/// # The window shape, and what it costs
+///
+/// **One reopened window that owns the whole recovery sequence, retries
+/// included.** By the time a recovery runs, the launch window has already
+/// closed: [`run_from_working`] RETURNS on a failed probe, deliberately (see
+/// its "What a failure does"), because the recovery kills `bw serve`, sends the
+/// user back through the master password and restarts -- none of which can run
+/// inside a frame closure. Keeping that window alive across the retry would
+/// mean lifting the whole kill/reauthenticate/restart sequence into a worker
+/// and parking the estate for the warm launch too, which is the machinery
+/// `run_from_working`'s own doc declines for the same reason.
+///
+/// So the window closes and this one opens. **The cost is one blink**, and it
+/// is bounded to that: this host opens at [`the_vault_windows_viewport`], the
+/// same size and position the launch window had and the vault will have, so
+/// nothing resizes and nothing re-centres -- what the user sees is the same
+/// frame, redrawn. What they no longer see is a 360x220 dialog, a second one
+/// after it, or a modal box with an OK button that exits.
+///
+/// # Retry, and what happens when it runs out
+///
+/// [`RECOVERY_ATTEMPTS`] probes in total: the one this host starts with, and
+/// two more the user can ask for by pressing Retry. Each is a fresh run of
+/// `probe` on a fresh worker thread, so a Retry is a real readiness probe and
+/// not a redraw. When the last one fails the body stops offering the button
+/// and says what is left instead (`RetryOffer::Spent`) -- no greyed control,
+/// for the reason `loading_ui`'s own `RetryOffer` records. The caller then
+/// gets [`RecoveryOutcome::Unreachable`] and decides; nothing here exits.
+///
+/// # Its ✕ is live in every body
+///
+/// Same argument as [`run_from_working`]'s, and stronger: this window can sit
+/// on an unreachable backend indefinitely, and a screen a user cannot leave is
+/// what the merged-window work already fixed once. A close is
+/// [`RecoveryOutcome::Abandoned`] -- "stop showing me a window", not "the
+/// backend is broken" -- and callers answer the two differently.
+pub fn run_recovery<T, F>(account: Option<String>, probe: F) -> RecoveryOutcome<T>
+where
+    T: Send + 'static,
+    F: Fn() -> Result<T, String> + Send + Clone + 'static,
+{
+    fn spawn_probe<T, F>(probe: &F) -> mpsc::Receiver<Result<T, String>>
+    where
+        T: Send + 'static,
+        F: Fn() -> Result<T, String> + Send + Clone + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let probe = probe.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe());
+        });
+        rx
+    }
+
+    // Read back after the event loop returns, for the reason every window in
+    // this crate uses `Rc<RefCell<_>>`.
+    let ready: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+    let unreachable: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let ready_cell = ready.clone();
+    let unreachable_cell = unreachable.clone();
+
+    let mut rx = spawn_probe(&probe);
+    // Restarted by every Retry, so the seconds the slow body shows are the
+    // seconds THIS attempt has been running -- not the age of the window.
+    let mut attempt_started = Instant::now();
+    let mut attempts_used: u32 = 1;
+    let mut failure: Option<String> = None;
+    let mut closing = Closing::not_yet();
+
+    run_the_one_window(the_vault_windows_viewport(), move |ui, _frame| {
+        let body = match failure {
+            Some(_) => loading_ui::FirstWindowBody::Unreachable {
+                retry: if attempts_used < RECOVERY_ATTEMPTS {
+                    loading_ui::RetryOffer::Offered
+                } else {
+                    loading_ui::RetryOffer::Spent
+                },
+            },
+            // **The threshold is `loading_ui`'s, applied to a real
+            // `Instant`.** A body picked here from a literal would be a
+            // second copy of the rule the design states once.
+            None => loading_ui::waiting_body(attempt_started.elapsed()),
+        };
+
+        let outcome = loading_ui::draw_first_window_body(
+            ui,
+            body,
+            loading_ui::FirstWindowFooter {
+                account: account.as_deref(),
+                // Read every frame rather than captured once: the answer can
+                // change under this window, and a footer that cached it would
+                // be a claim about the shortcut made before the attempt.
+                hotkey: crate::hotkey::availability(),
+            },
+            login_ui::CloseControl::Active,
+        );
+
+        match outcome.chrome {
+            login_ui::ChromeAction::Close => {
+                log::info!(
+                    "the recovery window was closed while the vault backend was still \
+                     unreachable; nothing is stranded by that -- `main` owns the `bw serve` \
+                     this window did not start -- so the close is honoured"
+                );
+                close_this_window(ui.ctx(), &mut closing);
+            }
+            login_ui::ChromeAction::Minimize => ui
+                .ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            login_ui::ChromeAction::None => {}
+        }
+
+        // Alt+F4 and the system menu, honoured for the same reason the ✕ is.
+        // `refuse_close_while_working` is deliberately not called here.
+        if !closing.decided() && ui.ctx().input(|i| i.viewport().close_requested()) {
+            close_this_window(ui.ctx(), &mut closing);
+        }
+
+        if outcome.retry && !closing.decided() {
+            attempts_used += 1;
+            log::info!(
+                "the recovery window's Retry was pressed; readiness probe attempt \
+                 {attempts_used} of {RECOVERY_ATTEMPTS}"
+            );
+            failure = None;
+            // Retracted with it: the outcome must not report a failure the
+            // user has already asked this window to try again past.
+            *unreachable_cell.borrow_mut() = None;
+            attempt_started = Instant::now();
+            rx = spawn_probe(&probe);
+            ui.ctx().request_repaint();
+            return;
+        }
+
+        // Not polled once the window has decided to end, and not polled while
+        // a failure is on screen -- the same guard the other hosts keep: a
+        // drain after the decision reports a true fact about the channel as a
+        // false story about the run.
+        if closing.decided() || failure.is_some() {
+            return;
+        }
+        match rx.try_recv() {
+            Ok(Ok(value)) => {
+                *ready_cell.borrow_mut() = Some(value);
+                close_this_window(ui.ctx(), &mut closing);
+            }
+            Ok(Err(why)) => {
+                log::warn!("the recovery window's readiness probe failed: {why}");
+                *unreachable_cell.borrow_mut() = Some(why.clone());
+                failure = Some(why);
+                ui.ctx().request_repaint();
+            }
+            Err(err) => match poll_working(err, attempt_started.elapsed()) {
+                WorkPoll::KeepWaiting => ui.ctx().request_repaint_after(WORKING_POLL),
+                WorkPoll::Failed(why) => {
+                    let message = give_up_message(why, attempt_started.elapsed());
+                    log::warn!("the recovery window gave up on this attempt: {message}");
+                    *unreachable_cell.borrow_mut() = Some(message.clone());
+                    failure = Some(message);
+                    ui.ctx().request_repaint();
+                }
+            },
+        }
+    });
+
+    if let Some(value) = ready.borrow_mut().take() {
+        return RecoveryOutcome::Ready(value);
+    }
+    // The window's last failure, if it ended on one. Taken from the outer
+    // handle: the closure's clone went with the closure when the event loop
+    // returned.
+    // Into a local first, for the reason `run_from_working`'s `prepared` is: a
+    // temporary `RefMut` living inside the `match` would still be borrowing
+    // after the `Rc` it borrows from is dropped.
+    let why = unreachable.borrow_mut().take();
+    match why {
+        Some(why) => RecoveryOutcome::Unreachable(why),
+        None => RecoveryOutcome::Abandoned,
+    }
+}
+
+/// How many readiness probes one recovery window may run: the one it opens
+/// with, plus two the user can ask for.
+///
+/// **Bounded, and bounded by a number rather than by the user's patience.**
+/// Each probe spends its own `wait_for_vault_ready` schedule (~30s), so three
+/// is already a minute and a half of asking a backend that is not answering.
+/// When they are spent the body stops offering Retry and says so, and the
+/// caller is handed [`RecoveryOutcome::Unreachable`].
+pub const RECOVERY_ATTEMPTS: u32 = 3;
+
+/// How a recovery window ended.
+///
+/// Three outcomes and not two, for the reason [`WarmLaunchOutcome::abandoned`]
+/// is a field rather than a failure: a user closing this window is not evidence
+/// that anything is broken, and the callers answer it more quietly than they
+/// answer a backend that never came back.
+pub enum RecoveryOutcome<T> {
+    /// A probe answered, and the vault is ready.
+    Ready(T),
+    /// The user closed the window (✕ or Alt+F4) without a probe having
+    /// answered either way.
+    Abandoned,
+    /// Every attempt was spent, or the user closed the window with a failure
+    /// on screen. Carries the last failure's own words.
+    Unreachable(String),
+}
+
 #[cfg(test)]
 mod transition_tests {
     use super::*;
@@ -3546,7 +3768,7 @@ mod startup_window_tests {
         //    were matched earlier than the real test modules, this anchor
         //    would fall below the cut instead of just above it.
         const LAST_PRODUCTION_ITEM: &str =
-            concat!("WarmLaunchOutcome { prepared, ", "vault, stages, abandoned }");
+            concat!("Unreachable(String)", ",");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,
@@ -3583,7 +3805,7 @@ mod startup_window_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 7,
+            modules, 8,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -5946,9 +6168,14 @@ mod warm_launch_host_tests {
     use super::startup_window_tests::{code, production};
     use super::*;
 
-    /// The warm-launch host from its head to the end of production code,
-    /// comments stripped -- and it IS the end of production: this host is the
-    /// last item in the file, which the production-cut control also pins.
+    /// The warm-launch host from its head to the head of the RECOVERY host,
+    /// comments stripped.
+    ///
+    /// **Bounded forward at the fourth host**, which is what it stopped being
+    /// unbounded for: `run_recovery` sits below this one, draws a body of its
+    /// own and closes its own window, so an unbounded slice would let this
+    /// file's negative guards fail on code they are not about and its positive
+    /// ones be satisfied by it.
     fn host() -> String {
         let production = code(production());
         let at = production
@@ -5957,7 +6184,11 @@ mod warm_launch_host_tests {
                 "the warm-launch host is gone entirely -- the launch that already has a \
                  session is back to a separate spinner window, which is the report",
             );
-        let host = production[at..].to_string();
+        let rest = &production[at..];
+        let host = match rest.find(concat!("pub fn run_", "recovery<T, F>(")) {
+            Some(end) => rest[..end].to_string(),
+            None => rest.to_string(),
+        };
         assert!(
             host.len() > 2_000,
             "the warm-launch host sliced down to {} bytes, which is not the whole of it -- \
@@ -5997,9 +6228,12 @@ mod warm_launch_host_tests {
         // both windows and not a coincidence between two copies.
         assert_eq!(
             code(production()).matches(concat!("the_vault_windows_", "viewport()")).count(),
-            3,
-            "the vault window's viewport is not built in one place and used by both hosts \
-             that open a window which becomes the vault -- one definition, two calls"
+            4,
+            "the vault window's viewport is not built in one place and used by every host \
+             that opens a window the vault arrives in -- one definition, three calls. The \
+             third call is `run_recovery`'s, and it is the whole of design turn 7's \
+             requirement that the recovery use the vault's frame rather than a dialog of \
+             its own"
         );
     }
 
@@ -6102,6 +6336,181 @@ mod warm_launch_host_tests {
             "the warm-launch vault session does not end through `finish`, so its geometry is \
              never written and everything it reported -- a lock, a switch, a gear visit -- is \
              dropped: {host}"
+        );
+    }
+}
+
+/// **The recovery host, held by source position** -- design turn 7.
+///
+/// `run_recovery` blocks on a real winit event loop and opens a real OS
+/// window, so nothing here can call it. What CAN be held is every property the
+/// design makes load-bearing and a transition table cannot state: that the
+/// window it opens is the vault's, that its close control is live, that Retry
+/// runs a real probe rather than a redraw, and that the bound on those probes
+/// exists. The same discipline, and the same needles-split-with-`concat!`
+/// discipline, as the three host test modules above.
+#[cfg(test)]
+mod recovery_host_tests {
+    use super::startup_window_tests::{code, production};
+    use super::*;
+
+    /// The recovery host from its head to the end of production code,
+    /// comments stripped -- and it IS the end of production: this host is the
+    /// last item in the file.
+    fn host() -> String {
+        let production = code(production());
+        let at = production
+            .find(concat!("pub fn run_", "recovery<T, F>("))
+            .expect(
+                "the recovery host is gone entirely -- the recovery is back to \
+                 `loading_ui::show_while`'s own 360x220 window, which is the owner's report",
+            );
+        let host = production[at..].to_string();
+        assert!(
+            host.len() > 2_000,
+            "the recovery host sliced down to {} bytes, which is not the whole of it -- every \
+             guard below would then be a statement about a region that stops short of the \
+             code it names",
+            host.len()
+        );
+        host
+    }
+
+    /// **The window it opens is the VAULT's**, which is design turn 7's whole
+    /// governing line: "same frame, same 1240 x 700 as the vault window, so
+    /// nothing jumps when the list arrives -- only the body changes".
+    ///
+    /// The recovery is entered from a launch window that has just closed at
+    /// that geometry, so a host that built a viewport of its own would put the
+    /// user back where they started: a differently sized box, somewhere else on
+    /// screen, in the middle of a failure.
+    #[test]
+    fn the_recovery_window_opens_at_the_vault_windows_own_geometry() {
+        let host = host();
+        assert!(
+            host.contains(concat!("the_vault_windows_", "viewport()")),
+            "the recovery host no longer opens at the vault window's geometry, so the window \
+             jumps or re-centres between the launch that failed and the recovery: {host}"
+        );
+        assert!(
+            !host.contains(concat!("Viewport", "Builder::default()")),
+            "the recovery host builds a viewport of its own, so the window it opens is no \
+             longer provably the one the launch was already using: {host}"
+        );
+    }
+
+    /// **Every body can be left.**
+    ///
+    /// This window can sit on a backend that is never coming back. `run`'s
+    /// working stage may refuse a close because closing it strands a sign-in;
+    /// nothing here is owed that -- `main` owns the `bw serve` -- and a failure
+    /// screen with no way out is worse than a spinner with none, because there
+    /// is nothing left for it to be waiting for.
+    #[test]
+    fn the_recovery_window_can_be_closed() {
+        let host = host();
+        assert!(
+            host.contains(concat!("CloseControl::", "Active")),
+            "the recovery window's close control is no longer live: {host}"
+        );
+        assert!(
+            !host.contains(concat!("CloseControl::", "Disabled")),
+            "the recovery window ghosts its own close control: {host}"
+        );
+        assert!(
+            !host.contains(concat!("refuse_close_while_", "working(")),
+            "the recovery host refuses closes that do not go through the chrome, so Alt+F4 is \
+             swallowed too and the escape hatch is only half there: {host}"
+        );
+    }
+
+    /// **It draws design 7's bodies, and the threshold it picks them by is
+    /// `loading_ui`'s own applied to a real clock.**
+    ///
+    /// A host that compared elapsed time to a literal of its own would be a
+    /// second copy of a rule the design states once; a host that picked the
+    /// slow body from anything other than an `Instant` would be showing a
+    /// number that is decoration.
+    #[test]
+    fn the_recovery_host_draws_the_designed_bodies() {
+        let host = host();
+        assert!(
+            host.contains(concat!("draw_first_window_", "body(")),
+            "the recovery host draws none of design 7's bodies, so the window it opens is \
+             blank: {host}"
+        );
+        assert!(
+            host.contains(concat!("waiting_body(attempt_started.", "elapsed())")),
+            "the recovery host no longer picks its body from how long THIS attempt has \
+             actually been running, so `Taking longer than usual` is either always on screen \
+             or never is: {host}"
+        );
+        assert!(
+            host.contains(concat!("hotkey::", "availability()")),
+            "the recovery host no longer reads the shortcut's real status, so the footer is \
+             back to asserting a hotkey nothing has registered: {host}"
+        );
+    }
+
+    /// **Retry really retries, and it is bounded.**
+    ///
+    /// The button's whole justification is that pressing it runs a fresh
+    /// readiness probe -- a Retry that redrew the same failure would be a
+    /// control that looks live and does nothing, which is the treatment
+    /// `RetryOffer::Spent` exists to avoid. And the bound has to be a bound: a
+    /// window that offered Retry forever would ask a user to keep pressing a
+    /// button at a backend that is not answering.
+    #[test]
+    fn retry_runs_a_real_probe_and_the_attempts_are_bounded() {
+        let host = host();
+        assert_eq!(
+            host.matches(concat!("spawn_", "probe(&probe)")).count(),
+            2,
+            "there are not exactly two places a probe is started in this host -- the one it \
+             opens with and the one Retry runs. Fewer means Retry does not probe; more means \
+             an unaccounted attempt: {host}"
+        );
+        assert!(
+            host.contains(concat!("attempts_used < RECOVERY_", "ATTEMPTS")),
+            "the recovery host no longer bounds its retries, so the unreachable body offers \
+             Retry forever: {host}"
+        );
+        assert!(
+            host.contains(concat!("RetryOffer::", "Spent")),
+            "the recovery host never reaches the spent state, so the bound above can only \
+             ever be reached by a button that stays on screen: {host}"
+        );
+        assert_eq!(
+            RECOVERY_ATTEMPTS, 3,
+            "the number of attempts is what it is on purpose -- each spends its own ~30s \
+             readiness schedule, so three is already a minute and a half"
+        );
+    }
+
+    /// **The 360x220 window is gone from the launch entirely.**
+    ///
+    /// This is the report, held where it can actually fail. `loading_ui::
+    /// show_while` still exists and is still right for `picker_ui` -- a fill
+    /// from the hotkey with no window of its own to draw in -- but `main` must
+    /// not reach it, because `main` is the launch, and every wait on the launch
+    /// now has the vault's frame around it.
+    #[test]
+    fn the_launch_never_opens_the_small_spinner_window_again() {
+        let main_rs = code(include_str!("main.rs"));
+        assert!(
+            !main_rs.contains(concat!("loading_ui::show_", "while(")),
+            "`main` opens `loading_ui::show_while`'s own 360x220 window again. That is the \
+             owner's report verbatim -- a small window captioned `Setting up your vault...`, \
+             then a second small one, then a message box -- and design turn 7 exists to \
+             remove it"
+        );
+        // Positive control: the function is still there to have been called,
+        // so the absence above is a decision and not a rename.
+        assert!(
+            code(include_str!("picker_ui.rs")).contains(concat!("loading_ui::show_", "while(")),
+            "control: nothing in this crate calls `show_while` any more, so the guard above \
+             would pass on a deleted function rather than on a launch that stopped opening a \
+             second window"
         );
     }
 }

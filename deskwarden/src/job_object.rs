@@ -1355,12 +1355,12 @@ mod tests {
     const THREAD_SPAWN_SITES: &[(&str, usize)] = &[
         ("app.rs", 1),
         ("app_identity.rs", 1),
-        // Five, not four: `run_from_working` -- the host for the launch that
-        // already has a session -- starts the readiness probe on a worker of
-        // its own, for the reason every other host here does. On the frame
-        // thread it would freeze the window exactly where it is meant to be
-        // showing a spinner.
-        ("app_window.rs", 5),
+        // Six. Five, then `run_recovery`'s: the recovery host starts a fresh
+        // readiness probe per attempt -- one when it opens, one per Retry --
+        // from a single site. On the frame thread any of them would freeze the
+        // window exactly where it is meant to be showing a spinner, which is
+        // the reason every other host here has a worker too.
+        ("app_window.rs", 6),
         ("breach.rs", 2),
         // One: the worker a `breach_scan` run starts. There are up to
         // `breach_scan::MAX_IN_FLIGHT` of them at a time, from this ONE site
@@ -1382,12 +1382,11 @@ mod tests {
         ("injector/mod.rs", 1),
         ("injector/sequence.rs", 1),
         ("login_ui.rs", 10),
-        // Twelve. Eleven of them were here when the tray's "Update available"
-        // item and its download-and-apply thread left for `update_panel.rs`
-        // below; the twelfth is the `bw status` the warm launch window's vault
-        // stage starts beside itself, so the toolbar's account label fills in
-        // rather than the window waiting seconds for it.
-        ("main.rs", 12),
+        // Eleven. It was twelve until design turn 7 moved the recovery's
+        // readiness wait into `app_window::run_recovery`, which starts that
+        // probe itself, once per attempt -- so the spawn that used to sit
+        // behind `loading_ui::show_while` here is gone with the window it fed.
+        ("main.rs", 11),
         ("picker_ui.rs", 2),
         // Two: the About page's check, and its download-and-verify. Neither
         // can be a tick in a frame loop -- both are seconds-to-minutes of
