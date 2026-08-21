@@ -96,17 +96,39 @@ pub enum Unavailable {
     /// and a future variant must degrade like the rest rather than fall off
     /// the end of a `match`.
     Refused,
+    /// **Nothing has tried yet.** Not a failure: the reason the shortcut is
+    /// not working is that this process has not reached
+    /// [`register_fill_hotkey`] -- which it does after the startup vault
+    /// window closes, six hundred lines below where that window opens.
+    ///
+    /// This exists because the Shortcuts page can be reached *before* that
+    /// point, from the Preferences modal inside that window, and
+    /// [`availability`] used to answer that route with [`HotkeyStatus::Armed`]
+    /// -- an assertion that the chord was registered, made before anything had
+    /// tried to register it, and wrong on exactly the machine the rest of this
+    /// module exists for. [`classify`] never produces it and nothing ever
+    /// [`publish`]es it; it is what [`availability`] says when nothing has
+    /// been published at all.
+    NotYetAttempted,
 }
 
 impl Unavailable {
     /// The one line the Shortcuts page shows under the shortcut.
     ///
     /// Actionable where it can be and honest where it cannot: the first names
-    /// the thing to do and how long the fix takes to be noticed, the other two
+    /// the thing to do and how long the fix takes to be noticed, the next two
     /// say plainly that the shortcut is off and that nothing else is, because
-    /// there is no action to offer. All three end on the same reassurance,
+    /// there is no action to offer. All of them end on the same reassurance,
     /// which is the part that stops a missing shortcut reading as a broken
     /// app.
+    ///
+    /// [`Unavailable::NotYetAttempted`]'s line is the odd one and is written
+    /// to be: it must not blame the machine, another program or Windows for
+    /// something none of them has done, because at that moment nothing has
+    /// happened at all. It says so, and says the page will have the real
+    /// answer shortly -- which it will, because the first attempt is made the
+    /// moment the startup window closes and an unavailable one is re-attempted
+    /// every [`RETRY_EVERY`] after that.
     pub fn message(self) -> &'static str {
         match self {
             Unavailable::TakenByAnotherProgram => {
@@ -121,6 +143,12 @@ impl Unavailable {
             Unavailable::Refused => {
                 "Windows refused this shortcut, so it is off for now. Everything else works \
                  normally; the log has the reason."
+            }
+            Unavailable::NotYetAttempted => {
+                "Deskwarden has not tried to claim CTRL+ALT+B yet, so it is not working at \
+                 this moment. It makes the attempt as soon as this window is out of the way, \
+                 and this page will then say whether it got the shortcut. Everything else \
+                 works normally."
             }
         }
     }
@@ -279,7 +307,14 @@ fn run_attempt(
 fn announce(status: HotkeyStatus) {
     let previous = publish(status);
     match (previous, status) {
-        (HotkeyStatus::Unavailable(_), HotkeyStatus::Armed) => log::info!(
+        // `Some(..)`, so this line means a real earlier failure and not the
+        // absence of one. Matching a bare `Unavailable(_)` here is what would
+        // have gone wrong the moment `STATUS` stopped being seeded with
+        // `Armed`: "nothing published yet" is now an unavailable-shaped answer
+        // too, so an ordinary launch where the chord was free would have
+        // reported "whatever was holding it has let go" about a conflict that
+        // never existed. `None` falls through to the plain line below.
+        (Some(HotkeyStatus::Unavailable(_)), HotkeyStatus::Armed) => log::info!(
             "the global shortcut CTRL+ALT+B is registered after all; whatever was holding it \
              has let go"
         ),
@@ -334,29 +369,61 @@ pub fn retry_if_unavailable(fh: &mut FillHotkey, now: Instant) -> bool {
 /// itself never uses -- see `prefs_ui::ACCOUNT_STATUS` for the same trade-off
 /// decided the same way). One writer, in this module, at the one moment the
 /// answer changes.
-static STATUS: Mutex<HotkeyStatus> = Mutex::new(HotkeyStatus::Armed);
+///
+/// **`Option`, and `None` until somebody publishes.** It used to hold a bare
+/// `HotkeyStatus` seeded with [`HotkeyStatus::Armed`], and that seed was a
+/// defect: `register_fill_hotkey` runs *after* `main` opens the startup vault
+/// window, that call blocks for the whole life of the window, and the
+/// Preferences modal inside it is drawn in that window's own loop -- so the
+/// Shortcuts page on that route read the seed and told the user the chord was
+/// working before anything had tried to claim it. A default that is a
+/// well-formed answer is an assertion nothing has established, which is what
+/// [`Unavailable::NotYetAttempted`] and this `None` exist to stop being
+/// spellable. Every other published static in this crate is already shaped
+/// this way -- `prefs_ui::PUBLISHED_ACCOUNT`, `app::NEVER_APPS`,
+/// `clipboard::ARMED`, `single_instance::ON_TAKEOVER` -- and
+/// `no_published_status_static_defaults_to_a_claim` in `main.rs` now requires
+/// it of all of them.
+static STATUS: Mutex<Option<HotkeyStatus>> = Mutex::new(None);
 
 /// Reads the published status.
 ///
-/// Defaults to [`HotkeyStatus::Armed`] before any attempt has been made, which
-/// is the right default for the only two things that can observe it: a
-/// production process, where `register_fill_hotkey` runs before the tray
-/// exists and therefore before any route to the Shortcuts page does; and a
-/// test process, which never registers anything and must not be shown a
-/// warning about a machine it is not running on.
+/// Answers "nothing has been published" as
+/// [`Unavailable::NotYetAttempted`] rather than as
+/// [`HotkeyStatus::Armed`], which makes the one route that can observe it
+/// truthful: the Preferences modal inside the startup vault window, which runs
+/// entirely before the first registration attempt. The page ghosts the chord
+/// and says nothing has tried yet, instead of showing it as working and then
+/// being contradicted half a second later by a chord another program is
+/// holding.
+///
+/// A test process observes the same thing, and that is right too: a test
+/// registers nothing, so "not registered" is the true answer -- and unlike the
+/// old default it says so without blaming a machine it is not running on.
+///
+/// The poisoned-lock arm answers the same way for the same reason it does not
+/// panic below: an unreadable status is not a working shortcut.
 pub fn availability() -> HotkeyStatus {
-    STATUS.lock().map(|s| *s).unwrap_or(HotkeyStatus::Armed)
+    STATUS
+        .lock()
+        .ok()
+        .and_then(|s| *s)
+        .unwrap_or(HotkeyStatus::Unavailable(Unavailable::NotYetAttempted))
 }
 
-/// Publishes a status, handing back the one it replaced.
-pub fn publish(status: HotkeyStatus) -> HotkeyStatus {
+/// Publishes a status, handing back the one it replaced -- `None` when this is
+/// the first thing ever published, which is what tells [`announce`] that an
+/// armed hotkey is a first success rather than a recovery.
+pub fn publish(status: HotkeyStatus) -> Option<HotkeyStatus> {
     match STATUS.lock() {
-        Ok(mut held) => std::mem::replace(&mut *held, status),
+        Ok(mut held) => held.replace(status),
         // A poisoned lock here means another thread panicked mid-write of a
-        // two-variant `Copy` enum. Publishing a status is not worth turning
-        // that into a second panic, in the module whose whole subject is that
-        // this feature does not take the process down.
-        Err(_) => status,
+        // small `Copy` enum. Publishing a status is not worth turning that
+        // into a second panic, in the module whose whole subject is that this
+        // feature does not take the process down. Reported as "the previous
+        // value was this one", so the caller logs a plain statement of the
+        // status rather than a transition it cannot actually vouch for.
+        Err(_) => Some(status),
     }
 }
 
@@ -461,6 +528,7 @@ mod tests {
             Unavailable::TakenByAnotherProgram,
             Unavailable::NoManager,
             Unavailable::Refused,
+            Unavailable::NotYetAttempted,
         ] {
             let message = reason.message();
             assert!(
@@ -536,20 +604,92 @@ mod tests {
         assert_eq!(classify(Err(&other)), HotkeyStatus::Unavailable(Unavailable::Refused));
     }
 
-    /// **The default the Shortcuts page sees before anything has been
-    /// registered is "working".**
+    /// **Before anything has tried, the page says nothing has tried -- not
+    /// that the shortcut works.**
     ///
-    /// Which is the right default for the only two things that can observe it,
-    /// and the argument is in [`availability`]'s doc. It is asserted rather
-    /// than round-tripped through [`publish`] on purpose: this is process-wide
-    /// state that `prefs_ui`'s painting tests read, and the tests in this
-    /// binary run in parallel, so a test that set it would be setting it for
-    /// whatever else was painting a Shortcuts page at that instant. The write
-    /// side is covered where it cannot race -- `register_fill_hotkey_with`
-    /// publishes through `announce` on every path above, and the *reading* of
-    /// a published value is `prefs_ui::draw_section`'s one line.
+    /// This is the defect this variant was added for. `register_fill_hotkey`
+    /// runs after `main` opens the startup vault window; that call blocks for
+    /// the window's whole life and the Preferences modal inside it is drawn in
+    /// that window's own loop, so Preferences > Shortcuts on that route is
+    /// reached before a single `RegisterHotKey` call has been made. The
+    /// default was [`HotkeyStatus::Armed`], so the page told those users the
+    /// chord was working -- and if the attempt then failed, which is the one
+    /// case this whole module exists for, the page had already said otherwise.
+    ///
+    /// It is asserted rather than round-tripped through [`publish`] on
+    /// purpose: this is process-wide state that `prefs_ui`'s painting tests
+    /// read, and the tests in this binary run in parallel, so a test that set
+    /// it would be setting it for whatever else was painting a Shortcuts page
+    /// at that instant. The write side is covered where it cannot race --
+    /// `register_fill_hotkey_with` publishes through `announce` on every path
+    /// above, and the *reading* of a published value is
+    /// `prefs_ui::draw_section`'s one line.
     #[test]
-    fn an_unregistered_process_is_not_warned_about_a_machine_it_is_not_on() {
-        assert_eq!(availability(), HotkeyStatus::Armed);
+    fn a_process_that_has_not_tried_yet_says_so_rather_than_claiming_the_shortcut_works() {
+        assert_eq!(
+            availability(),
+            HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+            "the published default is a claim again: the Shortcuts page inside the startup \
+             vault window reads this before anything has called RegisterHotKey, so this is \
+             what it would show the user"
+        );
+    }
+
+    /// **...and it says it without blaming anything.**
+    ///
+    /// The other three reasons name a cause -- another program, a refused
+    /// hook, a refused chord -- because by the time they are published there
+    /// is one. Here there is not: nothing has happened yet. A line that
+    /// borrowed one of theirs would send a user hunting for a conflicting
+    /// program half a second before Deskwarden claimed the chord without
+    /// trouble, which is a worse failure than the silence it replaced.
+    #[test]
+    fn the_not_yet_attempted_line_blames_nothing_and_promises_an_answer() {
+        let message = Unavailable::NotYetAttempted.message();
+        assert!(
+            !message.contains("Another program") && !message.contains("refused"),
+            "the not-yet-attempted line blames a cause that does not exist yet: {message:?}"
+        );
+        assert!(
+            message.contains("has not tried"),
+            "the not-yet-attempted line does not say that nothing has tried yet, which is the \
+             only fact there is at that moment: {message:?}"
+        );
+        assert!(
+            message.contains("CTRL+ALT+B"),
+            "the line names no chord, so a user cannot tell which shortcut it is about: \
+             {message:?}"
+        );
+        // And it is distinct from every other line, so the page cannot show
+        // this state wearing another one's words.
+        for other in [
+            Unavailable::TakenByAnotherProgram,
+            Unavailable::NoManager,
+            Unavailable::Refused,
+        ] {
+            assert_ne!(other.message(), message, "{other:?} and NotYetAttempted read the same");
+        }
+    }
+
+    /// **`NotYetAttempted` is never a *decided* status.**
+    ///
+    /// It is what [`availability`] synthesises for "nothing published", and
+    /// nothing else may produce it: a registration that came back as
+    /// "not attempted" would be a `FillHotkey` that reported it had never run
+    /// the attempt it had just run.
+    #[test]
+    fn no_attempt_can_ever_report_that_it_was_not_attempted() {
+        let not_attempted = HotkeyStatus::Unavailable(Unavailable::NotYetAttempted);
+        for attempt in [succeeds as RegisterAttempt, already_registered, no_manager, refused] {
+            let fh = register_fill_hotkey_with(attempt, unpublished, Instant::now());
+            assert_ne!(fh.availability(), not_attempted);
+        }
+        assert_ne!(classify(Ok(())), not_attempted);
+        let already = global_hotkey::Error::AlreadyRegistered(conflicting_chord());
+        assert_ne!(classify(Err(&already)), not_attempted);
+        // It does, however, retry like any other unavailable state, so a
+        // status that somehow reached the main loop would go and find out
+        // rather than sit there being not-yet-attempted forever.
+        assert!(should_retry(not_attempted, RETRY_EVERY));
     }
 }

@@ -10,6 +10,29 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Preferences no longer says the fill shortcut works before anything has tried it
+
+Preferences ▸ Shortcuts read a process-wide status whose starting value was
+"registered". Deskwarden claims `CTRL+ALT+B` only after the startup vault
+window closes — that window blocks for its whole life and hosts Preferences as
+a modal drawn in its own loop — so anyone who opened Shortcuts from that first
+window was shown a working shortcut before a single `RegisterHotKey` call had
+been made. If the attempt then failed, which is the case the shortcut's
+degrade-instead-of-crash handling exists for, the page had already said the
+opposite.
+
+The page now says so plainly on that route: the chord is greyed and the line
+under it reads *"Deskwarden has not tried to claim CTRL+ALT+B yet…"*, followed
+by the real answer as soon as the attempt is made. Nothing moved: registration
+still happens where it has to, and an unavailable shortcut is still re-tried
+every thirty seconds with the page updating when it succeeds.
+
+The starting value was the whole defect — a default is not a fact — so the
+status now begins as *nothing published at all*, which is how every other
+published value in the app already worked. A new source-walking guard requires
+that of all of them: no shared status may start life holding a fully formed
+answer, so the next one written cannot repeat this.
+
 ### A vault snapshot can be restored without asking the backend for it
 
 `VaultCache` gained `populate_with_vault`: a caller that already holds the

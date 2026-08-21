@@ -1539,6 +1539,22 @@ fn main() {
     // without the shortcut, Preferences > Shortcuts says why, and the main
     // loop re-attempts on `hotkey::RETRY_EVERY` in case whatever holds it
     // exits, which is what the `mut` is for. See `hotkey`'s module docs.
+    //
+    // **This line is late, and that is now safe rather than merely tolerated.**
+    // Everything above it -- including the whole life of the startup vault
+    // window and the Preferences modal drawn inside that window's own loop --
+    // runs before any `RegisterHotKey` call is made, so Preferences >
+    // Shortcuts is reachable before this. It cannot move up: the manager
+    // creates a hidden Win32 window bound to the thread that builds it and
+    // delivers `WM_HOTKEY` only while that thread pumps its own queue, and for
+    // the window's whole life that thread is inside `eframe` --
+    // `the_startup_windows_initialisations_stay_below_it_and_read_the_estate`
+    // pins it here for that reason and `foreground`/`job_object` both count
+    // the helper window it makes. So the fix was on the reading side instead:
+    // `hotkey::STATUS` holds nothing until this line publishes, and the page
+    // renders that nothing as "Deskwarden has not tried to claim CTRL+ALT+B
+    // yet" rather than as a working shortcut. It used to default to *armed*,
+    // and told those users the chord worked before anything had tried for it.
     let mut fill_hotkey = hotkey::register_fill_hotkey();
     // `mut`: the "Accounts" submenu is rebuilt in place after every add,
     // removal and switch, and rebuilding mints new `MenuId`s that the tray has
@@ -8586,6 +8602,188 @@ mod tests {
             install_at > window_at,
             "the rule cannot see a `main` that installs after opening a window, which is the \
              only thing it exists to catch"
+        );
+    }
+
+    /// **A published default must not be an assertion.**
+    ///
+    /// # The defect
+    ///
+    /// `hotkey::STATUS` was `Mutex<HotkeyStatus>` seeded with
+    /// `HotkeyStatus::Armed`, and `hotkey::availability()` -- which
+    /// `prefs_ui::draw_section` reads to paint Preferences > Shortcuts -- had
+    /// no way to tell that seed from a real answer. The first registration
+    /// attempt is made below the startup vault window (it cannot move up; see
+    /// the note at that line), that window blocks for its entire life, and its
+    /// Preferences modal is drawn in its own loop. So on that route the page
+    /// said the chord was registered *before anything had tried to register
+    /// it* -- and when the attempt then failed, which is the single case the
+    /// whole degrade-don't-die path in `hotkey` exists for, the page had
+    /// already told the user otherwise.
+    ///
+    /// This is the same family as
+    /// `every_published_environment_is_installed_before_the_first_window`, and
+    /// it is the half that rule could not see. That one catches a fact
+    /// *established late*; this one catches a fact *asserted early*, which is
+    /// worse in kind: a late environment gives a page that refuses to work and
+    /// says so, and a default-shaped-as-an-answer gives a page that lies
+    /// quietly.
+    ///
+    /// # The rule
+    ///
+    /// A process-wide `static` behind a `Mutex`/`RwLock` is how one part of
+    /// this process hands a value to another that cannot be passed one. Until
+    /// the writer runs there is no value, and "there is no value yet" has to
+    /// be *representable* -- so the initialiser may not be a variant of an
+    /// enum the same file declares. `None`, `()`, an empty collection: all
+    /// fine, because none of them can be mistaken for an answer. A domain
+    /// variant is not, because it can.
+    ///
+    /// Found rather than listed, and not by module name: every such static in
+    /// `src/` is checked, so the one written next year is covered on the day
+    /// it is written. Every published static in the crate already satisfies
+    /// this -- `prefs_ui::PUBLISHED_ACCOUNT`, `app::NEVER_APPS`,
+    /// `clipboard::ARMED`, `single_instance::ON_TAKEOVER`, `app_mutex::HELD`,
+    /// `bw_path::ACTIVE_DATA_DIR` -- and `hotkey::STATUS` was the sole
+    /// exception, which is exactly why it was the one that shipped wrong.
+    ///
+    /// Column-zero `static` only: a `fn`-local static is not published to
+    /// anybody and is usually a test's own scratch cell.
+    #[test]
+    fn no_published_status_static_defaults_to_a_claim() {
+        /// One column-zero `static NAME: ..Lock<..> = ..::new(INIT..);`,
+        /// reduced to the file it is in and the head of its initialiser.
+        fn published_statics(text: &str) -> Vec<(String, String)> {
+            let mut found = Vec::new();
+            for (at, _) in text.match_indices("\nstatic ") {
+                let decl = &text[at + 1..];
+                let end = match decl.find(';') {
+                    Some(end) => &decl[..end],
+                    None => continue,
+                };
+                let (declared, initialiser) = match end.split_once('=') {
+                    Some(halves) => halves,
+                    None => continue,
+                };
+                // Only the locks. `OnceLock`/`AtomicBool` cannot hold a
+                // variant-shaped default in the first place -- an unset
+                // `OnceLock` is already "nothing published".
+                if !declared.contains("Mutex<") && !declared.contains("RwLock<") {
+                    continue;
+                }
+                let name = declared
+                    .trim_start_matches("static ")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                // Past the lock's own `new(` to what is actually being stored.
+                let stored = match initialiser.find("new(") {
+                    Some(open) => initialiser[open + 4..].trim(),
+                    None => continue,
+                };
+                // `Mutex::new(Some(V))` is the same claim wearing an
+                // `Option`: the type can represent "nothing published" and
+                // the initialiser declines to use it.
+                let stored = stored.strip_prefix("Some(").unwrap_or(stored);
+                let stored = stored.trim().trim_end_matches(')').to_string();
+                found.push((name, stored));
+            }
+            found
+        }
+
+        /// The head of a path initialiser -- `A::B` -> `Some("A")` -- or
+        /// `None` for anything that is not one (`None`, `()`, a struct
+        /// literal, a bare call).
+        fn path_head(stored: &str) -> Option<&str> {
+            let head = stored.split("::").next()?;
+            if head == stored || head.is_empty() {
+                return None;
+            }
+            let head = head.trim();
+            head.chars().next()?.is_ascii_uppercase().then_some(head)
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        let mut checked = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let file = path.file_name().unwrap().to_string_lossy().to_string();
+                for (name, stored) in published_statics(&text) {
+                    checked += 1;
+                    let Some(head) = path_head(&stored) else { continue };
+                    // Only an enum THIS file declares. `Vec::new()` and
+                    // friends are paths too and are not answers to anything.
+                    let declares_enum = text.contains(&format!("enum {head} {{"));
+                    assert!(
+                        !declares_enum,
+                        "`{file}`'s `{name}` is seeded with `{stored}` -- a variant of \
+                         `{head}`, which is a fully formed answer. Nothing has published \
+                         anything at that point, so every reader before the first write is \
+                         told something the process has not established: that is how \
+                         Preferences > Shortcuts came to report a registered hotkey before \
+                         any code had called RegisterHotKey. Hold `Option<{head}>` and start \
+                         it at `None`, then let the reader turn \"nothing published\" into a \
+                         value that SAYS so -- `hotkey::availability` is the worked example, \
+                         and `prefs_ui::PUBLISHED_ACCOUNT` is the older one"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "control: only {checked} published statics were found in `src/`, so the walk this \
+             rule rests on has stopped finding them and it now passes by seeing nothing"
+        );
+    }
+
+    /// Control for the rule above: it can tell a claim from a blank.
+    ///
+    /// A source-reading rule that matched nothing would pass over the very
+    /// defect it was written for, and this one's whole job is a distinction
+    /// between two initialisers that look alike.
+    #[test]
+    fn the_published_default_rule_can_tell_a_claim_from_a_blank() {
+        // Modelled on the shape `hotkey.rs` had and the shape it has now.
+        let claim = "enum S { On }\nstatic X: Mutex<S> = Mutex::new(S::On);\n";
+        let blank = "enum S { On }\nstatic X: Mutex<Option<S>> = Mutex::new(None);\n";
+        // A path initialiser whose head is NOT an enum of this file, which
+        // must not be mistaken for a claim.
+        let foreign = "enum S { On }\nstatic X: Mutex<Vec<u8>> = Mutex::new(Vec::new());\n";
+        let head_of = |text: &str| {
+            let stored = text
+                .split_once("new(")
+                .map(|(_, rest)| rest.split(')').next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            let head = stored.split("::").next().unwrap_or("").to_string();
+            (head != stored).then_some(head)
+        };
+        assert_eq!(head_of(claim).as_deref(), Some("S"), "the rule cannot see a seeded variant");
+        assert_eq!(head_of(blank), None, "the rule reads `None` as a claim");
+        assert_eq!(
+            head_of(foreign).as_deref(),
+            Some("Vec"),
+            "control: the head really is extracted from any path"
+        );
+        assert!(
+            !foreign.contains(&format!("enum {} {{", head_of(foreign).unwrap())),
+            "the rule would fire on `Vec::new()`, which asserts nothing about anything"
+        );
+        assert!(
+            claim.contains(&format!("enum {} {{", head_of(claim).unwrap())),
+            "the rule cannot tie a seeded variant back to the enum the same file declares, \
+             which is the only thing that makes it a claim rather than a call"
         );
     }
 
