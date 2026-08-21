@@ -5720,6 +5720,134 @@ mod fill_dispatch_tests {
         totp.expect(0).assert();
     }
 
+    /// **Autofill really fills from a snapshot restored off the encrypted
+    /// disk file, with `bw serve` genuinely absent.**
+    ///
+    /// This is the claim `fill_from_vault`'s doc makes -- "the path that makes
+    /// autofill work with the backend fully stopped" -- carried the one step
+    /// further that `main`'s cache-first startup arm depends on. Every other
+    /// fill test above seeds its cache in memory; that proves the fill reads
+    /// the snapshot, but it says nothing about whether a snapshot that came
+    /// out of an encrypted FILE is a snapshot the fill can serve. A
+    /// cache-first launch has no other kind.
+    ///
+    /// The harness is the whole chain and nothing is stubbed in the middle:
+    ///
+    ///  1. a `VaultCache` over a real `DiskCache` in a scratch directory
+    ///     writes the item to a real encrypted file (the Hello step and DPAPI
+    ///     are the `DiskCacheEnv` `fn`-pointer fixtures, so nothing derives a
+    ///     hardware key and nothing calls DPAPI -- that is the ONLY
+    ///     substitution);
+    ///  2. a SECOND, independent `VaultCache` -- built the way `main` builds
+    ///     it, before anything spawns a backend -- restores from that file
+    ///     with `load_from_disk`;
+    ///  3. `fill_from_vault_with` runs against that restored cache and the
+    ///     recording filler is asked what it was given.
+    ///
+    /// **What makes it a real answer is the bridge.** It is
+    /// `test_vault::unreachable_bridge` -- `127.0.0.1:9`, refused immediately
+    /// and for the life of the process. That is not "a backend that happens
+    /// not to be asked"; it is a backend that cannot answer. So a fill that
+    /// fell through to `cache.bridge().get_item` -- the documented miss path,
+    /// three lines into `fill_from_vault_with` -- gets an error and types
+    /// nothing, and this test goes red rather than passing for the wrong
+    /// reason. `bw serve` still starting behind the tray is strictly weaker
+    /// than this: it would eventually answer.
+    ///
+    /// Both credentials are asserted, not just the password: a fill that lost
+    /// the username still logs nobody in.
+    #[test]
+    fn autofill_fills_from_a_disk_restored_snapshot_with_no_backend_at_all() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let dir = crate::vault_disk_cache::tests::temp_dir_for("autofill-cache-first");
+
+        // 1. The session that had a backend, once, and wrote the file.
+        let writer = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            crate::vault_disk_cache::tests::cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        let epoch = writer.epoch();
+        assert_eq!(
+            writer.populate_with_vault(
+                crate::vault_cache::VaultSnapshot {
+                    items: vec![item_with("")],
+                    folders: Vec::new(),
+                },
+                epoch,
+            ),
+            crate::vault_cache::PopulateOutcome::Populated,
+            "control: the writing session never got populated, so there is nothing to have \
+             been written to the file"
+        );
+        assert!(
+            dir.join("vault-cache.bin").exists(),
+            "control: no encrypted file was written, so the restore below would be \
+             restoring nothing and the fill would be reading a cache seeded in memory"
+        );
+
+        // 2. The next launch: a fresh cache, no backend, restore from disk.
+        //    This is `main` at the point the cache-first arm decides.
+        let restored = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            crate::vault_disk_cache::tests::cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        match restored.load_from_disk() {
+            crate::vault_disk_cache::DiskCacheLoad::Loaded { .. } => {}
+            other => panic!("the launch did not restore from disk: {other:?}"),
+        }
+        assert!(
+            restored.loaded_from_disk_at().is_some(),
+            "control: this is not a from-disk restore, so it is not the state a cache-first \
+             launch fills from"
+        );
+
+        // 3. The fill, exactly as `main`'s hotkey handler issues it.
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("cache-first-fill");
+        fill_from_vault_with(
+            &restored,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::UserTabPass,
+            &sequence::RecordingNotifier::default(),
+            &crate::vault_window::preflight::SendGate::describing(
+                a_masked_box_in_the_rules_process,
+            ),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
+        );
+
+        let fills = rec.default_fills.lock().unwrap();
+        assert_eq!(
+            fills.len(),
+            1,
+            "autofill typed nothing from a vault restored off the encrypted disk copy. A \
+             cache-first launch has a tray, a hotkey and no working autofill until `bw \
+             serve` comes up -- which is the whole of what that launch exists to avoid"
+        );
+        assert_eq!(
+            (fills[0].0, fills[0].1.as_str(), fills[0].2.as_str()),
+            (4242, USER, PASS),
+            "the fill reached the restored snapshot but did not carry the credentials out \
+             of it intact"
+        );
+
+        // And the restore is still a restore: filling read the snapshot and
+        // wrote nothing back, so the pill and the age survive the session's
+        // first fill exactly as they survive its startup.
+        assert!(
+            restored.loaded_from_disk_at().is_some(),
+            "a fill cleared the from-disk age, so the vault window opened after one autofill \
+             would stop saying the vault came from the cache"
+        );
+    }
+
     /// **The gate, driven from the entry point it gates.**
     ///
     /// The routing tests in `vault_window::preflight` prove `dispatch_with`

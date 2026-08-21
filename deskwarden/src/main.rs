@@ -866,6 +866,19 @@ fn main() {
     // silently report "the user was never shown a vault" for a window that
     // showed them one.
     let mut startup_vault: Option<vault_window::VaultWindowResult>;
+    // **Whether this launch came up off the encrypted disk copy without ever
+    // waiting for `bw serve`**, decided inside the cached-session arm and
+    // spent BELOW the branch, where the one thing still owing -- starting the
+    // backend and reconciling its answer over the restored snapshot -- is
+    // kicked off.
+    //
+    // Seeded `false` rather than declared bare, unlike the two locals above
+    // it: those are things every arm must decide and the compiler is the
+    // check that they did, whereas this one is a property only one arm can
+    // have. The signing-in arm has no session to restore a cache for and the
+    // visible arm waits for its window either way, so `false` is the truth
+    // about both of them and not a placeholder standing in for a decision.
+    let mut cache_first = false;
     // `Option` rather than a plain `Child`: with `keep_backend_running`
     // turned off, the backend is only up while the vault window is open (see
     // `backend_policy::should_run`), so "not currently running" has to be
@@ -1019,8 +1032,7 @@ fn main() {
 
     let mut estate = if let Some(token) = cached_session {
     session_token = token;
-    bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
-    // **Two `if`s and no `else`, deliberately.** The startup branch's own
+    // **Three `if`s and no `else`, deliberately.** The startup branch's own
     // shape guards find the boundary between its two arms by looking for a
     // `} else {` at this exact indentation (`startup_shape_tests::OUTER_ELSE`),
     // and an inner one here is indistinguishable from it -- every one of those
@@ -1029,11 +1041,101 @@ fn main() {
     // two-valued and both values are answered below, so nothing is left
     // undecided by the shape.
     let surface = first_surface(launch);
+    // **THE CACHE-FIRST LAUNCH, decided here and spent three times below.**
+    //
+    // `loaded_from_disk_at` is `Some` only if the `load_from_disk` far above
+    // -- which runs before anything spawns `bw serve` -- actually adopted a
+    // file: not `Absent`, not `Rejected`, not `Corrupt`, not `Unavailable`.
+    // So this is exactly "there is a decrypted vault in memory already", and
+    // on that evidence this launch has nothing to wait for: the tray, the
+    // global hotkey and autofill are all built BELOW the branch, out of the
+    // estate, and every one of them works off the snapshot.
+    //
+    // **Restricted to the tray launch, and that is a scope decision rather
+    // than a property of the cache.** A `ShowTheWindow` launch has a window
+    // to fill, and filling it early is design 7's own affordance ("Open the
+    // local copy" / "Continue offline") -- a user-driven path with its own
+    // wording, its own retry and its own tests. Making that window skip its
+    // readiness wait by itself is a second feature; this is the one the
+    // reports are about, where there is no window at all and the ~8 s cold
+    // start is time with NOTHING on screen and no tray icon to click.
+    cache_first = surface == FirstSurface::StayInTheTray && cache.loaded_from_disk_at().is_some();
+    // **NOT on a cache-first launch, and this line is the whole feature.**
+    // `start_backend` is `try_start_backend` plus a fatal dialog, and
+    // `try_start_backend` BLOCKS -- it waits for `bw serve` to answer and
+    // runs a `bw sync` on the way (see its doc). Every launch used to pay
+    // that here, above the surface decision, which is why "the tray launch
+    // still waits on `bw serve` before the tray appears" was true however
+    // full the cache was. A cache-first launch hands the same start to a
+    // worker below the branch instead, so `bw_serve_child` stays `None`
+    // until that worker reports and `adopt_started_child` takes it.
+    //
+    // **`then`, not an `if`/`else`.** An `else` at this indentation is
+    // indistinguishable from the one that ends this whole arm, which is what
+    // every shape guard in `startup_shape_tests` slices on (`OUTER_ELSE`);
+    // `bool::then` decides the same thing without spelling one, and is still
+    // lazy, so `start_backend` is genuinely not called on a cache-first
+    // launch rather than called and discarded.
+    bw_serve_child = (!cache_first).then(|| start_backend(&session_token, job_ref(&job)));
     // Assigned before either arm rather than by both: the tray arm opens no
     // window, so it has no vault session to report, and the visible arm
     // overwrites this with whatever its window came home holding.
     startup_vault = None;
-    if surface == FirstSurface::StayInTheTray {
+    if cache_first {
+    // **NO WINDOW AND NO WAIT: the encrypted copy is already in memory.**
+    //
+    // The whole of this arm is one statement, and that statement is the
+    // SECOND seeding site in this file. It deliberately does NOT go through
+    // `arm_autofill_and_seed_cache`: that helper's job is to take items a
+    // fetch just produced and write them into the cache, and it writes them
+    // at `Source::Backend` -- which clears `loaded_from_disk_at` (so the
+    // vault window's "Loaded from cache" pill would vanish on a launch that
+    // is entirely from cache) and re-persists the file (so `written_at` is
+    // stamped to now and the age line resets to "0 minutes old" without a
+    // single byte having been refreshed). Here there is nothing to seed: the
+    // cache is ALREADY populated, by `load_from_disk`, and the only half of
+    // a repopulation still owing is the match engine's.
+    //
+    // So this arm arms autofill and touches the cache not at all. See
+    // `every_startup_repopulation_arms_autofill_and_seeds_the_cache_together`
+    // for why that is one exception and not a licence, and
+    // `a_cache_first_launch_arms_autofill_without_rewriting_the_file` for the
+    // property itself, observed rather than argued.
+    //
+    // **TWO THINGS THIS ARM DELIBERATELY DOES NOT DO**, both of which the
+    // waiting tray arm below does, and both of which are consequences of
+    // having a vault already rather than oversights:
+    //
+    //  * **No `recover_from_failed_vault_wait`.** That recovery -- kill the
+    //    backend, ask for the master password, start over -- is the answer to
+    //    "the readiness probe failed", and this arm runs no probe. If the
+    //    session token really is dead, this launch finds out when the
+    //    reconcile below fails, and the tray's Sync item is what says so
+    //    ("Sync failed - click to retry"); clicking it, or opening the vault
+    //    window, reaches the ordinary recovery. So the owner's rule for a
+    //    failed tray launch -- "if fails - we should show the error screen"
+    //    -- is answered differently here ON PURPOSE: there is no failure to
+    //    report at the moment the tray appears, because the vault the user
+    //    wants is already in memory and already fillable. Interrupting a
+    //    working offline session with a master-password prompt, on the
+    //    strength of a backend that has not finished starting, would be the
+    //    wrong trade.
+    //  * **No `fatal_startup_error`.** `start_backend` ends the process when
+    //    the backend cannot be started at all; `spawn_sync`'s own
+    //    `try_start_backend` only logs. That inversion is the point. Killing
+    //    an app that is serving autofill from a perfectly good local copy,
+    //    because a background process failed to start, would throw away the
+    //    only thing this launch had.
+    *startup_entries.borrow_mut() = match_entries(&cache.items());
+    log::info!(
+        "cache-first launch: {} item(s) restored from the encrypted disk cache armed the \
+         match engine directly, so the tray, the fill hotkey and autofill come up now; \
+         `bw serve` is being started behind them and its answer will be reconciled over \
+         this snapshot when it lands",
+        cache.items().len()
+    );
+    }
+    if surface == FirstSurface::StayInTheTray && !cache_first {
     // **NO WINDOW: a login autostart boots in the background.**
     //
     // The owner: "if it autostart with minimized - it goes to tray", and, on
@@ -1626,6 +1728,52 @@ fn main() {
         );
     } else {
         estate.engine.rebuild(&startup_entries.borrow());
+    }
+
+    // **THE OTHER HALF OF THE CACHE-FIRST LAUNCH: start the backend behind
+    // the tray, and reconcile its answer over the restored snapshot.**
+    //
+    // Everything above this line is already armed off the disk copy -- the
+    // engine was rebuilt one statement ago -- and everything below it (the
+    // tray, the fill hotkey, the window-watch thread, the loop) never waited
+    // on `bw serve` in the first place. So this is the last thing owing, and
+    // it is deliberately the LAST thing, not the first: the whole point is
+    // that nothing between here and the tray blocks on it.
+    //
+    // **`spawn_sync` and not `spawn_backend_start`, and the difference is the
+    // reconciliation.** `spawn_backend_start` reports a `Child` and nothing
+    // else -- reads already come from the cache, so the vault-window path
+    // that uses it has nothing to reconcile. Here there IS something: the
+    // snapshot in memory is a file written some hours ago, and the vault may
+    // have been edited, emptied or had items deleted from another device
+    // since. `spawn_sync` starts the backend, syncs it and repopulates the
+    // cache through the same `write_back_at_epoch` every other populate uses,
+    // and `apply_backend_op` then rebuilds the match engine from the settled
+    // items -- so the backend's answer lands on top of the restore under the
+    // era guard, the pending-write replay and the `Source::Backend` rules,
+    // rather than beside it. `false` for `currently_running` is a fact and
+    // not an assumption: the cache-first arm is the one path that reaches
+    // here having called `start_backend` zero times.
+    //
+    // **`task_in_progress` is set here rather than in either estate literal.**
+    // Both arms end with the same `SessionEstate`, pinned character for
+    // character by `both_startup_arms_end_with_the_same_estate`, and a field
+    // only one launch shape can fill is exactly the divergence that guard
+    // exists to refuse. Set on the estate instead, in the one place that
+    // knows: it marks the operation in flight, so a "Add app..." click cannot
+    // race a second `try_start_backend` for the same port, and it arms the
+    // loop's wedge deadline -- which is what makes a backend that NEVER comes
+    // up say so on the tray ("Sync failed - click to retry") instead of
+    // leaving the item disabled forever.
+    if cache_first {
+        estate.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+        spawn_sync(
+            estate.token.clone(),
+            job.clone(),
+            Arc::clone(&estate.cache),
+            false,
+            backend_op_tx.clone(),
+        );
     }
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
@@ -10776,6 +10924,89 @@ mod tests {
         );
     }
 
+    /// **The cache-first arm's one statement, executed: a snapshot the cache
+    /// already holds arms the match engine, and the cache is not written.**
+    ///
+    /// The behavioural half of the exception the guard below counts. `fn
+    /// main` cannot be run from a test, but the statement it consists of is
+    /// three tokens long and every one of them is reachable here, so there is
+    /// no reason for this to be pinned by text alone.
+    ///
+    /// **The cache is `test_vault::cache_with_items` rather than a disk
+    /// restore, and that is a crate boundary and not a shortcut.** The
+    /// `DiskCacheEnv` fixtures that substitute the Hello step live behind
+    /// `#[cfg(test)]` in the library, so this binary cannot reach them, and
+    /// the alternative -- a real `DiskCache` -- would derive a real Windows
+    /// Hello key. What this test owns is therefore the second link of the
+    /// chain: *given* items in the cache, the engine is armed from them and
+    /// nothing else moves. The first link -- an encrypted file becomes those
+    /// items, without the file or its age being touched -- is
+    /// `vault_cache::tests::a_cache_first_launch_arms_autofill_without_
+    /// rewriting_the_file`, and the whole chain including a real fill is
+    /// `app::tests::autofill_fills_from_a_disk_restored_snapshot_with_no_
+    /// backend_at_all`.
+    ///
+    /// The negative control is the point of writing it at all: the same three
+    /// tokens with `arm_autofill_and_seed_cache` in place of the read would
+    /// pass the `lookup` assertion and fail the two below it.
+    #[test]
+    fn the_cache_first_arm_arms_the_engine_from_the_cache_and_writes_nothing_back() {
+        // **No `mockito` and no fetch.** The bridge is the discard port,
+        // dead for the life of the process, and `populate_with_vault` asks it
+        // for nothing -- so the cache is populated by the same write-back
+        // every populate uses, with the network taken out of the fixture. A
+        // seeding path that reached for it would fail visibly.
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:9"));
+        let seed_epoch = cache.epoch();
+        assert_eq!(
+            cache.populate_with_vault(
+                deskwarden::vault_cache::VaultSnapshot {
+                    items: probe_items(&[("7", "notepad.exe")]),
+                    folders: Vec::new(),
+                },
+                seed_epoch,
+            ),
+            PopulateOutcome::Populated,
+            "control: the fixture cache never got populated, so the arm below would be \
+             arming the engine from an empty vault and the lookup would fail for the wrong \
+             reason"
+        );
+        let populates_before = cache.epoch();
+        let entries: RefCell<Vec<(String, AppMatch)>> = RefCell::new(Vec::new());
+        assert!(
+            entries.borrow().is_empty(),
+            "control: the entries cell is already armed, so the assertion below would pass \
+             against a statement that did nothing"
+        );
+
+        // `main`'s cache-first arm, verbatim.
+        *entries.borrow_mut() = match_entries(&cache.items());
+
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&entries.borrow());
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_some(),
+            "the cache-first arm left autofill unarmed. That launch has no window and no \
+             other seeding site -- this statement is the whole of it -- so the session comes \
+             up with a tray, a hotkey and a match engine that will never match anything"
+        );
+
+        assert_eq!(
+            cache.items().len(),
+            1,
+            "arming the engine changed what the cache holds; the arm is supposed to READ it"
+        );
+        // The epoch is what a `clear` or a populate moves. Unchanged means
+        // the arm reached the write-back not at all -- which is the property
+        // that keeps the disk file and its age intact one layer down.
+        assert_eq!(
+            cache.epoch().era(),
+            populates_before.era(),
+            "the cache-first arm began a new vault era, so it cleared or repopulated the \
+             snapshot it was only supposed to read"
+        );
+    }
+
     /// **The other half of M6: no startup path may go back to seeding the
     /// cache without arming autofill beside it.**
     ///
@@ -10790,6 +11021,55 @@ mod tests {
     /// The count is exact rather than a lower bound: a FIFTH repopulation
     /// site is a fifth place that can be got wrong, and it should force
     /// whoever adds it to come here and say so.
+    ///
+    /// # The cache-first arm, and why it is an exception rather than a hole
+    ///
+    /// Startup now has SEVEN places that arm the match engine, not six, and
+    /// the seventh does not call `arm_autofill_and_seed_cache`. That is not
+    /// the rule being relaxed; it is the rule being applied to a site whose
+    /// inputs are different from every other one's, so it is worth saying
+    /// exactly what changed and what did not.
+    ///
+    /// The rule this guard has always enforced is **"a startup path that has
+    /// just obtained items must write them to BOTH halves"** -- the cache and
+    /// the engine -- because M6 was a path that wrote one. Every one of the
+    /// six paired sites has the same input: a `Vec<VaultItem>` a fetch just
+    /// produced, which the cache does not have yet. Pairing is the only
+    /// correct thing to do with it.
+    ///
+    /// The cache-first arm's input is not that. It has obtained nothing: the
+    /// cache is already full, populated by `load_from_disk` before `bw serve`
+    /// was even started, and the items it seeds the engine from are *read
+    /// back out of that cache*. So there is no second half owing, and doing
+    /// the pairing anyway would be actively wrong rather than merely
+    /// redundant -- `arm_autofill_and_seed_cache` writes at `Source::Backend`,
+    /// which clears `loaded_from_disk_at` and re-persists the file, stamping
+    /// `written_at` to now. A launch that refreshed nothing would come up
+    /// claiming a fresh vault and no "Loaded from cache" pill.
+    ///
+    /// So M6 is impossible there for a reason no count could express: the two
+    /// halves cannot drift apart when only one of them is being written and
+    /// the other is the *source*. What this guard pins instead is that the
+    /// exception stays exactly that shape, and it does it with three exact
+    /// counts rather than by exempting a region:
+    ///
+    ///  * `arm_autofill_and_seed_cache` is still called exactly **6** times.
+    ///    The seventh site did not join the six and no site left them.
+    ///  * `match_entries(` appears in the startup region exactly **once** --
+    ///    it used to be zero. Zero was the right number while every site went
+    ///    through the helper; one is the right number now, and it is still
+    ///    EXACT. A second by-hand `match_entries` in startup is the drift
+    ///    this guard was always about and still fails here.
+    ///  * that one occurrence reads `cache.items()`. That is the half that
+    ///    makes the exception safe rather than merely counted: an engine
+    ///    seeded in startup from anything other than the cache it is
+    ///    exempted for is a site that obtained items and wrote one half,
+    ///    which is M6 exactly.
+    ///
+    /// `seed_cache_at_startup(` stays pinned at zero in startup and two in
+    /// production, unchanged and for the unchanged reason: the exception
+    /// writes the cache not at all, so it cannot be spelled with a direct
+    /// seed either.
     #[test]
     fn every_startup_repopulation_arms_autofill_and_seeds_the_cache_together() {
         let code = what_a_finished_vault_session_means::code_only(production_half_of_this_file());
@@ -10831,7 +11111,12 @@ mod tests {
         let paired = main_body.matches(concat!("arm_autofill_and_", "seed_cache(")).count();
         assert_eq!(
             paired, 6,
-            "startup has {paired} repopulation sites, not the six it should have. Signing in: \
+            "startup has {paired} PAIRED repopulation sites, not the six it should have. \
+             Startup has seven sites that arm the match engine; six of them obtained items \
+             from a fetch and must therefore write both halves, and this is the count of \
+             those six. The seventh is the cache-first arm, which obtained nothing and is \
+             counted by the `match_entries(` assertion below instead -- see this test's doc. \
+             Signing in: \
              the single window's `build_vault`, the `work.items == Err` recovery and the \
              no-work recovery. Already holding a session and SHOWING a window: the warm launch \
              window's own `build_vault`, and the one recovery tail that answers every way that \
@@ -10857,11 +11142,41 @@ mod tests {
              definition and the single call inside `arm_autofill_and_seed_cache`. A third is a \
              second, unpaired seeding path"
         );
+        // **ONE, and it used to be zero.** See this test's doc for the whole
+        // of the reasoning; the short form is that zero was the right number
+        // while every site that armed the engine had also just obtained items
+        // to seed the cache with, and one is the right number now that
+        // exactly one site arms the engine from a cache it did not fill.
+        // Exact either way: a SECOND by-hand `match_entries` in startup is a
+        // site that obtained items and wrote one half, which is M6.
+        let by_hand = main_body.matches(concat!("match_", "entries(")).count();
         assert_eq!(
-            main_body.matches(concat!("match_", "entries(")).count(),
-            0,
-            "startup builds match entries by hand again outside the paired helper; the two \
-             halves of a repopulation are drifting apart at a call site once more"
+            by_hand, 1,
+            "startup builds match entries by hand {by_hand} time(s), not the one it should. \
+             Zero means the cache-first arm stopped arming autofill at all -- a login \
+             autostart that comes up off the disk copy would then have a tray, a hotkey and \
+             a dead match engine for the whole session. Two or more means a repopulation \
+             site went back to building entries by hand beside a cache seed, which is the \
+             two-halves-drifting-apart shape this guard is about"
+        );
+        // **And that one reads the CACHE.** The count alone would be
+        // satisfied by a cache-first arm that armed the engine from a fresh
+        // `list_items` -- which would be a seventh site that obtained items
+        // and wrote only the engine, M6 respelt in the one place this guard
+        // just made room for. The exception is safe *because* its source is
+        // the snapshot `load_from_disk` already adopted, so that is what is
+        // pinned, not merely the fact that it is unpaired.
+        assert_eq!(
+            main_body
+                .matches(concat!("match_", "entries(&cache.items())"))
+                .count(),
+            1,
+            "the one by-hand `match_entries` in startup no longer reads `cache.items()`. \
+             The cache-first arm is exempted from pairing on exactly one ground: it seeds \
+             the engine FROM the cache rather than beside it, so there is no second half \
+             owing. Seeded from a fetch instead, it becomes a site that obtained items and \
+             armed only autofill -- and the vault window would then paint whatever the disk \
+             copy held while the engine matched something else"
         );
     }
 

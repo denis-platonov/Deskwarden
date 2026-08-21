@@ -5542,4 +5542,361 @@ mod tests {
             DiskCacheLoad::Rejected(crate::vault_disk_cache::RejectReason::ForeignAccount)
         ));
     }
+
+    // -- reconciliation: what the backend's answer does to a restore --------
+    //
+    // A cache-first launch (`main`'s third startup arm) comes up off
+    // `load_from_disk` and starts `bw serve` behind the tray. Some seconds
+    // later that backend answers, and its answer is written over a snapshot
+    // that came out of a file written hours ago. The claim the design rests
+    // on is that this needs no new rules: `load_from_disk` restores through
+    // `write_back_at_epoch` and so does every populate, so the second one
+    // simply supersedes the first the way any two populates do.
+    //
+    // That is a claim about shared code, and shared code is exactly what
+    // drifts. These hold it as behaviour instead: the same restore, four
+    // different backend answers, each asserted on what is left in the
+    // snapshot AND on what is left of the from-disk age.
+    //
+    // No `mockito` and no fetch anywhere: `populate_with_vault` is the
+    // fetching populates' own write-back with the round trips removed (see
+    // its doc), so writing the backend's answer through it exercises the
+    // identical code with the network's flakiness taken out of the
+    // observation.
+
+    /// A cache over `dir` restored from a file `seed` already wrote, with a
+    /// bridge that can never answer -- the state `main` is in the moment the
+    /// cache-first arm runs, before `bw serve` exists.
+    ///
+    /// It asserts the restore landed and that the age is set, rather than
+    /// returning them: every caller below is about what happens *to* a
+    /// restore, and a fixture that quietly restored nothing would let them
+    /// all pass against an empty cache.
+    fn restored_from_disk(dir: &std::path::Path) -> VaultCache {
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(dir),
+            "fp".to_string(),
+            true,
+        );
+        match reader.load_from_disk() {
+            DiskCacheLoad::Loaded { .. } => {}
+            other => panic!("the fixture did not restore from disk: {other:?}"),
+        }
+        assert_eq!(reader.items().len(), 2, "control: the restore is the two-item fixture");
+        assert!(
+            reader.loaded_from_disk_at().is_some(),
+            "control: the restore did not record a from-disk age, so the assertions below \
+             about that age clearing would pass against a restore that never set one"
+        );
+        reader
+    }
+
+    /// **Edited elsewhere.** Item `1` was renamed on another device. The
+    /// backend's answer is newer truth than a file written before the edit,
+    /// so it wins outright -- there is no merge, no "keep the local name",
+    /// and nothing to prompt about. The user sees the new name the moment
+    /// the sync lands, which for a tray launch is a few seconds after the
+    /// tray appeared.
+    ///
+    /// **And the pill goes out.** `Source::Backend` clears
+    /// `loaded_from_disk_at`, which is what the toolbar's "Loaded from
+    /// cache" age pill reads. That is the honest thing: the vault on screen
+    /// is no longer the disk copy. A launch whose pill stayed up after a
+    /// successful reconcile would be telling the user their data was hours
+    /// old when it had just been refreshed.
+    #[test]
+    fn a_backend_answer_that_edited_an_item_elsewhere_wins_over_the_restore() {
+        let (writer, dir) = cache_with_disk("reconcile-edited", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+        assert_eq!(restored.items()[0].name, "Alpha", "control: the file's own name");
+
+        // The vault as `bw sync` would have listed it: item 1 renamed.
+        let mut fresh = body_list::<VaultItem>(items_body());
+        fresh[0].name = "Alpha (renamed on the phone)".to_string();
+
+        let epoch = restored.epoch();
+        assert_eq!(
+            restored.populate_with_vault(
+                VaultSnapshot { items: fresh, folders: body_list(folders_body()) },
+                epoch,
+            ),
+            PopulateOutcome::Populated
+        );
+
+        assert_eq!(
+            restored.items()[0].name,
+            "Alpha (renamed on the phone)",
+            "the backend's answer did not land over the restored snapshot; a cache-first \
+             launch would show the file's stale copy for the rest of the session, with the \
+             sync it just ran reporting success"
+        );
+        assert!(
+            restored.loaded_from_disk_at().is_none(),
+            "the from-disk age survived a successful reconcile, so the toolbar pill would \
+             still read \"Loaded from cache\" over a vault that has just been refreshed"
+        );
+    }
+
+    /// **Deleted elsewhere.** The one case where "the backend wins" has teeth:
+    /// the answer is a SHORTER list, and the item that is gone is gone by
+    /// virtue of not being in it. Nothing has to notice a deletion for it to
+    /// take effect -- `write_back_at_epoch` replaces `items` wholesale rather
+    /// than merging by id -- which is why an item deleted on another device
+    /// cannot survive in a restored snapshot as a fill that types a dead
+    /// password.
+    #[test]
+    fn a_backend_answer_that_deleted_an_item_elsewhere_removes_it_from_the_restore() {
+        let (writer, dir) = cache_with_disk("reconcile-deleted", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+
+        let fresh: Vec<VaultItem> = body_list::<VaultItem>(items_body())
+            .into_iter()
+            .filter(|i| i.id != "1")
+            .collect();
+        assert_eq!(fresh.len(), 1, "control: the fixture answer really dropped one item");
+
+        let epoch = restored.epoch();
+        assert_eq!(
+            restored.populate_with_vault(
+                VaultSnapshot { items: fresh, folders: body_list(folders_body()) },
+                epoch,
+            ),
+            PopulateOutcome::Populated,
+            "control: the reconcile was discarded, so the id check below would pass for a \
+             reason that has nothing to do with the deletion"
+        );
+
+        let ids: Vec<String> = restored.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            vec!["2".to_string()],
+            "an item deleted on another device survived the reconcile. Autofill reads this \
+             snapshot, so it would go on offering -- and typing -- a credential the vault \
+             no longer has"
+        );
+    }
+
+    /// **Emptied elsewhere**, which is the case a merge would get wrong and
+    /// this deliberately does not.
+    ///
+    /// An empty answer is indistinguishable, in the data, from a vault whose
+    /// every item was deleted -- and it IS that, when it is one. So it is
+    /// applied: the snapshot empties, and `is_populated` stays true, because
+    /// "populated with nothing" is a different state from "never populated"
+    /// and only the second means the window should still be waiting.
+    ///
+    /// The alternative -- refusing an empty answer as implausible -- would
+    /// mean a user who emptied their vault on purpose kept seeing it, and
+    /// filling from it, on this machine forever.
+    #[test]
+    fn a_backend_answer_that_emptied_the_vault_empties_the_restore() {
+        let (writer, dir) = cache_with_disk("reconcile-emptied", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+
+        let epoch = restored.epoch();
+        assert_eq!(
+            restored
+                .populate_with_vault(VaultSnapshot { items: Vec::new(), folders: Vec::new() }, epoch),
+            PopulateOutcome::Populated,
+            "control: an empty answer was DISCARDED rather than applied, so the emptiness \
+             below would be the era guard's doing and not the reconcile's"
+        );
+
+        assert!(
+            restored.items().is_empty(),
+            "a vault emptied on another device did not empty here; the restore's items \
+             outlived the account that held them"
+        );
+        assert!(
+            restored.is_populated(),
+            "the emptied vault reads as NEVER populated, which is the state the vault \
+             window paints a spinner for -- an account with no items would wait forever \
+             for a load that already happened"
+        );
+        assert!(restored.loaded_from_disk_at().is_none());
+    }
+
+    /// **And the era rule still bites**, which is the half that says the two
+    /// populates really are the same mechanism rather than merely ordered.
+    ///
+    /// A cache-first launch's reconcile runs on a worker thread while the
+    /// main thread can lock the vault or switch account -- both `clear` --
+    /// so this is not hypothetical here in the way it is for the inert epoch
+    /// captures elsewhere in this file. A `clear` between the restore and the
+    /// answer begins a new era, and the answer is discarded rather than
+    /// repopulating a vault the user just locked.
+    #[test]
+    fn a_backend_answer_that_lands_after_a_lock_is_discarded_not_written_over_the_restore() {
+        let (writer, dir) = cache_with_disk("reconcile-locked", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+
+        // The worker captured its epoch before its fetch, as `spawn_sync`
+        // does; the main thread locked while that fetch was in flight.
+        let epoch = restored.epoch();
+        restored.clear();
+
+        assert_eq!(
+            restored.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch,
+            ),
+            PopulateOutcome::DiscardedStale,
+            "the reconcile repopulated a vault that had been locked underneath it"
+        );
+        assert!(!restored.is_populated());
+        assert!(
+            restored.loaded_from_disk_at().is_none(),
+            "a discarded reconcile left a from-disk age behind, so the next window would \
+             claim to be showing a disk copy of an empty, locked vault"
+        );
+    }
+
+    /// **A cache-first launch arms autofill without rewriting the file or
+    /// clearing its age.**
+    ///
+    /// This is `main`'s third startup arm, reduced to the one statement it
+    /// consists of. The arm cannot be executed from a test -- `fn main` opens
+    /// real windows and never returns -- but what it must not do is a
+    /// property of the cache rather than of `main`: reading `items()` back
+    /// out to seed the match engine has to leave the file and the age exactly
+    /// as `load_from_disk` left them.
+    ///
+    /// The negative is what makes it worth writing. Had the arm gone through
+    /// `arm_autofill_and_seed_cache` -- the obvious thing, and the thing six
+    /// other startup sites do -- the cache would have been re-written at
+    /// `Source::Backend`, which clears `loaded_from_disk_at` and re-persists.
+    /// The vault window would then show no "Loaded from cache" pill and, if
+    /// it did, a `written_at` of *now*: a three-hour-old copy presenting
+    /// itself as current, on a launch where nothing was fetched at all. So
+    /// both halves are asserted, and the file is compared BYTE FOR BYTE
+    /// rather than by mtime -- a rewrite of identical plaintext produces
+    /// different ciphertext and a fresh `written_at`, and would pass a
+    /// weaker check.
+    #[test]
+    fn a_cache_first_launch_arms_autofill_without_rewriting_the_file() {
+        let (writer, dir) = cache_with_disk("cache-first-arms", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+
+        let before_bytes = std::fs::read(cache_file(&dir)).unwrap();
+        let before_age = restored
+            .loaded_from_disk_at()
+            .expect("the fixture asserted this is set");
+
+        // `main`'s cache-first arm, in everything that touches the cache:
+        // read the restored items back out to build match entries from.
+        let items = restored.items();
+        assert!(!items.is_empty(), "control: there is something to arm autofill from");
+
+        assert_eq!(
+            std::fs::read(cache_file(&dir)).unwrap(),
+            before_bytes,
+            "arming the match engine rewrote the encrypted file. A launch that fetched \
+             nothing has just stamped a fresh `written_at` into it, so the age line will \
+             read \"0 minutes old\" over data that is hours old -- and the next launch \
+             inherits the lie"
+        );
+        assert_eq!(
+            restored.loaded_from_disk_at(),
+            Some(before_age),
+            "arming the match engine cleared or moved the from-disk age. That age is what \
+             the toolbar's \"Loaded from cache\" pill is; a cache-first launch that lost it \
+             would present the disk copy as a live vault"
+        );
+    }
+
+    /// **What every write does when the backend never comes up at all**, which
+    /// is the state a cache-first launch is in for its whole first seconds
+    /// and can be in for its whole life -- offline, `bw` broken, the start
+    /// wedged past `BACKEND_OP_TIMEOUT`.
+    ///
+    /// The tray is up, the hotkey is claimed and autofill is filling, all
+    /// from the snapshot. Every WRITE, though, is an HTTP round trip to a
+    /// backend that is not there. What matters is that they REFUSE rather
+    /// than appear to work: each door does its HTTP first and records the
+    /// write afterwards, so a refusal returns `Err`, leaves the snapshot
+    /// untouched, leaves the file untouched, and -- the part with the longest
+    /// tail -- records no pending write, so the reconcile that lands minutes
+    /// later has no phantom edit to replay over the backend's answer.
+    ///
+    /// A silent no-op would be worse than a refusal in exactly the way the
+    /// owner said: the user renames an item, sees the rename, and it is gone
+    /// at the next launch with nothing having reported anything.
+    ///
+    /// One door of each shape is exercised -- an edit, a delete, a favourite
+    /// and a folder move -- because they are four separate `bridge` calls and
+    /// the ordering property is per-door.
+    #[test]
+    fn with_no_backend_every_write_refuses_and_leaves_the_restore_untouched() {
+        let (writer, dir) = cache_with_disk("no-backend-writes", true);
+        seed(&writer);
+        let restored = restored_from_disk(&dir);
+
+        let before_items = restored.items();
+        let before_bytes = std::fs::read(cache_file(&dir)).unwrap();
+        let mut edited = before_items[0].clone();
+        edited.name = "renamed while offline".to_string();
+
+        assert!(restored.update_item(&edited).is_err(), "an edit reported success offline");
+        assert!(restored.delete_item("2").is_err(), "a delete reported success offline");
+        assert!(
+            restored.set_favorite(&before_items[0], true).is_err(),
+            "a favourite reported success offline"
+        );
+        assert!(
+            restored.move_item_to_folder(&before_items[0], Some("f1")).is_err(),
+            "a move reported success offline"
+        );
+
+        // By id AND name: an id-only comparison would miss the edit, and the
+        // edit is the write with the longest tail (`update_item` is the one
+        // that PUTs the whole item back).
+        let shape = |items: &[VaultItem]| -> Vec<(String, String)> {
+            items.iter().map(|i| (i.id.clone(), i.name.clone())).collect()
+        };
+        assert_eq!(
+            shape(&restored.items()),
+            shape(&before_items),
+            "a refused write reached the snapshot anyway. Autofill reads this, so the user \
+             would be typing a password the vault does not have -- and the vault window \
+             would show an edit that no server ever accepted"
+        );
+        assert_eq!(
+            std::fs::read(cache_file(&dir)).unwrap(),
+            before_bytes,
+            "a refused write was persisted, so the next launch restores an edit that never \
+             happened and presents it as the vault"
+        );
+
+        // The longest tail: nothing was recorded as a pending local write, so
+        // when the backend finally does come up its answer is adopted whole
+        // rather than having a refused edit replayed back over it.
+        let epoch = restored.epoch();
+        assert_eq!(
+            restored.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body()),
+                    folders: body_list(folders_body()),
+                },
+                epoch,
+            ),
+            PopulateOutcome::Populated,
+            "control: the reconcile did not land, so the name below is the restore's own \
+             and says nothing about replay"
+        );
+        assert_eq!(
+            restored.items()[0].name,
+            "Alpha",
+            "a write that was REFUSED was replayed over the backend's answer when the \
+             backend finally came up, resurrecting an edit the server never accepted"
+        );
+    }
 }
