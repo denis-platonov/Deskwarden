@@ -2258,12 +2258,19 @@ pub fn build_frame_with_search(
                     .show(ui, |ui| {
                         let available = ui.available_height();
                         ui.vertical_centered(|ui| {
-                            // Roughly half the spinner-plus-label block, so
-                            // the pair sits centred rather than the spinner
-                            // alone.
-                            ui.add_space((available / 2.0 - 30.0).max(0.0));
-                            ui.add(egui::Spinner::new().size(28.0).color(theme::BLUE));
-                            ui.add_space(12.0);
+                            // Roughly half the bar-plus-label block, so the
+                            // pair sits centred rather than the bar alone.
+                            // Half of 3 + 22 + ~18 is ~21.
+                            ui.add_space((available / 2.0 - 21.0).max(0.0));
+                            // **Design turn 7's sliding bar, not a disc.**
+                            // This body is the last screen before the item
+                            // list and is seen seconds after `loading_ui`'s
+                            // own -- often in the same window, because the
+                            // startup host hands this one the frame. Two
+                            // different indicators across that handover is
+                            // the drift the shared widget exists to stop.
+                            theme::progress_bar(ui, 260.0);
+                            ui.add_space(22.0);
                             ui.label(
                                 egui::RichText::new("Loading your vault…")
                                     .size(13.0)

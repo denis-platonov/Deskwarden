@@ -698,17 +698,23 @@ const LABEL_GAP: f32 = 7.0;
 /// between two of them.
 const GROUP_GAP: f32 = 22.0;
 
-/// Diameter of the in-flight spinner beside Continue.
+/// Track width of the in-flight bar beside Continue.
 ///
-/// Deliberately *not* [`theme::BUTTON_HEIGHT`]. egui allocates a `Spinner`
-/// as a square and draws a ring of `size / 2 - 2` radius inside it, so
-/// matching the button's 32px box gave a 28px ring — the same size as the
-/// button by measurement, but visibly heavier beside it, because what the
-/// eye weighs the button by is its 13px label rather than its bounding box.
-/// Sized against the label instead; `ui.horizontal`'s `Align::Center` keeps
-/// it centred on the taller button, and the row's height is still the
-/// button's, so nothing reflows when it appears.
-const AUTH_SPINNER_SIZE: f32 = 20.0;
+/// **This was a 20px rotating disc**, and design turn 7 retires the disc from
+/// every surface a user meets before the vault — the sign-in card included.
+/// The owner's instruction was "it should always be one screen with line
+/// spinner as per design", and the card is the first of the screens that one
+/// window shows.
+///
+/// Narrower than the waiting bodies' 260/200px tracks because this one sits
+/// INSIDE a row beside a button rather than centred in an empty frame; the
+/// proportions it is drawn with (32% knob, 3px, 1.4s) are
+/// [`theme::progress_bar`]'s and are the same here as there.
+/// `ui.horizontal`'s `Align::Center` keeps it centred on the taller button,
+/// and the row's height is still the button's, so nothing reflows when it
+/// appears — which is what the disc's own note was protecting and is only
+/// more true of something 3px tall.
+const AUTH_BAR_WIDTH: f32 = 96.0;
 
 /// What the custom titlebar asked for this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1664,11 +1670,7 @@ pub fn draw_login_window(
                 }
                 if auth_in_progress {
                     ui.add_space(10.0);
-                    ui.add(
-                        egui::Spinner::new()
-                            .size(AUTH_SPINNER_SIZE)
-                            .color(theme::BLUE),
-                    );
+                    theme::progress_bar(ui, AUTH_BAR_WIDTH);
                 }
             });
         });

@@ -376,6 +376,25 @@ enum Surface {
     /// than greyed, which is the half of this state a picture is the only way
     /// to check.
     FirstWindowUnreachableSpent,
+    /// **The lock screen while the master password is with the server.**
+    ///
+    /// The owner named this one -- "Locking - same" -- and it was the
+    /// only pre-vault surface with a rotating disc that no picture in this
+    /// list showed: `LoginUnlock` draws the same card at rest, where the
+    /// indicator does not exist. A state nobody renders is a state nobody
+    /// looks at, which is this file's whole argument.
+    LoginUnlockBusy,
+    /// **One cycle of design 7's `dw-bar`, laid out as a filmstrip.**
+    ///
+    /// The one thing a PNG of this widget cannot show is the thing it is:
+    /// a still frame of a sliding bar is a blue dash somewhere in a grey
+    /// rail, and at the design's own opening keyframe -- `translateX(-100%)`
+    /// -- it is an empty rail and nothing else. So this surface draws the
+    /// SAME painter the live widget uses at six fixed phases across one
+    /// period, which is a picture of the motion rather than a picture taken
+    /// during it. Everything else here renders one state; this renders the
+    /// only part of the design that is a state MACHINE over time.
+    ProgressBarCycle,
 }
 
 /// The detail pane's exact width in the shipped vault window.
@@ -465,6 +484,8 @@ const ALL: &[Surface] = &[
     Surface::FirstWindowSlow,
     Surface::FirstWindowUnreachable,
     Surface::FirstWindowUnreachableSpent,
+    Surface::LoginUnlockBusy,
+    Surface::ProgressBarCycle,
 ];
 
 impl Surface {
@@ -524,6 +545,8 @@ impl Surface {
             Surface::FirstWindowSlow => "first_window_slow",
             Surface::FirstWindowUnreachable => "first_window_unreachable",
             Surface::FirstWindowUnreachableSpent => "first_window_unreachable_spent",
+            Surface::LoginUnlockBusy => "login_unlock_busy",
+            Surface::ProgressBarCycle => "progress_bar_cycle",
         }
     }
 
@@ -559,7 +582,13 @@ impl Surface {
                 overlay_ui::OVERLAY_WIDTH,
                 overlay_ui::overlay_height(overlay_ui::GENERATE_ROWS),
             ),
-            Surface::LoginUnlock | Surface::LoginSignin => egui::vec2(470.0, 588.0),
+            Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy => {
+                egui::vec2(470.0, 588.0)
+            }
+            // Wide enough for the design's own 260px track with room
+            // either side, and tall enough for six of them stacked with
+            // their labels.
+            Surface::ProgressBarCycle => egui::vec2(420.0, 420.0),
             Surface::LoginDetail
             | Surface::CardDetail
             | Surface::CardDetailRevealed
@@ -641,7 +670,10 @@ impl Surface {
 
     /// Whether this surface draws the login window's own titlebar.
     fn is_login_window(self) -> bool {
-        matches!(self, Surface::LoginUnlock | Surface::LoginSignin)
+        matches!(
+            self,
+            Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy
+        )
     }
 }
 
@@ -932,8 +964,10 @@ impl eframe::App for Preview {
             | Surface::OverlayGenerateFailed => {
                 self.draw_overlay_generate(root, &ctx, self.current())
             }
-            Surface::LoginUnlock => self.draw_login(root, &ctx, false),
-            Surface::LoginSignin => self.draw_login(root, &ctx, true),
+            Surface::LoginUnlock => self.draw_login(root, &ctx, false, false),
+            Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true),
+            Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
+            Surface::LoginSignin => self.draw_login(root, &ctx, true, false),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
             Surface::CardDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Card)),
             Surface::CardDetailRevealed => {
@@ -1142,7 +1176,13 @@ impl Preview {
             });
     }
 
-    fn draw_login(&mut self, root: &mut egui::Ui, ctx: &egui::Context, signin: bool) {
+    fn draw_login(
+        &mut self,
+        root: &mut egui::Ui,
+        ctx: &egui::Context,
+        signin: bool,
+        auth_in_progress: bool,
+    ) {
         // The exact chrome the shipped window draws.
         if login_ui::draw_window_chrome(root, "Log in to Deskwarden")
             == login_ui::ChromeAction::Close
@@ -1185,9 +1225,10 @@ impl Preview {
                     hello,
                     &mut self.form,
                     &mut flow_bottom,
-                    // Never in flight here: this preview draws the window's
-                    // states, it does not run a real sign-in.
-                    false,
+                    // In flight only for `LoginUnlockBusy`, and even there
+                    // nothing is actually running: this draws the window's
+                    // states and never spawns a real `bw`.
+                    auth_in_progress,
                     // Not a first run: the preview draws the window an
                     // existing account meets, so the first-run notice is not
                     // part of what this screenshots.
@@ -2164,6 +2205,57 @@ const LIST_JSON: &str = r#"[
       "expMonth": "06", "expYear": "2031" }
   }
 ]"#;
+
+/// **Design 7's `dw-bar`, one cycle, as six stills.**
+///
+/// Every other surface in this file is a picture of a state. This one is a
+/// picture of a state machine, and it exists because of what a PNG of an
+/// animated widget honestly cannot say. A single frame of a sliding bar is a
+/// blue dash somewhere in a grey rail; whether it MOVES -- and whether it
+/// moves on the design's curve rather than at a constant crawl -- is exactly
+/// the property a still cannot carry. At the design's own opening keyframe,
+/// `translateX(-100%)`, there is not even a dash: the knob is entirely outside
+/// the track and `theme::paint_progress_bar` clips it away, so a reviewer
+/// looking at a PNG taken at t=0 would see an empty rail and reasonably
+/// conclude the bar was broken.
+///
+/// So the phases are laid out side by side and labelled. It is
+/// `theme::paint_progress_bar` -- the SAME painter the live widget calls, one
+/// line below its own clock -- so nothing here is a second drawing of the bar
+/// that could drift from the shipped one. What a reader can check off this
+/// picture: the knob is a third of the track, it starts and ends out of sight,
+/// and the middle rows are further apart than the outer ones, which is the
+/// `ease-in-out` the design asks for and the difference between a bar that
+/// reads as motion and a marquee.
+fn draw_progress_bar_cycle(root: &mut egui::Ui) {
+    theme::paint_window_background(root);
+    egui::Frame::new()
+        .fill(theme::CANVAS)
+        .inner_margin(Margin::same(24))
+        .show(root, |ui| {
+            ui.label(theme::bold("dw-bar, one 1.4s cycle", 15.0).color(theme::INK));
+            ui.add_space(4.0);
+            ui.label(
+                theme::semibold("theme::paint_progress_bar at six fixed phases", 12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(18.0);
+            for step in 0..=5 {
+                let at = f64::from(step) * f64::from(theme::BAR_PERIOD) / 5.0;
+                let phase = theme::bar_phase(at);
+                ui.label(
+                    theme::semibold(format!("t = {at:.2} s"), 11.0).color(theme::TEXT_GHOST),
+                );
+                ui.add_space(3.0);
+                let (track, _) = ui.allocate_exact_size(
+                    egui::vec2(260.0, theme::BAR_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                theme::paint_progress_bar(ui.painter(), track, phase);
+                ui.add_space(20.0);
+            }
+        });
+}
 
 /// The two preflight states.
 ///

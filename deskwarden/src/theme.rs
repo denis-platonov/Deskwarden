@@ -1070,9 +1070,127 @@ pub fn kbd_chip_on_card(ui: &mut Ui, text: &str) {
     paint_chip(ui, text, CARD, BLUE, 5, 7.0);
 }
 
+// ---------------------------------------------------------------------------
+// The indeterminate progress indicator (design turn 7).
+// ---------------------------------------------------------------------------
+
+/// **The bar every waiting surface in this app draws, and the disc none of
+/// them draw any more.**
+///
+/// Design turn 7 -- "TURN 7 · FIRST WINDOW", the last section of
+/// `docs/design/Deskwarden.dc.html` -- draws the indicator for BOTH of its
+/// waiting bodies (7a's load and 7b's slow) as a short bar sliding inside a
+/// track:
+///
+/// ```text
+/// track: height 3px, radius 2px, background #eae7e7, overflow hidden
+/// knob:  width 32%, height 3px, radius 2px, background #1b3fa0,
+///        animation: dw-bar 1.4s ease-in-out infinite
+/// @keyframes dw-bar { 0% { translateX(-100%) } 100% { translateX(320%) } }
+/// ```
+///
+/// The rotating disc (`egui::Spinner`, the file's `dw-spin` keyframe) is what
+/// this app drew before, and it survives in that design only as a keyframe
+/// turn 7 never references. The owner's report was that the loading and
+/// locking screens "ha[ve the] old design with round spinner - wrong".
+///
+/// **Here rather than in `loading_ui`** because more than one module has a
+/// wait to draw -- `loading_ui`'s three bodies, `login_ui`'s in-flight
+/// sign-in, the vault's own first load -- and two hand-drawn copies of a
+/// four-constant animation are two chances for the app's idea of "waiting" to
+/// fork. `theme` is where this crate already keeps the widgets more than one
+/// window draws.
+///
+/// `width` is the TRACK width: the design uses 260px in its full-frame body
+/// and 200px in its half-width card, so the measure belongs to the surface and
+/// the proportions belong here.
+///
+/// Repaints itself, exactly as `egui::Spinner` did, so a host that otherwise
+/// only wakes on a channel poll still animates: an indicator that moves only
+/// when something else happens is a still picture of a bar.
+pub fn progress_bar(ui: &mut Ui, width: f32) {
+    let (track, _) = ui.allocate_exact_size(Vec2::new(width, BAR_HEIGHT), Sense::hover());
+    let phase = bar_phase(ui.input(|i| i.time));
+    paint_progress_bar(ui.painter(), track, phase);
+    ui.ctx().request_repaint();
+}
+
+/// [`progress_bar`]'s painting, at an explicit phase.
+///
+/// Split out so the preview example can render a still frame at a phase where
+/// the knob is actually inside the track -- at phase 0 the design's own
+/// keyframe has it entirely off the left edge, so a PNG taken there shows an
+/// empty track and tells a reviewer nothing.
+pub fn paint_progress_bar(painter: &egui::Painter, track: Rect, phase: f32) {
+    let radius = CornerRadius::same(BAR_RADIUS);
+    painter.rect_filled(track, radius, HAIRLINE);
+    // `overflow: hidden` on the track. Without it the knob is drawn outside
+    // the track for most of the cycle, which reads as a stray blue dash
+    // crossing the window rather than as something moving inside a rail.
+    painter.with_clip_rect(track).rect_filled(bar_knob(track, phase), radius, BLUE);
+}
+
+/// The track's height and the knob's -- design 7's own 3px.
+///
+/// Public because the bodies that draw the bar have to CENTRE it, and a
+/// surface that restated "3" to do its own arithmetic would be a copy of this
+/// number sitting in another file waiting to disagree with it.
+pub const BAR_HEIGHT: f32 = 3.0;
+
+/// The track's and knob's corner radius -- design 7's own 2px.
+const BAR_RADIUS: u8 = 2;
+
+/// The knob's share of the track -- design 7's own `width: 32%`.
+const BAR_KNOB_FRACTION: f32 = 0.32;
+
+/// One full cycle -- design 7's own `1.4s`.
+pub const BAR_PERIOD: f32 = 1.4;
+
+/// Where the knob starts, as a multiple of its OWN width: design 7's
+/// `translateX(-100%)`, i.e. one knob-width left of the track's left edge, so
+/// the cycle opens with the knob entirely out of sight.
+const BAR_FROM: f32 = -1.0;
+
+/// Where it ends: design 7's `translateX(320%)`. Together with [`BAR_FROM`]
+/// that is 4.2 knob-widths of travel per cycle, which at a 32% knob is 1.344
+/// track-widths -- the knob leaves the right edge completely before it
+/// reappears at the left.
+const BAR_TO: f32 = 3.2;
+
+/// **How far through one cycle the animation is, eased.**
+///
+/// Pure and separate from the painting so the timing is something a test can
+/// assert rather than an expression inside a paint call. `time` is
+/// `egui::InputState::time`, seconds since the context started.
+///
+/// The easing is `ease-in-out`, which the design states and CSS defines as
+/// `cubic-bezier(.42, 0, .58, 1)`. This is the sine form of the same shape --
+/// slow at both ends, fastest in the middle, exactly symmetric -- rather than
+/// a Bezier solver, because what the easing has to get right is that the knob
+/// hesitates at the edges and hurries through the middle, and the two curves
+/// differ by a couple of percent of the travel anywhere.
+pub fn bar_phase(time: f64) -> f32 {
+    let t = (time.rem_euclid(BAR_PERIOD as f64) / BAR_PERIOD as f64) as f32;
+    0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+}
+
+/// **Where the knob is at `phase`**, as a rect in the track's own space.
+///
+/// Pure, so "the knob starts off the left edge and ends off the right one" is
+/// arithmetic a test runs rather than a claim about a CSS keyframe nothing in
+/// this process reads.
+pub fn bar_knob(track: Rect, phase: f32) -> Rect {
+    let knob = track.width() * BAR_KNOB_FRACTION;
+    let offset = (BAR_FROM + (BAR_TO - BAR_FROM) * phase) * knob;
+    Rect::from_min_size(
+        Pos2::new(track.left() + offset, track.top()),
+        Vec2::new(knob, track.height()),
+    )
+}
+
 /// Height of the design's action buttons (3h Continue, 2b/3f toolbar).
 /// Named because things placed *beside* a button — the login window's
-/// in-flight spinner — have to match it, and a second hardcoded `32.0`
+/// in-flight indicator — have to match it, and a second hardcoded `32.0`
 /// could drift away from this one unnoticed.
 pub const BUTTON_HEIGHT: f32 = 32.0;
 
@@ -5657,5 +5775,127 @@ pub mod icon_probe {
             }
             _ => {}
         }
+    }
+}
+
+/// **The sliding bar's arithmetic** -- design turn 7's `dw-bar`.
+///
+/// The painting itself needs a `Painter`, which needs a `Context`; what is
+/// worth pinning is not the two `rect_filled` calls but the two pure
+/// functions under them, because those are where the design's numbers live.
+/// A bar that drew perfectly and moved on the wrong curve, or never left the
+/// track, would look exactly like a bar to every test that only checked a
+/// blue rect was painted.
+#[cfg(test)]
+mod sliding_bar_tests {
+    use super::*;
+
+    fn track() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(260.0, BAR_HEIGHT))
+    }
+
+    /// The design's `0% { translateX(-100%) }`: the knob opens the cycle one
+    /// whole knob-width to the LEFT of the track, so its right edge is exactly
+    /// the track's left edge and nothing of it is visible.
+    #[test]
+    fn the_knob_starts_entirely_off_the_left_edge_of_the_track() {
+        let knob = bar_knob(track(), 0.0);
+        assert!(
+            (knob.right() - track().left()).abs() < 0.01,
+            "at phase 0 the knob's right edge is at {}, not at the track's left edge {} -- so \
+             the cycle starts with a stub of blue already showing instead of with an empty \
+             track",
+            knob.right(),
+            track().left()
+        );
+    }
+
+    /// And `100% { translateX(320%) }`: at the end of the cycle the knob's
+    /// LEFT edge is past the track's right one, so the clip in
+    /// `paint_progress_bar` hides it completely. A knob that only reached the
+    /// right edge would appear to stall there once per cycle.
+    #[test]
+    fn the_knob_ends_entirely_off_the_right_edge_of_the_track() {
+        let knob = bar_knob(track(), 1.0);
+        assert!(
+            knob.left() >= track().right() - 0.01,
+            "at phase 1 the knob's left edge is at {}, still inside a track that ends at {} -- \
+             the design's 320% carries it clear of the track before the cycle restarts",
+            knob.left(),
+            track().right()
+        );
+    }
+
+    /// `width: 32%` of the track, at both of the design's two track widths.
+    #[test]
+    fn the_knob_is_the_designs_thirty_two_percent_of_whatever_track_it_is_given() {
+        for width in [260.0_f32, 200.0] {
+            let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, BAR_HEIGHT));
+            let knob = bar_knob(track, 0.5);
+            assert!(
+                (knob.width() - width * 0.32).abs() < 0.01,
+                "a {width}px track got a {}px knob, not the design's 32%",
+                knob.width()
+            );
+            assert!(
+                (knob.height() - BAR_HEIGHT).abs() < f32::EPSILON,
+                "the knob is {}px tall in a {BAR_HEIGHT}px track",
+                knob.height()
+            );
+        }
+    }
+
+    /// **The cycle is `BAR_PERIOD` long and repeats.** A phase that ran off
+    /// with the clock instead of wrapping would slide the knob out of the
+    /// track once and never bring it back -- an indicator that stops
+    /// indicating a few seconds into exactly the waits it exists for.
+    #[test]
+    fn the_phase_wraps_once_per_period_and_covers_the_whole_travel() {
+        assert!(bar_phase(0.0).abs() < 1e-5, "the cycle does not start at 0");
+        for cycle in 0..4 {
+            let base = f64::from(cycle) * f64::from(BAR_PERIOD);
+            assert!(
+                (bar_phase(base) - bar_phase(0.0)).abs() < 1e-4,
+                "second {base} is a whole number of periods in and is not back at the start of \
+                 the cycle"
+            );
+            assert!(
+                (bar_phase(base + f64::from(BAR_PERIOD) / 2.0) - 0.5).abs() < 1e-4,
+                "half a period in, the eased phase is not half way -- the curve has lost the \
+                 symmetry `ease-in-out` is"
+            );
+            assert!(
+                bar_phase(base + f64::from(BAR_PERIOD) * 0.999) > 0.99,
+                "at the very end of the cycle the knob has not reached the far end of its \
+                 travel, so the design's 320% is never actually spent"
+            );
+        }
+        // ...and never leaves [0, 1], which is what keeps `bar_knob`'s
+        // interpolation between the design's two keyframes rather than
+        // extrapolating past them.
+        for step in 0..280 {
+            let phase = bar_phase(f64::from(step) * 0.01);
+            assert!(
+                (0.0..=1.0).contains(&phase),
+                "phase {phase} at t={} is outside the keyframes it interpolates",
+                f64::from(step) * 0.01
+            );
+        }
+    }
+
+    /// **`ease-in-out`, not linear** -- the design says so, and it is the
+    /// difference between a bar that reads as motion and one that reads as a
+    /// marquee. Asserted as the property the easing exists for: the middle
+    /// quarter of the cycle covers more travel than the first quarter.
+    #[test]
+    fn the_travel_is_eased_rather_than_linear() {
+        let quarter = f64::from(BAR_PERIOD) / 4.0;
+        let first = bar_phase(quarter) - bar_phase(0.0);
+        let second = bar_phase(2.0 * quarter) - bar_phase(quarter);
+        assert!(
+            second > first * 1.5,
+            "the first quarter of the cycle covers {first:.3} of the travel and the second \
+             {second:.3}; that is a linear slide, not the design's ease-in-out"
+        );
     }
 }

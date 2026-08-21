@@ -961,9 +961,75 @@ fn main() {
     //   it would be reported over now exists just above, but nothing has been
     //   sent on it -- the only senders are `spawn_backend_start`'s callers,
     //   all of which are below the branch.
+    // **Did somebody ask for this app, or did Windows start it at sign-in?**
+    //
+    // Read here rather than at the top of `main` because this is the one
+    // decision it feeds and the branch below is where that decision is spent
+    // -- and because a launch with no cached session cannot honour it either
+    // way: there is nothing to boot in the background without a session, so
+    // that arm shows the sign-in card whoever started it. See
+    // [`launch_intent`] for what an install that predates the flag gets.
+    let launch = launch_intent(std::env::args().skip(1));
+    log::info!("this launch is a {launch:?}, so its first surface is {:?}", first_surface(launch));
+
     let mut estate = if let Some(token) = cached_session {
     session_token = token;
     bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
+    // **Two `if`s and no `else`, deliberately.** The startup branch's own
+    // shape guards find the boundary between its two arms by looking for a
+    // `} else {` at this exact indentation (`startup_shape_tests::OUTER_ELSE`),
+    // and an inner one here is indistinguishable from it -- every one of those
+    // guards would then be slicing this decision instead of the branch, and
+    // would fail saying something about the wrong thing. `FirstSurface` is
+    // two-valued and both values are answered below, so nothing is left
+    // undecided by the shape.
+    let surface = first_surface(launch);
+    // Assigned before either arm rather than by both: the tray arm opens no
+    // window, so it has no vault session to report, and the visible arm
+    // overwrites this with whatever its window came home holding.
+    startup_vault = None;
+    if surface == FirstSurface::StayInTheTray {
+    // **NO WINDOW: a login autostart boots in the background.**
+    //
+    // The owner: "if it autostart with minimized - it goes to tray", and, on
+    // what happens when that fails, "if fails - we should show the error
+    // screen, if no - everything boots up in background and works fine on its
+    // own - user may or may not open it until next reboot."
+    //
+    // Both halves are [`settle_a_tray_launch`]'s, which is where the rule
+    // lives and is tested; this site supplies the real probe and answers the
+    // one outcome that still needs `main`'s own locals. Nothing further down
+    // this arm depends on a window having been opened: `startup_vault` stays
+    // `None` -- the same value the visible launch leaves when its window is
+    // closed on the spinner -- the tray, the hotkey and the window-watch
+    // thread are all built below the branch, and autofill is armed by the
+    // same `arm_autofill_and_seed_cache` the visible path calls.
+    let account = login.account.map(|(_, account)| account.email.clone());
+    let items = match settle_a_tray_launch(|window| {
+        wait_for_the_vault(&vault, &schedule, window, account.clone())
+    }) {
+        TrayLaunchEnd::Ready(items) => items,
+        // The window has already said this, in design 7's own unreachable
+        // body, and the user closed it or spent its retries. The heavier
+        // recovery is the same one the visible launch runs on the same
+        // evidence -- kill the backend, ask for the master password, start
+        // over -- and it is allowed to put windows on screen: by this point
+        // the silence is over.
+        TrayLaunchEnd::Unreachable(e) => recover_from_failed_vault_wait(
+            &e,
+            &vault,
+            &schedule,
+            &mut bw_serve_child,
+            &mut session_token,
+            &job,
+            &store,
+            &config_dir,
+            login,
+        ),
+    };
+    arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    }
+    if surface == FirstSurface::ShowTheWindow {
     // **ONE WINDOW: the spinner, then the vault.**
     //
     // This is the launch the second report was about -- "On start there is
@@ -1108,6 +1174,7 @@ fn main() {
         };
 
         arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    }
     }
 
     SessionEstate {
@@ -7736,6 +7803,189 @@ enum ProbeWindow {
     Silent,
 }
 
+/// **The flag the installer's Run entry passes, and nothing else does.**
+///
+/// One `const`, read by [`launch_intent`] and reconciled against
+/// `installer/deskwarden.iss` by
+/// `the_installers_run_entry_passes_the_flag_the_app_reads`. Two spellings of
+/// the same word in two files that are never built together is exactly the
+/// drift that guard exists for: a typo here does not fail a build, it just
+/// makes every login start look like a double-click forever.
+const AUTOSTART_FLAG: &str = "--autostart";
+
+/// **How this process was started**, which until now it could not tell.
+///
+/// The owner: "if user launched it - it should show up (not go to tray), if it
+/// autostart with minimized - it goes to tray." Those are two different
+/// launches with two different right answers, and they arrived at `main`
+/// completely indistinguishable -- same executable, same empty command line,
+/// same working directory -- because the installer's `[Registry]` Run entry
+/// launched `deskwarden.exe` with no arguments at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchIntent {
+    /// Somebody asked for this app just now: a double-click, the Start menu
+    /// shortcut, or the installer's own post-install relaunch. They are
+    /// looking at the screen and expect something to appear on it.
+    UserLaunch,
+    /// Windows started this at sign-in, from the Run key. Nobody is waiting
+    /// for it and nobody clicked anything.
+    LoginAutostart,
+}
+
+/// Reads [`LaunchIntent`] off the command line.
+///
+/// # An install that predates the flag keeps the old behaviour, deliberately
+///
+/// The Run value is written by the installer, only when the `autostart` task
+/// is selected, and a self-update passes `/MERGETASKS=!autostart` -- so an
+/// upgrade never rewrites a Run value that is already on the machine. Every
+/// install that exists today therefore carries a bare `deskwarden.exe` and
+/// will keep carrying it until the user reinstalls by hand.
+///
+/// So the absent flag has to mean something, and it means
+/// [`LaunchIntent::UserLaunch`]:
+///
+/// * **It is what those installs do today.** A launch with no flag currently
+///   shows the window, so reading the absence as a user launch changes
+///   nothing for anyone who does not reinstall. Reading it as an autostart
+///   would silently take the window away from every existing user's
+///   double-click -- a behaviour change nobody asked for, delivered by a
+///   registry value they cannot see.
+/// * **Only one of the two mistakes is recoverable.** Showing a window at
+///   login that should have stayed in the tray costs one click. Sending a
+///   double-click to the tray costs the user their belief that the app
+///   started at all -- and the tray icon is the thing they would have to
+///   already know about in order to recover.
+///
+/// # It matches an ARGUMENT, not a substring of one
+///
+/// `args` is `std::env::args()`'s tail; the program name is dropped by the
+/// caller rather than here, because a function that skipped its own first
+/// item would answer differently for the same list depending on who built it.
+/// A path containing the word is not the flag: `contains` over the joined
+/// command line would read `C:\--autostart tools\deskwarden.exe` as a login
+/// start.
+fn launch_intent<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> LaunchIntent {
+    if args.into_iter().any(|arg| arg.as_ref() == AUTOSTART_FLAG) {
+        LaunchIntent::LoginAutostart
+    } else {
+        LaunchIntent::UserLaunch
+    }
+}
+
+/// **Whether this launch puts a window on screen at all.**
+///
+/// Its own type rather than a `bool` on [`LaunchIntent`], because the two
+/// questions are genuinely different and the second is the one every caller
+/// asks: "was this a login start" is a fact about how the process began, and
+/// "does anything appear" is the decision made from it. Today they are
+/// one-to-one; a future reason to show the window on an autostart belongs in
+/// this function and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstSurface {
+    /// The launch window opens, at the vault window's own geometry, and shows
+    /// the wait and then the vault. What every launch did before.
+    ShowTheWindow,
+    /// Nothing appears. The vault loads in the background, and the tray, the
+    /// hotkey and autofill all come up as usual; the user may never open the
+    /// window before the next reboot.
+    ///
+    /// **Silent while it succeeds, and only while it succeeds** -- see
+    /// [`settle_a_tray_launch`], which is the other half of this decision and
+    /// the half that keeps a failure from being invisible.
+    StayInTheTray,
+}
+
+fn first_surface(intent: LaunchIntent) -> FirstSurface {
+    match intent {
+        LaunchIntent::UserLaunch => FirstSurface::ShowTheWindow,
+        LaunchIntent::LoginAutostart => FirstSurface::StayInTheTray,
+    }
+}
+
+/// How a tray-only launch ended.
+enum TrayLaunchEnd {
+    /// The vault is ready. The ordinary autostart, and on this arm nothing was
+    /// ever shown.
+    Ready(Vec<deskwarden::vault_bridge::VaultItem>),
+    /// The background probe failed, the window was opened to say so, and the
+    /// user did not get past it. Carries the last failure's own words; the
+    /// caller answers it exactly as it answers any other failed startup wait.
+    Unreachable(String),
+}
+
+/// **A tray-only launch: silent while it works, visible the moment it does
+/// not.**
+///
+/// The owner, asked what an autostart that fails with no window on screen
+/// should do: "if fails - we should show the error screen, if no - everything
+/// boots up in background and works fine on its own - user may or may not open
+/// it until next reboot."
+///
+/// So: [`ProbeWindow::Silent`] first, which is a real readiness wait with no
+/// window behind it. If it answers, this launch is over and the user never saw
+/// anything. If it does not, the SAME window a visible launch would have shown
+/// opens now, showing design turn 7's unreachable body with its bounded Retry
+/// -- not a second treatment invented for this case, and not the message box
+/// that used to end this process.
+///
+/// # The window is created on demand, not created hidden
+///
+/// The alternative shape is a window opened invisibly at startup and made
+/// visible on failure, and it is worse in three ways.
+/// `eframe::run_ui_native` **blocks the thread it is called on for the
+/// window's whole life**, so a window that exists from the first moment means
+/// the entire launch runs inside a frame closure or on workers around one --
+/// the whole startup restructured to serve a window that, on the path this
+/// function exists for, is never seen. It would also have to not raise
+/// itself, because a raise is a taskbar flash on every silent boot;
+/// `foreground`'s tables classify a module as raising or as deliberately not
+/// raising, and there is no shape in them for "raises, but only sometimes".
+/// And the raise would have to move off the first-painted-frame hook every
+/// other window in this crate uses, onto the moment the window became
+/// visible.
+///
+/// Created on demand it is the same `app_window` host, at the same
+/// `the_vault_windows_viewport`, with the same chrome -- so the frame is the
+/// frame, and "nothing ever closes and reopens" is kept for the simplest
+/// reason available: nothing was open to close.
+///
+/// # Why it takes `probe` rather than calling it
+///
+/// `wait_for_the_vault` spawns threads, opens a real window and blocks on a
+/// winit event loop; nothing in a test can call it. As a parameter, the whole
+/// rule -- silent first, window only on failure, never the other way round --
+/// is driven by
+/// `an_autostart_that_fails_opens_the_window_it_never_opened_at_startup`
+/// against a fake that records which windows it was asked for.
+fn settle_a_tray_launch(mut probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome) -> TrayLaunchEnd {
+    match probe(ProbeWindow::Silent) {
+        VaultReadyOutcome::Ready(items) => TrayLaunchEnd::Ready(items),
+        // **Not reachable through the production probe**, which shows no
+        // window on this arm and so has nothing to dismiss. Answered rather
+        // than `unreachable!()` for the reason `settle_vault_after_unlock`'s
+        // twin of this arm gives: a panic here would be a crash the day
+        // somebody gives the silent probe a window.
+        VaultReadyOutcome::Dismissed => TrayLaunchEnd::Unreachable(
+            "the windowless readiness probe of a login autostart reported a dismissal, which \
+             it has no window to have been dismissed from"
+                .to_string(),
+        ),
+        VaultReadyOutcome::Failed(why) => {
+            log::warn!(
+                "this launch was a login autostart and stayed in the tray, but the vault \
+                 backend did not become ready ({why}); opening the window now so the failure \
+                 is on screen rather than only in the log"
+            );
+            match probe(ProbeWindow::InAWindow) {
+                VaultReadyOutcome::Ready(items) => TrayLaunchEnd::Ready(items),
+                VaultReadyOutcome::Dismissed => TrayLaunchEnd::Unreachable(why),
+                VaultReadyOutcome::Failed(again) => TrayLaunchEnd::Unreachable(again),
+            }
+        }
+    }
+}
+
 /// Waits for the vault, showing design turn 7's window while it waits -- or
 /// nothing at all, per [`ProbeWindow`].
 ///
@@ -9803,14 +10053,23 @@ mod tests {
         // proves there is no production code down there at all. Together they
         // do cover the file. Alone, this one covers the top of it.
         //
-        // Four calls plus the one `fn` definition. It was five calls while the
-        // cached-session launch answered a dismissal by reopening the spinner
-        // window and could therefore be dismissed twice; one window has one
-        // way of ending without a vault, so that third arm went with the
-        // second window.
+        // Five calls plus the one `fn` definition. It was four calls plus the
+        // definition until the launch learned to tell a login autostart from a
+        // double-click: that launch shows no window, probes in the background,
+        // and when even the window it then opens cannot reach the backend it
+        // takes the SAME recovery every other failed startup wait takes --
+        // `settle_a_tray_launch`'s `Unreachable` arm. A fifth call is the
+        // right answer there precisely because it is not a fifth ANSWER: a
+        // recovery invented for the autostart case would be a second way to
+        // fail a launch.
+        //
+        // It was five calls once before, while the cached-session launch
+        // answered a dismissal by reopening the spinner window and could
+        // therefore be dismissed twice; one window has one way of ending
+        // without a vault, so that third arm went with the second window.
         assert_eq!(
             production_half_of_this_file().matches(call).count(),
-            5,
+            6,
             "the number of `recover_from_failed_vault_wait` sites changed; a new one is not \
              covered by the argument check above -- extend the guard to reach it"
         );
@@ -10183,15 +10442,16 @@ mod tests {
 
         let paired = main_body.matches(concat!("arm_autofill_and_", "seed_cache(")).count();
         assert_eq!(
-            paired, 5,
-            "startup has {paired} repopulation sites, not the five it should have -- two per \
-             launch plus one. Signing in: the single window's `build_vault`, the \
-             `work.items == Err` recovery and the no-work recovery. Already holding a session: \
-             the warm launch window's own `build_vault`, and the one recovery tail that answers \
-             every way that window can end without a vault. The fifth is the extra recovery the \
-             signing-in launch has and the other does not. Each one must arm the match engine \
-             and seed the cache from the same items, and this count is what makes a new one a \
-             deliberate decision"
+            paired, 6,
+            "startup has {paired} repopulation sites, not the six it should have. Signing in: \
+             the single window's `build_vault`, the `work.items == Err` recovery and the \
+             no-work recovery. Already holding a session and SHOWING a window: the warm launch \
+             window's own `build_vault`, and the one recovery tail that answers every way that \
+             window can end without a vault. Already holding a session and staying in the TRAY \
+             -- a login autostart -- one, which is the whole of that arm: it has no window and \
+             therefore no `build_vault`, so the single site is both its happy path and its \
+             recovery's. Each one must arm the match engine and seed the cache from the same \
+             items, and this count is what makes a new one a deliberate decision"
         );
         assert_eq!(
             main_body.matches(concat!("seed_cache_at_", "startup(")).count(),
@@ -10380,6 +10640,193 @@ mod tests {
                 .next()
                 .expect("the lock recovery must not probe more times than the script allows")
         }
+    }
+
+    /// **A double-click and a login start must not look the same**, and
+    /// until the flag existed they did: same exe, no arguments, no way to
+    /// tell.
+    #[test]
+    fn the_flag_is_what_separates_a_login_start_from_a_double_click() {
+        assert_eq!(
+            launch_intent(std::iter::empty::<&str>()),
+            LaunchIntent::UserLaunch,
+            "a launch with no arguments is a double-click. Reading it as an autostart takes \
+             the window away from every install that predates the flag -- which is every \
+             install that exists"
+        );
+        assert_eq!(
+            launch_intent([AUTOSTART_FLAG]),
+            LaunchIntent::LoginAutostart,
+            "the flag the installer's Run entry passes is not recognised, so a login start is \
+             still indistinguishable from a double-click"
+        );
+        assert_eq!(
+            launch_intent(["--some-other-thing", AUTOSTART_FLAG]),
+            LaunchIntent::LoginAutostart,
+            "the flag is only read when it is first; a future argument in front of it turns \
+             every autostart back into a user launch"
+        );
+        // A path that CONTAINS the word is not the flag. `contains` over the
+        // joined command line would read this as a login start.
+        assert_eq!(
+            launch_intent([r"C:\--autostart tools\deskwarden.exe"]),
+            LaunchIntent::UserLaunch,
+            "the flag is being matched as a substring rather than as a whole argument"
+        );
+    }
+
+    /// The two intents, and the surfaces they buy. Spelled out rather than
+    /// derived, so a `first_surface` rewritten to answer one thing for both
+    /// cannot be checked against itself.
+    #[test]
+    fn a_user_launch_shows_the_window_and_a_login_start_does_not() {
+        assert_eq!(
+            first_surface(LaunchIntent::UserLaunch),
+            FirstSurface::ShowTheWindow,
+            "the owner: \"if user launched it - it should show up (not go to tray)\""
+        );
+        assert_eq!(
+            first_surface(LaunchIntent::LoginAutostart),
+            FirstSurface::StayInTheTray,
+            "the owner: \"if it autostart with minimized - it goes to tray\""
+        );
+    }
+
+    /// **The app and the installer must agree on the spelling**, and nothing
+    /// builds them together.
+    ///
+    /// `deskwarden.iss` is data to every Rust compiler that will ever read
+    /// this crate, so a typo in either place is not a build failure -- it is a
+    /// feature that silently never happens, on a path (a machine's first login
+    /// after an install) that nobody exercises while developing. Held by
+    /// reading the file, which is what makes it a fact rather than a
+    /// convention.
+    #[test]
+    fn the_installers_run_entry_passes_the_flag_the_app_reads() {
+        let iss = include_str!("../installer/deskwarden.iss");
+        let run = iss
+            .lines()
+            .find(|line| {
+                line.starts_with("Root:") && line.contains(r"CurrentVersion\Run")
+            })
+            .expect(
+                "the installer no longer writes a Run value at all, so nothing autostarts and \
+                 `launch_intent` has nothing to read",
+            );
+        assert!(
+            run.contains(AUTOSTART_FLAG),
+            "the installer's Run entry does not pass `{AUTOSTART_FLAG}`, so every login start \
+             arrives at `main` looking exactly like a double-click and goes on showing a \
+             window nobody asked for:\n{run}"
+        );
+        assert!(
+            run.contains("Tasks: autostart"),
+            "control: the Run line found is not the one the autostart task writes, so the \
+             assertion above is about some other registry value:\n{run}"
+        );
+        // ...and the ordinary launches must NOT pass it. The [Run] section's
+        // post-install relaunch and the Start-menu shortcut are both user
+        // launches by definition -- somebody just clicked something -- and a
+        // flag on either would send them to the tray.
+        for section in ["[Icons]", "[Run]"] {
+            let body = iss
+                .split_once(section)
+                .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest).to_string())
+                .unwrap_or_else(|| panic!("control: `{section}` is not in the installer script"));
+            assert!(
+                !body.contains(AUTOSTART_FLAG),
+                "`{section}` passes `{AUTOSTART_FLAG}`, so the shortcut or the post-install \
+                 relaunch -- both of which a user has just clicked -- would go straight to the \
+                 tray:\n{body}"
+            );
+        }
+    }
+
+    /// **An autostart that succeeds shows nothing at all.** The owner:
+    /// "everything boots up in background and works fine on its own - user may
+    /// or may not open it until next reboot."
+    #[test]
+    fn an_autostart_that_works_never_puts_a_window_on_screen() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let end = settle_a_tray_launch(scripted_probe(
+            vec![VaultReadyOutcome::Ready(probe_items(&[("1", "notepad.exe")]))],
+            &seen,
+        ));
+        assert!(
+            matches!(end, TrayLaunchEnd::Ready(_)),
+            "a probe that answered must end the launch ready"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![ProbeWindow::Silent],
+            "a login autostart whose vault came up fine still opened a window. That is the \
+             half of the report about a launch that \"goes to tray\" -- nothing is supposed to \
+             appear"
+        );
+    }
+
+    /// **And one that fails opens the window it never opened at startup.**
+    ///
+    /// The owner: "if fails - we should show the error screen". This is the
+    /// path with no prior window and no user action anywhere in it -- Windows
+    /// started the process at sign-in, nobody is at the keyboard, and the
+    /// backend did not come up. Before this, a launch in that state left
+    /// nothing on screen and nothing but a log line, which is strictly worse
+    /// than the modal dialog design turn 7 removed: at least the dialog was
+    /// visible.
+    ///
+    /// The window it opens is `ProbeWindow::InAWindow`, which is
+    /// `app_window::run_recovery` -- design 7's own unreachable body, at the
+    /// vault window's geometry, with the same bounded Retry a visible launch
+    /// would have offered. Not a second error treatment for this case.
+    #[test]
+    fn an_autostart_that_fails_opens_the_window_it_never_opened_at_startup() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let end = settle_a_tray_launch(scripted_probe(
+            vec![
+                VaultReadyOutcome::Failed("bw serve never answered".into()),
+                VaultReadyOutcome::Failed("still not answering".into()),
+            ],
+            &seen,
+        ));
+        assert_eq!(
+            *seen.borrow(),
+            vec![ProbeWindow::Silent, ProbeWindow::InAWindow],
+            "a login autostart failed with nothing on screen and put nothing on screen. The \
+             user is told nothing at all, by an app they did not start, about a vault that \
+             will not open"
+        );
+        match end {
+            TrayLaunchEnd::Unreachable(why) => assert_eq!(
+                why, "still not answering",
+                "the outcome must carry what the WINDOW last said, not what the silent probe \
+                 said before it -- the second attempt is the one the user watched"
+            ),
+            TrayLaunchEnd::Ready(_) => {
+                panic!("two failed probes cannot end a launch ready")
+            }
+        }
+    }
+
+    /// And the window it opens is a real one: a Retry inside it that succeeds
+    /// ends the launch ready, with no recovery, no re-authentication and no
+    /// second window.
+    #[test]
+    fn a_retry_inside_that_window_finishes_the_autostart() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let end = settle_a_tray_launch(scripted_probe(
+            vec![
+                VaultReadyOutcome::Failed("bw serve never answered".into()),
+                VaultReadyOutcome::Ready(probe_items(&[("1", "notepad.exe")])),
+            ],
+            &seen,
+        ));
+        assert!(
+            matches!(end, TrayLaunchEnd::Ready(_)),
+            "the recovery window answered with a ready vault and the launch did not take it, \
+             so the user watched a Retry work and then got the master-password recovery anyway"
+        );
+        assert_eq!(*seen.borrow(), vec![ProbeWindow::Silent, ProbeWindow::InAWindow]);
     }
 
     /// Review 17's Critical: closing the post-unlock spinner is ONE CLICK,
@@ -23091,6 +23538,22 @@ mod startup_shape_tests {
             arm.contains(concat!("app_window::run_from_", "working(")),
             "the launch that already has a session shows no window of its own any more, so \
              the user watches nothing at all for the eight seconds `bw serve` takes: {arm:?}"
+        );
+        // **...and it shows it only when somebody asked for it.** The owner:
+        // "if user launched it - it should show up (not go to tray), if it
+        // autostart with minimized - it goes to tray." Both halves are in
+        // this arm and both are one deletion away: without the branch every
+        // login start pops a full-size window on every boot, and without the
+        // tray path the branch has nothing to take.
+        assert!(
+            arm.contains("if surface == FirstSurface::ShowTheWindow {"),
+            "the launch that already has a session opens its window unconditionally again, so \
+             every sign-in of the day starts with a 1240x700 window nobody asked for: {arm:?}"
+        );
+        assert!(
+            arm.contains(concat!("settle_a_tray_", "launch(")),
+            "the cached-session arm has no tray-only path left, so a login autostart shows the \
+             same window a double-click does and the flag the installer passes buys nothing"
         );
         // **And the separate spinner window is gone from the WHOLE FILE**,
         // which is the report itself. This used to be a claim about this arm
