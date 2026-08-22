@@ -1916,21 +1916,6 @@ pub trait PromptPresenter {
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice>;
-    /// Shows design **3a** -- the card for a window with a password field that
-    /// nothing in the vault matches -- and returns when the user dismisses it.
-    ///
-    /// **No item argument, and no item in the answer.** There is nothing to
-    /// name; a signature that could carry an item id here is a signature
-    /// something can later fill in with a sentinel. See [`no_match_arm`].
-    ///
-    /// It does answer one bit -- whether the user clicked *New login* -- which
-    /// is 3a's button finally having a destination, not a promise about an
-    /// item. See [`overlay_ui::NoMatchAnswer`].
-    fn show_no_match(
-        &self,
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer;
     /// Shows design **3c** -- the save-a-new-login form -- and answers what the
     /// user decided together with what they typed.
     ///
@@ -1972,7 +1957,7 @@ pub trait PromptPresenter {
     /// focused while the vault cannot be read -- and returns when the user
     /// dismisses it.
     ///
-    /// A separate method rather than a flag on [`Self::show_no_match`], for the
+    /// A separate method rather than a flag on [`Self::show`], for the
     /// reason [`handle_no_match`] is separate from [`handle_match`]: the two
     /// cards make opposite claims about the vault, and a boolean that chose
     /// between them is a boolean something can pass wrongly.
@@ -1980,7 +1965,7 @@ pub trait PromptPresenter {
     /// **It answers now, and it still takes no item and returns none.** 3b's
     /// *Unlock* button has a destination -- [`crate::unlock_prompt`] -- and
     /// the route to it is this return value, exactly as
-    /// [`Self::show_no_match`]'s is the route to the vault window. What
+    /// the account picker's empty card is the route to the vault window. What
     /// [`overlay_ui::LockedAnswer`] can say is "the user asked to unlock" and
     /// nothing else: it names no item, authorises no fill, and carries no
     /// password. The card is still shown for a vault this process cannot read,
@@ -2010,9 +1995,6 @@ pub struct FnPresenter {
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
-    /// Asked to put design 3a on screen. Answers whether *New login* was
-    /// clicked; see [`PromptPresenter::show_no_match`].
-    pub show_no_match: fn(&str, Option<(f32, f32)>) -> overlay_ui::NoMatchAnswer,
     /// Asked to put design 3c on screen. See
     /// [`PromptPresenter::show_save_login`].
     #[allow(clippy::type_complexity)]
@@ -2049,14 +2031,6 @@ impl PromptPresenter for FnPresenter {
         choices: &[FillChoice],
     ) -> Option<FillChoice> {
         (self.show)(label, matched, position, choices)
-    }
-
-    fn show_no_match(
-        &self,
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer {
-        (self.show_no_match)(label, position)
     }
 
     fn show_save_login(
@@ -2099,7 +2073,6 @@ impl PromptPresenter for FnPresenter {
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: overlay_ui::show_prompt_overlay,
-    show_no_match: overlay_ui::show_no_match_overlay,
     show_locked: overlay_ui::show_locked_overlay,
     show_save_login: overlay_ui::show_save_login_overlay,
     show_generate: overlay_ui::show_generate_overlay,
@@ -2142,45 +2115,11 @@ pub fn prompt_arm<P: PromptPresenter>(
     presenter.show(label, matched.as_ref(), position, &choices)
 }
 
-/// **The whole of the no-match arm, as a pure function** -- the 3a sibling of
-/// [`prompt_arm`], and written the same way for the same reason.
-///
-/// It asks the presenter where the card goes and then shows it there. That is
-/// two lines, and both of them are exactly the two lines review 32 found could
-/// be silently wrong at a call site no test could reach: an overlay pinned to
-/// the top of the screen, or one opened for a window other than the one it
-/// names. Driven through a recording presenter, neither can be.
-///
-/// **The placement is asked about [`overlay_ui::NO_MATCH_ROWS`]**, which is
-/// the row count the 3a card is sized by. Asking about `0` -- or about a
-/// choice list this state does not have -- would clamp the card onto the work
-/// area using the wrong height, which on a window anchored near the bottom of
-/// the screen puts its footer, and its only dismiss hint, under the taskbar.
-///
-/// **The label is [`window_label`]**, not `exe_name`, for the reason
-/// `prompt_request` gives: a window matched through the title table belongs to
-/// a process whose name means nothing to the user. It matters more here than
-/// there -- this card's entire content is the name of the app it has nothing
-/// for, so a wrong name is the whole message being wrong.
-///
-/// **Nothing about an item crosses this function**, because there is no item.
-/// There is no id, no `VaultItem`, no [`PromptSubject`] and no cache: the
-/// re-prompt gate ([`permitted_by_reprompt`]) is defined over an existing item
-/// and so cannot be asked here, and this signature is why that is a
-/// type-level fact rather than a discipline.
-pub fn no_match_arm<P: PromptPresenter>(
-    presenter: &P,
-    window: &crate::window_watch::ForegroundEvent,
-) -> overlay_ui::NoMatchAnswer {
-    let position = presenter.position(window.hwnd, overlay_ui::NO_MATCH_ROWS);
-    presenter.show_no_match(window_label(&window.exe_name, &window.title), position)
-}
-
-/// **The whole of the 3c arm, as a pure function** -- [`no_match_arm`]'s
+/// **The whole of the 3c arm, as a pure function** -- [`prompt_arm`]'s
 /// sibling, written the same way and for the same two reasons.
 ///
-/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, not
-/// `NO_MATCH_ROWS`. The two are different numbers -- 3c is by far the tallest
+/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, and not
+/// about the card the user just left. The two differ -- 3c is by far the tallest
 /// state the overlay has -- and the clamp onto the monitor's work area is a
 /// function of the card's height, so asking about the card the user just left
 /// would put this card's *Save* button, its *Never* link and the bottom of its
@@ -2409,7 +2348,7 @@ pub fn route_save_answer(
 /// [`VaultCache::create_item`], which is the same route the edit form takes.
 ///
 /// Only the real presenter and the real create route are named on these lines;
-/// every decision is [`no_match_arm`]'s, [`save_login_arm`]'s and
+/// every decision is [`save_login_arm`]'s and
 /// [`route_save_answer`]'s, each of which a test drives with a recorder.
 /// **Where the favicon cache directory lives, threaded down from `main`.**
 ///
@@ -2534,7 +2473,7 @@ pub fn picker_offers_in(
 /// pure function.
 ///
 /// It exists so the mapping is testable at all, for exactly the reason
-/// [`no_match_follow_up`] and [`locked_follow_up`] exist: the only production
+/// [`locked_follow_up`] exists: the only production
 /// caller is [`handle_no_match`], which raises a real always-on-top window.
 ///
 /// `Cancelled` and `Unavailable` both answer `Nothing`, and they are not
@@ -2608,21 +2547,28 @@ pub fn handle_no_match(
     // and would not be there -- and an empty answer leaves every line below
     // this one doing exactly what it did before.
     let offers = picker_offers_for(cache, window);
-    if !offers.is_empty() {
-        let label = window_label(&window.exe_name, &window.title);
-        let outcome = crate::picker_prompt::ask(&offers);
-        log::info!(
-            "the account picker offered {} account(s) for {label} and was answered: {}",
-            offers.len(),
-            describe_picker_outcome(&outcome)
-        );
+    let label = window_label(&window.exe_name, &window.title);
+    let outcome = crate::picker_prompt::ask(&offers, label);
+    log::info!(
+        "the account picker offered {} account(s) for {label} and was answered: {}",
+        offers.len(),
+        describe_picker_outcome(&outcome)
+    );
+    // **The empty card's *New login* is 3c's door, and the populated card's
+    // is not.** They are the same `Outcome` because they are the same offer on
+    // the same window, but they are made in two different situations and
+    // `picker_follow_up`'s own doc records the difference: with accounts on
+    // screen the user has already been shown logins that look like this app,
+    // so *New login* means "none of these" and the vault window is the honest
+    // answer; with nothing on screen it means what 3a's *New login* meant,
+    // which is "save one now". Everything else -- including *Search vault* and
+    // dismissal, in either mode -- goes through the one mapping.
+    let empty_cards_new_login =
+        offers.is_empty() && matches!(outcome, crate::picker_prompt::Outcome::NewLogin);
+    if !empty_cards_new_login {
         return picker_follow_up(outcome, label);
     }
 
-    let answer = no_match_arm(&REAL_OVERLAY, window);
-    if answer != overlay_ui::NoMatchAnswer::NewLogin {
-        return no_match_follow_up(answer, window_label(&window.exe_name, &window.title));
-    }
     let outcome = route_save_answer(
         save_login_flow(&REAL_OVERLAY, window, &|request| {
             // **The one generator, and it is `bw serve`'s.** Nothing in this
@@ -2667,7 +2613,7 @@ pub fn handle_no_match(
 /// list is exhaustive over what the overlay may ask `main` for, and it is.
 ///
 /// Three variants and not a `bool` or an `Option<String>`, for the reason
-/// [`overlay_ui::NoMatchAnswer`] is two variants: the value crosses
+/// [`overlay_ui::LockedAnswer`] is two variants: the value crosses
 /// `main::process_foreground_event` and lands in `run`'s loop, and "there is a
 /// string" is a worse way to say "open a window" than saying it.
 ///
@@ -2717,18 +2663,6 @@ pub enum NoMatchFollowUp {
     Fill { item_id: String, choice: FillChoice },
 }
 
-/// [`overlay_ui::NoMatchAnswer`] as a [`NoMatchFollowUp`], **as a pure
-/// function**.
-///
-/// It exists so that the mapping is testable at all: the only production
-/// caller is [`handle_no_match`], which raises a real always-on-top window and
-/// so is the one thing on that path no test in this crate may execute.
-///
-/// [`overlay_ui::NoMatchAnswer::NewLogin`] answers `Nothing` here and that is
-/// not a hole: `handle_no_match` never reaches this function with it, because
-/// `NewLogin` means "run 3c" and 3c's own outcome is a save or a silence.
-/// Mapping it rather than making it unrepresentable keeps this function total,
-/// which is what lets a test walk all three answers.
 /// A [`window_label`] as something worth typing into the vault's search box:
 /// **the same name without a trailing `.exe`.**
 ///
@@ -2758,29 +2692,15 @@ pub fn search_query(label: &str) -> &str {
     label
 }
 
-pub fn no_match_follow_up(
-    answer: overlay_ui::NoMatchAnswer,
-    app_name: &str,
-) -> NoMatchFollowUp {
-    match answer {
-        overlay_ui::NoMatchAnswer::SearchVault => {
-            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
-        }
-        overlay_ui::NoMatchAnswer::Dismissed | overlay_ui::NoMatchAnswer::NewLogin => {
-            NoMatchFollowUp::Nothing
-        }
-    }
-}
-
 /// [`overlay_ui::LockedAnswer`] as a [`NoMatchFollowUp`], **as a pure
 /// function**.
 ///
-/// [`no_match_follow_up`]'s sibling, and it exists for the same reason: the
+/// [`picker_follow_up`]'s sibling, and it exists for the same reason: the
 /// only production caller is [`handle_locked`], which raises a real
 /// always-on-top window and so is the one thing on that path no test in this
 /// crate may execute.
 ///
-/// It takes no app name, where [`no_match_follow_up`] takes one. There is
+/// It takes no app name, where [`picker_follow_up`] takes one. There is
 /// nothing to name: an unlock is about *Deskwarden*, not about the app the
 /// card was shown over, and a query string threaded through here would be a
 /// string this follow-up has no use for and something later could act on.
@@ -2834,13 +2754,13 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
     }
 }
 
-/// **The whole of the locked arm, as a pure function** -- [`no_match_arm`]'s
+/// **The whole of the locked arm, as a pure function** -- [`prompt_arm`]'s
 /// 3b sibling, written the same way and for the same two reasons: the
 /// placement must be computed for the window the card names, and it must be
 /// computed for the row count the card is *sized* by.
 ///
 /// **The placement is asked about [`overlay_ui::LOCKED_ROWS`]**, not
-/// `NO_MATCH_ROWS`, even though the two are equal today. The clamp onto the
+/// about any other card's, even though several are equal today. The clamp onto the
 /// monitor's work area is a function of the card's height, so asking about the
 /// other card's constant would be correct only by coincidence -- and would
 /// stop being correct the moment either card changed shape, silently, by
@@ -2848,7 +2768,7 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 ///
 /// **Nothing about an item or the vault crosses this function.** There is no
 /// id, no `VaultItem`, no cache and no [`Reprompt`] -- the same signature-level
-/// fact `no_match_arm` records, and it is stronger here: this path runs
+/// fact `prompt_arm` records, and it is stronger here: this path runs
 /// precisely when the vault cannot be read, so a parameter that could carry an
 /// item would be a parameter nothing could honestly fill.
 /// **It answers what the card answered, and nothing more.** The one thing 3b
@@ -3247,9 +3167,8 @@ mod tests {
         shown: std::cell::RefCell<Vec<Shown>>,
         /// The choice list each `show` was handed.
         offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
-        /// The label and placement each `show_no_match` was handed -- design
+        /// The label and placement each locked card was handed -- design
         /// 3a's own log, kept apart from `shown`.
-        no_match_shown: std::cell::RefCell<Vec<NoMatchShown>>,
         /// The label and placement each `show_locked` was handed -- design
         /// 3b's own log, kept apart from both of the others.
         locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
@@ -3287,25 +3206,6 @@ mod tests {
             ));
             self.offered.borrow_mut().push(choices.to_vec());
             self.answer.clone()
-        }
-
-        /// Design 3a goes into a log of its own rather than into `shown`: a
-        /// no-match card recorded as though it were a matched one would let
-        /// `no_match_arm` satisfy a test written about `prompt_arm`, and the
-        /// two states differ by exactly whether an item exists.
-        fn show_no_match(
-            &self,
-            label: &str,
-            position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.no_match_shown
-                .borrow_mut()
-                .push((label.to_string(), position));
-            // Dismissed, so this recorder never leads on into 3c: the tests
-            // that use it are about WHERE 3a opened and WHAT it was called,
-            // and a recorder that walked on to the save card would make every
-            // one of them a test of two cards.
-            overlay_ui::NoMatchAnswer::Dismissed
         }
 
         /// Design 3c goes into a log of its own too, for the reason 3a and 3b
@@ -3411,65 +3311,13 @@ mod tests {
         assert_eq!(shown[0].1, None);
     }
 
-    /// **Design 3a opens where it was told, for the window it names.**
-    ///
-    /// The 3a sibling of `the_overlay_opens_where_the_placement_answered_for_
-    /// that_window`, and it exists for the same reason: `handle_no_match`'s one
-    /// line is unreachable, so the two things `no_match_arm` does -- ask where
-    /// the card goes, and show it there -- would otherwise be exactly as
-    /// silently alterable as the matched arm's were (review 32's Important 1,
-    /// where mapping the placement's `y` to `0.0` pinned every overlay to the
-    /// top of the screen with the whole suite green).
-    #[test]
-    fn the_no_match_card_opens_where_the_placement_answered_for_that_window() {
-        let w = window("AtlasLicence.exe", "Atlas Licence");
-        let presenter = RecordingPresenter {
-            placement: Some((120.0, 340.0)),
-            ..Default::default()
-        };
-
-        no_match_arm(&presenter, &w);
-
-        assert_eq!(
-            presenter.asked_about.get(),
-            Some(w.hwnd),
-            "the placement was computed for a handle other than the window that has nothing \
-             matching it"
-        );
-        assert_eq!(
-            presenter.asked_rows.get(),
-            Some(overlay_ui::NO_MATCH_ROWS),
-            "the placement was asked about a row count other than the one the 3a card is \
-             SIZED by. The clamp onto the monitor's work area is a function of that height, so \
-             a wrong count puts the card's footer -- and its only dismiss hint -- under the \
-             taskbar on a window anchored near the bottom of the screen"
-        );
-        let shown = presenter.no_match_shown.borrow();
-        assert_eq!(shown.len(), 1, "the no-match card is shown exactly once");
-        assert_eq!(
-            shown[0].1,
-            Some((120.0, 340.0)),
-            "the card must open at the placement that was answered for this window"
-        );
-        assert!(
-            presenter.shown.borrow().is_empty(),
-            "the MATCHED card was raised for a window with no match. The two states differ by \
-             exactly whether an item exists, and this one has none"
-        );
-        assert!(
-            presenter.locked_shown.borrow().is_empty(),
-            "the LOCKED card was raised by `no_match_arm`. That card says Deskwarden cannot \
-             read the vault, which is the opposite of what this arm is called for"
-        );
-    }
-
     /// [`locked_arm`]'s half of the same claim: the card opens **where** the
     /// placement answered, and the placement is asked **about this window**
     /// and **about the row count the 3b card is sized by**.
     ///
     /// Written out rather than shared with the 3a test above, because the two
     /// arms are two functions with two constants, and a test parameterised
-    /// over them would pass if `locked_arm` were a call to `no_match_arm`.
+    /// over them would pass if `locked_arm` were a call to `prompt_arm`.
     #[test]
     fn the_locked_card_opens_where_the_placement_answered_for_that_window() {
         let w = window("AtlasLicence.exe", "Atlas Licence");
@@ -3498,12 +3346,6 @@ mod tests {
             shown[0].1,
             Some((120.0, 340.0)),
             "the card must open at the placement that was answered for this window"
-        );
-        assert!(
-            presenter.no_match_shown.borrow().is_empty(),
-            "`locked_arm` raised the NO-MATCH card. That card asserts there is no saved login \
-             for this app, which a locked vault cannot know -- and it is the whole reason 3b \
-             exists"
         );
         assert!(
             presenter.shown.borrow().is_empty(),
@@ -3551,7 +3393,7 @@ mod tests {
 
     /// The join between what 3b answered and what `main` does about it.
     ///
-    /// [`no_match_follow_up`]'s table has the same shape and the same reason:
+    /// [`picker_follow_up`]'s table has the same shape and the same reason:
     /// the only production caller is [`handle_locked`], which raises a real
     /// window, so this mapping is the one part of that line a test can read. A
     /// `Nothing` for `Unlock` is an inert button; an `Unlock` for `Dismissed`
@@ -3573,30 +3415,6 @@ mod tests {
                 !matches!(locked_follow_up(answer), NoMatchFollowUp::SearchVault(_)),
                 "the locked card asked to search a vault it cannot read, which opens a window \
                  onto an empty list that reads as `nothing found`"
-            );
-        }
-    }
-
-    /// **Only *Search vault* asks for a window**, and it asks with a query.
-    ///
-    /// The pair matters more than either half: `NewLogin` mapping to
-    /// `SearchVault` would open the vault instead of design 3c, and
-    /// `Dismissed` mapping to it would open the vault on every card the user
-    /// closed -- an always-on-top card whose ✕ opens a window is worse than
-    /// the silence 3a replaced.
-    #[test]
-    fn only_the_search_button_asks_for_a_window() {
-        assert_eq!(
-            no_match_follow_up(overlay_ui::NoMatchAnswer::SearchVault, "Ledgerline.exe"),
-            NoMatchFollowUp::SearchVault("Ledgerline".to_string()),
-            "`Search vault` asked for nothing, or asked with the wrong query"
-        );
-        for quiet in [overlay_ui::NoMatchAnswer::Dismissed, overlay_ui::NoMatchAnswer::NewLogin] {
-            assert_eq!(
-                no_match_follow_up(quiet, "Ledgerline.exe"),
-                NoMatchFollowUp::Nothing,
-                "{quiet:?} opened the vault window. Only one of 3a's controls may, and this \
-                 is not it"
             );
         }
     }
@@ -3632,40 +3450,6 @@ mod tests {
         assert_eq!(search_query("Кошелёк.exe"), "Кошелёк");
     }
 
-    /// **The label is `window_label`'s answer, and this card is the one place
-    /// that matters most.**
-    ///
-    /// Every other overlay state also names the item; 3a names nothing but the
-    /// app, so a raw `exe_name` for a title-matched Store frame is the entire
-    /// message being wrong -- "ApplicationFrameHost.exe" is the exact
-    /// complaint that produced `window_label` in the first place.
-    ///
-    /// `HOST` is a host process, which is the only case in which the two
-    /// answers differ; a card told `exe_name` fails here and a card told the
-    /// title passes, which is what makes this a test and not a restatement.
-    #[test]
-    fn the_no_match_card_is_told_the_window_label_and_not_the_exe_name() {
-        let w = window(HOST, "Speedtest");
-        let presenter = RecordingPresenter::default();
-
-        no_match_arm(&presenter, &w);
-
-        let shown = presenter.no_match_shown.borrow();
-        assert_eq!(shown.len(), 1);
-        assert_eq!(
-            shown[0].0, "Speedtest",
-            "the 3a card was told {:?}. That name means nothing to the user, and on this card \
-             it is the ONLY thing about their window that is on screen",
-            shown[0].0
-        );
-        assert_ne!(shown[0].0, HOST, "the raw executable name reached the card");
-        assert_eq!(
-            shown[0].1, None,
-            "control: no placement is not a placement of (0, 0) -- a `no_match_arm` that handed \
-             the card a fixed pair would pass the placement test above and fail this"
-        );
-    }
-
     /// The string spy, pointed at 3a: **no argument the card is given carries
     /// a raw executable name.**
     ///
@@ -3693,26 +3477,6 @@ mod tests {
             seen.iter().any(|s| s == "Speedtest"),
             "control: the window's real name never reached the card either, so the loop above \
              was asserting about nothing"
-        );
-    }
-
-    #[test]
-    fn nothing_the_no_match_card_is_given_carries_the_raw_exe_name() {
-        let spy = StringSpy::default();
-        no_match_arm(&spy, &window(HOST, "Speedtest"));
-
-        let seen = spy.seen.borrow();
-        assert!(!seen.is_empty(), "control: the spy recorded nothing, so it observed nothing");
-        for s in seen.iter() {
-            assert!(
-                !s.contains(HOST),
-                "the 3a card was handed {s:?}, which carries the frame host's executable name"
-            );
-        }
-        assert!(
-            seen.iter().any(|s| s == "Speedtest"),
-            "control: the window's real name never reached the card either, so the loop above \
-             passes for the wrong reason"
         );
     }
 
@@ -3951,19 +3715,6 @@ mod tests {
             None
         }
 
-        /// Design 3a's label lands in the same log as everything else: this
-        /// spy exists to catch a raw `exe_name` reaching ANY string the
-        /// overlay renders, and 3a's label is one -- indeed it is the only
-        /// string that card shows about the window.
-        fn show_no_match(
-            &self,
-            label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.seen.borrow_mut().push(label.to_string());
-            overlay_ui::NoMatchAnswer::Dismissed
-        }
-
         /// And so does design 3c's -- it names the app in its App row, which
         /// is the row the whole card is built around.
         fn show_save_login(
@@ -4085,15 +3836,6 @@ mod tests {
         ) -> Option<FillChoice> {
             self.log.borrow_mut().push("overlay shown");
             None
-        }
-
-        fn show_no_match(
-            &self,
-            _label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.log.borrow_mut().push("no-match card shown");
-            overlay_ui::NoMatchAnswer::Dismissed
         }
 
         fn show_save_login(
@@ -4246,20 +3988,6 @@ mod tests {
         Some(FillChoice::Just(key_sequence::FieldRef::Totp))
     }
 
-    static NO_MATCH_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
-        std::sync::Mutex::new(Vec::new());
-
-    fn recording_show_no_match(
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer {
-        NO_MATCH_FORWARDED
-            .lock()
-            .unwrap()
-            .push((label.to_string(), position));
-        overlay_ui::NoMatchAnswer::Dismissed
-    }
-
     static SAVE_LOGIN_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
         std::sync::Mutex::new(Vec::new());
 
@@ -4320,7 +4048,6 @@ mod tests {
         let presenter = FnPresenter {
             position: recording_position,
             show: recording_show,
-            show_no_match: recording_show_no_match,
             show_locked: recording_show_locked,
             show_save_login: recording_show_save_login,
             show_generate: recording_show_generate,
@@ -4358,21 +4085,13 @@ mod tests {
         );
         assert_eq!(forwarded[0].2, Some((3.0, 4.0)));
 
-        // **The two no-item cards are forwarded to DIFFERENT functions**, and
-        // each to its own. `show_no_match` and `show_locked` have identical
-        // signatures, so a swap of the two fields -- which would show "no
-        // saved login" for a locked vault and "Deskwarden is locked" for a
-        // readable one, i.e. exactly the defect this state corrects, inverted
-        // -- compiles cleanly. Only reading both logs catches it.
+        // **The no-item card is forwarded to its own function**, with its own
+        // arguments. 3a used to sit beside it with an identical signature, so
+        // a swap of the two fields compiled and inverted the whole correction;
+        // 3a is the account picker's empty mode now, and what is left to read
+        // is that this card's label and placement arrive unaltered.
         drop(forwarded);
-        presenter.show_no_match("Atlas Licence.exe", Some((5.0, 6.0)));
         presenter.show_locked("Ledgerline.exe", Some((7.0, 8.0)));
-        assert_eq!(
-            *NO_MATCH_FORWARDED.lock().unwrap(),
-            vec![("Atlas Licence.exe".to_string(), Some((5.0, 6.0)))],
-            "the 3a card was not forwarded to the 3a function, or was handed the 3b call's \r
-             arguments"
-        );
         assert_eq!(
             *LOCKED_FORWARDED.lock().unwrap(),
             vec![("Ledgerline.exe".to_string(), Some((7.0, 8.0)))],
@@ -4433,17 +4152,16 @@ mod prompt_wiring_tests {
     const LOOKUP: &str = concat!("let lookup = || cache.", "get_by_id(item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
-    /// **The two no-item cards, each named in its own field.**
+    /// **The no-item card, named in its own field.**
     ///
-    /// `show_no_match` and `show_locked` have identical signatures, so
-    /// swapping the two values in [`REAL_OVERLAY`] compiles, warns about
-    /// nothing, and inverts the entire correction: a locked vault would be
-    /// told "No saved login for <app>" -- the defect 3b exists to remove --
-    /// and a readable one would be told Deskwarden is locked while it plainly
-    /// was not. `FnPresenter`'s forwarding test cannot see it, because the
-    /// swap is in the struct literal it does not build.
-    const REAL_SHOW_NO_MATCH: &str =
-        concat!("show_no_match: ", "overlay_ui::show_no_match_overlay,");
+    /// 3a's field used to sit beside this one, and the two had identical
+    /// signatures -- so swapping their values compiled, warned about nothing,
+    /// and inverted the whole correction. 3a is now the bare-Win32 account
+    /// picker's empty mode and has no field here at all, which is a stronger
+    /// answer than any needle: there is no longer a second value of this type
+    /// for this one to be swapped with. What is left to pin is that 3b's field
+    /// names the real function plainly, because `FnPresenter`'s forwarding
+    /// test cannot see the struct literal it does not build.
     const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "overlay_ui::show_locked_overlay,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
     /// it about the value it was HANDED. `match_disposition(true)` -- the
@@ -4551,16 +4269,11 @@ mod prompt_wiring_tests {
         let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
 
-        // The swap, planted both ways round, so each needle is shown to
-        // notice the other card's function being put in its field.
-        let planted = concat!("    show_no_match: ", "overlay_ui::show_no_match_overlay,");
-        assert_eq!(occurrences(planted, REAL_SHOW_NO_MATCH), 1, "planted: {planted}");
-        let swapped = concat!("    show_no_match: ", "overlay_ui::show_locked_overlay,");
-        assert_eq!(occurrences(swapped, REAL_SHOW_NO_MATCH), 0, "planted: {swapped}");
         let planted = concat!("    show_locked: ", "overlay_ui::show_locked_overlay,");
         assert_eq!(occurrences(planted, REAL_SHOW_LOCKED), 1, "planted: {planted}");
-        let swapped = concat!("    show_locked: ", "overlay_ui::show_no_match_overlay,");
-        assert_eq!(occurrences(swapped, REAL_SHOW_LOCKED), 0, "planted: {swapped}");
+        let wrapped =
+            concat!("    show_locked: ", "|_label, p| overlay_ui::show_locked_overlay(\"\", p),");
+        assert_eq!(occurrences(wrapped, REAL_SHOW_LOCKED), 0, "planted: {wrapped}");
 
         let planted = concat!("match match_disposition", "(prompt_on_match) {");
         assert_eq!(occurrences(planted, DISPOSITION_CALL), 1, "planted: {planted}");
@@ -4670,14 +4383,6 @@ mod prompt_wiring_tests {
              `prompt_arm` was careful to pass through unaltered"
         );
 
-        assert_eq!(
-            occurrences(source(), REAL_SHOW_NO_MATCH),
-            1,
-            "expected {REAL_SHOW_NO_MATCH:?} exactly once in app.rs -- `REAL_OVERLAY`'s 3a \
-             field. Zero most likely means it has been swapped with the 3b field, which \
-             compiles and puts \"No saved login for <app>\" back in front of every user whose \
-             vault is merely locked"
-        );
         assert_eq!(
             occurrences(source(), REAL_SHOW_LOCKED),
             1,
@@ -8725,14 +8430,6 @@ mod generate_flow_tests {
             _choices: &[FillChoice],
         ) -> Option<FillChoice> {
             unreachable!("the 3d flow never opens the matched card")
-        }
-
-        fn show_no_match(
-            &self,
-            _label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            unreachable!("the 3d flow never opens 3a")
         }
 
         fn show_save_login(

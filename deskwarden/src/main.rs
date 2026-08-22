@@ -23294,7 +23294,7 @@ mod tests {
         ) -> NoMatchFollowUp {
             NO_MATCH_SHOWN.with(|s| {
                 // The EVENT, not a label computed here: the label is
-                // `no_match_arm`'s to compute, and a recorder that computed it
+                // `locked_arm`'s to compute, and a recorder that computed it
                 // the same way would assert nothing but its own arithmetic.
                 // `app::the_no_match_card_is_told_the_window_label_and_not_the
                 // _exe_name` is where that claim lives.
@@ -23645,15 +23645,16 @@ mod tests {
         /// window.
         #[test]
         fn a_search_vault_answer_is_carried_out_of_the_event_handler() {
-            /// The 3a stub that clicks *Search vault*. It answers the label
-            /// the real `handle_no_match` answers -- `window_label`'s -- so
-            /// what this test reads is the query a user would really get.
+            /// The stub that clicks *Search vault* on the unmatched-window
+            /// card. It goes through the shipped mapping -- the account picker's,
+            /// since 3a is that card's empty mode now -- and answers `window_label`'s
+            /// label, so what this test reads is the query a user would really get.
             fn asks_to_search(
                 _cache: &VaultCache,
                 window: &window_watch::ForegroundEvent,
             ) -> NoMatchFollowUp {
-                deskwarden::app::no_match_follow_up(
-                    deskwarden::overlay_ui::NoMatchAnswer::SearchVault,
+                deskwarden::app::picker_follow_up(
+                    deskwarden::picker_prompt::Outcome::SearchVault,
                     deskwarden::app::window_label(&window.exe_name, &window.title),
                 )
             }

@@ -3,7 +3,16 @@
 //! ```text
 //! cargo run --example picker_preview
 //! cargo run --example picker_preview -- --capturable
+//! cargo run --example picker_preview -- --empty
 //! ```
+//!
+//! `--empty` shows the card's **empty mode**: the surface a user gets when
+//! nothing in the vault looks like the app they are in front of, which is by
+//! far the most common state this hotkey lands in. It is design 3a's content
+//! -- the app's name, the line saying there is no saved login for it, and the
+//! two offers *New login* and *Search vault* -- drawn by this card rather
+//! than by the egui window it replaced, which cost ~102 MB to say it. The two
+//! flags combine: `-- --empty --capturable` is the one to screenshot.
 //!
 //! **Every Win32 call is the real one.** The window, the capture exclusion,
 //! the message pump, the owner-drawn rows and the field palette are the code
@@ -24,6 +33,10 @@
 use deskwarden::app_candidates::Candidate;
 use deskwarden::key_sequence::FieldRef;
 use deskwarden::picker_prompt::{self, Offer, Outcome, Palette, PickerCalls, REAL};
+
+/// The app the card is pretending to have been opened in front of. A fixture
+/// like the candidates are -- nothing here reads a real foreground window.
+const APP_NAME: &str = "Ledgerline.exe";
 
 fn offer(id: &str, name: &str, username: &str, palette: Palette) -> Offer {
     Offer {
@@ -73,8 +86,15 @@ fn main() {
     if capturable {
         eprintln!("preview: capture exclusion is stubbed out, so this window can be screenshotted");
     }
+    let empty = std::env::args().any(|arg| arg == "--empty");
+    if empty {
+        eprintln!("preview: the empty card -- no account matched, which is design 3a's state");
+    }
 
-    let offers = fixtures();
+    // An empty offer list is not "no preview": it is the card's third mode,
+    // and it goes through exactly the same `ask`/`run_with` the populated one
+    // does. See `picker_prompt::empty_rows`.
+    let offers = if empty { Vec::new() } else { fixtures() };
     let outcome = if capturable {
         // The one seam that is not the shipped one. `ask` cannot be used here
         // because it names `REAL` outright; this is that call with `protect`
@@ -88,10 +108,11 @@ fn main() {
                 close: REAL.close,
             },
             &offers.iter().map(|o| o.candidate.clone()).collect::<Vec<_>>(),
+            APP_NAME,
             palette_of_fixture,
         )
     } else {
-        picker_prompt::ask(&offers)
+        picker_prompt::ask(&offers, APP_NAME)
     };
 
     match outcome {

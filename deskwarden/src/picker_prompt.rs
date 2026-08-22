@@ -62,8 +62,10 @@ pub enum Outcome {
     Fill { id: String, send: Send },
     /// The user asked to create a new login for this app.
     NewLogin,
-    /// Too many candidates to list; the user asked to search the vault
-    /// instead of picking from the truncated card.
+    /// The user asked to search the vault rather than pick from this card:
+    /// either because more candidates matched than fit on it, or because
+    /// **nothing** matched and the card offered the search as one of its two
+    /// actions. See [`empty_rows`].
     SearchVault,
     /// The user asked to edit the chosen candidate's binding.
     Edit(String),
@@ -83,8 +85,9 @@ pub enum Event {
     /// Picked the candidate at this index into the slice `run_with` was
     /// given.
     Chose(usize),
-    /// Asked to search the vault instead -- offered only when the card is
-    /// truncated. See `crate::win32_draw::visible_rows`.
+    /// Asked to search the vault instead -- offered when the card is
+    /// truncated (see `crate::win32_draw::visible_rows`) and as one of the
+    /// two rows of the empty card (see [`empty_rows`]).
     Overflow,
     /// Asked to create a new login for this app.
     NewLogin,
@@ -115,9 +118,16 @@ pub struct Palette {
 /// desktop. Nothing here decides anything; every decision lives in
 /// [`run_with`].
 pub struct PickerCalls {
-    /// Lays out and shows the card of candidates. `None` if it could not be
-    /// put on screen.
-    pub open: fn(&[Candidate]) -> Option<PickerWindow>,
+    /// Lays out and shows the card of candidates, for the app named by the
+    /// second argument. `None` if it could not be put on screen.
+    ///
+    /// **The name is not decoration.** An empty candidate slice is the card's
+    /// third mode -- see [`empty_rows`] -- whose heading is
+    /// [`empty_text`]'s, and that heading names the app the user is in front
+    /// of. It travels the seam rather than being read from a static so that
+    /// a test driving these pointers sees exactly what the window would be
+    /// told.
+    pub open: fn(&[Candidate], &str) -> Option<PickerWindow>,
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the top-level
     /// window, called before the first `next` -- see the module doc.
     pub protect: fn(PickerWindow) -> bool,
@@ -144,12 +154,20 @@ pub struct PickerCalls {
 /// 4. `close` runs on every exit path, including `Unavailable`'s
 ///    predecessor -- there is no window to close there, which is exactly why
 ///    `open` returning `None` returns before ever calling it.
+///
+/// **An empty `candidates` slice is not a refusal.** It is the card's empty
+/// mode -- design 3a's content, drawn by this card rather than by a second
+/// window (see [`empty_rows`]) -- and it needs no arm of its own here: its
+/// two rows answer [`Event::NewLogin`] and [`Event::Overflow`], which are the
+/// same two events the populated card's *New login* button and its overflow
+/// row answer, and they mean the same two things.
 pub fn run_with(
     calls: &PickerCalls,
     candidates: &[Candidate],
+    app_name: &str,
     palette: fn(&str) -> Palette,
 ) -> Outcome {
-    let Some(window) = (calls.open)(candidates) else {
+    let Some(window) = (calls.open)(candidates, app_name) else {
         log::warn!("the account picker could not be put on screen");
         return Outcome::Unavailable;
     };
@@ -377,6 +395,94 @@ pub fn palette_rows(palette: &Palette) -> Vec<Send> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The empty card -- design 3a, on this window rather than on a second one.
+// ---------------------------------------------------------------------------
+
+/// One of the two things the card offers when **nothing** in the vault looks
+/// like this app.
+///
+/// This is the most common state this card is opened in: most windows a user
+/// presses `CTRL+ALT+B` in front of have no saved login at all. It used to be
+/// a separate egui window of its own -- design 3a, in `overlay_ui` -- which
+/// cost ~102 MB for a card that says one sentence and offers two buttons.
+/// It is a *mode of this window* rather than a second window for the
+/// reason the two steps above it are: a surface that leads to typing a
+/// password must not be drawn by two renderers, because then it has two
+/// palettes, two layouts and two chances to be got wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyAction {
+    /// Create a login for this app. Leads to design 3c, the save-a-login
+    /// form -- which is where 3a's own *New login* led.
+    NewLogin,
+    /// Open the vault window with this app's name in its search box. Answers
+    /// [`Event::Overflow`], and so [`Outcome::SearchVault`], because that is
+    /// already exactly what it means.
+    SearchVault,
+}
+
+/// The rows the empty card offers, in the order it draws them.
+///
+/// **Rows rather than footer buttons**, and both of them: the footer has one
+/// free slot beside *Cancel*, and 3a offered two actions. Putting them in the
+/// list is also what lets them carry the one-line explanation each -- the same
+/// name-over-description shape every other row on this card has -- instead of
+/// being two bare words.
+///
+/// *New login* first, because it is the answer to the question the card just
+/// asked ("there is nothing saved for this"); *Search vault* second, for the
+/// user whose login is saved under a name this app's window does not say.
+///
+/// Bounded by construction, exactly as [`palette_rows`] is: two is two,
+/// forever, and the card has room for [`ROW_CAP`]. That is not a formality --
+/// this card does not scroll, so a third row added here without a taller card
+/// would be one the user could neither see nor reach.
+pub fn empty_rows() -> Vec<EmptyAction> {
+    vec![EmptyAction::NewLogin, EmptyAction::SearchVault]
+}
+
+/// What each empty-card row is called, and what it says it will do.
+///
+/// **The names are [`crate::overlay_ui::NEW_LOGIN_LABEL`] and
+/// [`crate::overlay_ui::SEARCH_VAULT_LABEL`] themselves**, not copies of their
+/// words. Those two constants exist so that "3a offers exactly these two" is
+/// one string a test can find rather than one it re-spells, and the card that
+/// replaced 3a's window inherits the offers -- so it inherits the constants.
+/// Re-typing them here would be the second spelling they were written to
+/// prevent, and `overlay_ui`'s own
+/// `the_locked_card_offers_no_new_login_button` still reads them off the
+/// locked card to prove neither has strayed onto it.
+pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
+    match action {
+        EmptyAction::NewLogin => {
+            (crate::overlay_ui::NEW_LOGIN_LABEL, "Save a login for this app")
+        }
+        EmptyAction::SearchVault => {
+            (crate::overlay_ui::SEARCH_VAULT_LABEL, "Look for it under another name")
+        }
+    }
+}
+
+/// The empty card's heading pair: **the app's name, and why there is nothing
+/// for it.**
+///
+/// Both lines are 3a's own, kept word for word rather than rewritten, and for
+/// the reason 3a gave for the second one: matching is by process name and
+/// window title, so an app whose window says something unexpected can be
+/// unmatched while its login *is* saved. That fact is what makes *Search
+/// vault* a sensible thing to offer rather than a shrug.
+///
+/// `app_name` is `crate::app::window_label`'s answer -- an executable name or
+/// a window title, either of which the user (or the app they ran) chooses. It
+/// is drawn into a fixed-width single-line run that clips, so no length of it
+/// can change the card's geometry; see [`layout`], whose height is a constant.
+pub fn empty_text(app_name: &str) -> (String, &'static str) {
+    (
+        format!("No saved login for {app_name}"),
+        "Deskwarden matches windows by process name and title.",
+    )
+}
+
 /// **Puts the card on screen and answers what the user did with it.**
 ///
 /// The production [`REAL`] calls, [`run_with`]'s decision, and nothing else.
@@ -384,12 +490,16 @@ pub fn palette_rows(palette: &Palette) -> Vec<Send> {
 /// close over anything -- and what it reads is the [`Offer`] slice this
 /// function parks for it, which is why the offers go in and come back out
 /// around the call rather than being a parameter of the seam.
-pub fn ask(offers: &[Offer]) -> Outcome {
+///
+/// **An empty `offers` slice is a card, not a no-op.** It puts the empty mode
+/// on screen -- design 3a's content, naming `app_name` -- and answers
+/// [`Outcome::NewLogin`], [`Outcome::SearchVault`] or [`Outcome::Cancelled`].
+pub fn ask(offers: &[Offer], app_name: &str) -> Outcome {
     let candidates: Vec<Candidate> = offers.iter().map(|o| o.candidate.clone()).collect();
     if let Ok(mut slot) = OFFERS.lock() {
         *slot = offers.to_vec();
     }
-    let outcome = run_with(&REAL, &candidates, palette_of);
+    let outcome = run_with(&REAL, &candidates, app_name, palette_of);
     if let Ok(mut slot) = OFFERS.lock() {
         slot.clear();
     }
@@ -540,6 +650,16 @@ pub fn row_at(index: usize) -> Box2 {
 static MODE: AtomicIsize = AtomicIsize::new(MODE_LIST);
 const MODE_LIST: isize = 0;
 const MODE_PALETTE: isize = 1;
+/// Nothing in the vault looks like this app: design 3a's content, on this
+/// card. See [`empty_rows`].
+const MODE_EMPTY: isize = 2;
+
+/// The app the card is about, as [`empty_text`] needs it.
+///
+/// A static for `MODE`'s reason -- a window procedure has nowhere to keep
+/// state -- and set by `open` from the name that came in over
+/// [`PickerCalls::open`], never read from anywhere else.
+static APP_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Set by `WM_DESTROY`, so a window that goes away underneath the pump is
 /// reported as [`Event::Closed`] rather than pumped forever.
@@ -588,8 +708,9 @@ static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
 /// Nothing in this module decides anything. See [`run_with`].
 mod win32 {
     use super::{
-        Box2, Candidate, Event, Palette, PickerWindow, ENTRIES, GONE, MODE, MODE_LIST,
-        MODE_PALETTE, OVERFLOWING, PENDING, PICKER_PROMPT_TITLE, ROW_CAP, SHOWN,
+        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES, GONE, MODE,
+        MODE_EMPTY, MODE_LIST, MODE_PALETTE, OVERFLOWING, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
+        SHOWN,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -859,11 +980,21 @@ mod win32 {
 
     // ---- the window --------------------------------------------------------
 
-    pub(super) fn open(candidates: &[Candidate]) -> Option<PickerWindow> {
+    pub(super) fn open(candidates: &[Candidate], app_name: &str) -> Option<PickerWindow> {
         register_fonts();
         GONE.store(false, Ordering::SeqCst);
         HOVERED.store(0, Ordering::SeqCst);
-        MODE.store(MODE_LIST, Ordering::SeqCst);
+        // **The mode is decided here and nowhere else.** An empty candidate
+        // slice is design 3a's card -- see `super::empty_rows` -- and every
+        // `MODE_EMPTY` branch below reads this one decision rather than
+        // re-testing `candidates.is_empty()` against a list it no longer has.
+        MODE.store(
+            if candidates.is_empty() { MODE_EMPTY } else { MODE_LIST },
+            Ordering::SeqCst,
+        );
+        if let Ok(mut slot) = APP_NAME.lock() {
+            *slot = app_name.to_string();
+        }
         if let Ok(mut slot) = PENDING.lock() {
             *slot = None;
         }
@@ -1145,6 +1276,18 @@ mod win32 {
                     let _ = ShowWindow(control, if index < count { SW_SHOW } else { SW_HIDE });
                 }
             }
+            // **The empty card's footer is Cancel alone.** Its two offers are
+            // rows, so a *New login* button beside them would be the same
+            // choice twice; and hiding it is what stops it -- an empty
+            // `BUTTON` left visible is still a tab stop and still posts
+            // `BN_CLICKED`, which is the same reason the unused rows above
+            // are hidden rather than merely unlabelled.
+            if let Ok(control) = GetDlgItem(window, ID_SECONDARY as i32) {
+                let _ = ShowWindow(
+                    control,
+                    if MODE.load(Ordering::SeqCst) == MODE_EMPTY { SW_HIDE } else { SW_SHOW },
+                );
+            }
             // **Only when there is a row to focus.** A palette that came back
             // empty -- `palette_of` missing its item -- hides every row, and
             // focusing a hidden control puts the keyboard nowhere the user can
@@ -1160,7 +1303,10 @@ mod win32 {
 
     /// How many row controls this step is using.
     fn visible_row_count() -> usize {
-        if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
+        let mode = MODE.load(Ordering::SeqCst);
+        if mode == MODE_EMPTY {
+            super::empty_rows().len().min(ROW_CAP)
+        } else if mode == MODE_PALETTE {
             ENTRIES.lock().map(|e| e.len()).unwrap_or(0).min(ROW_CAP)
         } else {
             let rows = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
@@ -1187,6 +1333,11 @@ mod win32 {
         }
         if let Ok(mut slot) = PENDING.lock() {
             *slot = None;
+        }
+        // Not a secret, but it is the name of an app this user was in front
+        // of, and nothing needs it once the card is down.
+        if let Ok(mut slot) = APP_NAME.lock() {
+            slot.clear();
         }
     }
 
@@ -1373,13 +1524,20 @@ mod win32 {
     /// nor Tab, and inventing an answer for it would be inventing a choice the
     /// user did not make.
     fn clicked(id: usize) {
-        let palette = MODE.load(Ordering::SeqCst) == MODE_PALETTE;
+        let mode = MODE.load(Ordering::SeqCst);
+        let palette = mode == MODE_PALETTE;
+        let empty = mode == MODE_EMPTY;
         if id == ID_CANCEL {
             set_pending(Event::Cancel);
             return;
         }
         if id == ID_SECONDARY {
-            set_pending(if palette { Event::EditSelected } else { Event::NewLogin });
+            // Hidden on the empty card -- `apply_mode` -- so this cannot be
+            // reached there by pointer or by Tab. Answering nothing is what
+            // makes that a fact rather than a layout accident.
+            if !empty {
+                set_pending(if palette { Event::EditSelected } else { Event::NewLogin });
+            }
             return;
         }
         if id < ID_ROW {
@@ -1387,6 +1545,17 @@ mod win32 {
         }
         let index = id - ID_ROW;
         if index >= visible_row_count() {
+            return;
+        }
+        if empty {
+            // The two offers answer the two events the populated card's own
+            // *New login* button and overflow row answer, so `run_with` needs
+            // no arm of its own for this mode.
+            match super::empty_rows().get(index) {
+                Some(EmptyAction::NewLogin) => set_pending(Event::NewLogin),
+                Some(EmptyAction::SearchVault) => set_pending(Event::Overflow),
+                None => {}
+            }
             return;
         }
         if palette {
@@ -1487,25 +1656,9 @@ mod win32 {
             rounded(mem, l.list, 8, crate::theme::CARD, Some((1, crate::theme::HAIRLINE)));
 
             if let Some(fonts) = fonts {
-                let palette = MODE.load(Ordering::SeqCst) == MODE_PALETTE;
-                text(
-                    mem,
-                    fonts.title,
-                    l.title,
-                    if palette { "What should I type?" } else { "Fill from vault" },
-                    crate::theme::INK,
-                );
-                text(
-                    mem,
-                    fonts.subtitle,
-                    l.subtitle,
-                    if palette {
-                        "Pick a field. Nothing is typed until you do."
-                    } else {
-                        "These accounts look like they belong to this app."
-                    },
-                    crate::theme::TEXT_FAINT,
-                );
+                let (title_run, subtitle_run) = headings();
+                text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
+                text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -1598,6 +1751,27 @@ mod win32 {
         }
     }
 
+    /// The card's heading pair for whichever step is showing.
+    ///
+    /// The empty card's pair is [`super::empty_text`]'s rather than a literal
+    /// here, so the words the card shows are the ones a test can read.
+    fn headings() -> (String, &'static str) {
+        match MODE.load(Ordering::SeqCst) {
+            MODE_PALETTE => (
+                "What should I type?".to_string(),
+                "Pick a field. Nothing is typed until you do.",
+            ),
+            MODE_EMPTY => {
+                let app = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
+                super::empty_text(&app)
+            }
+            _ => (
+                "Fill from vault".to_string(),
+                "These accounts look like they belong to this app.",
+            ),
+        }
+    }
+
     fn footer_label(id: usize) -> String {
         if id == ID_CANCEL {
             return "Cancel".to_string();
@@ -1616,6 +1790,16 @@ mod win32 {
     /// property that function exists to hold, and a second row painter is a
     /// second place for it to be got wrong.
     fn paint_row(hdc: HDC, rect: RECT, index: usize, state: RowState, fonts: &Fonts) {
+        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
+            let Some(action) = super::empty_rows().get(index).copied() else {
+                return;
+            };
+            let (name, says) = super::empty_label(action);
+            let row =
+                Candidate { id: String::new(), name: name.to_string(), username: says.to_string() };
+            draw_row(hdc, rect, &row, state, fonts.name, fonts.username);
+            return;
+        }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
             let Some(send) = ENTRIES.lock().ok().and_then(|e| e.get(index).cloned()) else {
                 return;
@@ -1848,6 +2032,58 @@ mod card_tests {
         );
         assert!(l.close_glyph.right() <= l.window.right());
     }
+
+    /// **The empty card's rows fit the card too**, which is the same bound
+    /// [`nothing_the_card_lays_out_falls_off_the_bottom_of_it`] and
+    /// [`a_wall_of_custom_fields_cannot_push_a_row_off_the_card`] hold for
+    /// the other two steps -- restated for the mode that replaced design 3a's
+    /// own window, because that window is gone and this one does not scroll.
+    #[test]
+    fn the_empty_cards_offers_cannot_fall_off_the_bottom_of_it() {
+        let rows = empty_rows();
+        assert_eq!(
+            rows,
+            vec![EmptyAction::NewLogin, EmptyAction::SearchVault],
+            "3a offered exactly these two, in this order, and the card that replaced it offers \
+             the same two under the same two names"
+        );
+        assert!(
+            rows.len() <= ROW_CAP,
+            "the empty card offered {} rows onto a card with room for {ROW_CAP}, and this card \
+             does not scroll -- the rest would simply be unreachable",
+            rows.len()
+        );
+        let last = row_at(rows.len() - 1);
+        assert!(last.bottom() <= layout().list.bottom());
+    }
+
+    /// The card says which app it has nothing for. A card that said only "no
+    /// saved login" would be a card the user cannot tell apart from a card
+    /// about some other window.
+    #[test]
+    fn the_empty_card_names_the_app_it_has_nothing_for() {
+        let (title, subtitle) = empty_text("Ledgerline.exe");
+        assert!(
+            title.contains("Ledgerline.exe"),
+            "the empty card's heading does not name the app it is about: {title:?}"
+        );
+        assert!(
+            subtitle.contains("process name and title"),
+            "3a's second line is the fact that makes *Search vault* worth offering rather than a \
+             shrug, and it is gone: {subtitle:?}"
+        );
+    }
+
+    /// Every offer says what it does, and neither is a bare word.
+    #[test]
+    fn each_empty_offer_says_what_it_will_do() {
+        for action in empty_rows() {
+            let (name, says) = empty_label(action);
+            assert!(!name.is_empty() && !says.is_empty(), "{action:?} has an empty label");
+        }
+        assert_eq!(empty_label(EmptyAction::NewLogin).0, "New login");
+        assert_eq!(empty_label(EmptyAction::SearchVault).0, "Search vault");
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1901,7 +2137,7 @@ mod tests {
     #[test]
     fn choosing_a_row_then_a_field_answers_that_item_and_that_field() {
         let calls = PickerCalls {
-            open: |_| Some(PickerWindow(1)),
+            open: |_, _| Some(PickerWindow(1)),
             protect: |_| true,
             next: |_| {
                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1914,13 +2150,97 @@ mod tests {
             show_palette: |_, _| {},
             close: |_| {},
         };
-        let outcome = run_with(&calls, &one("Slack"), |_| Palette {
+        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
             fields: vec![FieldRef::Password],
             has_sequence: false,
         });
         assert_eq!(
             outcome,
             Outcome::Fill { id: "id-1".to_string(), send: Send::Field(FieldRef::Password) }
+        );
+    }
+
+    /// **The empty card is a card, and its two offers answer.**
+    ///
+    /// This is the state design 3a's egui window existed for, and it is by
+    /// far the most common one this hotkey lands in -- most windows have no
+    /// saved login at all. Nothing about it may be a silent nothing: the card
+    /// goes up (`open` is called), it is protected, and each of its two rows
+    /// produces the `Outcome` that maps onto the `NoMatchFollowUp` 3a
+    /// produced.
+    #[test]
+    fn an_empty_card_still_opens_and_still_answers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OPENED_EMPTY: AtomicUsize = AtomicUsize::new(usize::MAX);
+        fn calls(next: fn(PickerWindow) -> Event) -> PickerCalls {
+            PickerCalls {
+                open: |candidates, app_name| {
+                    OPENED_EMPTY.store(candidates.len(), Ordering::SeqCst);
+                    assert_eq!(
+                        app_name, "Ledgerline.exe",
+                        "the card is told which app it is about"
+                    );
+                    Some(PickerWindow(1))
+                },
+                protect: |_| true,
+                next,
+                show_palette: |_, _| {},
+                close: |_| {},
+            }
+        }
+        fn empty(_: &str) -> Palette {
+            Palette { fields: vec![], has_sequence: false }
+        }
+
+        assert_eq!(
+            run_with(&calls(|_| Event::NewLogin), &[], "Ledgerline.exe", empty),
+            Outcome::NewLogin,
+            "*New login* on the empty card is 3a's own button, and it must still lead somewhere"
+        );
+        assert_eq!(
+            OPENED_EMPTY.load(Ordering::SeqCst),
+            0,
+            "an empty offer list must still put a card on screen -- there is no other surface \
+             for it now that the egui no-match window is gone"
+        );
+        assert_eq!(
+            run_with(&calls(|_| Event::Overflow), &[], "Ledgerline.exe", empty),
+            Outcome::SearchVault,
+            "*Search vault* on the empty card is 3a's other button"
+        );
+        assert_eq!(
+            run_with(&calls(|_| Event::Cancel), &[], "Ledgerline.exe", empty),
+            Outcome::Cancelled,
+            "and dismissing it is still dismissing it"
+        );
+    }
+
+    /// A row choice on a card with no candidates cannot invent an account.
+    ///
+    /// `Event::Chose` is not something the empty card's window procedure
+    /// posts -- its rows post `NewLogin` and `Overflow` -- but `run_with` is
+    /// the layer that must not trust that, because the alternative to
+    /// ignoring it is filling from an item the user never picked.
+    #[test]
+    fn a_row_choice_on_an_empty_card_fills_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        let calls = PickerCalls {
+            open: |_, _| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Chose(0),
+                _ => Event::Cancel,
+            },
+            show_palette: |_, _| panic!("there is no candidate to show a palette for"),
+            close: |_| {},
+        };
+        assert_eq!(
+            run_with(&calls, &[], "Ledgerline.exe", |_| Palette {
+                fields: vec![],
+                has_sequence: false
+            }),
+            Outcome::Cancelled
         );
     }
 
@@ -1931,7 +2251,7 @@ mod tests {
         static PROTECTED_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
         static PUMPED_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
         let calls = PickerCalls {
-            open: |_| Some(PickerWindow(1)),
+            open: |_, _| Some(PickerWindow(1)),
             protect: |_| {
                 PROTECTED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
                 true
@@ -1952,7 +2272,10 @@ mod tests {
             show_palette: |_, _| {},
             close: |_| {},
         };
-        let _ = run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false });
+        let _ = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
+            fields: vec![],
+            has_sequence: false,
+        });
         assert!(
             PROTECTED_AT.load(Ordering::SeqCst) < PUMPED_AT.load(Ordering::SeqCst),
             "a window that can be typed into before it is excluded from capture is a window a \
@@ -1965,14 +2288,17 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         static CLOSED: AtomicBool = AtomicBool::new(false);
         let calls = PickerCalls {
-            open: |_| Some(PickerWindow(1)),
+            open: |_, _| Some(PickerWindow(1)),
             protect: |_| true,
             next: |_| Event::Closed,
             show_palette: |_, _| {},
             close: |_| CLOSED.store(true, Ordering::SeqCst),
         };
         assert_eq!(
-            run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false }),
+            run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
+                fields: vec![],
+                has_sequence: false
+            }),
             Outcome::Cancelled
         );
         assert!(CLOSED.load(Ordering::SeqCst), "close runs on every exit path");
@@ -1981,14 +2307,17 @@ mod tests {
     #[test]
     fn a_window_that_cannot_be_opened_is_unavailable_and_not_a_silent_nothing() {
         let calls = PickerCalls {
-            open: |_| None,
+            open: |_, _| None,
             protect: |_| true,
             next: |_| Event::Cancel,
             show_palette: |_, _| {},
             close: |_| {},
         };
         assert_eq!(
-            run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false }),
+            run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
+                fields: vec![],
+                has_sequence: false
+            }),
             Outcome::Unavailable
         );
     }
@@ -1999,7 +2328,7 @@ mod tests {
         static CLOSED: AtomicBool = AtomicBool::new(false);
         static STEP: AtomicUsize = AtomicUsize::new(0);
         let calls = PickerCalls {
-            open: |_| Some(PickerWindow(1)),
+            open: |_, _| Some(PickerWindow(1)),
             protect: |_| true,
             next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
                 0 => Event::Chose(0),
@@ -2008,7 +2337,7 @@ mod tests {
             show_palette: |_, _| {},
             close: |_| CLOSED.store(true, Ordering::SeqCst),
         };
-        let outcome = run_with(&calls, &one("Slack"), |_| Palette {
+        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
             fields: vec![FieldRef::Password],
             has_sequence: false,
         });
@@ -2030,7 +2359,7 @@ mod tests {
         static SHOWN_FIELDS: std::sync::Mutex<Vec<FieldRef>> = std::sync::Mutex::new(Vec::new());
         static SHOWN_HAS_SEQUENCE: AtomicUsize = AtomicUsize::new(usize::MAX);
         let calls = PickerCalls {
-            open: |_| Some(PickerWindow(1)),
+            open: |_, _| Some(PickerWindow(1)),
             protect: |_| true,
             next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
                 0 => Event::Chose(0),
@@ -2042,7 +2371,7 @@ mod tests {
             },
             close: |_| {},
         };
-        let outcome = run_with(&calls, &one("Slack"), |id| {
+        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |id| {
             assert_eq!(id, "id-1");
             Palette { fields: vec![FieldRef::Totp], has_sequence: true }
         });
