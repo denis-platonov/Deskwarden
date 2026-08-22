@@ -1713,7 +1713,13 @@ fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
 /// without -- again -- a second list. Rows with no chord name themselves the
 /// same way they always have, with the literal they paint, which
 /// [`copy_row`] reads straight off the row it just drew.
-fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
+///
+/// `pub(crate)` rather than private so the EDIT form can be held to the same
+/// word: `detail_edit::WEBSITE_LABEL` labels the box that fills the row this
+/// names, and two hand-written spellings of "Website" are two things that can
+/// drift into a read pane and an edit form disagreeing about what a field is
+/// called. See `the_edit_form_and_the_read_pane_call_a_website_the_same_thing`.
+pub(crate) fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
     match which {
         CopyShortcut::Username => "Username",
         CopyShortcut::Password => "Password",

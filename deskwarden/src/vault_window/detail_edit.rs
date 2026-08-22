@@ -10,10 +10,10 @@ use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
 use crate::theme;
 use crate::vault_bridge::{
     CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
-    PasswordRecipe, VaultItem,
+    PasswordRecipe, UriEntry, VaultItem,
 };
 #[cfg(test)]
-use crate::vault_bridge::{LoginData, UriEntry};
+use crate::vault_bridge::LoginData;
 use crate::vault_window::{detail, sidebar};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use std::time::Duration;
@@ -224,6 +224,97 @@ pub struct SshKeyDraft {
     /// visibly does nothing. The public key and the fingerprint are not
     /// secrets and get no flag.
     pub reveal_private_key: bool,
+}
+
+/// One element of `login.uris`, as the edit form holds it.
+///
+/// **The unmodelled half of a URI entry rides [`Self::original`]**, and
+/// [`Self::to_entry`] rebuilds only `uri` on top of that entry's own `other`
+/// map -- the same "clone then overwrite what is known" rule [`FieldDraft`],
+/// [`EditDraft::apply_to`] and `vault_bridge::with_app_match` all follow.
+/// Bitwarden's per-URI **match type** (`match`: base domain, host,
+/// starts-with, exact, regex, never) is in that map, which is what lets this
+/// form gain a URI editor without becoming the defect
+/// `vault_bridge::uri_entry_extras_survive_a_round_trip` exists to prevent.
+///
+/// **The match type is preserved and not exposed**, deliberately, and the
+/// argument is not that it was easier. Nothing in this build reads it: the
+/// autofill path matches on the foreground *window* (`match_engine`,
+/// [`AppMatchDraft`]), the icon loader (`favicon::icon_domain_for`) and the
+/// read pane's AUTOFILL TARGETS card both take `login.uris.first()` and
+/// nothing else, and no expression in this crate names `match` at all. A
+/// dropdown here would therefore promise that Deskwarden behaves differently
+/// depending on what it is set to, when Deskwarden behaves identically --
+/// the "succeeds and ignores you" shape `generator_request`'s doc and
+/// [`EditDraft::may_unfile`] both refuse to ship. What the other Bitwarden
+/// clients set is theirs, it survives every save this form makes, and the
+/// block says so on screen ([`WEBSITE_MATCH_NOTE`]) rather than leaving its
+/// absence to be guessed at. The day something in this crate honours `match`
+/// is the day it earns an editor.
+#[derive(Debug, Clone)]
+pub struct UriDraft {
+    /// The URI itself, exactly as the box holds it.
+    pub uri: String,
+    /// This row's identity, for the same reason [`FieldDraft::row_id`] is
+    /// that one's: removing a row shifts every index below it, and an
+    /// `id_salt` built from the index hands each of those rows its
+    /// predecessor's caret, selection and undo buffer on the next frame.
+    row_id: u64,
+    /// What arrived, or `None` for a row this form created.
+    ///
+    /// Private, and read only by [`Self::to_entry`]: it is the round-trip
+    /// guarantee, and a caller that could swap it could swap one website's
+    /// match type onto another.
+    original: Option<UriEntry>,
+}
+
+impl UriDraft {
+    /// Reads one entry off a login.
+    fn from_entry(entry: &UriEntry) -> Self {
+        Self {
+            uri: entry.uri.clone().unwrap_or_default(),
+            row_id: next_field_row_id(),
+            original: Some(entry.clone()),
+        }
+    }
+
+    /// A blank row, for [`WEBSITE_ADD_BUTTON`].
+    fn new() -> Self {
+        Self { uri: String::new(), row_id: next_field_row_id(), original: None }
+    }
+
+    /// This row's widget identity. See [`Self::row_id`].
+    fn row_id(&self) -> u64 {
+        self.row_id
+    }
+
+    /// Whether this row is written at all.
+    ///
+    /// **A row the user added and left blank is not a website**, and keeping
+    /// one would put a `{}` element on the item and an empty box back on the
+    /// form for ever. A row that ARRIVED blank is kept, because its `other`
+    /// map may carry keys this build cannot see and dropping the element
+    /// would drop them -- which is the whole reason [`Self::original`] exists.
+    /// [`WEBSITE_REMOVE_BUTTON`], not the backspace key, is how a website
+    /// goes away.
+    fn survives(&self) -> bool {
+        !self.uri.trim().is_empty() || self.original.is_some()
+    }
+
+    /// This row as a wire entry: the box's contents over whatever else the
+    /// entry arrived carrying.
+    ///
+    /// `uri` goes through [`edited`] rather than being written
+    /// unconditionally, for that function's own reason -- a box emptied to
+    /// nothing means the key is absent, not that it is `""`, unless `""` is
+    /// what arrived -- so an untouched save is byte for byte what was read.
+    fn to_entry(&self) -> UriEntry {
+        let original = self.original.as_ref();
+        UriEntry {
+            uri: edited(original.and_then(|e| e.uri.as_deref()), &self.uri),
+            other: original.map(|e| e.other.clone()).unwrap_or_default(),
+        }
+    }
 }
 
 /// What this form may do with one element of [`VaultItem::fields`].
@@ -1024,6 +1115,28 @@ pub struct EditDraft {
     /// [`Self::reveal_password`]; the same rule applies, including that a
     /// freshly opened form never starts revealed.
     pub reveal_totp: bool,
+    /// The login's websites -- `login.uris`, **all of them, in the item's own
+    /// order**, one [`UriDraft`] each.
+    ///
+    /// A `Vec` and not a single `String`, because `uris` is a JSON array and
+    /// Bitwarden lets one login carry several: an account reached at
+    /// `example.com`, `login.example.com` and `example.co.uk` is one item
+    /// with three entries, and a form that modelled the first would silently
+    /// discard the rest on every save. Before this field existed, nothing
+    /// here modelled *any* of them and the whole array rode `apply_to`'s
+    /// clone untouched -- which is why it round-tripped and why the form the
+    /// owner was looking at showed no website at all.
+    ///
+    /// **Order is load-bearing**, for a sharper reason than the custom
+    /// fields' order is: `favicon::icon_domain_for` and the read pane's
+    /// AUTOFILL TARGETS card both read `uris.first()`, so the first element
+    /// is the one the rest of this app *acts* on. The block says so
+    /// ([`WEBSITE_FIRST_NOTE`]); nothing here sorts, filters or partitions.
+    ///
+    /// Populated for every kind by [`Self::from_item`] and written back only
+    /// for [`ItemKind::Login`], exactly as [`Self::username`] is -- no other
+    /// kind has a `login` object for the entries to have come from.
+    pub uris: Vec<UriDraft>,
     pub card: CardDraft,
     pub identity: IdentityDraft,
     pub ssh_key: SshKeyDraft,
@@ -1411,6 +1524,7 @@ impl Default for EditDraft {
             reveal_password: false,
             totp: String::new(),
             reveal_totp: false,
+            uris: Vec::new(),
             card: CardDraft::default(),
             identity: IdentityDraft::default(),
             ssh_key: SshKeyDraft::default(),
@@ -1530,6 +1644,10 @@ impl EditDraft {
             reveal_password: false,
             totp: drafted(login.and_then(|l| l.totp.as_deref()).map(|t| t.as_str())),
             reveal_totp: false,
+            // One walk, in the item's order, keeping every entry -- including
+            // an entry with no `uri` at all, whose `other` map is the only
+            // thing left of it. See [`Self::uris`] and [`UriDraft::survives`].
+            uris: login.map(|l| l.uris.iter().map(UriDraft::from_entry).collect()).unwrap_or_default(),
             card: {
                 let brand = drafted(card.and_then(|c| c.brand.as_deref()));
                 CardDraft {
@@ -1678,6 +1796,11 @@ impl EditDraft {
         self.reveal_password = false;
         self.totp = String::new();
         self.reveal_totp = false;
+        // Kind-specific, and cleared with the rest of the login's half: a
+        // `uris` array belongs to a `login` object, and carrying one into a
+        // card is how the abandoned kind's data reaches the wire under the
+        // chosen one.
+        self.uris = Vec::new();
         self.card = CardDraft::default();
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
@@ -1896,6 +2019,13 @@ impl EditDraft {
             reveal_password: _,
             totp,
             reveal_totp: _,
+            // Content. Adding, editing or removing a website is an edit, and
+            // a Cancel that did not ask about one would lose it in silence.
+            // Digested below as the strings the user can type plus the row
+            // COUNT: `row_id` is a widget salt nobody types and `original` is
+            // what arrived, and neither can move without a row being added or
+            // removed -- which the count says.
+            uris,
             card,
             identity,
             ssh_key,
@@ -1976,6 +2106,13 @@ impl EditDraft {
         for field in fields {
             let _ = write!(sketch, "{}\u{0}{}\u{0}{:?}\u{0}", field.name, field.value, field.role);
         }
+        // The count first, so a form that has had a blank row added to it is
+        // dirty even though the strings it writes are unchanged -- an empty
+        // row IS something the user would lose to a silent Cancel.
+        let _ = write!(sketch, "uris\u{0}{}\u{0}", uris.len());
+        for entry in uris {
+            let _ = write!(sketch, "{}\u{0}", entry.uri);
+        }
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         sketch.hash(&mut hasher);
@@ -2050,8 +2187,9 @@ impl EditDraft {
     }
 
     /// Applies this draft onto a clone of `item`, preserving every field the
-    /// draft doesn't know about (id, favorite, type, fields, TOTP, uris,
-    /// `sshKey`, and everything riding the `#[serde(flatten)] other`
+    /// draft doesn't know about (id, favorite, type, `sshKey`, the
+    /// `revisionDate` and friends, the unmodelled halves of a custom field
+    /// and of a URI entry, and everything riding the `#[serde(flatten)] other`
     /// catch-alls) via the same "clone then overwrite known fields" pattern
     /// `vault_bridge::with_app_match` already uses, so a save from this form
     /// can never silently drop data the design doesn't expose an editor for.
@@ -2095,6 +2233,24 @@ impl EditDraft {
                 // in both directions -- populated by `from_item`, written
                 // back here -- and never half of the pair.
                 login.totp = edited_secret(login.totp.as_deref().map(|t| t.as_str()), &self.totp);
+                // The websites. **One walk, in the draft's own order**, for
+                // the reason [`Self::uris`] gives: `uris` is a JSON array
+                // whose first element the icon loader and the read pane both
+                // act on, so nothing here sorts, filters by content or
+                // partitions. The one thing dropped is a row the user added
+                // and left blank -- see [`UriDraft::survives`], which is also
+                // what keeps a row that ARRIVED blank, and its unmodelled
+                // keys, on the item.
+                //
+                // Written unconditionally rather than only when non-empty:
+                // removing the last website is a real edit, and a `.is_empty()`
+                // guard here would make it the one edit this form could not
+                // make. (`LoginData::uris` is
+                // `skip_serializing_if = "Vec::is_empty"`, so an emptied list
+                // goes out as an absent key, which is what a login with no
+                // websites looks like.)
+                login.uris =
+                    self.uris.iter().filter(|u| u.survives()).map(UriDraft::to_entry).collect();
                 updated.login = Some(login);
             }
             ItemKind::Card => {
@@ -2552,6 +2708,62 @@ pub const TOTP_HINT: &str =
 /// it needs a `vault_bridge` change.
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
 
+/// The label above the login's first website box.
+///
+/// **The read pane's word for the same thing**, and not a new one: the
+/// AUTOFILL TARGETS card labels its row `copy_shortcut_label(CopyShortcut::Url)`,
+/// which is `"Website"`. `the_edit_form_and_the_read_pane_call_a_website_the_same_thing`
+/// holds the two together rather than trusting this comment.
+pub const WEBSITE_LABEL: &str = "Website";
+
+/// The label above the second and subsequent website boxes: `"Website 2"`,
+/// `"Website 3"`, ...
+///
+/// A function and not a `format!` at the call site, because the numbering is
+/// what says *which* box the read pane and the icon loader act on -- see
+/// [`WEBSITE_FIRST_NOTE`] -- and a second spelling of it is a second thing
+/// that can start counting from zero.
+pub fn website_label(index: usize) -> String {
+    if index == 0 { WEBSITE_LABEL.to_string() } else { format!("{WEBSITE_LABEL} {}", index + 1) }
+}
+
+/// The note under a login's websites, drawn only when there is more than one.
+///
+/// It is a statement of fact about this build, not advice:
+/// `favicon::icon_domain_for` and the read pane's AUTOFILL TARGETS card both
+/// read `login.uris.first()`. Drawn only when it can matter, because a
+/// sentence about "the first" over a single box is noise.
+pub const WEBSITE_FIRST_NOTE: &str =
+    "The first one is what this item's page shows and where its icon comes from.";
+
+/// The note under the websites block, in every state.
+///
+/// See [`UriDraft`] for why the per-URI match type has no editor here. Said
+/// on screen rather than left to be discovered, because "my match setting
+/// vanished" and "my match setting is untouched" look identical from a form
+/// that says nothing.
+pub const WEBSITE_MATCH_NOTE: &str =
+    "Match detection set in other Bitwarden apps is kept exactly as it is.";
+
+/// The button that appends a blank website row.
+pub const WEBSITE_ADD_BUTTON: &str = "Add a website\u{2026}";
+
+/// The button that takes one website row away.
+///
+/// A button and not "clear the box and it goes": clearing a row that ARRIVED
+/// leaves its unmodelled keys in place on purpose (see
+/// [`UriDraft::survives`]), so emptying the box is not the same gesture as
+/// removing the entry and must not look like it.
+pub const WEBSITE_REMOVE_BUTTON: &str = "Remove website";
+
+/// What the websites block says instead of boxes on a CREATE.
+///
+/// `vault_bridge::NewItem::Login` carries no `uris` -- the same shape as the
+/// TOTP seed and the card's two namespaced fields, and the same treatment for
+/// the same reason: a live box whose contents Save discards is worse than a
+/// greyed one that says when it will work. See [`TOTP_CREATE_NOTICE`].
+pub const WEBSITE_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+
 /// What the brand dropdown shows when the card has no brand at all.
 ///
 /// Not an empty combo box: a control whose closed state is blank reads as one
@@ -2658,6 +2870,77 @@ pub const FIELDS_CREATE_NOTICE: &str =
 
 /// The custom-fields block. Returns nothing: every effect it has is on
 /// `fields`, which it owns for the duration of the call.
+/// The login's websites: one box per `login.uris` entry, a Remove beside each
+/// and an Add under them.
+///
+/// **The gap this closes.** Until it existed nothing in this form edited
+/// `uris` at all -- the array rode `apply_to`'s clone untouched, which is why
+/// it round-tripped perfectly and why the owner opened an item with a website
+/// on it and found no website on the form. A read pane that shows a Website
+/// row over an edit form that has none is a form that cannot fix what the
+/// pane displays.
+///
+/// **A list, not a box.** `uris` is a JSON array and one login legitimately
+/// carries several; see [`EditDraft::uris`] for why the order matters and
+/// [`UriDraft`] for what happens to the half of an entry this form does not
+/// model.
+///
+/// Withheld on a CREATE, with a notice saying when it works -- see
+/// [`WEBSITE_CREATE_NOTICE`].
+fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
+    if creating {
+        theme::disabled_field_label(ui, WEBSITE_LABEL);
+        theme::disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
+        ui.add_space(10.0);
+        return;
+    }
+
+    // Collected, not removed inside the loop, and the row's `id_salt` is its
+    // [`UriDraft::row_id`] and not `i` -- both for the reasons
+    // `custom_fields_block` spells out at length: deferring protects the
+    // iterator and says nothing about the next frame, and it is the explicit
+    // id that stops each row below a removed one inheriting its predecessor's
+    // caret and undo buffer.
+    let mut remove: Option<usize> = None;
+    for (i, entry) in uris.iter_mut().enumerate() {
+        ui.scope_builder(
+            egui::UiBuilder::new().id(egui::Id::new(("login-uri", entry.row_id()))),
+            |ui| {
+                theme::field_label(ui, &website_label(i));
+                theme::text_field(ui, &mut entry.uri, false);
+                ui.add_space(4.0);
+                if theme::secondary_button(ui, WEBSITE_REMOVE_BUTTON).clicked() {
+                    remove = Some(i);
+                }
+            },
+        );
+        ui.add_space(10.0);
+    }
+    if let Some(i) = remove {
+        uris.remove(i);
+    }
+
+    // Only when there IS a second one. Over a single box the sentence is
+    // noise; over three it is the only thing on screen that says which box
+    // the rest of the app acts on.
+    if uris.len() > 1 {
+        ui.label(RichText::new(WEBSITE_FIRST_NOTE).size(11.0).color(theme::TEXT_FAINT));
+        ui.add_space(6.0);
+    }
+    // **Wrapped, not `horizontal`.** Same reason as the custom-fields and
+    // generator rows above: an unwrapped row does not shrink to fit, it
+    // pushes the card past the pane and inflates every `available_width()`
+    // measured after it.
+    ui.horizontal_wrapped(|ui| {
+        if theme::secondary_button(ui, WEBSITE_ADD_BUTTON).clicked() {
+            uris.push(UriDraft::new());
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(11.0).color(theme::TEXT_FAINT));
+    ui.add_space(10.0);
+}
+
 fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating: bool) {
     theme::hairline(ui);
     ui.add_space(10.0);
@@ -4888,6 +5171,12 @@ pub fn draw_detail_edit(
                     ui.add_space(4.0);
                     ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
                     ui.add_space(10.0);
+
+                    // Last of the login's own rows, matching the order
+                    // Bitwarden's own clients use (credentials, then the
+                    // one-time code, then where they are used) and the order
+                    // the read pane puts them in.
+                    websites_block(ui, &mut draft.uris, creating);
                 }
                 FormBody::Card => {
                     let card = &mut draft.card;
@@ -5285,7 +5574,15 @@ mod tests {
                 username: Some("a@b.com".into()),
                 password: Some("p".to_string().into()),
                 totp: Some("SEED".to_string().into()),
-                uris: vec![UriEntry { uri: Some("https://ledgerline.example".into()), other: serde_json::Map::new() }],
+                // **`other` carries a real match type, not an empty map.**
+                // The form has an editor for `uri` and none for `match`, and
+                // an entry with nothing in its catch-all cannot show that
+                // the catch-all was preserved -- the same objection
+                // `LOGIN_WITH_EXTRAS`'s doc raises about empty ones.
+                uris: vec![UriEntry {
+                    uri: Some("https://ledgerline.example".into()),
+                    other: serde_json::from_str(r#"{"match":2}"#).expect("valid object"),
+                }],
                 other: login_other,
             }),
             card: None,
@@ -6003,9 +6300,25 @@ mod tests {
         assert_eq!(
             login.uris.len(),
             1,
-            "login.uris must survive an edit the form doesn't expose a URI editor for"
+            "login.uris must survive an edit that did not touch them"
         );
         assert_eq!(login.uris[0].uri.as_deref(), Some("https://ledgerline.example"));
+        // **The half of the entry the form has no editor for.** This used to
+        // be free -- the whole array rode the clone, because nothing modelled
+        // it. It is not free any more: the draft now rebuilds every entry
+        // through `UriDraft::to_entry`, so `match` survives only because that
+        // function writes the original's `other` map back. See [`UriDraft`].
+        // A REAL match type, `2` (starts-with), and not the `null` this
+        // fixture used to carry: serde's flatten does not collect a null into
+        // the catch-all map at all, so `"match":null` deserialises to nothing
+        // and an entry carrying it cannot show that anything was preserved --
+        // the same "an item with nothing to lose" objection this fixture's
+        // own doc raises about empty catch-alls.
+        assert_eq!(
+            login.uris[0].other.get("match"),
+            Some(&serde_json::json!(2)),
+            "the per-URI match type must survive the form gaining a URI editor"
+        );
         assert_eq!(
             login.other.get("fido2Credentials"),
             Some(&serde_json::json!(["cred-1"])),
@@ -6036,7 +6349,7 @@ mod tests {
         "fields":[{"name":"deskwarden:app-match","value":"exe:code.exe","type":0,"linkedId":null}],
         "login":{"username":"a@b.com","password":"p","totp":"SEED",
                  "passwordRevisionDate":null,"fido2Credentials":[],
-                 "uris":[{"uri":"https://ledgerline.example","match":null}]}
+                 "uris":[{"uri":"https://ledgerline.example","match":2}]}
     }"#;
 
     const CARD_WITH_EXTRAS: &str = r#"{
@@ -9471,7 +9784,13 @@ mod sequence_builder_tests {
     /// not a claim about the app: the form scrolls, and what the app can
     /// really be resized to is asserted against `MIN_PANE_WIDTH` below and in
     /// `edit_pane_layout_tests`.
-    const PANE: Vec2 = egui::vec2(560.0, 1700.0);
+    /// Raised from 1700 when the login body gained its websites block: the
+    /// builder's own controls went below the fold, egui culled them, and four
+    /// tests here reported "found 0" for a control that was drawn. That is
+    /// the harness measuring itself, not the form -- these tests are about
+    /// the builder's wiring, and the height it needs is whatever the form
+    /// above it happens to be.
+    const PANE: Vec2 = egui::vec2(560.0, 1900.0);
 
     /// The narrowest the detail pane can be -- the same derivation, and the
     /// same reason, as `edit_pane_layout_tests`'s.
@@ -13750,6 +14069,277 @@ mod edit_pane_layout_tests {
         }
     }
 
+    /// A saved login carrying `uris` websites, each one distinguishable from
+    /// the others by what it says.
+    fn login_with_websites(count: usize) -> VaultItem {
+        let uris: Vec<String> =
+            (0..count).map(|i| format!(r#"{{"uri":"https://site{i}.example","match":{i}}}"#)).collect();
+        serde_json::from_str(&format!(
+            r#"{{"object":"item","id":"web-l","name":"Ledgerline","type":1,"fields":[],
+                 "login":{{"username":"a@b.com","uris":[{}]}}}}"#,
+            uris.join(",")
+        ))
+        .expect("the fixture is valid item JSON")
+    }
+
+    /// **Every website the login carries is drawn, labelled and reachable at
+    /// the app's minimum window WIDTH.**
+    ///
+    /// The owner's report was that the edit form showed no website at all.
+    /// The failure mode this guards on the way back is the opposite one: a
+    /// block that draws every entry but pushes the card past the pane, which
+    /// is `aae9429`'s defect and is what every wrapped row in this form
+    /// exists to avoid.
+    ///
+    /// Three websites, because a block that drew `uris.first()` -- the thing
+    /// every OTHER reader in this crate does -- would pass a one-entry test,
+    /// and a block that drew the first and the last would pass a two.
+    #[test]
+    fn every_website_is_drawn_and_reachable_at_the_apps_minimum_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(3);
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(draft.uris.len(), 3, "the fixture did not reach the draft");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let mut checked = 0;
+        for i in 0..3 {
+            checked += 1;
+            let label = website_label(i);
+            assert_inside(&format!("the {label:?} label"), &label, pane, &painted);
+            let value = format!("https://site{i}.example");
+            assert_inside(&format!("the {label:?} box"), &value, pane, &painted);
+        }
+        assert_eq!(checked, 3, "the website loop asserted about nothing");
+
+        // Three boxes, three removes -- a block that drew one Remove for the
+        // whole list would leave two of the three entries undeletable.
+        let removes = painted.rects_of(WEBSITE_REMOVE_BUTTON);
+        assert_eq!(
+            removes.len(),
+            3,
+            "three websites drew {} remove controls; painted: {:?}",
+            removes.len(),
+            painted.strings()
+        );
+        for rect in &removes {
+            assert!(
+                within_pane(*rect, pane),
+                "a {WEBSITE_REMOVE_BUTTON:?} is painted at x = {}..{} on a {}pt-wide pane",
+                rect.left(),
+                rect.right(),
+                pane.x
+            );
+        }
+        assert_inside("the add-a-website button", WEBSITE_ADD_BUTTON, pane, &painted);
+        assert_inside("the match-type note", WEBSITE_MATCH_NOTE, pane, &painted);
+    }
+
+    /// **...and every one of them is reachable at the minimum window
+    /// HEIGHT**, which is a different claim: the width test draws all three
+    /// on an uncullable pane, and a form whose third website sat below the
+    /// last scroll position would satisfy it and still be uneditable.
+    #[test]
+    fn every_website_is_reachable_at_the_apps_minimum_height() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(4);
+        let mut draft = EditDraft::from_item(&item);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let unscrolled = frame(&ctx, pane, &mut draft, false, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        assert!(
+            !unscrolled
+                .rects_of("https://site3.example")
+                .iter()
+                .any(|r| bounds.contains_rect(*r)),
+            "the four-website form already fits a {}x{} pane, so this test is not exercising \
+             scrolling at all",
+            pane.x,
+            pane.y
+        );
+
+        let mut reached = 0;
+        for i in 0..4 {
+            let value = format!("https://site{i}.example");
+            let after = scroll_to_reveal(&ctx, pane, &mut draft, &value);
+            assert_inside(&format!("website {i}'s box"), &value, pane, &after);
+            reached += 1;
+        }
+        assert_eq!(reached, 4, "the website walk reached {reached} rows, not 4");
+        // The Add sits below the last box, so it is the control a form that
+        // merely *drew* four rows would leave out of reach.
+        let after = scroll_to_reveal(&ctx, pane, &mut draft, WEBSITE_ADD_BUTTON);
+        assert_inside("the add-a-website button", WEBSITE_ADD_BUTTON, pane, &after);
+    }
+
+    /// **The website controls are wired to the draft, not merely painted.**
+    ///
+    /// `9dcee36`'s defect class: a control drawn and connected to nothing
+    /// passes every presence and in-pane assertion above. Both directions in
+    /// one test, because an Add that works over a Remove that does not leaves
+    /// a user who mis-clicked stuck with a row.
+    ///
+    /// The MIDDLE row is removed, which is the only index a removal that
+    /// always takes the first or the last cannot get right by accident.
+    #[test]
+    fn clicking_add_a_website_appends_a_row_and_remove_takes_the_row_it_is_on() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(3);
+        let mut draft = EditDraft::from_item(&item);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let at = painted.rect_of(WEBSITE_ADD_BUTTON).center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+        assert_eq!(
+            draft.uris.len(),
+            4,
+            "clicking {WEBSITE_ADD_BUTTON:?} did not reach the draft -- the control is \
+             painted and connected to nothing"
+        );
+        assert!(
+            draft.uris[3].uri.is_empty(),
+            "the added row arrived carrying something nobody typed"
+        );
+
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let removes = painted.rects_of(WEBSITE_REMOVE_BUTTON);
+        assert_eq!(removes.len(), 4, "four rows must draw four removes");
+        let _ = frame(&ctx, pane, &mut draft, false, &click(removes[1].center()));
+
+        let left: Vec<&str> = draft.uris.iter().map(|u| u.uri.as_str()).collect();
+        assert_eq!(
+            left,
+            vec!["https://site0.example", "https://site2.example", ""],
+            "the wrong website row was removed"
+        );
+    }
+
+    /// **A removal does not hand the rows below it the removed row's widget
+    /// state.**
+    ///
+    /// The same defect `removing_a_field_row_leaves_the_rows_below_it_holding_their_own_state`
+    /// records for custom fields, asked of the block that copied its idiom:
+    /// a row salted by its INDEX gives every row below a removed one its
+    /// predecessor's id, and with it that box's caret, selection and undo
+    /// buffer. See [`UriDraft::row_id`].
+    ///
+    /// Stated as focus, the cheapest visible consequence of a widget's
+    /// identity: put the caret in the LAST box, take the FIRST row away, and
+    /// the caret is still in the same box.
+    ///
+    /// The premise is measured on the ids egui was handed rather than on
+    /// `row_id`, because a block that gave every row ONE shared id -- no
+    /// identity at all -- leaves the comparison below trivially green.
+    #[test]
+    fn removing_a_website_row_leaves_the_rows_below_it_holding_their_own_state() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(3);
+        let mut draft = EditDraft::from_item(&item);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        // The three ids egui really gave the three boxes, read back by
+        // focusing each in turn.
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let at = painted.rect_of(&format!("https://site{i}.example")).center();
+            let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+            ids.push(ctx.memory(|m| m.focused()).expect("clicking a text box focuses it"));
+        }
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "the three website boxes share ids, so the comparison below cannot fail: {ids:?}"
+        );
+
+        // Caret in the LAST box, then the FIRST row taken away directly --
+        // a click is itself an interaction with the focus system and would
+        // leave the reading ambiguous. The click path is pinned above.
+        let at = painted.rect_of("https://site2.example").center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(ids[2]));
+        draft.uris.remove(0);
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(ids[2]),
+            "removing the first website moved the caret out of the last one's box -- the rows \
+             are salted by their position"
+        );
+    }
+
+    /// **The "first one counts" note appears exactly when it can matter.**
+    ///
+    /// It is a statement about `uris.first()`, which the icon loader and the
+    /// read pane both act on. Over a single box it is noise; over three it is
+    /// the only thing on screen that says which box the rest of the app
+    /// reads. A note drawn always, or never, is one of the two halves.
+    #[test]
+    fn the_first_website_note_shows_only_when_there_is_more_than_one() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut cases = 0;
+        for (count, expected) in [(0usize, false), (1, false), (2, true), (3, true)] {
+            cases += 1;
+            let ctx = styled_context(pane);
+            let item = login_with_websites(count);
+            let mut draft = EditDraft::from_item(&item);
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            assert_eq!(
+                painted.strings().contains(&WEBSITE_FIRST_NOTE),
+                expected,
+                "with {count} website(s) the note's presence is wrong; painted: {:?}",
+                painted.strings()
+            );
+            // The block really was drawn in every one of the four states, so
+            // an absence above is about the note and not about the block.
+            assert!(
+                painted.strings().contains(&WEBSITE_ADD_BUTTON),
+                "the websites block is not on screen at all with {count} website(s)"
+            );
+        }
+        assert_eq!(cases, 4, "the count loop asserted about nothing");
+    }
+
+    /// **A CREATE says when a website can be added instead of taking one it
+    /// would drop.**
+    ///
+    /// `vault_bridge::NewItem::Login` carries no `uris`, so a live box here
+    /// would be a box whose contents Save discards -- the same shape as the
+    /// TOTP seed and the card's two namespaced fields, and the same
+    /// treatment. A block that simply vanished on a create would pass an
+    /// absence check and tell the user nothing.
+    #[test]
+    fn a_create_form_says_a_website_can_be_added_once_the_item_exists() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+        let strings = painted.strings();
+
+        assert_inside("the websites label", WEBSITE_LABEL, pane, &painted);
+        assert!(
+            strings.contains(&WEBSITE_CREATE_NOTICE),
+            "the create form withholds the website boxes and says nothing about why: {strings:?}"
+        );
+        assert!(
+            !strings.contains(&WEBSITE_ADD_BUTTON),
+            "the create form offers an Add whose contents Save would discard"
+        );
+        assert!(draft.uris.is_empty(), "a create form put a website row on the draft");
+    }
+
     /// **The controls on the two assertions above.**
     ///
     /// Both are loops over what a frame happened to paint, and a loop over an
@@ -14492,5 +15082,326 @@ mod card_custom_field_tests {
         let mut zip = EditDraft::from_item(&item);
         zip.card.billing_zip.push('X');
         assert!(zip.is_dirty(), "editing the billing postcode did not register as a change");
+    }
+}
+
+/// **The login's websites**: how they are read, how they are written, and what
+/// happens to the half of a URI entry this form has no editor for.
+///
+/// The gap these close is recorded in [`websites_block`]: until it existed
+/// nothing in this form touched `login.uris` at all, so the array round-tripped
+/// perfectly and the owner opened an item with a website on it and found no
+/// website on the form.
+#[cfg(test)]
+mod website_tests {
+    use super::*;
+
+    /// A login carrying three websites, each with a DIFFERENT unmodelled
+    /// `match` value, plus a fourth key no build has ever seen.
+    ///
+    /// Built from JSON rather than struct literals, so the extra keys are
+    /// really on the fixture -- an entry with nothing to lose cannot show
+    /// that nothing was lost, which is the point
+    /// `card_custom_field_tests::field` makes about custom fields.
+    ///
+    /// Three and not two: a walk that keeps the first and the last, or that
+    /// reverses, is green on two.
+    fn login_with_three_websites() -> VaultItem {
+        serde_json::from_str(
+            r#"{
+                "object":"item","id":"web-1","name":"Ledgerline","type":1,"favorite":false,
+                "fields":[],
+                "login":{"username":"a@b.com","password":"p",
+                         "uris":[
+                           {"uri":"https://ledgerline.example","match":0},
+                           {"uri":"https://login.ledgerline.example","match":3},
+                           {"uri":"androidapp://com.ledgerline","match":null,"neverSeen":{"x":1}}
+                         ]}
+            }"#,
+        )
+        .expect("the fixture is valid item JSON")
+    }
+
+    /// The uris of `item` as `(uri, match)` pairs.
+    fn seen(item: &VaultItem) -> Vec<(Option<String>, Option<serde_json::Value>)> {
+        item.login
+            .as_ref()
+            .expect("a login")
+            .uris
+            .iter()
+            .map(|u| (u.uri.clone(), u.other.get("match").cloned()))
+            .collect()
+    }
+
+    /// **The form reads every website, in order.**
+    ///
+    /// The first half of the owner's report: "website is missing on edit
+    /// screen even though it is not empty". A draft that read only
+    /// `uris.first()` -- which is what every other reader in this crate does
+    /// -- would pass a test that asked about one.
+    #[test]
+    fn the_draft_reads_every_website_the_login_carries_in_order() {
+        let draft = EditDraft::from_item(&login_with_three_websites());
+        let read: Vec<&str> = draft.uris.iter().map(|u| u.uri.as_str()).collect();
+        assert_eq!(
+            read,
+            vec![
+                "https://ledgerline.example",
+                "https://login.ledgerline.example",
+                "androidapp://com.ledgerline"
+            ]
+        );
+    }
+
+    /// **Several websites survive a round trip with their unmodelled keys
+    /// intact.**
+    ///
+    /// This is the guarantee `EditDraft::apply_to`'s doc makes, asked of the
+    /// one part of the item that has just stopped riding the clone. It is no
+    /// longer free: every entry is rebuilt by `UriDraft::to_entry`, so
+    /// `match` -- and `neverSeen`, which no build models at all -- survive
+    /// only because that function writes the original's `other` map back.
+    #[test]
+    fn several_websites_survive_a_round_trip_with_their_unmodelled_keys() {
+        let item = login_with_three_websites();
+        let before = seen(&item);
+        assert_eq!(before.len(), 3, "the fixture is not carrying three websites");
+        assert!(
+            before.iter().any(|(_, m)| m == &Some(serde_json::json!(3))),
+            "the fixture carries no non-default match type, so preserving one proves nothing"
+        );
+
+        let draft = EditDraft::from_item(&item);
+        let updated = draft.apply_to(&item);
+
+        assert_eq!(seen(&updated), before, "a save nobody edited changed the websites");
+        assert_eq!(
+            updated.login.as_ref().unwrap().uris[2].other.get("neverSeen"),
+            Some(&serde_json::json!({"x": 1})),
+            "a key no build models was dropped by the form gaining a URI editor"
+        );
+    }
+
+    /// **An untouched save is byte for byte what was read, uris included.**
+    ///
+    /// Asked of the SERIALISED item rather than of the struct, because that
+    /// is what goes on the wire: a rebuilt entry that wrote `"uri": null`
+    /// where the item had no such key is invisible to a field-by-field
+    /// comparison and is a diff on every save.
+    #[test]
+    fn an_untouched_save_writes_the_same_uri_json_that_was_read() {
+        let item = login_with_three_websites();
+        let before = serde_json::to_value(&item).expect("serialises");
+        let after =
+            serde_json::to_value(EditDraft::from_item(&item).apply_to(&item)).expect("serialises");
+        assert_eq!(after["login"]["uris"], before["login"]["uris"]);
+    }
+
+    /// **Editing one website changes that one and no other.**
+    #[test]
+    fn editing_one_website_leaves_the_others_alone() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        draft.uris[1].uri = "https://sso.ledgerline.example".to_string();
+        let updated = draft.apply_to(&item);
+
+        let uris: Vec<Option<String>> = seen(&updated).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(
+            uris,
+            vec![
+                Some("https://ledgerline.example".to_string()),
+                Some("https://sso.ledgerline.example".to_string()),
+                Some("androidapp://com.ledgerline".to_string()),
+            ]
+        );
+        // ...and the edited row kept ITS match type, which is the half a
+        // rebuild that started from a fresh `UriEntry` would lose.
+        assert_eq!(seen(&updated)[1].1, Some(serde_json::json!(3)));
+    }
+
+    /// **A website added on the form lands on the item, at the end.**
+    #[test]
+    fn an_added_website_lands_on_the_item_after_the_ones_already_there() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        draft.uris.push(UriDraft::new());
+        draft.uris.last_mut().expect("just pushed").uri = "https://new.example".to_string();
+        let updated = draft.apply_to(&item);
+
+        let uris: Vec<Option<String>> = seen(&updated).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(uris.len(), 4);
+        assert_eq!(uris[3], Some("https://new.example".to_string()));
+        // A row this form created has no `match` to write, and inventing one
+        // would be this form choosing a match strategy on the user's behalf.
+        assert_eq!(seen(&updated)[3].1, None);
+    }
+
+    /// **A website removed on the form comes off the item.**
+    ///
+    /// The middle one, which is the only index a removal that always takes
+    /// the first or the last cannot get right by accident.
+    #[test]
+    fn a_removed_website_comes_off_the_item() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        draft.uris.remove(1);
+        let updated = draft.apply_to(&item);
+
+        let uris: Vec<Option<String>> = seen(&updated).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(
+            uris,
+            vec![
+                Some("https://ledgerline.example".to_string()),
+                Some("androidapp://com.ledgerline".to_string()),
+            ]
+        );
+    }
+
+    /// **Removing the last website really empties the list.**
+    ///
+    /// The case an `if !uris.is_empty()` guard in `apply_to` would silently
+    /// refuse -- a login whose only website the user deleted would keep it,
+    /// on a save that reported success.
+    #[test]
+    fn removing_every_website_leaves_the_login_with_none() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        draft.uris.clear();
+        let updated = draft.apply_to(&item);
+        assert!(updated.login.as_ref().expect("a login").uris.is_empty());
+        // ...and it goes out as an ABSENT key, not as `"uris": []`, because
+        // `LoginData::uris` skips an empty vec. That is what a login with no
+        // websites looks like on the wire.
+        let json = serde_json::to_value(&updated).expect("serialises");
+        assert!(
+            json["login"].get("uris").is_none(),
+            "an emptied website list should be an absent key, not an empty array: {}",
+            json["login"]
+        );
+    }
+
+    /// **A website row added and left blank does not land on the item.**
+    ///
+    /// The rule this form applies to every revealed-and-empty field: an empty
+    /// box is not a value, and writing one would put a `{}` element on the
+    /// item and an empty row back on the form for ever. Whitespace counts as
+    /// blank -- see [`UriDraft::survives`].
+    #[test]
+    fn a_website_row_left_blank_does_not_land_on_the_item() {
+        let item = login_with_three_websites();
+        for typed in ["", "   ", "\t\n"] {
+            let mut draft = EditDraft::from_item(&item);
+            draft.uris.push(UriDraft::new());
+            draft.uris.last_mut().expect("just pushed").uri = typed.to_string();
+            let updated = draft.apply_to(&item);
+            assert_eq!(
+                updated.login.as_ref().expect("a login").uris.len(),
+                3,
+                "a row holding {typed:?} was written to the item"
+            );
+        }
+    }
+
+    /// **...and a row that ARRIVED blank keeps its unmodelled keys.**
+    ///
+    /// The other half of [`UriDraft::survives`], and the reason "blank means
+    /// gone" is not the whole rule: an entry with no `uri` and a `match` on
+    /// it is still an entry, and dropping it to tidy up would be this form
+    /// deleting data it cannot see. [`WEBSITE_REMOVE_BUTTON`] is the gesture
+    /// that removes a website; the backspace key is not.
+    #[test]
+    fn a_website_entry_that_arrived_blank_keeps_its_unmodelled_keys() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"web-2","name":"Odd","type":1,"fields":[],
+                "login":{"uris":[{"match":4}]}}"#,
+        )
+        .expect("valid item JSON");
+        assert_eq!(seen(&item), vec![(None, Some(serde_json::json!(4)))]);
+
+        let draft = EditDraft::from_item(&item);
+        assert_eq!(draft.uris.len(), 1, "the form must show the row it is preserving");
+        assert_eq!(seen(&draft.apply_to(&item)), seen(&item));
+    }
+
+    /// **The websites belong to the login and to no other kind.**
+    ///
+    /// `apply_to` is gated on the kind, so a draft carried onto a card must
+    /// not write a `uris` array into it -- the same rule that stops a login's
+    /// username reaching a card, asked of the field that has just arrived.
+    #[test]
+    fn a_cards_save_writes_no_websites() {
+        let card: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"c1","name":"Visa","type":3,"fields":[],
+                "card":{"number":"4242424242424242"}}"#,
+        )
+        .expect("valid item JSON");
+        let mut draft = EditDraft::from_item(&card);
+        assert_eq!(draft.kind(), ItemKind::Card);
+        assert!(draft.uris.is_empty(), "a card's draft read websites off something");
+        draft.uris.push(UriDraft::new());
+        draft.uris[0].uri = "https://not-a-card.example".into();
+
+        let updated = draft.apply_to(&card);
+        assert!(updated.login.is_none(), "a card's save grew a login object");
+    }
+
+    /// **Switching the create form's type takes the websites with it.**
+    ///
+    /// `set_kind`'s standing rule: everything kind-specific is dropped,
+    /// because carrying it forward is how the abandoned kind's data reaches
+    /// the wire under the chosen one.
+    #[test]
+    fn changing_the_kind_clears_the_websites() {
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.uris.push(UriDraft::new());
+        draft.uris[0].uri = "https://example.test".into();
+        draft.set_kind(ItemKind::Card);
+        assert!(draft.uris.is_empty(), "a card draft is still carrying a login's websites");
+    }
+
+    /// **Every way of touching a website makes the draft dirty**, so a Cancel
+    /// asks before throwing one away.
+    #[test]
+    fn adding_editing_and_removing_a_website_all_register_as_changes() {
+        let item = login_with_three_websites();
+        assert!(!EditDraft::from_item(&item).is_dirty(), "the fixture opens dirty");
+
+        let mut added = EditDraft::from_item(&item);
+        added.uris.push(UriDraft::new());
+        assert!(added.is_dirty(), "adding a blank website row did not register as a change");
+
+        let mut edited = EditDraft::from_item(&item);
+        edited.uris[0].uri.push('/');
+        assert!(edited.is_dirty(), "editing a website did not register as a change");
+
+        let mut removed = EditDraft::from_item(&item);
+        removed.uris.remove(2);
+        assert!(removed.is_dirty(), "removing a website did not register as a change");
+    }
+
+    /// **The edit form and the read pane call a website the same thing.**
+    ///
+    /// Read off the read pane's own function rather than compared against a
+    /// second literal: the pane labels its AUTOFILL TARGETS row
+    /// `copy_shortcut_label(CopyShortcut::Url)`, and a form that called the
+    /// same field "URL" or "Address" would leave the user matching the two up
+    /// by position.
+    #[test]
+    fn the_edit_form_and_the_read_pane_call_a_website_the_same_thing() {
+        assert_eq!(WEBSITE_LABEL, detail::copy_shortcut_label(detail::CopyShortcut::Url));
+    }
+
+    /// **...and the numbering says which one the read pane is showing.**
+    ///
+    /// The pane and the icon loader both act on `uris.first()`, so the box
+    /// the form calls plain "Website" has to be index 0 and every other one
+    /// has to be visibly not it. A `website_label` that counted from 1, or
+    /// that numbered the first box too, would put the user's eye on the wrong
+    /// row.
+    #[test]
+    fn only_the_first_website_is_unnumbered() {
+        assert_eq!(website_label(0), WEBSITE_LABEL);
+        assert_eq!(website_label(1), "Website 2");
+        assert_eq!(website_label(2), "Website 3");
     }
 }

@@ -169,6 +169,16 @@ enum Surface {
     CardDetailRevealed,
     /// The edit form with the discard confirmation over it.
     DiscardConfirm,
+    /// **The edit form's websites block, with three of them on it.**
+    ///
+    /// A surface of its own because the block's whole shape is the thing a
+    /// list can get wrong and a one-entry shot cannot show: three numbered
+    /// labels, a Remove under each box, the "first one counts" note that only
+    /// appears once there IS more than one, and the Add under all of it. The
+    /// form had no URI editor at all until this block existed -- the owner
+    /// opened an item with a website on it and found no website on the form
+    /// -- so this is the picture of the gap being closed.
+    EditWebsites,
     /// The record composer -- the Send export form and its seed warning.
     RecordComposer,
     /// **Design 6c/6d**: the by-hand "add a one-time code" form, with a URI
@@ -467,6 +477,7 @@ const ALL: &[Surface] = &[
     Surface::CardDetail,
     Surface::CardDetailRevealed,
     Surface::DiscardConfirm,
+    Surface::EditWebsites,
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
@@ -526,6 +537,7 @@ impl Surface {
             Surface::CardDetail => "detail_card",
             Surface::CardDetailRevealed => "detail_card_revealed",
             Surface::DiscardConfirm => "edit_discard_confirm",
+            Surface::EditWebsites => "edit_websites",
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
@@ -624,6 +636,13 @@ impl Surface {
             | Surface::RecordComposer
             | Surface::TotpAddConfirm
             | Surface::TotpAddPicker => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            // Taller than the shipped pane on purpose. A login carrying three
+            // websites is a longer form than 740pt holds, and the shipped
+            // pane's answer -- scroll it -- is right for the app and useless
+            // for a screenshot: the block this surface exists to show would
+            // be below the fold in the PNG. The width is the real one, which
+            // is the axis a layout can get wrong.
+            Surface::EditWebsites => egui::vec2(PANE_WIDTH, 1180.0),
             Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
                 deskwarden::preflight_host::PREFLIGHT_WIDTH,
                 deskwarden::preflight_host::PREFLIGHT_HEIGHT,
@@ -1006,6 +1025,7 @@ impl eframe::App for Preview {
                 self.draw_pane(root, PaneKind::Detail(DetailShot::CardRevealed))
             }
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
+            Surface::EditWebsites => self.draw_pane(root, PaneKind::EditWebsites),
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
@@ -1094,6 +1114,8 @@ enum PaneKind {
     Detail(DetailShot),
     /// The edit form with its discard confirmation up.
     Discard,
+    /// The edit form of a login carrying several websites.
+    EditWebsites,
     /// The Send record composer.
     Composer,
     /// The "add a one-time code" form, mid-confirmation.
@@ -1895,6 +1917,21 @@ impl Preview {
                     // take the dialog away before the capture.
                     fixtures.draft.discard_prompt = true;
                 }
+                PaneKind::EditWebsites => {
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        &mut fixtures.websites_draft,
+                        &fixtures.folders,
+                        // An EDIT, not a create: `NewItem::Login` carries no
+                        // `uris`, so the create form draws the notice rather
+                        // than the boxes and this shot would be a picture of
+                        // one greyed line.
+                        false,
+                        &mut fixtures.apps,
+                        Some(&fixtures.websites_login),
+                        &TotpState::NoSecret,
+                    );
+                }
                 PaneKind::Composer => {
                     let _ = record_ui::draw_export_form(
                         ui,
@@ -1935,6 +1972,12 @@ struct Fixtures {
     apps: AppIdentityCache,
     breaches: BreachCache,
     draft: EditDraft,
+    /// The item behind [`Self::websites_draft`], kept because
+    /// `draw_detail_edit` takes the item as well as the draft.
+    websites_login: VaultItem,
+    /// A login carrying three websites, opened for editing -- see
+    /// [`Surface::EditWebsites`].
+    websites_draft: EditDraft,
     record: RecordDraft,
     totp_add: TotpAdd,
     totp_picker: TotpAdd,
@@ -1973,6 +2016,18 @@ impl Fixtures {
         // app does not reach.
         draft.password.push_str("-edited");
         draft.discard_prompt = true;
+        // The same account reached three ways, which is the ordinary shape of
+        // a multi-URI login and not a contrived one: the app, the SSO host it
+        // redirects to, and the Android package. Untouched, so the shot is of
+        // a form as it OPENS -- the state the owner's report was about.
+        let websites_login = item(WEBSITES_JSON);
+        let websites_draft = EditDraft::from_item(&websites_login);
+        assert_eq!(
+            websites_draft.uris.len(),
+            3,
+            "the websites shot is not showing a multi-website login, so it shows nothing the \
+             one-website shots do not"
+        );
         let totp = TotpState::Code { code: "418902".to_string(), seconds_left: 19 };
         // The seed's tick on, so the composer's seed warning -- the sentence
         // that decides whether that tick was a mistake -- is in the picture.
@@ -2032,6 +2087,8 @@ impl Fixtures {
             totp_add,
             totp_picker,
             draft,
+            websites_login,
+            websites_draft,
             login,
             card,
             list,
@@ -2174,6 +2231,27 @@ const LOGIN_JSON: &str = r#"{
     "uris": [{ "uri": "https://app.ledgerline.eu/signin" }]
   },
   "fields": [{ "name": "Employee ID", "value": "LL-40912", "type": 0 }]
+}"#;
+
+/// A login reached at three addresses, each entry carrying a `match` key this
+/// form has no editor for -- see `detail_edit::UriDraft`. The keys are on the
+/// fixture on purpose: a preview of a block that preserves nothing would look
+/// exactly like this one.
+const WEBSITES_JSON: &str = r#"{
+  "id": "6f1c2f5e-0000-4a10-9c31-2b7a51d0a003",
+  "type": 1,
+  "name": "Ledgerline",
+  "folderId": "f-work",
+  "login": {
+    "username": "a.novak@ledgerline.com",
+    "password": "correct-horse-battery-staple-7",
+    "uris": [
+      { "uri": "https://app.ledgerline.eu/signin", "match": 0 },
+      { "uri": "https://sso.ledgerline.eu", "match": 1 },
+      { "uri": "androidapp://eu.ledgerline.mobile", "match": null }
+    ]
+  },
+  "fields": []
 }"#;
 
 const CARD_JSON: &str = r#"{

@@ -10,6 +10,28 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Websites can be edited, and a login can have more than one
+
+The edit form had no box for an item's website. The item could have one --
+the item's page showed it, and its icon came from it -- but there was nowhere
+to change it, add one, or take one away. Editing anything else left it exactly
+as it was, which is why the gap was easy to miss.
+
+The form now shows every website the login carries, one box each, with a
+Remove beside it and an Add under them. Bitwarden lets one login list several
+addresses for the same account -- the app, the single-sign-on host it
+redirects to, the mobile package -- and all of them are shown and editable.
+When there is more than one, a line says which is the first: that is the one
+the item's page displays and the one its icon is fetched from.
+
+The per-website match-detection setting that Bitwarden's other apps offer is
+not shown here, because nothing in Deskwarden behaves differently according to
+it. Whatever those apps have set is kept exactly as it is through every save
+this form makes, and the block says so.
+
+A website can be added once an item exists; the "new item" form says so rather
+than offering a box whose contents it would have to throw away.
+
 ### "What is new" uses the whole page instead of a small box
 
 The release notes on **Preferences -> Updates** were shown in a box of a fixed
