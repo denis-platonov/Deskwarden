@@ -9,6 +9,7 @@
 //! Every colour and dimension comes from [`crate::theme`], the same module
 //! egui reads, so a theme change moves both renderers at once.
 
+use crate::app_candidates::Candidate;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, RoundRect, SelectObject, SetBkMode,
@@ -118,9 +119,114 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
     }
 }
 
+/// How many candidate rows to draw, and whether an overflow row is needed.
+///
+/// **A cap that hides candidates without saying so is the defect this project
+/// keeps finding.** When there are more candidates than fit, one slot is spent
+/// on a *Search vault* row so the truncation is visible; that is why the
+/// overflowing case shows `cap - 1` and not `cap`.
+pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
+    if total <= cap {
+        (total, false)
+    } else {
+        (cap.saturating_sub(1), true)
+    }
+}
+
+/// Whether a row is under the pointer, selected, both or neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowState {
+    pub selected: bool,
+    pub hovered: bool,
+}
+
+/// Paint one candidate row into `hdc`.
+///
+/// The background fills the entire `rect` -- edge to edge, including the icon
+/// gutter -- before any text is drawn, so hover and selection never hug just
+/// the text; that half-width highlight was reported as a defect on the vault
+/// window's menu and is not to be repeated here.
+///
+/// A square gutter the height of the row is left blank on the left for
+/// Task 5's icon; this function does not draw into it.
+///
+/// Every GDI object created here is restored and deleted before returning,
+/// matching [`draw_button`] -- this also runs in the daemon's repaint path.
+pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, name_font: HFONT, user_font: HFONT) {
+    unsafe {
+        let fill = if state.selected {
+            rgb(crate::theme::BLUE_WASH)
+        } else if state.hovered {
+            rgb(crate::theme::CARD_TINT)
+        } else {
+            rgb(crate::theme::CARD)
+        };
+        let brush = CreateSolidBrush(fill);
+        let old_brush = SelectObject(hdc, brush);
+        let pen = CreatePen(PS_SOLID, 1, fill);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 0, 0);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+
+        let gutter = rect.bottom - rect.top;
+        let text_left = rect.left + gutter;
+
+        SetBkMode(hdc, TRANSPARENT);
+
+        SetTextColor(hdc, rgb(crate::theme::INK));
+        let old_font = SelectObject(hdc, name_font);
+        let mut name_chars: Vec<u16> = candidate.name.encode_utf16().collect();
+        let mut name_rc = RECT {
+            left: text_left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.top + gutter / 2,
+        };
+        DrawTextW(hdc, &mut name_chars, &mut name_rc, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
+
+        SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+        let old_font = SelectObject(hdc, user_font);
+        let mut user_chars: Vec<u16> = candidate.username.encode_utf16().collect();
+        let mut user_rc = RECT {
+            left: text_left,
+            top: rect.top + gutter / 2,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        DrawTextW(hdc, &mut user_chars, &mut user_rc, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_that_fits_shows_everything_and_offers_no_overflow_row() {
+        assert_eq!(visible_rows(3, 5), (3, false));
+        assert_eq!(visible_rows(5, 5), (5, false), "exactly full is not overflowing");
+    }
+
+    #[test]
+    fn a_list_that_overflows_gives_up_a_row_to_say_so() {
+        let (shown, overflow) = visible_rows(9, 5);
+        assert!(overflow, "the user must be told the list was cut");
+        assert_eq!(
+            shown, 4,
+            "the overflow row occupies one of the cap's slots -- showing 5 candidates AND an \
+             overflow row would be 6 rows in a window sized for 5, and the last one is unreachable"
+        );
+    }
+
+    #[test]
+    fn a_cap_of_one_still_leaves_room_to_say_there_is_more() {
+        assert_eq!(visible_rows(4, 1), (0, true));
+    }
 
     #[test]
     fn the_primary_and_secondary_skins_differ_in_every_channel_that_matters() {
