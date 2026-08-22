@@ -11,6 +11,7 @@
 
 pub mod accounts;
 pub mod app;
+pub mod app_candidates;
 pub mod app_identity;
 pub mod app_match;
 /// The named Windows mutex the installer looks for before replacing this
