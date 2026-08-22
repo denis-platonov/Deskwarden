@@ -61,6 +61,26 @@ ignore = [
     # at all, so no affected code is compiled into this Windows-only binary.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2023-0071, the "Marvin attack": a timing side-channel in the
+    # `rsa` crate's private-key operation. There is NO fixed version -- the
+    # advisory has stood open since 2023 and the constant-time rewrite has not
+    # landed -- so this is not a deferred upgrade, it is a decision.
+    #
+    # It is ignored, deliberately and narrowly, and the argument is about
+    # exposure rather than severity. Marvin is a *repeated-oracle* attack:
+    # it recovers a key from many thousands of timed decryptions that an
+    # attacker gets to trigger and measure. The one place this crate uses
+    # `rsa` is `rest::crypto::unwrap_org_key` -- unwrapping an organisation
+    # key, locally, in this process, once per session, from ciphertext the
+    # server already handed over. An attacker who can time that loop is
+    # already running code in this process's address space, where the
+    # unwrapped key is sitting in memory anyway.
+    #
+    # **This stops being true the moment anything here decrypts RSA on
+    # behalf of a remote caller, in a loop, or with attacker-chosen
+    # ciphertext.** Nothing does today. If that changes, this line must be
+    # revisited before the code ships, not after.
+    "RUSTSEC-2023-0071",
 ]
 
 [sources]

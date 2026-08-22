@@ -1129,7 +1129,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 55] = [
+        const OPENS_NO_WINDOW: [&str; 56] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1242,6 +1242,15 @@ mod tests {
             // gate over one call into `hello`, which is on this list for
             // exactly the same reason.
             "reprompt",
+            // The direct-REST vault backend. Today it is one file of
+            // client-side cryptography -- key derivation, key stretching,
+            // `EncString` parsing, AES-CBC-plus-HMAC and RSA-OAEP -- with no
+            // I/O of any kind: no HTTP, no API client, no login flow, and no
+            // caller anywhere in the app. It cannot open a window, and when
+            // the layers above it arrive, the surfaces that ask for a master
+            // password will be `login_ui` and `unlock_prompt`, which are
+            // classified in their own right and are not this module.
+            "rest",
             // **Judgement call, recorded rather than assumed**, and a
             // different one from `file_picker`'s and `reprompt`'s above: this
             // module opens nothing at all, not even somebody else's window.

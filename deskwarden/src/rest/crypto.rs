@@ -1,0 +1,1304 @@
+//! The client-side cryptography of a direct-REST Bitwarden backend: master
+//! key, stretched key, protected symmetric key, `EncString`, and the two
+//! unwraps that hang off them.
+//!
+//! # This changes the app's threat model, and that is the first thing to read
+//!
+//! **Today Deskwarden never holds the master password.** The login window
+//! hands it to the `bw` CLI, `bw` derives every key from it inside its own
+//! process, and this process keeps one thing: a session token, DPAPI-wrapped
+//! at rest ([`crate::session_store`]). Whatever went wrong in this app's
+//! memory, the master key was somewhere else.
+//!
+//! **A REST backend ends that.** To talk to a Bitwarden-compatible server
+//! without the CLI, this process must derive the master key itself, stretch
+//! it, unwrap the user's symmetric key with it, and hold that key for as long
+//! as the vault is unlocked -- because every item, every organisation key and
+//! every attachment key is decrypted under it. The master password is in this
+//! process's address space for the length of a login, and the keys below it
+//! for the length of a session.
+//!
+//! That is not an argument against the change; it is what *any* client that
+//! is not shelling out to another client has to do, and it is what the
+//! official clients do. It is an argument for saying so out loud:
+//!
+//! * Everything here that is a key or a plaintext is [`Zeroizing`], so it is
+//!   wiped when it is dropped rather than left in a freed page.
+//! * No type here derives `Debug` over one; see
+//!   [`crate::debug_leak_guard`], which fails the suite if one ever does.
+//! * No error, log line or panic message in this file carries a key, a
+//!   password or a plaintext. "MAC mismatch" is the whole of what a failure
+//!   is allowed to say.
+//!
+//! **`PRIVACY.md` says the current thing, and it will stop being true.** Its
+//! wording rests on `bw` owning the master password, and it must be revisited
+//! before any of this ships -- not when the HTTP layer lands, but before a
+//! user can reach a REST login at all.
+//!
+//! # What is verified, and what is not
+//!
+//! Every primitive below is checked against a **published** test vector, cited
+//! next to the test that uses it: RFC 7914 for PBKDF2-HMAC-SHA256, RFC 5869
+//! for HKDF-SHA256, RFC 4231 for HMAC-SHA256, NIST SP 800-38A for
+//! AES-256-CBC, RFC 9106 for Argon2id.
+//!
+//! **The Bitwarden-specific composition is not**, and this is stated plainly
+//! rather than dressed up. Which key stretches into which, that the HKDF info
+//! strings are `enc` and `mac`, that the PBKDF2 salt is the lowercased email
+//! and the Argon2id salt is its SHA-256, that the protected symmetric key is
+//! 64 bytes of encryption-key-then-MAC-key -- all of that is taken from
+//! Bitwarden's published format and its clients, and **nothing in this crate
+//! can confirm it**. Confirming it needs a real account on a real server,
+//! which no test here is allowed to touch. The composition tests below build
+//! their fixture out of the verified primitives and check that this code
+//! agrees with itself about it; where a NIST vector could supply the
+//! ciphertext and plaintext instead of this code, it does, and that is said
+//! at the test. See `the_composition_is_self_consistent_and_that_is_all_it_is`.
+//!
+//! # Scope
+//!
+//! Decryption only, and no I/O of any kind. There is no HTTP here, no API
+//! client, no login flow, and nothing in the running app calls this yet.
+
+use aes::Aes256;
+use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
+use cbc::cipher::block_padding::NoPadding;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::{Oaep, RsaPrivateKey};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+use crate::record::seal::base64_from;
+
+/// AES's block size, in bytes. The IV's length, and the granularity every
+/// CBC ciphertext has to be a whole number of.
+const BLOCK: usize = 16;
+
+/// The length of every key in this module: AES-256 and HMAC-SHA256 alike.
+const KEY_LEN: usize = 32;
+
+/// The length of the protected symmetric key's plaintext: an encryption key
+/// followed by a MAC key.
+const SYMMETRIC_KEY_LEN: usize = KEY_LEN * 2;
+
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type HmacSha256 = Hmac<Sha256>;
+
+// ---- errors ----------------------------------------------------------------
+
+/// Why a derivation, a parse or a decryption did not produce a key.
+///
+/// **Nothing in here is derived from a secret.** Every arm carries either a
+/// fixed string or a length, and lengths of ciphertext are already public to
+/// anyone holding the ciphertext. This is not a formality: an error type is
+/// the value most likely to reach a log file, and the reason `SealFailed` in
+/// [`crate::record::seal`] is shaped the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoError {
+    /// A KDF parameter the server sent cannot be used -- a zero iteration
+    /// count, an Argon2 memory or lane figure outside what the algorithm
+    /// accepts. The `&'static str` names the parameter, never its value's
+    /// provenance.
+    KdfParams(&'static str),
+    /// The `EncString` is not the shape its own type byte claims. Carries a
+    /// fixed description of what was wrong with the *structure*.
+    Malformed(&'static str),
+    /// A recognised Bitwarden `EncString` type this module refuses, **by
+    /// name** so the refusal says which format was seen rather than a number.
+    Unsupported(&'static str),
+    /// The type byte is not one Bitwarden has ever defined.
+    UnknownType,
+    /// The MAC did not verify. The ciphertext was **not** decrypted: this is
+    /// returned before the cipher is constructed.
+    MacMismatch,
+    /// PKCS#7 padding was not well-formed after a MAC that did verify. That
+    /// combination means a bug or a corrupt store, not an attacker -- an
+    /// attacker cannot reach this arm without the MAC key.
+    Padding,
+    /// A decrypted key was not the length a key has to be.
+    KeyLength { expected: usize, got: usize },
+    /// The RSA private key could not be read as PKCS#8 DER, or OAEP
+    /// unwrapping failed. One arm for both on purpose: distinguishing them
+    /// tells a caller which half of a secret was wrong.
+    Rsa,
+}
+
+impl std::fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KdfParams(what) => write!(f, "the server's KDF parameters are unusable: {what}"),
+            Self::Malformed(what) => write!(f, "malformed encrypted string: {what}"),
+            Self::Unsupported(name) => {
+                write!(f, "encrypted string format `{name}` is not supported")
+            }
+            Self::UnknownType => f.write_str("encrypted string has an unknown type"),
+            Self::MacMismatch => f.write_str("MAC mismatch"),
+            Self::Padding => f.write_str("padding is not well-formed"),
+            Self::KeyLength { expected, got } => {
+                write!(f, "decrypted key is {got} bytes, expected {expected}")
+            }
+            Self::Rsa => f.write_str("RSA unwrapping failed"),
+        }
+    }
+}
+
+impl std::error::Error for CryptoError {}
+
+// ---- keys ------------------------------------------------------------------
+
+/// The master key: 32 bytes derived from the master password and the email.
+///
+/// It is not used to decrypt anything directly. It is stretched
+/// ([`MasterKey::stretch`]) into the pair that unwraps the user's real
+/// symmetric key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasterKey(Zeroizing<[u8; KEY_LEN]>);
+
+/// Redacting, and hand-written because it must be: see the module docs and
+/// [`crate::debug_leak_guard`]. A length is all a master key may print.
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MasterKey(<32 bytes redacted>)")
+    }
+}
+
+/// An encryption key and a MAC key, together.
+///
+/// Two things in Bitwarden have exactly this shape and this code uses one
+/// type for both, because they *are* the same thing used at different depths:
+/// the stretched master key, and the user's (or an organisation's) symmetric
+/// key that the stretched one unwraps.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SymmetricKey {
+    enc: Zeroizing<[u8; KEY_LEN]>,
+    mac: Zeroizing<[u8; KEY_LEN]>,
+}
+
+/// Redacting, for [`MasterKey`]'s reason.
+impl std::fmt::Debug for SymmetricKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SymmetricKey { enc: <32 bytes redacted>, mac: <32 bytes redacted> }")
+    }
+}
+
+impl SymmetricKey {
+    /// Splits the 64-byte plaintext of a protected symmetric key.
+    fn from_64(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.len() != SYMMETRIC_KEY_LEN {
+            return Err(CryptoError::KeyLength {
+                expected: SYMMETRIC_KEY_LEN,
+                got: bytes.len(),
+            });
+        }
+        let mut enc = Zeroizing::new([0u8; KEY_LEN]);
+        let mut mac = Zeroizing::new([0u8; KEY_LEN]);
+        enc.copy_from_slice(&bytes[..KEY_LEN]);
+        mac.copy_from_slice(&bytes[KEY_LEN..]);
+        Ok(Self { enc, mac })
+    }
+}
+
+// ---- the key derivation function -------------------------------------------
+
+/// The KDF an account's master key is derived with, as the server reports it.
+///
+/// Both arms exist because both kinds of account exist: PBKDF2 is what every
+/// account had before Argon2id was offered, and an account that has not been
+/// migrated still has it. A client that supports only one of them cannot log
+/// half its users in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kdf {
+    /// PBKDF2-HMAC-SHA256 with the account's own iteration count.
+    Pbkdf2 { iterations: u32 },
+    /// Argon2id with the account's memory, iteration and parallelism figures.
+    /// `memory_kib` is in kibibytes, which is the unit the server reports and
+    /// the unit [`argon2::Params`] takes.
+    Argon2id { iterations: u32, memory_kib: u32, parallelism: u32 },
+}
+
+/// Bitwarden's salt is the account's email, lowercased and trimmed.
+///
+/// Not a formality: the salt is what stops one precomputation covering every
+/// account, and it is the one input to the master key the user does not type.
+/// A client that trims differently from the server derives a different key
+/// from the right password and reports it as a wrong one.
+fn kdf_salt(email: &str) -> Zeroizing<String> {
+    Zeroizing::new(email.trim().to_lowercase())
+}
+
+/// Derives the master key from the master password and the email.
+///
+/// The password is taken as bytes rather than `&str` so a caller holding a
+/// `Zeroizing<String>` can pass `.as_bytes()` without this function making a
+/// second, un-wiped copy of it.
+pub fn master_key(password: &[u8], email: &str, kdf: Kdf) -> Result<MasterKey, CryptoError> {
+    let salt = kdf_salt(email);
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    match kdf {
+        Kdf::Pbkdf2 { iterations } => {
+            if iterations == 0 {
+                return Err(CryptoError::KdfParams("iteration count is zero"));
+            }
+            pbkdf2::pbkdf2_hmac::<Sha256>(password, salt.as_bytes(), iterations, &mut *out);
+        }
+        Kdf::Argon2id { iterations, memory_kib, parallelism } => {
+            // **Argon2id's salt is the SHA-256 of the email, not the email.**
+            // Argon2 requires at least 8 salt bytes and Bitwarden feeds it a
+            // fixed 32, which is also why this arm cannot reuse the PBKDF2
+            // salt directly.
+            let mut hashed = Zeroizing::new([0u8; KEY_LEN]);
+            hashed.copy_from_slice(&Sha256::digest(salt.as_bytes()));
+            let salt = hashed;
+            let params = ParamsBuilder::new()
+                .m_cost(memory_kib)
+                .t_cost(iterations)
+                .p_cost(parallelism)
+                .output_len(KEY_LEN)
+                .build()
+                .map_err(|_| CryptoError::KdfParams("memory, iteration or lane count"))?;
+            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+                .hash_password_into(password, &*salt, &mut *out)
+                .map_err(|_| CryptoError::KdfParams("Argon2id rejected them"))?;
+        }
+    }
+    Ok(MasterKey(out))
+}
+
+impl MasterKey {
+    /// **Key stretching**: HKDF-SHA256 *expand* over the master key.
+    ///
+    /// Expand only -- there is no extract step, and that is correct rather
+    /// than an omission. HKDF-Extract exists to condense a non-uniform input
+    /// into a pseudorandom key; the master key is already the 32-byte output
+    /// of a KDF, so it *is* the PRK, and Bitwarden feeds it in as one.
+    ///
+    /// Infallible by construction: `from_prk` refuses a PRK shorter than the
+    /// hash length and this one is exactly the hash length, and `expand`
+    /// refuses more than 255 blocks of output while this asks for one. The
+    /// two `expect`s below say so and carry no secret.
+    #[must_use]
+    pub fn stretch(&self) -> SymmetricKey {
+        let hkdf = Hkdf::<Sha256>::from_prk(&*self.0)
+            .expect("a 32-byte PRK is exactly SHA-256's output length");
+        let mut enc = Zeroizing::new([0u8; KEY_LEN]);
+        let mut mac = Zeroizing::new([0u8; KEY_LEN]);
+        hkdf.expand(b"enc", &mut *enc).expect("32 bytes is one HKDF block");
+        hkdf.expand(b"mac", &mut *mac).expect("32 bytes is one HKDF block");
+        SymmetricKey { enc, mac }
+    }
+}
+
+// ---- EncString -------------------------------------------------------------
+
+/// Bitwarden's `type.iv|ct|mac` wire format, parsed.
+///
+/// # Parsed strictly, and never guessed at
+///
+/// This is a reader of text that arrives from a server, so every ambiguity is
+/// a refusal: the type byte must be digits, the number of `|`-separated parts
+/// must be exactly what that type has, each part must be exactly standard
+/// base64 (through [`base64_from`], which refuses a stray character rather
+/// than skipping it), the IV must be 16 bytes, the MAC 32, and the ciphertext
+/// a non-zero whole number of AES blocks.
+///
+/// A parser that repairs its input is a parser that will one day accept an
+/// `EncString` whose MAC covers less than its ciphertext.
+///
+/// # Only two types are accepted
+///
+/// Type 2 (`AesCbc256_HmacSha256_B64`) is everything symmetric in a modern
+/// vault, and type 4 (`Rsa2048_OaepSha1_B64`) is how an organisation's key is
+/// wrapped for a member. The rest are refused **by name** -- see
+/// [`EncString::from_str`] -- rather than by number, because "type 0 is not
+/// supported" does not tell a reader that type 0 is unauthenticated AES-CBC
+/// with no MAC at all.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EncString {
+    /// Type 2. AES-256-CBC with a 16-byte IV, authenticated by
+    /// HMAC-SHA256 over `iv || ct`.
+    AesCbc256HmacSha256B64 { iv: [u8; BLOCK], ct: Vec<u8>, mac: [u8; KEY_LEN] },
+    /// Type 4. RSA-2048 OAEP with SHA-1. One part and no MAC: OAEP is not a
+    /// MAC but it is not a malleable padding either, and this is the format
+    /// organisation keys are actually stored in.
+    Rsa2048OaepSha1B64 { ct: Vec<u8> },
+}
+
+/// Redacting, in the house style of [`crate::record::seal::SealedSeed`].
+///
+/// A ciphertext is not a plaintext, but it is the whole of what an offline
+/// attack is run against; printing one into a log file hands over the target
+/// and saves the theft. Lengths only.
+impl std::fmt::Debug for EncString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AesCbc256HmacSha256B64 { ct, .. } => {
+                write!(f, "EncString::AesCbc256HmacSha256B64(<{} ciphertext bytes>)", ct.len())
+            }
+            Self::Rsa2048OaepSha1B64 { ct } => {
+                write!(f, "EncString::Rsa2048OaepSha1B64(<{} ciphertext bytes>)", ct.len())
+            }
+        }
+    }
+}
+
+/// The Bitwarden name of every `EncString` type this module refuses, so the
+/// refusal can say which format it saw.
+///
+/// A table rather than a `match` with the names inline, so that
+/// [`EncString::from_str`]'s unknown-type arm and this list cannot drift into
+/// disagreeing about which numbers are defined at all.
+const REFUSED_TYPES: [(u8, &str); 5] = [
+    // No MAC whatsoever: unauthenticated CBC, malleable, and the reason
+    // padding-oracle attacks have a name. Bitwarden deprecated it.
+    (0, "AesCbc256_B64"),
+    // AES-128 under a key half the size of everything else in the vault.
+    (1, "AesCbc128_HmacSha256_B64"),
+    (3, "Rsa2048_OaepSha256_B64"),
+    (5, "Rsa2048_OaepSha256_HmacSha256_B64"),
+    (6, "Rsa2048_OaepSha1_HmacSha256_B64"),
+];
+
+impl std::str::FromStr for EncString {
+    type Err = CryptoError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (type_text, rest) =
+            text.split_once('.').ok_or(CryptoError::Malformed("no `.` between type and body"))?;
+        if type_text.is_empty() || !type_text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(CryptoError::Malformed("the type is not a decimal number"));
+        }
+        let kind: u8 =
+            type_text.parse().map_err(|_| CryptoError::Malformed("the type is out of range"))?;
+        if let Some((_, name)) = REFUSED_TYPES.iter().find(|(n, _)| *n == kind) {
+            return Err(CryptoError::Unsupported(name));
+        }
+        let parts: Vec<&str> = rest.split('|').collect();
+        match kind {
+            2 => {
+                let [iv, ct, mac] = parts.as_slice() else {
+                    return Err(CryptoError::Malformed(
+                        "AesCbc256_HmacSha256_B64 needs exactly three `|`-separated parts",
+                    ));
+                };
+                let iv = fixed(iv, "the IV is not 16 bytes")?;
+                let mac = fixed(mac, "the MAC is not 32 bytes")?;
+                let ct =
+                    base64_from(ct).ok_or(CryptoError::Malformed("the ciphertext is not base64"))?;
+                if ct.is_empty() || !ct.len().is_multiple_of(BLOCK) {
+                    return Err(CryptoError::Malformed(
+                        "the ciphertext is not a non-zero whole number of AES blocks",
+                    ));
+                }
+                Ok(Self::AesCbc256HmacSha256B64 { iv, ct, mac })
+            }
+            4 => {
+                let [ct] = parts.as_slice() else {
+                    return Err(CryptoError::Malformed(
+                        "Rsa2048_OaepSha1_B64 has no `|`-separated parts",
+                    ));
+                };
+                let ct =
+                    base64_from(ct).ok_or(CryptoError::Malformed("the ciphertext is not base64"))?;
+                if ct.is_empty() {
+                    return Err(CryptoError::Malformed("the ciphertext is empty"));
+                }
+                Ok(Self::Rsa2048OaepSha1B64 { ct })
+            }
+            _ => Err(CryptoError::UnknownType),
+        }
+    }
+}
+
+/// Decodes one base64 part into an array of exactly `N` bytes, or refuses.
+fn fixed<const N: usize>(text: &str, wrong_length: &'static str) -> Result<[u8; N], CryptoError> {
+    let bytes = base64_from(text).ok_or(CryptoError::Malformed("a part is not base64"))?;
+    bytes.try_into().map_err(|_| CryptoError::Malformed(wrong_length))
+}
+
+// ---- symmetric decryption --------------------------------------------------
+
+/// Decrypts a type-2 `EncString` under `key`.
+///
+/// # The MAC is verified **before** anything is decrypted
+///
+/// The order is the whole point of this function, so it is written as
+/// straight-line code with an early return rather than as anything a later
+/// edit could reorder by accident: the HMAC over `iv || ct` is computed and
+/// compared first, and the CBC decryptor is not even constructed unless it
+/// matched. Verifying afterwards -- or comparing with `==`, which returns on
+/// the first differing byte and leaks the position of that byte through
+/// timing -- is the classic defect in exactly this composition.
+///
+/// The comparison is [`hmac::Mac::verify_slice`], which is
+/// `subtle::ConstantTimeEq` underneath. That is the reason this file names no
+/// `subtle` dependency of its own and the reason there is no `==` on a MAC
+/// anywhere in it.
+pub fn decrypt(key: &SymmetricKey, enc: &EncString) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let EncString::AesCbc256HmacSha256B64 { iv, ct, mac } = enc else {
+        return Err(CryptoError::Unsupported(
+            "Rsa2048_OaepSha1_B64 needs a private key, not a symmetric one",
+        ));
+    };
+
+    let mut hmac = <HmacSha256 as Mac>::new_from_slice(&*key.mac)
+        .expect("HMAC accepts a key of any length");
+    hmac.update(iv);
+    hmac.update(ct);
+    hmac.verify_slice(mac).map_err(|_| CryptoError::MacMismatch)?;
+
+    let plain = cbc_decrypt_raw(&key.enc, iv, ct)?;
+    strip_pkcs7(plain)
+}
+
+/// AES-256-CBC decryption with **no** padding handling: whole blocks in,
+/// whole blocks out.
+///
+/// Separate from the padding strip above it so that
+/// `aes_256_cbc_matches_nist_sp_800_38a` can drive it with NIST's own
+/// key, IV, ciphertext and plaintext -- none of which carry PKCS#7 padding,
+/// and all four of which would otherwise have to be manufactured here.
+fn cbc_decrypt_raw(
+    key: &[u8; KEY_LEN],
+    iv: &[u8; BLOCK],
+    ct: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if ct.is_empty() || !ct.len().is_multiple_of(BLOCK) {
+        return Err(CryptoError::Malformed(
+            "the ciphertext is not a non-zero whole number of AES blocks",
+        ));
+    }
+    let mut buf = Zeroizing::new(ct.to_vec());
+    let len = buf.len();
+    Aes256CbcDec::new(key.into(), iv.into())
+        .decrypt_padded_mut::<NoPadding>(&mut buf[..len])
+        .map_err(|_| CryptoError::Malformed("the ciphertext is not a whole number of AES blocks"))?;
+    Ok(buf)
+}
+
+/// Strips PKCS#7 padding, refusing anything malformed.
+///
+/// **Reached only after a MAC that verified**, which is what makes a plain
+/// byte-by-byte check safe here: an attacker who cannot forge the MAC cannot
+/// submit a ciphertext that reaches this function at all, so there is no
+/// padding oracle to time. That property is a fact about [`decrypt`]'s
+/// ordering, not about this function, which is why it is stated at both.
+fn strip_pkcs7(mut plain: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let pad = usize::from(*plain.last().ok_or(CryptoError::Padding)?);
+    if pad == 0 || pad > BLOCK || pad > plain.len() {
+        return Err(CryptoError::Padding);
+    }
+    if plain[plain.len() - pad..].iter().any(|b| usize::from(*b) != pad) {
+        return Err(CryptoError::Padding);
+    }
+    let keep = plain.len() - pad;
+    plain.truncate(keep);
+    Ok(plain)
+}
+
+// ---- the two unwraps -------------------------------------------------------
+
+/// Unwraps the user's symmetric key -- the account's **protected symmetric
+/// key**, as the server calls it -- with the stretched master key.
+///
+/// This is the hinge of the whole scheme: everything else in a vault is
+/// encrypted under what comes out of here, and the master key is used for
+/// nothing else. Changing the master password re-wraps this key rather than
+/// re-encrypting the vault, which is why it can be done in one request.
+pub fn unwrap_user_key(
+    stretched: &SymmetricKey,
+    protected: &EncString,
+) -> Result<SymmetricKey, CryptoError> {
+    let plain = decrypt(stretched, protected)?;
+    SymmetricKey::from_64(&plain)
+}
+
+/// Unwraps an **organisation's** symmetric key with the user's RSA private
+/// key, which the caller has already decrypted under the user's own key.
+///
+/// The private key is PKCS#8 DER -- the bytes Bitwarden stores, once its own
+/// `EncString` wrapper has been removed with [`decrypt`].
+pub fn unwrap_org_key(
+    private_key_pkcs8_der: &[u8],
+    protected: &EncString,
+) -> Result<SymmetricKey, CryptoError> {
+    let plain = decrypt_rsa(private_key_pkcs8_der, protected)?;
+    SymmetricKey::from_64(&plain)
+}
+
+/// RSA-OAEP-SHA1 decryption of a type-4 `EncString`.
+///
+/// # One honest caveat about what is wiped
+///
+/// The returned buffer is [`Zeroizing`] and [`RsaPrivateKey`] zeroizes itself
+/// on drop, but the `rsa` crate allocates and returns a plain `Vec<u8>` that
+/// this function copies into the wiped one, and that intermediate is outside
+/// this crate's control. It is one org key, once per session. It is recorded
+/// here rather than left for a reader to assume otherwise.
+pub fn decrypt_rsa(
+    private_key_pkcs8_der: &[u8],
+    enc: &EncString,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let EncString::Rsa2048OaepSha1B64 { ct } = enc else {
+        return Err(CryptoError::Unsupported(
+            "AesCbc256_HmacSha256_B64 needs a symmetric key, not a private one",
+        ));
+    };
+    let key =
+        RsaPrivateKey::from_pkcs8_der(private_key_pkcs8_der).map_err(|_| CryptoError::Rsa)?;
+    let plain = key.decrypt(Oaep::new::<sha1::Sha1>(), ct).map_err(|_| CryptoError::Rsa)?;
+    Ok(Zeroizing::new(plain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    /// Hex to bytes, for transcribing a published vector unchanged.
+    fn hex(text: &str) -> Vec<u8> {
+        assert!(text.len().is_multiple_of(2), "a hex vector has an even number of digits");
+        (0..text.len() / 2)
+            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).expect("hex digits"))
+            .collect()
+    }
+
+    /// Standard base64 with padding. The inverse of the crate's
+    /// [`base64_from`], used only to *build* the `EncString` text a fixture
+    /// is parsed from.
+    fn b64(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        crate::record::seal::base64_into(&mut out, bytes);
+        out
+    }
+
+    #[test]
+    fn the_hex_helper_is_not_the_thing_under_test() {
+        // Control: every vector below is transcribed through `hex`, so a
+        // broken `hex` would make all of them agree on the wrong bytes.
+        assert_eq!(hex(""), Vec::<u8>::new());
+        assert_eq!(hex("00ff10"), vec![0x00, 0xff, 0x10]);
+        assert_ne!(hex("0102"), hex("0201"));
+    }
+
+    // ---- the primitives, against published vectors ------------------------
+
+    /// **RFC 7914 (scrypt), section 11**, which is where the IETF publishes
+    /// PBKDF2-HMAC-SHA-256 vectors. RFC 6070's vectors are PBKDF2-HMAC-**SHA1**
+    /// and cannot check this code at all -- a point worth writing down,
+    /// because RFC 6070 is what gets cited for "PBKDF2 test vectors".
+    #[test]
+    fn pbkdf2_hmac_sha256_matches_rfc_7914() {
+        let mut out = [0u8; 64];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"passwd", b"salt", 1, &mut out);
+        assert_eq!(
+            out.to_vec(),
+            hex(concat!(
+                "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc",
+                "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+            ))
+        );
+
+        let mut out = [0u8; 64];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"Password", b"NaCl", 80_000, &mut out);
+        assert_eq!(
+            out.to_vec(),
+            hex(concat!(
+                "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56",
+                "a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"
+            ))
+        );
+    }
+
+    /// **RFC 5869, appendix A.1** (basic test case with SHA-256).
+    ///
+    /// The expand half only, and that is the half this module uses: Bitwarden
+    /// feeds the master key in as the PRK. The PRK and OKM below are the
+    /// RFC's own, so this checks `Hkdf::from_prk(..).expand(..)` -- the exact
+    /// call [`MasterKey::stretch`] makes -- rather than a composition of
+    /// extract and expand that this code never performs.
+    #[test]
+    fn hkdf_sha256_expand_matches_rfc_5869() {
+        let prk = hex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+        let info = hex("f0f1f2f3f4f5f6f7f8f9");
+        let mut okm = [0u8; 42];
+        Hkdf::<Sha256>::from_prk(&prk).expect("32-byte PRK").expand(&info, &mut okm).expect("42 bytes");
+        assert_eq!(
+            okm.to_vec(),
+            hex(concat!(
+                "3cb25f25faacd57a90434f64d0362f2a",
+                "2d2d0a90cf1a5a4c5db02d56ecc4c5bf",
+                "34007208d5b887185865"
+            ))
+        );
+    }
+
+    /// **RFC 4231, test cases 1 and 2** (HMAC-SHA-256).
+    ///
+    /// This checks the MAC primitive itself. That
+    /// [`decrypt`] computes it over `iv || ct` and nothing else is a
+    /// different claim, checked separately below.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&[0x0b; 20]).expect("any key length");
+        mac.update(b"Hi There");
+        assert_eq!(
+            mac.finalize().into_bytes().to_vec(),
+            hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+        );
+
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(b"Jefe").expect("any key length");
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            mac.finalize().into_bytes().to_vec(),
+            hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        );
+    }
+
+    /// **NIST SP 800-38A, appendix F.2.6** (CBC-AES256.Decrypt).
+    ///
+    /// Four blocks, no padding -- which is why [`cbc_decrypt_raw`] is its own
+    /// function: the vector's plaintext is NIST's, not something this file
+    /// manufactured, and PKCS#7 would have forced a fifth block of padding
+    /// that no published vector covers.
+    #[test]
+    fn aes_256_cbc_matches_nist_sp_800_38a() {
+        let key: [u8; 32] = hex(NIST_KEY).try_into().expect("32 bytes");
+        let iv: [u8; 16] = hex(NIST_IV).try_into().expect("16 bytes");
+        let plain = cbc_decrypt_raw(&key, &iv, &hex(NIST_CIPHERTEXT)).expect("four whole blocks");
+        assert_eq!(plain.to_vec(), hex(NIST_PLAINTEXT));
+
+        // Control: the vector is not decrypting to itself, and a wrong key
+        // does not quietly produce the right answer.
+        assert_ne!(hex(NIST_CIPHERTEXT), hex(NIST_PLAINTEXT));
+        let wrong = cbc_decrypt_raw(&[0u8; 32], &iv, &hex(NIST_CIPHERTEXT)).expect("still blocks");
+        assert_ne!(wrong.to_vec(), hex(NIST_PLAINTEXT));
+    }
+
+    /// NIST SP 800-38A appendix F.2.5/F.2.6's key, IV, plaintext and
+    /// ciphertext. At module scope because the `EncString` fixture below
+    /// reuses them -- so that its ciphertext and its expected plaintext both
+    /// come from NIST rather than from this file's own encryptor.
+    const NIST_KEY: &str = "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4";
+    const NIST_IV: &str = "000102030405060708090a0b0c0d0e0f";
+    const NIST_PLAINTEXT: &str = concat!(
+        "6bc1bee22e409f96e93d7e117393172a",
+        "ae2d8a571e03ac9c9eb76fac45af8e51",
+        "30c81c46a35ce411e5fbc1191a0a52ef",
+        "f69f2445df4f9b17ad2b417be66c3710"
+    );
+    const NIST_CIPHERTEXT: &str = concat!(
+        "f58c4c04d6e5f1ba779eabfb5f7bfbd6",
+        "9cfc4e967edb808d679f777bc6702c7d",
+        "39f23369a9d9bacfa530e26304231461",
+        "b2eb05e2c39be9fcda6c19078c6a9d1b"
+    );
+
+    /// **RFC 9106, section 5.3** (Argon2id test vector): v=0x13, t=3,
+    /// m=32 KiB, p=4, a 32-byte password of `0x01`, a 16-byte salt of `0x02`,
+    /// an 8-byte secret of `0x03`, 12 bytes of associated data `0x04`, and a
+    /// 32-byte tag.
+    ///
+    /// Driven through `argon2` directly rather than through [`master_key`],
+    /// because the RFC's vector uses a secret and associated data that
+    /// Bitwarden's derivation has neither of. What it pins is that the
+    /// algorithm, version and parameter *meanings* this module passes are the
+    /// ones the RFC defines -- in particular that `m_cost` is kibibytes and
+    /// that [`Version::V0x13`] is the version an existing account was
+    /// migrated under.
+    #[test]
+    fn argon2id_matches_rfc_9106() {
+        let params = ParamsBuilder::new()
+            .m_cost(32)
+            .t_cost(3)
+            .p_cost(4)
+            .output_len(32)
+            .data(
+                argon2::AssociatedData::new(&[0x04; 12]).expect("12 bytes of associated data"),
+            )
+            .build()
+            .expect("the RFC's own parameters");
+        let argon =
+            Argon2::new_with_secret(&[0x03; 8], Algorithm::Argon2id, Version::V0x13, params)
+                .expect("an 8-byte secret");
+        let mut tag = [0u8; 32];
+        argon.hash_password_into(&[0x01; 32], &[0x02; 16], &mut tag).expect("the RFC's inputs");
+        assert_eq!(
+            tag.to_vec(),
+            hex("0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
+        );
+    }
+
+    /// The parameters really do reach Argon2: the same password and salt
+    /// under two different cost settings must not produce the same key.
+    ///
+    /// Without this, [`master_key`]'s Argon2 arm could ignore `memory_kib`
+    /// entirely and `argon2id_matches_rfc_9106` -- which does not call it --
+    /// would stay green.
+    #[test]
+    fn the_argon2_parameters_this_module_passes_are_not_ignored() {
+        let a = master_key(
+            b"correct horse",
+            "user@example.com",
+            Kdf::Argon2id { iterations: 2, memory_kib: 64, parallelism: 1 },
+        )
+        .expect("usable parameters");
+        let b = master_key(
+            b"correct horse",
+            "user@example.com",
+            Kdf::Argon2id { iterations: 3, memory_kib: 64, parallelism: 1 },
+        )
+        .expect("usable parameters");
+        let c = master_key(
+            b"correct horse",
+            "user@example.com",
+            Kdf::Argon2id { iterations: 2, memory_kib: 128, parallelism: 1 },
+        )
+        .expect("usable parameters");
+        assert_ne!(a, b, "the iteration count is not reaching Argon2");
+        assert_ne!(a, c, "the memory cost is not reaching Argon2");
+    }
+
+    // ---- the salt, and the KDF wrapper ------------------------------------
+
+    /// [`master_key`]'s PBKDF2 arm is PBKDF2 over the lowercased, trimmed
+    /// email -- checked against the vector-verified primitive directly, so
+    /// this pins the *wiring* rather than re-checking PBKDF2.
+    #[test]
+    fn the_pbkdf2_arm_salts_with_the_normalised_email() {
+        let derived = master_key(b"pa55word", "  User@Example.COM  ", Kdf::Pbkdf2 { iterations: 7 })
+            .expect("a non-zero iteration count");
+        let mut expected = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"pa55word", b"user@example.com", 7, &mut expected);
+        assert_eq!(*derived.0, expected);
+
+        // Control: a different email is a different key, so the salt is
+        // reaching PBKDF2 at all.
+        let other = master_key(b"pa55word", "other@example.com", Kdf::Pbkdf2 { iterations: 7 })
+            .expect("a non-zero iteration count");
+        assert_ne!(derived, other);
+    }
+
+    #[test]
+    fn a_zero_iteration_count_is_refused_rather_than_derived_from() {
+        assert_eq!(
+            master_key(b"pa55word", "user@example.com", Kdf::Pbkdf2 { iterations: 0 }),
+            Err(CryptoError::KdfParams("iteration count is zero"))
+        );
+    }
+
+    #[test]
+    fn unusable_argon2_parameters_are_refused_rather_than_panicked_on() {
+        // Zero lanes is outside what Argon2 defines; `ParamsBuilder` refuses
+        // it, and this module must turn that into an error rather than an
+        // unwrap.
+        assert!(matches!(
+            master_key(
+                b"pa55word",
+                "user@example.com",
+                Kdf::Argon2id { iterations: 1, memory_kib: 64, parallelism: 0 }
+            ),
+            Err(CryptoError::KdfParams(_))
+        ));
+    }
+
+    /// The two KDFs are not accidentally the same function: the same password
+    /// and email under each must give different keys.
+    #[test]
+    fn the_two_kdfs_are_not_the_same_derivation() {
+        let pbkdf2 = master_key(b"pa55word", "user@example.com", Kdf::Pbkdf2 { iterations: 3 })
+            .expect("usable");
+        let argon = master_key(
+            b"pa55word",
+            "user@example.com",
+            Kdf::Argon2id { iterations: 1, memory_kib: 64, parallelism: 1 },
+        )
+        .expect("usable");
+        assert_ne!(pbkdf2, argon);
+    }
+
+    // ---- stretching -------------------------------------------------------
+
+    /// The stretch is HKDF-expand with `enc` and `mac`, and the two halves
+    /// are different keys -- which is the property that matters, because a
+    /// scheme where the encryption key and the MAC key are equal is one where
+    /// the MAC proves nothing an attacker holding the encryption key could
+    /// not forge.
+    #[test]
+    fn stretching_produces_two_different_keys_from_the_hkdf_the_rfc_pinned() {
+        let master = MasterKey(Zeroizing::new([7u8; 32]));
+        let stretched = master.stretch();
+        assert_ne!(stretched.enc, stretched.mac);
+
+        let hkdf = Hkdf::<Sha256>::from_prk(&[7u8; 32]).expect("32-byte PRK");
+        let mut enc = [0u8; 32];
+        let mut mac = [0u8; 32];
+        hkdf.expand(b"enc", &mut enc).expect("one block");
+        hkdf.expand(b"mac", &mut mac).expect("one block");
+        assert_eq!(*stretched.enc, enc, "the encryption key is not HKDF-expand with info `enc`");
+        assert_eq!(*stretched.mac, mac, "the MAC key is not HKDF-expand with info `mac`");
+    }
+
+    // ---- EncString parsing ------------------------------------------------
+
+    /// A valid type-2 string, assembled from the NIST vector so that its
+    /// ciphertext is not this file's invention.
+    fn nist_backed_enc_string(mac_key: &[u8; 32]) -> (SymmetricKey, String) {
+        let enc_key: [u8; 32] = hex(NIST_KEY).try_into().expect("32 bytes");
+        let iv = hex(NIST_IV);
+        let ct = hex(NIST_CIPHERTEXT);
+        let mut hmac = <HmacSha256 as Mac>::new_from_slice(mac_key).expect("any key length");
+        hmac.update(&iv);
+        hmac.update(&ct);
+        let mac = hmac.finalize().into_bytes();
+        let key = SymmetricKey {
+            enc: Zeroizing::new(enc_key),
+            mac: Zeroizing::new(*mac_key),
+        };
+        (key, format!("2.{}|{}|{}", b64(&iv), b64(&ct), b64(&mac)))
+    }
+
+    #[test]
+    fn a_well_formed_type_two_string_parses_into_its_three_parts() {
+        let (_, text) = nist_backed_enc_string(&[9u8; 32]);
+        let parsed = EncString::from_str(&text).expect("a well-formed type 2 string");
+        let EncString::AesCbc256HmacSha256B64 { iv, ct, mac } = parsed else {
+            panic!("parsed as the wrong variant");
+        };
+        assert_eq!(iv.to_vec(), hex(NIST_IV));
+        assert_eq!(ct, hex(NIST_CIPHERTEXT));
+        assert_eq!(mac.len(), 32);
+    }
+
+    #[test]
+    fn a_well_formed_type_four_string_parses() {
+        let text = format!("4.{}", b64(&[0xab; 256]));
+        let parsed = EncString::from_str(&text).expect("a well-formed type 4 string");
+        assert_eq!(parsed, EncString::Rsa2048OaepSha1B64 { ct: vec![0xab; 256] });
+    }
+
+    /// **Every refused type is refused by name**, which is the whole reason
+    /// [`REFUSED_TYPES`] is a table.
+    #[test]
+    fn the_types_this_module_does_not_implement_are_refused_by_name() {
+        for (number, name) in REFUSED_TYPES {
+            let text = format!("{number}.{}|{}|{}", b64(&[0; 16]), b64(&[0; 16]), b64(&[0; 32]));
+            assert_eq!(
+                EncString::from_str(&text),
+                Err(CryptoError::Unsupported(name)),
+                "type {number} must be refused as `{name}`"
+            );
+        }
+        // Control: the table is not empty and does not name a type that is
+        // in fact supported.
+        assert_eq!(REFUSED_TYPES.len(), 5);
+        assert!(REFUSED_TYPES.iter().all(|(n, _)| *n != 2 && *n != 4));
+    }
+
+    #[test]
+    fn a_type_bitwarden_never_defined_is_refused_too() {
+        assert_eq!(EncString::from_str("9.AAAA"), Err(CryptoError::UnknownType));
+    }
+
+    /// Malformed input is refused rather than repaired. Each case is a way a
+    /// lenient parser would have guessed.
+    #[test]
+    fn malformed_strings_are_refused_rather_than_guessed_at() {
+        let iv = b64(&[0; 16]);
+        let ct = b64(&[0; 16]);
+        let mac = b64(&[0; 32]);
+        let cases: [(&str, String); 9] = [
+            ("no dot at all", format!("2{iv}|{ct}|{mac}")),
+            ("an empty type", format!(".{iv}|{ct}|{mac}")),
+            ("a non-numeric type", format!("x.{iv}|{ct}|{mac}")),
+            ("a type out of a byte's range", format!("300.{iv}|{ct}|{mac}")),
+            ("two parts where three are required", format!("2.{iv}|{ct}")),
+            ("four parts where three are required", format!("2.{iv}|{ct}|{mac}|{mac}")),
+            ("a 32-byte IV", format!("2.{mac}|{ct}|{mac}")),
+            ("a 16-byte MAC", format!("2.{iv}|{ct}|{ct}")),
+            ("a ciphertext that is not a whole block", format!("2.{iv}|{}|{mac}", b64(&[0; 17]))),
+        ];
+        for (what, text) in cases {
+            assert!(
+                EncString::from_str(&text).is_err(),
+                "`{what}` was accepted; this parser must refuse rather than guess"
+            );
+        }
+
+        // Base64 strictness comes from `record::seal::base64_from`, and this
+        // is the assertion that it is really in the path: a `!` is not a
+        // base64 character and must not be skipped over.
+        let mut bad = iv.clone();
+        bad.replace_range(0..1, "!");
+        assert!(EncString::from_str(&format!("2.{bad}|{ct}|{mac}")).is_err());
+
+        // Control: the shape all nine cases were mutated from does parse, so
+        // the loop is not passing because every string is unparseable.
+        assert!(EncString::from_str(&format!("2.{iv}|{ct}|{mac}")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_ciphertext_is_refused_in_both_supported_types() {
+        let iv = b64(&[0; 16]);
+        let mac = b64(&[0; 32]);
+        assert!(EncString::from_str(&format!("2.{iv}||{mac}")).is_err());
+        assert!(EncString::from_str("4.").is_err());
+    }
+
+    // ---- MAC before decryption --------------------------------------------
+
+    /// **The MAC is checked, and a wrong one is a refusal rather than
+    /// garbage.**
+    #[test]
+    fn a_tampered_ciphertext_is_refused_and_not_decrypted() {
+        let (key, text) = nist_backed_enc_string(&[9u8; 32]);
+        let good = EncString::from_str(&text).expect("well-formed");
+
+        let EncString::AesCbc256HmacSha256B64 { iv, ct, mac } = good.clone() else {
+            panic!("wrong variant");
+        };
+        let mut flipped = ct.clone();
+        flipped[0] ^= 0x01;
+        let tampered = EncString::AesCbc256HmacSha256B64 { iv, ct: flipped, mac };
+        assert_eq!(decrypt(&key, &tampered), Err(CryptoError::MacMismatch));
+
+        // And a wrong MAC key on the right ciphertext, which is the other way
+        // the check can be reached.
+        let wrong_key = SymmetricKey { enc: key.enc.clone(), mac: Zeroizing::new([1u8; 32]) };
+        assert_eq!(decrypt(&wrong_key, &good), Err(CryptoError::MacMismatch));
+    }
+
+    /// The MAC covers **`iv || ct`**, not the ciphertext alone. Without this
+    /// an attacker could swap the IV -- which changes the first plaintext
+    /// block outright -- and the MAC would still verify.
+    #[test]
+    fn the_mac_covers_the_iv_as_well_as_the_ciphertext() {
+        let (key, text) = nist_backed_enc_string(&[9u8; 32]);
+        let EncString::AesCbc256HmacSha256B64 { ct, mac, .. } =
+            EncString::from_str(&text).expect("well-formed")
+        else {
+            panic!("wrong variant");
+        };
+        let swapped = EncString::AesCbc256HmacSha256B64 { iv: [0xff; 16], ct, mac };
+        assert_eq!(decrypt(&key, &swapped), Err(CryptoError::MacMismatch));
+    }
+
+    /// A symmetric key cannot be pointed at an RSA string, or the reverse.
+    /// Both directions are a named refusal rather than a wrong answer.
+    #[test]
+    fn the_two_key_kinds_are_not_interchangeable() {
+        let (key, _) = nist_backed_enc_string(&[9u8; 32]);
+        let rsa = EncString::Rsa2048OaepSha1B64 { ct: vec![0; 256] };
+        assert!(matches!(decrypt(&key, &rsa), Err(CryptoError::Unsupported(_))));
+
+        let sym = EncString::AesCbc256HmacSha256B64 {
+            iv: [0; 16],
+            ct: vec![0; 16],
+            mac: [0; 32],
+        };
+        assert!(matches!(decrypt_rsa(&[0; 8], &sym), Err(CryptoError::Unsupported(_))));
+    }
+
+    /// A throwaway RSA-2048 private key in PKCS#8 DER, generated with
+    /// **OpenSSL** for `rsa_oaep_sha1_opens_a_ciphertext_openssl_produced`:
+    /// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`, then
+    /// `openssl pkcs8 -topk8 -nocrypt -outform DER`. The second step is not
+    /// decoration: `genpkey -outform DER` emits a **PKCS#1** `RSAPrivateKey`,
+    /// which [`decrypt_rsa`] refuses -- as it should, and as this test
+    /// observed before the key was converted.
+    ///
+    /// It guards nothing and exists only in this file.
+    const ORG_KEY_PRIVATE_PKCS8_DER: &str = concat!(
+        "308204be020100300d06092a864886f70d0101010500048204a8308204a40201",
+        "000282010100bca69338a4fdb8d0ccf16c0c1c02f8ffa5ec1b20376b43b28b34",
+        "dbbce1dd377487dbe11b36075941a6c9fe418affc3081e790fa792d2f6dd36de",
+        "0152d1739ecb8f6c9963e3f016c3d94c8cb7ee74f83ee29521caf6c1cbcb0e4b",
+        "d28fe1864519e2b1acf45402a740c7fdb893c28906aa27bd0615a25370dfdbb1",
+        "0bd35a5ee6643504c5d551a047acd05fa60d50e135d54f27ad5a2ae708b939b4",
+        "7d7a760b43ab99a505f70ca10c782eaa512797019cf667f26780b7b00dfd26d6",
+        "27ce053784d97207aac954af97cc2bbe1a47a1327c7837f7f665cbe36bfe20b3",
+        "fb0594f753f7b316db286ec5f9b23bab3227286bd25ef9e3041d79e48668e7b1",
+        "488f9626fd990203010001028201004a8ae79172606f2ed24c730d35e456cf6d",
+        "98a5ff4ce6ad91574043b396ebfa85a94950e197afbfad1962a77cee97b150fb",
+        "f98a1e04fe275db1d8775d6a35ed8131e30f9950f0058ecdc659b4341d341a65",
+        "1dd884828c8122733bb2aff7c53e78c402c0fcaa5582112ef52a81f8547cb5af",
+        "8e1961630ae5870f201e341d79723f674d7b1d50dab8642e272241196486b7da",
+        "f90dab6528997e7bb221e092455c48d4948c5fe3d256432b1e615d20660cd0a3",
+        "7a9d21179597921977e9f893bdc2fb30a63e03f76b62d1af1cc4bcb29658df0d",
+        "940f10f42afca38d1a732a516edc66a237a75c4afc3a47c3e1e73bf03369d076",
+        "7dec6f2d9146beeb9a969f989061a102818100f8f12ac269ba0e082e5f271644",
+        "ac9427a7a94a0d97937859ca3e523e56f2de2306b3732eca06784fcee0534d40",
+        "873d71ca02b21e40edd7cf8c3a18ac1d28766cfd43c72f7c76159e81b19be040",
+        "a2edb1147271ba909481f7a3c00457a7b904e2bddc977c5c42fccacade0c93b8",
+        "62cfb20a781b66ca4904b379f659960fe988db02818100c1ffcf7add38efb57e",
+        "10779b96b5393df7fe6bcbe0143acfaf83cbac394b0691d186b825578a1bbc2b",
+        "e4c1df10c5b0ac3c64464fd50aa9912993901dbcd0bfe1dcbfa1b36a24d854df",
+        "2169d3bb29a94c18d07208c207f767bf025ac12d9b7e3ddbdba9930ede5bd8ab",
+        "776320372dd82b12dd28a4b6b87d0a6c22327e0030b39b02818100e2c33c420f",
+        "f0ed2b42a266868053fc390b1ec8580d44c6127489c47d08d2feca45265dbbb7",
+        "47a17c8164123d82942ec262538650ccb05b2fb1fa91d2e6549f5bb4707316ac",
+        "771c4660b99ad5f1caf85d9fd488087bfeeb4cdb1ae459bc6c6b28e7edf307d3",
+        "3b29eec850f07ff72bfb29a123bb422cedca9c7a728f34849624950281810088",
+        "66937c00952abd823093d85a837b06de1a0db2e00f79365362a84ea44de3059d",
+        "bb4a383f2f84c6ae59fe1217d9d7999230b2db28a0818ee61bb1a5a6ff631aac",
+        "3a34b850362dc0a6cdf8797d4c1293c592b1cb0499d3532792c13ab8156f1291",
+        "460619b6c792ee69c8dc7267399d96d3819a350d9ff392e36abbf3a9b0946702",
+        "818043aba77daf1feec0386385cc678f2ca09382657d23649da0d7b5fc22e277",
+        "da3e4676611049e8904a766f134983434e6a847013eaf660d6735226713fe836",
+        "21fa9dad6390a2d6ae4cab8a16f4291017a94f1501013cc5f7e77e41eae3be04",
+        "5d396e345fa34b0915e3f66f17760343869308500e4a4e43c30aaae69adc550c",
+        "71ca",
+    );
+
+    /// The 64 bytes `00 01 .. 3f` wrapped to the key above, by **OpenSSL**
+    /// and not by this crate: `openssl pkeyutl -encrypt -keyform DER -pkeyopt
+    /// rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha1 -pkeyopt
+    /// rsa_mgf1_md:sha1`.
+    const ORG_KEY_WRAPPED_OAEP_SHA1: &str = concat!(
+        "005691be74361eb94a830d8968f704a8396c5b1bf3c3c6a6ceb39554a293c17c",
+        "74685bc7652f3314b17f1096567d23a69da164094c6094dcc1b58cdac20414c0",
+        "a302882cdc41c712bd574f51a1fc125e20a9a37238f77650b533ed8aff6a45c8",
+        "8d1c52f9122bb48ab7f19a7a500cca748e0408d15742b6e09887f1f8cd4376ac",
+        "48b49336164c9190d4e9875e05a6decbba33e05a1cc654d8535abf48d495676e",
+        "02d8f294f046fbafe88b4c834dfe5e9717a988ed1f6be69657fc542788fa0748",
+        "03597ac6ab107f69b9e7ac1f62c830173e591cbb51d073c83386e0f3b48000cd",
+        "fc5415d5345114f6aff930b0d165286a7da7250836d24d49df0f826599296f7a",
+    );
+
+    /// **RSA-OAEP-SHA1, against a ciphertext this code did not produce.**
+    ///
+    /// The key pair and the ciphertext above came out of OpenSSL, an
+    /// independent implementation, and the plaintext is the 64 bytes
+    /// `00 01 .. 3f` -- the length and shape an organisation key has. So this
+    /// arm has external ground truth, in the way the composition test below
+    /// explicitly does not: if this module used SHA-256 for OAEP, or MGF1
+    /// with a different hash, or read the key as PKCS#1 rather than PKCS#8,
+    /// OpenSSL's ciphertext would not open.
+    #[test]
+    fn rsa_oaep_sha1_opens_a_ciphertext_openssl_produced() {
+        let key = hex(ORG_KEY_PRIVATE_PKCS8_DER);
+        let wrapped = EncString::Rsa2048OaepSha1B64 { ct: hex(ORG_KEY_WRAPPED_OAEP_SHA1) };
+        let org = unwrap_org_key(&key, &wrapped).expect("OpenSSL's own ciphertext");
+        let expected: Vec<u8> = (0..64u8).collect();
+        assert_eq!(*org.enc, expected[..32]);
+        assert_eq!(*org.mac, expected[32..]);
+
+        // Control: one flipped ciphertext byte does not open, so the
+        // assertion above is not passing on something OAEP ignored.
+        let mut ct = hex(ORG_KEY_WRAPPED_OAEP_SHA1);
+        ct[100] ^= 0x01;
+        assert_eq!(
+            unwrap_org_key(&key, &EncString::Rsa2048OaepSha1B64 { ct }),
+            Err(CryptoError::Rsa)
+        );
+    }
+
+    /// A private key that is not PKCS#8 DER is an error, not a panic.
+    #[test]
+    fn an_unreadable_private_key_is_an_error_rather_than_a_panic() {
+        let rsa = EncString::Rsa2048OaepSha1B64 { ct: vec![0; 256] };
+        assert_eq!(decrypt_rsa(b"not a key", &rsa), Err(CryptoError::Rsa));
+    }
+
+    // ---- padding ----------------------------------------------------------
+
+    #[test]
+    fn pkcs7_padding_is_stripped_and_malformed_padding_is_refused() {
+        let mut block = vec![0xaa; 11];
+        block.extend_from_slice(&[5u8; 5]);
+        assert_eq!(
+            strip_pkcs7(Zeroizing::new(block)).expect("well-formed padding").to_vec(),
+            vec![0xaa; 11]
+        );
+
+        // A full block of padding, which is what an exact-multiple plaintext
+        // gets and the case an off-by-one strips wrongly.
+        assert_eq!(strip_pkcs7(Zeroizing::new(vec![16u8; 16])).expect("full block").len(), 0);
+
+        for bad in [vec![0u8; 16], vec![17u8; 17], vec![5u8; 3], {
+            let mut v = vec![0xaa; 12];
+            v.extend_from_slice(&[4, 4, 3, 4]);
+            v
+        }] {
+            assert_eq!(strip_pkcs7(Zeroizing::new(bad)), Err(CryptoError::Padding));
+        }
+        assert_eq!(strip_pkcs7(Zeroizing::new(Vec::new())), Err(CryptoError::Padding));
+    }
+
+    // ---- the composition, and exactly what it does and does not prove -----
+
+    /// **This test proves the composition is self-consistent, and that is the
+    /// whole of what it proves.**
+    ///
+    /// It builds a protected symmetric key by encrypting 64 known bytes under
+    /// a stretched master key, then unwraps it and checks the 64 bytes come
+    /// back. The 64 bytes are chosen here, the encryption is done here, and
+    /// so a systematic error in the *composition* -- the wrong HKDF info
+    /// string, the salt normalised differently from the server, the encryption
+    /// and MAC halves swapped -- would be made identically on both sides and
+    /// would pass.
+    ///
+    /// **No external ground truth for this step could be established**, and
+    /// nothing in this crate can supply one. It needs an `EncString` produced
+    /// by Bitwarden's own client for a known password, email, KDF and
+    /// plaintext; Bitwarden publishes no such vector, and generating one here
+    /// would mean a real account on a real server, which no test in this
+    /// crate may touch. The primitives underneath are each pinned to a
+    /// published vector above; the arrangement of them is pinned to
+    /// Bitwarden's documentation and to this code agreeing with itself. That
+    /// is the honest description and it should not be paraphrased into a
+    /// stronger one.
+    ///
+    /// What it does catch, and is worth having for: a later edit that breaks
+    /// the round trip, reorders the MAC check, or changes one side of the
+    /// composition without the other.
+    #[test]
+    fn the_composition_is_self_consistent_and_that_is_all_it_is() {
+        use cbc::cipher::block_padding::Pkcs7;
+        use cbc::cipher::BlockEncryptMut;
+        type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+
+        // **Deliberately not the 600 000 a real account carries.** This test
+        // derives three master keys and none of them is testing PBKDF2's
+        // cost -- `pbkdf2_hmac_sha256_matches_rfc_7914` already pins the
+        // primitive, at the RFC's own 80 000. Running the real figure here
+        // adds about thirteen seconds to a debug suite and pins nothing.
+        const COMPOSITION_ITERATIONS: u32 = 1_000;
+
+        let master = master_key(b"correct horse battery staple", "User@Example.com", Kdf::Pbkdf2 {
+            iterations: COMPOSITION_ITERATIONS,
+        })
+        .expect("usable");
+        let stretched = master.stretch();
+
+        // The user key, known because this test chose it.
+        let user_key: Vec<u8> = (0..64u8).collect();
+
+        let iv = [0x5au8; 16];
+        let mut buf = vec![0u8; 64 + 16];
+        buf[..64].copy_from_slice(&user_key);
+        let ct = Aes256CbcEnc::new((&*stretched.enc).into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, 64)
+            .expect("room for one padding block")
+            .to_vec();
+        let mut hmac =
+            <HmacSha256 as Mac>::new_from_slice(&*stretched.mac).expect("any key length");
+        hmac.update(&iv);
+        hmac.update(&ct);
+        let mac = hmac.finalize().into_bytes();
+
+        let protected =
+            EncString::from_str(&format!("2.{}|{}|{}", b64(&iv), b64(&ct), b64(&mac)))
+                .expect("well-formed");
+        let unwrapped = unwrap_user_key(&stretched, &protected).expect("the right key");
+        assert_eq!(*unwrapped.enc, user_key[..32]);
+        assert_eq!(*unwrapped.mac, user_key[32..]);
+
+        // Controls, which are the part of this test that can actually fail
+        // for a real reason: the wrong password does not unwrap it, and the
+        // wrong email does not either.
+        let wrong_password =
+            master_key(b"correct horse battery stapl", "User@Example.com", Kdf::Pbkdf2 {
+                iterations: COMPOSITION_ITERATIONS,
+            })
+            .expect("usable");
+        assert_eq!(
+            unwrap_user_key(&wrong_password.stretch(), &protected),
+            Err(CryptoError::MacMismatch)
+        );
+        let wrong_email =
+            master_key(b"correct horse battery staple", "other@example.com", Kdf::Pbkdf2 {
+                iterations: COMPOSITION_ITERATIONS,
+            })
+            .expect("usable");
+        assert_eq!(
+            unwrap_user_key(&wrong_email.stretch(), &protected),
+            Err(CryptoError::MacMismatch)
+        );
+    }
+
+    /// A decrypted "key" of the wrong length is refused rather than padded or
+    /// truncated into one.
+    #[test]
+    fn a_protected_key_that_is_not_64_bytes_is_refused() {
+        assert_eq!(
+            SymmetricKey::from_64(&[0u8; 32]),
+            Err(CryptoError::KeyLength { expected: 64, got: 32 })
+        );
+        assert!(SymmetricKey::from_64(&[0u8; 64]).is_ok());
+    }
+
+    /// A round trip through the NIST-backed `EncString`: the ciphertext and
+    /// the expected plaintext are both NIST's, so this one *does* have
+    /// external ground truth for its AES half. Only the MAC is computed here,
+    /// and HMAC-SHA256 is pinned to RFC 4231 above.
+    ///
+    /// The plaintext is not PKCS#7-padded (NIST's vectors are not), so
+    /// `decrypt` refuses its padding -- and that refusal is the assertion:
+    /// it reached the padding step, which means the MAC verified and the
+    /// AES-CBC decryption ran.
+    #[test]
+    fn the_mac_and_cbc_layers_compose_over_the_nist_vector() {
+        let (key, text) = nist_backed_enc_string(&[9u8; 32]);
+        let enc = EncString::from_str(&text).expect("well-formed");
+        assert_eq!(
+            decrypt(&key, &enc),
+            Err(CryptoError::Padding),
+            "the MAC must verify and the CBC layer must run before padding is judged"
+        );
+
+        // And the block underneath really is NIST's plaintext.
+        let EncString::AesCbc256HmacSha256B64 { iv, ct, .. } = &enc else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            cbc_decrypt_raw(&key.enc, iv, ct).expect("whole blocks").to_vec(),
+            hex(NIST_PLAINTEXT)
+        );
+    }
+
+    // ---- no secret in a message -------------------------------------------
+
+    /// **Every error this module can produce prints without a secret in it**,
+    /// and every secret-bearing type prints redacted.
+    #[test]
+    fn nothing_here_prints_a_secret() {
+        let master = MasterKey(Zeroizing::new([0xde; 32]));
+        let printed = format!("{master:?}");
+        assert!(!printed.contains("222"), "a byte of the key reached Debug: {printed}");
+        assert!(printed.contains("redacted"));
+
+        let stretched = master.stretch();
+        let printed = format!("{stretched:?}");
+        assert!(printed.contains("redacted"));
+        // Control on the assertion itself: the real bytes would have shown up
+        // as decimal in a derived `Debug`, and they do not.
+        let first = stretched.enc[0];
+        assert!(!printed.contains(&format!("{first}")), "{printed}");
+
+        let (_, text) = nist_backed_enc_string(&[9u8; 32]);
+        let enc = EncString::from_str(&text).expect("well-formed");
+        let printed = format!("{enc:?}");
+        assert!(printed.contains("64 ciphertext bytes"), "{printed}");
+        assert!(!printed.contains("245"), "a ciphertext byte reached Debug: {printed}");
+
+        // The errors, each rendered through `Display`, which is what a log
+        // line would use.
+        for error in [
+            CryptoError::KdfParams("iteration count is zero"),
+            CryptoError::Malformed("no `.` between type and body"),
+            CryptoError::Unsupported("AesCbc256_B64"),
+            CryptoError::UnknownType,
+            CryptoError::MacMismatch,
+            CryptoError::Padding,
+            CryptoError::KeyLength { expected: 64, got: 32 },
+            CryptoError::Rsa,
+        ] {
+            let text = error.to_string();
+            assert!(!text.is_empty());
+            assert!(!text.contains("222"), "{text}");
+        }
+    }
+}

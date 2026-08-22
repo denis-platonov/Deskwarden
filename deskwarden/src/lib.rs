@@ -81,6 +81,12 @@ pub mod record;
 /// the picker is wired to it, exactly as `screen_capture` below has none yet.
 pub mod region_overlay;
 pub mod reprompt;
+/// The direct-REST vault backend, without the `bw` CLI. Only its client-side
+/// cryptography exists so far and nothing in the running app reaches it: no
+/// HTTP, no API client, no login flow, no wiring. It changes what this
+/// process holds -- see `rest::crypto`'s module docs, which is where that is
+/// written down and where `PRIVACY.md` is flagged for revisiting.
+pub mod rest;
 /// `scan_history.json`: what the last twenty breach scans counted. Counts and
 /// timestamps only -- never a password, an item, or anything derived from one.
 pub mod scan_history;

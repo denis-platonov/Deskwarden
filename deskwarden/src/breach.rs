@@ -2250,11 +2250,31 @@ mod tests {
     /// `sha1`/`sha2`, pinned against RFC 2202/4231's HMAC vectors and RFC
     /// 6238's TOTP vectors.
     ///
+    /// **`rest/crypto.rs` may use the CRATE, and this one really is SHA-1 as
+    /// a security primitive.** It is the third carve-out and the only one
+    /// that has to admit that outright, so it is worth being exact about what
+    /// it is and is not. Bitwarden's `EncString` type 4 --
+    /// `Rsa2048_OaepSha1_B64`, how an organisation's symmetric key is wrapped
+    /// for a member -- is RSA-OAEP with **SHA-1** as the OAEP hash and MGF1
+    /// hash. That is the format the ciphertext on the server is already in.
+    /// A client cannot choose a different hash and still open it, and there
+    /// is no second, better-hashed copy of an org key to read instead.
+    ///
+    /// It is not a *second implementation*, which is the rule here: it is the
+    /// same `sha1` crate this module already depends on, handed to `rsa` as a
+    /// type parameter. And OAEP's use of a hash is not the use SHA-1's
+    /// collision breaks make dangerous -- OAEP needs it as a mask generator
+    /// and a one-way padding check, not as a signature over
+    /// attacker-chosen data. That is a real argument and not a comfortable
+    /// one; it is written here so the next reader weighs it rather than
+    /// inherits it.
+    ///
     /// The rule this test protects is unchanged and still worth having: **no
     /// SECOND implementation of SHA-1, and no use of it as a security
-    /// primitive nobody looked at.** Two files may name it, each for a reason
-    /// written down here; every other file in the crate still may not. A named
-    /// list rather than a loosened needle, for the same reason as before.
+    /// primitive nobody looked at.** Three files may name it, each for a
+    /// reason written down here; every other file in the crate still may not.
+    /// A named list rather than a loosened needle, for the same reason as
+    /// before.
     #[test]
     fn sha1_is_confined_to_the_breach_module() {
         const TYPE_NAME: &str = concat!("Sha", "1");
@@ -2264,6 +2284,10 @@ mod tests {
         /// The one file allowed BOTH needles: the live code on the "add a
         /// one-time code" confirmation. See this test's docs.
         const HMAC_EXEMPT: &str = "vault_window/totp_add.rs";
+        /// The other file allowed BOTH needles: RSA-OAEP-SHA1, which is the
+        /// hash Bitwarden's `EncString` type 4 is already encrypted under.
+        /// See this test's docs.
+        const OAEP_EXEMPT: &str = "rest/crypto.rs";
 
         let files = crate_source_files();
         assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
@@ -2278,7 +2302,7 @@ mod tests {
 
         let mut offenders = Vec::new();
         for (path, text) in &files {
-            if path == "breach.rs" || path == HMAC_EXEMPT {
+            if path == "breach.rs" || path == HMAC_EXEMPT || path == OAEP_EXEMPT {
                 continue;
             }
             for needle in [TYPE_NAME, CRATE_PATH] {
@@ -2362,6 +2386,29 @@ mod tests {
                 && hmac.1.contains(concat!("pub fn code", "_at(")),
             "{HMAC_EXEMPT} no longer computes a one-time code, which is the whole reason it \
              may name SHA-1 at all"
+        );
+
+        // 5. The THIRD carve-out, on exactly the same terms: it names a file
+        //    that exists, it is load-bearing, and the reason it holds is
+        //    visible in that file rather than only in a comment here. The
+        //    reason is RSA-OAEP with SHA-1, which is the hash Bitwarden's
+        //    `EncString` type 4 is already encrypted under -- so if the
+        //    OAEP call goes, so does the exemption.
+        const OAEP_EXEMPT: &str = "rest/crypto.rs";
+        let oaep = files
+            .iter()
+            .find(|(path, _)| path == OAEP_EXEMPT)
+            .expect("the OAEP carve-out names a file that is not in this crate");
+        assert!(
+            oaep.1.contains(CRATE_PATH),
+            "{OAEP_EXEMPT} no longer uses {CRATE_PATH:?}, so its carve-out in \
+             `sha1_is_confined_to_the_breach_module` is an open hole with no reason left. \
+             Delete it."
+        );
+        assert!(
+            oaep.1.contains(concat!("Oaep::new::<sha", "1::Sha1>()")),
+            "{OAEP_EXEMPT} no longer unwraps an organisation key with RSA-OAEP-SHA1, which is \
+             the whole reason it may name SHA-1 at all"
         );
     }
 

@@ -160,6 +160,54 @@ png = "0.17"
 # `equivalent` and `foldhash` were already in the tree.
 rqrr = { version = "0.10", default-features = false }
 
+# ---- the direct-REST vault backend's cryptography (src/rest/crypto.rs) -----
+#
+# These six exist for ONE reason: talking to a Bitwarden-compatible server
+# without the `bw` CLI means this process derives the master key itself and
+# unwraps every key below it. `bw` did that until now, which is why none of
+# these were here. All six are RustCrypto, the same family as the `sha2`,
+# `aes-gcm` and `argon2` already above, so they share `digest`/`subtle`/
+# `cipher` rather than bringing a second set.
+#
+# `aes` is the AES-256 block cipher for the CBC half of Bitwarden's
+# `EncString` (its AEAD sibling `aes-gcm`, already here, cannot be pointed at
+# CBC). It is ALREADY IN THE TREE as `aes-gcm`'s own dependency and at the
+# same version, so naming it here adds a line and no crate.
+aes = "0.8"
+# CBC mode over that block cipher, with PKCS#7 unpadding. One crate, no
+# transitive additions: it is `cipher`, which is already here.
+cbc = "0.1"
+# HMAC-SHA256, used for BOTH halves of the composition: the MAC that
+# authenticates an `EncString` before a single byte of it is decrypted, and
+# the PRF inside PBKDF2 and HKDF below. One crate, over the `digest` traits
+# `sha2` already provides. Its `verify_slice` is the constant-time comparison
+# the MAC check goes through -- `subtle::ConstantTimeEq` underneath, which is
+# why no separate `subtle` line appears here.
+hmac = "0.12"
+# HKDF-SHA256, for the one step Bitwarden calls "key stretching": the 32-byte
+# master key is EXPANDED (extract is skipped -- the master key is the PRK)
+# into a 32-byte encryption key and a 32-byte MAC key. Hand-rolling ten lines
+# of RFC 5869 was the alternative and was rejected: this crate is verified
+# against the RFC's own vectors upstream as well as in `rest::crypto`.
+hkdf = "0.12"
+# PBKDF2-HMAC-SHA256, the master-key KDF for every account whose server did
+# not move it to Argon2id. `default-features = false` drops the `simple`
+# feature and with it the `password-hash` string format, which nothing here
+# uses: the input is a per-account iteration count from the server and the
+# output is 32 raw bytes.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# RSA-OAEP-SHA1, and nothing else, for unwrapping an ORGANISATION's symmetric
+# key with the user's private key. There is no way to avoid it: that is the
+# format Bitwarden servers store organisation keys in.
+#
+# It is the only crate here that is not small. It brings `num-bigint-dig` and
+# its arithmetic tail. It also carries RUSTSEC-2023-0071 (the Marvin attack --
+# a timing side-channel in RSA decryption) with no fixed version available;
+# see the module docs in `src/rest/crypto.rs` for why a LOCAL, one-shot
+# unwrap of an already-fetched org key is not the repeated-oracle exposure
+# that advisory is about, and `deny.toml` for the recorded decision.
+rsa = "0.9"
+
 [dev-dependencies]
 mockito = "1"
 

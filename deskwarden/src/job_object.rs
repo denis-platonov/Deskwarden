@@ -2111,7 +2111,31 @@ mod tests {
             // appeared, and `[build-dependencies]` still reads exactly
             // `winresource = "0.1"`. 8522 -> 8837 bytes, all of it the
             // feature name and the comment above it.
-            (8837, 0x62bd_d4b7_fcdd_2235_u64),
+            //
+            // **Re-pinned because dependencies really did move**, and more of
+            // them at once than any previous hop: SIX names were ADDED, all
+            // from crates.io, all RustCrypto, for `src/rest/crypto.rs` -- the
+            // client-side cryptography of a direct-REST vault backend, which
+            // is work the `bw` CLI did for this app until now. `aes` (already
+            // in the tree as `aes-gcm`'s own dependency and at the same
+            // version, so it adds a line and no crate), `cbc`, `hmac`,
+            // `hkdf`, `pbkdf2` (`default-features = false`,
+            // `features = ["hmac"]`) and `rsa`.
+            //
+            // No existing name was removed or re-pointed, no
+            // `[patch]`/`[replace]` table was introduced, no path or fork
+            // appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. They bring TWENTY-ONE crates into the
+            // tree, and the count is worth stating because fifteen of them
+            // are `rsa`'s tail: `num-bigint-dig`, `num-integer`, `num-iter`,
+            // `libm`, `rand`, `rand_chacha`, `signature`, `spin`,
+            // `lazy_static`, and the `der`/`spki`/`pkcs1`/`pkcs8`/
+            // `const-oid`/`pem-rfc7468` key-format stack. `rsa` also carries
+            // RUSTSEC-2023-0071 with no fixed version; that decision is
+            // recorded in `deny.toml`, not here.
+            // 8837 -> 11684 bytes, all of it the new entries and the comments
+            // above them.
+            (11684, 0xf9ac_e17e_ea52_bf7c_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
