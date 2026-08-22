@@ -569,13 +569,13 @@ mod win32 {
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polygon, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
-        CLEARTYPE_QUALITY, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
         SRCCOPY, TRANSPARENT,
     };
@@ -619,10 +619,10 @@ mod win32 {
     /// `theme`'s `Color32` as GDI's BGR `COLORREF`.
     ///
     /// One conversion, used everywhere, so that no hex value in this file is
-    /// a palette entry written out a second time.
-    fn rgb(c: eframe::egui::Color32) -> COLORREF {
-        COLORREF((c.r() as u32) | ((c.g() as u32) << 8) | ((c.b() as u32) << 16))
-    }
+    /// a palette entry written out a second time. Lives in
+    /// [`crate::win32_draw`] now, alongside [`crate::win32_draw::draw_button`]
+    /// which every button in this window paints through.
+    use crate::win32_draw::rgb;
 
     // ---- fonts -------------------------------------------------------------
 
@@ -1518,6 +1518,8 @@ mod win32 {
     }
 
     fn paint_button(button: HWND, id: isize) {
+        use crate::win32_draw::{draw_button, ButtonSkin};
+
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(button, &mut ps);
@@ -1529,24 +1531,15 @@ mod win32 {
             let disabled = primary && BUSY.load(Ordering::SeqCst);
             let focused = GetFocus() == button;
 
-            let (fill_colour, text_colour, border) = if primary {
-                (
-                    if disabled {
-                        crate::theme::BLUE_SOFT
-                    } else if hovered {
-                        crate::theme::BLUE_BRIGHT
-                    } else {
-                        crate::theme::BLUE
-                    },
-                    crate::theme::CARD,
-                    None,
-                )
+            // `ButtonSkin::primary`/`secondary` are the two looks this app
+            // has; `hovered` and `disabled` are states layered on top of
+            // whichever one applies, not a third and fourth palette.
+            let skin = if primary {
+                let skin = ButtonSkin::primary();
+                if disabled { skin.disabled() } else { skin }
             } else {
-                (
-                    if hovered { crate::theme::CANVAS } else { crate::theme::CARD },
-                    crate::theme::INK,
-                    Some((1, crate::theme::BORDER_STRONG)),
-                )
+                let skin = ButtonSkin::secondary();
+                if hovered { ButtonSkin { fill: rgb(crate::theme::CARD_TINT), ..skin } } else { skin }
             };
 
             let mem = CreateCompatibleDC(hdc);
@@ -1558,18 +1551,31 @@ mod win32 {
             fill(mem, rc, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
-            let whole = Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom };
-            if focused {
-                rounded(mem, whole, 8, crate::theme::FOCUS_RING, None);
-                rounded(mem, inset(whole, 2, 2, 2, 2), 7, fill_colour, border);
-            } else {
-                rounded(mem, whole, 7, fill_colour, border);
-            }
+            let whole = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom };
+            let radius = scale(7);
+            let label = if primary { "Unlock" } else { "Cancel" };
 
             let guard = FONTS.lock();
-            if let Some(fonts) = guard.as_ref().ok().and_then(|s| s.as_ref()) {
-                let label = if primary { "Unlock" } else { "Cancel" };
-                text(mem, fonts.button, whole, label, text_colour, DT_CENTER, 0);
+            let font = guard.as_ref().ok().and_then(|s| s.as_ref()).map(|fonts| fonts.button);
+            if let Some(font) = font {
+                if focused {
+                    rounded(
+                        mem,
+                        Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom },
+                        8,
+                        crate::theme::FOCUS_RING,
+                        None,
+                    );
+                    let inner = RECT {
+                        left: whole.left + 2,
+                        top: whole.top + 2,
+                        right: whole.right - 2,
+                        bottom: whole.bottom - 2,
+                    };
+                    draw_button(mem, inner, label, font, skin, radius);
+                } else {
+                    draw_button(mem, whole, label, font, skin, radius);
+                }
             }
             drop(guard);
 

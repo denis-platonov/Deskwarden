@@ -113,5 +113,6 @@ pub mod vault_cache;
 pub mod vault_disk_cache;
 pub mod vault_export;
 pub mod vault_window;
+pub mod win32_draw;
 pub mod window_list;
 pub mod window_watch;
