@@ -1426,10 +1426,12 @@ impl Preview {
         use deskwarden::update_panel::UpdateStage;
         use deskwarden::updater::ReleaseInfo;
 
-        // Longer than `UPDATE_NOTES_HEIGHT` can show on purpose, so the
-        // screenshots answer "does the region scroll or does it grow" -- the
-        // one thing about this card that a too-long release body could break,
-        // on a window with no scrollbar of its own and no resize.
+        // Longer than the page can show on purpose, so the screenshots answer
+        // "does the region scroll or does it grow past the window" -- the one
+        // thing about this card that a too-long release body could break, on
+        // a window with no scrollbar of its own and no resize. The region now
+        // takes the page's remaining height rather than a fixed 128 points,
+        // so this body has to beat the WINDOW, not a constant.
         let release = ReleaseInfo {
             version: semver::Version::parse("0.9.0").unwrap(),
             installer_download_url: "https://example.invalid/deskwarden-0.9.0-installer.exe"
@@ -1486,13 +1488,21 @@ impl Preview {
                 .to_string(),
                 ..release
             }),
-            // **What a user three releases behind is shown.** Built in the
+            // **What a user seven releases behind is shown.** Built in the
             // exact shape `updater::notes_across` composes -- one `##`
             // heading per version, newest first, and the release that
             // published no notes NAMED rather than missing, because a range
             // with a hole in it is not a range. This is also the case where
             // a scrollbar is legitimately wanted, so one picture reviews
             // both halves.
+            //
+            // **Seven rather than three, since the region grew.** The notes
+            // region now takes the page's remaining height instead of a
+            // fixed 128 points, and three versions no longer come close to
+            // filling it -- which would have left every screenshot in this
+            // set showing a region that fits, and the scrolling half of the
+            // behaviour reviewed by nobody. The count is chosen against the
+            // window, which is what it was always really measuring.
             Surface::PrefsUpdatesManyReleases => UpdateStage::Available(ReleaseInfo {
                 body: concat!(
                     "## Deskwarden 0.9.0\n",
@@ -1505,6 +1515,23 @@ impl Preview {
                     "## Deskwarden 0.8.5\n",
                     "- The vault window remembers its size, via `settings.json`.\n",
                     "- Details on [the release page](https://example.invalid/r).\n",
+                    "\n",
+                    "## Deskwarden 0.8.4\n",
+                    "- Cyrillic names render in the app's own typeface.\n",
+                    "- One Deskwarden per session, and starting it again takes over.\n",
+                    "- Password health rows line up with the item list again.\n",
+                    "\n",
+                    "## Deskwarden 0.8.3\n",
+                    "- The favourite star is lighter, rounder and quieter.\n",
+                    "- Browsers no longer get the \"no saved login\" card.\n",
+                    "\n",
+                    "## Deskwarden 0.8.2\n",
+                    "- The autofill prompt setting silences every pop-up.\n",
+                    "- The reveal eye is taller and rounder.\n",
+                    "\n",
+                    "## Deskwarden 0.8.1\n",
+                    "- The tray menu names the account it is signed in as.\n",
+                    "- Preferences opens on the page it was last left on.\n",
                 )
                 .to_string(),
                 ..release

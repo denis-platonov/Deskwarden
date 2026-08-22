@@ -596,16 +596,29 @@ const UPDATE_NOTES_LABEL: &str = "What is new";
 /// failed to load.
 const UPDATE_NOTES_EMPTY: &str = "This release came with no notes.";
 
-/// The notes region's height.
+/// The floor under the notes region's height.
 ///
-/// Fixed, with the region scrolling inside it. **This is a requirement, not a
-/// style choice.** A GitHub release body is written by whoever cut the release
-/// and can be any length; a region that grew to fit one would push the buttons
-/// below the bottom edge of a window that is not resizable. This crate has
-/// shipped a layout that put a control out of reach before. The character
-/// bound in `updater::release_notes_for_display` is the second half of the
-/// same guarantee, covering layout cost rather than reach.
-const UPDATE_NOTES_HEIGHT: f32 = 128.0;
+/// **This used to be the region's fixed height, and the reasoning that made
+/// it fixed still holds -- it is now enforced by a different quantity.** A
+/// GitHub release body is written by whoever cut the release and can be any
+/// length; a region that grew *to fit its content* would push the buttons
+/// below the bottom edge of a window that is not resizable, and this crate
+/// has shipped a layout that put a control out of reach before. What
+/// [`notes_max_height`] does instead is grow the region to the space the page
+/// still HAS -- never to what the notes want -- so the ceiling is the page's
+/// own remaining height, and nothing below the region can be displaced
+/// because below it there is nothing left. Overflow still scrolls; it simply
+/// scrolls later.
+///
+/// The floor bites only on a page whose remaining space is smaller than this,
+/// which the shipping window sizes do not produce. Kept at the old fixed
+/// height so that case is exactly today's behaviour rather than a new one,
+/// and so a degenerate rect cannot collapse the region to nothing.
+///
+/// The character bound in `updater::release_notes_for_display` is unchanged
+/// and still the second half of the guarantee, covering layout cost rather
+/// than reach.
+const UPDATE_NOTES_MIN_HEIGHT: f32 = 128.0;
 
 /// Vertical distance between two lines of the notes, and between two
 /// paragraphs of them.
@@ -2577,7 +2590,8 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 /// The notes region: a heading, then the release body rendered through the
-/// bounded Markdown subset in `updater`, inside a fixed-height scroll area.
+/// bounded Markdown subset in `updater`, inside a scroll area bounded by the
+/// page's remaining height.
 ///
 /// Two things this deliberately does not do:
 ///
@@ -2586,10 +2600,10 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
 ///   anywhere a release author chose. The argument for drawing that line
 ///   exactly there is in `updater`'s subset header, next to the parser it
 ///   governs.
-/// * It does not size itself to its content. The height is
-///   [`UPDATE_NOTES_HEIGHT`] whatever arrives, and the overflow scrolls, so
-///   no release body can push the buttons above it off a window that cannot
-///   be resized.
+/// * It does not size itself to its content. Its ceiling is
+///   [`notes_max_height`] -- the space the page still has, never what the
+///   notes want -- and the overflow scrolls, so no release body can push the
+///   buttons above it off a window that cannot be resized.
 ///
 /// The body has already been through `updater::release_notes_blocks`, which
 /// runs `release_notes_for_display` -- control characters, bidi overrides,
@@ -2654,11 +2668,17 @@ fn release_notes(ui: &mut Ui, body: &str) {
             scroll.active_handle_opacity = 1.0;
             scroll.interact_handle_opacity = 1.0;
         }
+        // Measured HERE, after the heading and immediately before the region
+        // that will consume it, because that is the only moment the number
+        // means "what is left". Read a row earlier and it would include the
+        // heading; read outside the card row it would include the card's own
+        // bottom padding, which `card_row`'s frame has already taken off.
+        let ceiling = notes_max_height(ui);
         let scrolled = egui::ScrollArea::vertical()
-            .max_height(UPDATE_NOTES_HEIGHT)
+            .max_height(ceiling)
             .auto_shrink([false, true])
             // **Always visible, never on hover.** Long notes are clipped at
-            // `UPDATE_NOTES_HEIGHT`, and clipped text with no scrollbar reads
+            // that ceiling, and clipped text with no scrollbar reads
             // as text that failed to load rather than as text that continues.
             // egui's default hides the bar until the pointer is inside the
             // region, which puts the only cue that there is more to read
@@ -2765,7 +2785,7 @@ fn notes_line(
 
     if let Some(level) = heading {
         // Two sizes, not six. A release body's headings are section names
-        // ("Added", "Fixed"); a scale with six steps inside a 128pt region
+        // ("Added", "Fixed"); a scale with six steps inside a region this size
         // would be a hierarchy nobody can see.
         let size = if level <= 2 { 13.0 } else { 12.0 };
         for span in spans {
@@ -2833,6 +2853,40 @@ fn notes_line(
         ui.add_space(inset);
         ui.add(egui::Label::new(job));
     });
+}
+
+/// How tall the notes region is allowed to get: **whatever the page has
+/// left**, floored at [`UPDATE_NOTES_MIN_HEIGHT`].
+///
+/// # Why this is safe where sizing to the content would not be
+///
+/// The old fixed 128 points existed to stop a long release body pushing the
+/// Download button off a window that cannot be resized or scrolled. Growing
+/// to `available_height()` cannot do that, and the reason is structural
+/// rather than arithmetical: this region is the last row of the last card on
+/// the Updates page (see [`draw_update_card`]), the page itself has no
+/// scroll area of its own -- [`draw_prefs_body`] hands the content column a
+/// bounded `max_rect` -- and `available_height` is the distance from the
+/// region's own top to the bottom of that rect. Taking all of it displaces
+/// nothing, because everything that could be displaced is already above.
+/// Anything the notes need beyond it still scrolls, exactly as before; the
+/// only change is where "beyond" starts.
+///
+/// Short notes are unaffected: `auto_shrink([false, true])` on the region
+/// means this is a CEILING, and a body that needs 40 points takes 40. That
+/// was true at 128 too, and it is why raising the ceiling cannot leave a
+/// short body sitting in an oversized box.
+///
+/// # Not cached, and not a constant
+///
+/// The card is drawn at two widths and two heights by the window shell and
+/// the vault modal, and the rows above it change with the update stage -- a
+/// progress bar appears mid-download, the "automatic checks are off" note
+/// comes and goes with a setting. A number computed once would be the wrong
+/// number on the next stage. It is read from the live `Ui` every frame for
+/// the same reason `notes_line` reads its wrap width there.
+fn notes_max_height(ui: &Ui) -> f32 {
+    ui.available_height().max(UPDATE_NOTES_MIN_HEIGHT)
 }
 
 /// Whether the notes are short enough that there is nothing to scroll, which
@@ -6150,7 +6204,13 @@ mod tests {
         frame(&ctx, &mut state, &[])
     }
 
-    /// A release body far longer than [`UPDATE_NOTES_HEIGHT`] can show.
+    /// A release body far longer than [`notes_max_height`] can show.
+    ///
+    /// Sixty lines, which is far past the whole page's height and so past the
+    /// region's ceiling however much of the page it is given. Sized this way
+    /// on purpose: the number is not tuned to the old fixed 128 points, so it
+    /// keeps meaning "overflows" now that the ceiling is the page's own
+    /// remaining space.
     fn notes_that_overflow() -> String {
         (0..60)
             .map(|n| format!("line {n} of a release note that keeps going"))
@@ -6218,7 +6278,7 @@ mod tests {
         );
         assert!(
             paints_a_visible_scrollbar(&long),
-            "notes clipped at UPDATE_NOTES_HEIGHT with no bar read as text that failed to \
+            "notes clipped at the region's ceiling with no bar read as text that failed to \
              load rather than as text that continues -- and the bar must be there WITHOUT \
              the pointer, which this frame has nowhere near the region"
         );
@@ -6253,6 +6313,79 @@ mod tests {
                 && (short_card.left() - long_card.left()).abs() < 0.5,
             "the card moved with the length of its notes: short {short_card:?}, long \
              {long_card:?}"
+        );
+        // **The RIGHT edge, stated separately.** Equal widths and equal left
+        // edges already imply it arithmetically, but the right edge is the
+        // one a person sees against the Version card above, and it is the
+        // edge a re-subtracted gutter would move. Asserted in its own name so
+        // a future change to how the width is measured cannot quietly drop
+        // the property this test exists for.
+        assert!(
+            (short_card.right() - long_card.right()).abs() < 0.5,
+            "the card's right edge moved with the length of its notes: short {} long {}",
+            short_card.right(),
+            long_card.right()
+        );
+    }
+
+    /// **The region takes the page's remaining height, then scrolls.**
+    ///
+    /// The reported request: "that area should expand until the end of the
+    /// screen and only then scroll if needed". Both halves are here, and the
+    /// second half is the one that used to be a fixed 128 points.
+    ///
+    /// Read off the CARD rather than off the scroll area, because the card is
+    /// drawn around whatever its rows came to and is therefore the honest
+    /// witness to how tall the region actually got. A body that overflows
+    /// must reach the bottom of the page's content area; a short one must not
+    /// -- it must still stop at its own last line, which is what stops a
+    /// three-line release note sitting in a box of empty white.
+    #[test]
+    fn long_notes_fill_the_page_and_short_notes_only_take_what_they_need() {
+        let short = paint_updates_settled(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let long = paint_updates_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: notes_that_overflow(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        let short_card = notes_card_rect(&short);
+        let long_card = notes_card_rect(&long);
+
+        // Down to the page's own edge, give or take the content padding the
+        // column was shrunk by. Not asserted to the point, because the exact
+        // value is `CONTENT_PAD_Y` plus a card's own inner padding and that
+        // arithmetic is the layout's business, not this test's.
+        assert!(
+            long_card.bottom() > BODY_SIZE.y - CONTENT_PAD_Y - 2.0,
+            "long notes stopped {} points short of the page's bottom edge ({}), so the region \
+             is still capped at something other than the space available",
+            BODY_SIZE.y - long_card.bottom(),
+            BODY_SIZE.y
+        );
+        // ...and never past it, which is the guarantee the old fixed height
+        // was protecting and that this must not have spent.
+        assert!(
+            long_card.bottom() <= BODY_SIZE.y,
+            "the notes card ran off the bottom of a page that cannot scroll or resize: {}",
+            long_card.bottom()
+        );
+
+        // The short body is a single line. Anything close to the page's height
+        // here would mean the region had grown to its ceiling rather than to
+        // its content -- the "128pt box with empty space" defect, moved down
+        // the page rather than fixed.
+        assert!(
+            short_card.bottom() < long_card.bottom() - UPDATE_NOTES_MIN_HEIGHT,
+            "a short release note took the whole page anyway: short card ends at {}, long at \
+             {}",
+            short_card.bottom(),
+            long_card.bottom()
         );
     }
 

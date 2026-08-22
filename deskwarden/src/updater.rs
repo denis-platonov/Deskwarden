@@ -646,7 +646,7 @@ const RELEASES_PER_PAGE: usize = 100;
 ///
 /// Separate from [`RELEASES_PER_PAGE`] because it bounds a different thing:
 /// not how much is fetched but how much is composed into a string that a
-/// fixed-height region then lays out. `release_notes_for_display`'s character
+/// bounded-height region then lays out. `release_notes_for_display`'s character
 /// bound is the backstop, and this keeps the work before that bound from
 /// being a hundred bodies' worth of allocation for text nobody scrolls to.
 const MAX_NOTES_RELEASES: usize = 20;
