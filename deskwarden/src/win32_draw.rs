@@ -33,12 +33,21 @@ pub struct ButtonSkin {
     pub fill: COLORREF,
     pub text: COLORREF,
     pub border: Option<COLORREF>,
+    /// The fill to use when the pointer is over the button. Carried as a
+    /// field set by each constructor so `hovered()` never needs to know
+    /// which kind of skin it was called on.
+    hover_fill: COLORREF,
 }
 
 impl ButtonSkin {
     /// The blue call-to-action.
     pub fn primary() -> Self {
-        Self { fill: rgb(crate::theme::BLUE_BRIGHT), text: rgb(crate::theme::CARD), border: None }
+        Self {
+            fill: rgb(crate::theme::BLUE),
+            text: rgb(crate::theme::CARD),
+            border: None,
+            hover_fill: rgb(crate::theme::BLUE_BRIGHT),
+        }
     }
 
     /// The quiet one beside it. **Bordered on purpose**: it is card-coloured
@@ -48,6 +57,7 @@ impl ButtonSkin {
             fill: rgb(crate::theme::CARD),
             text: rgb(crate::theme::INK),
             border: Some(rgb(crate::theme::BORDER)),
+            hover_fill: rgb(crate::theme::CARD_TINT),
         }
     }
 
@@ -55,6 +65,14 @@ impl ButtonSkin {
     /// leave the disabled variant behind.
     pub fn disabled(self) -> Self {
         Self { fill: rgb(crate::theme::TOGGLE_OFF), text: rgb(crate::theme::TEXT_GHOST), ..self }
+    }
+
+    /// Hovered, derived the same way `disabled()` is: the fill changes to
+    /// whichever hover shade this skin's constructor picked, nothing else.
+    /// Symmetric with `disabled()` so neither the primary nor the secondary
+    /// button special-cases hover at the call site.
+    pub fn hovered(self) -> Self {
+        Self { fill: self.hover_fill, ..self }
     }
 }
 
@@ -116,6 +134,28 @@ mod tests {
              read as a button at all -- this is the defect the stock Cancel had"
         );
         assert!(primary.border.is_none(), "a filled button does not need one");
+    }
+
+    #[test]
+    fn primary_hover_fill_differs_from_its_resting_fill() {
+        let resting = ButtonSkin::primary();
+        let hovered = resting.hovered();
+        assert_ne!(
+            resting.fill, hovered.fill,
+            "a button whose hover looks identical to its resting state gives the user no \
+             feedback that it is clickable"
+        );
+    }
+
+    #[test]
+    fn secondary_hover_fill_differs_from_its_resting_fill() {
+        let resting = ButtonSkin::secondary();
+        let hovered = resting.hovered();
+        assert_ne!(
+            resting.fill, hovered.fill,
+            "a button whose hover looks identical to its resting state gives the user no \
+             feedback that it is clickable"
+        );
     }
 
     #[test]

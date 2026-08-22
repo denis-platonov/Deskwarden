@@ -1536,10 +1536,16 @@ mod win32 {
             // whichever one applies, not a third and fourth palette.
             let skin = if primary {
                 let skin = ButtonSkin::primary();
-                if disabled { skin.disabled() } else { skin }
+                if disabled {
+                    skin.disabled()
+                } else if hovered {
+                    skin.hovered()
+                } else {
+                    skin
+                }
             } else {
                 let skin = ButtonSkin::secondary();
-                if hovered { ButtonSkin { fill: rgb(crate::theme::CARD_TINT), ..skin } } else { skin }
+                if hovered { skin.hovered() } else { skin }
             };
 
             let mem = CreateCompatibleDC(hdc);
