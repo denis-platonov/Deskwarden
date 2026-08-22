@@ -710,11 +710,11 @@ const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction:
 /// the reason [`credential_row`]'s do: each carries one user-controlled string
 /// (`app::window_label`'s answer), wrapping is what made a one-row card 189pt
 /// tall in a 164pt window, and this window still cannot scroll.
-/// **The two cards are no longer the same height, and `buttons` is why.** 3a's
-/// footer carries buttons and 3b's does not, so 3a's row count and
-/// [`LOCKED_ROWS`] are separately measured against separately sized cards --
-/// which is exactly the reason those two constants were written as separate
-/// constants rather than as an alias in the first place.
+/// **`buttons` is what makes this card taller than an empty-footer one.** 3b
+/// carries [`UNLOCK_LABEL`] in its footer, so [`LOCKED_ROWS`] is measured
+/// against a card with a button in it, and the six points that button cost are
+/// the whole argument (see `LOCKED_SLACK` in this file's tests) for measuring
+/// this card's height against nothing but itself.
 ///
 /// **`buttons` is a slice and not a second `Option`.** All of them share one
 /// `ui.horizontal` with the `Esc Dismiss` hint, so the card's HEIGHT is a
@@ -827,7 +827,7 @@ fn draw_notice_card(
                     // fill would be the card contradicting itself.
                     theme::footer_hints(ui, &[("Esc", "Dismiss")]);
                 } else {
-                    // 3a. Every button on this strip has a destination that
+                    // Every button on this strip has a destination that
                     // exists: a control on a frameless, always-on-top card
                     // that does nothing when clicked is worse than no control,
                     // which is why *Search vault* waited for `main` to grow a
@@ -853,7 +853,8 @@ fn draw_notice_card(
     action_taken
 }
 
-/// What 3a's one button says, and **the only card that may carry it**.
+/// What the account picker's empty-card *New login* row says, and **the
+/// only egui card that may NOT carry it**.
 ///
 /// [`draw_locked_card`] hands [`draw_notice_card`] `None` here, deliberately:
 /// design 3c ends in `VaultCache::create_item`, which is a write through
@@ -868,11 +869,13 @@ fn draw_notice_card(
 /// test finds in the painted output rather than one it re-spells.
 pub const NEW_LOGIN_LABEL: &str = "New login";
 
-/// What 3a's other button says, and **the only card that may carry it**.
+/// What the account picker's other empty-card row says, and **the only egui
+/// card that may NOT carry it**.
 ///
 /// # Why it took three releases to draw
 ///
-/// 3a as designed always had two buttons. Only *New login* was drawn, because
+/// Design 3a as drawn in egui always had two buttons. Only *New login* was
+/// drawn, because
 /// *Search vault* had to reach the vault window from inside
 /// `main::process_foreground_event` -- and at the time that function could
 /// reach nothing that opens one. A button on a frameless, always-on-top card
@@ -1119,9 +1122,8 @@ impl eframe::App for LockedApp {
         let action = if keys == OverlayAction::None { card } else { keys };
         if let Some(answer) = locked_answer_of(&action) {
             // Recorded BEFORE the close, so the answer survives the window,
-            // exactly as `NoMatchApp::ui` does it: `show_locked_overlay` reads
-            // this cell after `run_native` returns, and `run_native` returns
-            // because of this command.
+            // `show_locked_overlay` reads this cell after `run_native`
+            // returns, and `run_native` returns because of this command.
             *self.asked.borrow_mut() = answer;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -4911,7 +4913,7 @@ mod geometry_tests {
         }
     }
 
-    // -------------------------------------------------- design 3a: no match
+    // ------------------------------------------------ design 3b: locked card
 
     /// The locked card, painted into a window `height` tall, and its ink.
     fn painted_locked(app_name: &str, height: f32) -> Vec<Ink> {
@@ -5030,8 +5032,8 @@ mod geometry_tests {
     /// Every [`OverlayAction`] has an answer on the locked card, and the table
     /// is what says which.
     ///
-    /// [`every_no_match_action_has_an_answer`]'s sibling and written for the
-    /// same reason: `LockedApp::ui` needs a real always-on-top window, so the
+    /// Written for the reason its deleted 3a-card sibling was: `LockedApp::ui`
+    /// needs a real always-on-top window, so the
     /// mapping is the only part of that body a test can execute, and the three
     /// answers this card cannot produce are pinned rather than left to a
     /// wildcard.
@@ -6185,7 +6187,7 @@ mod geometry_tests {
     /// **Esc dismisses, as it does in every other overlay state** -- and Enter
     /// does not, because there is nothing to fill.
     ///
-    /// `NoMatchApp::ui` needs an `eframe::Frame` and a real always-on-top
+    /// `LockedApp::ui` needs an `eframe::Frame` and a real always-on-top
     /// window and can never be executed here, which is exactly why the
     /// decision is `no_match_keyboard_action` and not an `if` inside it.
     #[test]

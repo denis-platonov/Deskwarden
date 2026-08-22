@@ -450,8 +450,8 @@ pub fn empty_rows() -> Vec<EmptyAction> {
 /// replaced 3a's window inherits the offers -- so it inherits the constants.
 /// Re-typing them here would be the second spelling they were written to
 /// prevent, and `overlay_ui`'s own
-/// `the_locked_card_offers_no_new_login_button` still reads them off the
-/// locked card to prove neither has strayed onto it.
+/// `the_locked_card_offers_neither_of_the_pickers_two_offers` still reads them
+/// off the locked card to prove neither has strayed onto it.
 pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
     match action {
         EmptyAction::NewLogin => {
@@ -743,7 +743,7 @@ mod win32 {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
-        PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+        RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED,
         BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG,
         PM_REMOVE, SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -1552,8 +1552,25 @@ mod win32 {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // **NO `PostQuitMessage` HERE, EVER.** This window is opened
+                // on the daemon thread, and that thread goes on to run egui
+                // windows -- the save-a-login form after *New login*, the
+                // preflight host after *Password* / *One-time code*.
+                // `close()` calls `DestroyWindow`, which dispatches this
+                // message synchronously on that thread, so a `PostQuitMessage`
+                // here leaves the thread's quit flag set with nothing left to
+                // drain it: `next()` has already returned and no pump of ours
+                // runs again. The next `eframe::run_native` then takes that
+                // stale `WM_QUIT` out of `GetMessageW`, leaves its loop before
+                // it draws a frame, and returns its default answer -- the form
+                // never appears, and the preflight reports "not confirmed" so
+                // nothing is typed.
+                //
+                // Quitting is not this handler's job in the first place:
+                // `GONE` on the line above is what `next()` reads to report
+                // `Event::Closed`, and the `WM_QUIT` branch in `next()` stays
+                // for a quit posted from outside.
                 GONE.store(true, Ordering::SeqCst);
-                PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(window, msg, wparam, lparam),
@@ -2170,6 +2187,67 @@ mod card_tests {
         }
         assert_eq!(empty_label(EmptyAction::NewLogin).0, "New login");
         assert_eq!(empty_label(EmptyAction::SearchVault).0, "Search vault");
+    }
+
+    /// **This window may not post a thread quit.**
+    ///
+    /// A source pin, because no test can open the real window: the defect is
+    /// a `WM_QUIT` left sitting in the daemon thread's queue *after* `next()`
+    /// has already returned, and nothing this crate can drive in a test
+    /// observes that queue.
+    ///
+    /// The shape is this crate's established one -- read the file, cut at the
+    /// first column-0 `#[cfg(test)]`, scan the production half -- the same cut
+    /// `job_object.rs`'s pins make, with a control assertion so a scan that
+    /// read nothing cannot pass.
+    #[test]
+    fn the_picker_window_never_posts_a_thread_quit() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        // **Comments stripped, and the rule reads CODE.** The `WM_DESTROY` arm
+        // carries a comment naming the very call this forbids -- that comment
+        // is the reason the call is not there, and a scan that could not tell
+        // the two apart would forbid explaining itself.
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // CONTROL, so a pin that scanned nothing cannot pass: the cut must
+        // have thrown something away, and the half it kept must be the half
+        // that carries the window procedure this rule is about.
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found in picker_prompt.rs, so this \
+             scan is reading the test module as production and the rule below is meaningless"
+        );
+        assert!(
+            code.contains("WM_DESTROY =>"),
+            "control: the production cut of picker_prompt.rs does not contain the window \
+             procedure's WM_DESTROY arm, so the cut is in the wrong place and this pin is \
+             scanning the wrong text"
+        );
+        assert!(
+            code.contains("GONE.store(true, Ordering::SeqCst);"),
+            "control: the comment stripper has eaten code -- the WM_DESTROY arm's one              surviving statement is not in the text this rule scans"
+        );
+
+        assert!(
+            !code.contains(concat!("PostQuit", "Message")),
+            "picker_prompt.rs's production half posts a thread quit. This window is opened on \
+             the daemon thread, and that thread goes on to run egui windows: the design-3c \
+             save-a-login form after *New login*, and the preflight host after *Password* / \
+             *One-time code*. `close()` calls `DestroyWindow`, which dispatches WM_DESTROY \
+             synchronously on that thread, and nothing drains the queue afterwards -- `next()` \
+             has already returned. The next `eframe::run_native` takes the stale WM_QUIT out of \
+             `GetMessageW`, leaves its loop before it draws, and returns its DEFAULT answer: \
+             the save form never appears, and the preflight reports \"not confirmed\" so the \
+             password the user picked is silently never typed. `GONE` is what `next()` reads; \
+             quitting the thread is not this window's job."
+        );
     }
 }
 #[cfg(test)]

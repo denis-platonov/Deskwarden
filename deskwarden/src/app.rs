@@ -746,6 +746,13 @@ fn confirmed_by_preflight(
         FillChoice::Just(field) => {
             crate::key_sequence::render(&[crate::key_sequence::Token::Field(field.clone())])
         }
+        // **Effectively `Saved`-only.** `UserTabPass` shares the arm because
+        // the match must be total, not because it can arrive here: it is the
+        // one choice `fill_action` answers `FillAction::Default` for, so it
+        // never reaches `confirmed_by_preflight` at all, and even if it did,
+        // `preflight_guard_for` answers `NotRequired` for it and the `else`
+        // above returns before this line. Do not read it as evidence that
+        // `UserTabPass` previews a stored sequence -- it has none to preview.
         FillChoice::UserTabPass | FillChoice::Saved => sequence_for(item),
     };
     // "Copy instead" is an escape from typing, not from the vault: it is the
@@ -8678,6 +8685,79 @@ mod picker_wiring_tests {
     /// Those are two constants in two files, and this is the assertion that
     /// stops them drifting: change either and this fails, rather than the card
     /// quietly typing something other than what its own row promised.
+    /// **A window the configured engine matched can never reach the picker.**
+    ///
+    /// The design's Testing section names this case: the picker is the
+    /// unmatched window's card, and a matched window must never see it. The
+    /// only door to it is [`Open::NoMatch`] -- `main::process_foreground_event`
+    /// calls `handle_no_match`, which is what calls `picker_prompt::ask`, from
+    /// that arm and from no other -- so the property is exactly "`disposition`
+    /// does not answer `NoMatch` for a `Matched::Yes`".
+    ///
+    /// **It is swept, not spot-checked.** The other five inputs are three
+    /// suppressors, a field probe and a vault state, and every one of them
+    /// already turns some *unmatched* window into a different answer. This
+    /// walks all of them against a match, so a suppressor added later that
+    /// reroutes rather than silences -- or an arm reordered above the matched
+    /// one -- fails here rather than putting an account picker over a window
+    /// whose account is already known.
+    #[test]
+    fn a_window_the_engine_matched_never_reaches_the_picker() {
+        let mut checked = 0;
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                for never in [NeverForApp::Yes, NeverForApp::No] {
+                    for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
+                        for browser in [BrowserWindow::Yes, BrowserWindow::No] {
+                            let open = disposition(
+                                Matched::Yes("42"),
+                                field,
+                                vault,
+                                never,
+                                prompts,
+                                browser,
+                            );
+                            assert_ne!(
+                                open,
+                                Open::NoMatch,
+                                "a window the engine matched was routed to the unmatched card, \
+                                 which is the one door to `picker_prompt::ask`: the user would \
+                                 be asked to choose an account for a window whose account is \
+                                 already known ({field:?}, {vault:?}, {never:?}, {prompts:?}, \
+                                 {browser:?})"
+                            );
+                            assert_eq!(
+                                open,
+                                Open::Match("42"),
+                                "a matched window's disposition changed with {field:?}, \
+                                 {vault:?}, {never:?}, {prompts:?}, {browser:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48, "the sweep did not cover every combination of the five inputs");
+
+        // POSITIVE CONTROL, so the sweep above cannot be satisfied by a
+        // `disposition` that never answers `NoMatch` at all: the same five
+        // inputs that never produced it for a match DO produce it for the
+        // unmatched window this card was written for.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::No,
+                OverlayPrompts::Shown,
+                BrowserWindow::No,
+            ),
+            Open::NoMatch,
+            "control: nothing reaches the picker at all, so the sweep above proves nothing"
+        );
+    }
+
     #[test]
     fn the_all_choice_types_what_the_default_fill_types() {
         assert_eq!(
