@@ -606,21 +606,30 @@ pub struct Layout {
     pub close_glyph: Box2,
 }
 
-/// The card's geometry.
+/// The card's geometry, for a list `rows` rows tall.
 ///
-/// **The height is fixed, and the list is [`ROW_CAP`] rows tall whichever step
-/// is showing.** A window that shrank when the second step had fewer rows than
-/// the first would move its own Cancel button out from under the pointer at
-/// the moment the user is about to click it; `unlock_prompt::layout` reserves
-/// its error row for exactly that reason, and the same argument applies to a
-/// card whose two steps have different row counts.
-pub fn layout() -> Layout {
+/// **The two steps that share a live window are both laid out at [`ROW_CAP`],
+/// whichever of them is showing.** A window that shrank when the second step
+/// had fewer rows than the first would move its own Cancel button out from
+/// under the pointer at the moment the user is about to click it;
+/// `unlock_prompt::layout` reserves its error row for exactly that reason, and
+/// the same argument applies to a card whose two steps have different row
+/// counts.
+///
+/// **That argument does not reach the empty card.** `MODE_EMPTY` is decided
+/// once, in `open`, from an empty candidate slice, and never transitions to or
+/// from anything -- so sizing it to [`empty_rows`]`.len()` moves no control
+/// out from under a pointer that is already over it. Sizing it to `ROW_CAP`
+/// instead left 132 px of `theme::CARD` between its last offer and its Cancel
+/// button, which reads as a list that lost its rows rather than as a card with
+/// two.
+pub fn layout(rows: usize) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
     let title = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: content_w, h: 21 };
     let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 17 };
     let list =
-        Box2 { x: MARGIN_X, y: subtitle.bottom() + 10, w: content_w, h: ROW_H * ROW_CAP as i32 };
+        Box2 { x: MARGIN_X, y: subtitle.bottom() + 10, w: content_w, h: ROW_H * rows as i32 };
 
     // Right-aligned, Cancel outermost: the choice that does nothing sits where
     // the eye leaves the card.
@@ -633,9 +642,11 @@ pub fn layout() -> Layout {
     Layout { window, title, subtitle, list, secondary, cancel, close_glyph }
 }
 
-/// The `index`th row's rectangle, in logical pixels.
-pub fn row_at(index: usize) -> Box2 {
-    let list = layout().list;
+/// The `index`th row's rectangle, in logical pixels, on a card laid out for
+/// `rows` rows -- the same count [`layout`] was given, so the row and the list
+/// it sits in can never be measured against two different cards.
+pub fn row_at(rows: usize, index: usize) -> Box2 {
+    let list = layout(rows).list;
     Box2 { x: list.x, y: list.y + ROW_H * index as i32, w: list.w, h: ROW_H }
 }
 
@@ -1060,12 +1071,21 @@ mod win32 {
             *slot = Some(Fonts::build());
         }
 
-        let l = super::layout();
+        // **Sized from the one mode decision above**, never from a second
+        // test of the candidate slice -- see `laid_out_rows`.
+        let l = super::layout(laid_out_rows());
         let (w, h) = (scale(l.window.w), scale(l.window.h));
         // Centred on the primary work area rather than on the foreground
         // window, for `unlock_prompt::centred`'s reason: a card that jumped
         // around the desktop depending on which app happened to be in front is
         // one the user has to hunt for.
+        //
+        // **The retired egui no-match card anchored itself to the foreground
+        // window** -- `overlay_position(hwnd, NO_MATCH_ROWS)` -- and that
+        // anchoring is deliberately dropped here, now that the empty card is
+        // this window's most common mode rather than a surface of its own. One
+        // card in one place beats a card that lands wherever the app that
+        // raised it happens to be.
         let (x, y) = centred(w, h);
 
         let window = unsafe {
@@ -1111,6 +1131,14 @@ mod win32 {
                 }
             }
             drop_icons();
+            // `close`'s reason, on the path that never reaches `close`: not a
+            // secret, but it is the name of an app this user was in front of,
+            // and `run_with` answers `Unavailable` and returns without ever
+            // taking the card down -- so without this the name would sit in
+            // the static until the next `open`.
+            if let Ok(mut slot) = APP_NAME.lock() {
+                slot.clear();
+            }
             None
         }
 
@@ -1131,7 +1159,7 @@ mod win32 {
                 window,
                 w!("BUTTON"),
                 WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-                super::row_at(index),
+                super::row_at(laid_out_rows(), index),
                 ID_ROW + index,
                 name_font,
             ) else {
@@ -1299,6 +1327,22 @@ mod win32 {
             }
         }
         repaint(window);
+    }
+
+    /// How many rows this step's card is **laid out** for -- which is not
+    /// [`visible_row_count`].
+    ///
+    /// `MODE_LIST` and `MODE_PALETTE` are two steps of one live window, so
+    /// both are laid out at `ROW_CAP` whatever they are showing: see
+    /// [`super::layout`] for why a window that resized between them would move
+    /// its own Cancel button. `MODE_EMPTY` never transitions -- `open` decides
+    /// it once and nothing sets it -- so it is sized to its own two offers.
+    fn laid_out_rows() -> usize {
+        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
+            super::empty_rows().len().min(ROW_CAP)
+        } else {
+            ROW_CAP
+        }
     }
 
     /// How many row controls this step is using.
@@ -1617,7 +1661,7 @@ mod win32 {
     }
 
     fn in_close_glyph(lparam: LPARAM) -> bool {
-        let l = super::layout();
+        let l = super::layout(laid_out_rows());
         let x = (lparam.0 & 0xffff) as i16 as i32;
         let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
         x >= scale(l.close_glyph.x)
@@ -1650,7 +1694,7 @@ mod win32 {
             fill(mem, client, crate::theme::WINDOW_BG);
             SetBkMode(mem, TRANSPARENT);
 
-            let l = super::layout();
+            let l = super::layout(laid_out_rows());
             // The card the rows sit on, so a row's own white reads as part of
             // one surface rather than as five floating strips.
             rounded(mem, l.list, 8, crate::theme::CARD, Some((1, crate::theme::HAIRLINE)));
@@ -2019,13 +2063,13 @@ mod card_tests {
     /// the one that would go first.
     #[test]
     fn nothing_the_card_lays_out_falls_off_the_bottom_of_it() {
-        let l = layout();
+        let l = layout(ROW_CAP);
         assert!(l.subtitle.bottom() <= l.list.y);
         assert!(l.list.bottom() <= l.cancel.y);
         assert!(l.cancel.bottom() <= l.window.bottom());
         assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
         assert!(l.secondary.x >= 0, "the footer runs off the left edge of the card");
-        let last = row_at(ROW_CAP - 1);
+        let last = row_at(ROW_CAP, ROW_CAP - 1);
         assert!(
             last.bottom() <= l.list.bottom(),
             "the last row is outside the list area, and this card cannot scroll to it"
@@ -2033,13 +2077,23 @@ mod card_tests {
         assert!(l.close_glyph.right() <= l.window.right());
     }
 
-    /// **The empty card's rows fit the card too**, which is the same bound
+    /// **The empty card is exactly as tall as the offers it has.**
+    ///
+    /// Not the same claim as
     /// [`nothing_the_card_lays_out_falls_off_the_bottom_of_it`] and
-    /// [`a_wall_of_custom_fields_cannot_push_a_row_off_the_card`] hold for
-    /// the other two steps -- restated for the mode that replaced design 3a's
-    /// own window, because that window is gone and this one does not scroll.
+    /// [`a_wall_of_custom_fields_cannot_push_a_row_off_the_card`], which bound
+    /// the last row from above: two rows trivially fit a card with room for
+    /// five, and a test that asserted only that let a card sized for five rows
+    /// it does not have ship with 132 px of bare `theme::CARD` under its last
+    /// offer. What is asserted here is the other direction -- that the card
+    /// asks the OS for the height its own content needs, and that no dead band
+    /// is left between the last offer and the Cancel button.
+    ///
+    /// `MODE_EMPTY` is allowed to do this and the other two steps are not:
+    /// see [`layout`]. It is decided once in `open` and never transitions, so
+    /// there is no live window whose Cancel button could move.
     #[test]
-    fn the_empty_cards_offers_cannot_fall_off_the_bottom_of_it() {
+    fn the_empty_card_is_no_taller_than_the_offers_it_has() {
         let rows = empty_rows();
         assert_eq!(
             rows,
@@ -2053,8 +2107,41 @@ mod card_tests {
              does not scroll -- the rest would simply be unreachable",
             rows.len()
         );
-        let last = row_at(rows.len() - 1);
-        assert!(last.bottom() <= layout().list.bottom());
+
+        let l = layout(rows.len());
+        let last = row_at(rows.len(), rows.len() - 1);
+        assert!(last.bottom() <= l.list.bottom());
+        assert_eq!(
+            last.bottom(),
+            l.list.bottom(),
+            "the empty card's list is drawn taller than its own offers: {} px of bare \
+             `theme::CARD` sits under the last one. The card cannot scroll and has no rows to \
+             fill that band, so it reads as a list that lost its contents",
+            l.list.bottom() - last.bottom()
+        );
+
+        // The window follows the list, so the dead band is not merely pushed
+        // out of the card and into the gap above Cancel.
+        let full = layout(ROW_CAP);
+        let needed = full.window.h - ROW_H * (ROW_CAP - rows.len()) as i32;
+        assert_eq!(
+            l.window.h,
+            needed,
+            "the empty card asks the OS for a {} px window when its own {} offers need {needed} \
+             px. A card sized for rows it does not have is {} px of bare `theme::CARD` between \
+             *Search vault* and *Cancel* -- and the fixed height buys nothing here, because \
+             `MODE_EMPTY` never transitions and so has no Cancel button that could move out \
+             from under the pointer",
+            l.window.h,
+            rows.len(),
+            l.window.h - needed
+        );
+        assert_eq!(
+            l.cancel.y - l.list.bottom(),
+            full.cancel.y - full.list.bottom(),
+            "the empty card's footer does not sit the same distance below its list as the \
+             populated card's does"
+        );
     }
 
     /// The card says which app it has nothing for. A card that said only "no

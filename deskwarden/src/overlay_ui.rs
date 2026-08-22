@@ -701,8 +701,10 @@ const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction:
 /// in three strings -- and because the height evidence is a property of *this*
 /// layout. Two copies would let one of them drift a point taller than the
 /// window they both ask the OS for, in a viewport that cannot scroll; shared,
-/// `the_no_match_card_fits_the_window_it_asks_for` and
-/// `the_locked_card_fits_the_window_it_asks_for` measure the same code twice.
+/// `the_locked_card_fits_the_window_it_asks_for` measures it. (3a's own card
+/// measured it a second time until that card was deleted; the account picker
+/// draws design 3a now, and measures its own geometry in
+/// `picker_prompt::card_tests`.)
 ///
 /// `primary` and `secondary` are borrowed and both labels `.truncate()`, for
 /// the reason [`credential_row`]'s do: each carries one user-controlled string
@@ -719,7 +721,9 @@ const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction:
 /// function of whether the slice is empty and of nothing else -- one button or
 /// two is the same strip. What a longer slice spends is width, which is
 /// bounded by [`OVERLAY_WIDTH`] and is what
-/// `the_no_match_footer_fits_across_the_card` measures. Each entry carries the
+/// `the_locked_card_names_the_app_and_the_way_out_inside_its_window` measures,
+/// asserting every painted run inside the window rather than only its
+/// height. Each entry carries the
 /// [`OverlayAction`] it answers, so a button cannot be drawn without an answer
 /// or wired to the wrong one.
 fn draw_notice_card(
@@ -856,8 +860,9 @@ fn draw_notice_card(
 /// `bw serve` against an unlocked vault, so a *New login* button on the locked
 /// card would be an offer the process cannot honour -- the same class of
 /// defect as the locked card's own correction (a card claiming something about
-/// a vault it cannot read). `the_locked_card_offers_no_new_login_button` reads
-/// the painted glyphs of both cards rather than trusting the argument.
+/// a vault it cannot read).
+/// `the_locked_card_offers_neither_of_the_pickers_two_offers` reads the locked
+/// card's painted glyphs rather than trusting the argument.
 ///
 /// A constant for the reason [`LOCKED_LABEL`] is one: it is the string a
 /// test finds in the painted output rather than one it re-spells.
@@ -951,10 +956,9 @@ pub const LOCKED_LABEL: &str = "Vault locked";
 ///
 /// The two cards have been the same height, then not, and are again: 3a gained
 /// the *New login* button and 3b had none, and now 3b has [`UNLOCK_LABEL`].
-/// Nothing relies on that equality -- `LOCKED_SLACK` and `NO_MATCH_SLACK` are
-/// separate numbers measured against separate cards, which is exactly so that
-/// the next time the two diverge, one of them fails rather than both quietly
-/// agreeing.
+/// Nothing relies on that equality: `LOCKED_SLACK` is measured against this
+/// card alone, and 3a's own slack constant went with 3a's card, so there is no
+/// number here that two cards could quietly agree on.
 pub const LOCKED_ROWS: usize = 1;
 
 /// The window the locked card asks the OS for. 3a's own sibling of this,
@@ -4999,9 +5003,11 @@ mod geometry_tests {
 
     /// How much taller than it needs to be the LOCKED card's window is.
     ///
-    /// **Its own constant, and deliberately not [`NO_MATCH_SLACK`]** even
-    /// though the two are equal again. The history is the whole argument for
-    /// keeping them apart: both cards were 153pt in a 164pt window (slack 11);
+    /// **Its own constant, measured against this card and no other.** 3a had
+    /// a slack constant of its own, equal to this one again by the end, and it
+    /// was deleted with 3a's card rather than shared. The history is the whole
+    /// argument for never having merged them: both cards were 153pt in a
+    /// 164pt window (slack 11);
     /// 3a's footer then gained the *New login* button and became 159pt (slack
     /// 5) while 3b, which had no button it could honour, stayed at 11; and now
     /// 3b's footer carries [`UNLOCK_LABEL`], so it is 159pt too and this
@@ -5014,8 +5020,8 @@ mod geometry_tests {
     /// button is not being drawn. It moved by exactly the six points 3a's did,
     /// which is what says the same `draw_notice_card` drew both.
     ///
-    /// Slack in this direction is the safe direction, for the reason
-    /// [`NO_MATCH_SLACK`] spells out: a window taller than its card wastes
+    /// Slack in this direction is the safe direction: a window taller than its
+    /// card wastes
     /// five points, and a window shorter than its card loses the bottom of a
     /// frameless, always-on-top surface -- which is where the Esc hint, and
     /// now the *Unlock* button, are.
@@ -5111,6 +5117,73 @@ mod geometry_tests {
     }
 
 
+    /// **The locked card claims nothing about whether a match exists.**
+    ///
+    /// This is the whole content of the correction, and it is asserted about
+    /// the strings themselves rather than about the painted card, so it holds
+    /// however the card is later laid out.
+    ///
+    /// It was written with 3a's own primary line as the forbidden string;
+    /// that card and `no_match_text` are gone, so what remains is the
+    /// phrase list, which is the part that never depended on 3a existing. A
+    /// locked vault does not know whether it has a login for this app -- the
+    /// match engine that would say so is exactly what the lock cleared -- and
+    /// no line on this card may imply otherwise.
+    #[test]
+    fn the_locked_card_claims_nothing_about_a_match() {
+        let (primary, secondary) = locked_text(APP);
+        for line in [&primary, &secondary] {
+            for phrase in ["No saved login", "logins for", "nothing for"] {
+                assert!(
+                    !line.contains(phrase),
+                    "the locked card says {line:?}, which contains {phrase:?} -- a claim about \
+                     the contents of a vault this process cannot read"
+                );
+            }
+        }
+        assert!(
+            primary.contains("locked"),
+            "control: the locked card does not say it is locked, so the assertions above are \
+             about a card that says nothing useful at all"
+        );
+        assert!(
+            secondary.contains(APP),
+            "control: the locked card never names the window it appeared over"
+        );
+    }
+
+    /// **The locked card says what it is for, inside its window.**
+    ///
+    /// Not a smoke test, and not the same claim as
+    /// [`the_locked_card_fits_the_window_it_asks_for`], which measures
+    /// `ui.min_rect().bottom()` and therefore cannot see a line elided to
+    /// "ledgerlin…" or a run painted past an edge. The header, the body's two
+    /// lines and the footer's one hint are the entire content, and the body's
+    /// first line is the only place the app is named. Each is found as exactly
+    /// one laid-out glyph run -- so an elided line has no match and fails --
+    /// and each is asserted to be inside the window the overlay actually asks
+    /// for. This window is frameless, always-on-top and has no scrollbar and
+    /// no title bar to drag.
+    #[test]
+    fn the_locked_card_names_the_app_and_the_way_out_inside_its_window() {
+        let height = overlay_height(LOCKED_ROWS);
+        let ink = painted_locked(APP, height);
+        let win = window(height);
+
+        let (primary, secondary) = locked_text(APP);
+        let mut checked = 0;
+        for text in [LOCKED_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
+            let rect = glyph_run(&ink, text);
+            assert!(
+                fits(rect, win),
+                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
+                 asks the OS for. There is no scrollbar and no title bar to drag"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have covered all four strings");
+    }
+
     /// Every glyph run a notice card paints, laid out unconstrained.
     fn notice_glyphs(draw: impl Fn(&mut egui::Ui) -> OverlayAction) -> Vec<String> {
         const ROOMY: f32 = 700.0;
@@ -5173,8 +5246,8 @@ mod geometry_tests {
 
     /// How much taller than it needs to be the 3c card's window is.
     ///
-    /// Measured, not chosen, exactly as [`NO_MATCH_SLACK`] and [`LOCKED_SLACK`]
-    /// are, and pinned exactly rather than bounded for the same reason: a
+    /// Measured, not chosen, exactly as [`LOCKED_SLACK`] is, and pinned
+    /// exactly rather than bounded for the same reason: a
     /// one-sided bound cannot tell deliberate dead space from a row that has
     /// stopped being drawn -- and this card has four rows to lose one of.
     const SAVE_LOGIN_SLACK: f32 = 10.0;
@@ -5188,7 +5261,7 @@ mod geometry_tests {
     /// falls off the bottom of 3a is a dismiss hint; what falls off the bottom
     /// of this one is *Save*, or the password field the user is typing into.
     ///
-    /// So, in the idiom `NO_MATCH_SLACK` set:
+    /// So, in the idiom [`LOCKED_SLACK`] set:
     ///
     /// * the card must **fit** `overlay_height(SAVE_LOGIN_ROWS)`;
     /// * it must **not fit** one [`ROW_HEIGHT`] less, which is the half that
@@ -5568,7 +5641,8 @@ mod geometry_tests {
     /// **3c offers the way in to 3d**, and it is on the Password row.
     ///
     /// Read out of the painted 3c card, in the idiom
-    /// `the_locked_card_offers_no_new_login_button` set: a link that is
+    /// `the_locked_card_offers_neither_of_the_pickers_two_offers` set: a link
+    /// that is
     /// computed but not painted is a destination the user cannot reach.
     #[test]
     fn the_save_login_card_paints_the_way_into_the_generator() {

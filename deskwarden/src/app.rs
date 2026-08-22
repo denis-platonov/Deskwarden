@@ -8912,6 +8912,68 @@ mod picker_wiring_tests {
         assert!(without[0].icon.is_none());
     }
 
+    /// **The empty card is told the window label, not the exe name**, pinned
+    /// structurally.
+    ///
+    /// `empty_text` builds the card's entire message out of the one string it
+    /// is handed, so the difference between the two is the difference between
+    /// a card that says "Ledgerline" and a card that says "Ledgerline.exe".
+    /// `window_label` exists to make that choice once -- title first, exe name
+    /// only as a fallback -- and it was held by two tests over the pure
+    /// `no_match_arm` until that function was deleted with design 3a's window.
+    ///
+    /// The property now lives on the single `picker_prompt::ask` call inside
+    /// `handle_no_match`, where `label` and `window.exe_name` are both `&str`:
+    /// swapping them compiles, passes every type check, and silently makes the
+    /// card name the wrong thing. `handle_no_match` raises a real
+    /// always-on-top window over a real vault, so no test may execute it --
+    /// which is `the_vault_snapshot_does_not_outlive_the_scan_that_needs_it`'s
+    /// situation exactly, and this is its idiom: slice the function's body out
+    /// of the source and read it.
+    #[test]
+    fn the_empty_card_is_told_the_window_label_and_not_the_exe_name() {
+        let source = include_str!("app.rs");
+        // Split literals, in this crate's idiom: a whole needle would match
+        // its own declaration.
+        let start = source
+            .find(concat!("pub fn handle_no", "_match("))
+            .expect("`handle_no_match` is in this file");
+        // Line-based rather than a `"\n}\n"` needle, because that needle is
+        // vacuous on a CRLF checkout and this repo has no `.gitattributes`.
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        // Controls, so an extraction that silently stopped scanning -- a
+        // renamed function, a reformatted signature, a closing brace that
+        // moved -- cannot pass by finding nothing.
+        assert!(
+            body.contains(concat!("window_", "label(")),
+            "control: the slice being scanned is not the function that chooses the card's name"
+        );
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(")),
+            "control: the slice being scanned is not the function that raises the card"
+        );
+
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(&offers, label)")),
+            "`handle_no_match` no longer hands `picker_prompt::ask` the `window_label` it \
+             computed. `label` and `window.exe_name` are both `&str`, so the swap compiles -- \
+             and `empty_text` builds the whole of the card's message out of that one string, \
+             so the card would announce `Ledgerline.exe` where the user's window is called \
+             `Ledgerline`"
+        );
+        assert!(
+            !body.contains(concat!("ask(&offers, &window.", "exe_name")),
+            "`handle_no_match` is handing the card the raw executable name. `window_label` \
+             exists precisely to prefer the window's title over it"
+        );
+    }
+
     /// **The plaintext vault snapshot does not outlive the scan that needs
     /// it**, pinned structurally.
     ///
