@@ -10,6 +10,17 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Filling a password is faster
+
+Every autofill used to make a private copy of your entire vault just to look up
+the one item it was about to type -- several megabytes of copying, on a large
+vault, sitting between the moment you pressed the key and the moment the
+password appeared. Deskwarden now asks for the one item it needs. On a
+1,663-item vault that removes about 3.7 milliseconds and roughly 34,000 memory
+allocations from every fill; the bigger your vault, the more it was costing
+you. Nothing about what gets filled has changed, and a fill still works with
+the connection to Bitwarden fully stopped.
+
 ### A locked vault can be unlocked from the card that says it is locked
 
 Focus a password box while Deskwarden is locked and a small card appears

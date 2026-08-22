@@ -412,10 +412,14 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
     gate: &crate::vault_window::preflight::SendGate,
     reprompt: &mut Reprompt<'_>,
 ) {
+    // `get_by_id`, not `items()`: the answer is one item, and cloning the
+    // whole vault to find it put 5.66 MB and 46,494 allocations -- 5.6-9.4 ms
+    // over a realistic vault -- between the keypress and the password. The
+    // miss arm below is unchanged and still reached, because `get_by_id`
+    // answers only from the snapshot and returns `None` for an id it does not
+    // hold, exactly as the `find` did.
     let item = cache
-        .items()
-        .into_iter()
-        .find(|i| i.id == item_id)
+        .get_by_id(item_id)
         .map(Ok)
         .unwrap_or_else(|| {
             log::warn!("cache miss for item {item_id} during a fill; falling back to bw serve");
@@ -1689,7 +1693,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // credentials -- and the fill path re-resolves the item on its
             // own anyway.
             //
-            // Reads `cache.items()`, not `cache.bridge()`: the fill itself
+            // Reads the cache, not `cache.bridge()`: the fill itself
             // (`fill_from_vault`, two lines below) already resolves the item
             // from the cache, so it is provably in memory here too -- going
             // to the bridge instead meant that with `keep_backend_running`
@@ -1714,7 +1718,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // line**, which is the point: this line is the one no test can
             // reach, and an argument written here is an argument nothing can
             // check (review 32's Important 1).
-            let lookup = || cache.items().into_iter().find(|i| i.id == item_id);
+            let lookup = || cache.get_by_id(item_id);
             if let Some(choice) = prompt_arm_for(&REAL_OVERLAY, window, lookup) {
                 // `choice` is the user's answer, and the fill is OF it. The
                 // `debug_assert_eq!(choice, FillChoice::Saved)` that stood
@@ -4169,14 +4173,21 @@ mod prompt_wiring_tests {
     // checkout and fail on a CRLF one (this repo has both).
     const ARM_CALL: &str = concat!("prompt_arm_for", "(&REAL_OVERLAY, window, lookup)");
     /// The cache read `handle_match` hands the arm, as a closure it does NOT
-    /// call itself. `|| cache.items()...` bound to a `let item` and passed as
-    /// `item.as_ref()` -- the shape this line had until step 5 -- keeps the
+    /// call itself. `|| cache.get_by_id(..)` bound to a `let item` and passed
+    /// as `item.as_ref()` -- the shape this line had until step 5 -- keeps the
     /// plaintext item alive for the whole time the overlay is on screen, and
     /// every behavioural test in this file still passes, because the overlay
     /// is told the same things either way. The difference is residency, and
     /// residency has no observable effect at all from outside this line.
-    const LOOKUP: &str =
-        concat!("let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
+    ///
+    /// **Re-cut, not loosened, when the read became `get_by_id`.** The needle
+    /// still quotes the whole statement verbatim, `let` binding included, so
+    /// it still fails on exactly what it failed on before: a `let item =` on
+    /// this line, which can only be there in order to outlive the statement.
+    /// The reasoning is unchanged -- what moved is only which cache method the
+    /// closure calls, and this needle names that method so a silent revert to
+    /// the whole-vault clone is a failure here too, not just a slower fill.
+    const LOOKUP: &str = concat!("let lookup = || cache.", "get_by_id(item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
     /// **The two no-item cards, each named in its own field.**
@@ -4276,11 +4287,16 @@ mod prompt_wiring_tests {
         // arm call intact and only changes what is passed, so `ARM_CALL`
         // above cannot see it -- but a `let item =` on that line can only be
         // there in order to outlive the statement.
-        let planted =
-            concat!("            let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
+        let planted = concat!("            let lookup = || cache.", "get_by_id(item_id);");
         assert_eq!(occurrences(planted, LOOKUP), 1, "planted: {planted}");
-        let held = concat!("            let item = cache.items()", ".into_iter().find(|i| i.id == item_id);");
+        let held = concat!("            let item = cache.", "get_by_id(item_id);");
         assert_eq!(occurrences(held, LOOKUP), 0, "planted: {held}");
+        // And the whole-vault clone this line stopped paying for: a revert to
+        // it is a revert to 5.66 MB and 46,494 allocations between the
+        // keypress and the password, and the needle notices.
+        let cloned_whole_vault =
+            concat!("            let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
+        assert_eq!(occurrences(cloned_whole_vault, LOOKUP), 0, "planted: {cloned_whole_vault}");
 
         let planted = concat!("    position: ", "overlay_position,");
         assert_eq!(occurrences(planted, REAL_POSITION), 1, "planted: {planted}");
@@ -5396,6 +5412,48 @@ mod fill_dispatch_tests {
         Reprompt::with_gate_for(proof, |_| crate::reprompt::RepromptGate::allowing_for_test())
     }
 
+    /// Captures this thread's `log` output for the duration of `f`.
+    ///
+    /// The warning on the fill's cache-miss path returns nothing and changes
+    /// nothing, so there is no other observable for it. The logger is global
+    /// and installed once; the buffer is thread-local, so tests running in
+    /// parallel cannot see each other's lines. If the install ever loses a
+    /// race to some other logger the buffer simply stays empty -- which is why
+    /// the test using this asserts on a string it knows the line contains, so
+    /// "captured nothing" fails rather than passes.
+    fn captured_logs(f: impl FnOnce()) -> Vec<String> {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        }
+
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                LINES.with(|l| {
+                    if let Some(lines) = l.borrow_mut().as_mut() {
+                        lines.push(record.args().to_string());
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(Capture));
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+
+        LINES.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        f();
+        LINES.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
     fn scratch_stats(label: &str) -> crate::fill_stats::FillStats {
         let dir = std::env::temp_dir().join(format!(
             "deskwarden-fill-dispatch-{label}-{}-{:?}-{:?}",
@@ -5878,6 +5936,83 @@ mod fill_dispatch_tests {
             [Step::Text { text: PASS.to_string(), rate: sequence::DEFAULT_RATE }]
         );
         totp.expect(0).assert();
+    }
+
+    /// **The cache miss still falls through to the bridge, and still warns.**
+    ///
+    /// `fill_from_vault_with` asks the cache for one item rather than cloning
+    /// the whole vault to `find` it, and the whole point of `get_by_id`
+    /// returning `Option` is that this arm survives the change. A `get_by_id`
+    /// that reached the bridge itself, or one whose `None` was turned into a
+    /// silent "no item", would leave this test's mock unhit or its log line
+    /// missing -- and the warning is deliberate: a miss here is a bug signal
+    /// worth noticing rather than swallowing.
+    ///
+    /// The cache holds `item-1` and the fill asks for `item-404`, so the miss
+    /// is real and not an empty-cache artefact. Three things are asserted,
+    /// because any one alone can pass for the wrong reason: the bridge was
+    /// asked (the mock), the miss was announced (the log), and the fetched
+    /// item was actually typed (the recorder), which is what makes this the
+    /// fallback rather than an abandoned fill.
+    #[test]
+    fn a_cache_miss_during_a_fill_reaches_the_bridge_and_logs() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let mut server = mockito::Server::new();
+        let fetched = server
+            .mock("GET", "/object/item/item-404")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"data":{"id":"item-404","name":"Only At The Bridge",
+                "fields":[],"type":1,
+                "login":{"username":"bridge-user","password":"bridge-pass"}}}"#,
+            )
+            .expect(1)
+            .create();
+
+        let cache = crate::test_vault::cache_at(server.url(), vec![item_with("")], Vec::new());
+        assert!(
+            cache.get_by_id("item-404").is_none(),
+            "control: the cache already holds item-404, so there would be no miss to fall back \
+             from"
+        );
+        assert!(
+            cache.get_by_id("item-1").is_some(),
+            "control: the cache is empty, so this would miss for every id and prove nothing \
+             about a miss in particular"
+        );
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("cache-miss-fallback");
+        let lines = captured_logs(|| {
+            fill_from_vault_with(
+                &cache,
+                &injector,
+                &stats,
+                "item-404",
+                4242,
+                FillChoice::Just(key_sequence::FieldRef::Password),
+                &sequence::RecordingNotifier::default(),
+                &crate::vault_window::preflight::SendGate::describing(
+                    a_masked_box_in_the_rules_process,
+                ),
+                &mut ungated(&mut crate::reprompt::Proof::default()),
+            );
+        });
+
+        fetched.assert();
+        assert!(
+            lines.iter().any(|l| l.contains("cache miss for item item-404")),
+            "the miss was not announced; logged lines were {lines:?}"
+        );
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the fallback item never reached the sequence path");
+        assert_eq!(
+            sequences[0].1,
+            [Step::Text { text: "bridge-pass".to_string(), rate: sequence::DEFAULT_RATE }],
+            "what was typed did not come from the item the bridge answered with"
+        );
     }
 
     /// **Autofill really fills from a snapshot restored off the encrypted
