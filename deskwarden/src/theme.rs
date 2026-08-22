@@ -80,7 +80,7 @@ pub const ERROR: Color32 = Color32::from_rgb(0xb4, 0x23, 0x18);
 /// Face name for Archivo Regular (the design's 400 weight). Unlike the three
 /// below it is not a *named family*: it is the front of egui's own
 /// [`FontFamily::Proportional`] stack, which is what plain text resolves to.
-const REGULAR: &str = "Archivo-Regular";
+pub const REGULAR: &str = "Archivo-Regular";
 
 /// Named font family for Archivo SemiBold (the design's 600 weight: buttons,
 /// row titles, field emphasis). Use via [`semibold`].
@@ -175,6 +175,47 @@ const CYRILLIC_FACES: [(&str, &str, &[u8]); 4] = [
     ),
 ];
 
+/// The four bundled Archivo cuts, as `(egui family name, GDI family name, GDI
+/// weight, bytes)`.
+///
+/// **One `include_bytes!` per face for the whole crate.** [`font_definitions`]
+/// registers these with egui by the first field; `unlock_prompt` registers the
+/// same bytes with GDI through `AddFontMemResourceEx` and then asks for them
+/// by the second and third. A Win32 surface that shipped its own
+/// `include_bytes!` would put a second copy of every face in the binary and,
+/// worse, let the two renderers drift onto different files.
+///
+/// **The GDI names are not the egui ones, and are read out of the files
+/// rather than guessed.** GDI matches on the legacy `name` records (IDs 1 and
+/// 2), which can hold only four styles per family, so Archivo's static cuts
+/// spell themselves this way: Regular and Bold share the family `Archivo` and
+/// are told apart by weight, while SemiBold and ExtraBold each carry their own
+/// legacy family and are `Regular` *within* it. Asking GDI for
+/// `("Archivo", 600)` therefore returns synthesised-looking Regular, not
+/// SemiBold, which is exactly the kind of near-miss that made the last raw
+/// Win32 surface in this project read as foreign.
+pub const ARCHIVO_FACES: [(&str, &str, i32, &[u8]); 4] = [
+    (REGULAR, "Archivo", 400, include_bytes!("../assets/fonts/Archivo-Regular.ttf")),
+    (SEMIBOLD, "Archivo SemiBold", 400, include_bytes!("../assets/fonts/Archivo-SemiBold.ttf")),
+    (BOLD, "Archivo", 700, include_bytes!("../assets/fonts/Archivo-Bold.ttf")),
+    (EXTRABOLD, "Archivo ExtraBold", 400, include_bytes!("../assets/fonts/Archivo-ExtraBold.ttf")),
+];
+
+/// The `(GDI family, GDI weight)` a caller outside egui asks for to get the
+/// cut `family` names, from [`ARCHIVO_FACES`].
+///
+/// Falls back to Regular's pair rather than panicking: a prompt set in the
+/// wrong weight is a cosmetic defect, and this is the one surface in the app
+/// whose whole reason for existing is that it must open when the heavier
+/// machinery cannot.
+pub fn gdi_face_for(family: &str) -> (&'static str, i32) {
+    ARCHIVO_FACES
+        .iter()
+        .find(|(egui_family, ..)| *egui_family == family)
+        .map(|(_, gdi, weight, _)| (*gdi, *weight))
+        .unwrap_or(("Archivo", 400))
+}
+
 /// The Noto Cyrillic face standing behind `archivo`, from [`CYRILLIC_FACES`].
 fn cyrillic_for(archivo: &str) -> &'static str {
     CYRILLIC_FACES
@@ -201,30 +242,11 @@ fn cyrillic_for(archivo: &str) -> &'static str {
 /// after them would never be consulted and nothing would change.
 fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        REGULAR.to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/Archivo-Regular.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        SEMIBOLD.to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/Archivo-SemiBold.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        BOLD.to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/Archivo-Bold.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        EXTRABOLD.to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/Archivo-ExtraBold.ttf"
-        ))),
-    );
+    for (family, _, _, bytes) in ARCHIVO_FACES {
+        fonts
+            .font_data
+            .insert(family.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
+    }
 
     for (_, noto, bytes) in CYRILLIC_FACES {
         fonts
@@ -513,7 +535,13 @@ pub fn apply(ctx: &egui::Context) {
 /// is a bug in this file" does not hold: the mismatch is the fix, and
 /// `quadrant_tones_alternate_around_the_mark` locks it in so it cannot be
 /// quietly reverted to palette order.
-const QUADRANT_FILLS: [Color32; 4] = [BLUE_DEEP, BLUE_BRIGHT, BLUE_SOFT, BLUE];
+/// **Public because the mark is painted by two renderers, not one.**
+/// `unlock_prompt` draws the same shield through GDI `Polygon` with no egui
+/// anywhere in the process, and it reads the fills and the outlines from here
+/// rather than restating them. Two copies of a brand mark that must agree is
+/// the same defect shape this crate's palette constants exist to prevent, and
+/// a cross-renderer copy is the version of it nobody would notice drifting.
+pub const QUADRANT_FILLS: [Color32; 4] = [BLUE_DEEP, BLUE_BRIGHT, BLUE_SOFT, BLUE];
 
 /// Kappa for approximating a 90° circular arc with one cubic Bézier,
 /// pre-multiplied by the design's 2.4-unit corner radius.
@@ -543,7 +571,10 @@ fn flatten_cubic(out: &mut Vec<Pos2>, p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, st
 /// constant in all but name (it just needs float arithmetic a `const` can't
 /// do). Callers scale the returned points into screen space themselves, so
 /// there is nothing frame-dependent to recompute.
-fn quadrant_outlines() -> &'static [Vec<Pos2>; 4] {
+/// Public for [`QUADRANT_FILLS`]'s reason: `unlock_prompt` scales these same
+/// points into GDI device space and fills them with `Polygon`, so the Win32
+/// surface draws the design's shield rather than an approximation of it.
+pub fn quadrant_outlines() -> &'static [Vec<Pos2>; 4] {
     static OUTLINES: OnceLock<[Vec<Pos2>; 4]> = OnceLock::new();
     OUTLINES.get_or_init(build_quadrant_outlines)
 }

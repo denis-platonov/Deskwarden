@@ -696,7 +696,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 10] = [
+    const OPENS_WINDOWS: [&str; 11] = [
         "app_window",
         "loading_ui",
         "login_ui",
@@ -717,6 +717,13 @@ mod tests {
         // [`OPENS_A_VIEWPORT_AND_RAISES_IT`], which is the table that holds
         // its raise.
         "scratch_window",
+        // The daemon's unlock prompt. The FIRST window in this crate that is
+        // neither an `eframe` loop nor an egui viewport since the rehearsal
+        // window stopped being one -- it is bare Win32, deliberately, because
+        // creating an egui window costs ~95 MB of OpenGL driver arenas that
+        // nothing releases. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which
+        // is the table that came back to hold it.
+        "unlock_prompt",
         "vault_window",
     ];
 
@@ -810,6 +817,47 @@ mod tests {
         ("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE"),
         ("region_overlay", include_str!("region_overlay.rs"), "REGION_TITLE"),
     ];
+
+    /// **Opens a raw Win32 window -- no `eframe`, no egui -- and raises it.**
+    ///
+    /// The fourth category, and it is a table that was deleted and has come
+    /// back. [`OPENS_A_VIEWPORT_AND_RAISES_IT`]'s own docstring records the
+    /// deletion: it used to be `OPENS_A_WIN32_WINDOW_AND_RAISES_IT`, holding
+    /// the rehearsal window's first implementation, and it was renamed rather
+    /// than joined by a fourth on the stated ground that "there is no Win32
+    /// window left in this crate for the old one to hold" and "a table kept
+    /// alive for a case that no longer exists is a guard that counts zero
+    /// forever".
+    ///
+    /// That reasoning was right and its premise has expired. `unlock_prompt`
+    /// is a Win32 window, and it is one **on purpose and permanently**: the
+    /// daemon/UI split measured a process that creates an egui window at ~95 MB
+    /// of unreleasable OpenGL driver arenas against 1.61 MB for one that never
+    /// does, and the unlock prompt is the surface that pays that on the
+    /// commonest interaction a locked vault has. So this is not a table
+    /// speculatively kept for a case that might return; it is a table for a
+    /// case that is now load-bearing.
+    ///
+    /// **Its needle is `CreateWindowExW(`, and the raise it holds is
+    /// `SetForegroundWindow`, not `raise_window`.** Both differ from every
+    /// other table here and both are deliberate:
+    ///
+    /// * `RAISING_SITES` greps `run_ui_native(TITLE,`, which names `eframe`'s
+    ///   entry point. This module does not call it and must not: calling it is
+    ///   the 95 MB.
+    /// * `raise_window(TITLE)` finds a window by walking this process's own
+    ///   windows and matching the title. This module already **holds the
+    ///   `HWND` it just created**, so going out to `EnumWindows` to find a
+    ///   window it is holding would be strictly worse -- slower, and matching
+    ///   on a string where an exact handle is in scope. `foreground`'s whole
+    ///   reason for matching on titles is that `eframe` never hands the window
+    ///   back; bare Win32 does.
+    ///
+    /// What is unchanged is the obligation: a window that takes the foreground
+    /// has to ask for it somewhere a test can see, and a refusal has to be a
+    /// handled outcome rather than an ignored return value.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 1] =
+        [("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE")];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
@@ -1000,6 +1048,57 @@ mod tests {
         // `code()` the loop uses: they can be found where they really are, so a
         // zero above is an absence and not a typo.
         assert!(RAISING_SITES.iter().all(|(_, s, ..)| code(s).contains("run_ui_native(")));
+    }
+
+    /// **The bare-Win32 window really opens, really opens under its own title,
+    /// and really asks for the foreground.**
+    ///
+    /// [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`]'s sibling of the two tests above,
+    /// and it has to be its own because none of their needles apply: this
+    /// module calls neither `run_ui_native(` nor `show_viewport_deferred(`, and
+    /// it raises by `SetForegroundWindow` on a handle it is holding rather than
+    /// by `raise_window` on a title it has to go and find. A row added to
+    /// either of the other tables would fail on a window that is doing
+    /// everything right; a row in neither would be a window nothing checks,
+    /// which is the hole this whole file exists to close.
+    #[test]
+    fn the_bare_win32_window_this_crate_opens_asks_for_the_foreground() {
+        for (name, source, title) in OPENS_A_WIN32_WINDOW_AND_RAISES_IT {
+            let (production, cut) = production_half(source);
+            assert!(cut > 0, "no test module was cut out of `{name}`");
+            let source = code(&production);
+
+            assert!(
+                source.contains(&format!("&HSTRING::from({title})")),
+                "`{name}` does not open its window under `{title}`. The title is what keeps                  `pick`'s `find` exact while this window is up alongside the tray's and the                  hotkey listener's helper windows, and                  `only_one_window_of_this_process_can_exist_at_a_time` asserts it is unique --                  an assertion about a constant no window is actually opened under proves                  nothing."
+            );
+            assert_eq!(
+                source.matches("SetForegroundWindow(").count(),
+                1,
+                "`{name}` opens a window the user has to type into and does not ask for the                  foreground exactly once. This surface is answered by typing; without the                  foreground the keystrokes go to whatever the user was in, which for a master                  password is considerably worse than a window sitting behind something."
+            );
+            assert_eq!(
+                source.matches("SetWindowDisplayAffinity(").count(),
+                1,
+                "`{name}` shows a master password and does not exclude itself from screen                  capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
+            );
+            assert_eq!(
+                source.matches("run_ui_native(").count(),
+                0,
+                "`{name}` has become an `eframe` window, which is the ~95 MB of unreleasable                  OpenGL driver arenas this surface exists to not spend. If that is deliberate,                  move it to `RAISING_SITES` -- and re-measure, because the daemon/UI split's                  whole premise is that this file never links a renderer."
+            );
+        }
+        // Positive controls on the four needles above, so none of them is a
+        // count over a string that occurs nowhere. The three that must be
+        // present are found by the loop itself; these are the two that must be
+        // ABSENT, checked where they really do occur.
+        assert!(RAISING_SITES.iter().all(|(_, s, ..)| code(s).contains("run_ui_native(")));
+        assert!(
+            OPENS_A_WIN32_WINDOW_AND_RAISES_IT
+                .iter()
+                .all(|(_, s, _)| code(&production_half(s).0).contains("CreateWindowExW(")),
+            "control: the bare-Win32 table's source does not create a window at all"
+        );
     }
 
     /// **The list above is hand-enumerated, and that is its one weakness.** A
@@ -1244,6 +1343,7 @@ mod tests {
             .iter()
             .map(|(module, ..)| *module)
             .chain(OPENS_A_VIEWPORT_AND_RAISES_IT.iter().map(|(module, ..)| *module))
+            .chain(OPENS_A_WIN32_WINDOW_AND_RAISES_IT.iter().map(|(module, ..)| *module))
             .collect();
         let excused: Vec<&str> = OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
             .iter()
@@ -1254,12 +1354,18 @@ mod tests {
         // reading real names rather than iterating an empty vector.
         assert_eq!(
             raises.len(),
-            RAISING_SITES.len() + OPENS_A_VIEWPORT_AND_RAISES_IT.len(),
-            "control: a name per raising site, `eframe`'s loops and the viewport alike"
+            RAISING_SITES.len()
+                + OPENS_A_VIEWPORT_AND_RAISES_IT.len()
+                + OPENS_A_WIN32_WINDOW_AND_RAISES_IT.len(),
+            "control: a name per raising site -- `eframe`'s loops, the viewports and the one              bare-Win32 window alike"
         );
         assert!(
             raises.contains(&"scratch_window"),
             "control: the viewport raise table is being read at all: {raises:?}"
+        );
+        assert!(
+            raises.contains(&"unlock_prompt"),
+            "control: the bare-Win32 raise table is being read at all: {raises:?}"
         );
         assert!(
             raises.contains(&"vault_window"),
@@ -1505,6 +1611,11 @@ mod tests {
                     .map(|(module, source, _)| (*module, *source)),
             )
             .chain(
+                OPENS_A_WIN32_WINDOW_AND_RAISES_IT
+                    .iter()
+                    .map(|(module, source, _)| (*module, *source)),
+            )
+            .chain(
                 OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
                     .iter()
                     .map(|(module, source, _)| (*module, *source)),
@@ -1553,13 +1664,21 @@ mod tests {
             // `with_any_thread` by name inside a window module fails this test
             // -- which is a build failure that says exactly what it means.)
             assert!(
-                source.contains("ViewportBuilder"),
-                "control: `{module}`'s source does not build a viewport at all, so it is
-                 either not the file this thinks it is or not a window-opening module -- and
-                 the counts below are then zero for a reason that has nothing to do with the
-                 invariant. (This used to accept `CreateWindowExW` as well, for the rehearsal
-                 window's first, raw-Win32 implementation. That window is now an egui
-                 viewport, and every window this crate opens builds a `ViewportBuilder`.)"
+                source.contains("ViewportBuilder") || source.contains("CreateWindowExW("),
+                "control: `{module}`'s source neither builds a viewport nor creates a Win32
+                 window, so it is either not the file this thinks it is or not a
+                 window-opening module -- and the counts below are then zero for a reason
+                 that has nothing to do with the invariant.
+
+                 (`CreateWindowExW` was accepted here once before, for the rehearsal
+                 window's first, raw-Win32 implementation, and was removed when that window
+                 became an egui viewport and `ViewportBuilder` really was universal. It is
+                 back for `unlock_prompt`, which is bare Win32 permanently and for a
+                 measured reason -- see `OPENS_A_WIN32_WINDOW_AND_RAISES_IT`. The two
+                 needles are an OR rather than a per-module table because what this control
+                 asserts is only that the source is a real window-opening file; WHICH kind
+                 of window it opens is the raise tables' business, and they hold it
+                 per-module.)"
             );
             assert_eq!(
                 source.matches("with_any_thread").count(),

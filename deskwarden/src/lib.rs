@@ -103,6 +103,10 @@ pub mod theme;
 pub mod tray;
 pub mod update_panel;
 pub mod updater;
+/// The daemon's bare-Win32 unlock prompt: the app asking for the master
+/// password without launching the app. Opens a window and never a GL context,
+/// which is the whole point -- see the module doc.
+pub mod unlock_prompt;
 pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;
