@@ -2496,7 +2496,23 @@ pub fn picker_offers(
     candidates: &[crate::app_candidates::Candidate],
     items: &[VaultItem],
 ) -> Vec<crate::picker_prompt::Offer> {
-    let dir = ICON_CACHE_DIR.get();
+    picker_offers_in(ICON_CACHE_DIR.get().map(std::path::PathBuf::as_path), candidates, items)
+}
+
+/// The same, with the icon cache directory passed in rather than read from the
+/// process-wide `OnceLock`.
+///
+/// **This is not a test seam; it is where the directory stops being ambient.**
+/// `ICON_CACHE_DIR` is set once, by `main`, so a caller that reads it can only
+/// ever see one directory for the life of the process -- which left the icon
+/// branch below unreachable from any test in the binary. The read now happens
+/// at the one production call site above, and everything that decides *which*
+/// icon an offer carries lives here, where it can be handed a directory.
+pub fn picker_offers_in(
+    dir: Option<&std::path::Path>,
+    candidates: &[crate::app_candidates::Candidate],
+    items: &[VaultItem],
+) -> Vec<crate::picker_prompt::Offer> {
     candidates
         .iter()
         .filter_map(|candidate| {
@@ -2553,6 +2569,35 @@ pub fn picker_follow_up(
     }
 }
 
+/// The picker's offers for this window, **and the whole lifetime of the vault
+/// snapshot they were built from**.
+///
+/// The scan genuinely wants every item -- `app_candidates::candidates` ranks
+/// against the whole vault -- so a full [`VaultCache::items`] snapshot is
+/// taken. What must not happen is that snapshot outliving the scan:
+/// `items()` deep-clones every item *including every plaintext password*, into
+/// a `Vec` that does not zeroize, at a measured 5.66 MB and 46,494 allocations
+/// over a 1,663-item vault (see its own docstring, and commit `d29d440`, which
+/// removed exactly this pattern from the fill path). The account picker's card
+/// is modal and stays up for as long as the user looks at it, so a snapshot
+/// still bound at the `ask` call would be a non-zeroizing copy of the whole
+/// vault sitting in memory for that entire time.
+///
+/// Confining it to this function is what makes that a fact rather than a
+/// convention: the return type carries offers only -- palettes, names and PNG
+/// bytes, no secret -- so the clone is dropped here, at the `}`, before any
+/// caller can put a window on screen. `handle_no_match` therefore never names
+/// `items()` at all, which is what `the_vault_snapshot_does_not_outlive_the_scan`
+/// pins.
+fn picker_offers_for(
+    cache: &VaultCache,
+    window: &crate::window_watch::ForegroundEvent,
+) -> Vec<crate::picker_prompt::Offer> {
+    let items = cache.items();
+    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
+    picker_offers(&candidates, &items)
+}
+
 pub fn handle_no_match(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
@@ -2562,9 +2607,7 @@ pub fn handle_no_match(
     // `MatchEngine` on purpose -- see its module doc for why that is safe here
     // and would not be there -- and an empty answer leaves every line below
     // this one doing exactly what it did before.
-    let items = cache.items();
-    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
-    let offers = picker_offers(&candidates, &items);
+    let offers = picker_offers_for(cache, window);
     if !offers.is_empty() {
         let label = window_label(&window.exe_name, &window.title);
         let outcome = crate::picker_prompt::ask(&offers);
@@ -4697,6 +4740,15 @@ mod prompt_wiring_tests {
 /// find them and either fail forever or have to be weakened until it accepted
 /// them, and a scan weakened to accept a test's `UserTabPass` would accept
 /// production's too. What is being claimed is about what SHIPS.
+///
+/// **The one blind spot in the reshaped guard**: forms are matched against a
+/// call's text by substring, with nothing binding a form to a *position*, so
+/// two call sites in the same file that SWAPPED their entitlements would each
+/// still match exactly one form and this test would pass -- for `main.rs` that
+/// means the hotkey naming `FillChoice::Saved` and the picker forwarding
+/// `, choice,` could trade places unnoticed. Catching that needs the rows to
+/// name the call sites themselves, which nothing in the source text supports
+/// today.
 #[cfg(test)]
 mod fill_call_site_tests {
     // Split across two literals so `include_str!` of this very file does not
@@ -9102,6 +9154,115 @@ mod picker_wiring_tests {
             !line.contains("Recovery PIN"),
             "a custom field's name is out of the user's own vault item and does not belong in a \
              log file on disk: {line}"
+        );
+    }
+
+    /// A login with a URI, so `favicon::icon_domain_for` has a domain to
+    /// answer with -- the fixture above has no URIs and so can never carry an
+    /// icon whatever directory it is offered.
+    fn login_at(domain: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"id-1","name":"Slack","type":1,"login":{{"username":"ada","password":"hunter2","uris":[{{"uri":"https://{domain}/login"}}]}}}}"#
+        ))
+        .expect("the fixture item is valid")
+    }
+
+    /// A unique temp directory, in `favicon`'s own idiom. **Never
+    /// `%APPDATA%\Deskwarden`**: the icon cache this test writes into is the
+    /// real one's shape, not the real one.
+    fn unique_icon_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deskwarden-test-picker-icons-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    /// **The icon branch, actually taken.**
+    ///
+    /// The sibling test above asserts `icon.is_none()`, and it can only say
+    /// that because no directory is set -- which for as long as the directory
+    /// was read from a process-wide `OnceLock` meant the branch that puts a
+    /// PNG on an offer was unreachable from the whole test binary.
+    /// `picker_offers_in` takes the directory, so it can be handed one.
+    #[test]
+    fn an_offer_carries_the_icon_already_cached_for_its_items_domain() {
+        let dir = unique_icon_dir("hit");
+        let png = vec![137u8, 80, 78, 71, 13, 10, 26, 10];
+        crate::favicon::write_cached_icon(&dir, "slack.com", &png);
+
+        let item = login_at("slack.com");
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: "ada".to_string(),
+        }];
+
+        let offers = picker_offers_in(Some(&dir), &candidates, std::slice::from_ref(&item));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            offers[0].icon.as_deref(),
+            Some(png.as_slice()),
+            "the offer came back without the icon that is already on disk for its domain -- the \
+             card would draw a monogram for an item whose favicon was fetched long ago"
+        );
+
+        // The control: the same call with no directory answers no icon, so the
+        // assertion above is about the directory and not about a function that
+        // always finds something.
+        let without = picker_offers_in(None, &candidates, std::slice::from_ref(&item));
+        assert!(without[0].icon.is_none());
+    }
+
+    /// **The plaintext vault snapshot does not outlive the scan that needs
+    /// it**, pinned structurally.
+    ///
+    /// `VaultCache::items()` deep-clones every item including every plaintext
+    /// password into a `Vec` that does not zeroize -- 5.66 MB and 46,494
+    /// allocations over a realistic vault, which is why `get_by_id` exists and
+    /// why commit `d29d440` took this pattern out of the fill path. The
+    /// account picker's card is modal: a snapshot still bound when
+    /// `picker_prompt::ask` is called sits in memory for as long as the user
+    /// looks at the card.
+    ///
+    /// The lifetime itself cannot be tested from here -- `handle_no_match`
+    /// needs a real vault and raises a real always-on-top window, so no test
+    /// may execute it. What is pinned instead is the structure that makes the
+    /// lifetime true: the snapshot is taken inside `picker_offers_for`, whose
+    /// return type carries offers and no items, so it is dropped at that
+    /// function's `}` -- and `handle_no_match`, the function that calls `ask`,
+    /// never names `items()` at all. This is the source-pin idiom
+    /// `the_save_goes_through_the_one_create_route_the_edit_form_uses` uses,
+    /// for the same reason.
+    #[test]
+    fn the_vault_snapshot_does_not_outlive_the_scan_that_needs_it() {
+        let source = include_str!("app.rs");
+        // Split literals, in this crate's idiom: a whole needle would match
+        // its own declaration.
+        let start = source
+            .find(concat!("pub fn handle_no", "_match("))
+            .expect("`handle_no_match` is in this file");
+        // Line-based rather than a `"\n}\n"` needle, because that needle is
+        // vacuous on a CRLF checkout and this repo has no `.gitattributes`.
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(")),
+            "control: the slice being scanned is not the function that raises the card"
+        );
+        assert!(
+            !body.contains(concat!("cache.", "items()")),
+            "`handle_no_match` takes a full `VaultCache::items()` snapshot itself. That clone \
+             holds every plaintext password in the vault, does not zeroize, and this function \
+             puts a modal card on screen -- so the copy would be alive for as long as the user \
+             looks at it. Take it inside `picker_offers_for`, which returns offers and no items \
+             and therefore drops it before the card is raised"
         );
     }
 }

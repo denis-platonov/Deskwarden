@@ -912,7 +912,22 @@ mod win32 {
         }
 
         register_class();
-        *FONTS.lock().ok()? = Some(Fonts::build());
+        // **Destroy the previous set before overwriting it.** `Fonts` has no
+        // `Drop` -- it holds raw `HFONT`s -- so assigning over a `Some` would
+        // leak five fonts per `open` that ran without a matching `close`.
+        {
+            let mut slot = match FONTS.lock() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    drop_icons();
+                    return None;
+                }
+            };
+            if let Some(previous) = slot.take() {
+                previous.destroy();
+            }
+            *slot = Some(Fonts::build());
+        }
 
         let l = super::layout();
         let (w, h) = (scale(l.window.w), scale(l.window.h));
@@ -948,44 +963,73 @@ mod win32 {
 
         round_corners(window);
 
-        {
-            let guard = FONTS.lock().ok()?;
-            let fonts = guard.as_ref()?;
-
-            // Every slot gets a control whether or not this list fills it: the
-            // second step reuses the same controls for its own rows, and
-            // creating them lazily would mean creating a window from inside a
-            // repaint.
-            for index in 0..ROW_CAP {
-                let control = child(
-                    window,
-                    w!("BUTTON"),
-                    WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-                    super::row_at(index),
-                    ID_ROW + index,
-                    fonts.name,
-                )?;
-                subclass(control);
+        // **Below this line the card is on screen.** `WS_VISIBLE` is in the
+        // style, so a bare `?` here would return `None`, make `run_with`
+        // answer `Unavailable`, and leave a frameless topmost card with no
+        // controls and no way for the user to dismiss it -- `close` is only
+        // reached with a `PickerWindow` in hand. Every failure path from here
+        // on goes through `abandon`, which takes the window down and frees the
+        // fonts and the DIBs before answering `None`.
+        fn abandon(window: HWND) -> Option<PickerWindow> {
+            unsafe {
+                let _ = DestroyWindow(window);
             }
-            let secondary = child(
-                window,
-                w!("BUTTON"),
-                WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-                l.secondary,
-                ID_SECONDARY,
-                fonts.button,
-            )?;
-            let cancel = child(
-                window,
-                w!("BUTTON"),
-                WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-                l.cancel,
-                ID_CANCEL,
-                fonts.button,
-            )?;
-            subclass(secondary);
-            subclass(cancel);
+            if let Ok(mut slot) = FONTS.lock() {
+                if let Some(fonts) = slot.take() {
+                    fonts.destroy();
+                }
+            }
+            drop_icons();
+            None
         }
+
+        // The handles are copied out and the guard dropped at the end of this
+        // statement: `abandon` locks `FONTS` itself, so holding the guard
+        // across the `child` calls below would deadlock the failure path.
+        let Some((name_font, button_font)) =
+            FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| (f.name, f.button)))
+        else {
+            return abandon(window);
+        };
+
+        // Every slot gets a control whether or not this list fills it: the
+        // second step reuses the same controls for its own rows, and creating
+        // them lazily would mean creating a window from inside a repaint.
+        for index in 0..ROW_CAP {
+            let Some(control) = child(
+                window,
+                w!("BUTTON"),
+                WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+                super::row_at(index),
+                ID_ROW + index,
+                name_font,
+            ) else {
+                return abandon(window);
+            };
+            subclass(control);
+        }
+        let Some(secondary) = child(
+            window,
+            w!("BUTTON"),
+            WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+            l.secondary,
+            ID_SECONDARY,
+            button_font,
+        ) else {
+            return abandon(window);
+        };
+        let Some(cancel) = child(
+            window,
+            w!("BUTTON"),
+            WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+            l.cancel,
+            ID_CANCEL,
+            button_font,
+        ) else {
+            return abandon(window);
+        };
+        subclass(secondary);
+        subclass(cancel);
 
         apply_mode(window);
 
@@ -1101,8 +1145,14 @@ mod win32 {
                     let _ = ShowWindow(control, if index < count { SW_SHOW } else { SW_HIDE });
                 }
             }
-            if let Ok(control) = GetDlgItem(window, ID_ROW as i32) {
-                let _ = SetFocus(control);
+            // **Only when there is a row to focus.** A palette that came back
+            // empty -- `palette_of` missing its item -- hides every row, and
+            // focusing a hidden control puts the keyboard nowhere the user can
+            // see it.
+            if count > 0 {
+                if let Ok(control) = GetDlgItem(window, ID_ROW as i32) {
+                    let _ = SetFocus(control);
+                }
             }
         }
         repaint(window);
