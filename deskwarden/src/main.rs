@@ -208,6 +208,12 @@ fn main() {
     // it lazily on first write, same as `update_download_dir`'s directory is
     // created lazily by `download_and_verify`.
     let icon_cache_dir = project_dirs.cache_dir().join("icons");
+    // The account picker's rows draw the same cached icons the vault window
+    // does, and its card is opened from `app::handle_no_match` -- behind an
+    // `fn` pointer with a pinned shape, so there is no argument to pass it
+    // through. This is that one binding handed over, rather than the path
+    // derived a second time in `app.rs`. See `app::set_icon_cache_dir`.
+    deskwarden::app::set_icon_cache_dir(icon_cache_dir.clone());
 
     // Logging first: a background tray app has no console, so without a log
     // file every failure below is invisible to whoever has to diagnose it.
@@ -3062,7 +3068,16 @@ fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
         // open the ~95 MB window the locked card exists to spare the user,
         // against a vault that is still locked and would therefore show an
         // empty list.
-        NoMatchFollowUp::Unlock | NoMatchFollowUp::Nothing => None,
+        // **`Fill` opens no window either, and must not.** It is answered
+        // inside `process_foreground_event`, which holds the injector that can
+        // type; by the time a follow-up reaches this function the fill has
+        // already happened or already been refused, so a `Fill` arriving here
+        // would be a routing mistake rather than a request. Opening the vault
+        // window for it would put a window in front of the app the user just
+        // watched a password typed into.
+        NoMatchFollowUp::Fill { .. }
+        | NoMatchFollowUp::Unlock
+        | NoMatchFollowUp::Nothing => None,
     }
 }
 
@@ -3080,7 +3095,9 @@ fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
 fn unlock_asked_for(follow_up: &NoMatchFollowUp) -> bool {
     match follow_up {
         NoMatchFollowUp::Unlock => true,
-        NoMatchFollowUp::SearchVault(_) | NoMatchFollowUp::Nothing => false,
+        NoMatchFollowUp::SearchVault(_)
+        | NoMatchFollowUp::Fill { .. }
+        | NoMatchFollowUp::Nothing => false,
     }
 }
 
@@ -3855,7 +3872,36 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // one opens a frameless always-on-top window, which no test in
             // this crate may do -- and which, called directly on this line,
             // would make those tests hang rather than fail.
-            (field_probe.show)(cache, event)
+            //
+            // **What the card may now ask for includes a fill, and that is
+            // why the answer is inspected here rather than returned whole.**
+            // The account picker offers accounts this window has no CONFIGURED
+            // binding for; picking one and picking a field is a fill the user
+            // asked for by name, twice. It goes through `fill_from_vault` --
+            // the same door `handle_match` uses -- so it is gated by the
+            // master-password re-prompt, gated by the 4b preflight, and typed
+            // by `Injector::fill_sequence`, whose foreground check refuses to
+            // type into a window that is no longer in front. This line is the
+            // only place in this function with an injector in scope, which is
+            // exactly why the request had to travel here to be carried out.
+            //
+            // Nothing is ARMED by it: `pending_hotkey_fill` is untouched, so
+            // the fill hotkey is no more armed after this card than it was
+            // before.
+            match (field_probe.show)(cache, event) {
+                NoMatchFollowUp::Fill { item_id, choice } => {
+                    log::info!(
+                        "the account picker asked to fill {} from vault item {item_id}",
+                        deskwarden::app::window_label(&event.exe_name, &event.title)
+                    );
+                    deskwarden::app::fill_from_vault(
+                        cache, injector, fill_stats, &item_id, event.hwnd, choice, notifier,
+                        reprompt,
+                    );
+                    NoMatchFollowUp::Nothing
+                }
+                other => other,
+            }
         }
         Open::Locked => {
             log::info!(

@@ -2468,6 +2468,7 @@ mod tests {
                 "build.rs",
                 "examples/field_locator_probe.rs",
                 "examples/icon_probe.rs",
+                "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",

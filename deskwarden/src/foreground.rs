@@ -696,12 +696,19 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 11] = [
+    const OPENS_WINDOWS: [&str; 12] = [
         "app_window",
         "loading_ui",
         "login_ui",
         "overlay_ui",
         "picker_ui",
+        // The account picker's card. The SECOND bare-Win32 window in this
+        // crate, and one for the same measured reason `unlock_prompt` is: an
+        // egui window costs ~102 MB of OpenGL driver arenas that nothing
+        // releases against this card's low single-digit MB. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise and which stopped being a one-row table for it.
+        "picker_prompt",
         // The 4b preflight confirmation. Excused from raising for the same
         // reasons `overlay_ui` is, and for one more that is stronger -- see
         // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
@@ -856,8 +863,26 @@ mod tests {
     /// What is unchanged is the obligation: a window that takes the foreground
     /// has to ask for it somewhere a test can see, and a refusal has to be a
     /// handled outcome rather than an ignored return value.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 1] =
-        [("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE")];
+    ///
+    /// **Widened to two rows rather than turned into a count**, for exactly
+    /// the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] was: a crate-wide count
+    /// of `CreateWindowExW(` could only say "two bare-Win32 windows exist
+    /// somewhere", which one module opening both satisfies. So it is one row
+    /// per module, and every assertion in
+    /// [`the_bare_win32_window_this_crate_opens_asks_for_the_foreground`] is
+    /// per-module: that module's own source opens under its own title, asks
+    /// for the foreground exactly once, and excludes itself from capture
+    /// exactly once.
+    ///
+    /// **`picker_prompt` excludes itself from capture too, and it shows no
+    /// password.** What it shows is which accounts this user holds for the app
+    /// they are in front of, which is the thing a screen recorder should not
+    /// be handed -- so the same one-call check applies to it, and the
+    /// assertion's message is worded for both.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 2] = [
+        ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
+        ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
+    ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
@@ -1080,7 +1105,7 @@ mod tests {
             assert_eq!(
                 source.matches("SetWindowDisplayAffinity(").count(),
                 1,
-                "`{name}` shows a master password and does not exclude itself from screen                  capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
+                "`{name}` shows something a screen recorder must not be handed -- a master                  password, or the list of which accounts this user holds for the app in front                  of them -- and does not exclude itself from screen capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
             );
             assert_eq!(
                 source.matches("run_ui_native(").count(),
@@ -1129,7 +1154,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 58] = [
+        const OPENS_NO_WINDOW: [&str; 57] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1225,11 +1250,6 @@ mod tests {
             // draw what it returns are a later step and are not this module.
             "otpauth",
             "password_strength",
-            // The account picker's decision: which candidate, then which
-            // field to type. `fn`-pointer seam over `PickerCalls`, exactly
-            // like `unlock_prompt`'s decision half -- no window, no Win32,
-            // just the pure logic a later task's window calls into.
-            "picker_prompt",
             // Wraps the QR decoder: an RGBA buffer in, a string out. Pure, with
             // no I/O at all -- the region capture that will feed it is a
             // later step and is not this module.
@@ -1590,6 +1610,28 @@ mod tests {
         // string, so an `assert_ne!` against either is an assertion about the
         // shared literal and not about two unrelated names.
         assert_eq!(crate::vault_window::WINDOW_TITLE, crate::preflight_host::PREFLIGHT_TITLE);
+
+        // **The two bare-Win32 windows.** Neither is an `eframe` window, so
+        // neither shares the `"Deskwarden"` literal the five above do -- but
+        // both are opened from the daemon while the tray's and the hotkey
+        // listener's helper windows already exist, and `pick` is a `find`. So
+        // their titles are asserted distinct from each other and from the
+        // shared literal, which is what keeps that `find` exact.
+        assert_ne!(
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            "the account picker and the unlock prompt are both opened from the daemon and both              found by title"
+        );
+        assert_ne!(
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert_ne!(
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert!(!crate::picker_prompt::PICKER_PROMPT_TITLE.is_empty());
+        assert!(!crate::unlock_prompt::UNLOCK_PROMPT_TITLE.is_empty());
 
         // **The 6b region overlay, the second viewport.** It is open alongside
         // the vault window too, and it takes the foreground deliberately -- so

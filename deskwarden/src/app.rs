@@ -2411,10 +2411,171 @@ pub fn route_save_answer(
 /// Only the real presenter and the real create route are named on these lines;
 /// every decision is [`no_match_arm`]'s, [`save_login_arm`]'s and
 /// [`route_save_answer`]'s, each of which a test drives with a recorder.
+/// **Where the favicon cache directory lives, threaded down from `main`.**
+///
+/// `main` computes it once, as `project_dirs.cache_dir().join("icons")`, and
+/// hands it here at startup. It is deliberately *not* recomputed in this file:
+/// a second derivation of that path is a second thing that has to agree with
+/// the first, and the one that disagreed would silently draw a card with no
+/// icons on it rather than fail.
+///
+/// A `OnceLock` and not a parameter because the only route to
+/// [`handle_no_match`] is `main`'s `NoMatchEnv::show`, an `fn` pointer whose
+/// shape is pinned by source text. `None` before it is set, and `None` is a
+/// card whose rows have no icons -- which is a shipped state, because an item
+/// with no URI never has one.
+static ICON_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Called once by `main`, with the directory it has already computed.
+pub fn set_icon_cache_dir(dir: std::path::PathBuf) {
+    let _ = ICON_CACHE_DIR.set(dir);
+}
+
+/// What the account picker's second step offers for one item.
+///
+/// `key_sequence::field_palette`'s answer verbatim -- the presence-only
+/// question, which asks whether a value is there and never what it is, so
+/// building this reads no secret. `crate::picker_prompt::palette_rows` is what
+/// decides which of them become rows, and carries the bound that keeps a
+/// fixed-size card honest.
+pub fn picker_palette(item: &VaultItem) -> crate::picker_prompt::Palette {
+    crate::picker_prompt::Palette {
+        fields: key_sequence::field_palette(item),
+        has_sequence: !sequence_for(item).is_empty(),
+    }
+}
+
+/// **What the account picker's choice means to the fill path.**
+///
+/// The picker answers in `crate::picker_prompt::Send`; every fill in this app
+/// goes through [`FillChoice`]; this is the one place the two meet.
+///
+/// **Deliberately a mapping onto the existing choice rather than a second
+/// dispatch route.** The obvious alternative -- build tokens with
+/// `picker_prompt::tokens_for`, resolve them, `sequence::plan`, and call
+/// `Injector::fill_sequence` from here -- reaches the same keystrokes for two
+/// of the three variants and *loses* everything [`fill_from_vault`] does
+/// around them: the master-password re-prompt gate ([`permitted_by_reprompt`]),
+/// the 4b preflight, the one-time-code fetch, and the outcome sink. A fill
+/// that skipped the re-prompt gate because it came from this card rather than
+/// from the overlay would be a hole opened by a routing decision, which is the
+/// worst way to open one.
+///
+/// The three arms, and the one that is not an identity:
+///
+/// * `Send::Field` is [`FillChoice::Just`]: `fill_action` renders exactly the
+///   token `tokens_for` produces, and plans it.
+/// * `Send::Sequence` is [`FillChoice::Saved`]: the item's own sequence
+///   through `key_sequence::parse`, which is what `tokens_for` does too.
+/// * `Send::All` is [`FillChoice::UserTabPass`], and this is the one that is
+///   not a token-for-token identity: `UserTabPass` is UI Automation's
+///   named-field fill with a `SendInput` username-Tab-password fallback, not a
+///   typed plan. What it types when it types is `key_sequence::DEFAULT_SEQUENCE`,
+///   which is token-for-token what `picker_prompt::tokens_for(&Send::All, ..)`
+///   produces -- pinned by `the_all_choice_types_what_the_default_fill_types`,
+///   so the two cannot drift. Collapsing the other way, and making this a
+///   plan, would delete the UI Automation path for this card alone.
+pub fn picker_choice(send: &crate::picker_prompt::Send) -> FillChoice {
+    match send {
+        crate::picker_prompt::Send::Field(field) => FillChoice::Just(field.clone()),
+        crate::picker_prompt::Send::Sequence => FillChoice::Saved,
+        crate::picker_prompt::Send::All => FillChoice::UserTabPass,
+    }
+}
+
+/// One `crate::picker_prompt::Offer` per candidate: the row, what it offers,
+/// and its cached icon.
+///
+/// **Nothing here fetches.** `favicon::read_cached_icon` reads a file that is
+/// already on disk or answers `None`; there is no network call on this path
+/// and there must never be one, because it sits between the hotkey and the
+/// card. A candidate whose item has left the snapshot between the ranking and
+/// this call is dropped rather than offered with an empty palette -- a row
+/// that offers nothing is a row that can only disappoint.
+pub fn picker_offers(
+    candidates: &[crate::app_candidates::Candidate],
+    items: &[VaultItem],
+) -> Vec<crate::picker_prompt::Offer> {
+    let dir = ICON_CACHE_DIR.get();
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let item = items.iter().find(|i| i.id == candidate.id)?;
+            let icon = dir.and_then(|dir| {
+                crate::favicon::icon_domain_for(item)
+                    .and_then(|domain| crate::favicon::read_cached_icon(dir, &domain))
+            });
+            Some(crate::picker_prompt::Offer {
+                candidate: candidate.clone(),
+                palette: picker_palette(item),
+                icon,
+            })
+        })
+        .collect()
+}
+
+/// **The account picker's outcome as something `main` can carry out**, as a
+/// pure function.
+///
+/// It exists so the mapping is testable at all, for exactly the reason
+/// [`no_match_follow_up`] and [`locked_follow_up`] exist: the only production
+/// caller is [`handle_no_match`], which raises a real always-on-top window.
+///
+/// `Cancelled` and `Unavailable` both answer `Nothing`, and they are not
+/// collapsed before they get here: `Unavailable` means the card could not be
+/// put on screen, which is worth the log line [`describe_picker_outcome`]
+/// writes, while `Cancelled` is the user saying no.
+pub fn picker_follow_up(
+    outcome: crate::picker_prompt::Outcome,
+    app_name: &str,
+) -> NoMatchFollowUp {
+    match outcome {
+        crate::picker_prompt::Outcome::Fill { id, send } => {
+            NoMatchFollowUp::Fill { item_id: id, choice: picker_choice(&send) }
+        }
+        crate::picker_prompt::Outcome::SearchVault => {
+            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
+        }
+        // *New login* opens the vault window at this app, which is the one
+        // door `main` already has -- see `NoMatchFollowUp::SearchVault`. It is
+        // deliberately NOT 3c's save-a-login form: that form is reached from
+        // the no-match card, which is the card the picker replaced precisely
+        // because there ARE saved logins that look like this app's.
+        crate::picker_prompt::Outcome::NewLogin => {
+            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
+        }
+        // The item's id rather than the app's name, because the id is what the
+        // user asked to edit and is what the vault window's search finds
+        // exactly one of.
+        crate::picker_prompt::Outcome::Edit(id) => NoMatchFollowUp::SearchVault(id),
+        crate::picker_prompt::Outcome::Cancelled
+        | crate::picker_prompt::Outcome::Unavailable => NoMatchFollowUp::Nothing,
+    }
+}
+
 pub fn handle_no_match(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
 ) -> NoMatchFollowUp {
+    // **The account picker comes first, and only when it has something to
+    // offer.** `app_candidates::candidates` is a looser matcher than
+    // `MatchEngine` on purpose -- see its module doc for why that is safe here
+    // and would not be there -- and an empty answer leaves every line below
+    // this one doing exactly what it did before.
+    let items = cache.items();
+    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
+    let offers = picker_offers(&candidates, &items);
+    if !offers.is_empty() {
+        let label = window_label(&window.exe_name, &window.title);
+        let outcome = crate::picker_prompt::ask(&offers);
+        log::info!(
+            "the account picker offered {} account(s) for {label} and was answered: {}",
+            offers.len(),
+            describe_picker_outcome(&outcome)
+        );
+        return picker_follow_up(outcome, label);
+    }
+
     let answer = no_match_arm(&REAL_OVERLAY, window);
     if answer != overlay_ui::NoMatchAnswer::NewLogin {
         return no_match_follow_up(answer, window_label(&window.exe_name, &window.title));
@@ -2496,6 +2657,21 @@ pub enum NoMatchFollowUp {
     /// particular it carries no password, no session token and no item id: it
     /// is a request to ask, not the answer to anything.
     Unlock,
+    /// **The account picker was answered with a fill.** The user picked one of
+    /// the candidate accounts and then picked which of its fields to type.
+    ///
+    /// It carries the item's **id** and **which** field, never the field's
+    /// value -- the same rule `crate::picker_prompt::Outcome::Fill` is written
+    /// to, and for the same reason: a secret carried here would be a second,
+    /// non-zeroizing home for it, alive for as long as this value is. The
+    /// plaintext is fetched at dispatch by [`fill_from_vault`], the component
+    /// that already holds it.
+    ///
+    /// **It carries no `hwnd`**, for the reason [`Self::Unlock`] carries
+    /// nothing: the window this is about is the one `main` just handed to the
+    /// dispatch, so the caller already has it, and a copy here would be a
+    /// second description of one window that could disagree with the first.
+    Fill { item_id: String, choice: FillChoice },
 }
 
 /// [`overlay_ui::NoMatchAnswer`] as a [`NoMatchFollowUp`], **as a pure
@@ -2580,6 +2756,30 @@ pub fn locked_follow_up(answer: overlay_ui::LockedAnswer) -> NoMatchFollowUp {
 /// `Zeroizing` is moved into the `NewItem` and dropped with it -- but the item
 /// *name* and the app name are in it, and this is where what is said about
 /// them is decided.
+/// What a `crate::picker_prompt::Outcome` is written to the log as.
+///
+/// [`describe_outcome`]'s sibling, and a function for the same reason: "the
+/// log line never carries a secret, and never a name out of the user's own
+/// item" is a claim worth being able to test. The field is named through
+/// `picker_prompt::describe_send`, which spells the three built-in fields and
+/// says only "a custom field" for the fourth -- see that function for why a
+/// diagnostic written to a file on disk does not follow the one precedent this
+/// crate has for spelling such a name.
+pub fn describe_picker_outcome(outcome: &crate::picker_prompt::Outcome) -> String {
+    match outcome {
+        crate::picker_prompt::Outcome::Fill { id, send } => {
+            format!("fill vault item {id} with {}", crate::picker_prompt::describe_send(send))
+        }
+        crate::picker_prompt::Outcome::NewLogin => "a new login for this app".to_string(),
+        crate::picker_prompt::Outcome::SearchVault => "search the vault instead".to_string(),
+        crate::picker_prompt::Outcome::Edit(id) => format!("edit the binding on vault item {id}"),
+        crate::picker_prompt::Outcome::Cancelled => "dismissed".to_string(),
+        crate::picker_prompt::Outcome::Unavailable => {
+            "the card could not be put on screen".to_string()
+        }
+    }
+}
+
 pub fn describe_outcome(outcome: &SaveOutcome) -> String {
     match outcome {
         SaveOutcome::Created(Ok(id)) => format!("saved as vault item {id}"),
@@ -4505,22 +4705,41 @@ mod fill_call_site_tests {
     // and vice versa, and this repo has no `.gitattributes`.
     const CALL: &str = concat!("fill_from_vault", "(");
 
-    /// The choice each file's production calls must pass, and how many calls
-    /// that file has -- **one row per file, and the two rows differ**.
+    /// The choice each production call must pass -- **one form per CALL SITE,
+    /// and the count of a file's call sites is the length of its row**.
     ///
-    /// The form and the count live in the same row deliberately. A rule that
+    /// The forms and the count live in the same row deliberately. A rule that
     /// was global and a count that was per file is what let `main.rs` inherit
     /// `app.rs`'s `, choice,`; keeping them together means a call site that
     /// appears in either file has to be given a row's worth of thought, and
     /// the count assertion below fires before anything is accepted.
     ///
-    /// The count is also what stops a call site DELETED (rather than changed)
+    /// The length is also what stops a call site DELETED (rather than changed)
     /// passing this by leaving nothing to check.
-    const RULES: [(&str, &str, usize); 2] = [
-        // Forwards the overlay's own answer; see the module doc.
-        ("app.rs", ", choice,", 1),
-        // Names the preserving choice; there is no answer to forward.
-        ("main.rs", concat!("FillChoice", "::Saved"), 1),
+    ///
+    /// **It was one form per FILE, and `main.rs` growing a second call site is
+    /// what made that shape wrong.** A per-file form can only say "every call
+    /// in this file passes the same thing", and `main.rs` now has two calls
+    /// that are entitled to opposite things: the fill hotkey has no answer to
+    /// forward and must name the preserving choice, while the account picker's
+    /// fill has an answer the user gave twice -- a row, then a field -- and
+    /// must forward it. Widening `main.rs`'s single form to accept both would
+    /// have let the hotkey forward a binding again, which is the exact
+    /// regression this module exists to hold; so the row became a list, and
+    /// the loop below matches each call to exactly one form and each form to
+    /// exactly one call.
+    const RULES: [(&str, &[&str]); 2] = [
+        // `handle_match`: forwards the overlay's own answer; see the module doc.
+        ("app.rs", &[", choice,"]),
+        ("main.rs", &[
+            // The fill hotkey: names the preserving choice, because there is
+            // no answer to forward.
+            concat!("FillChoice", "::Saved"),
+            // The account picker's fill: forwards the choice destructured out
+            // of `NoMatchFollowUp::Fill`, which is the field the user picked
+            // on the card's second step.
+            ", choice,",
+        ]),
     ];
 
     /// The row for `name`, or a hard failure.
@@ -4529,11 +4748,11 @@ mod fill_call_site_tests {
     /// own would otherwise be checked against nothing, or -- worse, and this
     /// is the defect being closed -- against whatever rule happened to be
     /// lying around for another file.
-    fn rule(name: &str) -> (&'static str, usize) {
+    fn rule(name: &str) -> &'static [&'static str] {
         RULES
             .iter()
-            .find(|(n, _, _)| *n == name)
-            .map(|(_, form, count)| (*form, *count))
+            .find(|(n, _)| *n == name)
+            .map(|(_, forms)| *forms)
             .unwrap_or_else(|| {
                 panic!(
                     "{name} is scanned but has no rule of its own. Add a row to RULES saying \
@@ -4607,7 +4826,7 @@ mod fill_call_site_tests {
         );
         let args = argument_lists(planted);
         assert_eq!(args.len(), 2, "the scanner did not find both planted calls: {args:?}");
-        let (app_form, _) = rule("app.rs");
+        let app_form = rule("app.rs")[0];
         assert!(args[0].contains(app_form), "{}", args[0]);
         assert!(
             !args[1].contains(app_form),
@@ -4617,43 +4836,59 @@ mod fill_call_site_tests {
         assert_eq!(argument_lists("nothing here").len(), 0);
     }
 
-    /// **The two files' rules are not interchangeable, in both directions.**
+    /// **The hotkey's rule and a forwarding rule are not interchangeable, in
+    /// both directions.**
     ///
     /// This is the guard on the guard. The defect being closed was one rule
     /// accepting either spelling everywhere, so the cheapest way to "fix" a
-    /// future failure of the test below is to widen a row until it accepts the
-    /// other file's form again -- and that would be silent. So the forms are
-    /// pinned as mutually rejecting: `main.rs`'s form must reject the shape
-    /// `app.rs` really passes, and `app.rs`'s form must reject the shape
-    /// `main.rs` really passes. Merge them and this fails.
+    /// future failure of the test below is to widen a row until it accepts a
+    /// forwarded binding on the hotkey path again -- and that would be silent.
+    /// So the two forms are pinned as mutually rejecting: the hotkey's form
+    /// must reject the shape a forwarding call really passes, and a forwarding
+    /// form must reject the shape the hotkey really passes. Merge them and
+    /// this fails.
+    ///
+    /// **`main.rs` now carries both forms, and that is not a merge.** Its two
+    /// call sites are entitled to opposite things and the row lists both; what
+    /// this test still holds is that neither form accepts the other's shape,
+    /// which is what stops the hotkey being handed a binding.
     ///
     /// The two shapes are written the way the production call sites are
     /// written, whitespace included, so this is a positive control for each
-    /// row as well as a negative one for the other.
+    /// form as well as a negative one for the other.
     #[test]
     fn the_two_files_rules_are_not_interchangeable() {
         let forwards = "item_id, hwnd, choice, notifier";
         let names_it = concat!("hwnd,\ndeskwarden::app::FillChoice", "::Saved,\n&notifier,");
-        let (app_form, app_count) = rule("app.rs");
-        let (main_form, main_count) = rule("main.rs");
+        let forwarding = rule("app.rs")[0];
+        let hotkey = rule("main.rs")[0];
 
-        assert!(app_form != main_form, "the two rows have collapsed into one rule again");
-        assert!(app_count > 0 && main_count > 0, "a file is scanned but has nothing to check");
+        assert!(forwarding != hotkey, "the two forms have collapsed into one rule again");
+        for name in ["app.rs", "main.rs"] {
+            assert!(!rule(name).is_empty(), "{name} is scanned but has nothing to check");
+        }
 
-        assert!(app_form.contains("choice"), "app.rs's rule stopped being about forwarding");
-        assert!(forwards.contains(app_form), "app.rs's rule rejects what app.rs really passes");
+        assert!(forwarding.contains("choice"), "the forwarding rule stopped being about forwarding");
+        assert!(forwards.contains(forwarding), "the forwarding rule rejects what app.rs passes");
         assert!(
-            !names_it.contains(app_form),
-            "app.rs's rule accepts a call that names a literal instead of forwarding"
+            !names_it.contains(forwarding),
+            "the forwarding rule accepts a call that names a literal instead of forwarding"
         );
 
-        assert!(names_it.contains(main_form), "main.rs's rule rejects what main.rs really passes");
+        assert!(names_it.contains(hotkey), "the hotkey's rule rejects what main.rs really passes");
         assert!(
-            !forwards.contains(main_form),
-            "main.rs's rule accepts a forwarded binding. The hotkey has no answer to forward, \
-             so a binding there can hold ANY choice -- `let choice = FillChoice::UserTabPass;` \
-             is the whole regression, and it is one line"
+            !forwards.contains(hotkey),
+            "the hotkey's rule accepts a forwarded binding. The hotkey has no answer to \
+             forward, so a binding there can hold ANY choice -- `let choice = \
+             FillChoice::UserTabPass;` is the whole regression, and it is one line"
         );
+
+        // **And the picker's call site is entitled to forward, deliberately.**
+        // Its row's second form is the forwarding one, so `main.rs` really
+        // does hold both -- a row that had quietly dropped back to one form
+        // would fail here rather than pass by having nothing to disagree with.
+        assert_eq!(rule("main.rs").len(), 2, "main.rs's two call sites are not both listed");
+        assert_eq!(rule("main.rs")[1], forwarding);
 
         assert_eq!(RULES.len(), sources().len(), "a file is scanned with no rule, or vice versa");
     }
@@ -4702,33 +4937,49 @@ mod fill_call_site_tests {
         let mut checked = 0;
         for (name, source) in sources() {
             let args = argument_lists(&production_only(source));
-            let (form, expected) = rule(name);
+            let forms = rule(name);
+            let expected = forms.len();
             assert_eq!(
                 args.len(),
                 expected,
                 "{name} has {} production calls to the fill, not {expected}. A call site was \
-                 added or deleted: give it a row's worth of thought and update RULES \
-                 deliberately -- a new call site must not inherit the other file's rule",
+                 added or deleted: give it a row's worth of thought and add or remove a FORM \
+                 in that file's row -- a new call site must not inherit another one's rule",
                 args.len()
             );
             assert!(expected > 0, "{name} is scanned but has no call to check");
-            for arg in &args {
-                assert!(
-                    arg.contains(form),
-                    "a fill in {name} does not pass {form:?}, which is the ONLY choice that \
-                     file's call sites are entitled to pass. In main.rs that means the hotkey \
-                     no longer names the choice that preserves what it has always done, and \
-                     every stored auto-type sequence in every existing vault is retired on \
-                     that path; in app.rs it means `handle_match` no longer forwards the \
-                     user's own answer, so the row they clicked is not the row that is typed. \
-                     Its arguments are ({arg})"
+            // **One call per form and one form per call.** Matching each form
+            // to exactly one call is what stops a file with two call sites
+            // satisfying both rows with the same call and leaving the other
+            // unchecked -- which a plain "every call matches some form" would
+            // allow, and which on this path means the fill hotkey going
+            // unexamined.
+            for form in forms {
+                assert_eq!(
+                    args.iter().filter(|arg| arg.contains(form)).count(),
+                    1,
+                    "{name} does not have exactly one fill passing {form:?}. Each call site in \
+                     this file is entitled to ONE of the forms in its row: in main.rs that \
+                     means the hotkey names the choice that preserves what it has always done \
+                     -- lose it and every stored auto-type sequence in every existing vault is \
+                     retired on that path -- and the account picker forwards the field the \
+                     user picked. In app.rs it means `handle_match` forwards the user's own \
+                     answer, so the row they clicked is the row that is typed. The calls found \
+                     were {args:?}"
                 );
                 checked += 1;
+            }
+            for arg in &args {
+                assert!(
+                    forms.iter().any(|form| arg.contains(form)),
+                    "a fill in {name} passes none of the choices that file's call sites are \
+                     entitled to pass. Its arguments are ({arg})"
+                );
             }
         }
         assert_eq!(
             checked,
-            RULES.iter().map(|(_, _, c)| c).sum::<usize>(),
+            RULES.iter().map(|(_, forms)| forms.len()).sum::<usize>(),
             "the loop did not check every call it found"
         );
         assert!(checked > 0, "the loop visited nothing at all");
@@ -8651,5 +8902,206 @@ mod generate_flow_tests {
         assert_eq!(outcome, SaveOutcome::Nothing);
         assert_eq!(*created.borrow(), 0, "a `Generate` created a vault item");
         assert_eq!(*silenced.borrow(), 0, "a `Generate` silenced the app forever");
+    }
+}
+
+/// **What the account picker's card is wired to, at the two seams that carry
+/// a decision.**
+///
+/// Nothing here opens a window, reads the real vault or touches the favicon
+/// cache: `picker_choice`, `picker_follow_up` and `picker_palette` are pure
+/// over values, which is why they are separate from `handle_no_match` at all
+/// -- that function raises a real always-on-top card and is the one thing on
+/// this path no test in this crate may execute.
+#[cfg(test)]
+mod picker_wiring_tests {
+    use super::*;
+    use crate::key_sequence::FieldRef;
+    use crate::picker_prompt::{Outcome as PickerOutcome, Palette, Send as PickerSend};
+
+    /// **The one arm of [`picker_choice`] that is not a token-for-token
+    /// identity, pinned.**
+    ///
+    /// `Send::All` maps to `FillChoice::UserTabPass`, which is UI Automation's
+    /// named-field fill rather than a typed plan -- so the mapping is only
+    /// honest for as long as what that fill *types*, when it falls back to
+    /// typing, is what `picker_prompt::tokens_for` says the choice types.
+    /// Those are two constants in two files, and this is the assertion that
+    /// stops them drifting: change either and this fails, rather than the card
+    /// quietly typing something other than what its own row promised.
+    #[test]
+    fn the_all_choice_types_what_the_default_fill_types() {
+        assert_eq!(
+            crate::picker_prompt::tokens_for(&PickerSend::All, None),
+            key_sequence::parse(key_sequence::DEFAULT_SEQUENCE),
+            "`Send::All` is routed to `FillChoice::UserTabPass`, whose SendInput fallback types \
+             `DEFAULT_SEQUENCE`. If the two stop agreeing, the picker's own row label promises \
+             one thing and the fill types another."
+        );
+        assert_eq!(picker_choice(&PickerSend::All), FillChoice::UserTabPass);
+    }
+
+    #[test]
+    fn one_field_and_a_saved_sequence_map_onto_the_choices_that_already_type_them() {
+        assert_eq!(
+            picker_choice(&PickerSend::Field(FieldRef::Totp)),
+            FillChoice::Just(FieldRef::Totp)
+        );
+        assert_eq!(picker_choice(&PickerSend::Sequence), FillChoice::Saved);
+    }
+
+    /// **The fill request carries an id and a choice, and no secret.**
+    ///
+    /// The type makes this true, which is the point -- but a later widening
+    /// that added a `password` field to the variant would compile, and this is
+    /// what would then have to be edited to let it through.
+    #[test]
+    fn a_picked_fill_names_the_item_and_the_field_and_carries_neither_value() {
+        let follow_up = picker_follow_up(
+            PickerOutcome::Fill { id: "id-1".to_string(), send: PickerSend::Field(FieldRef::Password) },
+            "Slack.exe",
+        );
+        assert_eq!(
+            follow_up,
+            NoMatchFollowUp::Fill {
+                item_id: "id-1".to_string(),
+                choice: FillChoice::Just(FieldRef::Password),
+            }
+        );
+    }
+
+    /// The two silences are silences, and the three requests are the one door
+    /// `main` already has.
+    #[test]
+    fn every_other_picker_outcome_is_a_silence_or_the_vault_window() {
+        assert_eq!(picker_follow_up(PickerOutcome::Cancelled, "Slack.exe"), NoMatchFollowUp::Nothing);
+        assert_eq!(
+            picker_follow_up(PickerOutcome::Unavailable, "Slack.exe"),
+            NoMatchFollowUp::Nothing,
+            "a card that could not be put on screen types nothing and opens nothing"
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::SearchVault, "Slack.exe"),
+            NoMatchFollowUp::SearchVault("Slack".to_string()),
+            "the `.exe` is stripped, because the vault's items are not called `Slack.exe` -- \
+             the same `search_query` the no-match card's own button goes through"
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::NewLogin, "Slack.exe"),
+            NoMatchFollowUp::SearchVault("Slack".to_string())
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::Edit("id-9".to_string()), "Slack.exe"),
+            NoMatchFollowUp::SearchVault("id-9".to_string()),
+            "editing a binding is about the ITEM the user chose, not about the app the card was \
+             shown over"
+        );
+    }
+
+    /// **A picked fill never opens a window on its way out**, which is the
+    /// property the two `main` routers have to keep: the fill is carried out
+    /// where the injector is, and by the time a follow-up reaches either of
+    /// them there is nothing left to do.
+    #[test]
+    fn a_picked_fill_asks_for_no_window() {
+        let follow_up =
+            NoMatchFollowUp::Fill { item_id: "id-1".to_string(), choice: FillChoice::Saved };
+        // The two routers live in `main.rs` and are not reachable from here;
+        // what this holds is the shape they match on -- a `Fill` is neither a
+        // `SearchVault` nor an `Unlock`, so neither router can route it to a
+        // window by falling through.
+        assert!(!matches!(follow_up, NoMatchFollowUp::SearchVault(_)));
+        assert!(!matches!(follow_up, NoMatchFollowUp::Unlock));
+    }
+
+    /// A fixture item, built the way the rest of this file builds one: from
+    /// JSON through the same `serde` path `bw serve` answers on, rather than
+    /// by naming every field of a struct that gains one every design turn.
+    fn login(username: &str, password: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"id-1","name":"Slack","type":1,"login":{{"username":"{username}","password":"{password}"}}}}"#
+        ))
+        .expect("the fixture item is valid")
+    }
+
+    /// The same fixture with nothing to type.
+    fn bare() -> VaultItem {
+        serde_json::from_str(r#"{"id":"id-1","name":"Slack","type":1}"#)
+            .expect("the fixture item is valid")
+    }
+
+    #[test]
+    fn the_palette_offered_is_the_presence_question_the_rest_of_the_app_asks() {
+        let item = login("ada", "hunter2");
+        let palette = picker_palette(&item);
+        assert_eq!(
+            palette,
+            Palette {
+                fields: key_sequence::field_palette(&item),
+                has_sequence: false,
+            },
+            "the picker asks the same question the sequence editor and the overlay ask, rather \
+             than a second one that could answer differently"
+        );
+    }
+
+    /// **An item with nothing to type still offers nothing**, so the card can
+    /// never show a row that could only fail.
+    #[test]
+    fn an_item_with_no_credentials_offers_no_rows() {
+        let palette = picker_palette(&bare());
+        assert!(crate::picker_prompt::palette_rows(&palette).is_empty());
+    }
+
+    /// **A candidate whose item is not in the snapshot is dropped, not offered
+    /// with an empty palette.**
+    ///
+    /// The ranking and the offer-building read the same `items()`, so this
+    /// cannot honestly happen -- but a row that offers nothing is a row that
+    /// can only disappoint, and the filter is what makes that a fact rather
+    /// than a coincidence of the call order.
+    #[test]
+    fn a_candidate_with_no_item_behind_it_is_not_offered() {
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: "gone".to_string(),
+            name: "Slack".to_string(),
+            username: "ada".to_string(),
+        }];
+        assert!(picker_offers(&candidates, &[login("ada", "hunter2")]).is_empty());
+    }
+
+    /// The offer really is built when the item IS there -- the control on the
+    /// test above, so its emptiness is a drop and not a function that returns
+    /// nothing for everything.
+    #[test]
+    fn a_candidate_with_an_item_behind_it_is_offered_with_that_items_palette() {
+        let item = login("ada", "hunter2");
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: "ada".to_string(),
+        }];
+        let offers = picker_offers(&candidates, std::slice::from_ref(&item));
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].palette, picker_palette(&item));
+        assert!(
+            offers[0].icon.is_none(),
+            "no favicon cache directory is set in a test, so nothing on this path reads a file"
+        );
+    }
+
+    /// **The log line names the item and the choice, and never a value.**
+    #[test]
+    fn the_picker_log_line_carries_no_secret_and_no_custom_field_name() {
+        let line = describe_picker_outcome(&PickerOutcome::Fill {
+            id: "id-1".to_string(),
+            send: PickerSend::Field(FieldRef::Custom("Recovery PIN".to_string())),
+        });
+        assert!(line.contains("id-1"), "the line must say which item: {line}");
+        assert!(
+            !line.contains("Recovery PIN"),
+            "a custom field's name is out of the user's own vault item and does not belong in a \
+             log file on disk: {line}"
+        );
     }
 }
