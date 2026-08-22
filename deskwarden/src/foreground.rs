@@ -1129,9 +1129,14 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 55] = [
+        const OPENS_NO_WINDOW: [&str; 57] = [
             "accounts",
             "app",
+            // A pure matching function over vault items: it scores and
+            // ranks the candidates for the account picker. No Win32, no
+            // window -- the card that lays out what it returns is drawn
+            // elsewhere.
+            "app_candidates",
             // Reads an executable's version resource and its shell icon.
             // Draws nothing itself; the edit form paints what it returns.
             "app_identity",
@@ -1304,6 +1309,11 @@ mod tests {
             // is the shell's, opened elsewhere; this module draws
             // nothing and calls no `run_ui_native`.
             "vault_export",
+            // GDI painting helpers -- brushes, text and blits -- called from
+            // an existing window's paint path. It creates no window of its
+            // own; whatever HWND it draws into was already created by its
+            // caller.
+            "win32_draw",
             "window_list",
             "window_watch",
         ];
