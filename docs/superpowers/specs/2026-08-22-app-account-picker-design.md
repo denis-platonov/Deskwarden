@@ -59,6 +59,22 @@ same module egui reads, and registers `theme::ARCHIVO_FACES` privately with
 `AddFontMemResourceEx` -- the same bytes, not a second copy. A theme change moves
 both renderers at once.
 
+**Direct2D was measured and rejected.** GDI cannot antialias a rounded corner
+or match egui's text rasterization, and Direct2D/DirectWrite can do both, so it
+was spiked on 2026-08-22: one window, one rounded rectangle, one line of system
+font. It cost **53.85 MB private / 44.45 MB working set** and loaded `d2d1.dll`,
+`dwrite.dll`, `dxgi.dll`, `d3d11.dll` and `nvgpucomp64.dll`. Direct2D is not a
+CPU rasterizer -- it sits on Direct3D, so it pulls in the GPU stack, and it
+lands within a few MB of the wgpu figure above because it is the same thing
+underneath. That is 30x the GDI prompt for a rectangle and a word. **Do not
+re-try this**; the DirectWrite custom-font work the quality comparison needed
+was never written, because the cheap half of the spike disqualified it.
+
+The corollary is worth keeping: two independent measurements on this machine now
+agree that a D3D-backed renderer costs ~40-55 MB against ~102 MB for OpenGL. The
+daemon cannot afford either. The vault window can, and roughly halves if the
+wgpu build problem is solved.
+
 **What is not yet on-design:** any control painted by Windows rather than by us.
 The prompt's *Cancel* is a stock button -- grey gradient, system font, square
 corners -- beside a correctly drawn *Unlock*. The fix is owner-draw
