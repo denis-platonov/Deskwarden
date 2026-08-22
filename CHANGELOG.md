@@ -8,7 +8,15 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.9.0 - 2026-08-21
+
+> The manual pre-release checklist was not run for this version either. The
+> vault can now be kept on this PC, encrypted under a key Windows Hello holds
+> in the TPM -- it is **off by default**, and with the setting off no file is
+> ever written. A login that has a copy now reaches the tray without waiting
+> for the Bitwarden CLI. None of that, nor the first window's states, has run
+> outside a test. If a launch, an update or the local copy misbehaves, please
+> open an issue.
 
 ### Fixed: Delete in an item's ⋮ menu did nothing and did not light up
 
