@@ -1129,7 +1129,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 57] = [
+        const OPENS_NO_WINDOW: [&str; 58] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1225,6 +1225,11 @@ mod tests {
             // draw what it returns are a later step and are not this module.
             "otpauth",
             "password_strength",
+            // The account picker's decision: which candidate, then which
+            // field to type. `fn`-pointer seam over `PickerCalls`, exactly
+            // like `unlock_prompt`'s decision half -- no window, no Win32,
+            // just the pure logic a later task's window calls into.
+            "picker_prompt",
             // Wraps the QR decoder: an RGBA buffer in, a string out. Pure, with
             // no I/O at all -- the region capture that will feed it is a
             // later step and is not this module.
