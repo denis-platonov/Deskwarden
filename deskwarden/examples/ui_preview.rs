@@ -1209,8 +1209,14 @@ impl Preview {
     /// other.
     fn draw_overlay_locked(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
         egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            if overlay_ui::draw_locked_card(ui, "Atlas Licence")
-                == overlay_ui::OverlayAction::Dismiss
+            // Through `locked_answer_of`, the shipped mapping, rather than a
+            // comparison against one variant: the card now carries an *Unlock*
+            // button, and a preview whose only live control did nothing when
+            // clicked would be showing a card that does not behave like the
+            // one the app ships. No prompt is opened here -- this is a preview,
+            // and the real unlock spawns `bw`.
+            if overlay_ui::locked_answer_of(&overlay_ui::draw_locked_card(ui, "Atlas Licence"))
+                .is_some()
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

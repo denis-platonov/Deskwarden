@@ -2027,20 +2027,22 @@ fn main() {
         if event.pid != own_pid {
             last_active_pid = Some(event.pid);
         }
-        pending_vault_search = search_asked_for(process_foreground_event(
+        pending_vault_search = dispatch_with_the_unlock_door(
             &event,
-            &estate.cache,
+            &mut estate,
             &injector,
             &fill_stats,
-            &estate.engine,
-            estate.settings.prompt_on_match,
-            deskwarden::app::vault_availability(estate.cache.is_populated()),
+            &mut fill_proof,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
             &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
-            &deskwarden::injector::sequence::REAL_NOTIFIER,
-            &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
-        ));
+            &job,
+            &schedule,
+            &tray,
+            &backend_op_rx,
+            &config_dir,
+            deskwarden::unlock_prompt::ask,
+        );
     }
 
     // Tray menu clicks that arrived while one of this app's blocking windows
@@ -3022,20 +3024,22 @@ fn main() {
             if event.pid != own_pid {
                 last_active_pid = Some(event.pid);
             }
-            pending_vault_search = search_asked_for(process_foreground_event(
+            pending_vault_search = dispatch_with_the_unlock_door(
                 &event,
-                &estate.cache,
+                &mut estate,
                 &injector,
                 &fill_stats,
-                &estate.engine,
-                estate.settings.prompt_on_match,
-                deskwarden::app::vault_availability(estate.cache.is_populated()),
+                &mut fill_proof,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
-                &deskwarden::injector::sequence::REAL_NOTIFIER,
-                &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
-            ));
+                &job,
+                &schedule,
+                &tray,
+                &backend_op_rx,
+                &config_dir,
+                deskwarden::unlock_prompt::ask,
+            );
         }
     }
 }
@@ -3051,7 +3055,32 @@ fn main() {
 fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
     match follow_up {
         NoMatchFollowUp::SearchVault(query) => Some(query),
-        NoMatchFollowUp::Nothing => None,
+        // **`Unlock` opens no window here, and that is the point of the
+        // whole feature.** It is answered by `unlock_asked_for` below, which
+        // leads to `unlock_prompt` -- a bare-Win32 prompt -- and not to the
+        // vault window this door opens. Collapsed into `SearchVault` it would
+        // open the ~95 MB window the locked card exists to spare the user,
+        // against a vault that is still locked and would therefore show an
+        // empty list.
+        NoMatchFollowUp::Unlock | NoMatchFollowUp::Nothing => None,
+    }
+}
+
+/// Whether a [`NoMatchFollowUp`] asks for the master-password prompt.
+///
+/// [`search_asked_for`]'s sibling, and separate rather than one function
+/// returning both, for the reason `NoMatchEnv`'s two card seams are separate:
+/// the two doors do opposite things -- one opens a window onto a readable
+/// vault, the other asks for the password to a locked one -- and a single
+/// answer that both read is one a later edit can route to the wrong door.
+///
+/// It is called at both of `process_foreground_event`'s call sites, which is
+/// the same reason [`search_asked_for`] is a named function rather than an
+/// inline `match`.
+fn unlock_asked_for(follow_up: &NoMatchFollowUp) -> bool {
+    match follow_up {
+        NoMatchFollowUp::Unlock => true,
+        NoMatchFollowUp::SearchVault(_) | NoMatchFollowUp::Nothing => false,
     }
 }
 
@@ -3563,7 +3592,14 @@ struct NoMatchEnv<'a> {
     /// `show`, for the reason `PromptPresenter::show_locked` gives -- and so
     /// that a dispatch test can say WHICH of the two cards went up, which is
     /// the whole of what this correction changed.
-    show_locked: fn(&window_watch::ForegroundEvent),
+    ///
+    /// **It answers now**, with the same [`NoMatchFollowUp`] `show` answers,
+    /// because 3b's *Unlock* button has to reach the master-password prompt
+    /// and the route back is `run`'s own loop -- the same route, and the same
+    /// reasoning, that got *Search vault* to the vault window. It still takes
+    /// no cache: this card is shown precisely when there is no readable vault,
+    /// so a cache here would be a parameter nothing could honestly fill.
+    show_locked: fn(&window_watch::ForegroundEvent) -> NoMatchFollowUp,
 }
 
 impl NoMatchEnv<'_> {
@@ -3622,7 +3658,16 @@ type NoMatchCard = fn(&VaultCache, &window_watch::ForegroundEvent) -> NoMatchFol
 
 /// The production 3b card, named and not called -- the same shape, and the
 /// same reason, as [`REAL_NO_MATCH_CARD`] directly above.
-const REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = handle_locked;
+const REAL_LOCKED_CARD: LockedCard = handle_locked;
+
+/// The shape of the 3b seam, as a name.
+///
+/// **An alias for the reason [`NoMatchCard`] is one**: the binding above is
+/// pinned by its source text in
+/// `the_production_seam_wires_each_no_item_card_to_its_own_function`, whose
+/// needle may not contain a newline, and spelling the whole `fn` type inline
+/// pushed the binding onto two lines the moment it grew a return type.
+type LockedCard = fn(&window_watch::ForegroundEvent) -> NoMatchFollowUp;
 
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
@@ -3822,14 +3867,177 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // more strongly: nothing is armed, nothing is typed, and this
             // path is handed no item because there provably is not one to be
             // had -- the engine that would name it is what the lock cleared.
-            (field_probe.show_locked)(event);
-            // 3b carries no buttons at all, so there is nothing for it to ask
-            // for -- and in particular not a search of a vault that cannot be
-            // read. See `overlay_ui::SEARCH_VAULT_LABEL`.
-            NoMatchFollowUp::Nothing
+            //
+            // **What it CAN ask for is one thing, and it is not a fill.** 3b
+            // carries exactly one button, and it is *Unlock*: not a search of
+            // a vault that cannot be read (see
+            // `overlay_ui::SEARCH_VAULT_LABEL`), and not a new login, which
+            // ends in a write to a vault that cannot be opened. The answer is
+            // carried out of here exactly as 3a's *Search vault* is -- as a
+            // return value to `run`'s loop, which owns the session this
+            // process would have to resettle.
+            (field_probe.show_locked)(event)
         }
         Open::Nothing => NoMatchFollowUp::Nothing,
     }
+}
+
+/// **`run`'s whole dispatch door, including the unlock the locked card can now
+/// ask for.**
+///
+/// One function and not two copies inline, because there are two dispatch call
+/// sites in [`run`] -- the one that seeds with whatever window is already
+/// focused, and the one in the loop -- and this is the sequence they must not
+/// disagree about: dispatch, and if the locked card asked to unlock, unlock and
+/// dispatch again. A card answered while seeding is honoured on the spot, which
+/// is what `pending_vault_search`'s comment records it could not do for the
+/// vault window (that door needs the estate by value; this one does not).
+///
+/// It answers the search query the 3a card asked for, if any, which is the one
+/// request left that this function cannot serve itself. **A search asked for by
+/// the RESUMED dispatch is what is returned**, not the first one: the first
+/// dispatch answered `Unlock`, and `search_asked_for` maps that to `None`, so
+/// there is nothing of the first to lose.
+///
+/// `ask` is the master-password prompt, threaded through rather than named
+/// inside for the reason [`authenticate_by_unlock_prompt`] gives.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_the_unlock_door<A: UiAutomationFiller, B: SendInputFiller>(
+    event: &window_watch::ForegroundEvent,
+    estate: &mut SessionEstate,
+    injector: &Injector<A, B>,
+    fill_stats: &fill_stats::FillStats,
+    fill_proof: &mut deskwarden::app::FillProof,
+    pending_hotkey_fill: &mut Option<(String, isize)>,
+    last_dispatched_hwnd: &mut Option<isize>,
+    field_probe: &mut NoMatchEnv<'_>,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &[Duration],
+    tray: &tray::AppTray,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    config_dir: &Path,
+    ask: fn(Option<std::path::PathBuf>) -> deskwarden::unlock_prompt::Outcome,
+) -> Option<String> {
+    let follow_up = process_foreground_event(
+        event,
+        &estate.cache,
+        injector,
+        fill_stats,
+        &estate.engine,
+        estate.settings.prompt_on_match,
+        deskwarden::app::vault_availability(estate.cache.is_populated()),
+        pending_hotkey_fill,
+        last_dispatched_hwnd,
+        field_probe,
+        &deskwarden::injector::sequence::REAL_NOTIFIER,
+        &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
+    );
+    if !unlock_asked_for(&follow_up) {
+        return search_asked_for(follow_up);
+    }
+
+    log::info!(
+        "the locked card asked to unlock the vault so that {} can be filled",
+        deskwarden::app::window_label(&event.exe_name, &event.title)
+    );
+    let outcome = unlock_from_the_locked_card(
+        estate,
+        job,
+        schedule,
+        tray,
+        backend_op_rx,
+        config_dir,
+        ask,
+    );
+    if !resumes_the_fill(outcome) {
+        // Nothing came back, so there is nothing to resume into. The card is
+        // already gone -- it closed to make way for the prompt -- and it is
+        // deliberately not re-opened: the user pressed a button on it, so
+        // putting the same card back over the same window would be answering
+        // a gesture with the thing the gesture dismissed. The next foreground
+        // change shows it again if the window still wants a password.
+        return None;
+    }
+    search_asked_for(resume_fill_after_unlock(
+        event,
+        &estate.cache,
+        injector,
+        fill_stats,
+        &estate.engine,
+        estate.settings.prompt_on_match,
+        deskwarden::app::vault_availability(estate.cache.is_populated()),
+        pending_hotkey_fill,
+        last_dispatched_hwnd,
+        field_probe,
+        &deskwarden::injector::sequence::REAL_NOTIFIER,
+        &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
+    ))
+}
+
+/// **Resuming the fill the user asked for, after the vault came back.**
+///
+/// The window is the one the locked card was shown over, and this dispatches
+/// it again -- through [`process_foreground_event`], the same function and the
+/// same decision that produced the locked card in the first place, with
+/// nothing about the vault's new state asserted here. It is asked afresh: the
+/// engine has been rebuilt from the unlocked account's items and `vault` is
+/// read off the cache at the call site, so a window that now matches reaches
+/// `handle_match` and one that still does not is answered honestly all over
+/// again.
+///
+/// **The one thing it does that a plain second call would not is clear
+/// `last_dispatched_hwnd`.** `dispatch::should_dispatch` suppresses a repeat
+/// event for the window already handled, which is exactly right for the
+/// foreground churn a modal window causes -- and exactly wrong here, where the
+/// window has not changed and the *vault* has. Left set, the resume is
+/// silently swallowed and the feature does nothing at all with every test
+/// green; `the_resume_is_not_swallowed_by_the_repeat_suppression` is what
+/// fails on its deletion. It is the same `= None` the three vault-window doors
+/// in `run` already perform for the same reason.
+///
+/// **`SetForegroundWindow` is not called here, and must not be.** The target
+/// may well have lost the foreground while the user typed their master
+/// password, but the fill path re-verifies the foreground before every burst
+/// it types (`injector::send_input::ensure_foreground`, called from
+/// `injector::sequence::run`), and that check is the one that refuses. Raising
+/// the window from here would be a second, unconditional foreground grab in
+/// front of a guarded one -- and it would steal focus from whatever the user
+/// moved to, to type into a window they are no longer looking at. What happens
+/// when the foreground has moved is therefore: the overlay opens for the
+/// window it names, the hotkey is armed for that same `hwnd`, and nothing is
+/// typed until the user is actually in front of it.
+#[allow(clippy::too_many_arguments)]
+fn resume_fill_after_unlock<A: UiAutomationFiller, B: SendInputFiller>(
+    event: &window_watch::ForegroundEvent,
+    cache: &VaultCache,
+    injector: &Injector<A, B>,
+    fill_stats: &fill_stats::FillStats,
+    engine: &MatchEngine,
+    prompt_on_match: bool,
+    vault: deskwarden::app::VaultAvailability,
+    pending_hotkey_fill: &mut Option<(String, isize)>,
+    last_dispatched_hwnd: &mut Option<isize>,
+    field_probe: &mut NoMatchEnv<'_>,
+    notifier: &dyn Notifier,
+    reprompt: &mut deskwarden::app::Reprompt<'_>,
+) -> NoMatchFollowUp {
+    // See this function's doc: without this the resume is suppressed as a
+    // repeat of the very event that opened the card.
+    *last_dispatched_hwnd = None;
+    process_foreground_event(
+        event,
+        cache,
+        injector,
+        fill_stats,
+        engine,
+        prompt_on_match,
+        vault,
+        pending_hotkey_fill,
+        last_dispatched_hwnd,
+        field_probe,
+        notifier,
+        reprompt,
+    )
 }
 
 /// Calls `updater::check_for_update` and logs the outcome. Network failures,
@@ -6328,6 +6536,104 @@ fn lock_after_walking_away(
     );
 }
 
+/// **Unlocking because the overlay's locked card asked to.**
+///
+/// [`lock_after_walking_away`]'s mirror image, written the same way and made
+/// of nothing new: the decision is not here (the card decided, and
+/// `app::locked_follow_up` said so), and the sequence is not here either --
+/// it is [`resettle_session`], the one teardown-and-repopulate path in this
+/// crate. What is here is the wiring, and exactly one thing differs from every
+/// other caller of that sequence: the `authenticate` closure is
+/// [`authenticate_by_unlock_prompt`] rather than a window.
+///
+/// **It is on `run`'s thread, and blocking, and that is deliberate.** The
+/// prompt pumps its own message queue until the user answers, and the resettle
+/// stops `bw serve`, starts a new one and waits for it -- none of which may
+/// happen on a worker (the tray is a hidden Win32 window bound to this thread,
+/// and `resettle_session`'s probe opens a spinner). The user is looking at a
+/// master-password prompt they just asked for, so a blocked loop here is not a
+/// new freeze; it is the same one every other unlock in this app already is.
+///
+/// The answer is [`ResettleOutcome`] and not a `bool`, so the caller's decision
+/// about whether to resume the fill is made on what actually happened. A
+/// cancelled prompt and a backend that would not start both arrive at
+/// `BackendNotStarted`, and neither may resume: one has no session at all, and
+/// the other has one but nothing serving it, so a fill dispatched into either
+/// would find an empty engine and an empty cache.
+#[allow(clippy::too_many_arguments)]
+fn unlock_from_the_locked_card(
+    est: &mut SessionEstate,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &[Duration],
+    tray: &tray::AppTray,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    config_dir: &Path,
+    ask: fn(Option<std::path::PathBuf>) -> deskwarden::unlock_prompt::Outcome,
+) -> ResettleOutcome {
+    // Field-level borrow splitting, for the reason `lock_after_walking_away`
+    // gives where it does the same: the closure below wants `store` and
+    // `active_account` while five other fields are held `&mut`.
+    let SessionEstate {
+        cache,
+        engine,
+        child,
+        token,
+        details,
+        task_in_progress,
+        store,
+        active_account,
+        ..
+    } = est;
+    resettle_session(
+        cache,
+        engine,
+        child,
+        job,
+        schedule,
+        tray,
+        backend_op_rx,
+        task_in_progress,
+        details,
+        token,
+        || {
+            // **The account's profile directory, derived by the one function
+            // that derives it.** `login_ui::profile_dir_for`'s doc is the rule
+            // -- never `bw_path::active_data_dir()` read here -- and
+            // `unlock_prompt::ask`'s own doc names that rule as the one it
+            // obeys. There is no `first_run` here and there cannot be: a
+            // freshly minted account has never been signed in to, so it has no
+            // vault to unlock, and this card is only ever shown for one that
+            // is locked.
+            let dir = login_ui::profile_dir_for(
+                active_account.as_ref().map(|account| (config_dir, account)),
+            );
+            authenticate_by_unlock_prompt(store, dir, ask)
+        },
+    )
+}
+
+/// Whether the fill the user asked for may be resumed.
+///
+/// **A function over [`ResettleOutcome`] rather than an `if` at the one call
+/// site**, because `run` is unreachable from every test in this crate, and
+/// "we only re-dispatch when the vault actually came back" is the single claim
+/// this whole feature turns on. Written inline it would be a branch nothing
+/// could read.
+///
+/// `BackendStarted` may still have stood autofill down -- `settle_vault_after_
+/// unlock` does that when the backend never answers -- and resuming is still
+/// right there: the re-dispatch asks `app::disposition` again with a vault
+/// availability read fresh off the cache, so a stood-down settle produces
+/// `Open::Locked` a second time rather than a fill. The decision it must not
+/// make is the other one: dispatching after a *cancelled* prompt would put the
+/// locked card straight back up over the window the user just dismissed it on.
+fn resumes_the_fill(outcome: ResettleOutcome) -> bool {
+    match outcome {
+        ResettleOutcome::BackendStarted => true,
+        ResettleOutcome::BackendNotStarted => false,
+    }
+}
+
 /// The one teardown-and-repopulate sequence in this crate: drain whatever
 /// backend operation is in flight, stop `bw serve`, clear the cache,
 /// authenticate, start a fresh backend, wait for it to answer, repopulate,
@@ -8745,6 +9051,70 @@ fn authenticate_for_switch(
         log::error!("failed to persist the session token for the account switched to: {e}");
     }
     Some(token)
+}
+
+/// [`authenticate_for_switch`]'s sibling for the overlay's *Unlock* button:
+/// the daemon's bare-Win32 master-password prompt, and the same save into the
+/// same [`session_store::SessionStore`].
+///
+/// **Why this and not `authenticate_for_switch`.** That one calls
+/// `login_ui::run_login_flow_for`, which is an `eframe` window: ~95 MB of
+/// OpenGL driver arenas that nothing releases, plus ~4 MB of ratchet per
+/// open/close cycle, to type one password. `crate::unlock_prompt` was measured
+/// at +0.99 MB to show, 0.00 MB of ratchet per cycle, with no renderer module
+/// loaded at any stage -- and paying the 95 MB is exactly what the locked card
+/// exists to spare the user, so reaching it from this button would have made
+/// the button pointless.
+///
+/// **It is not a second route to a session token.** `unlock_prompt` runs
+/// `bw unlock --raw` through `login_ui::run_bw_with_password`, the one
+/// function in this app that turns a master password into one; what differs is
+/// the window around it.
+///
+/// **Cancel answers `None`, and `None` is not an error.** It becomes
+/// `ResettleOutcome::BackendNotStarted` by way of `resettle_session_with`'s
+/// declined-authentication arm, which stands autofill down -- the vault was
+/// already locked and the engine already empty, so that arm leaves the app
+/// exactly where the user found it. `Unavailable` -- the prompt could not be
+/// put on screen at all -- answers `None` too, and deliberately does not fall
+/// back to the login window: the user pressed a button on a card whose whole
+/// premise is that unlocking is cheap, and answering it with the 95 MB window
+/// they were being spared is not a fallback they asked for. The tray's "Open
+/// Vault" is still there, and the log line says which of the two happened.
+///
+/// `ask` is a parameter rather than `unlock_prompt::ask` named inside, so the
+/// whole locked-fill path can be driven by a test: the real one opens a real
+/// Win32 window and spawns `bw`, and no test in this crate may do either.
+/// Production passes the real prompt at both of `dispatch_with_the_unlock_door`'s
+/// call sites, and `the_unlock_the_locked_card_opens_is_the_bare_win32_one`
+/// counts them.
+fn authenticate_by_unlock_prompt(
+    store: &session_store::SessionStore,
+    profile_dir: Option<std::path::PathBuf>,
+    ask: fn(Option<std::path::PathBuf>) -> deskwarden::unlock_prompt::Outcome,
+) -> Option<String> {
+    match ask(profile_dir) {
+        deskwarden::unlock_prompt::Outcome::Unlocked(token) => {
+            if let Err(e) = store.save(&token) {
+                log::error!("failed to persist the session token from the unlock prompt: {e}");
+            }
+            Some(token)
+        }
+        deskwarden::unlock_prompt::Outcome::Cancelled => {
+            log::info!(
+                "the unlock prompt the locked overlay opened was cancelled; the vault stays \
+                 locked and nothing is armed"
+            );
+            None
+        }
+        deskwarden::unlock_prompt::Outcome::Unavailable => {
+            log::warn!(
+                "the unlock prompt the locked overlay asked for could not be put on screen; \
+                 the vault stays locked. Open Vault from the tray to unlock in a window"
+            );
+            None
+        }
+    }
 }
 
 fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) -> String {
@@ -22908,8 +23278,13 @@ mod tests {
 
         /// The test seam's 3b -- `record_no_match`'s sibling, and for the same
         /// reason: `handle_locked` also calls `eframe::run_native`.
-        fn record_locked(window: &window_watch::ForegroundEvent) {
+        fn record_locked(window: &window_watch::ForegroundEvent) -> NoMatchFollowUp {
             LOCKED_SHOWN.with(|s| s.borrow_mut().push((window.exe_name.clone(), window.hwnd)));
+            // Dismissed, like `record_no_match`'s card. What an *Unlock*
+            // answer makes the loop do is
+            // `the_unlock_the_locked_card_asks_for_resumes_the_fill`'s
+            // question, through its own recorder.
+            NoMatchFollowUp::Nothing
         }
 
         /// Empties the locked recorder and returns what was in it.
@@ -22958,8 +23333,7 @@ mod tests {
             // binding on one line now that it has a return type -- see the
             // alias's own doc for why a one-line binding matters here.
             let no_match_const = concat!("REAL_NO_MATCH_CARD: NoMatchCard = ", "handle_no_match;");
-            let locked_const =
-                concat!("REAL_LOCKED_CARD: fn(&window_watch::ForegroundEvent) = ", "handle_locked;");
+            let locked_const = concat!("REAL_LOCKED_CARD: LockedCard = ", "handle_locked;");
             let no_match_field = concat!("show: ", "REAL_NO_MATCH_CARD,");
             let locked_field = concat!("show_locked: ", "REAL_LOCKED_CARD ");
 
@@ -23022,9 +23396,22 @@ mod tests {
             let named = concat!("REAL_", "NOTIFIER");
             // Only the half of the file above the tests: the definition of
             // `process_foreground_event` separates production from fixtures.
+            // **The boundary is the test module, not `process_foreground_event`.**
+            // It used to be that function's definition, because `run`'s two
+            // dispatch call sites were the only production text above it that
+            // could match. They are now inside `dispatch_with_the_unlock_door`,
+            // which is defined below that function because it calls it -- so
+            // the old split put production code in the "tests" half and the
+            // count read zero. The test module's own declaration is the split
+            // that actually means what the two assertions below say: everything
+            // above it ships, and nothing below it may name this. It is the
+            // same cut `startup_shape_tests::BELOW_CUT_MARKER` uses, and it is
+            // spelled in two halves for that guard's reason -- a second literal
+            // copy anywhere above the real module would move every cut in this
+            // file upwards.
             let boundary = source
-                .find(concat!("fn process_foreground", "_event<A:"))
-                .expect("`process_foreground_event`'s definition is gone from main.rs");
+                .find(concat!("mod ", "tests {"))
+                .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(real).count(),
                 3,
@@ -23073,9 +23460,22 @@ mod tests {
                 "fill_proof.scoped_to(estate.active_",
                 "account.as_ref().map(|a| &a.id))"
             );
+            // **The boundary is the test module, not `process_foreground_event`.**
+            // It used to be that function's definition, because `run`'s two
+            // dispatch call sites were the only production text above it that
+            // could match. They are now inside `dispatch_with_the_unlock_door`,
+            // which is defined below that function because it calls it -- so
+            // the old split put production code in the "tests" half and the
+            // count read zero. The test module's own declaration is the split
+            // that actually means what the two assertions below say: everything
+            // above it ships, and nothing below it may name this. It is the
+            // same cut `startup_shape_tests::BELOW_CUT_MARKER` uses, and it is
+            // spelled in two halves for that guard's reason -- a second literal
+            // copy anywhere above the real module would move every cut in this
+            // file upwards.
             let boundary = source
-                .find(concat!("fn process_foreground", "_event<A:"))
-                .expect("`process_foreground_event`'s definition is gone from main.rs");
+                .find(concat!("mod ", "tests {"))
+                .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(needle).count(),
                 3,
@@ -23112,9 +23512,22 @@ mod tests {
             let source = include_str!("main.rs");
             // Split so this test's own text is not one of the two.
             let needle = concat!("settings.", "prompt_on_match,");
+            // **The boundary is the test module, not `process_foreground_event`.**
+            // It used to be that function's definition, because `run`'s two
+            // dispatch call sites were the only production text above it that
+            // could match. They are now inside `dispatch_with_the_unlock_door`,
+            // which is defined below that function because it calls it -- so
+            // the old split put production code in the "tests" half and the
+            // count read zero. The test module's own declaration is the split
+            // that actually means what the two assertions below say: everything
+            // above it ships, and nothing below it may name this. It is the
+            // same cut `startup_shape_tests::BELOW_CUT_MARKER` uses, and it is
+            // spelled in two halves for that guard's reason -- a second literal
+            // copy anywhere above the real module would move every cut in this
+            // file upwards.
             let boundary = source
-                .find(concat!("fn process_foreground", "_event<A:"))
-                .expect("`process_foreground_event`'s definition is gone from main.rs");
+                .find(concat!("mod ", "tests {"))
+                .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(needle).count(),
                 2,
@@ -23984,6 +24397,431 @@ mod tests {
                  always has been: {line}"
             );
         }
+
+        // ---------------------------------------------------------------
+        // The locked-fill path, end to end: locked vault -> the card -> the
+        // master-password prompt -> the vault comes back -> the fill resumes.
+        // ---------------------------------------------------------------
+
+        /// The username and password the resumed fill must actually type.
+        /// They disagree and neither contains the other, so a fixture whose
+        /// two values agreed could not tell which one was typed.
+        const UNLOCKED_USER: &str = "ops.desk@ledgerline.example";
+        const UNLOCKED_PASS: &str = "Vd3-quixotic-HERON";
+
+        /// The session token the correct master password buys. A distinctive
+        /// value so the assertions below cannot pass against an empty string
+        /// left over from the locked state.
+        const UNLOCKED_TOKEN: &str = "session-token-from-the-unlock-prompt";
+
+        /// The vault item behind the window these tests dispatch: matched to
+        /// the process AND carrying credentials, which `probe_items`' fixture
+        /// deliberately does not -- that one exists to arm an engine, and this
+        /// one has to be filled from.
+        fn an_item_with_credentials() -> deskwarden::vault_bridge::VaultItem {
+            let mut item: deskwarden::vault_bridge::VaultItem =
+                serde_json::from_str(&super::vault_item_with_match("1", "Ledgerline.exe"))
+                    .expect("the fixture must deserialize as a vault item");
+            item.login = Some(deskwarden::vault_bridge::LoginData {
+                username: Some(UNLOCKED_USER.into()),
+                password: Some(UNLOCKED_PASS.to_string().into()),
+                ..deskwarden::vault_bridge::LoginData::default()
+            });
+            item
+        }
+
+        /// The one HTTP route the repopulation after an unlock still makes:
+        /// `VaultCache::populate_with` is seeded with the probe's items but
+        /// fetches folders itself. Nothing else here talks to a backend, and
+        /// the fill deliberately reads the cache rather than the bridge.
+        fn a_backend_that_answers_for_folders() -> mockito::ServerGuard {
+            let mut server = mockito::Server::new();
+            server
+                .mock("GET", "/list/object/folders")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+                .create();
+            server
+        }
+
+        /// A `SessionStore` on its own throwaway file, for
+        /// `scratch_fill_stats`'s reason: the real one lives beside the user's
+        /// account and a successful unlock writes to it.
+        fn scratch_session_store() -> (session_store::SessionStore, std::path::PathBuf) {
+            let path = std::env::temp_dir().join(format!(
+                "deskwarden-test-session-{}-{:?}.bin",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            (session_store::SessionStore::new(path.clone()), path)
+        }
+
+        /// The 3b stub that clicks *Unlock*. It answers through
+        /// `app::locked_follow_up`, the real mapping, so what these tests read
+        /// is what a user pressing that button really produces -- and it
+        /// records, so "the LOCKED card is the one that went up" is checked
+        /// rather than assumed.
+        fn asks_to_unlock(window: &window_watch::ForegroundEvent) -> NoMatchFollowUp {
+            LOCKED_SHOWN.with(|s| s.borrow_mut().push((window.exe_name.clone(), window.hwnd)));
+            deskwarden::app::locked_follow_up(deskwarden::overlay_ui::LockedAnswer::Unlock)
+        }
+
+        /// The master-password prompt, answered correctly. Stands in for
+        /// the production prompt, which opens a real Win32 window and spawns
+        /// `bw` -- neither of which any test in this crate may do.
+        fn a_correct_master_password(
+            _dir: Option<std::path::PathBuf>,
+        ) -> deskwarden::unlock_prompt::Outcome {
+            deskwarden::unlock_prompt::Outcome::Unlocked(UNLOCKED_TOKEN.to_string())
+        }
+
+        /// The same prompt, given a password `bw unlock` refused. **This is
+        /// what a wrong password looks like from `main`'s side**, and it is
+        /// `Cancelled` rather than a third variant on purpose: a refusal does
+        /// not close the prompt (`unlock_prompt::run_with` puts the CLI's
+        /// reason under the field and pumps on), so the only way a wrong
+        /// password reaches this seam is the user giving up on it. Three wrong
+        /// passwords are three error lines and one window; nothing here counts
+        /// them, because nothing here is told about them.
+        fn a_wrong_master_password(
+            _dir: Option<std::path::PathBuf>,
+        ) -> deskwarden::unlock_prompt::Outcome {
+            deskwarden::unlock_prompt::Outcome::Cancelled
+        }
+
+        /// A stub for the `bw serve` the resettle starts, so nothing in this
+        /// module spawns the real backend. Reaped by the caller.
+        fn a_stub_backend() -> Result<Child, BackendStartError> {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit"])
+                .spawn()
+                .map_err(BackendStartError::Spawn)
+        }
+
+        /// **The whole locked-fill path, driven through the real composition.**
+        ///
+        /// Every step below is the shipped function; the only substitutions
+        /// are `fn` pointers at the three seams that need a machine -- the
+        /// card (a real always-on-top window), the master-password prompt (a
+        /// real Win32 window and a `bw` spawn) and the backend start.
+        ///
+        /// **No `eframe` window is created anywhere on this route, and that is
+        /// the point of the feature rather than an incidental property.** The
+        /// route the card used to leave the user with was `login_ui`'s window:
+        /// ~95 MB of OpenGL driver arenas that nothing releases, to type one
+        /// password. Nothing here can open one -- the two card seams and the
+        /// prompt seam are all stubs -- and which function production really
+        /// passes for the prompt is
+        /// `the_unlock_the_locked_card_opens_is_the_bare_win32_one`.
+        #[test]
+        fn the_locked_card_unlocks_the_vault_and_the_fill_resumes() {
+            let server = a_backend_that_answers_for_folders();
+            let cache = VaultCache::new(VaultBridge::new(server.url()));
+            // The state a lock leaves: the cache emptied and the engine
+            // cleared, which is what `stand_down_after_unlock` does and why
+            // every window is unmatched while locked.
+            let mut engine = MatchEngine::new();
+            let filled = Filled::default();
+            let (stats, _stats_path) = scratch_fill_stats();
+            let (store, _store_path) = scratch_session_store();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let target = window("Ledgerline.exe", "Ledgerline -- Sign in", 0x4321);
+            let _ = take_locked_shown();
+            let _ = take_no_match_shown();
+
+            // 1. Locked. The card goes up, and it is the LOCKED one.
+            let follow_up = process_foreground_event(
+                &target,
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                // **The prompt setting is ON, and it must be**: `app::disposition`
+                // reads `overlay_prompts` inside the `HasPasswordField::Yes` arm,
+                // so a user who has switched the overlay off gets silence here
+                // rather than a locked card -- and there would be no button to
+                // press. `an_ordinary_window_is_still_silence_...` in `app` is
+                // where that suppression is held.
+                true,
+                deskwarden::app::VaultAvailability::Locked,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv {
+                    memo: &mut probe_memo,
+                    ask: has_password_field,
+                    show: record_no_match,
+                    show_locked: asks_to_unlock,
+                },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(
+                take_locked_shown(),
+                vec![("Ledgerline.exe".to_string(), 0x4321)],
+                "the locked card was not the one shown for a locked vault, so whatever this \
+                 test goes on to unlock is not what the user pressed"
+            );
+            assert!(
+                take_no_match_shown().is_empty(),
+                "the no-match card went up for a locked vault: it would claim there is no \
+                 saved login for an app there provably is one for"
+            );
+            assert_eq!(
+                follow_up,
+                NoMatchFollowUp::Unlock,
+                "pressing Unlock on the locked card asked `run` for nothing. The button is \
+                 inert, which is worse than not drawing it"
+            );
+            assert!(unlock_asked_for(&follow_up));
+            assert_eq!(
+                search_asked_for(follow_up.clone()),
+                None,
+                "an unlock request must not open the vault WINDOW: that is the ~95 MB this \
+                 whole path exists to avoid, against a vault that is still locked"
+            );
+            assert!(
+                filled.seen().is_empty() && pending_hotkey_fill.is_none(),
+                "the locked path typed or armed something. There is no readable vault behind \
+                 this card, so whatever that was came from somewhere it must not"
+            );
+
+            // 2. The unlock itself, through the one resettle sequence.
+            let mut child = None;
+            let mut details = None;
+            let mut token = String::new();
+            let outcome = resettle_session_with(
+                &cache,
+                &mut engine,
+                &mut child,
+                &mut details,
+                &mut token,
+                || authenticate_by_unlock_prompt(&store, None, a_correct_master_password),
+                |started_with| {
+                    assert_eq!(
+                        started_with, UNLOCKED_TOKEN,
+                        "the backend was started from a session other than the one the \
+                         master password just bought"
+                    );
+                    a_stub_backend()
+                },
+                |_window| VaultReadyOutcome::Ready(vec![an_item_with_credentials()]),
+            );
+            assert_eq!(outcome, ResettleOutcome::BackendStarted);
+            assert!(resumes_the_fill(outcome), "a vault that came back must resume the fill");
+            assert_eq!(token, UNLOCKED_TOKEN, "the session the unlock produced was dropped");
+            assert_eq!(
+                store.load().as_deref(),
+                Some(UNLOCKED_TOKEN),
+                "the unlock did not persist the session, so the next launch asks for the \
+                 master password again for no reason"
+            );
+            assert!(
+                cache.is_populated()
+                    && engine.lookup(&super::foreground("Ledgerline.exe")).is_some(),
+                "control: the unlock really did repopulate the cache and re-arm the engine, \
+                 or the resume below is being asked about a vault that is still locked"
+            );
+
+            // 3. The resume: the same window, dispatched again.
+            let resumed = resume_fill_after_unlock(
+                &target,
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                // **And OFF for the resume, which is a fixture constraint rather
+                // than a claim about the user.** With the prompt on, a matched
+                // window reaches `handle_match` -> `prompt_arm_for` ->
+                // `eframe::run_native`, and no test in this crate may open a
+                // real always-on-top window. What this step asserts --  that
+                // the resumed dispatch ARMED the fill -- is unchanged by the
+                // setting: `handle_match` arms on both branches of
+                // `match_disposition`, and the prompt is what happens after.
+                // The pair is representable in production too: the setting is
+                // read fresh at each call site, so a user who turns the overlay
+                // off while the master-password prompt is up gets exactly this.
+                false,
+                deskwarden::app::vault_availability(cache.is_populated()),
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv {
+                    memo: &mut probe_memo,
+                    ask: has_password_field,
+                    show: record_no_match,
+                    show_locked: record_locked,
+                },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(resumed, NoMatchFollowUp::Nothing);
+            assert!(
+                take_locked_shown().is_empty() && take_no_match_shown().is_empty(),
+                "the resumed dispatch put a no-item card up again. The vault is open and the \
+                 window matches, so there is an item to offer"
+            );
+            assert_eq!(
+                pending_hotkey_fill,
+                Some(("1".to_string(), 0x4321)),
+                "the resumed dispatch armed nothing, so the fill the user asked for is lost \
+                 and Ctrl+Alt+B does nothing at the window they were sitting in front of"
+            );
+
+            // 4. And the armed fill types the credentials -- `run`'s hotkey
+            //    arm, which is what an armed (item, hwnd) is FOR.
+            deskwarden::app::fill_from_vault(
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                "1",
+                0x4321,
+                deskwarden::app::FillChoice::Saved,
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(
+                filled.seen(),
+                vec![(0x4321, UNLOCKED_USER.to_string(), UNLOCKED_PASS.to_string())],
+                "the filler did not receive the credentials the unlocked vault holds, so the \
+                 whole path ends one step short of the thing the user asked for"
+            );
+
+            kill_and_reap(&mut child);
+        }
+
+        /// **The negative from the same path: a password `bw unlock` refused
+        /// fills nothing and leaves nothing armed.**
+        ///
+        /// The same steps with one seam changed. That is deliberate: a
+        /// negative written against a different fixture proves the fixture,
+        /// not the path.
+        #[test]
+        fn a_master_password_the_cli_refused_fills_nothing_and_arms_nothing() {
+            let server = a_backend_that_answers_for_folders();
+            let cache = VaultCache::new(VaultBridge::new(server.url()));
+            let mut engine = MatchEngine::new();
+            let filled = Filled::default();
+            let (stats, _stats_path) = scratch_fill_stats();
+            let (store, _store_path) = scratch_session_store();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+            let mut probe_memo = deskwarden::app::PasswordFieldProbe::new();
+            let target = window("Ledgerline.exe", "Ledgerline -- Sign in", 0x4321);
+            let _ = take_locked_shown();
+
+            let follow_up = process_foreground_event(
+                &target,
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                // **The prompt setting is ON, and it must be**: `app::disposition`
+                // reads `overlay_prompts` inside the `HasPasswordField::Yes` arm,
+                // so a user who has switched the overlay off gets silence here
+                // rather than a locked card -- and there would be no button to
+                // press. `an_ordinary_window_is_still_silence_...` in `app` is
+                // where that suppression is held.
+                true,
+                deskwarden::app::VaultAvailability::Locked,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+                &mut NoMatchEnv {
+                    memo: &mut probe_memo,
+                    ask: has_password_field,
+                    show: record_no_match,
+                    show_locked: asks_to_unlock,
+                },
+                &recorder(),
+                &mut no_reprompt(),
+            );
+            assert_eq!(follow_up, NoMatchFollowUp::Unlock, "control: the same button was pressed");
+            assert_eq!(take_locked_shown().len(), 1, "control: the locked card really went up");
+
+            let mut child = None;
+            let mut details = None;
+            let mut token = String::new();
+            let outcome = resettle_session_with(
+                &cache,
+                &mut engine,
+                &mut child,
+                &mut details,
+                &mut token,
+                || authenticate_by_unlock_prompt(&store, None, a_wrong_master_password),
+                |_token| panic!("no backend may be started for a session nobody authenticated"),
+                |_window| panic!("there is nothing to probe once no backend came up"),
+            );
+
+            assert_eq!(outcome, ResettleOutcome::BackendNotStarted);
+            assert!(
+                !resumes_the_fill(outcome),
+                "a refused master password resumed the fill. The vault is still locked, so \
+                 the resume would put the very card the user just answered straight back up \
+                 over the window they answered it on"
+            );
+            assert!(
+                token.is_empty(),
+                "a refused unlock wrote a session token. Whatever that is, it is not one the \
+                 user authenticated"
+            );
+            assert_eq!(
+                store.load(),
+                None,
+                "a refused unlock persisted something to the session store"
+            );
+            assert!(
+                !cache.is_populated()
+                    && engine.lookup(&super::foreground("Ledgerline.exe")).is_none(),
+                "a refused unlock left the vault readable or the matches armed"
+            );
+            assert!(
+                filled.seen().is_empty(),
+                "a refused master password typed credentials into the window anyway"
+            );
+            assert_eq!(
+                pending_hotkey_fill, None,
+                "a refused master password left a fill armed, so a later Ctrl+Alt+B fires at \
+                 a window with no readable vault behind it"
+            );
+            assert!(child.is_none(), "a refused unlock left a backend child behind");
+        }
+
+        /// **The unlock the locked card opens is the bare-Win32 one, on the
+        /// production lines no test can execute.**
+        ///
+        /// `dispatch_with_the_unlock_door` takes the prompt as an `fn` pointer
+        /// precisely so the two tests above can drive it, which means the one
+        /// thing they cannot see is which function `run` really passes. Named
+        /// `login_ui`'s flow instead, both of them stay green while the shipped
+        /// app answers the *Unlock* button with an `eframe` window costing
+        /// ~95 MB that nothing releases -- the exact cost the card, the prompt
+        /// and this whole path exist to avoid. It is the same shape of hole
+        /// `the_production_dispatch_uses_the_real_notifier` closes, and it is
+        /// counted the same way.
+        #[test]
+        fn the_unlock_the_locked_card_opens_is_the_bare_win32_one() {
+            let source = include_str!("main.rs");
+            let real = concat!("deskwarden::unlock_prompt::", "ask,");
+            let boundary = source
+                .find(concat!("mod ", "tests {"))
+                .expect("the test module is gone from main.rs");
+            assert_eq!(
+                source[..boundary].matches(real).count(),
+                2,
+                "expected the bare-Win32 prompt to be named exactly twice in `run` -- the \
+                 seeding dispatch door and the event-loop one. Fewer means one of the two \
+                 answers the Unlock button with something else; more means a third \
+                 production door appeared that nobody has thought about"
+            );
+            assert_eq!(
+                source[boundary..].matches(concat!("unlock_prompt::", "ask")).count(),
+                0,
+                "a test names the real unlock prompt. That opens a real Win32 window and \
+                 spawns `bw` on the machine running the suite: pass a stub"
+            );
+        }
     }
 }
 
@@ -24635,9 +25473,16 @@ mod startup_shape_tests {
             concat!("estate.settings.keep_backend_", "running"),
             concat!("estate.accounts.as_", "ref()"),
             concat!("estate.active_account.as_ref().map(|a| a.id.", "clone())"),
-            concat!("&estate.", "cache,"),
-            concat!("&estate.", "engine,"),
-            concat!("estate.settings.prompt_on_", "match,"),
+            // **The seeding dispatch, which now hands over the WHOLE estate.**
+            // It used to spell the cache, the engine and
+            // the live prompt setting here, one argument each to
+            // `process_foreground_event`. Those three moved into
+            // `dispatch_with_the_unlock_door` -- the door that can now also
+            // unlock -- and what is left on this line is a `&mut` to the estate
+            // itself, which is a stronger form of the same claim: not "it reads
+            // three fields the window may have rewritten" but "it is handed the
+            // value the window rewrites, and may rewrite it again".
+            concat!("&mut ", "estate,"),
         ];
         for needle in reads {
             assert!(

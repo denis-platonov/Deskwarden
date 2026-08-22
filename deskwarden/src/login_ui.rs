@@ -2041,7 +2041,14 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
 /// meaning: no override, so the child resolves the profile the CLI would by
 /// itself. That is also what the global held in that state, so nothing about
 /// it changed.
-fn profile_dir_for(account: Option<(&Path, &Account)>) -> Option<PathBuf> {
+///
+/// **Public because the daemon's unlock prompt needs exactly this answer.**
+/// `crate::unlock_prompt::ask` runs `bw unlock` against a profile directory,
+/// and its own doc names this function's rule as the one it must obey -- "the
+/// account's, never `bw_path::active_data_dir()` read in here". A second
+/// derivation over there would be a second chance to make precisely the
+/// mistake the paragraphs above describe.
+pub fn profile_dir_for(account: Option<(&Path, &Account)>) -> Option<PathBuf> {
     account.map(|(config_dir, account)| crate::accounts::data_dir_for(config_dir, &account.id))
 }
 
