@@ -1463,6 +1463,12 @@ impl Preview {
                 "\n",
                 "## Notes\n",
                 "- The full list is on [the releases page](https://example.invalid/r).\n",
+                // The refusal, beside the acceptance, so one picture reviews
+                // both: an https link is blue, underlined and followable; a
+                // link with any other scheme is plain text with its
+                // destination still beside it, and nothing on the page is
+                // painted as a link that will not behave as one.
+                "- Anything but https is text: [open settings](ms-settings:windowsupdate).\n",
                 "- Raw HTML is not in the subset: <b>this stays literal</b>.\n",
                 "- It is deliberately long here so this screenshot shows the\n",
                 "  region scrolling rather than pushing the buttons off the\n",

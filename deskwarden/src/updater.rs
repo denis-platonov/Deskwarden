@@ -253,21 +253,48 @@ pub fn release_notes_for_display(body: &str) -> String {
 //
 // IN: headings (`#`..`######`), bullet lists (`-`/`*`/`+`, one nesting level
 // per two leading spaces), bold (`**`/`__`), italic (`*`/`_`), inline code
-// (`` ` ``), backslash escapes, and a link's TEXT with its destination shown
-// beside it as text.
+// (`` ` ``), backslash escapes, and an `https` link -- its words, its
+// destination shown beside them as text, and a click that opens it.
+//
+// # Links were excluded, and are no longer. What changed, and what did not
+//
+// **The original rule was that nothing here is clickable**, and the argument
+// for it was this: every other thing in this subset can only make text LOOK
+// wrong -- egui executes nothing, so a misparsed emphasis is a cosmetic
+// defect -- while a link is the single element that turns styling into a
+// place the user can be SENT, on the one page whose job is telling them what
+// they are about to download and run, from text supplied by whoever published
+// the release. Showing the destination as text was held to keep the
+// information without the one-click path.
+//
+// That rule has been **reversed by the owner's decision**, and this paragraph
+// exists so the next reader finds the current reasoning rather than the old
+// one. The reversal is deliberate and its cost is understood: a release body
+// can now put one click between a reader and an arbitrary `https` address.
+//
+// What survives the reversal, because none of it costs anything:
+//
+//  * **`https` only.** Any other scheme -- `http`, `file:`, `ms-settings:`,
+//    `javascript:` -- is not a link at all here. Its words are painted as
+//    ordinary text with the destination beside them, exactly as every link
+//    was painted before. This is decided HERE, at the parse, rather than at
+//    the paint: a refused URL never reaches a [`NotesSpan`], so there is no
+//    downstream code that could be talked into opening one.
+//  * **The destination stays visible.** The ` (url)` run beside the words is
+//    unchanged. A user can see where a link goes without clicking it, which
+//    is the property a clickable link that hid its URL would take away.
+//  * **The words look like what they do.** A refused link is styled plain,
+//    not blue and underlined, so nothing on this page is painted as a link
+//    that will not act as one.
+//  * **One way to open a URL.** The renderer opens through
+//    `vault_window::webbrowser_open`, which goes via `ShellExecuteW` rather
+//    than through `cmd.exe`, and which re-checks the scheme itself. There is
+//    no second opener in this crate and this change did not add one.
+//  * **[`release_notes_for_display`] is untouched**, so the sanitisation
+//    below still runs before any of this.
 //
 // OUT, and each for its own reason:
 //
-//  * **Anything clickable.** A link's words and its URL are rendered; the
-//    result cannot be activated and opens nothing. This is the one exclusion
-//    worth arguing for rather than merely stating. Every other thing in the
-//    subset can only make text LOOK wrong -- egui executes nothing, so a
-//    misparsed emphasis is a cosmetic defect. A link is the single element
-//    that turns styling into a place the user can be SENT, on the one page
-//    whose job is telling them what they are about to download and run, from
-//    text supplied by whoever published the release. Showing the destination
-//    as text keeps the information -- it can be read, and deliberately
-//    copied -- without the one-click path.
 //  * **Images.** `![alt](url)` renders its alt text and drops the URL: an
 //    image is a network fetch, and this page makes no request it was not
 //    asked for.
@@ -293,19 +320,34 @@ pub enum NotesStyle {
     Emphasis,
     /// `` `inline code` ``.
     Code,
-    /// The words of a link. Styled as a link and **not clickable** -- see the
-    /// section header above.
+    /// The words of an `https` link. Styled as a link, and carrying the
+    /// destination in [`NotesSpan::link`] -- this is the only style that
+    /// ever does. A link the subset refused is [`NotesStyle::Plain`] with no
+    /// destination attached, so "looks like a link" and "acts like a link"
+    /// cannot come apart. See the section header above.
     LinkText,
     /// A link's destination, shown as text beside its words so the user can
-    /// see and copy where it would have gone.
+    /// see and copy where it goes -- refused links included, which is how a
+    /// refusal stays legible rather than looking like a dropped URL.
     LinkUrl,
 }
 
 /// One styled run of text within a line.
+///
+/// **`link` is the whole of the clickability decision.** It is `Some` only
+/// on a [`NotesStyle::LinkText`] span whose destination the subset accepted
+/// (`https`, and nothing else), and it holds the URL a renderer may open. A
+/// renderer needs no policy of its own: a span with no `link` has nothing to
+/// open, and a span with one has already been through the only check there
+/// is. See the section header for what that check is and why the exclusion
+/// it replaced was lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotesSpan {
     pub text: String,
     pub style: NotesStyle,
+    /// Where this run leads when it is clicked, or `None` -- which is every
+    /// span but an accepted link's words.
+    pub link: Option<String>,
 }
 
 /// One span, spelled once.
@@ -317,7 +359,45 @@ pub struct NotesSpan {
 /// that budget and read as the guard failing for the reason it exists to
 /// catch.
 fn span(text: impl Into<String>, style: NotesStyle) -> NotesSpan {
-    NotesSpan { text: text.into(), style }
+    NotesSpan { text: text.into(), style, link: None }
+}
+
+/// The words of an accepted link, and where they lead.
+///
+/// The one constructor that produces a span a renderer may click, kept
+/// beside [`span`] so the two are read together: everything else in this
+/// parser goes through `span` and is therefore inert by construction.
+fn link_span(text: impl Into<String>, url: String) -> NotesSpan {
+    NotesSpan { text: text.into(), style: NotesStyle::LinkText, link: Some(url) }
+}
+
+/// The destination of a link the subset will let a reader follow, or `None`.
+///
+/// **One match on the scheme, and `https` is the whole of it.** A release
+/// body is remote text on the page that says what is about to be installed;
+/// `http` is refused alongside `file:` and `ms-settings:` not because it is
+/// equally dangerous but because there is no release note that needs it, and
+/// a rule with one arm cannot be misread. Everything refused is still shown
+/// -- as words and a visible URL, which is how every link on this page used
+/// to be shown.
+///
+/// Trimmed before checking and returned trimmed, so the string that was
+/// judged is the string that would be opened; `webbrowser_open` makes the
+/// same pairing for the same reason.
+///
+/// `https:/` and `https://` with nothing after it are refused: a scheme with
+/// no host is not a destination, and offering a click that opens a blank is
+/// worse than painting the text.
+fn https_link(url: &str) -> Option<String> {
+    const SCHEME: &str = "https://";
+    let trimmed = url.trim();
+    // `get`, not a slice: a URL can begin mid-character and indexing one
+    // would panic where refusing it is the right answer anyway.
+    let scheme = trimmed.get(..SCHEME.len())?;
+    if !scheme.eq_ignore_ascii_case(SCHEME) || trimmed.len() == SCHEME.len() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// One line of release notes, and what kind of line it is.
@@ -461,12 +541,19 @@ fn inline_spans(line: &str) -> Vec<NotesSpan> {
         if c == '[' {
             if let Some((text, url, next)) = parse_link(&chars, i) {
                 flush(&mut spans, &mut plain);
-                // The words, then the destination. Both are text; neither is
-                // a widget anything can click.
-                spans.push(span(
-                    if text.is_empty() { url.clone() } else { text },
-                    NotesStyle::LinkText,
-                ));
+                // The words, then the destination -- and the destination is
+                // painted either way. A link the subset accepts carries its
+                // URL and can be clicked; one it refuses is painted as plain
+                // words beside the same visible URL, which is exactly how
+                // every link on this page looked before links could be
+                // followed at all. `https_link` is the only place that
+                // decides, and it decides here rather than at the paint so a
+                // refused URL is never carried anywhere.
+                let words = if text.is_empty() { url.clone() } else { text };
+                spans.push(match https_link(&url) {
+                    Some(target) => link_span(words, target),
+                    None => span(words, NotesStyle::Plain),
+                });
                 spans.push(span(format!(" ({url})"), NotesStyle::LinkUrl));
                 i = next;
                 continue;
@@ -1770,20 +1857,26 @@ mod tests {
         );
     }
 
-    /// **A link's words and its destination, and no way to follow it.**
+    /// **A link's words, its destination, AND a way to follow it.**
     ///
-    /// The parse produces text, never an action -- there is no variant of
-    /// [`NotesSpan`] a caller could turn into a click without deciding to.
-    /// The reason that line is drawn here rather than left to taste is in the
-    /// subset header: everything else in this parser can only make text look
-    /// wrong, while a link is the one element that can send someone
-    /// somewhere, from a string chosen by whoever published the release, on
-    /// the page that says what is about to be installed and run.
+    /// The destination half is the older assertion and the part that did not
+    /// change when links became clickable: a reader can see where these words
+    /// go without going there. The `link` half is the reversal -- see the
+    /// subset header for what the old rule was and why it was lifted.
     #[test]
     fn a_link_keeps_its_words_and_shows_its_destination_as_text() {
         let spans = spans_of("see [the notes](https://example.invalid/x) please");
 
-        assert!(spans.iter().any(|s| s.style == NotesStyle::LinkText && s.text == "the notes"));
+        let words = spans
+            .iter()
+            .find(|s| s.style == NotesStyle::LinkText)
+            .unwrap_or_else(|| panic!("no link span at all: {spans:?}"));
+        assert_eq!(words.text, "the notes");
+        assert_eq!(
+            words.link.as_deref(),
+            Some("https://example.invalid/x"),
+            "an accepted link carries the destination a renderer opens"
+        );
         assert!(
             spans
                 .iter()
@@ -1792,6 +1885,67 @@ mod tests {
             "the destination must be readable rather than hidden behind words: {spans:?}"
         );
         assert!(!text_of(&spans).contains('['), "got {spans:?}");
+    }
+
+    /// **Everything that is not `https` is text, and carries nothing to
+    /// open.**
+    ///
+    /// The refusal is asserted on the SPAN rather than on a renderer,
+    /// because that is where it is made: a refused URL never becomes a
+    /// `link`, so no caller can be talked into opening one. Both halves are
+    /// checked -- no destination attached, and not painted in the style that
+    /// promises a click -- since a plain-looking span that was still
+    /// clickable and a blue underlined one that was not are both defects.
+    #[test]
+    fn only_https_links_can_be_followed() {
+        for hostile in [
+            "http://example.invalid/x",
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-settings:windowsupdate",
+            "javascript:alert(1)",
+            "//example.invalid/x",
+            "https:/example.invalid/x",
+            "https://",
+            "/relative/path",
+        ] {
+            let spans = spans_of(&format!("see [the notes]({hostile}) please"));
+            assert!(
+                spans.iter().all(|s| s.link.is_none()),
+                "{hostile:?} became something a click could open: {spans:?}"
+            );
+            assert!(
+                spans.iter().all(|s| s.style != NotesStyle::LinkText),
+                "{hostile:?} is painted as a link it will not behave as: {spans:?}"
+            );
+            // Refused, not swallowed: the words and the destination are both
+            // still on screen, which is how a reader can tell what the
+            // release author wrote.
+            assert!(
+                text_of(&spans).contains("the notes") && text_of(&spans).contains(hostile),
+                "{hostile:?} lost its words or its destination: {spans:?}"
+            );
+        }
+    }
+
+    /// The scheme is matched without regard to case, and the destination
+    /// handed on is the string that was judged rather than a normalised
+    /// rewrite of it.
+    ///
+    /// `HTTPS://` is a legal spelling of the scheme, and a check that only
+    /// knew the lowercase one would refuse a perfectly ordinary link -- the
+    /// failure mode of a scheme test that compares bytes.
+    #[test]
+    fn the_scheme_check_reads_the_url_the_way_it_would_be_opened() {
+        let spans = spans_of("see [notes](HTTPS://Example.invalid/X) please");
+        let words = spans
+            .iter()
+            .find(|s| s.style == NotesStyle::LinkText)
+            .unwrap_or_else(|| panic!("an https link in capitals was refused: {spans:?}"));
+        assert_eq!(
+            words.link.as_deref(),
+            Some("HTTPS://Example.invalid/X"),
+            "the destination must be the string the check passed, not a rewrite of it"
+        );
     }
 
     /// An image keeps its alt text and loses its URL: rendering it is a

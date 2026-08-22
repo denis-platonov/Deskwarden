@@ -10374,7 +10374,15 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
     action
 }
 
-fn webbrowser_open(url: &str) {
+/// **`pub(crate)` for one caller outside this module**: `prefs_ui`'s release
+/// notes, whose links became clickable and which opens them through here
+/// rather than growing an opener of its own. There is exactly one way to open
+/// a URL in this crate and this is it -- a second one would be a second copy
+/// of the `ShellExecuteW`-not-`cmd.exe` decision the doc below records, and
+/// the copy that drifts. The scheme check runs for that caller too, on top of
+/// the stricter `https`-only rule `updater::https_link` already applied
+/// before the URL reached a span at all.
+pub(crate) fn webbrowser_open(url: &str) {
     if !is_safe_web_url(url) {
         log::warn!("refusing to open non-http(s) URL from vault data: {url}");
         return;

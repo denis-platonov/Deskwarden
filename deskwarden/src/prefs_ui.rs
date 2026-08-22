@@ -2593,13 +2593,15 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
 /// bounded Markdown subset in `updater`, inside a scroll area bounded by the
 /// page's remaining height.
 ///
-/// Two things this deliberately does not do:
+/// Two things about it worth stating here:
 ///
-/// * **Nothing here is clickable.** A link's words and its destination are
-///   painted; neither is a widget, and no click on this page can navigate
-///   anywhere a release author chose. The argument for drawing that line
-///   exactly there is in `updater`'s subset header, next to the parser it
-///   governs.
+/// * **The only clickable thing is an `https` link's words**, and even that
+///   is a recent reversal of a rule that made this region entirely inert.
+///   What the rule was, why it was lifted, and what survived the lifting are
+///   recorded in `updater`'s subset header, next to the parser that now
+///   decides which links are followable -- the decision is made there so a
+///   refused URL is never carried as far as this function. `notes_line`
+///   below is the half that turns an accepted one into a click.
 /// * It does not size itself to its content. Its ceiling is
 ///   [`notes_max_height`] -- the space the page still has, never what the
 ///   notes want -- and the overflow scrolls, so no release body can push the
@@ -2711,11 +2713,20 @@ fn release_notes(ui: &mut Ui, body: &str) {
 
 /// Paints the parsed release notes, one line per block.
 ///
-/// **`Label`s, not a `TextEdit` and not a widget of any kind.** A label is
-/// text egui has laid out; it takes no click, holds no focus, and has no
-/// action. That is the property that keeps a link's words from becoming a
-/// link's behaviour, and it is why the styled runs go into a `LayoutJob` --
-/// which is still one galley of text -- rather than into per-span widgets.
+/// **One galley per line, still, and no `TextEdit` anywhere.** The styled
+/// runs go into a single `LayoutJob` rather than into per-span widgets, which
+/// is what lets a line wrap as one piece of prose -- a row of widgets in a
+/// horizontal layout would break at widget boundaries instead of at word
+/// ones, and a bullet's continuation would no longer line up under its own
+/// text. That was always the reason for the `LayoutJob`; it did not stop
+/// being the reason when links became clickable. What [`notes_line`] adds is
+/// a hit rectangle over the part of the already-laid-out galley that a link's
+/// words occupy, which changes nothing about how the text is measured or
+/// where it breaks.
+///
+/// The block index is passed down as the line number, because the interaction
+/// ids below have to be unique across a body that can name the same URL
+/// twice.
 fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
     use crate::updater::NotesBlock;
 
@@ -2738,7 +2749,7 @@ fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
                 if !opening {
                     ui.add_space(UPDATE_NOTES_PARAGRAPH_GAP);
                 }
-                notes_line(ui, spans, 0.0, Some(*level));
+                notes_line(ui, spans, 0.0, Some(*level), n);
             }
             NotesBlock::Bullet { depth, spans } => {
                 // The glyph joins the line's own runs rather than being a
@@ -2747,12 +2758,13 @@ fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
                 let mut with_glyph = vec![crate::updater::NotesSpan {
                     text: UPDATE_NOTES_BULLET_GLYPH.to_string(),
                     style: crate::updater::NotesStyle::Plain,
+                    link: None,
                 }];
                 with_glyph.extend_from_slice(spans);
                 let inset = *depth as f32 * UPDATE_NOTES_BULLET_STEP;
-                notes_line(ui, &with_glyph, inset, None);
+                notes_line(ui, &with_glyph, inset, None, n);
             }
-            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None),
+            NotesBlock::Paragraph { spans } => notes_line(ui, spans, 0.0, None, n),
         }
     }
 }
@@ -2766,11 +2778,29 @@ fn notes_body(ui: &mut Ui, blocks: &[crate::updater::NotesBlock]) {
 /// region actually has, minus the inset -- not from a constant, because this
 /// card is drawn at two different widths by the window shell and the vault
 /// modal.
+///
+/// # The clickable part
+///
+/// A span the parser accepted as an `https` link (`NotesSpan::link` is
+/// `Some`) gets a hit rectangle over the glyphs its words occupy, and a click
+/// there opens the URL through `vault_window::webbrowser_open`. The rectangle
+/// is derived from the galley AFTER layout rather than by laying the words
+/// out separately, so the link's extent is by construction the extent of the
+/// painted words -- a second measurement could disagree with the first and
+/// put a click target beside the thing it is meant to be on. A link that
+/// wrapped across rows gets one rectangle per row for the same reason: the
+/// union of two rows' boxes would cover the empty right-hand end of the first
+/// row and the empty left-hand start of the second, neither of which has the
+/// link's words in it.
+///
+/// Nothing about the LAYOUT changes: the rectangles are interacted with, not
+/// allocated, so they cannot move the text they sit on.
 fn notes_line(
     ui: &mut Ui,
     spans: &[crate::updater::NotesSpan],
     inset: f32,
     heading: Option<u8>,
+    line: usize,
 ) {
     use crate::updater::NotesStyle;
     use egui::text::{LayoutJob, TextFormat};
@@ -2783,10 +2813,24 @@ fn notes_line(
     let mut job = LayoutJob::default();
     job.wrap.max_width = (ui.available_width() - inset).max(1.0);
 
+    // Char ranges into the finished job's text, one per followable link, in
+    // the order they were appended. Chars rather than bytes because that is
+    // what a galley's rows are counted in -- one glyph per char.
+    let mut links: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let mut chars_appended = 0usize;
+
     if let Some(level) = heading {
         // Two sizes, not six. A release body's headings are section names
         // ("Added", "Fixed"); a scale with six steps inside a region this size
         // would be a hierarchy nobody can see.
+        //
+        // **A heading's runs are all painted alike, links included, and so
+        // none of them is clickable here.** A heading is a section name, it
+        // is painted in one weight and one colour by design, and a run inside
+        // it that opened a browser while looking exactly like the words
+        // either side of it would be the "looks like a link / acts like a
+        // link" pair coming apart in the other direction. The destination is
+        // still beside the words, as it is everywhere else.
         let size = if level <= 2 { 13.0 } else { 12.0 };
         for span in spans {
             job.append(
@@ -2829,10 +2873,12 @@ fn notes_line(
                     ..Default::default()
                 },
                 // Underlined and in the page's blue, which is what a link
-                // looks like -- and then it does nothing, because it is
-                // text. The destination beside it is the honest half: the
-                // user can see and copy where these words point, which a
-                // clickable link that hid its URL would not give them.
+                // looks like -- and now also what it does. Only a link the
+                // parser accepted is ever given this style, so the blue is a
+                // promise the click below keeps. The destination beside it
+                // is unchanged and is the honest half: the user can see and
+                // copy where these words point BEFORE following them, which
+                // a clickable link that hid its URL would not give them.
                 NotesStyle::LinkText => TextFormat {
                     font_id: FontId::new(12.0, FontFamily::Proportional),
                     color: theme::BLUE,
@@ -2845,14 +2891,93 @@ fn notes_line(
                     ..Default::default()
                 },
             };
+            if let Some(url) = span.link.as_deref() {
+                let start = chars_appended;
+                links.push((start..start + span.text.chars().count(), url));
+            }
+            chars_appended += span.text.chars().count();
             job.append(&span.text, 0.0, format);
         }
     }
 
+    // **Laid out here rather than inside `Label`, and handed to `Label`
+    // already laid out.** The widget is given the finished galley, so there
+    // is exactly ONE layout of this line: what is painted and what the hit
+    // rectangles below are measured from are the same object, not two
+    // measurements of the same text that could disagree.
+    let galley = ui.painter().layout_job(job);
     ui.horizontal(|ui| {
         ui.add_space(inset);
-        ui.add(egui::Label::new(job));
+        let response = ui.add(egui::Label::new(galley.clone()));
+        for (n, (range, url)) in links.iter().enumerate() {
+            for (row, rect) in notes_link_rects(&galley, response.rect.min, range.clone()) {
+                // Ids are (line, link, row) rather than anything derived from
+                // the URL: a release body may name the same address twice,
+                // and two widgets sharing an id is the diagnostic
+                // `no_id_diagnostic_on_any_preferences_page` exists to catch.
+                let hit = ui.interact(
+                    rect,
+                    ui.id().with(("release-note-link", line, n, row)),
+                    Sense::click(),
+                );
+                if hit.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if hit.clicked() {
+                    // The crate's one opener -- `ShellExecuteW`, not
+                    // `cmd.exe` -- reused rather than reimplemented. It
+                    // re-checks the scheme itself, on top of the stricter
+                    // `https`-only rule `updater::https_link` applied before
+                    // this URL was ever attached to a span.
+                    crate::vault_window::webbrowser_open(url);
+                }
+            }
+        }
     });
+}
+
+/// Where one link's glyphs are, one rectangle per row of the galley they
+/// wrapped onto, paired with that row's index.
+///
+/// **Per row, not one union.** A link that wraps occupies the tail of one row
+/// and the head of the next; the bounding box of the two would additionally
+/// cover the blank right-hand end of the first row and the blank left-hand
+/// start of the second, making a click on empty space open a URL. The row's
+/// full height is used rather than the glyphs' own, because a hit target the
+/// exact height of the letterforms is one a pointer slides off.
+///
+/// `chars` indexes the galley's text in characters. That is the unit the rows
+/// are counted in -- one glyph per character -- and the line has no newlines
+/// in it (`updater` emits one block per source line), so a running count
+/// across rows lands exactly.
+fn notes_link_rects(
+    galley: &egui::Galley,
+    origin: Pos2,
+    chars: std::ops::Range<usize>,
+) -> Vec<(usize, Rect)> {
+    let mut found = Vec::new();
+    let mut seen = 0usize;
+    for (index, placed) in galley.rows.iter().enumerate() {
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for (n, glyph) in placed.row.glyphs.iter().enumerate() {
+            if chars.contains(&(seen + n)) {
+                left = left.min(glyph.pos.x);
+                right = right.max(glyph.max_x());
+            }
+        }
+        seen += placed.row.glyphs.len();
+        if left <= right {
+            found.push((
+                index,
+                Rect::from_min_max(
+                    origin + Vec2::new(left, placed.pos.y),
+                    origin + Vec2::new(right, placed.pos.y + placed.row.size.y),
+                ),
+            ));
+        }
+    }
+    found
 }
 
 /// How tall the notes region is allowed to get: **whatever the page has
@@ -6389,6 +6514,214 @@ mod tests {
         );
     }
 
+    // -- Updates: a link in the notes ---------------------------------------
+    //
+    // These are the render half of the reversal recorded in `updater`'s
+    // subset header: links used to be inert here by design and now are not.
+    // The parse half -- which URLs become followable at all -- is asserted in
+    // `updater`, at the one place that decides.
+    //
+    // **Nothing below clicks a link.** A click opens a browser, which is not
+    // a thing a test may do, so what is asserted here is that the click
+    // TARGET exists and sits on the link's words: egui reports a pointing
+    // hand only from a `Sense::click` widget under the pointer, so the cursor
+    // is the honest witness to a hit rectangle a test must not press.
+
+    /// The pointing-hand cursor a hover at `pos` produces, over notes made of
+    /// `body`.
+    ///
+    /// Two frames, like [`paint_updates_settled`]: the region's own overflow
+    /// verdict settles on the second, and a hit rectangle laid over a line
+    /// that moved between frames would be read at the wrong place.
+    fn cursor_over_notes(body: &str, pos: Pos2) -> egui::CursorIcon {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Updates;
+        state.show_update_stage(crate::update_panel::UpdateStage::Available(
+            crate::updater::ReleaseInfo { body: body.to_string(), ..a_release() },
+        ));
+        let hover = [egui::Event::PointerMoved(pos)];
+        let mut icon = egui::CursorIcon::Default;
+        // A loop rather than two spelled-out frames, so this harness is ONE
+        // `draw_prefs_body` site: `exactly_one_place_in_this_program_draws_
+        // the_settings_form` counts them textually, and a helper that says
+        // the name twice spends two of the budget it is guarding.
+        for _ in 0..2 {
+            icon = ctx
+                .run_ui(raw_input(&hover), |ui| draw_prefs_body(ui, &mut state))
+                .platform_output
+                .cursor_icon;
+        }
+        icon
+    }
+
+    /// The rect of the one painted line containing `needle`.
+    ///
+    /// A line is one galley, so its whole text comes back as a single run and
+    /// the link's words are inside it rather than beside it -- which is
+    /// exactly the property that makes the hit rectangles worth testing.
+    fn notes_line_rect(painted: &Painted, needle: &str) -> Rect {
+        let mut found = painted.texts.iter().filter(|(t, _)| t.contains(needle));
+        let first = found
+            .next()
+            .unwrap_or_else(|| panic!("no line contains {needle:?}; got {:?}", painted.strings()));
+        assert!(found.next().is_none(), "{needle:?} appears on more than one line");
+        first.1
+    }
+
+    /// **An `https` link's words are a click target, and the rest of the line
+    /// is not.**
+    ///
+    /// The link is put at the START of the line on purpose, so the assertion
+    /// can name a point on its words and a point off them without measuring
+    /// glyphs: the words begin at the line's left edge, and the trailing
+    /// prose ends at its right one. A hit rectangle covering the whole line
+    /// -- the defect a union of wrapped rows would produce -- fails the
+    /// second half.
+    #[test]
+    fn an_https_links_words_are_the_click_target_and_the_rest_of_the_line_is_not() {
+        let body = "[the notes](https://example.invalid/x) and then some ordinary trailing prose";
+        let painted = paint_updates_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: body.to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        let line = notes_line_rect(&painted, "the notes");
+
+        assert_eq!(
+            cursor_over_notes(body, Pos2::new(line.left() + 4.0, line.center().y)),
+            egui::CursorIcon::PointingHand,
+            "the words of an https link are not offering to be followed"
+        );
+        assert_ne!(
+            cursor_over_notes(body, Pos2::new(line.right() - 4.0, line.center().y)),
+            egui::CursorIcon::PointingHand,
+            "the whole line became a link: ordinary prose beside a link must not open it"
+        );
+    }
+
+    /// **A link the subset refused offers nothing to click, anywhere on its
+    /// line.**
+    ///
+    /// The same line, one scheme different. Swept across the line rather than
+    /// sampled at one point, because a refusal that merely moved the hit
+    /// rectangle would pass a single sample and is the same defect.
+    #[test]
+    fn a_link_the_subset_refused_is_not_a_click_target_anywhere() {
+        let body = "[the notes](file:///C:/Windows/System32/calc.exe) and then some prose";
+        let painted = paint_updates_settled(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: body.to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+        let line = notes_line_rect(&painted, "the notes");
+
+        let mut x = line.left() + 1.0;
+        while x < line.right() {
+            assert_ne!(
+                cursor_over_notes(body, Pos2::new(x, line.center().y)),
+                egui::CursorIcon::PointingHand,
+                "a refused scheme was clickable at x={x} on the line {line:?}"
+            );
+            // Sixteen points, which is a third of the width "the notes" is
+            // painted at: coarse enough to keep this test's frame count
+            // sane, fine enough that the link cannot fall between samples.
+            x += 16.0;
+        }
+        // Control: the same sweep on the same sentence with an https scheme
+        // DOES find a target, so the silence above is a refusal rather than a
+        // test that cannot see a link at all.
+        let allowed = "[the notes](https://example.invalid/x) and then some prose";
+        let allowed_line = notes_line_rect(
+            &paint_updates_settled(
+                crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                    body: allowed.to_string(),
+                    ..a_release()
+                }),
+                Settings::default(),
+            ),
+            "the notes",
+        );
+        let mut x = allowed_line.left() + 1.0;
+        let mut hit = false;
+        while x < allowed_line.right() {
+            hit |= cursor_over_notes(allowed, Pos2::new(x, allowed_line.center().y))
+                == egui::CursorIcon::PointingHand;
+            // Sixteen points, which is a third of the width "the notes" is
+            // painted at: coarse enough to keep this test's frame count
+            // sane, fine enough that the link cannot fall between samples.
+            x += 16.0;
+        }
+        assert!(hit, "the sweep cannot see a link at all, so its silence above means nothing");
+    }
+
+    /// **The destination is still painted beside the words.**
+    ///
+    /// The half of the old rule that survived it becoming clickable: a reader
+    /// can see where a link goes without going there. Asserted for an
+    /// accepted link and a refused one, because the refused case is where a
+    /// missing URL would read as the release note having lost a word.
+    #[test]
+    fn a_links_destination_is_visible_whether_or_not_it_can_be_followed() {
+        for (body, url) in [
+            ("see [the notes](https://example.invalid/x)", "https://example.invalid/x"),
+            ("see [the notes](ms-settings:windowsupdate)", "ms-settings:windowsupdate"),
+        ] {
+            let painted = paint_updates_settled(
+                crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                    body: body.to_string(),
+                    ..a_release()
+                }),
+                Settings::default(),
+            );
+            assert!(
+                painted.any_containing(url),
+                "{url:?} was not painted anywhere: {:?}",
+                painted.strings()
+            );
+        }
+    }
+
+    /// **A link that wraps gets a rectangle per row, not one box around
+    /// both.**
+    ///
+    /// The union of a wrapped link's two rows covers the blank end of the
+    /// first row and the blank start of the second, so a click on empty space
+    /// would open a URL. Checked on the geometry directly, because the two
+    /// arrangements are indistinguishable from any one sample point.
+    #[test]
+    fn a_wrapped_link_is_hit_tested_row_by_row() {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let ctx = styled_context();
+        let words = "a link whose words are long enough to have to wrap somewhere";
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = 120.0;
+        job.append(words, 0.0, TextFormat::default());
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        assert!(galley.rows.len() > 1, "the fixture did not wrap, so it tests nothing");
+
+        let rects = notes_link_rects(&galley, Pos2::ZERO, 0..words.chars().count());
+        assert_eq!(
+            rects.len(),
+            galley.rows.len(),
+            "one rectangle per row of the wrapped link, got {rects:?}"
+        );
+        // No rectangle may reach into another row's band, which is what a
+        // union would do.
+        for (index, rect) in &rects {
+            let row = &galley.rows[*index];
+            assert!(
+                rect.top() >= row.pos.y - 0.5 && rect.bottom() <= row.pos.y + row.row.size.y + 0.5,
+                "row {index}'s hit area {rect:?} leaves the row it belongs to"
+            );
+        }
+    }
+
     /// **The state the tray could not express.**
     ///
     /// The control this page replaced was `MenuItem::new("Update available",
@@ -7504,14 +7837,17 @@ mod modal_tests {
     fn exactly_one_place_in_this_program_draws_the_settings_form() {
         let source = include_str!("prefs_ui.rs");
         let body_calls = concat!("draw_prefs_", "body(");
-        // The definition, `run`'s call, the modal's call, and `tests`' three
+        // The definition, `run`'s call, the modal's call, and `tests`' four
         // harnesses -- `frame`; `paint_general_at`, which is the same frame
-        // on a pane of a chosen width; and `body_shapes`, which is the same
-        // frame again returned as raw shapes for the id-clash guards. All
-        // three are tests; the production callers are still the two shells.
+        // on a pane of a chosen width; `body_shapes`, which is the same frame
+        // again returned as raw shapes for the id-clash guards; and
+        // `cursor_over_notes`, which is the same frame again read for its
+        // cursor rather than its shapes, because a hit rectangle a test may
+        // not click can only be witnessed by hovering it. All four are tests;
+        // the production callers are still the two shells.
         assert_eq!(
             source.match_indices(body_calls).count(),
-            6,
+            7,
             "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
              was added, confirm it is a shell and not a second form"
         );
