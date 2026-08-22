@@ -214,9 +214,28 @@ pub enum Kdf {
     /// PBKDF2-HMAC-SHA256 with the account's own iteration count.
     Pbkdf2 { iterations: u32 },
     /// Argon2id with the account's memory, iteration and parallelism figures.
-    /// `memory_kib` is in kibibytes, which is the unit the server reports and
-    /// the unit [`argon2::Params`] takes.
-    Argon2id { iterations: u32, memory_kib: u32, parallelism: u32 },
+    ///
+    /// **`memory_mib` is MEBIbytes, not kibibytes**, and the distinction is
+    /// not pedantry -- it is a factor of 1024 in the memory cost, which makes
+    /// a different key out of the right password. An earlier version of this
+    /// enum called the field `memory_kib` and passed it to
+    /// [`argon2::ParamsBuilder::m_cost`] unchanged, on the stated but wrong
+    /// grounds that kibibytes are "the unit the server reports". They are
+    /// not: the server's `KdfMemory` is what the user typed into the "memory"
+    /// box in MiB (Vaultwarden's default is `64`, meaning 64 MiB), and
+    /// Bitwarden's own client multiplies it by 1024 before handing it to
+    /// Argon2 -- `crates/bitwarden-crypto/src/keys/kdf.rs`, `derive_kdf_key`:
+    /// `let memory = memory.get() * 1024; // Convert MiB to KiB`.
+    ///
+    /// It was caught by
+    /// `the_password_hash_matches_bitwardens_own_vector_for_argon2id`, which
+    /// is exactly the kind of thing the module docs said could not be found
+    /// without a real payload, and is the reason that vector is worth the
+    /// memory it costs to run.
+    ///
+    /// The conversion happens in [`master_key`], once, so that this type
+    /// carries the server's unit and nothing in between has to remember.
+    Argon2id { iterations: u32, memory_mib: u32, parallelism: u32 },
 }
 
 /// Bitwarden's salt is the account's email, lowercased and trimmed.
@@ -244,7 +263,7 @@ pub fn master_key(password: &[u8], email: &str, kdf: Kdf) -> Result<MasterKey, C
             }
             pbkdf2::pbkdf2_hmac::<Sha256>(password, salt.as_bytes(), iterations, &mut *out);
         }
-        Kdf::Argon2id { iterations, memory_kib, parallelism } => {
+        Kdf::Argon2id { iterations, memory_mib, parallelism } => {
             // **Argon2id's salt is the SHA-256 of the email, not the email.**
             // Argon2 requires at least 8 salt bytes and Bitwarden feeds it a
             // fixed 32, which is also why this arm cannot reuse the PBKDF2
@@ -252,6 +271,13 @@ pub fn master_key(password: &[u8], email: &str, kdf: Kdf) -> Result<MasterKey, C
             let mut hashed = Zeroizing::new([0u8; KEY_LEN]);
             hashed.copy_from_slice(&Sha256::digest(salt.as_bytes()));
             let salt = hashed;
+            // MiB -> KiB, which is the unit Argon2 itself counts in. Checked
+            // rather than wrapping: a `KdfMemory` of four million from a
+            // hostile or broken server would otherwise silently become a
+            // small, cheap cost instead of an error.
+            let Some(memory_kib) = memory_mib.checked_mul(1024) else {
+                return Err(CryptoError::KdfParams("the memory cost does not fit in KiB"));
+            };
             let params = ParamsBuilder::new()
                 .m_cost(memory_kib)
                 .t_cost(iterations)
@@ -288,6 +314,49 @@ impl MasterKey {
         hkdf.expand(b"enc", &mut *enc).expect("32 bytes is one HKDF block");
         hkdf.expand(b"mac", &mut *mac).expect("32 bytes is one HKDF block");
         SymmetricKey { enc, mac }
+    }
+
+    /// The **password hash the server is given**, base64'd: one iteration of
+    /// PBKDF2-HMAC-SHA256 with the *master key* as the input and the *master
+    /// password* as the salt.
+    ///
+    /// # The inputs are the other way round from [`master_key`], and that is
+    /// the whole point
+    ///
+    /// [`master_key`] hashes the **password** salted by the **email**, tens
+    /// or hundreds of thousands of times. This hashes the **master key**
+    /// salted by the **password**, once. Swapping them, or reusing the
+    /// account's iteration count here, produces a value the server rejects as
+    /// a wrong password with no hint that the code, not the user, is wrong --
+    /// which is why this is a separate function with its own name rather than
+    /// a parameter on the other one.
+    ///
+    /// One iteration is not a weakness. The input is already a KDF output
+    /// with the account's full work factor behind it, so there is nothing
+    /// left for a second iteration to slow down; what this step buys is that
+    /// the *server* never sees the master key, only a value derived from it
+    /// that cannot be turned back into the key that decrypts the vault. The
+    /// server hashes it again, slowly, before storing it.
+    ///
+    /// **Bitwarden calls this the `ServerAuthorization` purpose.** There is a
+    /// second purpose (`LocalAuthorization`, two iterations) used to check a
+    /// password offline against a stored hash. This crate has no such store
+    /// and does not implement it: an enum with one reachable arm is a worse
+    /// thing to have than one function that says what it is for.
+    ///
+    /// Verified against **Bitwarden's own published test vectors** -- see
+    /// `the_password_hash_matches_bitwardens_own_vector_for_pbkdf2` and its
+    /// Argon2id sibling below. Those two are the strongest external
+    /// statements this module has: they pin the master-key derivation *and*
+    /// this hash together, end to end, against values Bitwarden's own client
+    /// asserts on.
+    #[must_use]
+    pub fn password_hash(&self, password: &[u8]) -> Zeroizing<String> {
+        let mut out = Zeroizing::new([0u8; KEY_LEN]);
+        pbkdf2::pbkdf2_hmac::<Sha256>(&*self.0, password, 1, &mut *out);
+        let mut text = Zeroizing::new(String::new());
+        crate::record::seal::base64_into(&mut text, &*out);
+        text
     }
 }
 
@@ -553,12 +622,25 @@ pub fn decrypt_rsa(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::str::FromStr;
 
+    // ---- fixtures shared with `rest::sync`'s tests -------------------------
+    //
+    // `pub` on this module, and on the six items below, exists for one
+    // reason: the sync mapper's tests need to *build* ciphertext, and every
+    // field this type has is private to this file. The alternatives were both
+    // worse -- widening `SymmetricKey`'s production API with a
+    // bytes-out accessor nothing in the app would call, or a `cfg(test)` seam
+    // in production code, which this crate bans outright. Test helpers
+    // sharing a `pub mod tests` is neither: no production item changed
+    // visibility, and nothing outside a test build compiles.
+    //
+    // Nothing here is reachable from the shipped binary.
+
     /// Hex to bytes, for transcribing a published vector unchanged.
-    fn hex(text: &str) -> Vec<u8> {
+    pub fn hex(text: &str) -> Vec<u8> {
         assert!(text.len().is_multiple_of(2), "a hex vector has an even number of digits");
         (0..text.len() / 2)
             .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).expect("hex digits"))
@@ -734,27 +816,32 @@ mod tests {
     /// The parameters really do reach Argon2: the same password and salt
     /// under two different cost settings must not produce the same key.
     ///
-    /// Without this, [`master_key`]'s Argon2 arm could ignore `memory_kib`
+    /// Without this, [`master_key`]'s Argon2 arm could ignore `memory_mib`
     /// entirely and `argon2id_matches_rfc_9106` -- which does not call it --
     /// would stay green.
+    ///
+    /// The figures are 1 and 2 MiB rather than anything realistic on purpose:
+    /// this test is about the parameters *arriving*, not about a cost, and a
+    /// realistic 64 MiB here would allocate sixty-four megabytes three times
+    /// for a property one megabyte proves exactly as well.
     #[test]
     fn the_argon2_parameters_this_module_passes_are_not_ignored() {
         let a = master_key(
             b"correct horse",
             "user@example.com",
-            Kdf::Argon2id { iterations: 2, memory_kib: 64, parallelism: 1 },
+            Kdf::Argon2id { iterations: 2, memory_mib: 1, parallelism: 1 },
         )
         .expect("usable parameters");
         let b = master_key(
             b"correct horse",
             "user@example.com",
-            Kdf::Argon2id { iterations: 3, memory_kib: 64, parallelism: 1 },
+            Kdf::Argon2id { iterations: 3, memory_mib: 1, parallelism: 1 },
         )
         .expect("usable parameters");
         let c = master_key(
             b"correct horse",
             "user@example.com",
-            Kdf::Argon2id { iterations: 2, memory_kib: 128, parallelism: 1 },
+            Kdf::Argon2id { iterations: 2, memory_mib: 2, parallelism: 1 },
         )
         .expect("usable parameters");
         assert_ne!(a, b, "the iteration count is not reaching Argon2");
@@ -798,7 +885,7 @@ mod tests {
             master_key(
                 b"pa55word",
                 "user@example.com",
-                Kdf::Argon2id { iterations: 1, memory_kib: 64, parallelism: 0 }
+                Kdf::Argon2id { iterations: 1, memory_mib: 1, parallelism: 0 }
             ),
             Err(CryptoError::KdfParams(_))
         ));
@@ -813,7 +900,7 @@ mod tests {
         let argon = master_key(
             b"pa55word",
             "user@example.com",
-            Kdf::Argon2id { iterations: 1, memory_kib: 64, parallelism: 1 },
+            Kdf::Argon2id { iterations: 1, memory_mib: 1, parallelism: 1 },
         )
         .expect("usable");
         assert_ne!(pbkdf2, argon);
@@ -845,6 +932,50 @@ mod tests {
 
     /// A valid type-2 string, assembled from the NIST vector so that its
     /// ciphertext is not this file's invention.
+    /// A [`SymmetricKey`] from 64 known bytes: the first 32 the encryption
+    /// key, the last 32 the MAC key. The split
+    /// `a_protected_keys_plaintext_is_the_encryption_key_then_the_mac_key`
+    /// pins against Bitwarden's own vector.
+    pub fn key_from_64(bytes: &[u8; SYMMETRIC_KEY_LEN]) -> SymmetricKey {
+        SymmetricKey::from_64(bytes).expect("64 bytes is exactly a symmetric key")
+    }
+
+    /// Seals bytes into a type-2 `EncString`, the way a Bitwarden server's
+    /// stored value looks.
+    ///
+    /// **This is a test's encryptor and the module has no production
+    /// counterpart**, because this module is decrypt-only. It therefore
+    /// proves nothing about whether Bitwarden arranges an `EncString` this
+    /// way -- that question is answered, as far as it can be, by the
+    /// published vectors above. What it is for is building a payload the
+    /// *mapper* can be tested against.
+    ///
+    /// The IV is fixed rather than random: a fixture wants to be
+    /// reproducible, and nothing here is protecting anything.
+    pub fn seal(key: &SymmetricKey, plain: &[u8]) -> String {
+        use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
+
+        let iv = [0x5au8; BLOCK];
+        let mut buffer = vec![0u8; plain.len() + BLOCK];
+        buffer[..plain.len()].copy_from_slice(plain);
+        let ct = cbc::Encryptor::<Aes256>::new((&*key.enc).into(), (&iv).into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
+            .expect("the buffer carries a whole block of headroom")
+            .to_vec();
+
+        let mut hmac = <HmacSha256 as Mac>::new_from_slice(&*key.mac).expect("any key length");
+        hmac.update(&iv);
+        hmac.update(&ct);
+        let mac = hmac.finalize().into_bytes();
+        format!("2.{}|{}|{}", b64(&iv), b64(&ct), b64(&mac))
+    }
+
+    /// Base64 with padding, exported alongside [`seal`] so a caller can build
+    /// a type-4 string out of the OpenSSL fixture below.
+    pub fn base64(bytes: &[u8]) -> String {
+        b64(bytes)
+    }
+
     fn nist_backed_enc_string(mac_key: &[u8; 32]) -> (SymmetricKey, String) {
         let enc_key: [u8; 32] = hex(NIST_KEY).try_into().expect("32 bytes");
         let iv = hex(NIST_IV);
@@ -1010,7 +1141,7 @@ mod tests {
     /// observed before the key was converted.
     ///
     /// It guards nothing and exists only in this file.
-    const ORG_KEY_PRIVATE_PKCS8_DER: &str = concat!(
+    pub const ORG_KEY_PRIVATE_PKCS8_DER: &str = concat!(
         "308204be020100300d06092a864886f70d0101010500048204a8308204a40201",
         "000282010100bca69338a4fdb8d0ccf16c0c1c02f8ffa5ec1b20376b43b28b34",
         "dbbce1dd377487dbe11b36075941a6c9fe418affc3081e790fa792d2f6dd36de",
@@ -1056,7 +1187,7 @@ mod tests {
     /// and not by this crate: `openssl pkeyutl -encrypt -keyform DER -pkeyopt
     /// rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha1 -pkeyopt
     /// rsa_mgf1_md:sha1`.
-    const ORG_KEY_WRAPPED_OAEP_SHA1: &str = concat!(
+    pub const ORG_KEY_WRAPPED_OAEP_SHA1: &str = concat!(
         "005691be74361eb94a830d8968f704a8396c5b1bf3c3c6a6ceb39554a293c17c",
         "74685bc7652f3314b17f1096567d23a69da164094c6094dcc1b58cdac20414c0",
         "a302882cdc41c712bd574f51a1fc125e20a9a37238f77650b533ed8aff6a45c8",
@@ -1300,5 +1431,267 @@ mod tests {
             assert!(!text.is_empty());
             assert!(!text.contains("222"), "{text}");
         }
+    }
+
+    // ---- the composition, against BITWARDEN's own published vectors -------
+    //
+    // Everything above this line checks a primitive against an IETF or NIST
+    // vector, or checks this code against itself. The four tests below are a
+    // different kind of thing and the module docs' caveat is narrowed by
+    // exactly this much: each one transcribes a value asserted by
+    // **Bitwarden's own client**, in the open, at
+    // `bitwarden/sdk-internal`, `crates/bitwarden-crypto/`. They are not this
+    // crate agreeing with itself. If Deskwarden had the arrangement wrong --
+    // the salt, the info strings, the iteration count, the order of the three
+    // base64 parts -- these go red.
+    //
+    // They are still not a live account. What they cannot reach is written
+    // down at `the_composition_is_still_not_fully_pinned_and_here_is_what_is_left`.
+
+    /// **Bitwarden `crates/bitwarden-crypto/src/keys/master_key.rs`,
+    /// `test_password_hash_pbkdf2`.**
+    ///
+    /// This is the single most valuable vector in the file: it is a function
+    /// of the master key, so it pins [`master_key`]'s PBKDF2 arm -- the
+    /// password as the input, the *email* as the salt, that count of
+    /// iterations, 32 bytes of output -- **and** [`MasterKey::password_hash`]
+    /// on top of it. Getting either wrong changes the answer.
+    ///
+    /// The three salts are Bitwarden's, not this crate's, and they are what
+    /// pins [`kdf_salt`]: the same hash must come out of the trimmed and the
+    /// untrimmed, the upper- and the lower-cased email.
+    #[test]
+    fn the_password_hash_matches_bitwardens_own_vector_for_pbkdf2() {
+        let password = b"asdfasdf";
+        for salt in ["test@bitwarden.com", "TEST@bitwarden.com", " test@bitwarden.com"] {
+            let key = master_key(password, salt, Kdf::Pbkdf2 { iterations: 100_000 })
+                .expect("100000 is a usable iteration count");
+            assert_eq!(
+                *key.password_hash(password),
+                "wmyadRMyBZOH7P/a/ucTCbSghKgdzDpPqUnu/DAVtSw=",
+                "the password hash for salt {salt:?} is not the one Bitwarden's own client \
+                 asserts on -- the master key derivation, the salt normalisation or the hash \
+                 itself is arranged differently from Bitwarden's"
+            );
+        }
+    }
+
+    /// **Bitwarden `master_key.rs`, `test_password_hash_argon2id`.**
+    ///
+    /// The Argon2id arm of the same claim, and it pins one thing the PBKDF2
+    /// vector cannot: that the Argon2id salt is the **SHA-256 of** the
+    /// normalised email rather than the email. Feeding the email straight in
+    /// would produce a different key and a different hash here.
+    ///
+    /// Bitwarden's salt for this vector is `test_salt`, not an email. It is
+    /// transcribed unchanged: [`kdf_salt`] leaves it alone (nothing to trim,
+    /// nothing to lowercase), so the vector still exercises the arm.
+    #[test]
+    fn the_password_hash_matches_bitwardens_own_vector_for_argon2id() {
+        let password = b"asdfasdf";
+        let key = master_key(
+            password,
+            "test_salt",
+            Kdf::Argon2id { iterations: 4, memory_mib: 32, parallelism: 2 },
+        )
+        .expect("Argon2id accepts m=32 KiB, t=4, p=2");
+        assert_eq!(
+            *key.password_hash(password),
+            "PR6UjYmjmppTYcdyTiNbAhPJuQQOmynKbdEl1oyi/iQ=",
+            "the Argon2id master key or the hash over it is arranged differently from \
+             Bitwarden's -- the likeliest cause is the salt not being SHA-256'd"
+        );
+    }
+
+    /// **Bitwarden `crates/bitwarden-crypto/src/keys/utils.rs`,
+    /// `test_stretch_kdf_key`.**
+    ///
+    /// [`MasterKey::stretch`] against Bitwarden's own input and output. This
+    /// is what the module docs single out as unconfirmable -- "that the HKDF
+    /// info strings are `enc` and `mac`" -- and it is now confirmed, along
+    /// with expand-without-extract and which of the two halves is which.
+    /// Swapping the two info strings reds the second assertion.
+    #[test]
+    fn key_stretching_matches_bitwardens_own_vector() {
+        let master = MasterKey(Zeroizing::new([
+            31, 79, 104, 226, 150, 71, 177, 90, 194, 80, 172, 209, 17, 129, 132, 81, 138, 167, 69,
+            167, 254, 149, 2, 27, 39, 197, 64, 42, 22, 195, 86, 75,
+        ]));
+        let stretched = master.stretch();
+        assert_eq!(
+            *stretched.enc,
+            [
+                111, 31, 178, 45, 238, 152, 37, 114, 143, 215, 124, 83, 135, 173, 195, 23, 142,
+                134, 120, 249, 61, 132, 163, 182, 113, 197, 189, 204, 188, 21, 237, 96
+            ],
+            "the stretched ENCRYPTION key does not match Bitwarden's"
+        );
+        assert_eq!(
+            *stretched.mac,
+            [
+                221, 127, 206, 234, 101, 27, 202, 38, 86, 52, 34, 28, 78, 28, 185, 16, 48, 61, 127,
+                166, 209, 247, 194, 87, 232, 26, 48, 85, 193, 249, 179, 155
+            ],
+            "the stretched MAC key does not match Bitwarden's"
+        );
+    }
+
+    /// **Bitwarden `crates/bitwarden-crypto/src/enc_string/symmetric.rs`,
+    /// `test_enc_from_to_buffer`.**
+    ///
+    /// Which of a type-2 `EncString`'s three base64 parts is the IV, which is
+    /// the ciphertext and which is the MAC -- externally, rather than by this
+    /// crate's say-so.
+    ///
+    /// Bitwarden's vector is a *string* and the *byte buffer* it serialises
+    /// to, and the buffer's layout is `type || iv || mac || ct` -- a
+    /// different order from the string's `type.iv|ct|mac`, which is precisely
+    /// what makes it useful here: the two orders can only be reconciled one
+    /// way. Slicing the published buffer at 1, 17 and 49 and demanding the
+    /// parsed string's fields equal those slices pins all three assignments
+    /// and both fixed lengths at once.
+    #[test]
+    fn an_enc_strings_parts_are_assigned_the_way_bitwarden_assigns_them() {
+        const TEXT: &str = concat!(
+            "2.pMS6/icTQABtulw52pq2lg==|XXbxKxDTh+mWiN1HjH2N1w==|",
+            "Q6PkuT+KX/axrgN9ubD5Ajk2YNwxQkgs3WJM0S0wtG8="
+        );
+        // Bitwarden's `to_buffer()` output for exactly that string.
+        const BUFFER: [u8; 65] = [
+            2, 164, 196, 186, 254, 39, 19, 64, 0, 109, 186, 92, 57, 218, 154, 182, 150, 67, 163,
+            228, 185, 63, 138, 95, 246, 177, 174, 3, 125, 185, 176, 249, 2, 57, 54, 96, 220, 49,
+            66, 72, 44, 221, 98, 76, 209, 45, 48, 180, 111, 93, 118, 241, 43, 16, 211, 135, 233,
+            150, 136, 221, 71, 140, 125, 141, 215,
+        ];
+
+        let EncString::AesCbc256HmacSha256B64 { iv, ct, mac } =
+            EncString::from_str(TEXT).expect("Bitwarden's own well-formed type 2")
+        else {
+            panic!("a type-2 EncString parsed as something else");
+        };
+
+        assert_eq!(BUFFER[0], 2, "control: the published buffer's type byte is not 2");
+        assert_eq!(iv.as_slice(), &BUFFER[1..17], "the first base64 part is not the IV");
+        assert_eq!(mac.as_slice(), &BUFFER[17..49], "the third base64 part is not the MAC");
+        assert_eq!(ct.as_slice(), &BUFFER[49..], "the second base64 part is not the ciphertext");
+    }
+
+    /// **Bitwarden `master_key.rs`, `test_decrypt_user_key_aes_cbc256_b64`.**
+    ///
+    /// That a protected symmetric key's plaintext is **64 bytes of
+    /// encryption key followed by MAC key** -- [`SymmetricKey::from_64`]'s
+    /// one assumption, and named in the module docs as unconfirmed.
+    ///
+    /// # Why this test does the AES itself
+    ///
+    /// Bitwarden's vector is a **type 0** `EncString` (`AesCbc256_B64`:
+    /// unauthenticated AES-256-CBC, no MAC, unwrapped with the master key
+    /// *directly* rather than the stretched one). [`EncString`] refuses type
+    /// 0 by name and must keep refusing it -- an unauthenticated ciphertext
+    /// is exactly what this crate declines to decrypt -- so the vector cannot
+    /// be run through [`decrypt`].
+    ///
+    /// Doing the CBC here instead is not this crate marking its own homework:
+    /// the *inputs* (password, salt, iteration count, ciphertext) and the
+    /// *outputs* (the two 32-byte halves) are all Bitwarden's, and the only
+    /// thing this test supplies is the AES-CBC step, which NIST SP 800-38A
+    /// already pins two hundred lines above. What it therefore proves is the
+    /// split: that the first 32 bytes are the encryption key and the last 32
+    /// the MAC key, and not the reverse.
+    ///
+    /// It also pins [`master_key`] a second time, at a different iteration
+    /// count and a different salt from the PBKDF2 vector above.
+    #[test]
+    fn a_protected_keys_plaintext_is_the_encryption_key_then_the_mac_key() {
+        let key = master_key(b"asdfasdfasdf", "legacy@bitwarden.com", Kdf::Pbkdf2 {
+            iterations: 600_000,
+        })
+        .expect("600000 is a usable iteration count");
+
+        // Bitwarden's type-0 EncString, split by hand because this crate's
+        // parser refuses the type: `0.<iv>|<ct>`.
+        const IV_B64: &str = "8UClLa8IPE1iZT7chy5wzQ==";
+        const CT_B64: &str = concat!(
+            "6PVfHnVk5S3XqEtQemnM5yb4JodxmPkkWzmDRdfyHtjORmvxqlLX40tBJZ+CKxQWmS8tpEB5w39r",
+            "bgHg/gqs0haGdZG4cPbywsgGzxZ7uNI="
+        );
+        let iv: [u8; BLOCK] =
+            base64_from(IV_B64).expect("base64").try_into().expect("a 16-byte IV");
+        let ct = base64_from(CT_B64).expect("base64");
+
+        // The master key IS the AES key here -- no stretch, which is what
+        // makes type 0 the legacy format it is.
+        let mut plain = Zeroizing::new(ct);
+        Aes256CbcDec::new((&*key.0).into(), (&iv).into())
+            .decrypt_padded_mut::<NoPadding>(&mut plain)
+            .expect("a whole number of blocks");
+        let plain = strip_pkcs7(plain).expect("Bitwarden's own ciphertext is well-padded");
+
+        assert_eq!(plain.len(), SYMMETRIC_KEY_LEN, "a protected key is not 64 bytes");
+        let split = SymmetricKey::from_64(&plain).expect("64 bytes");
+        assert_eq!(
+            *split.enc,
+            [
+                12, 95, 151, 203, 37, 4, 236, 67, 137, 97, 90, 58, 6, 127, 242, 28, 209, 168, 125,
+                29, 118, 24, 213, 44, 117, 202, 2, 115, 132, 165, 125, 148
+            ],
+            "the FIRST 32 bytes are not the encryption key"
+        );
+        assert_eq!(
+            *split.mac,
+            [
+                186, 215, 234, 137, 24, 169, 227, 29, 218, 57, 180, 237, 73, 91, 189, 51, 253, 26,
+                17, 52, 226, 4, 134, 75, 194, 208, 178, 133, 128, 224, 140, 167
+            ],
+            "the LAST 32 bytes are not the MAC key"
+        );
+    }
+
+    /// What the five vectors above still do **not** pin, stated as a test so
+    /// it is read rather than skipped, and so it fails if someone deletes the
+    /// caveat from the module docs without deleting the gap.
+    ///
+    /// Pinned externally now: the PBKDF2 and Argon2id master keys including
+    /// both salts, the password hash, the stretch's info strings and their
+    /// order, the three parts of a type-2 `EncString`, and the enc-then-mac
+    /// split of a protected key.
+    ///
+    /// **Not pinned, and this is the whole of what is left:**
+    ///
+    /// * **That the HMAC covers `iv || ct` rather than `ct` alone.** No
+    ///   published vector this crate could find gives a type-2 `EncString`
+    ///   together with the key that opens it, so the MAC input is still taken
+    ///   from Bitwarden's format description. A wrong MAC input fails
+    ///   *closed* -- every decryption returns `MacMismatch` and nothing
+    ///   silently decrypts wrong -- which is the safe direction, but it is
+    ///   unverified.
+    /// * **That the protected user key is wrapped under the STRETCHED master
+    ///   key** rather than the master key itself. Type 0 (the vector above)
+    ///   uses the master key directly. Bitwarden's *source* is unambiguous
+    ///   that type 2 uses the stretched pair --
+    ///   `crates/bitwarden-crypto/src/keys/master_key.rs`,
+    ///   `decrypt_user_key`: the `Aes256Cbc_HmacSha256_B64` arm builds
+    ///   `stretch_key(key)` first -- but reading a client's source is a
+    ///   weaker thing than a vector, and it is recorded as the weaker thing.
+    /// * **RSA-OAEP-SHA1 for organisation keys**, end to end. The primitive
+    ///   round-trips against a generated key above, but no published
+    ///   Bitwarden org-key ciphertext with a known plaintext was found.
+    ///
+    /// What would settle all three: one `EncString` produced by a real
+    /// Bitwarden client together with the account it came from -- a throwaway
+    /// account on a self-hosted server, logged in once with the official
+    /// client, its `/api/sync` response and its master password recorded.
+    /// That is a one-off manual capture, and it is the only thing that can
+    /// close this.
+    #[test]
+    fn the_composition_is_still_not_fully_pinned_and_here_is_what_is_left() {
+        // Not a tautology: it asserts the module docs still carry the caveat
+        // this test enumerates, so removing one without the other reds.
+        let docs = include_str!("crypto.rs");
+        assert!(
+            docs.contains("The Bitwarden-specific composition is not"),
+            "the module docs no longer state that the composition is unverified, but the gap \
+             this test enumerates is still open"
+        );
     }
 }

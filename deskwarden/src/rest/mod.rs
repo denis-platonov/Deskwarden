@@ -9,9 +9,64 @@
 //! token. A direct backend derives those keys **here**.
 //!
 //! Nothing in this module is reachable from the running app yet, and that is
-//! deliberate. [`crypto`] is the whole of it: the client-side cryptography,
-//! built and checked against published test vectors first, because everything
-//! an HTTP layer above it could do is worthless if the decryption underneath
-//! is wrong. No HTTP client, no login flow and no wiring exist yet.
+//! deliberate. The three submodules are layered so that each can be checked
+//! without the one above it:
+//!
+//! * [`crypto`] -- the client-side cryptography, and **no I/O of any kind**.
+//!   Built and checked against published test vectors first, because
+//!   everything an HTTP layer above it could do is worthless if the
+//!   decryption underneath is wrong.
+//! * [`api`] -- prelogin, the OAuth password grant, token refresh and
+//!   `GET /api/sync`. Every test drives it through `mockito`; nothing here
+//!   may reach a real server, the real vault, `%APPDATA%` or `bw`.
+//! * [`sync`] -- the sync payload, decrypted and mapped into the
+//!   [`crate::vault_bridge`] shapes the rest of the app already depends on.
+//!
+//! **Read-only.** There is no create, update, delete, folder write, Send or
+//! attachment path here, and no app wiring: nothing in this crate constructs
+//! an [`api::RestClient`]. Two-factor authentication is *recognised* and
+//! refused by name ([`api::RestError::TwoFactorRequired`]), not completed.
+//!
+//! # What is verified, and where the boundary now sits
+//!
+//! [`crypto`]'s module docs said the Bitwarden-specific composition could not
+//! be confirmed without a real payload. This layer moved that boundary rather
+//! than leaving it where it was: the master key (both KDFs), the password
+//! hash, the key stretch, the assignment of an `EncString`'s three parts and
+//! the enc-then-mac split of a protected key are now each pinned against a
+//! vector **Bitwarden's own client asserts on** -- and one of those vectors
+//! caught a real unit bug here (`KdfMemory` is MiB, not KiB). What is still
+//! open, and what would settle it, is enumerated at
+//! `crypto::tests::the_composition_is_still_not_fully_pinned_and_here_is_what_is_left`.
 
+//! # The server this was written against, and what that does not cover
+//!
+//! The account driving this work is on a **self-hosted, Bitwarden-compatible
+//! server that is neither Bitwarden nor Vaultwarden** -- one running on
+//! Cloudflare Workers, which documents organisations, collections, roles,
+//! SSO and SCIM as *not implemented*. Three things follow, and they are
+//! written here rather than assumed:
+//!
+//! * **Treat the API as a subset.** A field official Bitwarden returns is not
+//!   guaranteed present. Every wire struct in [`sync`] is optional-by-default
+//!   and every read is a tolerant one with a named refusal; there is no
+//!   `unwrap` on a server-supplied value anywhere in this module. A mapper
+//!   that unwraps where a fixture was generous panics on the real payload.
+//! * **The organisation path is kept, and it is untested end to end.** It is
+//!   kept because other users *do* have organisations and the RSA unwrap
+//!   underneath it is the one piece with genuine external ground truth (an
+//!   OpenSSL ciphertext). It is untested end to end because this server will
+//!   never send an org cipher, so no live payload can exercise it -- only
+//!   `sync::tests::an_organisation_cipher_decrypts_through_the_rsa_wrapped_org_key`,
+//!   whose own doc says exactly this.
+//! * **A Worker is not a long-lived process.** Connection reuse, keep-alive
+//!   and cold starts behave differently from a persistent server, which is
+//!   why [`api`]'s connect timeout is ten seconds rather than
+//!   `vault_bridge`'s three. Nothing else in this module depends on
+//!   connection behaviour: no request here is correct only because a previous
+//!   one warmed a socket, and pooling is a performance property, not a
+//!   correctness one.
+
+pub mod api;
 pub mod crypto;
+pub mod sync;
