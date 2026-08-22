@@ -92,6 +92,23 @@ pub enum Event {
     Sends(Send),
 }
 
+/// The fields a candidate offers, and whether it has a stored sequence worth
+/// offering as [`Send::Sequence`].
+///
+/// A named struct rather than a bare `(Vec<FieldRef>, bool)` so call sites
+/// say what the `bool` means instead of `show_palette(window, &fields,
+/// false)` and `|_| (vec![], false)` -- neither of which tells a reader
+/// anything on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Palette {
+    /// The fields offered, same shape as
+    /// `crate::key_sequence::field_palette`.
+    pub fields: Vec<FieldRef>,
+    /// Whether the item has a stored sequence worth offering as
+    /// [`Send::Sequence`].
+    pub has_sequence: bool,
+}
+
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
 /// desktop. Nothing here decides anything; every decision lives in
 /// [`run_with`].
@@ -104,10 +121,8 @@ pub struct PickerCalls {
     pub protect: fn(PickerWindow) -> bool,
     /// Pumps until the user does something.
     pub next: fn(PickerWindow) -> Event,
-    /// Shows the field palette for the chosen candidate: the fields offered,
-    /// and whether the item has a stored sequence worth offering as
-    /// [`Send::Sequence`].
-    pub show_palette: fn(PickerWindow, &[FieldRef], bool),
+    /// Shows the field palette for the chosen candidate.
+    pub show_palette: fn(PickerWindow, &Palette),
     /// Destroys the window and releases its resources.
     pub close: fn(PickerWindow),
 }
@@ -130,7 +145,7 @@ pub struct PickerCalls {
 pub fn run_with(
     calls: &PickerCalls,
     candidates: &[Candidate],
-    palette: fn(&str) -> (Vec<FieldRef>, bool),
+    palette: fn(&str) -> Palette,
 ) -> Outcome {
     let Some(window) = (calls.open)(candidates) else {
         log::warn!("the account picker could not be put on screen");
@@ -164,11 +179,18 @@ pub fn run_with(
             }
             Event::Chose(index) => {
                 let Some(candidate) = candidates.get(index) else {
+                    log::warn!(
+                        "the account picker chose row {index} but only {len} candidates were \
+                         offered; the Win32 row list and the candidate slice have disagreed, \
+                         which would otherwise surface later as the picker typing the wrong \
+                         account's password -- ignoring the choice",
+                        len = candidates.len()
+                    );
                     continue;
                 };
                 chosen = Some(index);
-                let (fields, has_sequence) = palette(&candidate.id);
-                (calls.show_palette)(window, &fields, has_sequence);
+                let palette = palette(&candidate.id);
+                (calls.show_palette)(window, &palette);
             }
             Event::EditSelected => {
                 if let Some(candidate) = chosen.and_then(|index| candidates.get(index)) {
@@ -176,6 +198,9 @@ pub fn run_with(
                     (calls.close)(window);
                     return Outcome::Edit(id);
                 }
+                log::warn!(
+                    "the account picker got EditSelected with nothing chosen yet; ignoring it"
+                );
             }
             Event::Sends(send) => {
                 if let Some(candidate) = chosen.and_then(|index| candidates.get(index)) {
@@ -183,6 +208,10 @@ pub fn run_with(
                     (calls.close)(window);
                     return Outcome::Fill { id, send };
                 }
+                log::warn!(
+                    "the account picker got a field choice ({send:?}) with nothing chosen yet; \
+                     ignoring it"
+                );
             }
         }
     }
@@ -202,12 +231,17 @@ pub fn tokens_for(send: &Send, sequence: Option<&str>) -> Vec<crate::key_sequenc
     match send {
         Send::Field(field) => vec![Token::Field(field.clone())],
         Send::All => {
-            let mut tokens = vec![Token::Field(FieldRef::Username)];
-            if let Some(tab) = crate::key_sequence::key_named("TAB") {
-                tokens.push(Token::Key(tab));
-            }
-            tokens.push(Token::Field(FieldRef::Password));
-            tokens
+            // A half-sequence here is worse than none: username with no Tab
+            // between it and password types the password straight into the
+            // username box, in plaintext, in whatever app is focused. If
+            // "TAB" is ever not a known key that is a bug in the key table,
+            // not a reason to degrade -- refuse loudly instead.
+            let tab = crate::key_sequence::key_named("TAB").expect("TAB is a known key");
+            vec![
+                Token::Field(FieldRef::Username),
+                Token::Key(tab),
+                Token::Field(FieldRef::Password),
+            ]
         }
         Send::Sequence => sequence.map(crate::key_sequence::parse).unwrap_or_default(),
     }
@@ -275,10 +309,13 @@ mod tests {
                     _ => Event::Sends(Send::Field(FieldRef::Password)),
                 }
             },
-            show_palette: |_, _, _| {},
+            show_palette: |_, _| {},
             close: |_| {},
         };
-        let outcome = run_with(&calls, &one("Slack"), |_| (vec![FieldRef::Password], false));
+        let outcome = run_with(&calls, &one("Slack"), |_| Palette {
+            fields: vec![FieldRef::Password],
+            has_sequence: false,
+        });
         assert_eq!(
             outcome,
             Outcome::Fill { id: "id-1".to_string(), send: Send::Field(FieldRef::Password) }
@@ -298,13 +335,22 @@ mod tests {
                 true
             },
             next: |_| {
-                PUMPED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+                // Record only the FIRST pump. If every pump overwrote this,
+                // the last write would win and the assertion below would
+                // only mean "protect happened before the final pump" -- which
+                // passes even if an earlier pump ran before protect.
+                let _ = PUMPED_AT.compare_exchange(
+                    usize::MAX,
+                    ORDER.fetch_add(1, Ordering::SeqCst),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
                 Event::Cancel
             },
-            show_palette: |_, _, _| {},
+            show_palette: |_, _| {},
             close: |_| {},
         };
-        let _ = run_with(&calls, &one("Slack"), |_| (vec![], false));
+        let _ = run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false });
         assert!(
             PROTECTED_AT.load(Ordering::SeqCst) < PUMPED_AT.load(Ordering::SeqCst),
             "a window that can be typed into before it is excluded from capture is a window a \
@@ -320,10 +366,13 @@ mod tests {
             open: |_| Some(PickerWindow(1)),
             protect: |_| true,
             next: |_| Event::Closed,
-            show_palette: |_, _, _| {},
+            show_palette: |_, _| {},
             close: |_| CLOSED.store(true, Ordering::SeqCst),
         };
-        assert_eq!(run_with(&calls, &one("Slack"), |_| (vec![], false)), Outcome::Cancelled);
+        assert_eq!(
+            run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false }),
+            Outcome::Cancelled
+        );
         assert!(CLOSED.load(Ordering::SeqCst), "close runs on every exit path");
     }
 
@@ -333,9 +382,70 @@ mod tests {
             open: |_| None,
             protect: |_| true,
             next: |_| Event::Cancel,
-            show_palette: |_, _, _| {},
+            show_palette: |_, _| {},
             close: |_| {},
         };
-        assert_eq!(run_with(&calls, &one("Slack"), |_| (vec![], false)), Outcome::Unavailable);
+        assert_eq!(
+            run_with(&calls, &one("Slack"), |_| Palette { fields: vec![], has_sequence: false }),
+            Outcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_fill_path_also_closes_the_window() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static CLOSED: AtomicBool = AtomicBool::new(false);
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        let calls = PickerCalls {
+            open: |_| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Chose(0),
+                _ => Event::Sends(Send::Field(FieldRef::Password)),
+            },
+            show_palette: |_, _| {},
+            close: |_| CLOSED.store(true, Ordering::SeqCst),
+        };
+        let outcome = run_with(&calls, &one("Slack"), |_| Palette {
+            fields: vec![FieldRef::Password],
+            has_sequence: false,
+        });
+        assert_eq!(
+            outcome,
+            Outcome::Fill { id: "id-1".to_string(), send: Send::Field(FieldRef::Password) }
+        );
+        assert!(
+            CLOSED.load(Ordering::SeqCst),
+            "the Fill path is the one that most needs close -- the window's lifetime bounds an \
+             un-wipeable copy of typed text"
+        );
+    }
+
+    #[test]
+    fn choosing_a_row_shows_the_palette_it_was_given() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        static SHOWN_FIELDS: std::sync::Mutex<Vec<FieldRef>> = std::sync::Mutex::new(Vec::new());
+        static SHOWN_HAS_SEQUENCE: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let calls = PickerCalls {
+            open: |_| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Chose(0),
+                _ => Event::Cancel,
+            },
+            show_palette: |_, palette| {
+                *SHOWN_FIELDS.lock().unwrap() = palette.fields.clone();
+                SHOWN_HAS_SEQUENCE.store(palette.has_sequence as usize, Ordering::SeqCst);
+            },
+            close: |_| {},
+        };
+        let outcome = run_with(&calls, &one("Slack"), |id| {
+            assert_eq!(id, "id-1");
+            Palette { fields: vec![FieldRef::Totp], has_sequence: true }
+        });
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(*SHOWN_FIELDS.lock().unwrap(), vec![FieldRef::Totp]);
+        assert_eq!(SHOWN_HAS_SEQUENCE.load(Ordering::SeqCst), 1);
     }
 }
