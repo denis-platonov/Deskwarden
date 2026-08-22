@@ -403,7 +403,7 @@ pub fn configure_server_in(url: &str, data_dir: Option<&Path>) -> Result<(), Str
 /// window in which it names another account's profile is a window in which a
 /// sync can land in the wrong vault -- the rule `main`'s `remove_account`
 /// already states and `bw_logout_in` already obeys.
-fn run_bw_with_password(
+pub(crate) fn run_bw_with_password(
     args: &[&str],
     password: &str,
     data_dir: Option<&Path>,

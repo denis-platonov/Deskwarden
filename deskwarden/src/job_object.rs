@@ -1388,6 +1388,15 @@ mod tests {
         // behind `loading_ui::show_while` here is gone with the window it fed.
         ("main.rs", 11),
         ("picker_ui.rs", 2),
+        // One: the `bw unlock` behind the daemon's unlock prompt. It cannot be
+        // inline for a reason stronger than the frame-loop one every entry
+        // above gives -- that surface has no frame loop at all. It is a bare
+        // Win32 window pumping its own message queue, and a CLI spawn plus a
+        // network round trip run on that thread stops the pump: the window
+        // stops repainting, drags smear across it, and Windows offers to kill
+        // it. The worker is what lets the prompt keep drawing its progress bar
+        // while the password is with the CLI.
+        ("unlock_prompt.rs", 1),
         // Two: the About page's check, and its download-and-verify. Neither
         // can be a tick in a frame loop -- both are seconds-to-minutes of
         // network -- and neither can belong to `main`'s loop, which is not
