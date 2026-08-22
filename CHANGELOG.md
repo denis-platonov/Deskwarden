@@ -10,6 +10,33 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Editing an item shows what it has, and an Add control for the rest
+
+The edit form used to draw every box the item type has, filled in or not. An
+identity is eighteen of them, and a real one uses three or four -- so the
+fields with something in them were scattered through fourteen that were empty,
+and finding the one you came to change meant reading past the rest.
+
+Editing an item now opens showing the fields it actually has. Everything else
+is behind an **Add...** control that lists the missing fields by name; pick
+one and its row appears, ready to type into. Each optional row has a **Remove**
+beside its label that takes it away and clears it.
+
+Some rows are always there, because an edit form without them would be a form
+for something else: a login's username and password, a card's number and
+brand, an identity's first and last name, a note's body. A card's brand is
+always shown for a second reason -- the form fills it in from the number, and
+a value the form sets should not be one the user cannot see.
+
+A field you add and then leave empty is not saved. It disappears again, which
+is the same thing that happens to a field you clear -- an empty box has always
+meant "this item does not have this", and it still does. The Add menu says so
+where you pick.
+
+Creating an item is unchanged: everything is empty on a new item by
+definition, so there is nothing to hide and no list worth putting behind a
+control.
+
 ### Websites can be edited, and a login can have more than one
 
 The edit form had no box for an item's website. The item could have one --

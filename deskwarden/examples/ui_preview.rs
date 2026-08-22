@@ -179,6 +179,20 @@ enum Surface {
     /// opened an item with a website on it and found no website on the form
     /// -- so this is the picture of the gap being closed.
     EditWebsites,
+    /// **A sparse item's edit form**: an identity that has a name and an
+    /// email and nothing else, so the form is four rows and an Add control
+    /// rather than eighteen empty boxes.
+    ///
+    /// The picture is the argument. The shape being replaced -- every row
+    /// drawn whether or not the item uses it -- reads perfectly reasonably in
+    /// prose and is miserable on screen, and the only way to see that the
+    /// replacement is better is to look at it.
+    EditSparse,
+    /// **The same item with the Add menu open**, which is the other half of
+    /// that surface: the rows that are NOT on the form have to be reachable
+    /// and legible as a list of names, and a chip row that wrapped into an
+    /// unreadable block would satisfy every geometry assertion in the suite.
+    EditSparseAdding,
     /// The record composer -- the Send export form and its seed warning.
     RecordComposer,
     /// **Design 6c/6d**: the by-hand "add a one-time code" form, with a URI
@@ -478,6 +492,8 @@ const ALL: &[Surface] = &[
     Surface::CardDetailRevealed,
     Surface::DiscardConfirm,
     Surface::EditWebsites,
+    Surface::EditSparse,
+    Surface::EditSparseAdding,
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
@@ -538,6 +554,8 @@ impl Surface {
             Surface::CardDetailRevealed => "detail_card_revealed",
             Surface::DiscardConfirm => "edit_discard_confirm",
             Surface::EditWebsites => "edit_websites",
+            Surface::EditSparse => "edit_sparse",
+            Surface::EditSparseAdding => "edit_sparse_adding",
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
@@ -643,6 +661,13 @@ impl Surface {
             // be below the fold in the PNG. The width is the real one, which
             // is the axis a layout can get wrong.
             Surface::EditWebsites => egui::vec2(PANE_WIDTH, 1180.0),
+            // The shipped pane's own size, and that is the point of these
+            // two: a sparse identity FITS it, which the eighteen-row form it
+            // replaces did not. A taller preview would hide the very thing
+            // being shown. The Add menu adds a wrapped chip row, so the open
+            // state gets a little more room rather than a scroll bar.
+            Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
             Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
                 deskwarden::preflight_host::PREFLIGHT_WIDTH,
                 deskwarden::preflight_host::PREFLIGHT_HEIGHT,
@@ -1026,6 +1051,8 @@ impl eframe::App for Preview {
             }
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
             Surface::EditWebsites => self.draw_pane(root, PaneKind::EditWebsites),
+            Surface::EditSparse => self.draw_pane(root, PaneKind::EditSparse(false)),
+            Surface::EditSparseAdding => self.draw_pane(root, PaneKind::EditSparse(true)),
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
@@ -1116,6 +1143,8 @@ enum PaneKind {
     Discard,
     /// The edit form of a login carrying several websites.
     EditWebsites,
+    /// The edit form of a sparse identity, with the Add menu open or shut.
+    EditSparse(bool),
     /// The Send record composer.
     Composer,
     /// The "add a one-time code" form, mid-confirmation.
@@ -1932,6 +1961,22 @@ impl Preview {
                         &TotpState::NoSecret,
                     );
                 }
+                PaneKind::EditSparse(adding) => {
+                    // **Set, never toggled**, for the reason the read pane's
+                    // reveal flags are: one `Fixtures` is shared by the whole
+                    // `--all` walk, and a menu left open would change
+                    // whichever surface happened to run next.
+                    fixtures.sparse_draft.add_menu_open = adding;
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        &mut fixtures.sparse_draft,
+                        &fixtures.folders,
+                        false,
+                        &mut fixtures.apps,
+                        Some(&fixtures.sparse_identity),
+                        &TotpState::NoSecret,
+                    );
+                }
                 PaneKind::Composer => {
                     let _ = record_ui::draw_export_form(
                         ui,
@@ -1978,6 +2023,11 @@ struct Fixtures {
     /// A login carrying three websites, opened for editing -- see
     /// [`Surface::EditWebsites`].
     websites_draft: EditDraft,
+    /// The item behind [`Self::sparse_draft`].
+    sparse_identity: VaultItem,
+    /// An identity with four of its eighteen fields filled in, opened for
+    /// editing -- see [`Surface::EditSparse`].
+    sparse_draft: EditDraft,
     record: RecordDraft,
     totp_add: TotpAdd,
     totp_picker: TotpAdd,
@@ -2027,6 +2077,21 @@ impl Fixtures {
             3,
             "the websites shot is not showing a multi-website login, so it shows nothing the \
              one-website shots do not"
+        );
+        // Four of eighteen fields, which is what a real identity looks like.
+        // The point of the shot is the fourteen that are NOT drawn.
+        let sparse_identity = item(SPARSE_IDENTITY_JSON);
+        let sparse_draft = EditDraft::from_item(&sparse_identity);
+        assert_eq!(
+            sparse_draft.shown_slots(false).len(),
+            4,
+            "the sparse shot is showing {} rows, so it is not a picture of a sparse form",
+            sparse_draft.shown_slots(false).len()
+        );
+        assert_eq!(
+            sparse_draft.addable_slots(false).len(),
+            14,
+            "the sparse shot has nothing behind its Add control"
         );
         let totp = TotpState::Code { code: "418902".to_string(), seconds_left: 19 };
         // The seed's tick on, so the composer's seed warning -- the sentence
@@ -2089,6 +2154,8 @@ impl Fixtures {
             draft,
             websites_login,
             websites_draft,
+            sparse_identity,
+            sparse_draft,
             login,
             card,
             list,
@@ -2250,6 +2317,24 @@ const WEBSITES_JSON: &str = r#"{
       { "uri": "https://sso.ledgerline.eu", "match": 1 },
       { "uri": "androidapp://eu.ledgerline.mobile", "match": null }
     ]
+  },
+  "fields": []
+}"#;
+
+/// An identity with a name, an email and a phone number on it -- four of the
+/// eighteen fields Bitwarden models -- and nothing else. That ratio is the
+/// ordinary one, and it is why the form's old shape was fourteen empty boxes
+/// deep.
+const SPARSE_IDENTITY_JSON: &str = r#"{
+  "id": "6f1c2f5e-0000-4a10-9c31-2b7a51d0a004",
+  "type": 4,
+  "name": "Anna Novak",
+  "folderId": "f-personal",
+  "identity": {
+    "firstName": "Anna",
+    "lastName": "Novak",
+    "email": "a.novak@ledgerline.com",
+    "phone": "+31 20 555 0142"
   },
   "fields": []
 }"#;

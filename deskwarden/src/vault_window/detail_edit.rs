@@ -1206,6 +1206,42 @@ pub struct EditDraft {
     /// confirmation is not an edit, and a draft that became dirty by being
     /// asked about would be a form that could never answer "nothing to lose".
     pub discard_prompt: bool,
+    /// **Which optional rows this form is showing** -- see [`Slot`].
+    ///
+    /// Seeded by [`Self::from_item`] with every slot the item has something
+    /// in, and added to by the "Add" menu. A slot leaves it only through
+    /// [`Self::hide_slot`], which empties the box on the way out.
+    ///
+    /// **Seeded rather than recomputed each frame from "is the box empty".**
+    /// A row that vanished the moment the user selected its contents and
+    /// pressed Backspace -- taking the caret with it, mid-edit -- is the
+    /// obvious version of this and is unusable. So "shown" is a decision
+    /// taken when the form opens and changed only by the user asking for it;
+    /// emptiness decides what is WRITTEN (an empty box is an absent value,
+    /// which [`edited`] has always said) and not what is drawn.
+    ///
+    /// A `BTreeSet` rather than a `Vec`: the question asked of it is "is this
+    /// slot in?" on every row of every frame, and it must not be possible to
+    /// reveal one row twice.
+    ///
+    /// **Private**, with [`Self::shows`] to read it, for the reason
+    /// [`Self::kind`] is: the set is meaningful only against
+    /// `Slot::all_for(self.kind)`, and a caller that could assign it could
+    /// leave a card's draft claiming to show an identity's rows.
+    revealed: std::collections::BTreeSet<Slot>,
+    /// The "Add" menu is open.
+    ///
+    /// **View state**, like [`Self::reveal_password`] and
+    /// [`Self::discard_prompt`], and excluded from [`Self::content_digest`]
+    /// for the same reason: opening a menu is something the user does to the
+    /// form, and a draft that became dirty by being looked at could never say
+    /// "nothing to lose".
+    ///
+    /// A disclosure on the draft rather than an egui popup layer, so this is
+    /// a state a test and a screenshot can both put the form into -- the same
+    /// argument [`GeneratorDraft::options_open`] already makes. See
+    /// [`slot_add_block`].
+    pub add_menu_open: bool,
 }
 
 /// The four character classes, in a wrapper that **cannot hold all four off**.
@@ -1532,6 +1568,10 @@ impl Default for EditDraft {
             generator: GeneratorDraft::default(),
             app: None,
             fields: Vec::new(),
+            // Nothing to reveal on a blank draft, and nothing hidden either:
+            // the create form draws every slot regardless -- see [`Slot`].
+            revealed: std::collections::BTreeSet::new(),
+            add_menu_open: false,
         }
         // A blank form has nothing to lose, and `is_dirty` has to say so from
         // the first frame. Every other constructor routes through this one or
@@ -1733,7 +1773,15 @@ impl EditDraft {
             fields: item.fields.iter().map(FieldDraft::from_field).collect(),
             opened_digest: 0,
             discard_prompt: false,
+            // Filled in immediately below, off the draft this literal builds
+            // -- see `reveal_what_is_filled`. It cannot be computed here:
+            // the answer is a question about every other field of this very
+            // struct.
+            revealed: std::collections::BTreeSet::new(),
+            add_menu_open: false,
         }
+        // **What the item HAS is what the form shows.** See [`Slot`].
+        .reveal_what_is_filled()
         // The item AS READ is this form's opening state, so "dirty" means
         // "differs from the item on screen" and not "is non-empty".
         .seal()
@@ -1805,6 +1853,12 @@ impl EditDraft {
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
         self.note_body = String::new();
+        // Every [`Slot`] is kind-specific by construction, so a set built for
+        // the abandoned kind describes rows the new one does not have. Left
+        // standing it would be harmless today only because `shown_slots`
+        // intersects it with `Slot::all_for` -- and would start showing the
+        // wrong rows the moment two kinds shared a slot.
+        self.revealed.clear();
         // `fields` is deliberately NOT cleared, for exactly the reason `app`
         // below is not: a custom field can sit on an item of ANY type, so it
         // is item-level data like the name and the folder, and clearing it
@@ -2051,6 +2105,16 @@ impl EditDraft {
             // The measurement itself, and the question being asked about it.
             opened_digest: _,
             discard_prompt: _,
+            // **View state, both.** Which rows are on screen and whether the
+            // add menu is open are things the user does to the FORM: nothing
+            // in either is written to the item, and revealing a row changes
+            // what the save produces only by way of the box it reveals --
+            // which is empty until somebody types into it, and an empty box
+            // is an absent value. A draft that counted them would ask
+            // "discard your changes?" of a user who had opened a menu and
+            // shut it again.
+            revealed: _,
+            add_menu_open: _,
         } = self;
         let CardDraft {
             cardholder_name,
@@ -2184,6 +2248,173 @@ impl EditDraft {
     /// are unaffected.
     pub fn may_unfile(&self) -> bool {
         self.original_folder_id.is_none()
+    }
+
+    /// Whether this draft has anything in `slot`.
+    ///
+    /// **"Empty" is exactly [`edited`]'s "empty": the empty string, and
+    /// nothing else.** A `None` and an empty string are the same thing here
+    /// and always have been -- `drafted` maps the first to the second on the
+    /// way in, so the form has never been able to tell them apart and neither
+    /// can the read pane.
+    ///
+    /// **Whitespace is not empty**, and that is an answer rather than an
+    /// oversight. A trim here would hide a value the item really carries: an
+    /// identity whose `middleName` is two spaces would open with no
+    /// middle-name row, and the user would have no way to see or clear what
+    /// the vault is holding. It would also put a second definition of "blank"
+    /// in this file -- [`edited`] writes `"   "` back verbatim, precisely so
+    /// an untouched save of an item that arrived carrying whitespace is still
+    /// byte for byte what was read -- and the two would disagree about the
+    /// same box. ([`Self::is_valid`] does trim, and that is a different
+    /// question: whether the user has supplied a name at all, not whether the
+    /// item has a value.)
+    ///
+    /// [`Slot::Websites`] is the one row that is a LIST rather than a box, so
+    /// its question is "are there any entries", not "is a string empty" -- a
+    /// blank entry is still an entry the user can see and type into.
+    fn slot_filled(&self, slot: Slot) -> bool {
+        let filled = |s: &str| !s.is_empty();
+        match slot {
+            Slot::Username => filled(&self.username),
+            Slot::Password => filled(&self.password),
+            Slot::Totp => filled(&self.totp),
+            Slot::Websites => !self.uris.is_empty(),
+            Slot::CardholderName => filled(&self.card.cardholder_name),
+            Slot::CardBrand => filled(&self.card.brand),
+            Slot::CardNumber => filled(&self.card.number),
+            Slot::CardExpMonth => filled(&self.card.exp_month),
+            Slot::CardExpYear => filled(&self.card.exp_year),
+            Slot::CardCode => filled(&self.card.code),
+            Slot::CardBank => filled(&self.card.bank_domain),
+            Slot::CardBillingZip => filled(&self.card.billing_zip),
+            Slot::Identity(field) => filled(field.value(&self.identity)),
+            Slot::Note => filled(&self.note_body),
+            Slot::SshPrivateKey => filled(&self.ssh_key.private_key),
+            Slot::SshPublicKey => filled(&self.ssh_key.public_key),
+            Slot::SshFingerprint => filled(&self.ssh_key.key_fingerprint),
+        }
+    }
+
+    /// Reveals every slot this draft has something in. Called by
+    /// [`Self::from_item`] and by nothing else.
+    ///
+    /// **Over `Slot::all_for(self.kind)` and not over every variant**, so a
+    /// login that somehow carried a card number could not reveal a row the
+    /// login form does not draw.
+    fn reveal_what_is_filled(mut self) -> Self {
+        for slot in Slot::all_for(self.kind) {
+            if self.slot_filled(slot) {
+                self.revealed.insert(slot);
+            }
+        }
+        self
+    }
+
+    /// Whether the form draws `slot` -- on an EDIT. See [`Self::shown_slots`]
+    /// for the create-mode answer, which is "all of them".
+    pub fn shows(&self, slot: Slot) -> bool {
+        slot.always_shown() || self.revealed.contains(&slot)
+    }
+
+    /// The rows this form draws, in order.
+    ///
+    /// **Everything on a create**, and that is the whole of the mode
+    /// difference -- see [`Slot`] for why hiding empty rows on a form where
+    /// every row is empty is not a feature.
+    pub fn shown_slots(&self, creating: bool) -> Vec<Slot> {
+        let all = Slot::all_for(self.kind);
+        if creating {
+            all
+        } else {
+            all.into_iter().filter(|slot| self.shows(*slot)).collect()
+        }
+    }
+
+    /// The rows the "Add" menu offers, in the order the form would draw them.
+    ///
+    /// **The exact complement of [`Self::shown_slots`]** -- built by negating
+    /// the same predicate over the same list, so a row cannot be missing from
+    /// both. A menu that listed a row already on screen, or that failed to
+    /// list one that was not, is the failure this shape makes unreachable
+    /// rather than merely untested.
+    pub fn addable_slots(&self, creating: bool) -> Vec<Slot> {
+        if creating {
+            return Vec::new();
+        }
+        Slot::all_for(self.kind).into_iter().filter(|slot| !self.shows(*slot)).collect()
+    }
+
+    /// Puts `slot`'s row on screen, ready to type into.
+    ///
+    /// A no-op for a slot this kind does not have, which is the only honest
+    /// answer: the menu offers `addable_slots` and nothing else, so this is
+    /// the backstop rather than the door.
+    ///
+    /// [`Slot::Websites`] gets its first empty row here, because a block
+    /// revealed with no rows in it is a heading and an Add button -- the user
+    /// asked for a website, and what they should get is a box.
+    pub fn reveal_slot(&mut self, slot: Slot) {
+        if !Slot::all_for(self.kind).contains(&slot) {
+            return;
+        }
+        if slot == Slot::Websites && self.uris.is_empty() {
+            self.uris.push(UriDraft::new());
+        }
+        self.revealed.insert(slot);
+    }
+
+    /// Takes `slot`'s row off the screen **and empties it**.
+    ///
+    /// **Both halves, and the second is the point.** A Remove that only hid
+    /// the row would leave whatever was typed into it on the draft and write
+    /// it on the next Save -- a control that says "remove" and removes
+    /// nothing but the evidence. Clearing is also what makes Remove and
+    /// "empty it and save" agree, which is what stops the form having two
+    /// answers to "how do I get rid of this".
+    ///
+    /// **Refuses a floor row** ([`Slot::always_shown`]). The form draws no
+    /// Remove on one, so this is unreachable through the UI; it is here so
+    /// that the rule lives with the slot rather than only in the drawing
+    /// code, where a later edit could route around it and silently wipe a
+    /// login's password.
+    pub fn hide_slot(&mut self, slot: Slot) {
+        if slot.always_shown() {
+            return;
+        }
+        self.revealed.remove(&slot);
+        match slot {
+            Slot::Totp => self.totp.clear(),
+            Slot::Websites => self.uris.clear(),
+            Slot::CardholderName => self.card.cardholder_name.clear(),
+            Slot::CardExpMonth => self.card.exp_month.clear(),
+            Slot::CardExpYear => self.card.exp_year.clear(),
+            Slot::CardCode => self.card.code.clear(),
+            Slot::CardBank => self.card.bank_domain.clear(),
+            Slot::CardBillingZip => self.card.billing_zip.clear(),
+            // Through the form's OWN row list rather than a third match over
+            // the eighteen fields: `identity_rows` is the one place that
+            // pairs a field with its box, and a second pairing here is a
+            // second thing that can name the wrong one.
+            Slot::Identity(field) => {
+                if let Some((_, value)) =
+                    identity_rows(&mut self.identity).into_iter().find(|(f, _)| *f == field)
+                {
+                    value.clear();
+                }
+            }
+            // Every remaining variant is a floor row, refused above. Spelled
+            // out rather than reached by a `_ =>`, so a slot that stops being
+            // floor does not silently inherit "hiding it clears nothing".
+            Slot::Username
+            | Slot::Password
+            | Slot::CardBrand
+            | Slot::CardNumber
+            | Slot::Note
+            | Slot::SshPrivateKey
+            | Slot::SshPublicKey
+            | Slot::SshFingerprint => {}
+        }
     }
 
     /// Applies this draft onto a clone of `item`, preserving every field the
@@ -2586,30 +2817,315 @@ fn form_body(kind: ItemKind, creating: bool) -> FormBody {
     }
 }
 
+/// One field of an identity, named so it can be talked about apart from the
+/// box that edits it.
+///
+/// **A name and not an index**, because the thing that needs naming is a
+/// *row of the form* -- [`Slot::Identity`] carries one of these, the "add a
+/// field" menu lists them, and a draft remembers which the user revealed. An
+/// index into [`identity_rows`] would do all of that and would silently mean
+/// something else the day a row moved; a variant cannot.
+///
+/// The order of [`Self::ALL`] is the read pane's order, which is
+/// [`identity_rows`]'s order, and
+/// `the_identity_rows_are_exactly_the_identity_fields_in_order` is what holds
+/// the two to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdentityField {
+    Title,
+    FirstName,
+    MiddleName,
+    LastName,
+    Email,
+    Phone,
+    Username,
+    Company,
+    Address1,
+    Address2,
+    Address3,
+    City,
+    State,
+    PostalCode,
+    Country,
+    Ssn,
+    PassportNumber,
+    LicenseNumber,
+}
+
+impl IdentityField {
+    /// Every field, in the order the form draws them.
+    pub const ALL: [IdentityField; 18] = [
+        IdentityField::Title,
+        IdentityField::FirstName,
+        IdentityField::MiddleName,
+        IdentityField::LastName,
+        IdentityField::Email,
+        IdentityField::Phone,
+        IdentityField::Username,
+        IdentityField::Company,
+        IdentityField::Address1,
+        IdentityField::Address2,
+        IdentityField::Address3,
+        IdentityField::City,
+        IdentityField::State,
+        IdentityField::PostalCode,
+        IdentityField::Country,
+        IdentityField::Ssn,
+        IdentityField::PassportNumber,
+        IdentityField::LicenseNumber,
+    ];
+
+    /// The caption above this field's box, and the caption the "add a field"
+    /// menu lists it under. **One string for both**: a menu that named a field
+    /// differently from the row it reveals would leave the user hunting for
+    /// what they just added.
+    pub fn label(self) -> &'static str {
+        match self {
+            IdentityField::Title => "Title",
+            IdentityField::FirstName => "First name",
+            IdentityField::MiddleName => "Middle name",
+            IdentityField::LastName => "Last name",
+            IdentityField::Email => "Email",
+            IdentityField::Phone => "Phone",
+            IdentityField::Username => "Username",
+            IdentityField::Company => "Company",
+            IdentityField::Address1 => "Address",
+            IdentityField::Address2 => "Address 2",
+            IdentityField::Address3 => "Address 3",
+            IdentityField::City => "City",
+            IdentityField::State => "State",
+            IdentityField::PostalCode => "Postal code",
+            IdentityField::Country => "Country",
+            IdentityField::Ssn => "SSN",
+            IdentityField::PassportNumber => "Passport number",
+            IdentityField::LicenseNumber => "Licence number",
+        }
+    }
+
+    /// What this field currently holds.
+    ///
+    /// The read-only twin of [`identity_rows`]'s `&mut String`, and a second
+    /// match rather than a projection of the first because the borrow checker
+    /// will not let one `&mut IdentityDraft` produce eighteen `&mut String`s
+    /// through a per-field function -- the row list gets them out in one
+    /// struct-field expression each, which is exactly what it cannot do
+    /// behind a `match` on a runtime value. The two are held together by
+    /// `every_identity_field_reads_back_the_box_it_writes`, which writes a
+    /// distinct marker through the row list and reads it back through here:
+    /// a mis-wired arm swaps two fields and that test says which.
+    pub fn value(self, d: &IdentityDraft) -> &str {
+        match self {
+            IdentityField::Title => &d.title,
+            IdentityField::FirstName => &d.first_name,
+            IdentityField::MiddleName => &d.middle_name,
+            IdentityField::LastName => &d.last_name,
+            IdentityField::Email => &d.email,
+            IdentityField::Phone => &d.phone,
+            IdentityField::Username => &d.username,
+            IdentityField::Company => &d.company,
+            IdentityField::Address1 => &d.address1,
+            IdentityField::Address2 => &d.address2,
+            IdentityField::Address3 => &d.address3,
+            IdentityField::City => &d.city,
+            IdentityField::State => &d.state,
+            IdentityField::PostalCode => &d.postal_code,
+            IdentityField::Country => &d.country,
+            IdentityField::Ssn => &d.ssn,
+            IdentityField::PassportNumber => &d.passport_number,
+            IdentityField::LicenseNumber => &d.license_number,
+        }
+    }
+}
+
 /// The identity form's rows, in the same order and grouping the read pane
 /// uses. One place, so a field cannot be modelled, drafted and then never
 /// offered.
-fn identity_rows(d: &mut IdentityDraft) -> Vec<(&'static str, &mut String)> {
+///
+/// Each row is named by its [`IdentityField`] rather than by its caption:
+/// the caption is `IdentityField::label`, so there is one list of words and
+/// this is one list of boxes, and neither can grow a row the other has not.
+fn identity_rows(d: &mut IdentityDraft) -> Vec<(IdentityField, &mut String)> {
     vec![
-        ("Title", &mut d.title),
-        ("First name", &mut d.first_name),
-        ("Middle name", &mut d.middle_name),
-        ("Last name", &mut d.last_name),
-        ("Email", &mut d.email),
-        ("Phone", &mut d.phone),
-        ("Username", &mut d.username),
-        ("Company", &mut d.company),
-        ("Address", &mut d.address1),
-        ("Address 2", &mut d.address2),
-        ("Address 3", &mut d.address3),
-        ("City", &mut d.city),
-        ("State", &mut d.state),
-        ("Postal code", &mut d.postal_code),
-        ("Country", &mut d.country),
-        ("SSN", &mut d.ssn),
-        ("Passport number", &mut d.passport_number),
-        ("Licence number", &mut d.license_number),
+        (IdentityField::Title, &mut d.title),
+        (IdentityField::FirstName, &mut d.first_name),
+        (IdentityField::MiddleName, &mut d.middle_name),
+        (IdentityField::LastName, &mut d.last_name),
+        (IdentityField::Email, &mut d.email),
+        (IdentityField::Phone, &mut d.phone),
+        (IdentityField::Username, &mut d.username),
+        (IdentityField::Company, &mut d.company),
+        (IdentityField::Address1, &mut d.address1),
+        (IdentityField::Address2, &mut d.address2),
+        (IdentityField::Address3, &mut d.address3),
+        (IdentityField::City, &mut d.city),
+        (IdentityField::State, &mut d.state),
+        (IdentityField::PostalCode, &mut d.postal_code),
+        (IdentityField::Country, &mut d.country),
+        (IdentityField::Ssn, &mut d.ssn),
+        (IdentityField::PassportNumber, &mut d.passport_number),
+        (IdentityField::LicenseNumber, &mut d.license_number),
     ]
+}
+
+/// **One row of the edit form that an item may or may not have anything in.**
+///
+/// The owner's ask: "When edit - show only fields that not empty and the rest
+/// should be Add - select type and then it shows up and you can enter
+/// something." A form that opens with eighteen empty identity boxes is a form
+/// whose two filled rows are hidden in the middle of sixteen that are not; the
+/// answer is to draw what the item HAS and to put the rest behind a control
+/// that names them.
+///
+/// **A named row and not a `bool` per box**, because three separate things
+/// have to agree about the same list -- what the form draws, what the "add"
+/// menu offers, and what a draft remembers the user revealing -- and a set of
+/// these is the one value all three read.
+///
+/// **EDIT only.** [`EditDraft::shown_slots`] hands back every slot on a
+/// create, and that is not an omission: a create form has nothing filled in by
+/// definition, so "show only what is filled in" would show nothing at all and
+/// the add menu would BE the form. The owner's ask names the edit screen, and
+/// this is where it stops.
+///
+/// Not every row is one of these. The name, the folder, the custom-fields
+/// block and the matched-app block are drawn unconditionally for every kind:
+/// the first is required ([`EditDraft::is_valid`]), and the last three are
+/// blocks with their own add-and-remove controls already, so folding them in
+/// would put an add button behind an add button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slot {
+    Username,
+    Password,
+    Totp,
+    /// The whole websites block, not one box in it -- see
+    /// [`websites_block`]. Revealing it adds the first empty row; removing
+    /// the last row takes the slot away again, which is why it is the one
+    /// slot with no Remove control of its own.
+    Websites,
+    CardholderName,
+    CardBrand,
+    CardNumber,
+    CardExpMonth,
+    CardExpYear,
+    CardCode,
+    CardBank,
+    CardBillingZip,
+    Identity(IdentityField),
+    Note,
+    SshPrivateKey,
+    SshPublicKey,
+    SshFingerprint,
+}
+
+impl Slot {
+    /// Every slot this kind's form has, in the order the form draws them.
+    ///
+    /// Exhaustive with no catch-all, as [`ItemKind`] requires: a `_ =>` would
+    /// hand a type Bitwarden ships next whichever list happened to sit beside
+    /// it.
+    pub fn all_for(kind: ItemKind) -> Vec<Slot> {
+        match kind {
+            ItemKind::Login => {
+                vec![Slot::Username, Slot::Password, Slot::Totp, Slot::Websites]
+            }
+            ItemKind::Card => vec![
+                Slot::CardholderName,
+                Slot::CardBrand,
+                Slot::CardNumber,
+                Slot::CardExpMonth,
+                Slot::CardExpYear,
+                Slot::CardCode,
+                Slot::CardBank,
+                Slot::CardBillingZip,
+            ],
+            ItemKind::Identity => IdentityField::ALL.iter().copied().map(Slot::Identity).collect(),
+            ItemKind::SecureNote => vec![Slot::Note],
+            ItemKind::SshKey => {
+                vec![Slot::SshPrivateKey, Slot::SshPublicKey, Slot::SshFingerprint]
+            }
+            // Nothing is known about this type, so there is nothing to offer
+            // -- `form_body` gives it `UneditableNotice` for the same reason.
+            ItemKind::Unknown(_) => Vec::new(),
+        }
+    }
+
+    /// **The floor: a row that is drawn whether or not it has anything in
+    /// it.**
+    ///
+    /// Not everything is optional, and the line is not "what the backend
+    /// requires" -- `bw serve` requires only a name. It is what an edit form
+    /// for this kind would be strange without:
+    ///
+    ///  * **A login's username and password.** A login is a pair of
+    ///    credentials; a form for one that offered no box to fill the username
+    ///    into would be an edit screen for something else. The owner's ask
+    ///    names the empty rows as the problem, and these two are the rows a
+    ///    user opens the form to type into.
+    ///  * **A card's number and brand.** The number is what a card IS. The
+    ///    brand is drawn always for a second reason that has nothing to do
+    ///    with taste: `CardDraft::suggest_brand` runs beside the number box
+    ///    and fills the brand in from the digits, so a hidden brand would be a
+    ///    value this form sets and the user cannot see.
+    ///  * **An identity's first and last name.** An identity is a person, the
+    ///    read pane's headline is their name, and this is the kind with
+    ///    eighteen rows -- the one the feature is for -- so its floor is the
+    ///    two rows that say whose identity it is.
+    ///  * **A secure note's body**, which is the entire item. A note form with
+    ///    no note box is nothing.
+    ///  * **An SSH key's three fields.** They exist on a CREATE only (see
+    ///    `form_body`), where nothing is hidden anyway, and `NewItem::ssh_key`
+    ///    posts all three.
+    pub fn always_shown(self) -> bool {
+        match self {
+            Slot::Username
+            | Slot::Password
+            | Slot::CardNumber
+            | Slot::CardBrand
+            | Slot::Note
+            | Slot::SshPrivateKey
+            | Slot::SshPublicKey
+            | Slot::SshFingerprint => true,
+            Slot::Identity(field) => {
+                matches!(field, IdentityField::FirstName | IdentityField::LastName)
+            }
+            Slot::Totp
+            | Slot::Websites
+            | Slot::CardholderName
+            | Slot::CardExpMonth
+            | Slot::CardExpYear
+            | Slot::CardCode
+            | Slot::CardBank
+            | Slot::CardBillingZip => false,
+        }
+    }
+
+    /// What the form calls this row, and therefore what the add menu lists it
+    /// under.
+    ///
+    /// **Read off the same constants the form draws with**, never a second
+    /// spelling: a menu entry that said "Security code" over a row captioned
+    /// "CVV" would be two names for one box.
+    pub fn label(self) -> &'static str {
+        match self {
+            Slot::Username => "Username",
+            Slot::Password => "Password",
+            Slot::Totp => TOTP_LABEL,
+            Slot::Websites => WEBSITE_LABEL,
+            Slot::CardholderName => "Cardholder name",
+            Slot::CardBrand => "Brand",
+            Slot::CardNumber => "Number",
+            Slot::CardExpMonth => "Expiry month",
+            Slot::CardExpYear => "Expiry year",
+            Slot::CardCode => "Security code",
+            Slot::CardBank => BANK_LABEL,
+            Slot::CardBillingZip => BILLING_ZIP_LABEL,
+            Slot::Identity(field) => field.label(),
+            Slot::Note => "Note",
+            Slot::SshPrivateKey => "Private key",
+            Slot::SshPublicKey => "Public key",
+            Slot::SshFingerprint => "Fingerprint",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2887,6 +3403,104 @@ pub const FIELDS_CREATE_NOTICE: &str =
 ///
 /// Withheld on a CREATE, with a notice saying when it works -- see
 /// [`WEBSITE_CREATE_NOTICE`].
+/// The button that opens the list of rows this item does not have.
+///
+/// Short on purpose, and deliberately short of the four other Add captions on
+/// this form ([`FIELD_ADD_TEXT_BUTTON`], [`FIELD_ADD_HIDDEN_BUTTON`],
+/// [`APP_ADD_BUTTON`], [`WEBSITE_ADD_BUTTON`]): every one of those adds a NEW
+/// thing -- a custom field the item type has no box for, an app binding,
+/// another website -- and this one reveals a row the item type already has
+/// and this item happens not to use. Two controls captioned "Add a field..."
+/// on one form would be one phrase for two different gestures.
+pub const SLOT_ADD_BUTTON: &str = "Add\u{2026}";
+
+/// What the open menu says above its choices.
+///
+/// **It states the blank rule on screen**, because that rule is otherwise
+/// invisible until a save: a row revealed and left empty is not written, so
+/// it is gone the next time the item is opened. A user who cannot see that
+/// has to discover it, and the discovery looks like the form losing their
+/// work.
+pub const SLOT_ADD_HINT: &str =
+    "Pick a field to fill in. One left empty is not saved, and goes away again.";
+
+/// The chip that takes an optional row off the form.
+///
+/// Beside the row's caption rather than under its box, so revealing a field
+/// costs one row of height and not two -- an identity has eighteen of them.
+///
+/// **Drawn only on a row [`Slot::always_shown`] is false for.** A login with
+/// a Remove beside its password would be one click from a wiped credential,
+/// and [`EditDraft::hide_slot`] refuses that independently of the drawing.
+pub const SLOT_REMOVE_BUTTON: &str = "Remove";
+
+/// One optional row's caption, with its Remove chip beside it. Answers
+/// whether the chip was clicked.
+///
+/// **Wrapped, not `horizontal`**, for the reason every other multi-control
+/// row on this form is: an unwrapped row does not shrink to fit, it pushes
+/// the card past the pane and inflates every `available_width()` measured
+/// after it -- `aae9429`'s defect.
+fn slot_label(ui: &mut egui::Ui, label: &str, removable: bool) -> bool {
+    if !removable {
+        theme::field_label(ui, label);
+        return false;
+    }
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        theme::field_label(ui, label);
+        clicked = ui.add(small_chip_button(SLOT_REMOVE_BUTTON)).clicked();
+    });
+    clicked
+}
+
+/// **The Add control, and the list of rows it reveals.**
+///
+/// The second half of the owner's ask -- "the rest should be Add - select
+/// type and then it shows up and you can enter something". Answers with the
+/// slot the user picked, or `None`.
+///
+/// **A disclosure and a row of chips, not a popup menu.** Three reasons, and
+/// the first is the one `GeneratorDraft::options_open` already makes: a popup
+/// lives in its own egui layer and exists only between a click and the next
+/// one, so neither a layout test nor a rendered preview could ever be put in
+/// front of the open menu -- a state nobody can look at is a state nobody
+/// checks. The second is width: a chip row in a `horizontal_wrapped` has a
+/// floor of one widest chip rather than a sum, so it cannot push the card out
+/// however many fields the kind grows. The third is that the list IS the
+/// answer to "what is this item missing", and a list you have to hold a menu
+/// open to read is a worse answer than one on the page.
+///
+/// Drawn only when there is something to add, so an item with every row
+/// already on screen gets nothing rather than a control that opens onto an
+/// empty list.
+fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Option<Slot> {
+    if addable.is_empty() {
+        return None;
+    }
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(*open, SLOT_ADD_BUTTON).clicked() {
+            *open = !*open;
+        }
+    });
+    if *open {
+        ui.add_space(6.0);
+        ui.label(RichText::new(SLOT_ADD_HINT).size(11.0).color(theme::TEXT_FAINT));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for slot in addable {
+                if theme::secondary_button(ui, slot.label()).clicked() {
+                    chosen = Some(*slot);
+                }
+            }
+        });
+    }
+    ui.add_space(10.0);
+    chosen
+}
+
+
 fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     if creating {
         theme::disabled_field_label(ui, WEBSITE_LABEL);
@@ -4998,16 +5612,42 @@ pub fn draw_detail_edit(
             theme::text_field(ui, &mut draft.name, false);
             ui.add_space(10.0);
 
+            // **Which of the kind's rows this form is drawing, and which are
+            // behind the Add control.** Both computed here, off the draft,
+            // before the body borrows it -- and both from `EditDraft`'s own
+            // predicates rather than from an `is_empty()` at each row, so the
+            // rule is one decision a test can call instead of twenty
+            // conditions no test can reach. See [`Slot`].
+            //
+            // On a CREATE `shown` is every slot and `addable` is empty, so
+            // everything below draws exactly as it always has.
+            let shown = draft.shown_slots(creating);
+            let addable = draft.addable_slots(creating);
+            let showing = |slot: Slot| shown.contains(&slot);
+            // A Remove is offered on a row that is optional, and on an edit.
+            // The floor rows have none -- see [`Slot::always_shown`] -- and a
+            // create hides nothing, so there is nothing there to take away.
+            let removable = |slot: Slot| !creating && !slot.always_shown();
+            // Collected and applied AFTER the body, for the reason
+            // `custom_fields_block`'s removal is deferred: the rows below
+            // hold `&mut` into the very boxes `hide_slot` empties.
+            let mut hide: Option<Slot> = None;
+
             // Exhaustive, no catch-all: `ItemKind`'s doc forbids one, and a
             // `_ =>` here would render a login's username and password box
             // over whatever kind Bitwarden ships next.
             match form_body(draft.kind, creating) {
                 FormBody::Login => {
-                    theme::field_label(ui, "Username");
+                    // Username and password are the floor for a login -- see
+                    // [`Slot::always_shown`] -- so neither is gated and
+                    // neither carries a Remove. Their captions still come
+                    // from `Slot::label`, so the Add menu could never name
+                    // one of them differently from the row it reveals.
+                    theme::field_label(ui, Slot::Username.label());
                     theme::text_field(ui, &mut draft.username, false);
                     ui.add_space(10.0);
 
-                    theme::field_label(ui, "Password");
+                    theme::field_label(ui, Slot::Password.label());
                     theme::password_field(ui, &mut draft.password, &mut draft.reveal_password);
                     ui.add_space(6.0);
                     // The generator, in this form's own idiom rather than
@@ -5155,7 +5795,10 @@ pub fn draw_detail_edit(
                     // the order the user meets them in when setting an
                     // account up, and because the seed is the one field on
                     // this body the generator has nothing to do with.
-                    theme::field_label(ui, TOTP_LABEL);
+                    if showing(Slot::Totp) {
+                    if slot_label(ui, Slot::Totp.label(), removable(Slot::Totp)) {
+                        hide = Some(Slot::Totp);
+                    }
                     if creating {
                         theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
                     } else {
@@ -5171,20 +5814,42 @@ pub fn draw_detail_edit(
                     ui.add_space(4.0);
                     ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
                     ui.add_space(10.0);
+                    }
 
                     // Last of the login's own rows, matching the order
                     // Bitwarden's own clients use (credentials, then the
                     // one-time code, then where they are used) and the order
                     // the read pane puts them in.
-                    websites_block(ui, &mut draft.uris, creating);
+                    //
+                    // **The block carries its own Remove per row**, so the
+                    // slot has none of its own: removing the last website is
+                    // what takes the block away, which is handled below the
+                    // match. See [`Slot::Websites`].
+                    if showing(Slot::Websites) {
+                        websites_block(ui, &mut draft.uris, creating);
+                    }
                 }
                 FormBody::Card => {
                     let card = &mut draft.card;
-                    theme::field_label(ui, "Cardholder name");
-                    theme::text_field(ui, &mut card.cardholder_name, false);
-                    ui.add_space(10.0);
+                    if showing(Slot::CardholderName) {
+                        if slot_label(
+                            ui,
+                            Slot::CardholderName.label(),
+                            removable(Slot::CardholderName),
+                        ) {
+                            hide = Some(Slot::CardholderName);
+                        }
+                        theme::text_field(ui, &mut card.cardholder_name, false);
+                        ui.add_space(10.0);
+                    }
 
-                    theme::field_label(ui, "Brand");
+                    // **The brand is floor** -- never hidden, never
+                    // removable -- and not because a card needs one on the
+                    // wire. `suggest_brand` below fills it in from the
+                    // number's own digits, so a hidden brand would be a value
+                    // this form sets and the user cannot see. See
+                    // [`Slot::always_shown`].
+                    theme::field_label(ui, Slot::CardBrand.label());
                     // A dropdown over `CARD_BRANDS` rather than a text box,
                     // and the rows are derived from the enumeration rather
                     // than written out here: a second hand-written list is
@@ -5217,7 +5882,7 @@ pub fn draw_detail_edit(
                         });
                     ui.add_space(10.0);
 
-                    theme::field_label(ui, "Number");
+                    theme::field_label(ui, Slot::CardNumber.label());
                     theme::password_field(ui, &mut card.number, &mut card.reveal_number);
                     // Every frame, unconditionally. `suggest_brand` is
                     // idempotent and returns immediately once the user has
@@ -5227,17 +5892,34 @@ pub fn draw_detail_edit(
                     card.suggest_brand();
                     ui.add_space(10.0);
 
-                    theme::field_label(ui, "Expiry month");
-                    theme::text_field(ui, &mut card.exp_month, false);
-                    ui.add_space(10.0);
+                    if showing(Slot::CardExpMonth) {
+                        if slot_label(
+                            ui,
+                            Slot::CardExpMonth.label(),
+                            removable(Slot::CardExpMonth),
+                        ) {
+                            hide = Some(Slot::CardExpMonth);
+                        }
+                        theme::text_field(ui, &mut card.exp_month, false);
+                        ui.add_space(10.0);
+                    }
 
-                    theme::field_label(ui, "Expiry year");
-                    theme::text_field(ui, &mut card.exp_year, false);
-                    ui.add_space(10.0);
+                    if showing(Slot::CardExpYear) {
+                        if slot_label(ui, Slot::CardExpYear.label(), removable(Slot::CardExpYear))
+                        {
+                            hide = Some(Slot::CardExpYear);
+                        }
+                        theme::text_field(ui, &mut card.exp_year, false);
+                        ui.add_space(10.0);
+                    }
 
-                    theme::field_label(ui, "Security code");
-                    theme::password_field(ui, &mut card.code, &mut card.reveal_code);
-                    ui.add_space(10.0);
+                    if showing(Slot::CardCode) {
+                        if slot_label(ui, Slot::CardCode.label(), removable(Slot::CardCode)) {
+                            hide = Some(Slot::CardCode);
+                        }
+                        theme::password_field(ui, &mut card.code, &mut card.reveal_code);
+                        ui.add_space(10.0);
+                    }
 
                     // The two namespaced custom fields. Withheld on a CREATE
                     // for the same reason the TOTP seed is (see
@@ -5245,37 +5927,60 @@ pub fn draw_detail_edit(
                     // so anything typed here would be silently discarded on
                     // Save. A disabled box that says so beats a live box that
                     // lies.
-                    theme::field_label(ui, BANK_LABEL);
-                    if creating {
-                        theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                    } else {
-                        bank_domain_row(ui, card);
+                    if showing(Slot::CardBank) {
+                        if slot_label(ui, Slot::CardBank.label(), removable(Slot::CardBank)) {
+                            hide = Some(Slot::CardBank);
+                        }
+                        if creating {
+                            theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                        } else {
+                            bank_domain_row(ui, card);
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
+                        ui.add_space(10.0);
                     }
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
-                    ui.add_space(10.0);
 
-                    theme::field_label(ui, BILLING_ZIP_LABEL);
-                    if creating {
-                        theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                    } else {
-                        // Free text, unlike the bank: a postcode has no
-                        // closed set to pick from, and a wrong one fails in
-                        // front of the user on the payment form rather than
-                        // silently here.
-                        theme::text_field(ui, &mut card.billing_zip, false);
+                    if showing(Slot::CardBillingZip) {
+                        if slot_label(
+                            ui,
+                            Slot::CardBillingZip.label(),
+                            removable(Slot::CardBillingZip),
+                        ) {
+                            hide = Some(Slot::CardBillingZip);
+                        }
+                        if creating {
+                            theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                        } else {
+                            // Free text, unlike the bank: a postcode has no
+                            // closed set to pick from, and a wrong one fails
+                            // in front of the user on the payment form rather
+                            // than silently here.
+                            theme::text_field(ui, &mut card.billing_zip, false);
+                        }
+                        ui.add_space(10.0);
                     }
-                    ui.add_space(10.0);
                 }
                 FormBody::Identity => {
-                    for (label, value) in identity_rows(&mut draft.identity) {
-                        theme::field_label(ui, label);
+                    // **The kind this feature earns its keep on.** Eighteen
+                    // rows, of which a real identity fills two or three; the
+                    // rest are behind the Add control below.
+                    for (field, value) in identity_rows(&mut draft.identity) {
+                        let slot = Slot::Identity(field);
+                        if !showing(slot) {
+                            continue;
+                        }
+                        if slot_label(ui, field.label(), removable(slot)) {
+                            hide = Some(slot);
+                        }
                         theme::text_field(ui, value, false);
                         ui.add_space(10.0);
                     }
                 }
                 FormBody::Note => {
-                    theme::field_label(ui, "Note");
+                    // Floor, and the only slot a note has: the body IS the
+                    // item. See [`Slot::always_shown`].
+                    theme::field_label(ui, Slot::Note.label());
                     // A multiline box rather than `theme::text_field`: a
                     // secure note's body is the whole item and is routinely
                     // several lines. `theme` has no multiline helper.
@@ -5290,7 +5995,10 @@ pub fn draw_detail_edit(
                     let ssh = &mut draft.ssh_key;
                     // Wire keys `privateKey`, `publicKey`, `keyFingerprint`,
                     // captured from a real type-5 item -- see `SshKeyDraft`.
-                    theme::field_label(ui, "Private key");
+                    // All three are floor: they exist on a CREATE only, where
+                    // nothing is hidden, and `NewItem::ssh_key` posts all
+                    // three. See [`Slot::always_shown`].
+                    theme::field_label(ui, Slot::SshPrivateKey.label());
                     // The one secret of the three, so the one with a reveal.
                     // Multiline would suit a PEM block better, but
                     // `theme` has no masked multiline box and an unmasked one
@@ -5298,11 +6006,11 @@ pub fn draw_detail_edit(
                     theme::password_field(ui, &mut ssh.private_key, &mut ssh.reveal_private_key);
                     ui.add_space(10.0);
 
-                    theme::field_label(ui, "Public key");
+                    theme::field_label(ui, Slot::SshPublicKey.label());
                     theme::text_field(ui, &mut ssh.public_key, false);
                     ui.add_space(10.0);
 
-                    theme::field_label(ui, "Fingerprint");
+                    theme::field_label(ui, Slot::SshFingerprint.label());
                     theme::text_field(ui, &mut ssh.key_fingerprint, false);
                     ui.add_space(10.0);
                 }
@@ -5318,6 +6026,28 @@ pub fn draw_detail_edit(
                     );
                     ui.add_space(10.0);
                 }
+            }
+
+            // **Immediately under the kind's own rows, and above everything
+            // else.** The Add control names the rows this item has not
+            // filled in, so it belongs at the end of the rows it is talking
+            // about -- not below the custom-fields and matched-app blocks,
+            // which are about different things and carry their own Adds.
+            if let Some(slot) = slot_add_block(ui, &mut draft.add_menu_open, &addable) {
+                draft.reveal_slot(slot);
+            }
+            // The deferred Remove -- see `hide` above. `hide_slot` empties
+            // the box as well as taking the row away, which is why it cannot
+            // run while the body still holds a `&mut` into it.
+            if let Some(slot) = hide {
+                draft.hide_slot(slot);
+            }
+            // ... and the websites block's own Remove, one level up: taking
+            // the last website away takes the block with it, so "Website"
+            // goes back into the Add list rather than leaving a heading and
+            // an Add button behind. See [`Slot::Websites`].
+            if draft.uris.is_empty() {
+                draft.hide_slot(Slot::Websites);
             }
 
             // Between the kind's own boxes and the app block: a custom field
@@ -13161,12 +13891,20 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// Every control an **empty** draft of `kind` must be offered.
+    /// Every control an empty draft of `kind` must be offered, in `creating`
+    /// mode.
     ///
-    /// Built from the same sources the form draws from where there is one
-    /// (`identity_rows`, the block's own consts), so a field that is modelled
-    /// and drafted and then never offered cannot pass by both lists being
-    /// edited to agree.
+    /// **Built from the form's own decisions where there is one** --
+    /// `form_body`, `EditDraft::shown_slots`, `Slot::label`, the blocks' own
+    /// consts -- so a field that is modelled and drafted and then never
+    /// offered cannot pass by both lists being edited to agree.
+    ///
+    /// The body's rows come from `shown_slots` and NOT from a hand-written
+    /// list, which is the whole point after the sparse-form change: on a
+    /// create it answers with every slot the kind has, and on an edit of an
+    /// empty draft it answers with the floor alone. A hand-written list would
+    /// have had to be edited to match the new behaviour, which is exactly the
+    /// edit that turns a test into a restatement of the code's current mood.
     fn expected_controls(kind: ItemKind, creating: bool) -> Vec<&'static str> {
         // What every kind gets in both states: its name, the custom-fields
         // section, the app section -- the two gaps this list exists for --
@@ -13187,34 +13925,51 @@ mod edit_pane_layout_tests {
         // so an SSH key -- whose boxes exist on a create and are withheld on
         // an edit -- is expected to offer exactly what `form_body` says and
         // this list cannot drift from it.
-        match form_body(kind, creating) {
+        let body = form_body(kind, creating);
+        if body != FormBody::UneditableNotice {
+            expected.extend(
+                EditDraft::empty_of(kind).shown_slots(creating).into_iter().map(Slot::label),
+            );
+        }
+        match body {
+            // The generator row belongs to the password box and is not a slot
+            // of its own; the seed's and the websites' notices are conditional
+            // on the mode.
             FormBody::Login => {
-                expected.extend(["Username", "Password", "Generate", TOTP_LABEL]);
-                // The seed box, like the custom-field boxes, cannot exist on
-                // a create (`NewItem::login` has no `totp`), so the row says
-                // why instead of taking input Save would drop.
-                expected.push(if creating { TOTP_CREATE_NOTICE } else { TOTP_HINT });
+                expected.push("Generate");
+                // Each notice belongs to its row and is hidden with it, which
+                // is why these are asked of `shown_slots` too rather than of
+                // `creating` alone.
+                let shown = EditDraft::empty_of(kind).shown_slots(creating);
+                if shown.contains(&Slot::Totp) {
+                    expected.push(if creating { TOTP_CREATE_NOTICE } else { TOTP_HINT });
+                }
+                if creating && shown.contains(&Slot::Websites) {
+                    expected.push(WEBSITE_CREATE_NOTICE);
+                }
             }
-            FormBody::Card => expected.extend([
-                "Cardholder name",
-                "Brand",
-                "Number",
-                "Expiry month",
-                "Expiry year",
-                "Security code",
-            ]),
-            FormBody::Identity => {
-                // The form's own row list, not a copy of it.
-                expected.extend(identity_rows(&mut IdentityDraft::default()).into_iter().map(
-                    |(label, _)| label,
-                ));
-            }
-            FormBody::Note => expected.push("Note"),
-            FormBody::SshKey => expected.extend(["Private key", "Public key", "Fingerprint"]),
+            FormBody::Card | FormBody::Identity | FormBody::Note | FormBody::SshKey => {}
             // Name and folder only, both already in the list above.
             FormBody::UneditableNotice => {}
         }
+        // ...and, on an edit, the control that reaches everything the rows
+        // above do not show. Only when there IS something behind it: a note
+        // has one slot and it is floor, so the control would open onto an
+        // empty list and is withheld.
+        if !EditDraft::empty_of(kind).addable_slots(creating).is_empty() {
+            expected.push(SLOT_ADD_BUTTON);
+        }
         expected
+    }
+
+    /// The rows an empty draft of `kind` must NOT be showing on an edit, by
+    /// label -- the other half of [`expected_controls`], and the half the
+    /// owner's ask is about.
+    fn expected_hidden(kind: ItemKind, creating: bool) -> Vec<&'static str> {
+        if form_body(kind, creating) == FormBody::UneditableNotice {
+            return Vec::new();
+        }
+        EditDraft::empty_of(kind).addable_slots(creating).into_iter().map(Slot::label).collect()
     }
 
     /// **The user's ask, as a test: on a form with nothing filled in, every
@@ -13239,6 +13994,14 @@ mod edit_pane_layout_tests {
     ///   that is painted and unreachable is the same defect as one that is
     ///   missing. The pane is `MIN_PANE_WIDTH` for that reason -- the width is
     ///   the axis this form cannot scroll.
+    ///
+    /// **What "offered" means changed with the sparse form, and this test
+    /// changed with it rather than being pinned to one layout.** On a CREATE
+    /// it is what it always was: every row the kind has. On an EDIT of an
+    /// empty draft it is the floor rows plus the control that reaches the
+    /// rest -- and `expected_controls` reads both answers out of
+    /// `EditDraft::shown_slots`, so neither list can be quietly edited into
+    /// agreement with a form that stopped drawing something.
     #[test]
     fn every_control_the_kind_supports_is_offered_even_on_an_empty_draft() {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
@@ -13308,6 +14071,26 @@ mod edit_pane_layout_tests {
                     expected.len(),
                     "the control loop for {kind:?} did not visit every expected control"
                 );
+
+                // **...and the rows the item has nothing in are NOT drawn.**
+                // The owner's ask has two halves and only one of them is an
+                // "is it there" check; a form that showed everything would
+                // pass every assertion above, which is what it did before
+                // this block existed.
+                let hidden = expected_hidden(kind, creating);
+                assert_eq!(
+                    hidden.is_empty(),
+                    creating || Slot::all_for(kind).iter().all(|s| s.always_shown()),
+                    "{kind:?} (creating: {creating}) expects {} hidden rows, which does not \
+                     match what the kind actually has",
+                    hidden.len()
+                );
+                for label in &hidden {
+                    assert!(
+                        !strings.contains(label),
+                        "an EMPTY {kind:?} is still drawing {label:?}. Painted: {strings:?}"
+                    );
+                }
             }
         }
         assert_eq!(states, 2, "the state loop visited {states} states");
@@ -13860,6 +14643,13 @@ mod edit_pane_layout_tests {
         let mut draft = EditDraft::empty_of(ItemKind::Login);
         draft.username = USERNAME.into();
         draft.totp = SEED.into();
+        // The seed's ROW has to be on screen for this to be about the mask.
+        // An empty draft's optional rows are behind the Add control (see
+        // [`Slot`]), and a row that is not drawn paints no mask and no
+        // plaintext -- which would satisfy the "never in the clear" half
+        // vacuously.
+        draft.reveal_slot(Slot::Totp);
+        assert!(draft.shows(Slot::Totp), "the seed's row is not on the form to be masked");
         assert!(!draft.reveal_totp, "a form opens with the seed already revealed");
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
@@ -14287,7 +15077,12 @@ mod edit_pane_layout_tests {
     fn the_first_website_note_shows_only_when_there_is_more_than_one() {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
         let mut cases = 0;
-        for (count, expected) in [(0usize, false), (1, false), (2, true), (3, true)] {
+        // From ONE website, not from none: a login with no websites has no
+        // websites block at all now -- the row is behind the Add control (see
+        // [`Slot::Websites`]) -- so the zero case says nothing about the note
+        // and is asserted separately by
+        // `a_login_with_no_website_offers_one_through_the_add_menu`.
+        for (count, expected) in [(1usize, false), (2, true), (3, true)] {
             cases += 1;
             let ctx = styled_context(pane);
             let item = login_with_websites(count);
@@ -14307,7 +15102,7 @@ mod edit_pane_layout_tests {
                 "the websites block is not on screen at all with {count} website(s)"
             );
         }
-        assert_eq!(cases, 4, "the count loop asserted about nothing");
+        assert_eq!(cases, 3, "the count loop asserted about nothing");
     }
 
     /// **A CREATE says when a website can be added instead of taking one it
@@ -14338,6 +15133,652 @@ mod edit_pane_layout_tests {
             "the create form offers an Add whose contents Save would discard"
         );
         assert!(draft.uris.is_empty(), "a create form put a website row on the draft");
+    }
+
+    /// Puts `value` into `slot`'s box on `draft`.
+    ///
+    /// Exhaustive with no catch-all, so a slot added later cannot be filled
+    /// by accident with nothing and quietly drop out of every loop below.
+    /// [`Slot::Websites`] is a list and gets one entry.
+    fn fill(draft: &mut EditDraft, slot: Slot, value: &str) {
+        let set = |s: &mut String| *s = value.to_string();
+        match slot {
+            Slot::Username => set(&mut draft.username),
+            Slot::Password => set(&mut draft.password),
+            Slot::Totp => set(&mut draft.totp),
+            Slot::Websites => {
+                let mut entry = UriDraft::new();
+                entry.uri = value.to_string();
+                draft.uris.push(entry);
+            }
+            Slot::CardholderName => set(&mut draft.card.cardholder_name),
+            Slot::CardBrand => set(&mut draft.card.brand),
+            Slot::CardNumber => set(&mut draft.card.number),
+            Slot::CardExpMonth => set(&mut draft.card.exp_month),
+            Slot::CardExpYear => set(&mut draft.card.exp_year),
+            Slot::CardCode => set(&mut draft.card.code),
+            Slot::CardBank => set(&mut draft.card.bank_domain),
+            Slot::CardBillingZip => set(&mut draft.card.billing_zip),
+            Slot::Identity(field) => {
+                let row = identity_rows(&mut draft.identity).into_iter().find(|(f, _)| *f == field);
+                if let Some((_, box_)) = row {
+                    set(box_);
+                }
+            }
+            Slot::Note => set(&mut draft.note_body),
+            Slot::SshPrivateKey => set(&mut draft.ssh_key.private_key),
+            Slot::SshPublicKey => set(&mut draft.ssh_key.public_key),
+            Slot::SshFingerprint => set(&mut draft.ssh_key.key_fingerprint),
+        }
+    }
+
+    /// A draft of `kind` with `slot` filled in, opened the way a real one is:
+    /// the values first, then `reveal_what_is_filled` -- the SAME function
+    /// `EditDraft::from_item` runs, so this fixture and the app agree about
+    /// what "the item has something in it" reveals.
+    fn opened_with(kind: ItemKind, slot: Slot, value: &str) -> EditDraft {
+        let mut draft = EditDraft::empty_of(kind);
+        fill(&mut draft, slot, value);
+        draft.reveal_what_is_filled()
+    }
+
+    /// Clicks into the box under `label` and types `text` into it, then
+    /// answers with what the draft holds afterwards.
+    ///
+    /// The box has no caption of its own to find it by -- an empty
+    /// `theme::text_field` paints an empty run -- so it is located from the
+    /// caption directly above it, which is what the user's eye does too.
+    fn type_under(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        label: &str,
+        text: &str,
+    ) {
+        let painted = frame(ctx, pane, draft, false, &[]);
+        let caption = painted.rect_of(label);
+        // The box is the first wide filled rectangle under the caption. Found
+        // by geometry rather than guessed at a fixed offset, so a change to
+        // the row's spacing does not turn this into a click on the card.
+        let mut boxes: Vec<Rect> = painted
+            .rects
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| r.top() >= caption.bottom() - 1.0 && r.width() > 120.0 && r.height() < 60.0)
+            .collect();
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        let field = *boxes.first().unwrap_or_else(|| {
+            panic!("nothing box-shaped is painted under {label:?}, so that row has no box at all")
+        });
+        // **Two frames, not one.** egui sets the focus at the END of the
+        // frame the click lands in, so a `Text` event delivered in the same
+        // frame reaches nothing.
+        let _ = frame(ctx, pane, draft, false, &click(field.center()));
+        let _ = frame(ctx, pane, draft, false, &[egui::Event::Text(text.to_string())]);
+    }
+
+    /// **The owner's ask, both halves, from one frame: a field with a value
+    /// is shown and one without is not.**
+    ///
+    /// "When edit - show only fields that not empty and the rest should be
+    /// Add." A test that asserted only the first half would pass on the form
+    /// as it was, which showed everything; one that asserted only the second
+    /// would pass on a form that showed nothing.
+    ///
+    /// **Every kind**, and for each of them the FIRST optional row is the one
+    /// filled in -- so the assertion is never about a row that would have
+    /// been drawn anyway (`Slot::always_shown`), and the rows expected absent
+    /// are the kind's real remainder rather than a list written here.
+    ///
+    /// A note has no optional rows at all and is skipped by the `continue`,
+    /// which the count assertion at the end then notices.
+    #[test]
+    fn a_filled_field_is_shown_and_an_empty_one_is_hidden_for_every_kind() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut kinds = 0;
+        let mut skipped = 0;
+        for kind in CREATABLE_KINDS {
+            let optional: Vec<Slot> =
+                Slot::all_for(kind).into_iter().filter(|s| !s.always_shown()).collect();
+            // An SSH key is `FormBody::UneditableNotice` on an edit and a
+            // secure note is one floor row; neither has anything to hide.
+            if optional.is_empty() || form_body(kind, false) == FormBody::UneditableNotice {
+                skipped += 1;
+                continue;
+            }
+            kinds += 1;
+
+            let shown = optional[0];
+            let hidden = &optional[1..];
+            assert!(
+                !hidden.is_empty(),
+                "{kind:?} has one optional row, so this case cannot show a hidden one"
+            );
+
+            let ctx = styled_context(pane);
+            let mut draft = opened_with(kind, shown, "https://filled.example");
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            let strings = painted.strings();
+
+            assert_inside(
+                &format!("{kind:?}'s filled {:?} row", shown),
+                shown.label(),
+                pane,
+                &painted,
+            );
+            for slot in hidden {
+                assert!(
+                    !strings.contains(&slot.label()),
+                    "an empty {:?} row is still drawn on a {kind:?}. Painted: {strings:?}",
+                    slot
+                );
+            }
+            // ...and the control that reaches them is on screen, so "hidden"
+            // means "behind the Add" and not "gone".
+            assert_inside("the add control", SLOT_ADD_BUTTON, pane, &painted);
+        }
+        assert_eq!(kinds, 3, "the kind loop asserted about {kinds} kinds, not 3");
+        assert_eq!(skipped, 2, "the skip count moved, so the loop is covering something else");
+    }
+
+    /// **An identity opens showing what the person has, not eighteen empty
+    /// boxes.**
+    ///
+    /// The kind this feature is for, driven the way the app drives it -- off
+    /// a real item through `EditDraft::from_item` -- rather than through the
+    /// `opened_with` shortcut, so the seeding path the app uses is the path
+    /// under test.
+    #[test]
+    fn an_identity_opens_showing_only_the_fields_it_has() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"id-1","name":"Anna","type":4,"fields":[],
+                "identity":{"firstName":"Anna","lastName":"Novak",
+                            "email":"a.novak@ledgerline.com","middleName":"",
+                            "company":"  "}}"#,
+        )
+        .expect("valid item JSON");
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::from_item(&item);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let strings = painted.strings();
+
+        for field in [IdentityField::FirstName, IdentityField::LastName, IdentityField::Email] {
+            assert!(
+                strings.contains(&field.label()),
+                "{:?} is filled in and is not on the form. Painted: {strings:?}",
+                field
+            );
+        }
+        // **An explicit empty string is absent, and whitespace is not.**
+        // `middleName` is `""`, which is what `drafted` turns a missing key
+        // into and what `edited` writes back as absent -- so no row.
+        // `company` is two spaces, which is a value the item really carries
+        // and which a save writes back verbatim, so it gets a row the user
+        // can see and clear. Hiding it would be this form concealing vault
+        // contents; see `EditDraft::slot_filled`.
+        assert!(
+            !strings.contains(&IdentityField::MiddleName.label()),
+            "an empty middle name put a row on the form. Painted: {strings:?}"
+        );
+        assert!(
+            strings.contains(&IdentityField::Company.label()),
+            "a company of two spaces -- a value the item really holds -- is hidden from the \
+             user. Painted: {strings:?}"
+        );
+        let drawn = IdentityField::ALL.iter().filter(|f| strings.contains(&f.label())).count();
+        assert_eq!(
+            drawn, 4,
+            "an identity with four filled fields is drawing {drawn} of its eighteen rows"
+        );
+    }
+
+    /// **The Add menu lists exactly what is missing, and picking one reveals
+    /// a row that can be typed into.**
+    ///
+    /// The other half of the ask -- "select type and then it shows up and you
+    /// can enter something" -- and all three claims in one run, because the
+    /// interesting failures are between them: a menu that lists the wrong
+    /// names, a chip wired to nothing (`9dcee36`'s defect class), and a row
+    /// that appears but is not really a box.
+    #[test]
+    fn the_add_menu_lists_what_is_missing_and_picking_one_makes_it_editable() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = opened_with(ItemKind::Identity, Slot::Identity(IdentityField::Email), "a@b");
+        let missing: Vec<Slot> = draft.addable_slots(false);
+        assert_eq!(
+            missing.len(),
+            15,
+            "an identity with three rows showing should have fifteen behind the Add: {missing:?}"
+        );
+
+        // Shut, the chips are not on screen at all -- so the assertions below
+        // are about the menu and not about a list that is always drawn.
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let shut = frame(&ctx, pane, &mut draft, false, &[]);
+        assert!(
+            !shut.strings().contains(&IdentityField::Company.label()),
+            "the add menu's choices are on screen before it was opened"
+        );
+
+        let at = shut.rect_of(SLOT_ADD_BUTTON).center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+        assert!(draft.add_menu_open, "clicking Add did not open the menu");
+        let open = frame(&ctx, pane, &mut draft, false, &[]);
+        let strings = open.strings();
+        let mut listed = 0;
+        for slot in &missing {
+            listed += 1;
+            assert!(
+                strings.contains(&slot.label()),
+                "the add menu does not offer {:?}. Painted: {strings:?}",
+                slot
+            );
+            for rect in open.rects_of(slot.label()) {
+                assert!(
+                    within_pane(rect, pane),
+                    "the {:?} chip is painted at x = {}..{} on a {}pt-wide pane -- this pane \
+                     does not scroll horizontally",
+                    slot,
+                    rect.left(),
+                    rect.right(),
+                    pane.x
+                );
+            }
+        }
+        assert_eq!(listed, missing.len(), "the chip loop asserted about nothing");
+        // And nothing MORE than what is missing: a menu that also offered a
+        // row already on screen would reveal what is already there.
+        assert!(
+            !strings.contains(&IdentityField::Email.label())
+                || open.rects_of(IdentityField::Email.label()).len() == 1,
+            "the add menu is offering a row the form is already showing"
+        );
+
+        // Pick one -- not the first, which a chip loop that always reports
+        // index 0 would get right by accident.
+        let chip = *open.rects_of(IdentityField::Company.label()).last().expect("the chip");
+        let _ = frame(&ctx, pane, &mut draft, false, &click(chip.center()));
+        assert!(
+            draft.shows(Slot::Identity(IdentityField::Company)),
+            "clicking the chip did not reach the draft -- it is painted and connected to nothing"
+        );
+
+        // ...and the revealed row is a real box.
+        type_under(&ctx, pane, &mut draft, IdentityField::Company.label(), "Ledgerline");
+        assert_eq!(
+            draft.identity.company, "Ledgerline",
+            "the revealed row is on screen and cannot be typed into"
+        );
+    }
+
+    /// **A row revealed and left blank does not land on the item.**
+    ///
+    /// The honest behaviour for a field the user added by accident: it
+    /// disappears again on save rather than being written as an empty value
+    /// that then shows on the read pane. "Blank" is the empty string, which
+    /// is `edited`'s rule and `EditDraft::slot_filled`'s -- three typed
+    /// spaces are three characters the user typed and are saved, exactly as
+    /// they would be in a box that was already on screen.
+    ///
+    /// Every optional row of every kind, because the write path is per field
+    /// (`edited`, `card_data`, `identity_data`, `apply_card_fields_to`,
+    /// `UriDraft::survives`) and one of them getting it wrong is invisible in
+    /// the others.
+    #[test]
+    fn a_revealed_row_left_blank_does_not_land_on_the_item() {
+        let mut checked = 0;
+        for (kind, json) in [
+            (
+                ItemKind::Login,
+                r#"{"object":"item","id":"a","name":"L","type":1,"fields":[],
+                    "login":{"username":"u","password":"p"}}"#,
+            ),
+            (
+                ItemKind::Card,
+                r#"{"object":"item","id":"b","name":"C","type":3,"fields":[],
+                    "card":{"number":"4242424242424242"}}"#,
+            ),
+            (
+                ItemKind::Identity,
+                r#"{"object":"item","id":"c","name":"I","type":4,"fields":[],
+                    "identity":{"firstName":"Anna","lastName":"Novak"}}"#,
+            ),
+        ] {
+            let item: VaultItem = serde_json::from_str(json).expect("valid item JSON");
+            let before = serde_json::to_value(&item).expect("serialises");
+            for slot in Slot::all_for(kind).into_iter().filter(|s| !s.always_shown()) {
+                checked += 1;
+                let mut draft = EditDraft::from_item(&item);
+                assert!(!draft.shows(slot), "{slot:?} is already on the form");
+                draft.reveal_slot(slot);
+                assert!(draft.shows(slot), "revealing {slot:?} did nothing");
+                // Left exactly as revealing it leaves it. `fill` is
+                // deliberately NOT called with an empty string: typing
+                // nothing is the case under test, and reaching the same state
+                // the long way round would only prove that `fill` can write
+                // `""`.
+                // Websites is the one slot that is a LIST: revealing it adds
+                // an empty ROW, so "filled" is true of the block while the
+                // box in it is blank -- and `UriDraft::survives` is what
+                // keeps that blank row off the item.
+                assert!(
+                    slot == Slot::Websites || !draft.slot_filled(slot),
+                    "the revealed {slot:?} row arrived carrying something"
+                );
+
+                let after = serde_json::to_value(draft.apply_to(&item)).expect("serialises");
+                assert_eq!(
+                    after, before,
+                    "revealing {slot:?} and leaving it blank changed the item"
+                );
+            }
+        }
+        assert!(checked >= 20, "the slot walk checked only {checked} cases");
+    }
+
+    /// **Remove takes the row away AND empties it.**
+    ///
+    /// Both halves, because a Remove that only hid the row would leave what
+    /// was typed on the draft and write it on the next Save -- a control that
+    /// removes nothing but the evidence. Driven through a real click, so the
+    /// chip is pinned as wired and not merely painted.
+    #[test]
+    fn removing_a_revealed_row_takes_it_off_the_form_and_empties_it() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = opened_with(ItemKind::Login, Slot::Totp, "JBSWY3DPEHPK3PXP");
+        assert!(draft.shows(Slot::Totp));
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let removes = painted.rects_of(SLOT_REMOVE_BUTTON);
+        assert_eq!(
+            removes.len(),
+            1,
+            "one optional row showing should draw one Remove, found {}; painted: {:?}",
+            removes.len(),
+            painted.strings()
+        );
+        let _ = frame(&ctx, pane, &mut draft, false, &click(removes[0].center()));
+
+        assert!(!draft.shows(Slot::Totp), "Remove left the row on the form");
+        assert!(draft.totp.is_empty(), "Remove hid the row and kept the seed on the draft");
+        let after = frame(&ctx, pane, &mut draft, false, &[]);
+        assert!(
+            !after.strings().contains(&TOTP_LABEL),
+            "the removed row is still painted: {:?}",
+            after.strings()
+        );
+        // ...and it is back in the Add menu, so the removal is not a
+        // one-way door.
+        assert!(draft.addable_slots(false).contains(&Slot::Totp));
+    }
+
+    /// **A floor row has no Remove.**
+    ///
+    /// A login with a Remove beside its password would be one click from a
+    /// wiped credential. Asserted by counting the chips on a form whose
+    /// optional rows are ALL hidden: whatever is drawn there would be beside
+    /// a floor row.
+    #[test]
+    fn a_floor_row_draws_no_remove_chip() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut kinds = 0;
+        for kind in CREATABLE_KINDS {
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::empty_of(kind);
+            assert!(
+                draft.shown_slots(false).iter().all(|s| s.always_shown()),
+                "{kind:?}'s empty draft is showing an optional row"
+            );
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            assert!(
+                painted.rects_of(SLOT_REMOVE_BUTTON).is_empty(),
+                "a {kind:?} showing only its floor rows draws a Remove: {:?}",
+                painted.strings()
+            );
+            kinds += 1;
+        }
+        assert_eq!(kinds, CREATABLE_KINDS.len(), "the kind loop asserted about nothing");
+    }
+
+    /// **A create form hides nothing and offers no Add.**
+    ///
+    /// The line this feature stops at, stated as a test: a form where every
+    /// box is empty by definition would show nothing at all under the sparse
+    /// rule, and its Add menu would BE the form. See [`Slot`].
+    #[test]
+    fn a_create_form_shows_every_row_and_offers_no_add_control() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut kinds = 0;
+        for kind in CREATABLE_KINDS {
+            kinds += 1;
+            let draft = EditDraft::empty_of(kind);
+            assert_eq!(
+                draft.shown_slots(true),
+                Slot::all_for(kind),
+                "a {kind:?} being created is not showing every row"
+            );
+            assert!(
+                draft.addable_slots(true).is_empty(),
+                "a {kind:?} being created has rows behind an Add control"
+            );
+
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::empty_of(kind);
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let painted = frame(&ctx, pane, &mut draft, true, &[]);
+            assert!(
+                !painted.strings().contains(&SLOT_ADD_BUTTON),
+                "a {kind:?} being created draws the Add control"
+            );
+        }
+        assert_eq!(kinds, CREATABLE_KINDS.len(), "the kind loop asserted about nothing");
+    }
+
+    /// **A login with no website reaches one through the Add menu**, which is
+    /// the whole of the zero case the note test above stops short of.
+    #[test]
+    fn a_login_with_no_website_offers_one_through_the_add_menu() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(0);
+        let mut draft = EditDraft::from_item(&item);
+        assert!(draft.uris.is_empty(), "the fixture carries a website");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let shut = frame(&ctx, pane, &mut draft, false, &[]);
+        assert!(
+            !shut.strings().contains(&WEBSITE_ADD_BUTTON),
+            "a login with no website is drawing the websites block"
+        );
+
+        let _ = frame(&ctx, pane, &mut draft, false, &click(shut.rect_of(SLOT_ADD_BUTTON).center()));
+        let open = frame(&ctx, pane, &mut draft, false, &[]);
+        let chip = *open.rects_of(WEBSITE_LABEL).last().expect("a Website chip");
+        let _ = frame(&ctx, pane, &mut draft, false, &click(chip.center()));
+
+        // Revealed WITH a box to type in, not just a heading.
+        assert_eq!(draft.uris.len(), 1, "the revealed block has no row to type into");
+        let after = frame(&ctx, pane, &mut draft, false, &[]);
+        assert_inside("the websites block's own Add", WEBSITE_ADD_BUTTON, pane, &after);
+
+        // ...and taking that row away takes the block with it.
+        let remove = after.rect_of(WEBSITE_REMOVE_BUTTON).center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(remove));
+        assert!(!draft.shows(Slot::Websites), "the emptied websites block is still on the form");
+        assert!(draft.addable_slots(false).contains(&Slot::Websites));
+    }
+
+    /// **The open Add menu is reachable at the app's minimum window size, at
+    /// its widest.**
+    ///
+    /// An identity showing only its floor rows has sixteen chips behind the
+    /// control, which is the longest that list gets. The chip row is a
+    /// `horizontal_wrapped` precisely so its width floor is one widest chip
+    /// rather than a sum -- an unwrapped row would push the card past the
+    /// pane and inflate every `available_width()` measured after it
+    /// (`aae9429`). This is the measurement that says so.
+    #[test]
+    fn every_add_menu_chip_is_reachable_at_the_apps_minimum_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Identity);
+        draft.add_menu_open = true;
+        let chips = draft.addable_slots(false);
+        assert_eq!(chips.len(), 16, "an empty identity should have sixteen chips");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let mut checked = 0;
+        for slot in &chips {
+            checked += 1;
+            assert_inside(&format!("the {:?} chip", slot), slot.label(), pane, &painted);
+        }
+        assert_eq!(checked, 16, "the chip loop asserted about nothing");
+        assert_inside("the add menu's hint", SLOT_ADD_HINT, pane, &painted);
+
+        // ...and the card did not grow to hold them. Read off the Name box's
+        // own caption, which is above the menu and therefore laid out against
+        // whatever width the rows below asked for.
+        let shut = {
+            let ctx = styled_context(pane);
+            let mut shut_draft = EditDraft::empty_of(ItemKind::Identity);
+            let _ = frame(&ctx, pane, &mut shut_draft, false, &[]);
+            frame(&ctx, pane, &mut shut_draft, false, &[])
+        };
+        assert_eq!(
+            painted.rect_of("Name").left(),
+            shut.rect_of("Name").left(),
+            "opening the add menu moved the card, so the chip row is widening it"
+        );
+    }
+
+    /// **...and at the minimum window HEIGHT**, which is a different claim:
+    /// the width test draws every chip on an uncullable pane, and a menu
+    /// whose last chips sat below the last scroll position would satisfy it
+    /// and still be unclickable.
+    #[test]
+    fn every_add_menu_chip_is_reachable_at_the_apps_minimum_height() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Identity);
+        draft.add_menu_open = true;
+        let chips = draft.addable_slots(false);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let unscrolled = frame(&ctx, pane, &mut draft, false, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        let last = chips.last().expect("chips").label();
+        assert!(
+            !unscrolled.rects_of(last).iter().any(|r| bounds.contains_rect(*r)),
+            "the whole open menu already fits a {}x{} pane, so this test is not exercising \
+             scrolling at all",
+            pane.x,
+            pane.y
+        );
+
+        let mut reached = 0;
+        for slot in &chips {
+            let after = scroll_to_reveal(&ctx, pane, &mut draft, slot.label());
+            assert_inside(&format!("the {:?} chip", slot), slot.label(), pane, &after);
+            reached += 1;
+        }
+        assert_eq!(reached, 16, "the chip walk reached {reached} chips, not 16");
+    }
+
+    /// **Nothing on the sparse form's tallest state is painted outside the
+    /// minimum pane.**
+    ///
+    /// The companion to
+    /// [`nothing_on_the_tallest_edit_form_is_painted_outside_the_minimum_pane`],
+    /// which measures a login being created. The shape this feature adds is a
+    /// different one -- an identity with every row showing, sixteen Remove
+    /// chips beside their captions and the add menu open under them -- and
+    /// every one of those is a control that can leave the pane sideways
+    /// without moving anything the other test looks at.
+    #[test]
+    fn nothing_on_the_widest_sparse_form_is_painted_outside_the_minimum_pane() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Identity);
+        for field in IdentityField::ALL {
+            fill(&mut draft, Slot::Identity(field), "filled");
+        }
+        let mut draft = draft.reveal_what_is_filled();
+        draft.add_menu_open = true;
+        assert_eq!(draft.shown_slots(false).len(), 18, "not every identity row is showing");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        assert!(!painted.glyphs.is_empty(), "the form painted no glyphs at all");
+        for (text, ink) in &painted.glyphs {
+            assert!(
+                within_pane(*ink, pane),
+                "{text:?} lays glyphs over x = {}..{} on a {}pt-wide pane",
+                ink.left(),
+                ink.right(),
+                pane.x
+            );
+        }
+        assert!(!painted.rect_ink.is_empty(), "the form painted no filled boxes at all");
+        for (ink, fill) in &painted.rect_ink {
+            assert!(
+                within_pane(*ink, pane),
+                "a {fill:?} box lays ink over x = {}..{} on a {}pt-wide pane",
+                ink.left(),
+                ink.right(),
+                pane.x
+            );
+        }
+    }
+
+    /// **Sixteen Remove chips do not push the card out.**
+    ///
+    /// The chips sit beside their captions in a `horizontal_wrapped`, which
+    /// is what stops a long caption plus a chip widening the card. Measured
+    /// against the same form with the chips absent -- a create, where nothing
+    /// is removable -- so this is a comparison and not a magic number.
+    #[test]
+    fn the_remove_chips_do_not_widen_the_card() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let with = {
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::empty_of(ItemKind::Identity);
+            for field in IdentityField::ALL {
+                fill(&mut draft, Slot::Identity(field), "filled");
+            }
+            let mut draft = draft.reveal_what_is_filled();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            frame(&ctx, pane, &mut draft, false, &[])
+        };
+        assert_eq!(
+            with.rects_of(SLOT_REMOVE_BUTTON).len(),
+            16,
+            "the fixture is not drawing the sixteen chips this test is about"
+        );
+        let without = {
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::empty_of(ItemKind::Identity);
+            for field in IdentityField::ALL {
+                fill(&mut draft, Slot::Identity(field), "filled");
+            }
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            frame(&ctx, pane, &mut draft, true, &[])
+        };
+        assert!(without.rects_of(SLOT_REMOVE_BUTTON).is_empty(), "the create form drew chips");
+        assert_eq!(
+            with.rect_of("Name").left(),
+            without.rect_of("Name").left(),
+            "the Remove chips widened the card"
+        );
     }
 
     /// **The controls on the two assertions above.**
@@ -15403,5 +16844,334 @@ mod website_tests {
         assert_eq!(website_label(0), WEBSITE_LABEL);
         assert_eq!(website_label(1), "Website 2");
         assert_eq!(website_label(2), "Website 3");
+    }
+}
+
+/// **The sparse form's decisions**, asked of the pure functions rather than
+/// of a painted frame: which rows a kind has, which of them are floor, what
+/// revealing and hiding do, and what none of it does to "is this draft
+/// dirty".
+///
+/// `edit_pane_layout_tests` asks the same questions of real frames. Both are
+/// needed: these say the rule is right, those say the form obeys it.
+#[cfg(test)]
+mod sparse_form_tests {
+    use super::*;
+
+    /// **The form's row list and the field enumeration are the same list, in
+    /// the same order.**
+    ///
+    /// `identity_rows` is the one place that pairs a field with its box and
+    /// `IdentityField::ALL` is the one place that orders them; a field added
+    /// to the enum and forgotten in the row list would be a row the form
+    /// never draws and the Add menu happily offers.
+    #[test]
+    fn the_identity_rows_are_exactly_the_identity_fields_in_order() {
+        let mut draft = IdentityDraft::default();
+        let rows: Vec<IdentityField> =
+            identity_rows(&mut draft).into_iter().map(|(field, _)| field).collect();
+        assert_eq!(rows, IdentityField::ALL.to_vec());
+    }
+
+    /// **Each field's reader really reads that field's box.**
+    ///
+    /// `IdentityField::value` is a second match over the eighteen fields --
+    /// the borrow checker will not allow one -- and the failure it can have
+    /// is silent: two arms swapped read each other's box, and every count and
+    /// every order assertion above stays green. This writes a distinct marker
+    /// through the ROW list and reads it back through the value list.
+    #[test]
+    fn every_identity_field_reads_back_the_box_it_writes() {
+        let mut draft = IdentityDraft::default();
+        for (i, (_, box_)) in identity_rows(&mut draft).into_iter().enumerate() {
+            *box_ = format!("value-{i}");
+        }
+        let mut checked = 0;
+        for (i, field) in IdentityField::ALL.into_iter().enumerate() {
+            assert_eq!(
+                field.value(&draft),
+                format!("value-{i}"),
+                "{field:?} reads the wrong box"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 18, "the field walk checked {checked} fields, not 18");
+    }
+
+    /// **Every slot belongs to exactly one kind**, so a set of them is
+    /// meaningful without carrying the kind alongside it -- which is what
+    /// lets `EditDraft::revealed` be a bare set and `set_kind` clear it
+    /// rather than filter it.
+    #[test]
+    fn no_two_kinds_share_a_slot() {
+        let mut seen: Vec<Slot> = Vec::new();
+        for kind in CREATABLE_KINDS {
+            for slot in Slot::all_for(kind) {
+                assert!(!seen.contains(&slot), "{slot:?} belongs to two kinds");
+                seen.push(slot);
+            }
+        }
+        assert_eq!(seen.len(), 4 + 8 + 18 + 1 + 3, "the slot list changed size");
+    }
+
+    /// **Every slot has a caption, and no two rows of one kind share one.**
+    ///
+    /// The Add menu lists rows BY NAME, so two rows of the same kind called
+    /// the same thing would be a menu with two identical chips and no way to
+    /// tell which one arrives.
+    #[test]
+    fn a_kinds_slots_all_have_distinct_labels() {
+        for kind in CREATABLE_KINDS {
+            let mut labels: Vec<&str> = Slot::all_for(kind).into_iter().map(Slot::label).collect();
+            let before = labels.len();
+            labels.sort_unstable();
+            labels.dedup();
+            assert_eq!(labels.len(), before, "{kind:?} has two rows with one caption");
+            assert!(labels.iter().all(|l| !l.is_empty()), "{kind:?} has an unnamed row");
+        }
+    }
+
+    /// **The floor, stated as a test rather than only as prose.**
+    ///
+    /// This is the answer to "what is never hidden", per kind, and it is
+    /// spelled out here so that changing it is a deliberate edit to a list of
+    /// expectations and not a quiet consequence of touching a `match` arm.
+    #[test]
+    fn each_kinds_floor_is_the_rows_it_would_be_strange_without() {
+        let floor = |kind: ItemKind| -> Vec<&'static str> {
+            Slot::all_for(kind).into_iter().filter(|s| s.always_shown()).map(Slot::label).collect()
+        };
+        assert_eq!(floor(ItemKind::Login), vec!["Username", "Password"]);
+        assert_eq!(floor(ItemKind::Card), vec!["Brand", "Number"]);
+        assert_eq!(floor(ItemKind::Identity), vec!["First name", "Last name"]);
+        assert_eq!(floor(ItemKind::SecureNote), vec!["Note"]);
+        assert_eq!(
+            floor(ItemKind::SshKey),
+            vec!["Private key", "Public key", "Fingerprint"],
+            "an SSH key is create-only, where nothing is hidden anyway"
+        );
+        assert!(floor(ItemKind::Unknown(9)).is_empty());
+    }
+
+    /// **A shown row and an addable row are the two halves of one list.**
+    ///
+    /// Neither can gain or lose a row without the other losing or gaining it,
+    /// which is what makes "the menu offers what is missing" true by
+    /// construction rather than by a second walk. Asked in several states,
+    /// because the interesting one is after a reveal.
+    #[test]
+    fn the_shown_and_addable_rows_partition_the_kinds_rows() {
+        for kind in CREATABLE_KINDS {
+            for creating in [true, false] {
+                let mut draft = EditDraft::empty_of(kind);
+                for stage in 0..3 {
+                    if stage > 0 {
+                        if let Some(slot) = draft.addable_slots(false).first().copied() {
+                            draft.reveal_slot(slot);
+                        }
+                    }
+                    let mut both = draft.shown_slots(creating);
+                    both.extend(draft.addable_slots(creating));
+                    both.sort_unstable();
+                    let mut all = Slot::all_for(kind);
+                    all.sort_unstable();
+                    assert_eq!(
+                        both, all,
+                        "{kind:?} (creating: {creating}, stage {stage}) has a row that is \
+                         neither shown nor addable, or is both"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Revealing a row the kind does not have does nothing.**
+    ///
+    /// The backstop under the menu: `addable_slots` offers this kind's rows
+    /// and nothing else, and this is what happens if something ever reaches
+    /// past it.
+    #[test]
+    fn revealing_another_kinds_row_is_refused() {
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.reveal_slot(Slot::Identity(IdentityField::Ssn));
+        assert!(!draft.shows(Slot::Identity(IdentityField::Ssn)));
+        assert_eq!(draft.shown_slots(false), vec![Slot::Username, Slot::Password]);
+    }
+
+    /// **Hiding a row empties it, and hiding a floor row does neither.**
+    ///
+    /// The first is what stops Remove being a control that removes the
+    /// evidence and saves the value anyway. The second is why a login's
+    /// password cannot be wiped by a call this form does not make: the rule
+    /// lives on the draft, not only in the drawing.
+    #[test]
+    fn hiding_a_row_empties_it_and_a_floor_row_refuses() {
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.reveal_slot(Slot::Totp);
+        draft.totp = "SEED".into();
+        draft.password = "hunter2".into();
+
+        draft.hide_slot(Slot::Totp);
+        assert!(!draft.shows(Slot::Totp));
+        assert!(draft.totp.is_empty(), "hiding the seed's row left the seed on the draft");
+
+        draft.hide_slot(Slot::Password);
+        assert!(draft.shows(Slot::Password), "the password's row was taken off the form");
+        assert_eq!(draft.password, "hunter2", "hiding a floor row wiped it");
+    }
+
+    /// **Every optional row's Remove really empties its own box** -- and no
+    /// other.
+    ///
+    /// `hide_slot`'s clearing arm is a per-slot `match`, so the failure it
+    /// can have is one arm clearing the wrong field, which no count or
+    /// presence assertion can see. Each slot is filled with a marker of its
+    /// own, hidden, and everything else is checked to have survived.
+    #[test]
+    fn hiding_one_row_empties_that_row_and_no_other() {
+        let mut cases = 0;
+        for kind in CREATABLE_KINDS {
+            let optional: Vec<Slot> =
+                Slot::all_for(kind).into_iter().filter(|s| !s.always_shown()).collect();
+            for target in &optional {
+                cases += 1;
+                let mut draft = EditDraft::empty_of(kind);
+                for slot in &optional {
+                    fill_slot(&mut draft, *slot, "marker");
+                }
+                let mut draft = draft.reveal_what_is_filled();
+                draft.hide_slot(*target);
+
+                assert!(!draft.slot_filled(*target), "hiding {target:?} did not empty it");
+                for slot in optional.iter().filter(|s| *s != target) {
+                    assert!(
+                        draft.slot_filled(*slot),
+                        "hiding {target:?} also emptied {slot:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(cases, 2 + 6 + 16, "the slot walk covered {cases} rows");
+    }
+
+    /// [`edit_pane_layout_tests::fill`]'s twin, kept here so this module does
+    /// not depend on that one. Exhaustive for the same reason.
+    fn fill_slot(draft: &mut EditDraft, slot: Slot, value: &str) {
+        let set = |s: &mut String| *s = value.to_string();
+        match slot {
+            Slot::Username => set(&mut draft.username),
+            Slot::Password => set(&mut draft.password),
+            Slot::Totp => set(&mut draft.totp),
+            Slot::Websites => {
+                let mut entry = UriDraft::new();
+                entry.uri = value.to_string();
+                draft.uris.push(entry);
+            }
+            Slot::CardholderName => set(&mut draft.card.cardholder_name),
+            Slot::CardBrand => set(&mut draft.card.brand),
+            Slot::CardNumber => set(&mut draft.card.number),
+            Slot::CardExpMonth => set(&mut draft.card.exp_month),
+            Slot::CardExpYear => set(&mut draft.card.exp_year),
+            Slot::CardCode => set(&mut draft.card.code),
+            Slot::CardBank => set(&mut draft.card.bank_domain),
+            Slot::CardBillingZip => set(&mut draft.card.billing_zip),
+            Slot::Identity(field) => {
+                let row = identity_rows(&mut draft.identity).into_iter().find(|(f, _)| *f == field);
+                if let Some((_, box_)) = row {
+                    set(box_);
+                }
+            }
+            Slot::Note => set(&mut draft.note_body),
+            Slot::SshPrivateKey => set(&mut draft.ssh_key.private_key),
+            Slot::SshPublicKey => set(&mut draft.ssh_key.public_key),
+            Slot::SshFingerprint => set(&mut draft.ssh_key.key_fingerprint),
+        }
+    }
+
+    /// **Opening the menu and revealing a row are not edits.**
+    ///
+    /// The discard confirmation exists so a Cancel cannot lose typing; a
+    /// confirmation that fires when there is nothing to lose teaches the user
+    /// to click through it. Revealing an EMPTY row loses nothing -- an empty
+    /// box is an absent value, so the save it produces is the same one.
+    ///
+    /// Removing a row that had something in it IS an edit, because the value
+    /// goes with it, and the last assertion is what keeps the three apart.
+    #[test]
+    fn opening_the_menu_and_revealing_a_row_leave_the_draft_clean() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"a","name":"L","type":1,"fields":[],
+                "login":{"username":"u","password":"p","totp":"SEED"}}"#,
+        )
+        .expect("valid item JSON");
+        assert!(!EditDraft::from_item(&item).is_dirty(), "the fixture opens dirty");
+
+        let mut opened = EditDraft::from_item(&item);
+        opened.add_menu_open = true;
+        assert!(!opened.is_dirty(), "opening the add menu counted as an edit");
+
+        // A card, whose optional rows are all plain boxes -- revealing one
+        // puts an empty string on a form that already held an empty string,
+        // so there is nothing to lose and nothing to confirm.
+        let card: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"b","name":"C","type":3,"fields":[],
+                "card":{"number":"4242424242424242"}}"#,
+        )
+        .expect("valid item JSON");
+        let mut revealed = EditDraft::from_item(&card);
+        for slot in revealed.addable_slots(false) {
+            revealed.reveal_slot(slot);
+        }
+        assert!(!revealed.is_dirty(), "revealing every empty row on a card counted as an edit");
+
+        // **The websites block is the exception, and deliberately so**:
+        // revealing it puts an empty ROW on the list, and an empty row is a
+        // thing on the form a Cancel would take away. `content_digest`
+        // counts the rows for that reason.
+        let mut website = EditDraft::from_item(&item);
+        website.reveal_slot(Slot::Websites);
+        assert!(website.is_dirty(), "the added website row is not counted as a change");
+
+        // ...and removing a row that HAD something in it is an edit, because
+        // the value goes with it. This is what keeps the three apart.
+        let mut removed = EditDraft::from_item(&item);
+        removed.hide_slot(Slot::Totp);
+        assert!(removed.is_dirty(), "removing a filled row is not an edit");
+        removed.reveal_slot(Slot::Totp);
+        assert!(
+            removed.is_dirty(),
+            "removing a filled row and putting the empty one back said nothing was lost -- the \
+             seed is gone and Cancel would not ask"
+        );
+    }
+
+    /// **A save from a sparse form writes what the item already had.**
+    ///
+    /// The rows behind the Add control hold empty strings, and `edited`'s
+    /// rule is that a blank draft over an existing value means "cleared".
+    /// If the hidden rows were ever populated from anything other than the
+    /// item -- or if `from_item` stopped populating them -- every hidden
+    /// field on the item would be wiped by an edit to the name. This is the
+    /// standing round-trip guarantee asked of the form's new shape.
+    #[test]
+    fn an_edit_through_the_sparse_form_leaves_the_hidden_fields_alone() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"i","name":"Anna","type":4,"fields":[],
+                "identity":{"firstName":"Anna","lastName":"Novak","ssn":"000-00-0000",
+                            "passportNumber":"P1","country":"NL","futureKey":{"deep":true}}}"#,
+        )
+        .expect("valid item JSON");
+        let before = serde_json::to_value(&item).expect("serialises");
+
+        let mut draft = EditDraft::from_item(&item);
+        // Every filled row IS on the form -- the hidden ones are the empty
+        // ones -- so this is a claim about `from_item` populating what it
+        // shows and about `apply_to` writing it back.
+        assert_eq!(draft.shown_slots(false).len(), 5, "the fixture's five filled rows");
+        draft.name = "Anna Novak".into();
+
+        let after = serde_json::to_value(draft.apply_to(&item)).expect("serialises");
+        assert_eq!(after["identity"], before["identity"], "a rename disturbed the identity");
+        assert_eq!(after["name"], serde_json::json!("Anna Novak"));
     }
 }
