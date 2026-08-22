@@ -5110,13 +5110,21 @@ mod source_pins {
         // a whole-crate map with a file on it, so a fourth file that starts
         // naming any of them fails here and says which file.
         //
-        // `main.rs`'s two `spawn_sync` are the TRAY's own unrelated
-        // `fn spawn_sync(..)` and its one call; they are pinned, not
+        // `main.rs`'s three `spawn_sync` are the TRAY's own unrelated
+        // `fn spawn_sync(..)` and its TWO calls; they are pinned, not
         // exempted, so they cannot grow either.
+        //
+        // It was two until the cache-first startup arm landed. A login that
+        // restores an encrypted copy from disk reaches the tray without
+        // waiting for `bw serve`, so the backend is started and reconciled
+        // *behind* the arm rather than above it -- a second call, on a path
+        // that has no session to hand the window because no window is open
+        // on it. The count moved with a reason; it is still exact, and a
+        // fourth still fails.
         for (needle, expected) in [
             (
                 concat!("spawn_", "sync"),
-                vec![("main.rs", 2usize), ("vault_window/mod.rs", 3)],
+                vec![("main.rs", 3usize), ("vault_window/mod.rs", 3)],
             ),
             (concat!("env.", "sync"), vec![("vault_window/mod.rs", 1)]),
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),
