@@ -1971,9 +1971,22 @@ pub trait PromptPresenter {
     /// A separate method rather than a flag on [`Self::show_no_match`], for the
     /// reason [`handle_no_match`] is separate from [`handle_match`]: the two
     /// cards make opposite claims about the vault, and a boolean that chose
-    /// between them is a boolean something can pass wrongly. Neither returns
-    /// anything, and neither takes an item.
-    fn show_locked(&self, label: &str, position: Option<(f32, f32)>);
+    /// between them is a boolean something can pass wrongly.
+    ///
+    /// **It answers now, and it still takes no item and returns none.** 3b's
+    /// *Unlock* button has a destination -- [`crate::unlock_prompt`] -- and
+    /// the route to it is this return value, exactly as
+    /// [`Self::show_no_match`]'s is the route to the vault window. What
+    /// [`overlay_ui::LockedAnswer`] can say is "the user asked to unlock" and
+    /// nothing else: it names no item, authorises no fill, and carries no
+    /// password. The card is still shown for a vault this process cannot read,
+    /// so a signature that could carry an id would be one nothing could
+    /// honestly fill.
+    fn show_locked(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::LockedAnswer;
 }
 
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
@@ -2014,9 +2027,9 @@ pub struct FnPresenter {
             &crate::vault_bridge::GenerateRequest,
         ) -> Result<zeroize::Zeroizing<String>, String>,
     ) -> Option<zeroize::Zeroizing<String>>,
-    /// Asked to put design 3b on screen. Answers nothing; see
-    /// [`PromptPresenter::show_locked`].
-    pub show_locked: fn(&str, Option<(f32, f32)>),
+    /// Asked to put design 3b on screen. Answers whether *Unlock* was clicked;
+    /// see [`PromptPresenter::show_locked`].
+    pub show_locked: fn(&str, Option<(f32, f32)>) -> overlay_ui::LockedAnswer,
 }
 
 impl PromptPresenter for FnPresenter {
@@ -2061,7 +2074,11 @@ impl PromptPresenter for FnPresenter {
         (self.show_generate)(label, position, generate)
     }
 
-    fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
+    fn show_locked(
+        &self,
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::LockedAnswer {
         (self.show_locked)(label, position)
     }
 }
@@ -2429,10 +2446,19 @@ pub fn handle_no_match(
     NoMatchFollowUp::Nothing
 }
 
-/// **What the caller must do after design 3a closes**, and the only thing it
-/// can be asked to do.
+/// **What the caller must do after one of the two unmatched-window cards
+/// closes**, and the only things it can be asked to do.
 ///
-/// Two variants and not a `bool` or an `Option<String>`, for the reason
+/// **The name is 3a's and the type is now both cards'.** It was written when
+/// 3a was the only card that could ask for anything at all; 3b's *Unlock*
+/// button gave the locked card its first request, and it travels this same
+/// channel because there is only one -- `main::process_foreground_event`
+/// returns one value to `run`'s loop, and a second parallel return would be
+/// two answers about one event that could disagree. Renaming it would touch
+/// every call site for no behavioural difference; what matters is that this
+/// list is exhaustive over what the overlay may ask `main` for, and it is.
+///
+/// Three variants and not a `bool` or an `Option<String>`, for the reason
 /// [`overlay_ui::NoMatchAnswer`] is two variants: the value crosses
 /// `main::process_foreground_event` and lands in `run`'s loop, and "there is a
 /// string" is a worse way to say "open a window" than saying it.
@@ -2454,6 +2480,18 @@ pub enum NoMatchFollowUp {
     /// the user is handed the query they were just looking at rather than an
     /// unfiltered list of everything.
     SearchVault(String),
+    /// 3b's *Unlock* was clicked. Put [`crate::unlock_prompt`] on screen, and
+    /// if it answers with a session token, resettle the session and dispatch
+    /// this window again -- which is how the fill the user asked for resumes.
+    ///
+    /// **It carries nothing**, and that is not an oversight. The window this
+    /// is about is the one `run` just handed to `process_foreground_event`, so
+    /// the caller already has it; a copy in here would be a second description
+    /// of one window that could disagree with the first -- the exact defect
+    /// `handle_match`'s "take one `ForegroundEvent`" rule exists for. In
+    /// particular it carries no password, no session token and no item id: it
+    /// is a request to ask, not the answer to anything.
+    Unlock,
 }
 
 /// [`overlay_ui::NoMatchAnswer`] as a [`NoMatchFollowUp`], **as a pure
@@ -2511,6 +2549,25 @@ pub fn no_match_follow_up(
     }
 }
 
+/// [`overlay_ui::LockedAnswer`] as a [`NoMatchFollowUp`], **as a pure
+/// function**.
+///
+/// [`no_match_follow_up`]'s sibling, and it exists for the same reason: the
+/// only production caller is [`handle_locked`], which raises a real
+/// always-on-top window and so is the one thing on that path no test in this
+/// crate may execute.
+///
+/// It takes no app name, where [`no_match_follow_up`] takes one. There is
+/// nothing to name: an unlock is about *Deskwarden*, not about the app the
+/// card was shown over, and a query string threaded through here would be a
+/// string this follow-up has no use for and something later could act on.
+pub fn locked_follow_up(answer: overlay_ui::LockedAnswer) -> NoMatchFollowUp {
+    match answer {
+        overlay_ui::LockedAnswer::Unlock => NoMatchFollowUp::Unlock,
+        overlay_ui::LockedAnswer::Dismissed => NoMatchFollowUp::Nothing,
+    }
+}
+
 /// What a [`SaveOutcome`] is written to the log as.
 ///
 /// **A function, so that "the log line never carries the password" is a claim
@@ -2547,26 +2604,39 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 /// fact `no_match_arm` records, and it is stronger here: this path runs
 /// precisely when the vault cannot be read, so a parameter that could carry an
 /// item would be a parameter nothing could honestly fill.
+/// **It answers what the card answered, and nothing more.** The one thing 3b
+/// can now ask for is the master-password prompt, and this function neither
+/// opens it nor decides whether it may be opened: it forwards
+/// [`overlay_ui::LockedAnswer`] to `main::process_foreground_event`, which
+/// forwards it to `run`'s loop -- the one place in this process that owns the
+/// session, the backend child and the tray, and therefore the only place that
+/// may resettle any of them. Opened here instead, the unlock would be a second
+/// teardown-and-repopulate path beside `main::resettle_session`, which is the
+/// defect that function's doc exists to prevent.
 pub fn locked_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
-) {
+) -> overlay_ui::LockedAnswer {
     let position = presenter.position(window.hwnd, overlay_ui::LOCKED_ROWS);
-    presenter.show_locked(window_label(&window.exe_name, &window.title), position);
+    presenter.show_locked(window_label(&window.exe_name, &window.title), position)
 }
 
 /// Dispatches a freshly foregrounded window that asks for a password while the
 /// vault cannot be read: design 3b.
 ///
 /// [`handle_no_match`]'s sibling, and separate for the reason that one is
-/// separate from [`handle_match`]. It returns nothing, so nothing is armed;
-/// it is handed no cache, no injector, no `FillStats` and no [`Reprompt`], so
-/// nothing it holds can type, count or unlock anything.
+/// separate from [`handle_match`]. **Nothing is armed**: it is handed no
+/// cache, no injector, no `FillStats` and no [`Reprompt`], so nothing it holds
+/// can type, count or unlock anything -- and that stays true now that it
+/// answers, because what it answers is a request rather than an authorisation.
+/// [`overlay_ui::LockedAnswer::Unlock`] names no item and carries no password;
+/// the caller that acts on it is `run`'s loop, and what it does there is the
+/// one resettle sequence this crate has.
 ///
 /// Only the real presenter is named on this line; every decision is
 /// [`locked_arm`]'s, which a test drives with a recorder.
-pub fn handle_locked(window: &crate::window_watch::ForegroundEvent) {
-    locked_arm(&REAL_OVERLAY, window);
+pub fn handle_locked(window: &crate::window_watch::ForegroundEvent) -> NoMatchFollowUp {
+    locked_follow_up(locked_arm(&REAL_OVERLAY, window))
 }
 
 /// [`prompt_arm`] with the vault lookup in front of it, so that **the item is
@@ -2936,6 +3006,11 @@ mod tests {
         /// The label and placement each `show_locked` was handed -- design
         /// 3b's own log, kept apart from both of the others.
         locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
+        /// What `show_locked` answers: whether the user pressed *Unlock*.
+        /// Defaults to [`overlay_ui::LockedAnswer::Dismissed`], so every test
+        /// that does not name it gets the card being closed rather than a
+        /// master-password prompt being asked for.
+        locked_answer: overlay_ui::LockedAnswer,
         /// The label and placement each `show_save_login` was handed -- design
         /// 3c's own log, kept apart from all three of the others.
         save_login_shown: std::cell::RefCell<Vec<NoMatchShown>>,
@@ -3024,10 +3099,15 @@ mod tests {
         /// claims about the vault, so a recorder that could not tell them
         /// apart would let either satisfy a test written about the other --
         /// which is exactly the defect this state exists to correct.
-        fn show_locked(&self, label: &str, position: Option<(f32, f32)>) {
+        fn show_locked(
+            &self,
+            label: &str,
+            position: Option<(f32, f32)>,
+        ) -> overlay_ui::LockedAnswer {
             self.locked_shown
                 .borrow_mut()
                 .push((label.to_string(), position));
+            self.locked_answer
         }
     }
 
@@ -3182,6 +3262,72 @@ mod tests {
             presenter.shown.borrow().is_empty(),
             "the matched card was raised for a vault that cannot be read at all"
         );
+    }
+
+    /// **What the locked card answered comes back out of [`locked_arm`]**, and
+    /// a dismissal does not.
+    ///
+    /// The sibling of the placement test above, and the half that is new: 3b
+    /// used to answer nothing at all, so the whole of "the *Unlock* button
+    /// reaches anything" lives in this return value. Dropped -- an arm that
+    /// showed the card and then answered `Dismissed` -- the button is inert,
+    /// which is the failure `overlay_ui::SEARCH_VAULT_LABEL`'s doc calls worse
+    /// than not drawing it at all.
+    ///
+    /// Both directions, from the same recorder, so the assertion cannot be
+    /// satisfied by an arm that answers `Unlock` unconditionally: that would
+    /// put a modal master-password prompt up every time a user dismissed the
+    /// card.
+    #[test]
+    fn the_locked_arm_answers_what_the_card_answered() {
+        let w = window("AtlasLicence.exe", "Atlas Licence");
+
+        let pressed = RecordingPresenter {
+            locked_answer: overlay_ui::LockedAnswer::Unlock,
+            ..Default::default()
+        };
+        assert_eq!(
+            locked_arm(&pressed, &w),
+            overlay_ui::LockedAnswer::Unlock,
+            "pressing Unlock on 3b answered a dismissal, so the button does nothing and the \
+             user is left with the ~95 MB window the card exists to spare them"
+        );
+
+        let dismissed = RecordingPresenter::default();
+        assert_eq!(
+            locked_arm(&dismissed, &w),
+            overlay_ui::LockedAnswer::Dismissed,
+            "dismissing 3b asked for a master-password prompt. Closing a card the app put on \
+             screen unprompted must cost the user nothing at all"
+        );
+    }
+
+    /// The join between what 3b answered and what `main` does about it.
+    ///
+    /// [`no_match_follow_up`]'s table has the same shape and the same reason:
+    /// the only production caller is [`handle_locked`], which raises a real
+    /// window, so this mapping is the one part of that line a test can read. A
+    /// `Nothing` for `Unlock` is an inert button; an `Unlock` for `Dismissed`
+    /// is a master-password prompt for a card the user just closed.
+    #[test]
+    fn a_dismissed_locked_card_asks_for_no_unlock() {
+        assert_eq!(
+            locked_follow_up(overlay_ui::LockedAnswer::Unlock),
+            NoMatchFollowUp::Unlock
+        );
+        assert_eq!(
+            locked_follow_up(overlay_ui::LockedAnswer::Dismissed),
+            NoMatchFollowUp::Nothing
+        );
+        // And it never asks for the vault WINDOW, which is the other door
+        // `main` has and the one that costs what this path avoids.
+        for answer in [overlay_ui::LockedAnswer::Unlock, overlay_ui::LockedAnswer::Dismissed] {
+            assert!(
+                !matches!(locked_follow_up(answer), NoMatchFollowUp::SearchVault(_)),
+                "the locked card asked to search a vault it cannot read, which opens a window \
+                 onto an empty list that reads as `nothing found`"
+            );
+        }
     }
 
     /// **Only *Search vault* asks for a window**, and it asks with a query.
@@ -3598,8 +3744,13 @@ mod tests {
 
         /// And so does design 3b's, for the same reason: it is the only
         /// string that card shows about the window.
-        fn show_locked(&self, label: &str, _position: Option<(f32, f32)>) {
+        fn show_locked(
+            &self,
+            label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::LockedAnswer {
             self.seen.borrow_mut().push(label.to_string());
+            overlay_ui::LockedAnswer::Dismissed
         }
     }
 
@@ -3719,8 +3870,13 @@ mod tests {
             None
         }
 
-        fn show_locked(&self, _label: &str, _position: Option<(f32, f32)>) {
+        fn show_locked(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::LockedAnswer {
             self.log.borrow_mut().push("locked card shown");
+            overlay_ui::LockedAnswer::Dismissed
         }
     }
 
@@ -3898,11 +4054,15 @@ mod tests {
     static LOCKED_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn recording_show_locked(label: &str, position: Option<(f32, f32)>) {
+    fn recording_show_locked(
+        label: &str,
+        position: Option<(f32, f32)>,
+    ) -> overlay_ui::LockedAnswer {
         LOCKED_FORWARDED
             .lock()
             .unwrap()
             .push((label.to_string(), position));
+        overlay_ui::LockedAnswer::Dismissed
     }
 
     /// The forwarding is the only code between [`REAL_OVERLAY`]'s named
@@ -8174,7 +8334,11 @@ mod generate_flow_tests {
                 .map(|p| zeroize::Zeroizing::new(p.to_string()))
         }
 
-        fn show_locked(&self, _label: &str, _position: Option<(f32, f32)>) {
+        fn show_locked(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> overlay_ui::LockedAnswer {
             unreachable!("the 3d flow never opens 3b")
         }
     }

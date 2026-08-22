@@ -10,6 +10,51 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### A locked vault can be unlocked from the card that says it is locked
+
+Focus a password box while Deskwarden is locked and a small card appears
+saying so. Until now that was all it did: to unlock, you had to open
+Deskwarden's window, type your master password, close it again, and go back to
+what you were doing. The card told you what was wrong and gave you no way to
+fix it.
+
+The card now has an **Unlock** button. Pressing it opens a small
+master-password prompt -- not the app's window -- and a correct password
+unlocks the vault, brings the connection to Bitwarden back up, and then looks
+at the window you were in front of again. If it has a saved login, you get the
+same offer to fill it that you would have had if the vault had been open all
+along.
+
+The prompt is deliberately small. Deskwarden's own window is an accelerated
+graphics window: showing one costs about 95 MB that Windows does not give back
+when it closes, and about 4 MB more every time it is opened and closed again.
+The unlock prompt costs about 1 MB while it is on screen and nothing after it,
+because it is a plain Windows dialog with no graphics stack behind it. It is
+excluded from screen capture and screen sharing, as the app's own
+master-password box is.
+
+A few details worth knowing:
+
+* **A wrong password keeps the prompt open**, with Bitwarden's own reason
+  underneath the box. Nothing is lost and nothing is locked out -- a refused
+  password is refused by the Bitwarden CLI, not by Deskwarden, and there is no
+  attempt counter here. Try again, or press Cancel.
+* **Cancel leaves everything exactly as it was.** The vault stays locked,
+  nothing is armed, and no fill is waiting. The card is not put back: you
+  pressed a button on it, and it appears again by itself the next time you
+  focus a password box.
+* **If you moved to another window while typing your password**, nothing is
+  typed into it. Deskwarden never types into a window that is not the one it
+  was asked about; the offer is still armed for the original window, so
+  clicking back into it and pressing `CTRL+ALT+B` fills it.
+* **The card's wording changed** with the button: it used to tell you to go and
+  unlock somewhere else, and now the button is the instruction. It still does
+  not claim to know whether the vault has a login for the app -- while locked,
+  it cannot.
+
+If Deskwarden's overlay is switched off in Preferences, this card does not
+appear, exactly as before.
+
 ### Editing an item shows what it has, and an Add control for the rest
 
 The edit form used to draw every box the item type has, filled in or not. An

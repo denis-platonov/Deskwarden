@@ -320,7 +320,16 @@ pub fn no_match_answer_of(action: &OverlayAction) -> Option<NoMatchAnswer> {
         OverlayAction::None => None,
         OverlayAction::NewLogin => Some(NoMatchAnswer::NewLogin),
         OverlayAction::SearchVault => Some(NoMatchAnswer::SearchVault),
-        OverlayAction::Dismiss | OverlayAction::Fill(_) => Some(NoMatchAnswer::Dismissed),
+        // `Unlock` joins `Fill` here for the same reason: 3a is handed
+        // [`NO_MATCH_BUTTONS`], which does not name it, so this card cannot
+        // paint the control that answers it -- and the safe reading of an
+        // impossible answer is that nothing follows. It must NOT map to
+        // anything that unlocks: 3a is shown only when the vault is readable,
+        // where a master-password prompt would be asking for a password
+        // nothing needs.
+        OverlayAction::Dismiss | OverlayAction::Fill(_) | OverlayAction::Unlock => {
+            Some(NoMatchAnswer::Dismissed)
+        }
     }
 }
 
@@ -427,13 +436,15 @@ impl eframe::App for OverlayApp {
                 true
             }
             OverlayAction::Dismiss => true,
-            // Both unreachable, and by construction rather than by
-            // discipline: `draw_overlay_card_rows` never answers either --
-            // only `draw_no_match_card` does, through the buttons
-            // `draw_notice_card` is handed. Closing the card is what a
-            // matched overlay would have to do with an answer it cannot
-            // produce, and it is the same thing `Dismiss` does.
-            OverlayAction::NewLogin | OverlayAction::SearchVault => true,
+            // All three unreachable, and by construction rather than by
+            // discipline: `draw_overlay_card_rows` never answers any of them
+            // -- only `draw_no_match_card` and `draw_locked_card` do, through
+            // the button lists `draw_notice_card` is handed, and this card is
+            // handed none. Closing is what a matched overlay would have to do
+            // with an answer it cannot produce, and it is the same thing
+            // `Dismiss` does. `Unlock` in particular must not unlock anything
+            // here: this card is shown only for a vault that is already open.
+            OverlayAction::NewLogin | OverlayAction::SearchVault | OverlayAction::Unlock => true,
             OverlayAction::None => false,
         };
 
@@ -600,19 +611,28 @@ pub enum OverlayAction {
     ///
     /// **Only [`draw_no_match_card`] can answer this**, and that is a property
     /// of the two cards rather than of discipline: [`draw_notice_card`] paints
-    /// the button only when it is handed a label, and [`draw_locked_card`]
-    /// hands it `None`. See [`NEW_LOGIN_LABEL`] for why a locked vault must
-    /// not offer it.
+    /// a button only for a label it is handed, and the list
+    /// [`draw_locked_card`] hands it ([`LOCKED_BUTTONS`]) does not contain
+    /// this one. See [`NEW_LOGIN_LABEL`] for why a locked vault must not
+    /// offer it.
     NewLogin,
     /// The 3a card's *Search vault* button was clicked: close this card and
     /// open the vault window, with this app's name already in its search box.
     ///
     /// **Only [`draw_no_match_card`] can answer this**, by the same
     /// construction as [`Self::NewLogin`]: [`draw_notice_card`] paints a
-    /// button only for a label it is handed, and [`draw_locked_card`] is
-    /// handed none. See [`SEARCH_VAULT_LABEL`] for what made this drawable
+    /// button only for a label it is handed, and [`LOCKED_BUTTONS`] does not
+    /// name it. See [`SEARCH_VAULT_LABEL`] for what made this drawable
     /// after three releases of deliberately not drawing it.
     SearchVault,
+    /// The 3b card's *Unlock* button was clicked: close this card and put the
+    /// daemon's bare-Win32 master-password prompt on screen.
+    ///
+    /// **Only [`draw_locked_card`] can answer this**, by the same construction
+    /// running the other way: [`NO_MATCH_BUTTONS`] does not name it, so 3a
+    /// cannot paint it. See [`UNLOCK_LABEL`] for why the locked card may make
+    /// this offer when it may make neither of 3a's.
+    Unlock,
 }
 
 /// Draws the overlay card itself — header (mark, wordmark, match count,
@@ -840,8 +860,9 @@ pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
 /// A constant rather than an array literal at the call site so that "3a offers
 /// exactly these two, in this order" is one thing a test can name -- and so
 /// that the two labels and the two [`OverlayAction`]s cannot be paired up
-/// wrongly in a second place. [`draw_locked_card`] passes `&[]`, which is what
-/// makes both answers unreachable from the locked card by construction.
+/// wrongly in a second place. [`draw_locked_card`] passes [`LOCKED_BUTTONS`],
+/// which names neither of them -- so both answers stay unreachable from the
+/// locked card by construction, exactly as when it passed an empty slice.
 const NO_MATCH_BUTTONS: &[(&str, OverlayAction)] = &[
     (SEARCH_VAULT_LABEL, OverlayAction::SearchVault),
     (NEW_LOGIN_LABEL, OverlayAction::NewLogin),
@@ -866,22 +887,39 @@ const NO_MATCH_BUTTONS: &[(&str, OverlayAction)] = &[
 /// Desktop"); this build cannot count them, because the engine that would is
 /// exactly what the lock cleared -- and a number here would be the same lie in
 /// the other direction. Nor does it offer Windows Hello or a PIN: neither
-/// exists in this app, and a card offering an unlock it cannot perform is
-/// worse than the silence it replaces.
+/// exists in this app.
 ///
-/// What is left is the one thing that is both true and useful: Deskwarden is
-/// locked, it therefore cannot answer for this app, and unlocking is what
-/// changes that.
+/// **It does now offer an unlock**, which is the one offer this state can
+/// honour, and it is [`UNLOCK_LABEL`] rather than either of 3a's two. The card
+/// shipped without any button because the only unlock this app had was
+/// `login_ui`'s window -- ~95 MB of OpenGL arenas that nothing releases, to
+/// type one password -- so the card would have been trading a card that could
+/// not act for a control the user would learn not to press.
+/// [`crate::unlock_prompt`] is what changed that: a bare-Win32 prompt measured
+/// at +0.99 MB to show and no renderer module loaded at any stage.
 ///
-/// Same shape, same window and same height as [`draw_no_match_card`] (see
-/// [`LOCKED_ROWS`]), because it is the same two-line body: they share
-/// [`draw_notice_card`] rather than each spelling the card out.
+/// So what is left is still only what is both true and useful: Deskwarden is
+/// locked, it therefore cannot answer for this app, and here is the button
+/// that changes that.
+///
+/// Same shape and same window as [`draw_no_match_card`] (see [`LOCKED_ROWS`]),
+/// and -- since both footers now carry a button -- the same height again:
+/// they share [`draw_notice_card`] rather than each spelling the card out.
 ///
 /// Public so the `ui_preview` example renders the card the app ships.
 pub fn draw_locked_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
     let (primary, secondary) = locked_text(app_name);
-    draw_notice_card(ui, LOCKED_LABEL, &primary, &secondary, &[])
+    draw_notice_card(ui, LOCKED_LABEL, &primary, &secondary, LOCKED_BUTTONS)
 }
+
+/// 3b's footer buttons: exactly one, and paired with the answer it gives.
+///
+/// [`NO_MATCH_BUTTONS`]'s sibling and written the same way, so that "3b offers
+/// exactly this, and nothing else" is one thing a test can name. The two lists
+/// are disjoint, and that disjointness is what keeps each card's answers
+/// unreachable from the other by construction rather than by discipline --
+/// see [`OverlayAction::NewLogin`] and [`OverlayAction::Unlock`].
+const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction::Unlock)];
 
 /// The card [`draw_no_match_card`] and [`draw_locked_card`] share: a header
 /// with a ✕, a two-line body, and an `Esc Dismiss` footer.
@@ -1092,6 +1130,41 @@ pub const NEW_LOGIN_LABEL: &str = "New login";
 /// test finds in the painted output rather than one it re-spells.
 pub const SEARCH_VAULT_LABEL: &str = "Search vault";
 
+/// What 3b's one button says, and **the only card that may carry it**.
+///
+/// # Why it took until now to draw
+///
+/// The same shape of reason [`SEARCH_VAULT_LABEL`] records, and the same
+/// resolution. 3b shipped with no buttons at all because a control on a
+/// frameless, always-on-top card that cannot be honoured is worse than no
+/// control -- and the only unlock this process had was `login_ui`'s window,
+/// which is an `eframe` loop costing ~95 MB that nothing releases and ~4 MB
+/// per open/close cycle. Offering that from a card whose whole point is to be
+/// cheap would have been offering the very thing the card exists to spare the
+/// user.
+///
+/// [`crate::unlock_prompt`] is the destination that did not exist: bare Win32,
+/// measured at +0.99 MB to show, 0.00 MB of ratchet per cycle and no renderer
+/// module loaded at any stage, reusing `login_ui::run_bw_with_password` so
+/// there is still exactly one route from a master password to a session token.
+///
+/// **And the answer travels the way every other overlay answer travels** -- as
+/// a return value, up through [`LockedAnswer`], `crate::app::locked_arm` and
+/// `main::process_foreground_event`, to `run`'s own loop, which is the one
+/// place in this process that may block on a modal prompt and then resettle
+/// the session. No published environment, no background thread, and
+/// `crate::app::disposition` is untouched and still takes exactly the six
+/// inputs it took before: this is not an input to the decision about which
+/// card to show, it is what the card answered.
+///
+/// **It is not "Unlock Deskwarden"**, which is
+/// [`crate::unlock_prompt::UNLOCK_PROMPT_TITLE`]: a button says what pressing
+/// it does, and the window it opens says what it is.
+///
+/// A constant for the reason [`NO_MATCH_LABEL`] is one: it is the string a
+/// test finds in the painted output rather than one it re-spells.
+pub const UNLOCK_LABEL: &str = "Unlock";
+
 /// What the locked card's header says.
 ///
 /// A constant for the same reason [`NO_MATCH_LABEL`] is one, and **it must not
@@ -1109,8 +1182,13 @@ pub const LOCKED_LABEL: &str = "Vault locked";
 /// identically; they are separate constants because the card each one sizes is
 /// separately measured (`the_locked_card_fits_the_window_it_asks_for`), and a
 /// `pub use` would make one card's growth invisible in the other's window.
-/// `the_two_notice_cards_are_the_same_height` asserts the equality it is safe
-/// to rely on, from the cards rather than from the constants.
+///
+/// The two cards have been the same height, then not, and are again: 3a gained
+/// the *New login* button and 3b had none, and now 3b has [`UNLOCK_LABEL`].
+/// Nothing relies on that equality -- `LOCKED_SLACK` and `NO_MATCH_SLACK` are
+/// separate numbers measured against separate cards, which is exactly so that
+/// the next time the two diverge, one of them fails rather than both quietly
+/// agreeing.
 pub const LOCKED_ROWS: usize = 1;
 
 /// The window the locked card asks the OS for. [`no_match_options`]'s sibling,
@@ -1128,13 +1206,73 @@ pub fn locked_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
 /// what answers the question. `the_locked_card_claims_nothing_about_a_match`
 /// holds the two strings to that.
 ///
+/// **The second line changed when the card gained its button.** It used to
+/// read "Unlock it to see whether the vault has a login for X." -- a sentence
+/// written for a card that could not act, so it had to describe an unlock the
+/// user would have to go and perform somewhere else, and "it" had no
+/// antecedent on the card. With [`UNLOCK_LABEL`] in the footer the instruction
+/// is the button, so the line says what the button will *find out* instead of
+/// telling the user to go and do something. It still claims nothing: "check"
+/// is what a locked process can honestly promise, where "see the login" would
+/// be the old lie in a new place.
+///
 /// `app_name` is `app::window_label`'s answer, so it is user-controlled and
 /// the card's height must not depend on it; see [`draw_notice_card`].
 fn locked_text(app_name: &str) -> (String, String) {
     (
         "Deskwarden is locked".to_string(),
-        format!("Unlock it to see whether the vault has a login for {app_name}."),
+        format!("Unlock to check the vault for {app_name}."),
     )
+}
+
+/// What 3b answered: nothing, or "open the master-password prompt".
+///
+/// [`NoMatchAnswer`]'s sibling, and a two-variant enum rather than a `bool`
+/// for the same reason that one is not one: the call site in
+/// `crate::app::locked_arm` reads as the two states it is and cannot be
+/// silently inverted by a `!`.
+///
+/// A separate type from [`NoMatchAnswer`] rather than a shared one, for the
+/// reason `PromptPresenter::show_locked` is a separate method from
+/// `show_no_match`: the two cards make opposite claims about the vault, and
+/// the answers they may give are disjoint. A shared enum would let a 3a
+/// dismissal be handed to the unlock wiring, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockedAnswer {
+    /// The ✕, Esc, or the window closing. Nothing follows, and in particular
+    /// nothing is armed.
+    #[default]
+    Dismissed,
+    /// *Unlock* was clicked: put [`crate::unlock_prompt`] on screen for this
+    /// window, and if it answers with a session token, resume the fill this
+    /// card interrupted.
+    Unlock,
+}
+
+/// What the locked card's [`OverlayAction`] means to the window around it:
+/// `None` to stay up, or the answer to close with.
+///
+/// [`no_match_answer_of`]'s sibling and written for the same reason, which
+/// applies here identically: `LockedApp::ui` needs an `eframe::Frame` and a
+/// real always-on-top window, so no test in this crate may execute it, and
+/// "Esc dismisses" is not a claim that may live only where nothing can check
+/// it. As one total `match`, a new [`OverlayAction`] variant is a compile
+/// error here and `every_locked_action_has_an_answer` reads the table.
+///
+/// [`OverlayAction::Fill`], [`OverlayAction::NewLogin`] and
+/// [`OverlayAction::SearchVault`] all map to [`LockedAnswer::Dismissed`]: all
+/// three are unreachable on this card by construction ([`LOCKED_BUTTONS`]
+/// names none of them, and there is no item to fill from), and the safe
+/// reading of an impossible answer is that nothing follows.
+pub fn locked_answer_of(action: &OverlayAction) -> Option<LockedAnswer> {
+    match action {
+        OverlayAction::None => None,
+        OverlayAction::Unlock => Some(LockedAnswer::Unlock),
+        OverlayAction::Dismiss
+        | OverlayAction::Fill(_)
+        | OverlayAction::NewLogin
+        | OverlayAction::SearchVault => Some(LockedAnswer::Dismissed),
+    }
 }
 
 /// Opens design **3b** for `app_name`: the locked card, at `anchor`.
@@ -1144,19 +1282,28 @@ fn locked_text(app_name: &str) -> (String, String) {
 /// about which kind, and 3a stacked on 3b is the same defect as two copies of
 /// either.
 ///
-/// Returns nothing, for the same reason 3a's does: there is no item, so there
-/// is no choice, and an `Option<FillChoice>` here would be a promise this
-/// state cannot keep.
-pub fn show_locked_overlay(app_name: &str, anchor: Option<(f32, f32)>) {
+/// **It still does not return an `Option<FillChoice>`**, for the reason it
+/// never did: there is no item here, so there is no choice, and a signature
+/// that could carry one would be a promise this state cannot keep. What it
+/// answers is [`LockedAnswer`] -- whether the user asked for the
+/// master-password prompt -- which names no item and authorises no fill.
+///
+/// The refusal to stack answers [`LockedAnswer::Dismissed`], and that is the
+/// conservative reading rather than an arbitrary one: nothing was put on
+/// screen, so the user cannot have pressed anything, and answering `Unlock`
+/// would put a modal master-password prompt up for a card that was never
+/// shown.
+pub fn show_locked_overlay(app_name: &str, anchor: Option<(f32, f32)>) -> LockedAnswer {
     if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
         log::warn!(
             "locked overlay requested for {app_name} while one is already open in this \
              process; ignoring rather than stacking a second window"
         );
-        return;
+        return LockedAnswer::Dismissed;
     }
 
-    let app = LockedApp { app_name: app_name.to_string() };
+    let asked = Rc::new(RefCell::new(LockedAnswer::Dismissed));
+    let app = LockedApp { app_name: app_name.to_string(), asked: Rc::clone(&asked) };
     let options = locked_options(anchor);
 
     let _ = eframe::run_native(
@@ -1169,10 +1316,14 @@ pub fn show_locked_overlay(app_name: &str, anchor: Option<(f32, f32)>) {
     );
 
     OVERLAY_OPEN.store(false, Ordering::SeqCst);
+
+    let answer = *asked.borrow();
+    answer
 }
 
 struct LockedApp {
     app_name: String,
+    asked: Rc<RefCell<LockedAnswer>>,
 }
 
 impl eframe::App for LockedApp {
@@ -1191,11 +1342,13 @@ impl eframe::App for LockedApp {
         let keys = no_match_keyboard_action(EscapePressed::read(&ctx));
         let card = draw_locked_card(ui, &self.app_name);
 
-        let done = matches!(
-            if keys == OverlayAction::None { card } else { keys },
-            OverlayAction::Dismiss | OverlayAction::Fill(_)
-        );
-        if done {
+        let action = if keys == OverlayAction::None { card } else { keys };
+        if let Some(answer) = locked_answer_of(&action) {
+            // Recorded BEFORE the close, so the answer survives the window,
+            // exactly as `NoMatchApp::ui` does it: `show_locked_overlay` reads
+            // this cell after `run_native` returns, and `run_native` returns
+            // because of this command.
+            *self.asked.borrow_mut() = answer;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -5199,19 +5352,27 @@ mod geometry_tests {
 
     /// How much taller than it needs to be the LOCKED card's window is.
     ///
-    /// **Its own constant, and no longer [`NO_MATCH_SLACK`].** The two notice
-    /// cards were the same height until 3a's footer gained the *New login*
-    /// button that leads to design 3c; 3b's footer deliberately does not have
-    /// one (see [`NEW_LOGIN_LABEL`]), so 3a is now 159pt where 3b is still the
-    /// 153pt both were, in the same 164pt window. That a separate constant was
-    /// already there to take the difference is exactly the point
-    /// [`LOCKED_ROWS`]'s doc makes about not aliasing [`NO_MATCH_ROWS`].
+    /// **Its own constant, and deliberately not [`NO_MATCH_SLACK`]** even
+    /// though the two are equal again. The history is the whole argument for
+    /// keeping them apart: both cards were 153pt in a 164pt window (slack 11);
+    /// 3a's footer then gained the *New login* button and became 159pt (slack
+    /// 5) while 3b, which had no button it could honour, stayed at 11; and now
+    /// 3b's footer carries [`UNLOCK_LABEL`], so it is 159pt too and this
+    /// number is 5 again.
     ///
-    /// **This number did not move, and that is the assertion.** 3b is drawn by
-    /// the same `draw_notice_card` 3a is, so a change to the shared body would
-    /// show up here as well as in [`NO_MATCH_SLACK`]; that only 3a's moved is
-    /// what says the button landed in 3a's footer and nowhere else.
-    const LOCKED_SLACK: f32 = 11.0;
+    /// **That is the assertion, and it is a specific one.** A `row_button` is
+    /// taller than the hint text it sits beside, and the footer strip's own
+    /// inner margin shrinks from 8 to 6 when it carries one, so a card that
+    /// gained a button and did *not* move this number would be a card whose
+    /// button is not being drawn. It moved by exactly the six points 3a's did,
+    /// which is what says the same `draw_notice_card` drew both.
+    ///
+    /// Slack in this direction is the safe direction, for the reason
+    /// [`NO_MATCH_SLACK`] spells out: a window taller than its card wastes
+    /// five points, and a window shorter than its card loses the bottom of a
+    /// frameless, always-on-top surface -- which is where the Esc hint, and
+    /// now the *Unlock* button, are.
+    const LOCKED_SLACK: f32 = 5.0;
 
     /// **3b offers no route to 3c, and 3a does** -- read off the two painted
     /// cards, not off the argument `draw_notice_card` is handed.
@@ -5247,6 +5408,82 @@ mod geometry_tests {
                 "the locked card paints a {label:?} button. Neither of 3a's two offers can \
                  be honoured against a vault this process cannot open, so the user is \
                  offered something that cannot happen. Painted: {on_3b:?}"
+            );
+        }
+    }
+
+    /// **3b offers the unlock, and 3a does not** -- the positive half of the
+    /// test above, read off the two painted cards rather than off the argument
+    /// `draw_notice_card` is handed.
+    ///
+    /// Without this, the locked card's only button could stop being drawn --
+    /// by an empty `LOCKED_BUTTONS`, or by the footer strip losing its button
+    /// branch -- with `the_locked_card_offers_no_new_login_button` still green,
+    /// because that test only says which buttons must NOT be there. A card
+    /// that offers nothing is exactly what this work exists to change.
+    ///
+    /// The exclusion runs the other way too: `UNLOCK_LABEL` must not appear on
+    /// 3a. That card is shown only when the vault is readable, so an unlock
+    /// there would be asking for a master password nothing needs.
+    #[test]
+    fn the_locked_card_offers_the_unlock_and_the_no_match_card_does_not() {
+        let on_3a = notice_glyphs(|ui| draw_no_match_card(ui, APP));
+        let on_3b = notice_glyphs(|ui| draw_locked_card(ui, APP));
+
+        assert_eq!(
+            on_3b.iter().filter(|g| *g == UNLOCK_LABEL).count(),
+            1,
+            "the locked card paints no {UNLOCK_LABEL:?} button. The card is back to being a \
+             notice the user cannot act on, and the only unlock left to them is the ~95 MB \
+             window this whole path exists to avoid. Painted: {on_3b:?}"
+        );
+        assert_eq!(
+            on_3a.iter().filter(|g| *g == UNLOCK_LABEL).count(),
+            0,
+            "the no-match card paints an {UNLOCK_LABEL:?} button. It is shown only when the \
+             vault is readable, so it would be offering to unlock what is already open. \
+             Painted: {on_3a:?}"
+        );
+    }
+
+    /// Every [`OverlayAction`] has an answer on the locked card, and the table
+    /// is what says which.
+    ///
+    /// [`every_no_match_action_has_an_answer`]'s sibling and written for the
+    /// same reason: `LockedApp::ui` needs a real always-on-top window, so the
+    /// mapping is the only part of that body a test can execute, and the three
+    /// answers this card cannot produce are pinned rather than left to a
+    /// wildcard.
+    #[test]
+    fn every_locked_action_has_an_answer() {
+        assert_eq!(
+            locked_answer_of(&OverlayAction::None),
+            None,
+            "an idle frame closed the card"
+        );
+        assert_eq!(
+            locked_answer_of(&OverlayAction::Unlock),
+            Some(LockedAnswer::Unlock),
+            "`Unlock` did not reach the master-password prompt -- the button is inert, which \
+             is worse than not drawing it"
+        );
+        assert_eq!(
+            locked_answer_of(&OverlayAction::Dismiss),
+            Some(LockedAnswer::Dismissed),
+            "the ✕ did not dismiss"
+        );
+        // The three this card cannot produce. None of them may be read as an
+        // unlock: a stray `Fill` must not open a master-password prompt.
+        for impossible in [
+            OverlayAction::Fill(FillChoice::UserTabPass),
+            OverlayAction::NewLogin,
+            OverlayAction::SearchVault,
+        ] {
+            assert_eq!(
+                locked_answer_of(&impossible),
+                Some(LockedAnswer::Dismissed),
+                "an impossible {impossible:?} on 3b was read as something other than a \
+                 dismissal"
             );
         }
     }
@@ -6740,6 +6977,15 @@ mod geometry_tests {
                     // a single counter still satisfied.
                     OverlayAction::NewLogin => new_logins += 1,
                     OverlayAction::SearchVault => searches += 1,
+                    // Not a control on THIS card: `NO_MATCH_BUTTONS` does not
+                    // name it, so a click that produced it would mean 3a is
+                    // painting 3b's button -- and offering to unlock a vault
+                    // this card was only shown because it could read.
+                    OverlayAction::Unlock => panic!(
+                        "clicking ({x}, {y}) on the no-match card answered Unlock. That button \
+                         belongs to the locked card, and this one is shown only when the vault \
+                         is readable"
+                    ),
                     OverlayAction::None => {}
                 }
                 probed += 1;
