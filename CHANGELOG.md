@@ -8,6 +8,41 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### "What is new" uses the whole page instead of a small box
+
+The release notes on **Preferences -> Updates** were shown in a box of a fixed
+height with everything past it scrolled out of sight, whatever the release
+actually said. Short notes sat in that box; long ones were cut off a few lines
+in. The area now takes whatever room the page has left and only scrolls once
+the notes run past the bottom of the window, so most releases are readable
+without scrolling at all and a one-line note takes one line.
+
+Nothing below the notes can be pushed out of reach by a long release body,
+which is what the fixed height was protecting against: the area grows into the
+space that is left rather than to the length of the text, and there is nothing
+underneath it to displace.
+
+### "Full changelog" and other links in the notes can be clicked
+
+Links in the release notes were painted to look like links and did nothing.
+They can now be followed, and they open in your normal browser.
+
+Only `https` links are followable. Anything else -- an `http` address, a
+`file:` path, a `ms-settings:` link -- is shown as ordinary text rather than
+as something to click, so nothing on the page looks like a link that will not
+behave as one. Every link still shows its destination beside its words,
+followable or not, so you can see where one goes before deciding to go there.
+
+### Release notes lead with what the release does
+
+A published release used to open with the note about the build being unsigned,
+which meant the app's "What is new" panel did too. A release now starts with a
+short list of what changed -- taken from this file's entry for that version, so
+it is written once -- followed by a link to the full changelog as it stood at
+that release, and then the unsigned-build and digest-verification notes.
+
 ## 0.9.0 - 2026-08-21
 
 > The manual pre-release checklist was not run for this version either. The

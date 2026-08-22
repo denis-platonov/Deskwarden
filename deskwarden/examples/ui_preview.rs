@@ -1473,6 +1473,15 @@ impl Preview {
                 "- It is deliberately long here so this screenshot shows the\n",
                 "  region scrolling rather than pushing the buttons off the\n",
                 "  page.\n",
+                "\n",
+                // The workflow's own last line, verbatim. `release.yml`
+                // composes `**[Full changelog](...)**` for every release, so
+                // this is a copy of production output rather than an invented
+                // string -- and it is the one line of the panel a reader is
+                // most likely to want to follow, which makes it worth a
+                // picture that it renders as a link rather than as its own
+                // square brackets in bold.
+                "**[Full changelog](https://example.invalid/CHANGELOG.md)**\n",
             )
             .to_string(),
         };

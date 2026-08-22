@@ -4,6 +4,12 @@
 # bare executable and the installer as GitHub Release assets whenever a
 # "vX.Y.Z" tag is pushed.
 #
+# The release BODY is composed here rather than written by hand, because the
+# app renders it: `updater::release_notes_blocks` reads it straight onto the
+# Preferences -> Updates panel, so what this workflow emits is what a user
+# reads before deciding to install. The shape and the reasoning are at the
+# "Compose the release body" step below.
+#
 # Signing: SignPath integration is a disclosed, pending manual prerequisite
 # (see docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md).
 # Until the SignPath project is approved and its GitHub Action documented,
@@ -151,20 +157,120 @@ jobs:
         run: |
           echo "TODO: wire SignPath signing once the account is approved. This installer is UNSIGNED. The updater's SHA-256 digest check is not a substitute; see docs/code-signing-policy.md."
 
+      # The release body, in the shape the app's "What is new" panel reads.
+      #
+      # WHY THIS IS COMPOSED RATHER THAN HARD-CODED. Until v0.9.0 the body was
+      # a fixed template that led with the unsigned-build caveat, so the panel
+      # -- which renders the GitHub release body verbatim, see
+      # `updater::release_notes_blocks` -- opened every update on a disclaimer
+      # rather than on what the release does. v0.9.0's body was rewritten by
+      # hand into the shape below. This step makes every future release get
+      # that shape without anyone remembering to.
+      #
+      # WHERE THE BULLETS COME FROM. `CHANGELOG.md`'s section for the version
+      # being released, whose `### ` headings are already one line per
+      # user-visible change -- that IS the list, written once. Asking a human
+      # to write it a second time into a release body is how the two drift.
+      #
+      # WHY THE EXTRACTION IS RELIABLE. It is a two-state scan over lines, not
+      # a Markdown parse: `## <version>` opens the section, the next `## `
+      # closes it, and `### ` lines in between are the bullets. `^##\s` cannot
+      # match a `### ` heading (the third character is `#`, not whitespace),
+      # so the two levels cannot be confused. Nothing about the prose BELOW a
+      # `### ` is read, so a section can contain anything -- blockquotes,
+      # code, lists -- without affecting the result. The version is matched
+      # against `$env:APP_VERSION`, which an earlier step has already proved
+      # equal to the crate version and to the tag.
+      #
+      # WHAT IT DOES WHEN THE SECTION IS MISSING. Warns loudly in the job log
+      # and publishes the rest of the body -- the link and the two notes --
+      # without the "What's new" block. It deliberately does NOT fail the
+      # release: the tag is already public by the time this runs, the missing
+      # thing is prose rather than a correctness problem (unlike the
+      # tag/crate-version mismatch above, which really does strand every
+      # user), and a body can be edited on the release page afterwards while
+      # a failed publish cannot be un-failed. The warning is what makes the
+      # omission visible.
+      - name: Compose the release body
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          $changelog = Join-Path $env:GITHUB_WORKSPACE 'CHANGELOG.md'
+          $version = $env:APP_VERSION
+          $bullets = @()
+          $found = $false
+          if (Test-Path -LiteralPath $changelog) {
+            $inSection = $false
+            foreach ($line in (Get-Content -LiteralPath $changelog -Encoding utf8)) {
+              if ($line -match '^##\s') {
+                if ($inSection) { break }
+                if ($line -match ('^##\s+' + [regex]::Escape($version) + '(\s|$)')) {
+                  $inSection = $true
+                  $found = $true
+                }
+                continue
+              }
+              if ($inSection -and $line -match '^###\s+(.+)$') {
+                $bullets += $Matches[1].Trim()
+              }
+            }
+          } else {
+            Write-Host "::warning::CHANGELOG.md is missing from the checkout."
+          }
+
+          $parts = @()
+          if ($bullets.Count -gt 0) {
+            $parts += "## What's new in $version"
+            $parts += ""
+            foreach ($bullet in $bullets) { $parts += "- $bullet" }
+            $parts += ""
+          } elseif ($found) {
+            Write-Host ("::warning::CHANGELOG.md has a section for $version but no '### ' " +
+              "headings in it, so this release body has no 'What's new' list.")
+          } else {
+            Write-Host ("::warning::CHANGELOG.md has no '## $version' section, so this " +
+              "release body has no 'What's new' list. Add one and edit the release body.")
+          }
+
+          # The TAG, never `main`: this link is read by someone installing
+          # THIS release, possibly long after the file has moved on, and it
+          # has to keep saying what this release contained.
+          $parts += "**[Full changelog]($env:REPO_URL/blob/$env:REF_NAME/CHANGELOG.md)**"
+          $parts += ""
+          $parts += "---"
+          $parts += ""
+          $parts += "**Note:** this build is unsigned. SignPath code-signing"
+          $parts += "integration is pending manual account approval; see"
+          $parts += "docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md."
+          $parts += ""
+          $parts += "Deskwarden's in-app updater verifies the installer it downloads"
+          $parts += "against the SHA-256 digest GitHub publishes for the asset, and"
+          $parts += "refuses to run it on any mismatch. That checks the bytes, not the"
+          $parts += "publisher -- it is not equivalent to a signed build. See"
+          $parts += "docs/code-signing-policy.md."
+
+          # UTF-8 without a BOM: the changelog has em dashes and a `⋮` in its
+          # headings, and a BOM would arrive as stray characters at the head
+          # of the panel's first line.
+          $body = $parts -join "`n"
+          $path = Join-Path $env:GITHUB_WORKSPACE 'release-body.md'
+          Set-Content -LiteralPath $path -Value $body -Encoding utf8NoBOM
+          Write-Host "--- release body ---"
+          Write-Host $body
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             deskwarden/target/release/deskwarden.exe
             deskwarden/installer/deskwarden-*-installer.exe
-          generate_release_notes: true
-          body: |
-            **Note:** this build is unsigned. SignPath code-signing
-            integration is pending manual account approval; see
-            docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md.
-
-            Deskwarden's in-app updater verifies the installer it downloads
-            against the SHA-256 digest GitHub publishes for the asset, and
-            refuses to run it on any mismatch. That checks the bytes, not the
-            publisher -- it is not equivalent to a signed build. See
-            docs/code-signing-policy.md.
+          # `body_path`, and `generate_release_notes` deliberately OFF.
+          #
+          # The generated notes are a commit/PR list appended AFTER whatever
+          # `body` says, which on this project means the app's "What is new"
+          # panel ended on a wall of commit subjects below the digest note --
+          # the same panel the shape above exists to keep readable. What that
+          # list was for is now the "Full changelog" link, which points at a
+          # file written for people rather than at a diff.
+          body_path: release-body.md

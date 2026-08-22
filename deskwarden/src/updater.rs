@@ -495,6 +495,15 @@ fn parse_notes_line(line: &str) -> NotesBlock {
 /// bound, because the input is chosen by a remote host and nesting is free to
 /// write; a parser with no stack cannot be given one to overflow. The cost is
 /// a construct nobody puts in a release note rendering slightly plainly.
+///
+/// **One exception, and it is not recursion.** An emphasis run whose ENTIRE
+/// contents are a single link is read as that link -- `**[Full changelog](
+/// ...)**`, which is the shape `.github/workflows/release.yml` composes and
+/// which otherwise painted its own square brackets in bold on the one line of
+/// the panel most worth following. It costs one `parse_link` call on a slice,
+/// that call looks at no emphasis of its own, and so the depth this reaches
+/// cannot grow with the input. Everything else inside an emphasis run is
+/// still literal.
 fn inline_spans(line: &str) -> Vec<NotesSpan> {
     let chars: Vec<char> = line.chars().collect();
     let mut spans: Vec<NotesSpan> = Vec::new();
@@ -541,20 +550,7 @@ fn inline_spans(line: &str) -> Vec<NotesSpan> {
         if c == '[' {
             if let Some((text, url, next)) = parse_link(&chars, i) {
                 flush(&mut spans, &mut plain);
-                // The words, then the destination -- and the destination is
-                // painted either way. A link the subset accepts carries its
-                // URL and can be clicked; one it refuses is painted as plain
-                // words beside the same visible URL, which is exactly how
-                // every link on this page looked before links could be
-                // followed at all. `https_link` is the only place that
-                // decides, and it decides here rather than at the paint so a
-                // refused URL is never carried anywhere.
-                let words = if text.is_empty() { url.clone() } else { text };
-                spans.push(match https_link(&url) {
-                    Some(target) => link_span(words, target),
-                    None => span(words, NotesStyle::Plain),
-                });
-                spans.push(span(format!(" ({url})"), NotesStyle::LinkUrl));
+                push_link(&mut spans, text, url);
                 i = next;
                 continue;
             }
@@ -569,10 +565,34 @@ fn inline_spans(line: &str) -> Vec<NotesSpan> {
                 // four asterisks somebody typed.
                 if !inner.is_empty() {
                     flush(&mut spans, &mut plain);
-                    spans.push(span(
-                        inner,
-                        if doubled { NotesStyle::Strong } else { NotesStyle::Emphasis },
-                    ));
+                    // **The one thing looked at inside an emphasis run, and
+                    // it is not recursion.** The flat rule above stands:
+                    // `**a *b* c**` is still bold text containing literal
+                    // asterisks. What is handled here is the single case
+                    // where the run's ENTIRE contents are one link, which is
+                    // `**[Full changelog](...)**` -- the shape the release
+                    // workflow composes and the one line on the panel most
+                    // worth being able to follow. Without this it rendered as
+                    // its own square brackets, in bold.
+                    //
+                    // Bounded, and cannot become a stack: `parse_link` is
+                    // called once, on a slice, and looks at no emphasis of
+                    // its own. Depth cannot grow with the input.
+                    //
+                    // The bold is dropped rather than combined, because the
+                    // subset has no bold-link style and inventing one to say
+                    // "important" over text that already says "follow me"
+                    // buys nothing.
+                    let inner_chars = &chars[i + run..close];
+                    match parse_link(inner_chars, 0) {
+                        Some((text, url, next)) if next == inner_chars.len() => {
+                            push_link(&mut spans, text, url);
+                        }
+                        _ => spans.push(span(
+                            inner,
+                            if doubled { NotesStyle::Strong } else { NotesStyle::Emphasis },
+                        )),
+                    }
                     i = close + run;
                     continue;
                 }
@@ -585,6 +605,28 @@ fn inline_spans(line: &str) -> Vec<NotesSpan> {
 
     flush(&mut spans, &mut plain);
     spans
+}
+
+/// Appends one link's words and its visible destination.
+///
+/// The words, then the destination, and the destination is painted either
+/// way. A link the subset accepts carries its URL and can be clicked; one it
+/// refuses is painted as plain words beside the same visible URL, which is
+/// exactly how every link on this page looked before links could be followed
+/// at all. [`https_link`] is the only thing that decides, and it decides here
+/// -- at the parse -- so a refused URL is never carried any further.
+///
+/// Spelled once because there are two places a link is recognised: on its own,
+/// and as the entire contents of an emphasis run (see [`inline_spans`]). Two
+/// copies of this would be two copies of the scheme rule, and the copy that
+/// drifts is the one that forgets to check.
+fn push_link(spans: &mut Vec<NotesSpan>, text: String, url: String) {
+    let words = if text.is_empty() { url.clone() } else { text };
+    spans.push(match https_link(&url) {
+        Some(target) => link_span(words, target),
+        None => span(words, NotesStyle::Plain),
+    });
+    spans.push(span(format!(" ({url})"), NotesStyle::LinkUrl));
 }
 
 /// Moves whatever has accumulated as unstyled text into a span.
@@ -1923,6 +1965,52 @@ mod tests {
             assert!(
                 text_of(&spans).contains("the notes") && text_of(&spans).contains(hostile),
                 "{hostile:?} lost its words or its destination: {spans:?}"
+            );
+        }
+    }
+
+    /// **The workflow's own "Full changelog" line, end to end.**
+    ///
+    /// `**[text](url)**` is the exact shape `.github/workflows/release.yml`
+    /// composes for every release, so this is a fixture in the sense that it
+    /// is a copy of production output rather than an invented string. Before
+    /// the emphasis run learned to contain one whole link it rendered as
+    /// literal square brackets in bold, on the line of the panel a reader is
+    /// most likely to want to follow.
+    #[test]
+    fn a_link_that_is_the_whole_of_a_bold_run_is_still_a_link() {
+        let spans = spans_of("**[Full changelog](https://example.invalid/CHANGELOG.md)**");
+
+        let words = spans
+            .iter()
+            .find(|s| s.style == NotesStyle::LinkText)
+            .unwrap_or_else(|| panic!("the bold run swallowed the link: {spans:?}"));
+        assert_eq!(words.text, "Full changelog");
+        assert_eq!(words.link.as_deref(), Some("https://example.invalid/CHANGELOG.md"));
+        assert!(
+            !text_of(&spans).contains('[') && !text_of(&spans).contains('*'),
+            "a delimiter survived into the painted text: {spans:?}"
+        );
+    }
+
+    /// The exception above is exactly that -- an emphasis run that merely
+    /// CONTAINS a link, rather than being one, is untouched, and the flat
+    /// rule the module header states still holds everywhere else.
+    #[test]
+    fn emphasis_around_more_than_a_link_stays_flat() {
+        for line in [
+            "**see [notes](https://example.invalid/x) now**",
+            "**a *b* c**",
+            "**plain**",
+        ] {
+            let spans = spans_of(line);
+            assert!(
+                spans.iter().any(|s| s.style == NotesStyle::Strong),
+                "{line:?} stopped being bold: {spans:?}"
+            );
+            assert!(
+                spans.iter().all(|s| s.link.is_none()),
+                "{line:?} produced a followable link out of literal text: {spans:?}"
             );
         }
     }
