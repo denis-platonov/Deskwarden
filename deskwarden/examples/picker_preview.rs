@@ -3,8 +3,15 @@
 //! ```text
 //! cargo run --example picker_preview
 //! cargo run --example picker_preview -- --capturable
+//! cargo run --example picker_preview -- --few
 //! cargo run --example picker_preview -- --empty
 //! ```
+//!
+//! `--few` shows a populated card with **two** candidates, which is the state
+//! the *Search the vault* row was invisible in: nothing overflows, so for a
+//! while the row was not drawn and two wrong guesses had no way out but
+//! dismissing the card. The default fixture list overflows, so this flag is
+//! the one that shows the row saying "Look for it under another name".
 //!
 //! `--empty` shows the card's **empty mode**: the surface a user gets when
 //! nothing in the vault looks like the app they are in front of, which is by
@@ -61,9 +68,9 @@ fn offer(id: &str, name: &str, username: &str, palette: Palette) -> Offer {
     }
 }
 
-/// Six candidates against a cap of five, deliberately: that is the case
-/// `win32_draw::visible_rows` spends a slot on, so the preview shows the
-/// *Search the vault* row rather than only the comfortable case.
+/// Six candidates against a cap of five, deliberately: that is the truncating
+/// case, so the preview shows the *Search the vault* row saying candidates
+/// were dropped. `few_fixtures` is the other half of the same row's story.
 fn fixtures() -> Vec<Offer> {
     let login = || Palette {
         fields: vec![FieldRef::Username, FieldRef::Password],
@@ -94,12 +101,23 @@ fn fixtures() -> Vec<Offer> {
     ]
 }
 
+/// **Two candidates, both plausibly wrong.** The reported state: the matcher
+/// is loose on purpose, so this card is ordinary -- and it must still offer
+/// the *Search the vault* row, here saying nothing was cut.
+fn few_fixtures() -> Vec<Offer> {
+    fixtures().into_iter().take(2).collect()
+}
+
 fn main() {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
 
     let capturable = std::env::args().any(|arg| arg == "--capturable");
     if capturable {
         eprintln!("preview: capture exclusion is stubbed out, so this window can be screenshotted");
+    }
+    let few = std::env::args().any(|arg| arg == "--few");
+    if few {
+        eprintln!("preview: two candidates -- nothing overflows, and the search row is still there");
     }
     let empty = std::env::args().any(|arg| arg == "--empty");
     if empty {
@@ -109,7 +127,13 @@ fn main() {
     // An empty offer list is not "no preview": it is the card's third mode,
     // and it goes through exactly the same `ask`/`run_with` the populated one
     // does. See `picker_prompt::empty_rows`.
-    let offers = if empty { Vec::new() } else { fixtures() };
+    let offers = if empty {
+        Vec::new()
+    } else if few {
+        few_fixtures()
+    } else {
+        fixtures()
+    };
     let outcome = if capturable {
         // The one seam that is not the shipped one. `ask` cannot be used here
         // because it names `REAL` outright; this is that call with `protect`
@@ -147,6 +171,7 @@ fn main() {
 /// over the fixtures -- it rebuilds them and looks the id up, which is exactly
 /// what the shipped `picker_prompt::ask` does through its own parked slice.
 fn palette_of_fixture(id: &str) -> Palette {
+    // `few_fixtures` is a prefix of `fixtures`, so one lookup serves both.
     fixtures()
         .into_iter()
         .find(|o| o.candidate.id == id)

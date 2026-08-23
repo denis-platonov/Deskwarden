@@ -120,17 +120,25 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
     }
 }
 
-/// How many candidate rows to draw, and whether an overflow row is needed.
+/// How many candidate rows to draw, and whether candidates were dropped.
+///
+/// **The last slot is the *Search the vault* row, always.** The matcher that
+/// produced the candidates is loose on purpose, so a card whose two guesses
+/// are both wrong is an ordinary state; drawing that row only when the list
+/// overflowed took the one route out of a wrong guess away from exactly the
+/// cards most likely to be wrong. That is why the candidates get `cap - 1`
+/// slots and never `cap`.
 ///
 /// **A cap that hides candidates without saying so is the defect this project
-/// keeps finding.** When there are more candidates than fit, one slot is spent
-/// on a *Search vault* row so the truncation is visible; that is why the
-/// overflowing case shows `cap - 1` and not `cap`.
+/// keeps finding**, so the returned flag is still the truncation news -- it
+/// now decides what that row's second line says rather than whether the row
+/// is there at all. See `picker_prompt::populated_rows`.
 pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
-    if total <= cap {
+    let room = cap.saturating_sub(1);
+    if total <= room {
         (total, false)
     } else {
-        (cap.saturating_sub(1), true)
+        (room, true)
     }
 }
 
@@ -294,9 +302,18 @@ mod tests {
     }
 
     #[test]
-    fn a_list_that_fits_shows_everything_and_offers_no_overflow_row() {
+    fn a_list_that_fits_shows_everything_and_reports_no_truncation() {
         assert_eq!(visible_rows(3, 5), (3, false));
-        assert_eq!(visible_rows(5, 5), (5, false), "exactly full is not overflowing");
+        assert_eq!(
+            visible_rows(4, 5),
+            (4, false),
+            "four candidates plus the always-drawn *Search the vault* row is exactly the cap"
+        );
+        assert_eq!(
+            visible_rows(5, 5),
+            (4, true),
+            "the fifth candidate does not fit beside the search row, and a card that dropped it              silently is the defect this whole rule exists to prevent"
+        );
     }
 
     #[test]

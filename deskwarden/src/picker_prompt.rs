@@ -560,9 +560,9 @@ const ROW_H: i32 = 44;
 ///
 /// The card does not scroll and cannot be resized, so this is not a viewport
 /// onto a longer list -- it is the whole of what is reachable.
-/// [`crate::win32_draw::visible_rows`] spends one of these slots on a *Search
-/// the vault* row when there are more candidates than fit, which is what stops
-/// the truncation being silent.
+/// [`crate::win32_draw::visible_rows`] always spends one of these slots on the
+/// *Search the vault* row -- the card's one route out of a wrong guess -- and
+/// that row's second line is what stops a truncation being silent.
 pub const ROW_CAP: usize = 5;
 
 /// Button height. `theme::BUTTON_HEIGHT`.
@@ -642,6 +642,53 @@ pub fn layout(rows: usize) -> Layout {
     Layout { window, title, subtitle, list, secondary, cancel, close_glyph }
 }
 
+/// One row of the **populated** card, in the order they are drawn.
+///
+/// The last row is always [`ListRow::SearchVault`]: the matcher that produced
+/// the candidates is deliberately loose, so a card whose two offers are both
+/// wrong is an ordinary state -- and dismissing the card was, for a while, the
+/// only way out of it. See [`populated_rows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRow {
+    /// The `usize`th candidate of the slice `open` was given.
+    Candidate(usize),
+    /// The route into the vault's own search. `truncated` says whether
+    /// candidates were dropped to make room for it, which is the only thing
+    /// that changes about the row.
+    SearchVault { truncated: bool },
+}
+
+/// The populated card's rows, for a candidate list `candidates` long.
+///
+/// **The *Search the vault* row is not the overflow notice.** It is the card's
+/// one route out of a wrong guess, so it is drawn whether or not anything
+/// overflowed; when candidates did have to be dropped, the same row carries
+/// that news in its second line rather than a second row doing it -- the card
+/// has no scrolling and no spare slot. See [`search_row_label`].
+pub fn populated_rows(candidates: usize) -> Vec<ListRow> {
+    let (shown, truncated) = crate::win32_draw::visible_rows(candidates, ROW_CAP);
+    let mut rows: Vec<ListRow> = (0..shown).map(ListRow::Candidate).collect();
+    rows.push(ListRow::SearchVault { truncated });
+    rows
+}
+
+/// What the *Search the vault* row says, on its two lines.
+///
+/// The second line is where the truncation is told, because the row itself is
+/// now always there. The non-truncated wording is the empty card's own line
+/// for the same action -- see [`empty_label`] -- so one action does not have
+/// two voices.
+pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
+    (
+        "Search the vault",
+        if truncated {
+            "More accounts match than fit on this card"
+        } else {
+            "Look for it under another name"
+        },
+    )
+}
+
 /// The `index`th row's rectangle, in logical pixels, on a card laid out for
 /// `rows` rows -- the same count [`layout`] was given, so the row and the list
 /// it sits in can never be measured against two different cards.
@@ -681,10 +728,14 @@ static GONE: AtomicBool = AtomicBool::new(false);
 /// would turn `run_with`'s ignore-and-continue arms into a spin.
 static PENDING: std::sync::Mutex<Option<Event>> = std::sync::Mutex::new(None);
 
-/// The candidates the first step is showing, and whether the last used slot is
-/// the *Search the vault* row rather than a candidate.
+/// The candidates the first step is showing, and whether candidates had to be
+/// dropped to fit them.
+///
+/// The *Search the vault* row below them is drawn either way -- see
+/// [`populated_rows`] -- so `TRUNCATED` decides only what its second line
+/// says, not whether it exists.
 static SHOWN: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec::new());
-static OVERFLOWING: AtomicBool = AtomicBool::new(false);
+static TRUNCATED: AtomicBool = AtomicBool::new(false);
 
 /// The second step's rows. Empty while the first step is showing.
 static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
@@ -720,8 +771,8 @@ static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
 mod win32 {
     use super::{
         Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES, GONE, MODE,
-        MODE_EMPTY, MODE_LIST, MODE_PALETTE, OVERFLOWING, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
-        SHOWN,
+        MODE_EMPTY, MODE_LIST, MODE_PALETTE, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
+        SHOWN, TRUNCATED,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -1013,12 +1064,15 @@ mod win32 {
             slot.clear();
         }
 
-        // **The cap, and the slot it spends to say the list was cut.** See
-        // `win32_draw::visible_rows`: a card that hid candidates without
-        // saying so is the defect this project keeps finding, and this window
-        // cannot scroll to show them.
-        let (shown, overflow) = crate::win32_draw::visible_rows(candidates.len(), ROW_CAP);
-        OVERFLOWING.store(overflow, Ordering::SeqCst);
+        // **The cap, and the slot the *Search the vault* row always holds.**
+        // See `win32_draw::visible_rows` and `super::populated_rows`: the last
+        // slot is that row whatever the list looks like, because a card whose
+        // few guesses are all wrong needs a way out, and this window cannot
+        // scroll to one. When candidates were dropped to fit, the same row
+        // says so -- a card that hid candidates silently is the defect this
+        // project keeps finding.
+        let (shown, truncated) = crate::win32_draw::visible_rows(candidates.len(), ROW_CAP);
+        TRUNCATED.store(truncated, Ordering::SeqCst);
         if let Ok(mut slot) = SHOWN.lock() {
             *slot = candidates[..shown].to_vec();
         }
@@ -1353,9 +1407,11 @@ mod win32 {
         } else if mode == MODE_PALETTE {
             ENTRIES.lock().map(|e| e.len()).unwrap_or(0).min(ROW_CAP)
         } else {
+            // The candidates, plus the *Search the vault* row that always
+            // follows them: `visible_rows` reserved its slot, so this is
+            // never more than `ROW_CAP`.
             let rows = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
-            let overflow = usize::from(OVERFLOWING.load(Ordering::SeqCst));
-            (rows + overflow).min(ROW_CAP)
+            (rows + 1).min(ROW_CAP)
         }
     }
 
@@ -1627,8 +1683,8 @@ mod win32 {
         }
         let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
         if index >= shown {
-            // The slot `win32_draw::visible_rows` spent so that a truncated
-            // list says it was truncated.
+            // The *Search the vault* row, which is the last row of every
+            // populated card -- see `super::populated_rows`.
             set_pending(Event::Overflow);
         } else {
             set_pending(Event::Chose(index));
@@ -1888,12 +1944,14 @@ mod win32 {
             }
             return;
         }
-        // The overflow row: the slot `win32_draw::visible_rows` spends so that
-        // a truncated list says it was truncated.
+        // The *Search the vault* row, drawn under every populated card's
+        // candidates. Its second line is the only place a truncated list is
+        // told it was truncated -- see `super::search_row_label`.
+        let (name, says) = super::search_row_label(TRUNCATED.load(Ordering::SeqCst));
         let row = Candidate {
             id: String::new(),
-            name: "Search the vault".to_string(),
-            username: "More accounts match than fit on this card".to_string(),
+            name: name.to_string(),
+            username: says.to_string(),
         };
         draw_row(hdc, rect, &row, state, fonts.name, fonts.username);
     }
@@ -2011,6 +2069,74 @@ mod card_tests {
             "`Send::All` types a Tab between two values; offered for an item that has only one, \
              it would type the password into whatever field followed the empty username"
         );
+    }
+
+    /// **Two wrong guesses must still have a way out.**
+    ///
+    /// Reported from use: "Fill from vault -- no search -- it shows two
+    /// options, both are miss, what do I do?". The matcher is loose on
+    /// purpose, so a short list of wrong guesses is an ordinary state, and the
+    /// card cannot be the one surface with no route into the vault's search.
+    #[test]
+    fn a_short_list_of_wrong_guesses_still_offers_the_search() {
+        let rows = populated_rows(2);
+        assert_eq!(
+            rows,
+            vec![
+                ListRow::Candidate(0),
+                ListRow::Candidate(1),
+                ListRow::SearchVault { truncated: false },
+            ],
+            "a two-candidate card offered no *Search the vault* row, so a user whose two offers              are both wrong can only dismiss the card"
+        );
+        // And the row tells the truth about why it is there: nothing was cut.
+        assert_eq!(
+            search_row_label(false).1,
+            empty_label(EmptyAction::SearchVault).1,
+            "the same action says two different things on the two cards"
+        );
+    }
+
+    /// **The truncation news survives the row becoming unconditional.**
+    ///
+    /// A cap that hides candidates without saying so is the defect this rule
+    /// exists to prevent. The row now does both jobs -- route and notice --
+    /// because the card has room for one row, not two.
+    #[test]
+    fn an_overflowing_list_still_says_it_was_cut_and_still_reaches_search() {
+        let rows = populated_rows(9);
+        assert_eq!(rows.len(), ROW_CAP, "the card has room for exactly {ROW_CAP} rows");
+        assert_eq!(
+            rows.last(),
+            Some(&ListRow::SearchVault { truncated: true }),
+            "the truncated card lost its route into the vault"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, ListRow::Candidate(_))).count(),
+            ROW_CAP - 1,
+            "the search row occupies one of the cap's slots; showing {ROW_CAP} candidates AND it              would be one row past the bottom of a card that cannot scroll"
+        );
+        assert_eq!(
+            search_row_label(true).1,
+            "More accounts match than fit on this card",
+            "the row is the only place the truncation is told now"
+        );
+    }
+
+    /// Every row the populated card plans is one the window has a control for
+    /// and the layout has a rectangle for.
+    #[test]
+    fn the_populated_cards_rows_all_fit_the_card() {
+        for candidates in 0..12 {
+            let rows = populated_rows(candidates);
+            assert!(
+                rows.len() <= ROW_CAP,
+                "{candidates} candidates planned {} rows onto a card with room for {ROW_CAP}",
+                rows.len()
+            );
+            let last = row_at(ROW_CAP, rows.len() - 1);
+            assert!(last.bottom() <= layout(ROW_CAP).list.bottom());
+        }
     }
 
     /// **The bound that makes a card with no scrolling honest.**
