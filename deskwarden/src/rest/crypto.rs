@@ -57,13 +57,22 @@
 //!
 //! # Scope
 //!
-//! Decryption only, and no I/O of any kind. There is no HTTP here, no API
-//! client, no login flow, and nothing in the running app calls this yet.
+//! Symmetric encryption and decryption, and no I/O of any kind. There is no
+//! HTTP here, no API client, no login flow, and nothing in the running app
+//! calls this yet.
+//!
+//! [`encrypt`] is the newest thing here and the only one that generates
+//! anything: a fresh OS-random IV per call, encrypt-then-MAC, PKCS#7. Its
+//! doc comment carries the reasoning, and it should be read alongside
+//! [`decrypt`]'s, because the two are one composition written in two places.
+//! Writing an `EncString` back out to `type.iv|ct|mac` is [`EncString`]'s
+//! `Display`. There is no *asymmetric* encryption: type 4 needs a public key
+//! this module does not hold.
 
 use aes::Aes256;
 use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
-use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::block_padding::{NoPadding, Pkcs7};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rsa::pkcs8::DecodePrivateKey;
@@ -71,7 +80,7 @@ use rsa::{Oaep, RsaPrivateKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::record::seal::base64_from;
+use crate::record::seal::{base64_from, base64_into};
 
 /// AES's block size, in bytes. The IV's length, and the granularity every
 /// CBC ciphertext has to be a whole number of.
@@ -85,6 +94,7 @@ const KEY_LEN: usize = 32;
 const SYMMETRIC_KEY_LEN: usize = KEY_LEN * 2;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
 // ---- errors ----------------------------------------------------------------
@@ -120,6 +130,17 @@ pub enum CryptoError {
     Padding,
     /// A decrypted key was not the length a key has to be.
     KeyLength { expected: usize, got: usize },
+    /// The operating system would not produce randomness, so no IV could be
+    /// generated and **nothing was encrypted**.
+    ///
+    /// A new arm rather than a reused one, and not an `expect`. Every other
+    /// failure here is a statement about data; this is a statement about the
+    /// machine, and the one thing that must never happen is for an encrypt
+    /// that could not get a fresh IV to fall back on a stale, derived or
+    /// constant one. Returning an error is the only behaviour that makes
+    /// that impossible to write by accident. It carries no detail from
+    /// [`getrandom`], which is a `Display` this module has not audited.
+    Rng,
     /// The RSA private key could not be read as PKCS#8 DER, or OAEP
     /// unwrapping failed. One arm for both on purpose: distinguishing them
     /// tells a caller which half of a secret was wrong.
@@ -140,6 +161,7 @@ impl std::fmt::Display for CryptoError {
             Self::KeyLength { expected, got } => {
                 write!(f, "decrypted key is {got} bytes, expected {expected}")
             }
+            Self::Rng => f.write_str("the operating system would not produce randomness"),
             Self::Rsa => f.write_str("RSA unwrapping failed"),
         }
     }
@@ -413,6 +435,51 @@ impl std::fmt::Debug for EncString {
     }
 }
 
+/// The wire form: `type.iv|ct|mac`, the exact text
+/// [`EncString::from_str`] parses.
+///
+/// # `Display`, not `Debug`, and the difference is deliberate
+///
+/// [`EncString`]'s `Debug` prints lengths only, because a `Debug` is what
+/// reaches a log line by accident. `Display` is what a caller asks for on
+/// purpose when it is about to put the value in a request body, and a
+/// ciphertext that cannot be written out is a ciphertext that cannot be
+/// stored. The two impls disagree on purpose; neither prints a plaintext or
+/// a key, which is the invariant that actually matters.
+///
+/// # Round-tripping is the contract
+///
+/// `EncString::from_str(&value.to_string()) == Ok(value)` for every value
+/// this module can construct, and
+/// `the_rendered_wire_string_parses_back_to_an_equal_value` holds it there.
+/// The parser refuses non-standard base64, a short IV and a ciphertext that
+/// is not a whole number of blocks; this writer emits standard padded base64
+/// through the same [`crate::record::seal`] encoder the parser's
+/// [`base64_from`] inverts, so the two cannot drift.
+impl std::fmt::Display for EncString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Built in one owned `String` rather than written piecewise into the
+        // formatter, because `base64_into` pushes into a `String` and this
+        // way the encoder is the single one in the crate.
+        let mut out = String::new();
+        match self {
+            Self::AesCbc256HmacSha256B64 { iv, ct, mac } => {
+                out.push_str("2.");
+                base64_into(&mut out, iv);
+                out.push('|');
+                base64_into(&mut out, ct);
+                out.push('|');
+                base64_into(&mut out, mac);
+            }
+            Self::Rsa2048OaepSha1B64 { ct } => {
+                out.push_str("4.");
+                base64_into(&mut out, ct);
+            }
+        }
+        f.write_str(&out)
+    }
+}
+
 /// The Bitwarden name of every `EncString` type this module refuses, so the
 /// refusal can say which format it saw.
 ///
@@ -565,6 +632,110 @@ fn strip_pkcs7(mut plain: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>, Cryp
     let keep = plain.len() - pad;
     plain.truncate(keep);
     Ok(plain)
+}
+
+// ---- symmetric encryption --------------------------------------------------
+
+/// Encrypts `plain` under `key` into a type-2 `EncString`.
+///
+/// The other half of [`decrypt`], and it is written to be read next to it:
+/// what that function verifies, this function must produce, and every
+/// property below exists because the reverse of it is invisible in a passing
+/// test and fatal in a real vault.
+///
+/// # A fresh random IV, every call, from the operating system
+///
+/// The IV is 16 bytes straight from [`getrandom`], which is the OS CSPRNG --
+/// `BCryptGenRandom` on Windows, `getrandom(2)` on Linux -- and is the same
+/// source [`crate::record::seal`] and [`crate::vault_disk_cache`] use for
+/// their nonces. It is **not** a counter, not derived from the key, not
+/// derived from the plaintext, and not a constant.
+///
+/// That is not a style preference. CBC's first block is
+/// `E(plaintext_block ^ iv)`, so two encryptions under one key with one IV
+/// produce identical leading ciphertext for exactly as long as the two
+/// plaintexts agree -- an observer who never breaks AES still learns that
+/// two vault items share a prefix, and, byte-block by byte-block, where they
+/// stop sharing it. A password changed from `hunter2` to `hunter3` is
+/// visibly a one-character edit.
+///
+/// A deterministic IV is also the failure that no round-trip test can see:
+/// `decrypt(encrypt(x)) == x` holds perfectly with the IV nailed to zero.
+/// The test that catches it is
+/// `two_encryptions_of_one_plaintext_differ_in_both_iv_and_ciphertext`,
+/// which encrypts the same bytes twice and asserts the two IVs *and* the two
+/// ciphertexts differ. It is a statistical test -- two OS-random 16-byte IVs
+/// collide with probability 2^-128 -- and it is statistical on purpose,
+/// because the alternative is a test-only hook that lets a caller choose the
+/// IV, and a seam in the randomness path is a worse thing to own than a test
+/// that could theoretically flake once per universe.
+///
+/// If the OS will not produce randomness, this returns [`CryptoError::Rng`]
+/// and encrypts nothing. There is no fallback IV, because every fallback IV
+/// anyone has ever written is a repeated one.
+///
+/// # Encrypt, then MAC -- in that order, over the ciphertext
+///
+/// AES-256-CBC under `key.enc` first; HMAC-SHA256 under `key.mac` over
+/// `iv || ct` second. Not MAC-then-encrypt, not MAC-over-the-plaintext, and
+/// not one key for both. [`decrypt`] verifies the MAC before it constructs a
+/// cipher, and that ordering is only worth anything if this side authenticated
+/// the *ciphertext* the other side is about to be handed. MAC-then-encrypt
+/// would leave `decrypt` no way to reject a forged ciphertext without first
+/// decrypting it, which is the padding oracle the module docs describe.
+///
+/// The IV is inside the MAC, so a flipped IV byte -- which in CBC flips the
+/// corresponding bit of the *first plaintext block* and nothing else -- is
+/// caught rather than silently delivered.
+///
+/// # PKCS#7, including the block that looks redundant
+///
+/// The plaintext is padded to a whole number of blocks, and an input that is
+/// already an exact multiple of 16 gains a **full extra block** of `0x10`
+/// bytes. That is not an inefficiency to special-case away: without it the
+/// last byte of a block-aligned plaintext would be indistinguishable from a
+/// padding length, and [`strip_pkcs7`] would truncate real data. Length 0 is
+/// therefore one block, not zero -- which also satisfies the parser's refusal
+/// of an empty ciphertext.
+///
+/// # What is wiped
+///
+/// The padded copy of the plaintext lives in a [`Zeroizing`] buffer, in the
+/// module's house style: a padded second copy of a password left for the
+/// allocator is a second home for it that nothing wipes. (The cipher encrypts
+/// in place, so by the time that buffer is dropped it holds ciphertext -- the
+/// `Zeroizing` covers the window between the copy and the encryption, which
+/// is the window a crash dump would catch it in.)
+///
+/// # Type 2 only
+///
+/// There is no `kind` parameter. Type 4 is RSA and needs a *public* key,
+/// which this module does not hold; the refused types are refused for
+/// [`REFUSED_TYPES`]'s reasons and writing one would be a downgrade this
+/// code should not be able to express. A function that can only produce the
+/// one good format cannot be talked into producing a bad one.
+pub fn encrypt(key: &SymmetricKey, plain: &[u8]) -> Result<EncString, CryptoError> {
+    let mut iv = [0u8; BLOCK];
+    getrandom::getrandom(&mut iv).map_err(|_| CryptoError::Rng)?;
+
+    // One whole block of headroom, always -- `BLOCK - len % BLOCK` is in
+    // `1..=BLOCK`, never 0, which is PKCS#7's rule and the reason a
+    // block-aligned input grows by a full block.
+    let padded = plain.len() + (BLOCK - plain.len() % BLOCK);
+    let mut buffer = Zeroizing::new(vec![0u8; padded]);
+    buffer[..plain.len()].copy_from_slice(plain);
+    let ct = Aes256CbcEnc::new((&*key.enc).into(), (&iv).into())
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
+        .expect("the buffer is the padded length by construction")
+        .to_vec();
+
+    let mut hmac = <HmacSha256 as Mac>::new_from_slice(&*key.mac)
+        .expect("HMAC accepts a key of any length");
+    hmac.update(&iv);
+    hmac.update(&ct);
+    let mac = hmac.finalize().into_bytes().into();
+
+    Ok(EncString::AesCbc256HmacSha256B64 { iv, ct, mac })
 }
 
 // ---- the two unwraps -------------------------------------------------------
@@ -1645,6 +1816,224 @@ pub mod tests {
             ],
             "the LAST 32 bytes are not the MAC key"
         );
+    }
+
+    // ---- encryption -------------------------------------------------------
+
+    /// A key whose two halves are different, so a test cannot pass by using
+    /// the encryption key where the MAC key belongs.
+    fn encrypt_test_key() -> SymmetricKey {
+        let mut bytes = [0u8; SYMMETRIC_KEY_LEN];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("64 fits in a byte");
+        }
+        key_from_64(&bytes)
+    }
+
+    /// The round trip, at the four lengths where PKCS#7 and CBC can each go
+    /// wrong differently: nothing at all, one exact block, an exact multiple
+    /// of the block size (where the padding block is entirely padding), and
+    /// something long enough to cross many blocks at a non-aligned length.
+    #[test]
+    fn encrypt_round_trips_through_this_modules_own_decrypt() {
+        let key = encrypt_test_key();
+        let cases: [Vec<u8>; 4] = [
+            Vec::new(),
+            b"sixteen bytes!!!".to_vec(),
+            b"exactly two whole blocks of it..".to_vec(),
+            (0..1000u32).map(|i| u8::try_from(i % 251).expect("under 256")).collect(),
+        ];
+        for plain in cases {
+            // The fixture must keep covering both sides of the boundary,
+            // since block-aligned input is the case PKCS#7 is easy to get
+            // wrong on.
+            assert!(
+                [0usize, 16, 32, 1000].contains(&plain.len()),
+                "the fixture lengths drifted"
+            );
+            let enc = encrypt(&key, &plain).expect("the OS has randomness");
+            let EncString::AesCbc256HmacSha256B64 { ref ct, .. } = enc else {
+                panic!("encrypt produced something other than type 2");
+            };
+            assert!(
+                ct.len() > plain.len() && ct.len() % BLOCK == 0,
+                "PKCS#7 must always add between one and {BLOCK} bytes, at length {}",
+                plain.len()
+            );
+            let back = decrypt(&key, &enc).expect("what this module sealed, it opens");
+            assert_eq!(
+                back.to_vec(),
+                plain,
+                "the round trip lost the plaintext at {} bytes",
+                plain.len()
+            );
+        }
+    }
+
+    /// **The test the IV exists for.**
+    ///
+    /// A fixed IV, an IV derived from the key, or an IV derived from the
+    /// plaintext all round-trip perfectly and all leak the relationship
+    /// between two ciphertexts. The only thing that separates them from a
+    /// correct implementation is that encrypting one plaintext twice under
+    /// one key gives two different answers.
+    ///
+    /// Statistical rather than exact, and deliberately so: pinning the IV
+    /// would need a test-only hook in the randomness path, which this crate
+    /// bans and which would be the very seam an attacker-facing bug hides
+    /// behind. Two OS-random 16-byte values collide with probability 2^-128,
+    /// which is not a flake anyone will see.
+    ///
+    /// Both halves are asserted. Equal IVs catch a constant or derived IV;
+    /// equal ciphertexts would additionally catch an IV that varies but is
+    /// not actually fed into the cipher.
+    #[test]
+    fn two_encryptions_of_one_plaintext_differ_in_both_iv_and_ciphertext() {
+        let key = encrypt_test_key();
+        let plain = b"the same plaintext, twice, under the same key";
+
+        let first = encrypt(&key, plain).expect("randomness");
+        let second = encrypt(&key, plain).expect("randomness");
+
+        let (
+            EncString::AesCbc256HmacSha256B64 { iv: iv_a, ct: ct_a, mac: mac_a },
+            EncString::AesCbc256HmacSha256B64 { iv: iv_b, ct: ct_b, mac: mac_b },
+        ) = (&first, &second)
+        else {
+            panic!("encrypt produced something other than type 2");
+        };
+
+        assert_ne!(iv_a, iv_b, "the IV is fixed or derived -- it must be fresh OS randomness");
+        assert_ne!(ct_a, ct_b, "two encryptions produced the same ciphertext");
+        assert_ne!(mac_a, mac_b, "the MAC does not vary with the IV");
+        assert_eq!(ct_a.len(), ct_b.len(), "one plaintext, two lengths");
+
+        // And both still open, so the difference is the IV and not damage.
+        assert_eq!(decrypt(&key, &first).expect("opens").to_vec(), plain.to_vec());
+        assert_eq!(decrypt(&key, &second).expect("opens").to_vec(), plain.to_vec());
+    }
+
+    /// Many IVs, all distinct: one pair differing could in principle be luck
+    /// with a badly seeded counter that happens to increment; a run of them
+    /// being pairwise distinct will not be.
+    #[test]
+    fn every_iv_in_a_run_of_encryptions_is_distinct() {
+        let key = encrypt_test_key();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let enc = encrypt(&key, b"x").expect("randomness");
+            let EncString::AesCbc256HmacSha256B64 { iv, .. } = enc else {
+                panic!("not type 2");
+            };
+            assert!(seen.insert(iv), "an IV repeated within 64 encryptions");
+        }
+        assert_eq!(seen.len(), 64);
+    }
+
+    /// The MAC covers the ciphertext: flip one bit of it and `decrypt`
+    /// refuses **before** decrypting anything.
+    #[test]
+    fn a_tampered_ciphertext_is_refused_with_a_mac_mismatch() {
+        let key = encrypt_test_key();
+        let enc = encrypt(&key, b"a value worth forging").expect("randomness");
+        let EncString::AesCbc256HmacSha256B64 { iv, mut ct, mac } = enc else {
+            panic!("not type 2");
+        };
+        ct[0] ^= 0x01;
+        assert_eq!(
+            decrypt(&key, &EncString::AesCbc256HmacSha256B64 { iv, ct, mac }),
+            Err(CryptoError::MacMismatch)
+        );
+    }
+
+    /// The MAC covers the **IV** too, which is the half that is easy to leave
+    /// out. In CBC a flipped IV bit flips the same bit of the first plaintext
+    /// block and corrupts nothing else, so a MAC over the ciphertext alone
+    /// would hand the caller quietly altered data instead of an error.
+    #[test]
+    fn a_tampered_iv_is_refused_with_a_mac_mismatch() {
+        let key = encrypt_test_key();
+        let enc = encrypt(&key, b"a value worth forging").expect("randomness");
+        let EncString::AesCbc256HmacSha256B64 { mut iv, ct, mac } = enc else {
+            panic!("not type 2");
+        };
+        iv[0] ^= 0x01;
+        assert_eq!(
+            decrypt(&key, &EncString::AesCbc256HmacSha256B64 { iv, ct, mac }),
+            Err(CryptoError::MacMismatch)
+        );
+    }
+
+    /// Control for the two above: without the tampering, the same assembly
+    /// opens. Otherwise both tests would pass against an `EncString` that was
+    /// broken for some other reason entirely.
+    #[test]
+    fn the_untampered_reassembly_still_opens() {
+        let key = encrypt_test_key();
+        let enc = encrypt(&key, b"a value worth forging").expect("randomness");
+        let EncString::AesCbc256HmacSha256B64 { iv, ct, mac } = enc else { panic!("not type 2") };
+        let rebuilt = EncString::AesCbc256HmacSha256B64 { iv, ct, mac };
+        assert_eq!(
+            decrypt(&key, &rebuilt).expect("untampered").to_vec(),
+            b"a value worth forging".to_vec()
+        );
+    }
+
+    /// A wrong MAC key is a `MacMismatch`, not a decryption -- the MAC is a
+    /// real check and not a checksum of the ciphertext alone.
+    #[test]
+    fn a_ciphertext_from_another_key_does_not_open() {
+        let enc = encrypt(&encrypt_test_key(), b"someone else's secret").expect("randomness");
+        let other = key_from_64(&[7u8; SYMMETRIC_KEY_LEN]);
+        assert_eq!(decrypt(&other, &enc), Err(CryptoError::MacMismatch));
+    }
+
+    /// [`EncString`]'s `Display` and its `FromStr` are inverses, for both
+    /// variants. This is the property the HTTP layer will rely on when it
+    /// puts an encrypted field in a request body.
+    #[test]
+    fn the_rendered_wire_string_parses_back_to_an_equal_value() {
+        let key = encrypt_test_key();
+        for len in [0usize, 1, 15, 16, 17, 32, 255] {
+            let enc = encrypt(&key, &vec![0xa5u8; len]).expect("randomness");
+            let text = enc.to_string();
+            assert!(text.starts_with("2."), "a type-2 string must say so: {text}");
+            assert_eq!(text.matches('|').count(), 2, "three parts, two separators");
+            let parsed = EncString::from_str(&text).expect("what Display wrote, FromStr reads");
+            assert!(parsed == enc, "the round trip through the wire form changed the value");
+            assert_eq!(
+                decrypt(&key, &parsed).expect("still opens").to_vec(),
+                vec![0xa5u8; len]
+            );
+        }
+
+        let rsa = EncString::Rsa2048OaepSha1B64 { ct: vec![0xab; 256] };
+        let text = rsa.to_string();
+        assert!(text.starts_with("4."), "a type-4 string must say so");
+        assert!(!text.contains('|'), "type 4 has no `|`-separated parts");
+        assert_eq!(EncString::from_str(&text), Ok(rsa));
+    }
+
+    /// The rendered parts are exactly the bytes, base64'd -- checked against
+    /// the fixture-built text of [`nist_backed_enc_string`], whose three
+    /// parts come from NIST's vector and this module's own MAC rather than
+    /// from `Display` itself.
+    #[test]
+    fn display_renders_the_same_text_the_fixture_builder_does() {
+        let (_, text) = nist_backed_enc_string(&[9u8; 32]);
+        let parsed = EncString::from_str(&text).expect("well formed");
+        assert_eq!(parsed.to_string(), text);
+    }
+
+    /// `Debug` still redacts after `Display` was added. The two must not be
+    /// confused with each other: see [`crate::debug_leak_guard`].
+    #[test]
+    fn debug_still_prints_lengths_and_display_still_prints_the_wire_form() {
+        let enc = encrypt(&encrypt_test_key(), b"secret").expect("randomness");
+        let debug = format!("{enc:?}");
+        assert!(debug.contains("ciphertext bytes"), "Debug stopped redacting: {debug}");
+        assert!(!debug.contains('|'), "Debug is printing the wire form");
+        assert!(enc.to_string().contains('|'), "Display is not printing the wire form");
     }
 
     /// What the five vectors above still do **not** pin, stated as a test so
