@@ -583,7 +583,7 @@ mod win32 {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
-        PeekMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+        PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
         TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
         ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG, PM_REMOVE,
@@ -1313,8 +1313,20 @@ mod win32 {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // No thread quit is posted here, deliberately. `close` calls
+                // `DestroyWindow`, which dispatches this message SYNCHRONOUSLY on
+                // the calling thread, and this window is opened on the thread
+                // that goes on to run egui windows (`unlock_from_the_locked_card`
+                // returns into `resume_fill_after_unlock`, which opens the
+                // autofill overlay and the preflight window, both
+                // `eframe::run_native` on this same thread). A quit posted here
+                // is never drained -- `next` has already returned and no pump
+                // runs before the caller acts -- so the next `run_native` would
+                // take it out of `GetMessageW`, leave its loop before drawing,
+                // and silently return its default answer. `GONE` above is what
+                // `next` actually reads; a quit posted from OUTSIDE is still
+                // honoured by `next`'s own `WM_QUIT` branch.
                 GONE.store(true, Ordering::SeqCst);
-                PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(window, msg, wparam, lparam),
@@ -2271,5 +2283,119 @@ mod tests {
                 "`{family}` is not a bundled face"
             );
         }
+    }
+}
+
+/// The prompt's window procedure must not post a THREAD quit.
+///
+/// No test can open the real window, so this is a source pin in this crate's
+/// established shape ([`crate::app`]'s wiring tests, [`crate::job_object`]'s
+/// scanners): it reads this file back with `include_str!`, cuts the
+/// `#[cfg(test)]` modules away so only what SHIPS is scanned, strips `//`
+/// comments so the explanation at the `WM_DESTROY` arm may name the call it
+/// forbids, and asserts the call is absent.
+///
+/// **Normalised first.** This is a CRLF checkout with no `.gitattributes`;
+/// slicing or comparing lines without trimming the carriage return makes the
+/// cut a no-op and the whole pin vacuous. The control assertions below are
+/// what prove it did not silently scan nothing, or the wrong half.
+#[cfg(test)]
+mod no_thread_quit_pin {
+    // Split across two literals, on ONE line, in this crate's idiom:
+    // `include_str!` pulls this module in too, so a whole needle would match
+    // its own declaration, and a needle with a newline in it is vacuous on one
+    // of the two possible checkouts.
+    const FORBIDDEN: &str = concat!("PostQuit", "Message");
+    const DESTROY_ARM: &str = concat!("WM_DESTROY", " =>");
+
+    /// `source` with CRLF normalised, every top-level `#[cfg(test)]` module
+    /// removed, and every `//` comment stripped.
+    ///
+    /// The module cut is line-based and anchored at column zero: a
+    /// `#[cfg(test)]` on its own unindented line, up to and including the next
+    /// unindented `}`. Every gated module in this file has that shape, and
+    /// `the_cut_really_discards_something` checks that rather than assuming it.
+    fn production_only(source: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in source.lines() {
+            let flat = line.trim_end();
+            if !skipping && flat == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if flat == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            // Comments only: a `//` inside a string literal would be cut too,
+            // but nothing this pin reads about lives in one, and cutting too
+            // much can only make the scan MISS a comment, never invent a call.
+            let code = match flat.find("//") {
+                Some(at) => &flat[..at],
+                None => flat,
+            };
+            out.push_str(code);
+            out.push('\n');
+        }
+        assert!(!skipping, "a gated module never closed at column zero; the cut is unreliable");
+        out
+    }
+
+    fn source() -> String {
+        production_only(include_str!("unlock_prompt.rs"))
+    }
+
+    /// Control: the cut discarded something.
+    ///
+    /// A `production_only` that returned its input unchanged -- or an empty
+    /// string -- would make the pin below pass for the wrong reason.
+    #[test]
+    fn the_cut_really_discards_something() {
+        let whole = include_str!("unlock_prompt.rs");
+        let kept = source();
+        assert!(!kept.is_empty(), "the cut kept nothing at all; the pin would be vacuous");
+        assert!(
+            kept.len() < whole.len(),
+            "the cut discarded nothing, so the gated modules -- including this one,              which names the forbidden call -- are still being scanned"
+        );
+        // This module's own declaration is inside the half that was cut.
+        assert!(
+            !kept.contains("mod no_thread_quit_pin"),
+            "this pin's own module survived the cut, so it would scan itself"
+        );
+    }
+
+    /// Control: the half that was KEPT is the window procedure's.
+    ///
+    /// If the cut ever ate the production half instead, the pin would pass on
+    /// an empty-ish string forever. The `WM_DESTROY` arm is the exact line the
+    /// rule is about, so requiring it proves the scan is looking at it.
+    #[test]
+    fn the_kept_half_still_contains_the_destroy_arm() {
+        assert!(
+            source().contains(DESTROY_ARM),
+            "the kept half no longer contains the `WM_DESTROY` arm, so the pin below              is not scanning the code it exists to guard"
+        );
+    }
+
+    /// Control: the scan can see the call when it is really there.
+    #[test]
+    fn the_scan_would_notice_the_call() {
+        let planted = production_only(concat!("    PostQuit", "Message(0);\n"));
+        assert!(planted.contains(FORBIDDEN), "the scanner cannot see a call that is present");
+        // ...and not when it is only mentioned in a comment.
+        let commented = production_only(concat!("    // PostQuit", "Message(0);\n"));
+        assert!(!commented.contains(FORBIDDEN), "the comment strip does not work");
+    }
+
+    #[test]
+    fn the_unlock_prompt_never_posts_a_thread_quit() {
+        assert!(
+            !source().contains(FORBIDDEN),
+            "the unlock prompt posts a thread quit. `close` destroys this window              SYNCHRONOUSLY on the calling thread, and that thread goes on to run              egui windows: `unlock_from_the_locked_card` returns into              `resume_fill_after_unlock`, which opens the autofill overlay and the              preflight window. Nothing drains the quit in between, so the next              `eframe::run_native` takes it out of `GetMessageW`, leaves its loop              BEFORE it draws, and returns its default answer -- the fill the user              just unlocked for silently does nothing. `GONE` is what `next` reads;              the quit is redundant as well as harmful."
+        );
     }
 }
