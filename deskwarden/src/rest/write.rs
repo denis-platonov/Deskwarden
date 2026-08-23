@@ -47,19 +47,31 @@
 //! in place, and encrypting that again would store a doubly-wrapped value
 //! that nothing can ever read.
 //!
-//! [`reencrypt_in_place`] therefore leaves any value that still parses as an
-//! [`EncString`] exactly as it found it. That is a heuristic and it is named
-//! as one, but it is a safe one in both directions: a real plaintext that
-//! happened to be `2.<16 bytes b64>|<whole blocks b64>|<32 bytes b64>` is not
-//! a value a human has ever typed, and the failure mode of guessing wrong the
-//! other way -- double-encrypting a password history entry -- is data the user
-//! cannot recover.
+//! **This is not decided by looking at the value.** An earlier version of
+//! [`reencrypt_in_place`] left alone anything that still parsed as an
+//! [`crate::rest::crypto::EncString`], and that was wrong in the one direction that matters: a
+//! *real* secret whose plaintext happens to have `EncString` shape -- a value
+//! beginning `2.` with two `|` separators and base64-looking parts, which a
+//! password generator can produce and a user can paste -- would have been
+//! skipped and **written to the server in the clear**. The two failure
+//! directions are not symmetric. A double-encrypted history entry is visible
+//! and recoverable; an exposed password is neither.
+//!
+//! So the write path is *told*, not left to infer.
+//! [`crate::rest::sync::DecryptedItem`] carries the paths `sync` recorded a
+//! decryption failure for -- which is exactly the set of values whose
+//! ciphertext is still in place -- and [`reencrypt_in_place`] consults that
+//! record and nothing else. An item whose record is empty (one this crate
+//! composed itself, via
+//! [`DecryptedItem::newly_composed`](crate::rest::sync::DecryptedItem::newly_composed))
+//! has every in-place value encrypted, which is the direction that cannot
+//! leak.
 //!
 //! # No plaintext is logged, ever
 //!
 //! Nothing here has a `Debug` of its own; the value it returns is a
 //! `serde_json::Value` full of ciphertext, and
-//! [`EncString`]'s `Display` -- which this module calls, because that is how a
+//! [`crate::rest::crypto::EncString`]'s `Display` -- which this module calls, because that is how a
 //! ciphertext is written down -- prints the wire form. **Do not log a mapped
 //! cipher.** The intermediate plaintexts are borrowed from the `Zeroizing`
 //! fields they already live in; this module makes no owned plaintext copy of
@@ -68,14 +80,54 @@
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::rest::crypto::{CryptoError, EncString, SymmetricKey, encrypt};
-use crate::rest::sync::{CipherKeys, VaultKeys};
+use crate::rest::crypto::{CryptoError, SymmetricKey, encrypt};
+use crate::rest::sync::{CipherKeys, DecryptedItem, VaultKeys};
 use crate::vault_bridge::{
     CardData, IdentityData, LoginData, SshKeyData, UriEntry, VaultField, VaultItem,
 };
 
 /// A `serde_json` object, spelled once -- as in [`crate::rest::sync`].
 type Object = serde_json::Map<String, Value>;
+
+/// A cipher body **this module produced**, and the only thing
+/// [`crate::rest::api`] will send to `POST /api/ciphers` or
+/// `PUT /api/ciphers/{id}`.
+///
+/// # Why this is a type and not a `serde_json::Value`
+///
+/// `PUT /api/ciphers/{id}` **replaces the whole cipher**: whatever the body
+/// does not carry, the server does not keep. A body assembled from the fields
+/// this crate models would therefore delete every field it does not model --
+/// attachments, `passwordHistory`, `fido2Credentials`, and whatever the next
+/// server version adds -- from the user's real vault, irreversibly and
+/// silently, on the first edit.
+///
+/// [`encrypt_item`] is the one function that builds a body the right way
+/// (over [`VaultItem::other`], never from the model), and while the write
+/// endpoints took a bare `Value` nothing said so except a doc comment. The
+/// field below is private and the only construction of this type in the crate
+/// is inside [`encrypt_item`], so "this body came from the mapper" is now
+/// something the compiler checks rather than something a reviewer remembers.
+/// `mapped_cipher_is_constructed_only_by_the_mapper` pins the half a private
+/// field cannot state on its own.
+///
+/// # No `Debug`, deliberately
+///
+/// This holds a whole cipher's worth of ciphertext, written with
+/// [`crate::rest::crypto::EncString`]'s `Display` -- which prints the wire
+/// form. Nothing should ever format one, so nothing can.
+pub struct MappedCipher {
+    body: Value,
+}
+
+impl MappedCipher {
+    /// The JSON to send. `pub(crate)` and returning a borrow: a caller can
+    /// hand it to `ureq`, which is the entire intended use, and cannot get an
+    /// owned `Value` back out to edit and re-send.
+    pub(crate) fn body(&self) -> &Value {
+        &self.body
+    }
+}
 
 /// One [`VaultItem`], as a server-ready cipher body.
 ///
@@ -85,13 +137,22 @@ type Object = serde_json::Map<String, Value>;
 /// it; on a create the caller is expected to hold an item whose `id` is empty,
 /// and an empty `id` is omitted rather than sent as `""`.
 ///
+/// Takes a [`DecryptedItem`] rather than a bare [`VaultItem`] because the two
+/// in-place values (`login.uri`, `passwordHistory[].password`) can only be
+/// handled correctly by an inverse that knows which of them actually
+/// decrypted. See the module docs.
+///
 /// # Errors
 ///
 /// [`CryptoError`] if the cipher's key cannot be worked out (an organisation
 /// this session has no key for, or a `cipher.key` that does not unwrap), or
 /// if any encryption fails. Never partial: on an error nothing has been sent
 /// anywhere, because nothing here sends.
-pub fn encrypt_item(item: &VaultItem, keys: &VaultKeys) -> Result<Value, CryptoError> {
+pub fn encrypt_item(
+    decrypted: &DecryptedItem,
+    keys: &VaultKeys,
+) -> Result<MappedCipher, CryptoError> {
+    let item: &VaultItem = &decrypted.item;
     // The retained JSON is the *base*, and everything below lays over it.
     // This ordering is the whole requirement of this file: build from the
     // remainder, never from the model.
@@ -103,7 +164,7 @@ pub fn encrypt_item(item: &VaultItem, keys: &VaultKeys) -> Result<Value, CryptoE
     let cipher_keys = CipherKeys::for_cipher(keys, &out)?;
     let key = cipher_keys.key();
 
-    reencrypt_password_history(key, &mut out)?;
+    reencrypt_password_history(key, &mut out, decrypted)?;
 
     if item.id.is_empty() {
         out.remove("id");
@@ -133,12 +194,12 @@ pub fn encrypt_item(item: &VaultItem, keys: &VaultKeys) -> Result<Value, CryptoE
     }
     out.insert("fields".to_string(), Value::Array(fields));
 
-    put_object(&mut out, "login", item.login.as_ref(), |l| encrypt_login(key, l))?;
+    put_object(&mut out, "login", item.login.as_ref(), |l| encrypt_login(key, l, decrypted))?;
     put_object(&mut out, "card", item.card.as_ref(), |c| encrypt_card(key, c))?;
     put_object(&mut out, "identity", item.identity.as_ref(), |i| encrypt_identity(key, i))?;
     put_object(&mut out, "sshKey", item.ssh_key.as_ref(), |s| encrypt_ssh_key(key, s))?;
 
-    Ok(Value::Object(out))
+    Ok(MappedCipher { body: Value::Object(out) })
 }
 
 /// Writes one optional type object, or removes it.
@@ -197,12 +258,18 @@ fn encrypt_field(key: &SymmetricKey, field: &VaultField) -> Result<Object, Crypt
     Ok(out)
 }
 
-fn encrypt_login(key: &SymmetricKey, login: &LoginData) -> Result<Object, CryptoError> {
+fn encrypt_login(
+    key: &SymmetricKey,
+    login: &LoginData,
+    decrypted: &DecryptedItem,
+) -> Result<Object, CryptoError> {
     let mut out = login.other.clone();
     // The API's back-compat duplicate of `uris[0].uri`, which `sync`
     // decrypted in place. See the module docs on why this is not simply
-    // re-encrypted unconditionally.
-    reencrypt_in_place(key, &mut out, "uri")?;
+    // re-encrypted unconditionally. The path is `sync`'s own spelling for
+    // this field, and the two have to stay in step -- `the_two_in_place_paths_
+    // are_spelled_the_same_on_both_sides` is what makes a rename fail.
+    reencrypt_in_place(key, &mut out, "uri", "login.uri", decrypted)?;
 
     put_text(&mut out, "username", login.username.as_deref(), key)?;
     put_text(&mut out, "password", login.password.as_deref().map(String::as_str), key)?;
@@ -278,33 +345,57 @@ fn encrypt_ssh_key(key: &SymmetricKey, ssh: &SshKeyData) -> Result<Object, Crypt
 ///
 /// `lastUsedDate` is plaintext on this wire, was left alone on the way in, and
 /// is left alone here.
-fn reencrypt_password_history(key: &SymmetricKey, out: &mut Object) -> Result<(), CryptoError> {
+fn reencrypt_password_history(
+    key: &SymmetricKey,
+    out: &mut Object,
+    decrypted: &DecryptedItem,
+) -> Result<(), CryptoError> {
     let Some(entries) = out.get_mut("passwordHistory").and_then(|v| v.as_array_mut()) else {
         return Ok(());
     };
-    for entry in entries.iter_mut() {
+    for (i, entry) in entries.iter_mut().enumerate() {
         let Some(object) = entry.as_object_mut() else { continue };
-        reencrypt_in_place(key, object, "password")?;
+        // The index is part of the path because `sync` recorded it that way:
+        // one broken entry in a history of five must not exempt the other
+        // four from being re-encrypted.
+        let path = format!("passwordHistory[{i}].password");
+        reencrypt_in_place(key, object, "password", &path, decrypted)?;
     }
     Ok(())
 }
 
-/// Encrypts `object[wire]` back into ciphertext -- unless it already is
-/// ciphertext.
+/// Encrypts `object[wire]` back into ciphertext -- unless [`crate::rest::sync`]
+/// recorded that `path` never decrypted, in which case what is there is still
+/// the server's own ciphertext and is left exactly as it was found.
 ///
-/// See the module docs for why the [`EncString`] parse is the guard and why
-/// erring in this direction is the safe one. A value that is absent or is not
-/// a JSON string is left alone: there is nothing to encrypt and inventing
-/// something would be worse.
+/// # The guard is a recorded fact, not a look at the value
+///
+/// It would be easy, and it was once done, to ask instead whether the value
+/// still parses as an [`crate::rest::crypto::EncString`]. That reads the
+/// *secret* to decide how to treat the secret, and it gets the answer wrong
+/// for a plaintext that happens to have `EncString` shape -- by writing it to
+/// the server unencrypted. `path` comes from
+/// [`DecryptedItem::is_still_encrypted`], which answers from what the decrypt
+/// pass actually did.
+///
+/// A path the record does not mention is encrypted. That is the safe default
+/// in both the case it is meant for (a value that decrypted) and the case it
+/// is not (an item this crate composed, or a record that has gone stale): the
+/// worst outcome is a doubly-wrapped value the user can see and fix.
+///
+/// A value that is absent or is not a JSON string is left alone: there is
+/// nothing to encrypt and inventing something would be worse.
 fn reencrypt_in_place(
     key: &SymmetricKey,
     object: &mut Object,
     wire: &str,
+    path: &str,
+    decrypted: &DecryptedItem,
 ) -> Result<(), CryptoError> {
     let Some(text) = object.get(wire).and_then(|v| v.as_str()) else { return Ok(()) };
-    if text.parse::<EncString>().is_ok() {
-        // Still ciphertext: this field never decrypted on the way in, and
-        // encrypting it again would bury it.
+    if decrypted.is_still_encrypted(path) {
+        // This field never decrypted on the way in, so the ciphertext is
+        // still sitting here and encrypting it again would bury it.
         return Ok(());
     }
     // Borrowed into a wiped buffer rather than handed to `encrypt` straight
@@ -317,12 +408,20 @@ fn reencrypt_in_place(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::rest::crypto::EncString;
     use crate::rest::crypto::Kdf;
     use crate::rest::crypto::master_key;
     use crate::rest::crypto::tests::{key_from_64, seal};
     use crate::rest::sync::{SyncResponse, decrypt_vault};
+
+    /// The mapped body as JSON, for the assertions below. [`MappedCipher`]
+    /// deliberately hands out only a borrow, and every test here wants to
+    /// index into it or feed it back through the read path.
+    fn mapped(item: &DecryptedItem, keys: &VaultKeys) -> Value {
+        encrypt_item(item, keys).expect("the item maps").body().clone()
+    }
 
     /// The 64 bytes of a deterministic fixture key. Same construction as
     /// `sync`'s own fixtures, so the two files' fixtures are the same keys.
@@ -356,7 +455,7 @@ mod tests {
     /// Decrypts a one-cipher sync and hands back the item plus the keys, so
     /// every test below round-trips through the *real* read path rather than
     /// hand-building a `VaultItem`.
-    fn round_trip_in(cipher: Value) -> (VaultItem, VaultKeys) {
+    fn round_trip_in(cipher: Value) -> (DecryptedItem, VaultKeys) {
         let (master, protected) = account();
         let payload = serde_json::json!({
             "profile": { "key": protected },
@@ -433,6 +532,29 @@ mod tests {
         })
     }
 
+    /// A real [`MappedCipher`] for [`crate::rest::api`]'s tests.
+    ///
+    /// It exists because those tests *cannot* hand-build one -- which is the
+    /// whole point of the type -- and building one the honest way means going
+    /// through the mapper. `pub(crate)` on a `#[cfg(test)]` module, in the
+    /// shape `crypto::tests` already established for its key helpers.
+    ///
+    /// The id matches the path `api`'s update test uses, and the password is
+    /// the plaintext those tests search the wire for and must never find.
+    pub(crate) fn a_mapped_cipher() -> MappedCipher {
+        let k = key(1);
+        let cipher = serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "type": 1,
+            "name": enc(&k, "Example"),
+            "favorite": false,
+            "reprompt": 1,
+            "login": { "password": enc(&k, "hunter2-never-on-the-wire") },
+        });
+        let (item, keys) = round_trip_in(cipher);
+        encrypt_item(&item, &keys).expect("the fixture maps")
+    }
+
     /// **The acceptance test for this module.**
     ///
     /// A wire cipher carrying fields this crate does not model goes through
@@ -443,7 +565,7 @@ mod tests {
     fn an_unmodelled_field_survives_a_decrypt_encrypt_round_trip() {
         let original = cipher_with_unmodelled_fields();
         let (item, keys) = round_trip_in(original.clone());
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
 
         let before = original.as_object().expect("an object");
         let after = written.as_object().expect("an object");
@@ -511,7 +633,7 @@ mod tests {
             },
         });
         let (item, keys) = round_trip_in(cipher);
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
 
         let login = written.get("login").and_then(|v| v.as_object()).expect("a login");
         assert_eq!(login.get("unknownLoginKey"), Some(&serde_json::json!({"a": 1})));
@@ -542,7 +664,7 @@ mod tests {
     #[test]
     fn every_modelled_secret_is_written_as_ciphertext_and_reads_back_the_same() {
         let (item, keys) = round_trip_in(cipher_with_unmodelled_fields());
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         let rendered = serde_json::to_string(&written).expect("serializable");
         for plaintext in ["Example", "user@example.invalid", "hunter2", "https://example.invalid"] {
             assert!(
@@ -567,7 +689,7 @@ mod tests {
     #[test]
     fn no_two_encrypted_fields_share_an_iv() {
         let (item, keys) = round_trip_in(cipher_with_unmodelled_fields());
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         let login = written.get("login").and_then(|v| v.as_object()).expect("a login");
         let ivs: Vec<&str> = [
             written.get("name").and_then(|v| v.as_str()),
@@ -603,7 +725,7 @@ mod tests {
         assert_eq!(item.login.as_ref().expect("a login").username.as_deref(), Some(""));
         assert!(item.login.as_ref().expect("a login").password.is_none());
 
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         let login = written.get("login").and_then(|v| v.as_object()).expect("a login");
         assert!(!login.contains_key("password"), "an absent password became a written one");
         assert!(!login.contains_key("totp"), "an absent totp became a written one");
@@ -632,7 +754,7 @@ mod tests {
             ],
         });
         let (item, keys) = round_trip_in(cipher);
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         let entry = written
             .get("passwordHistory")
             .and_then(|v| v.as_array())
@@ -689,7 +811,7 @@ mod tests {
         assert_eq!(vault.failures.len(), 1, "the fixture was supposed to fail one field");
         let item = vault.items.into_iter().next().expect("one item");
 
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         let kept = written
             .get("passwordHistory")
             .and_then(|v| v.as_array())
@@ -705,6 +827,167 @@ mod tests {
                 .expect("the original"),
             "an undecryptable history entry was encrypted a second time"
         );
+    }
+
+    /// **Risk 1, and the exact defect this file was hardened against.**
+    ///
+    /// A real secret whose *plaintext* has `EncString` shape. The old guard
+    /// asked whether the value parsed as an `EncString` and, for this one,
+    /// answered "still ciphertext, leave it" -- writing the user's previous
+    /// password and their URI to the server in the clear.
+    ///
+    /// Both in-place paths are exercised in one item so neither can be
+    /// satisfied by the other's rule, and the first assertion is the control
+    /// that makes the rest mean something: the plaintext really does parse.
+    #[test]
+    fn a_plaintext_that_looks_like_an_enc_string_is_encrypted_and_not_passed_through() {
+        // A well-formed type-2 EncString by shape. As a *plaintext* it is a
+        // password a generator could produce; as a guard it was indistinguishable
+        // from ciphertext, which was the bug.
+        const SHAPED: &str = "2.aXZpdml2aXZpdml2aXZpdg==|Y2lwaGVydGV4dGNpcGhlcnRleHRjaXBoZXJ0ZXh0MzI=|bWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWE=";
+        assert!(
+            SHAPED.parse::<EncString>().is_ok(),
+            "the fixture does not have EncString shape, so this test proves nothing"
+        );
+
+        let k = key(1);
+        let cipher = serde_json::json!({
+            "id": "77777777-7777-7777-7777-777777777777",
+            "type": 1,
+            "name": enc(&k, "Shaped"),
+            "favorite": false,
+            "login": { "uri": enc(&k, SHAPED), "uris": [] },
+            "passwordHistory": [{ "password": enc(&k, SHAPED), "lastUsedDate": null }],
+        });
+        let (item, keys) = round_trip_in(cipher);
+        // The read path really did decrypt both -- otherwise the write path
+        // would be right to leave them alone and this test would be asserting
+        // on the wrong thing.
+        assert_eq!(
+            item.login.as_ref().and_then(|l| l.other.get("uri")).and_then(|v| v.as_str()),
+            Some(SHAPED)
+        );
+
+        let written = mapped(&item, &keys);
+        let rendered = serde_json::to_string(&written).expect("serializable");
+        assert!(
+            !rendered.contains(SHAPED),
+            "a plaintext with EncString shape was written to the wire unencrypted"
+        );
+
+        // And it is not merely mangled: it comes back byte-identical.
+        let (again, _) = round_trip_in(written);
+        assert_eq!(
+            again.login.as_ref().and_then(|l| l.other.get("uri")).and_then(|v| v.as_str()),
+            Some(SHAPED)
+        );
+        assert_eq!(
+            again
+                .other
+                .get("passwordHistory")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("password"))
+                .and_then(|v| v.as_str()),
+            Some(SHAPED)
+        );
+    }
+
+    /// The record travels by *path string*, and the two sides spell those
+    /// strings independently. A rename on either side would silently turn the
+    /// guard off -- back into writing a plaintext -- so it is pinned.
+    ///
+    /// Read through normalised line endings, because this is a CRLF checkout.
+    #[test]
+    fn the_two_in_place_paths_are_spelled_the_same_on_both_sides() {
+        let sync_source = include_str!("sync.rs").replace("\r\n", "\n");
+        let write_source = include_str!("write.rs").replace("\r\n", "\n");
+        // Control: the sources were really read.
+        assert!(sync_source.contains("fn decrypt_password_history"), "sync.rs was not read");
+        assert!(write_source.contains("fn reencrypt_in_place"), "write.rs was not read");
+
+        // `login.uri`: recorded by `sync`'s `fail`, queried by `write`.
+        assert!(sync_source.contains(r#"fail("login.uri", why)"#), "sync renamed the login.uri path");
+        assert!(
+            write_source.contains(r#""uri", "login.uri", decrypted"#),
+            "write renamed the login.uri path"
+        );
+
+        // `passwordHistory[i].password`: the same `format!` on both sides.
+        let history = "passwordHistory[{i}].password";
+        assert_eq!(
+            sync_source.matches(history).count(),
+            1,
+            "sync no longer records the history path exactly once"
+        );
+        assert_eq!(
+            write_source.matches(history).count(),
+            2,
+            "write no longer queries the history path (once in code, once in this pin)"
+        );
+    }
+
+    /// **Risk 2's other half.** A private field says "nobody outside this
+    /// module builds one"; it does not say "nobody *inside* it does". The
+    /// claim `MappedCipher`'s doc makes -- that the only construction in the
+    /// crate is inside `encrypt_item` -- is pinned here.
+    ///
+    /// A WALK of `src/`, not an `include_str!` of one file: a second
+    /// construction added in any other module is exactly the thing that would
+    /// re-open the hole, and a pin that only reads this file would not see it.
+    /// Line endings are normalised first -- this is a CRLF checkout.
+    #[test]
+    fn mapped_cipher_is_constructed_only_by_the_mapper() {
+        // Built rather than written, so this test's own source does not
+        // contain the needle it counts.
+        let needle = format!("MappedCipher{}{{ body", " ");
+        let absent = format!("MappedCipher{}{{ payload", " ");
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        // Control: the walk found a real tree, including this file.
+        assert!(files.len() > 20, "the source walk found only {} files", files.len());
+
+        let mut sites = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|_| panic!("{} is readable", path.display()))
+                .replace("\r\n", "\n");
+            assert_eq!(text.matches(&absent).count(), 0, "the control needle matched");
+            for _ in 0..text.matches(&needle).count() {
+                sites.push(path.clone());
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "a mapped cipher is constructed somewhere other than the mapper: {sites:?}"
+        );
+        assert!(sites[0].ends_with("write.rs"), "{:?}", sites[0]);
+
+        // And that one site is inside `encrypt_item`, not merely in this file.
+        let this = include_str!("write.rs").replace("\r\n", "\n");
+        let start = this.find("pub fn encrypt_item(").expect("encrypt_item is in this file");
+        let body = &this[start..];
+        let end = body.find("\n}\n").expect("encrypt_item has an end");
+        assert!(
+            body[..end].contains(&needle),
+            "the one construction is not inside encrypt_item"
+        );
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     /// A cipher with its own `key` decrypts and re-encrypts under *that* key,
@@ -726,7 +1009,7 @@ mod tests {
         let (item, keys) = round_trip_in(cipher);
         assert_eq!(item.name, "Own key");
 
-        let written = encrypt_item(&item, &keys).expect("the item maps");
+        let written = mapped(&item, &keys);
         assert_eq!(
             written.get("key").and_then(|v| v.as_str()),
             Some(wrapped.as_str()),
@@ -752,9 +1035,16 @@ mod tests {
         let (item, keys) = round_trip_in(cipher_with_unmodelled_fields());
         let mut orphan = item;
         orphan
+            .item
             .other
             .insert("organizationId".to_string(), Value::String("no-such-org".to_string()));
-        let err = encrypt_item(&orphan, &keys).expect_err("no key for that organisation");
+        // `expect_err` is not available here, and that is the point:
+        // [`MappedCipher`] has no `Debug`, so an unexpected `Ok` cannot be
+        // printed -- which is exactly the property that keeps a mapped cipher
+        // out of a panic message.
+        let Err(err) = encrypt_item(&orphan, &keys) else {
+            panic!("an item in an unknown organisation was mapped anyway");
+        };
         assert!(matches!(err, CryptoError::Malformed(_)), "{err:?}");
     }
 
@@ -762,8 +1052,8 @@ mod tests {
     #[test]
     fn an_item_with_no_id_omits_it_rather_than_sending_an_empty_one() {
         let (item, keys) = round_trip_in(cipher_with_unmodelled_fields());
-        let fresh = VaultItem { id: String::new(), ..item };
-        let written = encrypt_item(&fresh, &keys).expect("the item maps");
+        let fresh = DecryptedItem::newly_composed(VaultItem { id: String::new(), ..item.item });
+        let written = mapped(&fresh, &keys);
         assert!(!written.as_object().expect("an object").contains_key("id"));
     }
 }

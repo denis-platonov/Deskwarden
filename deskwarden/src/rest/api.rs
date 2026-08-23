@@ -81,6 +81,7 @@ use zeroize::Zeroizing;
 use crate::http_agent::TotalBounded;
 use crate::rest::crypto::{CryptoError, Kdf, MasterKey, master_key};
 use crate::rest::sync::SyncResponse;
+use crate::rest::write::MappedCipher;
 
 /// Connect timeout. Larger than [`crate::vault_bridge`]'s three seconds, and
 /// the difference is the situation rather than caution: that one dials a Node
@@ -575,11 +576,13 @@ impl RestClient {
 
     /// `POST /api/ciphers` -- a new item.
     ///
-    /// `body` is what [`crate::rest::write::encrypt_item`] produced, and this
-    /// function does not look inside it: the only thing it could usefully
+    /// `cipher` is a [`MappedCipher`], which only
+    /// [`crate::rest::write::encrypt_item`] can produce -- see that type for
+    /// the reason the body's provenance is enforced rather than documented.
+    /// This function does not look inside it: the only thing it could usefully
     /// check is already the mapper's job, and reading a mapped cipher here
     /// would be one more place a plaintext could be logged from. **Nothing in
-    /// this function or below it formats `body`.**
+    /// this function or below it formats the body.**
     ///
     /// Returns the server's own copy of the created cipher -- still
     /// encrypted, and carrying the `id` and `revisionDate` it assigned, which
@@ -587,11 +590,13 @@ impl RestClient {
     pub fn create_cipher(
         &self,
         session: &mut Session,
-        body: &serde_json::Value,
+        cipher: &MappedCipher,
     ) -> Result<serde_json::Value, RestError> {
         let url = format!("{}/api/ciphers", self.base_url);
         self.refreshing(session, |session| {
-            self.value_from(self.bearer(self.write_agent.post(&url), session).send_json(body))
+            self.value_from(
+                self.bearer(self.write_agent.post(&url), session).send_json(cipher.body()),
+            )
         })
     }
 
@@ -599,20 +604,23 @@ impl RestClient {
     ///
     /// # This replaces the whole cipher
     ///
-    /// Whatever `body` omits, the server drops. That is the reason
-    /// [`crate::rest::write`] builds its body by laying the modelled fields
-    /// *over* the retained JSON rather than from the model alone, and it is
-    /// restated here because this is the function that does the damage if the
-    /// rule is ever broken upstream.
+    /// Whatever the body omits, the server drops -- which is why the body is a
+    /// [`MappedCipher`] and not a `serde_json::Value`. [`crate::rest::write`]
+    /// builds one by laying the modelled fields *over* the retained JSON
+    /// rather than from the model alone, and this is the function that does
+    /// the damage if that rule is ever broken upstream. It is now the type
+    /// system, not this comment, that keeps a hand-assembled body out.
     pub fn update_cipher(
         &self,
         session: &mut Session,
         id: &str,
-        body: &serde_json::Value,
+        cipher: &MappedCipher,
     ) -> Result<serde_json::Value, RestError> {
         let url = self.cipher_url(id, "")?;
         self.refreshing(session, |session| {
-            self.value_from(self.bearer(self.write_agent.put(&url), session).send_json(body))
+            self.value_from(
+                self.bearer(self.write_agent.put(&url), session).send_json(cipher.body()),
+            )
         })
     }
 
@@ -1449,19 +1457,64 @@ mod tests {
         (client, session)
     }
 
-    /// A mapped cipher body, as `rest::write` produces one: encrypted values
-    /// and one plaintext the tests below can search for and must never find.
+    /// The plaintext the tests below search the wire for and must never find.
     const SECRET: &str = "hunter2-never-on-the-wire";
-    fn encrypted_body() -> serde_json::Value {
-        serde_json::json!({
-            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "type": 1,
-            "name": "2.aWl2aXZpdml2aXZpdml2aQ==|Y2lwaGVydGV4dGNpcGhlcnRleHQ=|bWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWE=",
-            "login": {
-                "password": "2.aXZpdml2aXZpdml2aXZpdg==|c2VjcmV0Y2lwaGVydGV4dHM=|bWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWE=",
-            },
-            "reprompt": 1,
-        })
+
+    /// A body to send, and it is **not hand-built any more**: it comes out of
+    /// `rest::write`'s mapper, because [`MappedCipher`] has no other
+    /// constructor. That is the property risk 2 was closed with, and these
+    /// tests are the first place it is felt.
+    fn encrypted_cipher() -> MappedCipher {
+        crate::rest::write::tests::a_mapped_cipher()
+    }
+
+    /// **Risk 2, pinned on this side of the boundary.**
+    ///
+    /// The signatures already refuse a hand-assembled body -- that is the type
+    /// system's job and it needs no test. What a type cannot say is that no
+    /// *other* route out of this module sends a JSON body to a cipher
+    /// endpoint. So the production half of this file is read and its
+    /// body-sending calls are counted.
+    ///
+    /// The test module is cut off first, and the cut is made on normalised
+    /// line endings: this is a CRLF checkout, and a slice looking for `"\n}"`
+    /// or an un-normalised marker matches nothing and passes vacuously.
+    #[test]
+    fn the_only_json_bodies_this_module_sends_are_mapped_ciphers_and_the_prelogin() {
+        let source = include_str!("api.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = source.find(marker).expect("the test module marker was not found");
+        let production = &source[..cut];
+        let tests = &source[cut..];
+
+        // Controls: the cut landed where it was meant to, both halves are real.
+        assert!(production.contains("pub fn update_cipher"), "the cut lost the writers");
+        assert!(!production.contains("mockito"), "the cut left test code in the production half");
+        assert!(tests.contains("mockito"), "the cut left no test code in the test half");
+
+        // Three body senders in the whole module, and no more.
+        assert_eq!(
+            production.matches("send_json(").count(),
+            3,
+            "a new JSON body sender appeared in rest::api"
+        );
+        // Two of them are the cipher writers, and both send a mapped cipher.
+        assert_eq!(
+            production.matches("send_json(cipher.body())").count(),
+            2,
+            "a cipher endpoint stopped sending a MappedCipher"
+        );
+        // The third is prelogin, on the auth agent, which carries no vault data.
+        assert_eq!(production.matches("self.auth_agent.post(url).send_json(body)").count(), 1);
+
+        // And nothing else in the module reaches for the write agent with a
+        // body: the two writers above are its only `post`/`put` with content.
+        assert_eq!(
+            production.matches("self.write_agent.post(&url), session).send_json").count()
+                + production.matches("self.write_agent.put(&url), session).send_json").count(),
+            2,
+            "the write agent gained another body-carrying call"
+        );
     }
 
     /// The whole of what a create must put on the wire: the method, the path,
@@ -1470,7 +1523,8 @@ mod tests {
     fn a_create_posts_the_encrypted_body_with_the_bearer_token() {
         let mut server = mockito::Server::new();
         let (client, mut session) = granted(&mut server);
-        let body = encrypted_body();
+        let cipher = encrypted_cipher();
+        let body = cipher.body().clone();
         let created = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-1")
@@ -1481,7 +1535,7 @@ mod tests {
             .expect(1)
             .create();
 
-        let answer = client.create_cipher(&mut session, &body).expect("the create");
+        let answer = client.create_cipher(&mut session, &cipher).expect("the create");
         created.assert();
         // The server's own copy comes back, which is how the caller learns the
         // id it did not choose.
@@ -1491,10 +1545,12 @@ mod tests {
         // other side, on the exact bytes `match_body` accepted.
         let sent = serde_json::to_string(&body).expect("serializable");
         assert!(!sent.contains(SECRET), "a plaintext reached the request body");
-        assert!(
-            sent.contains("2.aXZpdml2aXZpdml2aXZpdg=="),
-            "the body did not carry the encrypted password at all"
-        );
+        let sealed = body
+            .get("login")
+            .and_then(|l| l.get("password"))
+            .and_then(|v| v.as_str())
+            .expect("the mapped body carries a login password");
+        assert!(sealed.starts_with("2."), "the body did not carry a ciphertext password");
     }
 
     /// An update is a `PUT` to the item's own path -- not a `POST`, and not to
@@ -1503,7 +1559,8 @@ mod tests {
     fn an_update_puts_to_the_item_path_and_carries_only_ciphertext() {
         let mut server = mockito::Server::new();
         let (client, mut session) = granted(&mut server);
-        let body = encrypted_body();
+        let cipher = encrypted_cipher();
+        let body = cipher.body().clone();
         let updated = server
             .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
@@ -1517,7 +1574,7 @@ mod tests {
         let wrong = server.mock("POST", "/api/ciphers").with_status(200).create();
 
         client
-            .update_cipher(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &body)
+            .update_cipher(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &cipher)
             .expect("the update");
         updated.assert();
         assert!(!wrong.matched(), "an update was sent as a create");
@@ -1569,7 +1626,8 @@ mod tests {
     fn a_401_on_a_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
         let mut server = mockito::Server::new();
         let (client, mut session) = granted(&mut server);
-        let body = encrypted_body();
+        let cipher = encrypted_cipher();
+        let body = cipher.body().clone();
         let stale = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-1")
@@ -1593,7 +1651,7 @@ mod tests {
             .expect(1)
             .create();
 
-        client.create_cipher(&mut session, &body).expect("the retried create");
+        client.create_cipher(&mut session, &cipher).expect("the retried create");
         stale.assert();
         refresh.assert();
         fresh.assert();
@@ -1699,7 +1757,7 @@ mod tests {
             .with_body(r#"{"error":"invalid_request","error_description":"Cipher type is required"}"#)
             .create();
         let err = client
-            .create_cipher(&mut session, &encrypted_body())
+            .create_cipher(&mut session, &encrypted_cipher())
             .expect_err("a rejected create");
         assert_eq!(
             err,

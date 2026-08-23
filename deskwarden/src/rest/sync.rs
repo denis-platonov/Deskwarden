@@ -165,6 +165,84 @@ impl std::fmt::Display for DecryptFailure {
     }
 }
 
+/// One decrypted cipher, **with the record of which of its in-place values
+/// actually decrypted**.
+///
+/// # Why a wrapper exists rather than a bare [`VaultItem`]
+///
+/// Two values are decrypted *in place* inside a catch-all rather than into a
+/// typed field -- `login.uri` and `passwordHistory[].password` (see
+/// [`map_login`] and [`decrypt_password_history`]). Everywhere else, a field
+/// that failed to decrypt becomes `None` and the difference between "absent"
+/// and "broken" is carried by [`DecryptedVault::failures`]. For these two
+/// there is no `None` to become: a failure leaves the **ciphertext** sitting
+/// in `other`, byte-identical to a plaintext as far as the type system is
+/// concerned.
+///
+/// [`crate::rest::write`] has to invert exactly this, and it must not guess:
+/// re-encrypting a value that never decrypted buries it, and *not* encrypting
+/// a value that did decrypt writes a password to the server in the clear.
+/// This type is how the fact travels instead of the guess -- and it is not new
+/// bookkeeping, it is [`DecryptFailure::field`]'s own vocabulary: a field this
+/// mapper recorded a failure for is, by definition, a field whose ciphertext
+/// is still where it was.
+pub struct DecryptedItem {
+    pub item: VaultItem,
+    /// The JSON paths -- [`DecryptFailure::field`] spellings -- of every field
+    /// of this cipher that did **not** decrypt, and whose ciphertext therefore
+    /// survived untouched.
+    ///
+    /// Only the two in-place paths are ever consulted; the rest cost nothing
+    /// and keeping the list whole means it says one thing ("these did not
+    /// decrypt") rather than a filtered subset a later reader has to re-derive.
+    still_encrypted: Vec<String>,
+}
+
+impl DecryptedItem {
+    /// An item this crate composed itself, rather than one that came back from
+    /// a server.
+    ///
+    /// Its catch-all holds nothing this mapper ever decrypted, so nothing in
+    /// it is stale ciphertext and every in-place value is plaintext. That is
+    /// also the **safe default** for the write path: with an empty record,
+    /// [`crate::rest::write`] encrypts, and the worst a mistake here can do is
+    /// double-wrap a value the user can see and fix -- never send one in the
+    /// clear.
+    pub fn newly_composed(item: VaultItem) -> Self {
+        Self { item, still_encrypted: Vec::new() }
+    }
+
+    /// Whether `path` is a field this mapper *failed* to decrypt, so that
+    /// whatever is at that path is still the server's ciphertext.
+    pub(crate) fn is_still_encrypted(&self, path: &str) -> bool {
+        self.still_encrypted.iter().any(|failed| failed == path)
+    }
+}
+
+/// Delegated so that a caller reading an item off a decrypted vault writes
+/// `item.name` and not `item.item.name`. Deliberately read-only: there is no
+/// `DerefMut`, because handing out `&mut VaultItem` through a wrapper whose
+/// whole purpose is to describe that item's contents invites the two drifting
+/// apart silently.
+impl std::ops::Deref for DecryptedItem {
+    type Target = VaultItem;
+    fn deref(&self) -> &VaultItem {
+        &self.item
+    }
+}
+
+/// Counts and field names only, for [`DecryptedVault`]'s reason: the item
+/// itself hand-writes a `Debug` that elides its secrets, and the path list is
+/// names -- never a ciphertext, never a plaintext.
+impl std::fmt::Debug for DecryptedItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptedItem")
+            .field("item", &self.item)
+            .field("still_encrypted", &self.still_encrypted)
+            .finish()
+    }
+}
+
 /// A whole sync, decrypted.
 ///
 /// # What is deliberately not mapped
@@ -187,7 +265,7 @@ impl std::fmt::Display for DecryptFailure {
 /// Everything else on the wire is either mapped into a typed field or ridden
 /// through [`VaultItem::other`] byte-for-byte.
 pub struct DecryptedVault {
-    pub items: Vec<VaultItem>,
+    pub items: Vec<DecryptedItem>,
     pub folders: Vec<Folder>,
     /// Empty on a healthy sync. Non-empty means some field of some item is
     /// missing from `items` and the caller should say so rather than pretend
@@ -391,7 +469,7 @@ fn map_cipher(
     raw: &serde_json::Value,
     keys: &VaultKeys,
     failures: &mut Vec<DecryptFailure>,
-) -> Option<VaultItem> {
+) -> Option<DecryptedItem> {
     let cipher = raw.as_object()?;
     let id = cipher.get("id").and_then(|v| v.as_str())?.to_string();
 
@@ -403,8 +481,15 @@ fn map_cipher(
         }
     };
     let key = cipher_keys.key();
+    // This cipher's own failures, collected locally before they join the
+    // sync's list -- because they are also the answer to "which of this
+    // item's values are still ciphertext", which is what [`DecryptedItem`]
+    // carries to the write path. One list, read two ways; see
+    // [`DecryptedItem`] on why that is the same fact rather than a second
+    // bookkeeping structure.
+    let mut mine: Vec<DecryptFailure> = Vec::new();
     let mut fail = |field: &str, why: CryptoError| {
-        failures.push(DecryptFailure {
+        mine.push(DecryptFailure {
             cipher_id: id.clone(),
             field: field.to_string(),
             why,
@@ -450,19 +535,25 @@ fn map_cipher(
     strip_null_type_objects(&mut other);
     decrypt_password_history(key, &mut other, &mut fail);
 
-    Some(VaultItem {
-        id,
-        name,
-        fields,
-        login,
-        card,
-        identity,
-        ssh_key,
-        notes,
-        item_type,
-        folder_id,
-        favorite,
-        other,
+    let still_encrypted = mine.iter().map(|f| f.field.clone()).collect();
+    failures.append(&mut mine);
+
+    Some(DecryptedItem {
+        item: VaultItem {
+            id,
+            name,
+            fields,
+            login,
+            card,
+            identity,
+            ssh_key,
+            notes,
+            item_type,
+            folder_id,
+            favorite,
+            other,
+        },
+        still_encrypted,
     })
 }
 
@@ -979,7 +1070,7 @@ mod tests {
         // `serde_json`'s object is a map, so a duplicate would appear as one
         // key too many rather than as invalid JSON: the round trip is what
         // catches it.
-        let text = serde_json::to_string(item).expect("serializes");
+        let text = serde_json::to_string(&item.item).expect("serializes");
         let back: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(back["name"], serde_json::json!("Site"));
         assert_eq!(back["notes"], serde_json::json!("a note"));
@@ -993,7 +1084,7 @@ mod tests {
     fn a_decrypted_item_round_trips_through_serde_unchanged() {
         let (master, user, protected) = account();
         let vault = vault_of(sync_fixture(&user, &protected), &master);
-        let before = serde_json::to_value(&vault.items[0]).expect("serializes");
+        let before = serde_json::to_value(&vault.items[0].item).expect("serializes");
         let again: VaultItem = serde_json::from_value(before.clone()).expect("deserializes");
         assert_eq!(before, serde_json::to_value(&again).expect("serializes"));
 
