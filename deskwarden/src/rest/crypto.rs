@@ -55,6 +55,19 @@
 //! ciphertext and plaintext instead of this code, it does, and that is said
 //! at the test. See `the_composition_is_self_consistent_and_that_is_all_it_is`.
 //!
+//! **This holds in both directions now, and the two directions are not
+//! equally pinned.** AES-256-CBC is checked against NIST SP 800-38A
+//! *encrypting* (F.2.5) as well as decrypting (F.2.6), so the cipher step
+//! [`encrypt`] performs is external, not a round trip against this file's
+//! own decryptor. What is **not** external on the encrypt side is PKCS#7
+//! *construction* -- the padding [`encrypt`] writes is checked only by
+//! [`strip_pkcs7`] accepting it back, and no published vector pads NIST's
+//! plaintext -- and, above that, the claim that an `EncString` this module
+//! emits is one another Bitwarden client will accept. Nothing in this crate
+//! can confirm that last claim in either direction, for the same reason:
+//! it needs a real account on a real server. The full list is at
+//! `the_composition_is_still_not_fully_pinned_and_here_is_what_is_left`.
+//!
 //! # Scope
 //!
 //! Symmetric encryption and decryption, and no I/O of any kind. There is no
@@ -71,7 +84,7 @@
 
 use aes::Aes256;
 use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
-use cbc::cipher::block_padding::{NoPadding, Pkcs7};
+use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -717,17 +730,41 @@ fn strip_pkcs7(mut plain: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>, Cryp
 pub fn encrypt(key: &SymmetricKey, plain: &[u8]) -> Result<EncString, CryptoError> {
     let mut iv = [0u8; BLOCK];
     getrandom::getrandom(&mut iv).map_err(|_| CryptoError::Rng)?;
+    encrypt_with_iv(key, iv, plain)
+}
 
+/// [`encrypt`] with the IV handed in rather than generated.
+///
+/// Split out so that the *randomness* is in exactly one place -- the four
+/// lines above -- and everything downstream of it is one function that a
+/// fixture builder can also call. `tests::seal` is that caller: it wants a
+/// reproducible `EncString`, and the alternative to this split is a second
+/// encryptor living in the test module, drifting away from the real one
+/// block by block until the fixtures stop resembling what production writes.
+///
+/// It is **not** a test seam. It has no `cfg` attribute, it is private, and
+/// [`encrypt`] is its only caller outside the test module -- the same shape
+/// as [`cbc_decrypt_raw`]. What a seam would look like is a public or
+/// `cfg(test)`-gated way for a *caller of `encrypt`* to choose the IV, and
+/// that does not exist: nothing outside this file can reach this function,
+/// so no production path can be talked into a fixed IV.
+fn encrypt_with_iv(
+    key: &SymmetricKey,
+    iv: [u8; BLOCK],
+    plain: &[u8],
+) -> Result<EncString, CryptoError> {
     // One whole block of headroom, always -- `BLOCK - len % BLOCK` is in
     // `1..=BLOCK`, never 0, which is PKCS#7's rule and the reason a
-    // block-aligned input grows by a full block.
-    let padded = plain.len() + (BLOCK - plain.len() % BLOCK);
-    let mut buffer = Zeroizing::new(vec![0u8; padded]);
+    // block-aligned input grows by a full block. Every added byte is the pad
+    // length itself, which is what [`strip_pkcs7`] checks on the way back.
+    let pad = BLOCK - plain.len() % BLOCK;
+    let fill = u8::try_from(pad).expect("a pad length is in 1..=16");
+    let mut buffer = Zeroizing::new(vec![fill; plain.len() + pad]);
     buffer[..plain.len()].copy_from_slice(plain);
-    let ct = Aes256CbcEnc::new((&*key.enc).into(), (&iv).into())
-        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
-        .expect("the buffer is the padded length by construction")
-        .to_vec();
+
+    let len = buffer.len();
+    cbc_encrypt_raw(&key.enc, &iv, &mut buffer[..len])?;
+    let ct = buffer.to_vec();
 
     let mut hmac = <HmacSha256 as Mac>::new_from_slice(&*key.mac)
         .expect("HMAC accepts a key of any length");
@@ -736,6 +773,35 @@ pub fn encrypt(key: &SymmetricKey, plain: &[u8]) -> Result<EncString, CryptoErro
     let mac = hmac.finalize().into_bytes().into();
 
     Ok(EncString::AesCbc256HmacSha256B64 { iv, ct, mac })
+}
+
+/// AES-256-CBC encryption with **no** padding handling: whole blocks in,
+/// whole blocks out, in place.
+///
+/// The mirror of [`cbc_decrypt_raw`], and separate from PKCS#7 for the same
+/// reason: `aes_256_cbc_encrypt_matches_nist_sp_800_38a` drives it with
+/// NIST's own key, IV and plaintext and compares against NIST's own
+/// ciphertext, none of which carry PKCS#7 padding. Without this split the
+/// forward direction could only be checked by round-tripping through this
+/// file's own decryptor, which cannot see a defect that is symmetric in both
+/// halves.
+fn cbc_encrypt_raw(
+    key: &[u8; KEY_LEN],
+    iv: &[u8; BLOCK],
+    buf: &mut [u8],
+) -> Result<(), CryptoError> {
+    if buf.is_empty() || !buf.len().is_multiple_of(BLOCK) {
+        return Err(CryptoError::Malformed(
+            "the padded plaintext is not a non-zero whole number of AES blocks",
+        ));
+    }
+    let len = buf.len();
+    Aes256CbcEnc::new(key.into(), iv.into())
+        .encrypt_padded_mut::<NoPadding>(buf, len)
+        .map_err(|_| {
+            CryptoError::Malformed("the padded plaintext is not a whole number of AES blocks")
+        })?;
+    Ok(())
 }
 
 // ---- the two unwraps -------------------------------------------------------
@@ -930,6 +996,49 @@ pub mod tests {
         assert_ne!(wrong.to_vec(), hex(NIST_PLAINTEXT));
     }
 
+    /// **NIST SP 800-38A, appendix F.2.5** (CBC-AES256.Encrypt) -- the
+    /// forward direction of the vector above, against the same published
+    /// key, IV, plaintext and ciphertext.
+    ///
+    /// The reason this exists separately from
+    /// `encrypt_round_trips_through_this_modules_own_decrypt`: a round trip
+    /// through this file's own decryptor cannot see a defect that is
+    /// symmetric in both halves -- a swapped key schedule, a mode that is
+    /// consistently not CBC, an IV applied to the wrong end -- because both
+    /// halves would agree on the same wrong answer and the plaintext would
+    /// come back intact. Only NIST's ciphertext can say that what this
+    /// module *emits* is what another client will read.
+    ///
+    /// It pins [`cbc_encrypt_raw`], which is the AES-CBC step of
+    /// [`encrypt`]. It does **not** pin the PKCS#7 padding that `encrypt`
+    /// wraps around it, because NIST's plaintext is four whole blocks and no
+    /// published vector pads it; that gap is recorded in
+    /// `the_composition_is_still_not_fully_pinned_and_here_is_what_is_left`.
+    #[test]
+    fn aes_256_cbc_encrypt_matches_nist_sp_800_38a() {
+        let key: [u8; 32] = hex(NIST_KEY).try_into().expect("32 bytes");
+        let iv: [u8; 16] = hex(NIST_IV).try_into().expect("16 bytes");
+
+        let mut buf = hex(NIST_PLAINTEXT);
+        cbc_encrypt_raw(&key, &iv, &mut buf).expect("four whole blocks");
+        assert_eq!(
+            buf,
+            hex(NIST_CIPHERTEXT),
+            "AES-256-CBC encryption does not agree with NIST SP 800-38A F.2.5"
+        );
+
+        // Control: a wrong key does not quietly produce the right answer,
+        // and neither does a wrong IV -- which would be invisible in a round
+        // trip, since the same wrong IV would undo it.
+        let mut wrong_key = hex(NIST_PLAINTEXT);
+        cbc_encrypt_raw(&[0u8; 32], &iv, &mut wrong_key).expect("still blocks");
+        assert_ne!(wrong_key, hex(NIST_CIPHERTEXT));
+
+        let mut wrong_iv = hex(NIST_PLAINTEXT);
+        cbc_encrypt_raw(&key, &[0u8; 16], &mut wrong_iv).expect("still blocks");
+        assert_ne!(wrong_iv, hex(NIST_CIPHERTEXT));
+    }
+
     /// NIST SP 800-38A appendix F.2.5/F.2.6's key, IV, plaintext and
     /// ciphertext. At module scope because the `EncString` fixture below
     /// reuses them -- so that its ciphertext and its expected plaintext both
@@ -1114,31 +1223,27 @@ pub mod tests {
     /// Seals bytes into a type-2 `EncString`, the way a Bitwarden server's
     /// stored value looks.
     ///
-    /// **This is a test's encryptor and the module has no production
-    /// counterpart**, because this module is decrypt-only. It therefore
-    /// proves nothing about whether Bitwarden arranges an `EncString` this
-    /// way -- that question is answered, as far as it can be, by the
-    /// published vectors above. What it is for is building a payload the
-    /// *mapper* can be tested against.
+    /// **This is production [`encrypt`]'s output, not a second
+    /// implementation of it.** It calls [`encrypt_with_iv`] -- the whole of
+    /// `encrypt` below the IV generation -- and renders the result with
+    /// [`EncString`]'s own `Display`, so a fixture and the real encryptor
+    /// cannot drift apart. It used to be a separate encryptor, written when
+    /// this module was decrypt-only; that is no longer true and the copy is
+    /// gone.
+    ///
+    /// It still proves nothing about whether *Bitwarden* arranges an
+    /// `EncString` this way -- that question is answered, as far as it can
+    /// be, by the published vectors above, and what is left of it is listed
+    /// in `the_composition_is_still_not_fully_pinned_and_here_is_what_is_left`.
+    /// What it is for is building a payload the *mapper* can be tested
+    /// against.
     ///
     /// The IV is fixed rather than random: a fixture wants to be
     /// reproducible, and nothing here is protecting anything.
     pub fn seal(key: &SymmetricKey, plain: &[u8]) -> String {
-        use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
-
-        let iv = [0x5au8; BLOCK];
-        let mut buffer = vec![0u8; plain.len() + BLOCK];
-        buffer[..plain.len()].copy_from_slice(plain);
-        let ct = cbc::Encryptor::<Aes256>::new((&*key.enc).into(), (&iv).into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
-            .expect("the buffer carries a whole block of headroom")
-            .to_vec();
-
-        let mut hmac = <HmacSha256 as Mac>::new_from_slice(&*key.mac).expect("any key length");
-        hmac.update(&iv);
-        hmac.update(&ct);
-        let mac = hmac.finalize().into_bytes();
-        format!("2.{}|{}|{}", b64(&iv), b64(&ct), b64(&mac))
+        encrypt_with_iv(key, [0x5au8; BLOCK], plain)
+            .expect("a padded plaintext is always whole blocks")
+            .to_string()
     }
 
     /// Base64 with padding, exported alongside [`seal`] so a caller can build
@@ -2014,15 +2119,32 @@ pub mod tests {
         assert_eq!(EncString::from_str(&text), Ok(rsa));
     }
 
-    /// The rendered parts are exactly the bytes, base64'd -- checked against
-    /// the fixture-built text of [`nist_backed_enc_string`], whose three
-    /// parts come from NIST's vector and this module's own MAC rather than
-    /// from `Display` itself.
+    /// The rendered parts are exactly the bytes, standard-alphabet base64
+    /// with padding, in the order `iv|ct|mac` behind a `2.`.
+    ///
+    /// Pinned against a **literal** string rather than against
+    /// [`nist_backed_enc_string`]'s output. The fixture builder uses the
+    /// same `b64` helper `Display` does, so comparing the two could only
+    /// ever check part order and structure -- never the alphabet (standard,
+    /// not URL-safe) or the padding. The literal below was produced outside
+    /// this crate from NIST SP 800-38A F.2.5's IV and ciphertext and an
+    /// HMAC-SHA256 over `iv || ct` under a key of 32 `0x09` bytes, so every
+    /// character of it is something this file has to match rather than
+    /// something it got to choose.
     #[test]
-    fn display_renders_the_same_text_the_fixture_builder_does() {
+    fn display_renders_the_wire_form_byte_for_byte() {
+        const EXPECTED: &str = concat!(
+            "2.AAECAwQFBgcICQoLDA0ODw==",
+            "|9YxMBNbl8bp3nqv7X3v71pz8TpZ+24CNZ593e8ZwLH058jNpqdm6z6Uw4mMEIxRhsusF4sOb6fza",
+            "bBkHjGqdGw==",
+            "|m/AW0QYMpQ2bEO1/UzsCzVTjf4I7YKujQ9eaK4lU0Hg="
+        );
+
         let (_, text) = nist_backed_enc_string(&[9u8; 32]);
-        let parsed = EncString::from_str(&text).expect("well formed");
-        assert_eq!(parsed.to_string(), text);
+        assert_eq!(text, EXPECTED, "the fixture builder no longer writes the pinned string");
+
+        let parsed = EncString::from_str(EXPECTED).expect("well formed");
+        assert_eq!(parsed.to_string(), EXPECTED);
     }
 
     /// `Debug` still redacts after `Display` was added. The two must not be
@@ -2036,16 +2158,39 @@ pub mod tests {
         assert!(enc.to_string().contains('|'), "Display is not printing the wire form");
     }
 
-    /// What the five vectors above still do **not** pin, stated as a test so
+    /// What the published vectors above still do **not** pin, stated as a test so
     /// it is read rather than skipped, and so it fails if someone deletes the
     /// caveat from the module docs without deleting the gap.
     ///
     /// Pinned externally now: the PBKDF2 and Argon2id master keys including
     /// both salts, the password hash, the stretch's info strings and their
-    /// order, the three parts of a type-2 `EncString`, and the enc-then-mac
-    /// split of a protected key.
+    /// order, the three parts of a type-2 `EncString`, the enc-then-mac
+    /// split of a protected key, the rendered wire form byte for byte, and
+    /// AES-256-CBC in **both** directions -- NIST SP 800-38A F.2.6 for
+    /// decryption and F.2.5 for encryption, so the cipher step [`encrypt`]
+    /// performs is not merely round-tripped against this file's own
+    /// decryptor.
     ///
     /// **Not pinned, and this is the whole of what is left:**
+    ///
+    /// * **That PKCS#7 *construction* is right**, as opposed to the cipher
+    ///   under it. The padding [`encrypt`] writes is checked only by
+    ///   [`strip_pkcs7`] accepting it back and by the block-length
+    ///   assertions in `encrypt_round_trips_through_this_modules_own_decrypt`
+    ///   -- both this file marking its own homework. NIST's CBC vectors are
+    ///   whole blocks and pad nothing, so F.2.5 cannot reach it. The failure
+    ///   this leaves open is symmetric: a pad byte written wrong and stripped
+    ///   wrong in the same way round-trips perfectly here and is rejected by
+    ///   every other client.
+    /// * **That an `EncString` this module emits is one another Bitwarden
+    ///   client accepts.** The encrypt direction is new, and it inherits
+    ///   every composition gap below -- the MAC input, the type-2 layout,
+    ///   which key encrypts what -- with the failure direction reversed.
+    ///   Getting the MAC input wrong on the *decrypt* side fails closed;
+    ///   getting it wrong on the *encrypt* side writes a value that this
+    ///   module happily reads back and no other client can open, and nothing
+    ///   here can tell the difference. Nothing in the running app calls
+    ///   [`encrypt`] yet, which is the only reason that is survivable.
     ///
     /// * **That the HMAC covers `iv || ct` rather than `ct` alone.** No
     ///   published vector this crate could find gives a type-2 `EncString`
@@ -2066,7 +2211,8 @@ pub mod tests {
     ///   round-trips against a generated key above, but no published
     ///   Bitwarden org-key ciphertext with a known plaintext was found.
     ///
-    /// What would settle all three: one `EncString` produced by a real
+    /// What would settle the composition gaps -- the last three above, and
+    /// the second one with them: one `EncString` produced by a real
     /// Bitwarden client together with the account it came from -- a throwaway
     /// account on a self-hosted server, logged in once with the official
     /// client, its `/api/sync` response and its master password recorded.
@@ -2081,6 +2227,11 @@ pub mod tests {
             docs.contains("The Bitwarden-specific composition is not"),
             "the module docs no longer state that the composition is unverified, but the gap \
              this test enumerates is still open"
+        );
+        assert!(
+            docs.contains("This holds in both directions now, and the two directions are not"),
+            "the module docs no longer state that the encrypt direction carries its own \
+             unverified claims, but the gaps this test enumerates are still open"
         );
     }
 }
