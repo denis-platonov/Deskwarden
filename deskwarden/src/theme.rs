@@ -2834,6 +2834,16 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 /// follows egui rather than inventing a number.
 pub const SCROLLBAR_WIDTH: f32 = 6.0;
 
+/// How far short of its rect's right edge a single line of clipped text stops.
+///
+/// Used by [`crate::win32_draw::draw_row`], whose `DrawTextW` calls carry
+/// `DT_END_ELLIPSIS`: without an inset the "..." Windows substitutes sits hard
+/// against the card's edge and reads as a cut rather than as a truncation.
+/// Three device pixels is the smallest gap that separates the glyph from the
+/// edge at 100% scaling; it is here rather than in `win32_draw` so the GDI
+/// renderer keeps taking every dimension from this module.
+pub const TEXT_CLIP_INSET: f32 = 3.0;
+
 /// Configures `ui` so that an [`egui::ScrollArea`] shown inside it reserves a
 /// `gutter`-wide lane down its right-hand edge and draws its bar in the
 /// OUTERMOST [`SCROLLBAR_WIDTH`] of that lane, instead of over the content's

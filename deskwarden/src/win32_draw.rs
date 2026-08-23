@@ -13,7 +13,8 @@ use crate::app_candidates::Candidate;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
+    SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC,
+    HFONT, PS_SOLID,
     TRANSPARENT,
 };
 
@@ -173,6 +174,11 @@ pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, na
 
         let gutter = rect.bottom - rect.top;
         let text_left = rect.left + gutter;
+        // `DT_END_ELLIPSIS` truncates against the rect's right edge, so the
+        // rect stops short of the row's: an ellipsis flush against the card's
+        // edge reads as a cut rather than as "there is more". The left gutter
+        // the icon lives in is untouched.
+        let text_right = rect.right - crate::theme::TEXT_CLIP_INSET as i32;
 
         SetBkMode(hdc, TRANSPARENT);
 
@@ -182,10 +188,15 @@ pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, na
         let mut name_rc = RECT {
             left: text_left,
             top: rect.top,
-            right: rect.right,
+            right: text_right,
             bottom: rect.top + gutter / 2,
         };
-        DrawTextW(hdc, &mut name_chars, &mut name_rc, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(
+            hdc,
+            &mut name_chars,
+            &mut name_rc,
+            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
         SelectObject(hdc, old_font);
 
         SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
@@ -194,10 +205,15 @@ pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, na
         let mut user_rc = RECT {
             left: text_left,
             top: rect.top + gutter / 2,
-            right: rect.right,
+            right: text_right,
             bottom: rect.bottom,
         };
-        DrawTextW(hdc, &mut user_chars, &mut user_rc, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(
+            hdc,
+            &mut user_chars,
+            &mut user_rc,
+            DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
         SelectObject(hdc, old_font);
     }
 }
@@ -205,6 +221,77 @@ pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, na
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Both of a row's lines end in an ellipsis rather than mid-glyph.**
+    ///
+    /// A source pin, because `DT_END_ELLIPSIS` is a painting flag: it changes
+    /// what `DrawTextW` puts on a device context, and nothing this crate can
+    /// drive in a test reads pixels back off the daemon's card. What is
+    /// decidable is that the flag is in the call, and that the rect it
+    /// truncates against stops short of the row's right edge -- without the
+    /// inset the "..." sits hard against the card's border.
+    ///
+    /// The shape is this crate's established one -- read the file, normalise
+    /// line endings (this is a CRLF checkout), cut at the first column-0
+    /// `#[cfg(test)]` and scan the production half -- with controls so a scan
+    /// that read nothing cannot pass.
+    #[test]
+    fn both_of_a_rows_lines_are_drawn_with_an_end_ellipsis() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("win32_draw.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        // Comments stripped, so the prose above `draw_row` -- which names both
+        // the flag and the inset -- cannot satisfy a rule about CODE.
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // CONTROLS, so a pin that scanned nothing cannot pass: the cut must
+        // have thrown something away, and the half it kept must be the half
+        // that carries the row painter this rule is about.
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found in win32_draw.rs, so this scan \r
+             is reading the test module as production and the rules below are meaningless"
+        );
+        assert!(
+            code.contains(concat!("pub fn draw_", "row(")),
+            "control: the production cut of win32_draw.rs does not contain `draw_row`, so the \r
+             cut is in the wrong place and this pin is scanning the wrong text"
+        );
+        let drawn = code.matches(concat!("Draw", "TextW(")).count();
+        assert_eq!(
+            drawn, 3,
+            "control: win32_draw.rs draws text in three places -- a button label and a row's two \r
+             lines. It now draws it in {drawn}, so the counts below no longer mean what this \r
+             pin says they mean"
+        );
+
+        assert_eq!(
+            code.matches(concat!("| DT_END_", "ELLIPSIS")).count(),
+            2,
+            "a row's name and username are drawn into fixed-width rects, and `DrawTextW` with no \r
+             `DT_END_ELLIPSIS` CLIPS: a long item name is cut through the middle of a letter \r
+             with nothing to say it was truncated. Both lines need the flag; the button label \r
+             does not, because a button is sized to its own text. The needle carries the \r
+             leading `|` so the import list is not counted as a third use"
+        );
+        assert!(
+            code.contains(concat!("rect.right - crate::theme::TEXT_CLIP_", "INSET as i32")),
+            "the row's text rect no longer stops short of the row's right edge. \r
+             `DT_END_ELLIPSIS` truncates against the rect it is given, so a rect flush with the \r
+             card's edge puts the \"...\" hard against the border, where it reads as a cut \r
+             rather than as \"there is more\""
+        );
+        assert!(
+            code.contains("let text_left = rect.left + gutter;"),
+            "the row's left gutter is gone. It is the square the favicon is drawn into, and the \r
+             text starting at `rect.left` would run underneath it"
+        );
+    }
 
     #[test]
     fn a_list_that_fits_shows_everything_and_offers_no_overflow_row() {

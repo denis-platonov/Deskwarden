@@ -2591,6 +2591,17 @@ fn picker_offers_for(
     picker_offers(&candidates, &items)
 }
 
+/// How long [`handle_no_match`] waits for the foreground app's version
+/// resource before giving up and naming the card after [`window_label`].
+///
+/// One local file's version block is read in single-digit milliseconds; this
+/// is not a budget for the ordinary case, it is the bound on the bad one --
+/// an executable on a mapped drive whose server is gone, where the open alone
+/// costs the SMB timeout. The card is a response to a keystroke the user just
+/// pressed, so the wait must be shorter than the delay a person notices, and
+/// what is lost when it expires is a prettier name and nothing else.
+const FRIENDLY_NAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
 pub fn handle_no_match(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
@@ -2602,9 +2613,24 @@ pub fn handle_no_match(
     // this one doing exactly what it did before.
     let offers = picker_offers_for(cache, window);
     let label = window_label(&window.exe_name, &window.title);
-    let outcome = crate::picker_prompt::ask(&offers, label);
+    // **The card says what the user calls the app, not what the file is
+    // called.** `window_label` returns `Privado.exe` for a non-host process
+    // and must keep doing so -- every other surface in this app compares or
+    // stores that string -- but the picker's heading is prose the user reads,
+    // and "No saved login for Privado.exe" names a file where the user sees an
+    // application. `app_identity` already owns the one version-resource reader
+    // and the one rule for ordering its answers; this is that reader, bounded,
+    // asked once as the card opens. Anything it cannot answer inside
+    // `FRIENDLY_NAME_BUDGET` -- an unreachable path, a binary with no
+    // resource, a process that has already exited -- leaves `label` standing,
+    // which is exactly what the card said before.
+    let friendly = crate::window_watch::process_image_path_for_pid(window.pid).and_then(|path| {
+        crate::app_identity::probe_display_name(&path, &window.exe_name, FRIENDLY_NAME_BUDGET)
+    });
+    let card_name = friendly.as_deref().unwrap_or(label);
+    let outcome = crate::picker_prompt::ask(&offers, card_name);
     log::info!(
-        "the account picker offered {} account(s) for {label} and was answered: {}",
+        "the account picker offered {} account(s) for {card_name} and was answered: {}",
         offers.len(),
         describe_picker_outcome(&outcome)
     );
@@ -9331,17 +9357,29 @@ mod picker_wiring_tests {
         );
 
         assert!(
-            body.contains(concat!("picker_prompt::", "ask(&offers, label)")),
-            "`handle_no_match` no longer hands `picker_prompt::ask` the `window_label` it \
-             computed. `label` and `window.exe_name` are both `&str`, so the swap compiles -- \
-             and `empty_text` builds the whole of the card's message out of that one string, \
-             so the card would announce `Ledgerline.exe` where the user's window is called \
-             `Ledgerline`"
+            body.contains(concat!("picker_prompt::", "ask(&offers, card_name)")),
+            "`handle_no_match` no longer hands `picker_prompt::ask` the name it computed for \r
+             the card. `card_name`, `label` and `window.exe_name` are all `&str`, so any swap \r
+             compiles -- and `empty_text` builds the whole of the card's message out of that \r
+             one string, so the card would announce `Ledgerline.exe` where the user's window \r
+             is called `Ledgerline`"
+        );
+        assert!(
+            body.contains(concat!("friendly.as_deref().unwrap", "_or(label)")),
+            "`card_name` is no longer the friendly name falling back to `window_label`. Those \r
+             are the only two things the card may be called: the version resource's answer \r
+             when there is one, and what the card said before this existed when there is not"
         );
         assert!(
             !body.contains(concat!("ask(&offers, &window.", "exe_name")),
-            "`handle_no_match` is handing the card the raw executable name. `window_label` \
-             exists precisely to prefer the window's title over it"
+            "`handle_no_match` is handing the card the raw executable name. `window_label` \r
+             exists precisely to prefer the window's title over it, and `card_name` prefers \r
+             the app's own name over both"
+        );
+        assert!(
+            !body.contains(concat!("ask(&offers, &window.", "title")),
+            "`handle_no_match` is handing the card the raw window title, which is whatever \r
+             document the app happens to have open"
         );
     }
 

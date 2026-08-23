@@ -36,7 +36,14 @@ use deskwarden::picker_prompt::{self, Offer, Outcome, Palette, PickerCalls, REAL
 
 /// The app the card is pretending to have been opened in front of. A fixture
 /// like the candidates are -- nothing here reads a real foreground window.
-const APP_NAME: &str = "Ledgerline.exe";
+///
+/// **`Ledgerline` and not `Ledgerline.exe`**, because that is now what the
+/// daemon hands `ask`: `app::handle_no_match` reads the foreground
+/// executable's `FileDescription` through `app_identity::probe_display_name`
+/// and falls back to `app::window_label` only when there is none. The card's
+/// whole message is built out of this one string, so the file name is exactly
+/// what it must not look like.
+const APP_NAME: &str = "Ledgerline";
 
 fn offer(id: &str, name: &str, username: &str, palette: Palette) -> Offer {
     Offer {
@@ -68,7 +75,15 @@ fn fixtures() -> Vec<Offer> {
     };
     vec![
         offer("id-1", "Slack", "ada@example.com", with_totp()),
-        offer("id-2", "Slack (work)", "ada.lovelace@northwind.example", login()),
+        // Deliberately far too long for the row: `win32_draw::draw_row` draws
+        // both lines with `DT_END_ELLIPSIS`, so this one is the fixture that
+        // shows the truncation ending in "..." rather than cut mid-letter.
+        offer(
+            "id-2",
+            "Northwind Group Consolidated Accounts Portal (production)",
+            "ada.lovelace@accounts.northwind-group-consolidated.example",
+            login(),
+        ),
         offer("id-3", "Atlas Licence", "ada", Palette { fields: vec![], has_sequence: true }),
         offer("id-4", "Ledgerline", "accounts@northwind.example", login()),
         offer("id-5", "Speedtest", "ada@example.com", Palette {
