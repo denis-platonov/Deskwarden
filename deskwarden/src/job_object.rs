@@ -2468,9 +2468,11 @@ mod tests {
                 "build.rs",
                 "examples/field_locator_probe.rs",
                 "examples/icon_probe.rs",
+                "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
+                "examples/unlock_prompt_preview.rs",
                 "examples/watch_windows.rs",
             ],
             "the set of Rust source files outside `src/` changed. A `.rs` file beside \

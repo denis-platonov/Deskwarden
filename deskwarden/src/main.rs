@@ -208,6 +208,12 @@ fn main() {
     // it lazily on first write, same as `update_download_dir`'s directory is
     // created lazily by `download_and_verify`.
     let icon_cache_dir = project_dirs.cache_dir().join("icons");
+    // The account picker's rows draw the same cached icons the vault window
+    // does, and its card is opened from `app::handle_no_match` -- behind an
+    // `fn` pointer with a pinned shape, so there is no argument to pass it
+    // through. This is that one binding handed over, rather than the path
+    // derived a second time in `app.rs`. See `app::set_icon_cache_dir`.
+    deskwarden::app::set_icon_cache_dir(icon_cache_dir.clone());
 
     // Logging first: a background tray app has no console, so without a log
     // file every failure below is invisible to whoever has to diagnose it.
@@ -2042,6 +2048,7 @@ fn main() {
             &backend_op_rx,
             &config_dir,
             deskwarden::unlock_prompt::ask,
+            deskwarden::app::Trigger::Foreground,
         );
     }
 
@@ -2845,6 +2852,55 @@ fn main() {
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
+            } else if let Some(event) = window_watch::current_foreground_event() {
+                // **Nothing was armed, and that is not a reason to do
+                // nothing.** An unmatched window arms no fill, so before this
+                // branch existed `CTRL+ALT+B` was silent for every app the
+                // user had not already bound -- and silent for good, if they
+                // had turned the automatic prompt off, because that setting
+                // reaches `app::disposition`'s unmatched arm. The chord is a
+                // deliberate request, so it dispatches the window in front of
+                // the user through the one dispatcher, with
+                // `Trigger::Hotkey`: `disposition` then reads none of the
+                // three suppressors and none of the field probe's answer, and
+                // opens the account picker (or, locked, the unlock card).
+                //
+                // **`last_dispatched_hwnd` is cleared first**, for the reason
+                // `resume_fill_after_unlock` clears it: `dispatch::
+                // should_dispatch` suppresses a repeat for the window already
+                // handled, which is right for foreground churn and wrong for
+                // a user pressing a chord at the window they are already in.
+                // Left set, this branch would do nothing at all and every
+                // test could still pass.
+                log::info!(
+                    "the fill hotkey was pressed with nothing armed; asking what {} deserves \
+                     as a request rather than as a foreground change",
+                    deskwarden::app::window_label(&event.exe_name, &event.title)
+                );
+                last_dispatched_hwnd = None;
+                if let Some(query) = dispatch_with_the_unlock_door(
+                    &event,
+                    &mut estate,
+                    &injector,
+                    &fill_stats,
+                    &mut fill_proof,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                    &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
+                    &job,
+                    &schedule,
+                    &tray,
+                    &backend_op_rx,
+                    &config_dir,
+                    deskwarden::unlock_prompt::ask,
+                    deskwarden::app::Trigger::Hotkey,
+                ) {
+                    // Only when the card actually asked for one: a bare
+                    // assignment here would erase a search request the
+                    // foreground path made earlier in this same pass, which
+                    // the loop has not reached its door for yet.
+                    pending_vault_search = Some(query);
+                }
             }
         }
 
@@ -3039,6 +3095,7 @@ fn main() {
                 &backend_op_rx,
                 &config_dir,
                 deskwarden::unlock_prompt::ask,
+                deskwarden::app::Trigger::Foreground,
             );
         }
     }
@@ -3062,7 +3119,16 @@ fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
         // open the ~95 MB window the locked card exists to spare the user,
         // against a vault that is still locked and would therefore show an
         // empty list.
-        NoMatchFollowUp::Unlock | NoMatchFollowUp::Nothing => None,
+        // **`Fill` opens no window either, and must not.** It is answered
+        // inside `process_foreground_event`, which holds the injector that can
+        // type; by the time a follow-up reaches this function the fill has
+        // already happened or already been refused, so a `Fill` arriving here
+        // would be a routing mistake rather than a request. Opening the vault
+        // window for it would put a window in front of the app the user just
+        // watched a password typed into.
+        NoMatchFollowUp::Fill { .. }
+        | NoMatchFollowUp::Unlock
+        | NoMatchFollowUp::Nothing => None,
     }
 }
 
@@ -3080,7 +3146,9 @@ fn search_asked_for(follow_up: NoMatchFollowUp) -> Option<String> {
 fn unlock_asked_for(follow_up: &NoMatchFollowUp) -> bool {
     match follow_up {
         NoMatchFollowUp::Unlock => true,
-        NoMatchFollowUp::SearchVault(_) | NoMatchFollowUp::Nothing => false,
+        NoMatchFollowUp::SearchVault(_)
+        | NoMatchFollowUp::Fill { .. }
+        | NoMatchFollowUp::Nothing => false,
     }
 }
 
@@ -3712,6 +3780,13 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     // shape that let the no-match card claim what it did. See
     // `app::VaultAvailability`.
     vault: deskwarden::app::VaultAvailability,
+    // **Which EVENT this call is answering**, and the reason it is a
+    // parameter is that this one function serves two of them: a foreground
+    // change nobody asked for, and a deliberate `CTRL+ALT+B`. See
+    // `app::Trigger`. It is threaded down to `app::disposition` untouched --
+    // no branch in here reads it -- so the only thing it can change is which
+    // card that function chooses, and only for an unmatched window.
+    trigger: deskwarden::app::Trigger,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
     // The password-field question, memoised. Borrowed for one event like
@@ -3811,6 +3886,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
         never,
         deskwarden::app::overlay_prompts(prompt_on_match),
         deskwarden::app::browser_window(&event.exe_name),
+        trigger,
     ) {
         Open::Match(item_id) => {
             log::info!(
@@ -3855,7 +3931,36 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // one opens a frameless always-on-top window, which no test in
             // this crate may do -- and which, called directly on this line,
             // would make those tests hang rather than fail.
-            (field_probe.show)(cache, event)
+            //
+            // **What the card may now ask for includes a fill, and that is
+            // why the answer is inspected here rather than returned whole.**
+            // The account picker offers accounts this window has no CONFIGURED
+            // binding for; picking one and picking a field is a fill the user
+            // asked for by name, twice. It goes through `fill_from_vault` --
+            // the same door `handle_match` uses -- so it is gated by the
+            // master-password re-prompt, gated by the 4b preflight, and typed
+            // by `Injector::fill_sequence`, whose foreground check refuses to
+            // type into a window that is no longer in front. This line is the
+            // only place in this function with an injector in scope, which is
+            // exactly why the request had to travel here to be carried out.
+            //
+            // Nothing is ARMED by it: `pending_hotkey_fill` is untouched, so
+            // the fill hotkey is no more armed after this card than it was
+            // before.
+            match (field_probe.show)(cache, event) {
+                NoMatchFollowUp::Fill { item_id, choice } => {
+                    log::info!(
+                        "the account picker asked to fill {} from vault item {item_id}",
+                        deskwarden::app::window_label(&event.exe_name, &event.title)
+                    );
+                    deskwarden::app::fill_from_vault(
+                        cache, injector, fill_stats, &item_id, event.hwnd, choice, notifier,
+                        reprompt,
+                    );
+                    NoMatchFollowUp::Nothing
+                }
+                other => other,
+            }
         }
         Open::Locked => {
             log::info!(
@@ -3917,6 +4022,10 @@ fn dispatch_with_the_unlock_door<A: UiAutomationFiller, B: SendInputFiller>(
     backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     config_dir: &Path,
     ask: fn(Option<std::path::PathBuf>) -> deskwarden::unlock_prompt::Outcome,
+    // Which event `run` is dispatching. Its three call sites are the seed
+    // before the loop and the foreground channel inside it, which are both
+    // `Foreground`, and the `CTRL+ALT+B` handler, which is `Hotkey`.
+    trigger: deskwarden::app::Trigger,
 ) -> Option<String> {
     let follow_up = process_foreground_event(
         event,
@@ -3926,6 +4035,7 @@ fn dispatch_with_the_unlock_door<A: UiAutomationFiller, B: SendInputFiller>(
         &estate.engine,
         estate.settings.prompt_on_match,
         deskwarden::app::vault_availability(estate.cache.is_populated()),
+        trigger,
         pending_hotkey_fill,
         last_dispatched_hwnd,
         field_probe,
@@ -3966,6 +4076,7 @@ fn dispatch_with_the_unlock_door<A: UiAutomationFiller, B: SendInputFiller>(
         &estate.engine,
         estate.settings.prompt_on_match,
         deskwarden::app::vault_availability(estate.cache.is_populated()),
+        trigger,
         pending_hotkey_fill,
         last_dispatched_hwnd,
         field_probe,
@@ -4015,6 +4126,11 @@ fn resume_fill_after_unlock<A: UiAutomationFiller, B: SendInputFiller>(
     engine: &MatchEngine,
     prompt_on_match: bool,
     vault: deskwarden::app::VaultAvailability,
+    // Carried through rather than hard-coded: the card being resumed was
+    // raised by whichever event produced it, and the resume asks the same
+    // question again. A literal here would answer a chord press as though the
+    // window had merely come to the front.
+    trigger: deskwarden::app::Trigger,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
     field_probe: &mut NoMatchEnv<'_>,
@@ -4032,6 +4148,7 @@ fn resume_fill_after_unlock<A: UiAutomationFiller, B: SendInputFiller>(
         engine,
         prompt_on_match,
         vault,
+        trigger,
         pending_hotkey_fill,
         last_dispatched_hwnd,
         field_probe,
@@ -23248,7 +23365,7 @@ mod tests {
         ) -> NoMatchFollowUp {
             NO_MATCH_SHOWN.with(|s| {
                 // The EVENT, not a label computed here: the label is
-                // `no_match_arm`'s to compute, and a recorder that computed it
+                // `locked_arm`'s to compute, and a recorder that computed it
                 // the same way would assert nothing but its own arithmetic.
                 // `app::the_no_match_card_is_told_the_window_label_and_not_the
                 // _exe_name` is where that claim lives.
@@ -23364,15 +23481,22 @@ mod tests {
             );
             assert_eq!(
                 source.matches(no_match_field).count(),
-                2,
-                "expected `NoMatchEnv`'s 3a field to name `REAL_NO_MATCH_CARD` at both \
-                 production call sites in `run`"
+                // THREE, not two: the seeding dispatch, the event-loop one,
+                // and the `CTRL+ALT+B` handler's, which dispatches the window
+                // in front of the user when nothing is armed. That third door
+                // raises the same two cards, so it must be wired to the same
+                // two functions.
+                3,
+                "expected `NoMatchEnv`'s 3a field to name `REAL_NO_MATCH_CARD` at all three \
+                 production call sites in `run` -- the seeding dispatch, the event loop, and \
+                 the fill hotkey's own"
             );
             assert_eq!(
                 source.matches(locked_field).count(),
-                2,
-                "expected `NoMatchEnv`'s 3b field to name `REAL_LOCKED_CARD` at both \
-                 production call sites in `run`"
+                3,
+                "expected `NoMatchEnv`'s 3b field to name `REAL_LOCKED_CARD` at all three \
+                 production call sites in `run` -- the seeding dispatch, the event loop, and \
+                 the fill hotkey's own"
             );
         }
 
@@ -23599,15 +23723,16 @@ mod tests {
         /// window.
         #[test]
         fn a_search_vault_answer_is_carried_out_of_the_event_handler() {
-            /// The 3a stub that clicks *Search vault*. It answers the label
-            /// the real `handle_no_match` answers -- `window_label`'s -- so
-            /// what this test reads is the query a user would really get.
+            /// The stub that clicks *Search vault* on the unmatched-window
+            /// card. It goes through the shipped mapping -- the account picker's,
+            /// since 3a is that card's empty mode now -- and answers `window_label`'s
+            /// label, so what this test reads is the query a user would really get.
             fn asks_to_search(
                 _cache: &VaultCache,
                 window: &window_watch::ForegroundEvent,
             ) -> NoMatchFollowUp {
-                deskwarden::app::no_match_follow_up(
-                    deskwarden::overlay_ui::NoMatchAnswer::SearchVault,
+                deskwarden::app::picker_follow_up(
+                    deskwarden::picker_prompt::Outcome::SearchVault,
                     deskwarden::app::window_label(&window.exe_name, &window.title),
                 )
             }
@@ -23628,6 +23753,7 @@ mod tests {
                     &engine_with(&[]),
                     true,
                     deskwarden::app::VaultAvailability::Readable,
+                    deskwarden::app::Trigger::Foreground,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &mut NoMatchEnv {
@@ -23723,6 +23849,7 @@ mod tests {
                 &engine,
                 false,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -23792,6 +23919,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -23867,6 +23995,7 @@ mod tests {
                 // The user turned `Prompt on match` off in Preferences.
                 false,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -23899,6 +24028,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -23941,6 +24071,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -23971,6 +24102,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -24026,6 +24158,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Locked,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: has_password_field, show: record_no_match, show_locked: record_locked },
@@ -24087,6 +24220,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Locked,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24136,6 +24270,7 @@ mod tests {
                 &engine,
                 true,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24201,6 +24336,7 @@ mod tests {
                 &engine,
                 false,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: must_not_be_asked, show: record_no_match, show_locked: record_locked },
@@ -24245,6 +24381,7 @@ mod tests {
                     &engine,
                     false,
                     deskwarden::app::VaultAvailability::Readable,
+                    deskwarden::app::Trigger::Foreground,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24295,6 +24432,7 @@ mod tests {
                 &engine,
                 false,
                 deskwarden::app::VaultAvailability::Readable,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24333,6 +24471,7 @@ mod tests {
                     &engine,
                     false,
                     deskwarden::app::VaultAvailability::Readable,
+                    deskwarden::app::Trigger::Foreground,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24381,6 +24520,7 @@ mod tests {
                     &engine,
                     false,
                     deskwarden::app::VaultAvailability::Readable,
+                    deskwarden::app::Trigger::Foreground,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &mut NoMatchEnv { memo: &mut probe_memo, ask: no_password_field, show: record_no_match, show_locked: record_locked },
@@ -24548,6 +24688,7 @@ mod tests {
                 // where that suppression is held.
                 true,
                 deskwarden::app::VaultAvailability::Locked,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv {
@@ -24646,6 +24787,7 @@ mod tests {
                 // off while the master-password prompt is up gets exactly this.
                 false,
                 deskwarden::app::vault_availability(cache.is_populated()),
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv {
@@ -24726,6 +24868,7 @@ mod tests {
                 // where that suppression is held.
                 true,
                 deskwarden::app::VaultAvailability::Locked,
+                deskwarden::app::Trigger::Foreground,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &mut NoMatchEnv {
@@ -24809,11 +24952,13 @@ mod tests {
                 .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(real).count(),
-                2,
-                "expected the bare-Win32 prompt to be named exactly twice in `run` -- the \
-                 seeding dispatch door and the event-loop one. Fewer means one of the two \
-                 answers the Unlock button with something else; more means a third \
-                 production door appeared that nobody has thought about"
+                3,
+                "expected the bare-Win32 prompt to be named exactly three times in `run` -- \
+                 the seeding dispatch door, the event-loop one, and the fill hotkey's, which \
+                 dispatches with `Trigger::Hotkey` when nothing is armed and so can raise the \
+                 locked card too. Fewer means one of the three answers the Unlock button with \
+                 something else; more means a fourth production door appeared that nobody has \
+                 thought about"
             );
             assert_eq!(
                 source[boundary..].matches(concat!("unlock_prompt::", "ask")).count(),

@@ -163,7 +163,7 @@ pub fn overlay_options(choices: &[FillChoice], anchor: Option<(f32, f32)>) -> ef
 /// public entry point takes the choice list rather than a count: handing it
 /// the wrong number is the entire bug that function exists to prevent, so its
 /// one caller is not given the opportunity to. The no-match card has no choice
-/// list to count -- it has [`NO_MATCH_ROWS`], a constant checked against the
+/// list to count -- it has [`LOCKED_ROWS`], a constant checked against the
 /// card it really draws -- so it needs this shape, and nothing outside this
 /// module may have it.
 fn options_for_rows(rows: usize, anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
@@ -238,141 +238,19 @@ pub fn show_prompt_overlay(
     answer
 }
 
-/// Opens design **3a** for `app_name`: the no-match card, at `anchor`.
+/// What the keyboard does to the two **notice** cards: **Esc dismisses, and
+/// that is all there is.**
 ///
-/// Returns nothing. There is no item and therefore no choice: the card's only
-/// outcomes are dismissal (the ✕, Esc, or closing the window) and dismissal,
-/// which is why this is not `Option<FillChoice>` -- a return type with a
-/// `Some` in it would be a promise this state cannot keep.
-///
-/// Shares [`OVERLAY_OPEN`] with [`show_prompt_overlay`], and deliberately: the
-/// guard is about how many overlay windows this process has on screen, not
-/// about which kind. Two states of one card stacking on each other is the same
-/// defect as two copies of one state.
-///
-/// **It answers one bit now**, where it used to answer nothing: whether the
-/// user clicked *New login*. That is not a promise about an item -- there
-/// still is none, and no id, `FillChoice` or `OverlayMatch` crosses this
-/// signature. It is the destination 3a's button did not have until 3c existed.
-pub fn show_no_match_overlay(app_name: &str, anchor: Option<(f32, f32)>) -> NoMatchAnswer {
-    if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
-        log::warn!(
-            "no-match overlay requested for {app_name} while one is already open in this \
-             process; ignoring rather than stacking a second window"
-        );
-        return NoMatchAnswer::Dismissed;
-    }
-
-    let asked = Rc::new(RefCell::new(NoMatchAnswer::Dismissed));
-    let app = NoMatchApp { app_name: app_name.to_string(), asked: Rc::clone(&asked) };
-    let options = no_match_options(anchor);
-
-    let _ = eframe::run_native(
-        "Deskwarden",
-        options,
-        Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    );
-
-    OVERLAY_OPEN.store(false, Ordering::SeqCst);
-
-    let answer = *asked.borrow();
-    answer
-}
-
-/// What 3a answered: nothing, or "open 3c".
-///
-/// A two-variant enum rather than a `bool`, so the call site in
-/// `crate::app::no_match_arm` reads as the two states it is and cannot be
-/// silently inverted by a `!`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NoMatchAnswer {
-    /// The ✕, Esc, or the window closing. Nothing follows.
-    #[default]
-    Dismissed,
-    /// *New login* was clicked: open design 3c for this window.
-    NewLogin,
-    /// *Search vault* was clicked: open the vault window, with this window's
-    /// app name in its search box. See [`SEARCH_VAULT_LABEL`].
-    SearchVault,
-}
-
-/// What the card's [`OverlayAction`] means to the window around it: `None` to
-/// stay up, or the answer to close with.
-///
-/// **One function rather than an `if` and a `matches!`**, which is what
-/// `NoMatchApp::ui` had. Those were two statements that had to agree about the
-/// same list of variants, in a function no test in this crate may execute --
-/// it needs an `eframe::Frame` and a real always-on-top window -- so a variant
-/// added to one and not the other would have been a card that recorded an
-/// answer and never closed, or closed and answered `Dismissed`. As one total
-/// `match` over a non-exhaustive-proof `enum`, a new variant is a compile
-/// error and `every_no_match_action_has_an_answer` reads the table.
-///
-/// [`OverlayAction::Fill`] maps to [`NoMatchAnswer::Dismissed`] and not to
-/// anything else: it is unreachable on this card by construction (there is no
-/// item to fill from), and the safe reading of an impossible fill is that
-/// nothing follows.
-pub fn no_match_answer_of(action: &OverlayAction) -> Option<NoMatchAnswer> {
-    match action {
-        OverlayAction::None => None,
-        OverlayAction::NewLogin => Some(NoMatchAnswer::NewLogin),
-        OverlayAction::SearchVault => Some(NoMatchAnswer::SearchVault),
-        // `Unlock` joins `Fill` here for the same reason: 3a is handed
-        // [`NO_MATCH_BUTTONS`], which does not name it, so this card cannot
-        // paint the control that answers it -- and the safe reading of an
-        // impossible answer is that nothing follows. It must NOT map to
-        // anything that unlocks: 3a is shown only when the vault is readable,
-        // where a master-password prompt would be asking for a password
-        // nothing needs.
-        OverlayAction::Dismiss | OverlayAction::Fill(_) | OverlayAction::Unlock => {
-            Some(NoMatchAnswer::Dismissed)
-        }
-    }
-}
-
-struct NoMatchApp {
-    app_name: String,
-    asked: Rc<RefCell<NoMatchAnswer>>,
-}
-
-impl eframe::App for NoMatchApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array()
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        // `no_match_keyboard_action`, not an `if` here, for the reason
-        // `keyboard_action` exists: this function needs an `eframe::Frame` and
-        // a real always-on-top window, so no test in this crate may execute
-        // it, and "Esc dismisses" is not a claim that may live only where
-        // nothing can check it.
-        let keys = no_match_keyboard_action(EscapePressed::read(&ctx));
-        let card = draw_no_match_card(ui, &self.app_name);
-
-        let action = if keys == OverlayAction::None { card } else { keys };
-        if let Some(answer) = no_match_answer_of(&action) {
-            // Recorded BEFORE the close, so the answer survives the window:
-            // `show_no_match_overlay` reads this cell after `run_native`
-            // returns, and `run_native` returns because of this command.
-            *self.asked.borrow_mut() = answer;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
-/// What the keyboard does to the no-match card: **Esc dismisses, and that is
-/// all there is.**
+/// Named for design 3a, which is where it started; 3a itself is now the bare
+/// Win32 account picker's empty mode (`crate::picker_prompt::empty_rows`),
+/// and what is left here is 3b's, which shares the behaviour exactly.
 ///
 /// Enter is not read at all, and that is the point rather than an omission.
-/// On the matched card Enter fills the primary row; here there is no row and
-/// no item, so an Enter that did anything would be doing it with credentials
-/// that do not exist. It takes only [`EscapePressed`], so there is no second
-/// argument for a swap to hide in -- the defect `keys`' newtypes exist to stop
-/// is not merely prevented here, it is unrepresentable.
+/// On the matched card Enter fills the primary row; on a notice card there is
+/// no row and no item, so an Enter that did anything would be doing it with
+/// credentials that do not exist. It takes only [`EscapePressed`], so there is
+/// no second argument for a swap to hide in -- the defect `keys`' newtypes
+/// exist to stop is not merely prevented here, it is unrepresentable.
 fn no_match_keyboard_action(escape: EscapePressed) -> OverlayAction {
     if escape.pressed() {
         return OverlayAction::Dismiss;
@@ -438,7 +316,7 @@ impl eframe::App for OverlayApp {
             OverlayAction::Dismiss => true,
             // All three unreachable, and by construction rather than by
             // discipline: `draw_overlay_card_rows` never answers any of them
-            // -- only `draw_no_match_card` and `draw_locked_card` do, through
+            // -- only `draw_locked_card` does, through
             // the button lists `draw_notice_card` is handed, and this card is
             // handed none. Closing is what a matched overlay would have to do
             // with an answer it cannot produce, and it is the same thing
@@ -609,7 +487,7 @@ pub enum OverlayAction {
     /// The 3a card's *New login* button was clicked: close this card and open
     /// design **3c**, the save-a-new-login form.
     ///
-    /// **Only [`draw_no_match_card`] can answer this**, and that is a property
+    /// **No card in this module can answer this any more**, and that is a property
     /// of the two cards rather than of discipline: [`draw_notice_card`] paints
     /// a button only for a label it is handed, and the list
     /// [`draw_locked_card`] hands it ([`LOCKED_BUTTONS`]) does not contain
@@ -619,7 +497,7 @@ pub enum OverlayAction {
     /// The 3a card's *Search vault* button was clicked: close this card and
     /// open the vault window, with this app's name already in its search box.
     ///
-    /// **Only [`draw_no_match_card`] can answer this**, by the same
+    /// **No card in this module can answer this any more**, by the same
     /// construction as [`Self::NewLogin`]: [`draw_notice_card`] paints a
     /// button only for a label it is handed, and [`LOCKED_BUTTONS`] does not
     /// name it. See [`SEARCH_VAULT_LABEL`] for what made this drawable
@@ -629,7 +507,7 @@ pub enum OverlayAction {
     /// daemon's bare-Win32 master-password prompt on screen.
     ///
     /// **Only [`draw_locked_card`] can answer this**, by the same construction
-    /// running the other way: [`NO_MATCH_BUTTONS`] does not name it, so 3a
+    /// running the other way: [`LOCKED_BUTTONS`] does not name it, so 3b
     /// cannot paint it. See [`UNLOCK_LABEL`] for why the locked card may make
     /// this offer when it may make neither of 3a's.
     Unlock,
@@ -763,116 +641,11 @@ pub fn draw_overlay_card_rows(
     action
 }
 
-/// The number of choice rows whose [`overlay_height`] the no-match card is
-/// sized by.
-///
-/// **A constant, and one that is checked against the card rather than chosen
-/// for it.** The overlay is a frameless, always-on-top window with a hardcoded
-/// inner size, no resize border, no title bar to drag and **no `ScrollArea`
-/// anywhere**: a control past its bottom edge is not merely awkward, it is
-/// unreachable. `f67bf42`'s message records three separate occasions on which
-/// a text or layout change pushed a control out of this viewport, which is why
-/// this card gets a measurement and not a guess.
-///
-/// It is `1` because the no-match card's body is the same shape as one
-/// credential row -- two truncated text lines -- and
-/// [`the_no_match_card_fits_the_window_it_asks_for`] both measures the real
-/// card against `overlay_height(NO_MATCH_ROWS)` and asserts it does NOT fit
-/// the next size down. A one-sided bound would let the body silently shrink to
-/// nothing; a two-sided one would not.
-pub const NO_MATCH_ROWS: usize = 1;
-
-/// The window the no-match card asks the OS for.
-///
-/// Separate from [`overlay_options`] rather than sharing its choice-list
-/// argument, because there is no choice list: the size comes from
-/// [`NO_MATCH_ROWS`]. It is public for the same reason `overlay_options` is --
-/// `show_no_match_overlay` calls `eframe::run_native` and no test here may
-/// execute it, so the size it asks for would otherwise be the one number in
-/// this card nothing could observe.
-pub fn no_match_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
-    options_for_rows(NO_MATCH_ROWS, anchor)
-}
-
-/// The two lines of the no-match card, as [`row_text`] is for the matched one.
-///
-/// Both lines are constants plus **one** user-controlled string, `app_name`,
-/// which is `app::window_label`'s answer -- an executable name or a window
-/// title, either of which a user (or the app they ran) chooses. The card's
-/// height must not depend on it; see [`draw_no_match_card`].
-fn no_match_text(app_name: &str) -> (String, String) {
-    (
-        format!("No saved login for {app_name}"),
-        // **It no longer says "Open Deskwarden to search the vault."** That
-        // was guidance for a button that was not drawn; *Search vault* is
-        // drawn now and does exactly that, so the line would be telling the
-        // user to go and do by hand the thing the control beneath it does.
-        // What is left is the fact that explains the card: matching is by
-        // process name and window title, so an app whose window says
-        // something unexpected can be unmatched while its login is saved.
-        "Deskwarden matches windows by process name and title.".to_string(),
-    )
-}
-
-/// Design **3a**: the card for a window that asks for a password and that
-/// nothing in the vault matches.
-///
-/// The state this exists for used to be indistinguishable from a broken app:
-/// focusing an unrecognised login window did nothing whatsoever, and a user
-/// cannot tell "Deskwarden has nothing for this" from "Deskwarden is not
-/// running". This says the first one.
-///
-/// **Both of 3a's drawn buttons are here now.** *New login* leads to design
-/// 3c (see [`NEW_LOGIN_LABEL`]); *Search vault* opens the vault window with
-/// this app's name in its search box (see [`SEARCH_VAULT_LABEL`], which
-/// records why it could not be drawn for three releases and what changed).
-/// The guidance for both stays out of the body text, which says only that
-/// there is nothing saved: the buttons are the offer.
-///
-/// **No avatar, and two truncated lines.** The body is the same shape as one
-/// [`credential_row`] minus the initials tile, and with the footer's buttons
-/// it is [`overlay_height`]`(`[`NO_MATCH_ROWS`]`)` tall with five points to
-/// spare -- six fewer than before the buttons, which is what `NO_MATCH_SLACK`
-/// records. **The second button cost no height**, because it shares the
-/// footer's one `ui.horizontal` with the first; what it costs is *width*, and
-/// `the_no_match_footer_fits_across_the_card` is what holds that. Both lines
-/// truncate inside
-/// a text column of explicit width for exactly the reason
-/// [`credential_row`]'s do: `app_name` is user-controlled, wrapping is what
-/// made a one-row card 189pt tall in a 164pt window, and this window still
-/// cannot scroll.
-///
-/// Public so the `ui_preview` example renders the card the app ships rather
-/// than a re-implementation that could drift from it.
-///
-/// Answers [`OverlayAction::Dismiss`] when the header's ✕ is clicked, and
-/// [`OverlayAction::None`] otherwise. It never answers `Fill`: there is no
-/// item to fill from, so the variant is unreachable here by construction
-/// rather than by discipline.
-pub fn draw_no_match_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
-    let (primary, secondary) = no_match_text(app_name);
-    draw_notice_card(ui, NO_MATCH_LABEL, &primary, &secondary, NO_MATCH_BUTTONS)
-}
-
-/// 3a's footer buttons, **in the order the design draws them** and paired with
-/// the answer each one gives.
-///
-/// A constant rather than an array literal at the call site so that "3a offers
-/// exactly these two, in this order" is one thing a test can name -- and so
-/// that the two labels and the two [`OverlayAction`]s cannot be paired up
-/// wrongly in a second place. [`draw_locked_card`] passes [`LOCKED_BUTTONS`],
-/// which names neither of them -- so both answers stay unreachable from the
-/// locked card by construction, exactly as when it passed an empty slice.
-const NO_MATCH_BUTTONS: &[(&str, OverlayAction)] = &[
-    (SEARCH_VAULT_LABEL, OverlayAction::SearchVault),
-    (NEW_LOGIN_LABEL, OverlayAction::NewLogin),
-];
-
 /// Design **3b**: the card for a window that asks for a password while the
 /// vault is **locked**.
 ///
 /// **This is a correction, not an addition.** Until it existed a locked vault
-/// reached [`draw_no_match_card`], and the user was told "No saved login for
+/// reached design 3a's card, and the user was told "No saved login for
 /// <app>" -- a statement about the contents of a vault this process cannot
 /// read. `main`'s `stand_down_after_unlock` empties the match engine on every
 /// lock, and says so in its own log line: "the app matches are cleared too, so
@@ -902,7 +675,7 @@ const NO_MATCH_BUTTONS: &[(&str, OverlayAction)] = &[
 /// locked, it therefore cannot answer for this app, and here is the button
 /// that changes that.
 ///
-/// Same shape and same window as [`draw_no_match_card`] (see [`LOCKED_ROWS`]),
+/// Same shape and same window as design 3a's card was (see [`LOCKED_ROWS`]),
 /// and -- since both footers now carry a button -- the same height again:
 /// they share [`draw_notice_card`] rather than each spelling the card out.
 ///
@@ -914,39 +687,43 @@ pub fn draw_locked_card(ui: &mut egui::Ui, app_name: &str) -> OverlayAction {
 
 /// 3b's footer buttons: exactly one, and paired with the answer it gives.
 ///
-/// [`NO_MATCH_BUTTONS`]'s sibling and written the same way, so that "3b offers
+/// Written the way 3a's own button list was, so that "3b offers
 /// exactly this, and nothing else" is one thing a test can name. The two lists
 /// are disjoint, and that disjointness is what keeps each card's answers
 /// unreachable from the other by construction rather than by discipline --
 /// see [`OverlayAction::NewLogin`] and [`OverlayAction::Unlock`].
 const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction::Unlock)];
 
-/// The card [`draw_no_match_card`] and [`draw_locked_card`] share: a header
+/// The card [`draw_locked_card`] draws, and 3a's drew before it: a header
 /// with a ✕, a two-line body, and an `Esc Dismiss` footer.
 ///
 /// **One function rather than two copies**, because the two states differ only
 /// in three strings -- and because the height evidence is a property of *this*
 /// layout. Two copies would let one of them drift a point taller than the
 /// window they both ask the OS for, in a viewport that cannot scroll; shared,
-/// `the_no_match_card_fits_the_window_it_asks_for` and
-/// `the_locked_card_fits_the_window_it_asks_for` measure the same code twice.
+/// `the_locked_card_fits_the_window_it_asks_for` measures it. (3a's own card
+/// measured it a second time until that card was deleted; the account picker
+/// draws design 3a now, and measures its own geometry in
+/// `picker_prompt::card_tests`.)
 ///
 /// `primary` and `secondary` are borrowed and both labels `.truncate()`, for
 /// the reason [`credential_row`]'s do: each carries one user-controlled string
 /// (`app::window_label`'s answer), wrapping is what made a one-row card 189pt
 /// tall in a 164pt window, and this window still cannot scroll.
-/// **The two cards are no longer the same height, and `buttons` is why.** 3a's
-/// footer carries buttons and 3b's does not, so [`NO_MATCH_ROWS`] and
-/// [`LOCKED_ROWS`] are separately measured against separately sized cards --
-/// which is exactly the reason those two constants were written as separate
-/// constants rather than as an alias in the first place.
+/// **`buttons` is what makes this card taller than an empty-footer one.** 3b
+/// carries [`UNLOCK_LABEL`] in its footer, so [`LOCKED_ROWS`] is measured
+/// against a card with a button in it, and the six points that button cost are
+/// the whole argument (see `LOCKED_SLACK` in this file's tests) for measuring
+/// this card's height against nothing but itself.
 ///
 /// **`buttons` is a slice and not a second `Option`.** All of them share one
 /// `ui.horizontal` with the `Esc Dismiss` hint, so the card's HEIGHT is a
 /// function of whether the slice is empty and of nothing else -- one button or
 /// two is the same strip. What a longer slice spends is width, which is
 /// bounded by [`OVERLAY_WIDTH`] and is what
-/// `the_no_match_footer_fits_across_the_card` measures. Each entry carries the
+/// `the_locked_card_names_the_app_and_the_way_out_inside_its_window` measures,
+/// asserting every painted run inside the window rather than only its
+/// height. Each entry carries the
 /// [`OverlayAction`] it answers, so a button cannot be drawn without an answer
 /// or wired to the wrong one.
 fn draw_notice_card(
@@ -1050,7 +827,7 @@ fn draw_notice_card(
                     // fill would be the card contradicting itself.
                     theme::footer_hints(ui, &[("Esc", "Dismiss")]);
                 } else {
-                    // 3a. Every button on this strip has a destination that
+                    // Every button on this strip has a destination that
                     // exists: a control on a frameless, always-on-top card
                     // that does nothing when clicked is worse than no control,
                     // which is why *Search vault* waited for `main` to grow a
@@ -1076,32 +853,29 @@ fn draw_notice_card(
     action_taken
 }
 
-/// What the no-match card's header says where the matched card counts matches.
-///
-/// A constant rather than a literal inside [`draw_no_match_card`] so that the
-/// card's one claim -- there is nothing here -- is a string a test can name
-/// and find in the painted output, rather than one it has to re-spell.
-pub const NO_MATCH_LABEL: &str = "No match";
-
-/// What 3a's one button says, and **the only card that may carry it**.
+/// What the account picker's empty-card *New login* row says, and **the
+/// only egui card that may NOT carry it**.
 ///
 /// [`draw_locked_card`] hands [`draw_notice_card`] `None` here, deliberately:
 /// design 3c ends in `VaultCache::create_item`, which is a write through
 /// `bw serve` against an unlocked vault, so a *New login* button on the locked
 /// card would be an offer the process cannot honour -- the same class of
 /// defect as the locked card's own correction (a card claiming something about
-/// a vault it cannot read). `the_locked_card_offers_no_new_login_button` reads
-/// the painted glyphs of both cards rather than trusting the argument.
+/// a vault it cannot read).
+/// `the_locked_card_offers_neither_of_the_pickers_two_offers` reads the locked
+/// card's painted glyphs rather than trusting the argument.
 ///
-/// A constant for the reason [`NO_MATCH_LABEL`] is one: it is the string a
+/// A constant for the reason [`LOCKED_LABEL`] is one: it is the string a
 /// test finds in the painted output rather than one it re-spells.
 pub const NEW_LOGIN_LABEL: &str = "New login";
 
-/// What 3a's other button says, and **the only card that may carry it**.
+/// What the account picker's other empty-card row says, and **the only egui
+/// card that may NOT carry it**.
 ///
 /// # Why it took three releases to draw
 ///
-/// 3a as designed always had two buttons. Only *New login* was drawn, because
+/// Design 3a as drawn in egui always had two buttons. Only *New login* was
+/// drawn, because
 /// *Search vault* had to reach the vault window from inside
 /// `main::process_foreground_event` -- and at the time that function could
 /// reach nothing that opens one. A button on a frameless, always-on-top card
@@ -1126,7 +900,7 @@ pub const NEW_LOGIN_LABEL: &str = "New login";
 /// search, and a vault window opened with a query in its box would show an
 /// empty list that means "locked" and reads as "nothing found".
 ///
-/// A constant for the reason [`NO_MATCH_LABEL`] is one: it is the string a
+/// A constant for the reason [`LOCKED_LABEL`] is one: it is the string a
 /// test finds in the painted output rather than one it re-spells.
 pub const SEARCH_VAULT_LABEL: &str = "Search vault";
 
@@ -1161,13 +935,13 @@ pub const SEARCH_VAULT_LABEL: &str = "Search vault";
 /// [`crate::unlock_prompt::UNLOCK_PROMPT_TITLE`]: a button says what pressing
 /// it does, and the window it opens says what it is.
 ///
-/// A constant for the reason [`NO_MATCH_LABEL`] is one: it is the string a
+/// A constant for the reason [`LOCKED_LABEL`] is one: it is the string a
 /// test finds in the painted output rather than one it re-spells.
 pub const UNLOCK_LABEL: &str = "Unlock";
 
 /// What the locked card's header says.
 ///
-/// A constant for the same reason [`NO_MATCH_LABEL`] is one, and **it must not
+/// A constant for the same reason [`LOCKED_LABEL`] is one, and **it must not
 /// be that string**: the two cards are drawn by the same
 /// [`draw_notice_card`], so the header is the only thing in the painted output
 /// that tells them apart, and
@@ -1177,7 +951,7 @@ pub const LOCKED_LABEL: &str = "Vault locked";
 /// The number of choice rows whose [`overlay_height`] the locked card is sized
 /// by.
 ///
-/// The same `1` as [`NO_MATCH_ROWS`] and **not an alias of it**. They are equal
+/// The same `1` design 3a's card was sized by, and **not an alias of it**. They are equal
 /// today because the two cards share [`draw_notice_card`] and so lay out
 /// identically; they are separate constants because the card each one sizes is
 /// separately measured (`the_locked_card_fits_the_window_it_asks_for`), and a
@@ -1185,20 +959,19 @@ pub const LOCKED_LABEL: &str = "Vault locked";
 ///
 /// The two cards have been the same height, then not, and are again: 3a gained
 /// the *New login* button and 3b had none, and now 3b has [`UNLOCK_LABEL`].
-/// Nothing relies on that equality -- `LOCKED_SLACK` and `NO_MATCH_SLACK` are
-/// separate numbers measured against separate cards, which is exactly so that
-/// the next time the two diverge, one of them fails rather than both quietly
-/// agreeing.
+/// Nothing relies on that equality: `LOCKED_SLACK` is measured against this
+/// card alone, and 3a's own slack constant went with 3a's card, so there is no
+/// number here that two cards could quietly agree on.
 pub const LOCKED_ROWS: usize = 1;
 
-/// The window the locked card asks the OS for. [`no_match_options`]'s sibling,
+/// The window the locked card asks the OS for. 3a's own sibling of this,
 /// public for the same reason: `show_locked_overlay` calls
 /// `eframe::run_native`, which no test here may execute.
 pub fn locked_options(anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
     options_for_rows(LOCKED_ROWS, anchor)
 }
 
-/// The two lines of the locked card, as [`no_match_text`] is for 3a.
+/// The two lines of the locked card, as `picker_prompt::empty_text` is for 3a.
 ///
 /// **Neither line says whether the vault has a login for `app_name`**, and
 /// that is the whole correction: the process cannot know while locked, so it
@@ -1227,14 +1000,15 @@ fn locked_text(app_name: &str) -> (String, String) {
 
 /// What 3b answered: nothing, or "open the master-password prompt".
 ///
-/// [`NoMatchAnswer`]'s sibling, and a two-variant enum rather than a `bool`
+/// A two-variant enum rather than a `bool`
 /// for the same reason that one is not one: the call site in
 /// `crate::app::locked_arm` reads as the two states it is and cannot be
 /// silently inverted by a `!`.
 ///
-/// A separate type from [`NoMatchAnswer`] rather than a shared one, for the
+/// A separate type from the account picker's `Outcome` rather than a shared
+/// one, for the
 /// reason `PromptPresenter::show_locked` is a separate method from
-/// `show_no_match`: the two cards make opposite claims about the vault, and
+/// its own method: the two cards make opposite claims about the vault, and
 /// the answers they may give are disjoint. A shared enum would let a 3a
 /// dismissal be handed to the unlock wiring, and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1252,7 +1026,7 @@ pub enum LockedAnswer {
 /// What the locked card's [`OverlayAction`] means to the window around it:
 /// `None` to stay up, or the answer to close with.
 ///
-/// [`no_match_answer_of`]'s sibling and written for the same reason, which
+/// Written for the reason 3a's own mapping was, which
 /// applies here identically: `LockedApp::ui` needs an `eframe::Frame` and a
 /// real always-on-top window, so no test in this crate may execute it, and
 /// "Esc dismisses" is not a claim that may live only where nothing can check
@@ -1277,10 +1051,13 @@ pub fn locked_answer_of(action: &OverlayAction) -> Option<LockedAnswer> {
 
 /// Opens design **3b** for `app_name`: the locked card, at `anchor`.
 ///
-/// [`show_no_match_overlay`]'s sibling, down to sharing [`OVERLAY_OPEN`] --
-/// the guard is about how many overlay windows this process has on screen, not
-/// about which kind, and 3a stacked on 3b is the same defect as two copies of
-/// either.
+/// **The last egui notice card.** It used to have a sibling -- design 3a's
+/// window, which shared [`OVERLAY_OPEN`] with it -- and that one is now the
+/// bare-Win32 account picker's empty mode, drawn by
+/// `crate::picker_prompt::empty_rows` at a fraction of the memory. The guard
+/// stays what it was: it is about how many overlay windows this process has on
+/// screen, not about which kind, and two copies of this card is the defect it
+/// exists to prevent.
 ///
 /// **It still does not return an `Option<FillChoice>`**, for the reason it
 /// never did: there is no item here, so there is no choice, and a signature
@@ -1345,9 +1122,8 @@ impl eframe::App for LockedApp {
         let action = if keys == OverlayAction::None { card } else { keys };
         if let Some(answer) = locked_answer_of(&action) {
             // Recorded BEFORE the close, so the answer survives the window,
-            // exactly as `NoMatchApp::ui` does it: `show_locked_overlay` reads
-            // this cell after `run_native` returns, and `run_native` returns
-            // because of this command.
+            // `show_locked_overlay` reads this cell after `run_native`
+            // returns, and `run_native` returns because of this command.
             *self.asked.borrow_mut() = answer;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1386,7 +1162,7 @@ pub const SAVE_LOGIN_ROWS: usize = 3;
 
 /// The window the save-a-new-login card asks the OS for.
 ///
-/// [`no_match_options`]'s sibling, public for the same reason:
+/// [`locked_options`]'s sibling, public for the same reason:
 /// [`show_save_login_overlay`] calls `eframe::run_native` and no test here may
 /// execute it, so the size it asks for would otherwise be the one number in
 /// this card nothing could observe.
@@ -1544,7 +1320,8 @@ pub const PASSWORD_HINT: &str = "type the password you used";
 /// has nothing for.
 ///
 /// Four rows -- App, Username, Password, Folder -- and three controls: *Save*,
-/// *Not now*, *Never for this app*. Reached from [`draw_no_match_card`]'s
+/// *Not now*, *Never for this app*. Reached from the account picker's empty
+/// card ([`crate::picker_prompt::empty_rows`])
 /// *New login* button, which is the destination that button did not have when
 /// 3a shipped.
 ///
@@ -5136,22 +4913,7 @@ mod geometry_tests {
         }
     }
 
-    // -------------------------------------------------- design 3a: no match
-
-    /// Paints the real no-match card into a window of exactly `height` points
-    /// and returns its ink.
-    fn painted_no_match(app_name: &str, height: f32) -> Vec<Ink> {
-        let ctx = styled_ctx();
-        let output = ctx.run_ui(sized(height), |ui| {
-            draw_no_match_card(ui, app_name);
-        });
-        let mut ink = Vec::new();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut ink);
-        }
-        ink.retain(|i| i.alpha > 0);
-        ink
-    }
+    // ------------------------------------------------ design 3b: locked card
 
     /// The locked card, painted into a window `height` tall, and its ink.
     fn painted_locked(app_name: &str, height: f32) -> Vec<Ink> {
@@ -5185,122 +4947,13 @@ mod geometry_tests {
         needed
     }
 
-    /// What egui says the no-match card needs, laid out unconstrained.
-    fn no_match_card_height(app_name: &str) -> f32 {
-        /// Comfortably taller than any card this module draws, so nothing is
-        /// culled and the layout is the unconstrained one.
-        const ROOMY: f32 = 700.0;
-        let ctx = styled_ctx();
-        let mut needed = f32::NAN;
-        let _ = ctx.run_ui(sized(ROOMY), |ui| {
-            assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
-            draw_no_match_card(ui, app_name);
-            needed = ui.min_rect().bottom();
-        });
-        assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
-        assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
-        needed
-    }
-
-    /// **`NO_MATCH_ROWS` is checked against the card, in both directions.**
-    ///
-    /// The overlay is frameless, always-on-top, hardcoded in size, and has no
-    /// `ScrollArea` anywhere -- so a control past its bottom edge is
-    /// unreachable, with no title bar to drag it back and nothing to scroll.
-    /// `f67bf42`'s message records three separate occasions on which a text or
-    /// layout change pushed a control out of this viewport. So the constant is
-    /// not chosen and left alone:
-    ///
-    /// * the card must **fit** `overlay_height(NO_MATCH_ROWS)` -- the
-    ///   load-bearing half, and the one a growing card fails; and
-    /// * it must **not fit** the next size down -- the half that stops the
-    ///   constant being silently too generous, which is how a body that
-    ///   stopped being drawn at all would otherwise go unnoticed.
-    ///
-    /// The second half is only meaningful because `overlay_height` floors at
-    /// one row, so "the next size down" is a real, smaller number rather than
-    /// the same one: `CHROME_HEIGHT` alone, the card with its body removed.
-    #[test]
-    fn the_no_match_card_fits_the_window_it_asks_for() {
-        let asked = no_match_options(None)
-            .viewport
-            .inner_size
-            .expect("the no-match viewport must request an inner size at all");
-        assert_eq!(asked.x, OVERLAY_WIDTH, "the no-match card asked for a {}pt-wide window", asked.x);
-        assert_eq!(
-            asked.y,
-            overlay_height(NO_MATCH_ROWS),
-            "the window asked for is not the one NO_MATCH_ROWS describes, so every assertion \
-             below is about a card the OS will never be given"
-        );
-
-        let needed = no_match_card_height(APP);
-        assert!(
-            needed <= asked.y,
-            "the no-match card lays out {needed}pt tall and the window the overlay asks the OS \
-             for is {}pt. This window is frameless and always-on-top -- no title bar, no resize \
-             border, no scroll area -- so the missing {:.1}pt, and the Esc hint in it, are gone",
-            asked.y,
-            needed - asked.y
-        );
-        assert!(
-            needed > asked.y - ROW_HEIGHT,
-            "the no-match card lays out {needed}pt, which still fits a window one ROW_HEIGHT \
-             shorter than the {}pt NO_MATCH_ROWS asks for. Either NO_MATCH_ROWS is a row too \
-             generous, or the card's body has stopped being drawn -- and the `fits` bound above \
-             cannot tell either of those from a card that is simply the right size",
-            asked.y
-        );
-
-        // And the slack exactly, in the idiom `CHROME_SLACK` set: a one-sided
-        // bound cannot tell eleven points of deliberate dead space from thirty
-        // points of a body line that silently stopped being painted.
-        assert_eq!(
-            asked.y - needed,
-            NO_MATCH_SLACK,
-            "the no-match card lays out {needed}pt in a {}pt window, so the dead space at its \
-             bottom is {:.1}pt rather than the recorded {NO_MATCH_SLACK}pt. A font, a margin or \
-             a line changing size fails here rather than by clipping a control off a window \
-             that has no scrollbar",
-            asked.y,
-            asked.y - needed
-        );
-    }
-
-    /// How much taller than it needs to be the no-match card's window is.
-    ///
-    /// **Measured, not chosen**, exactly like [`CHROME_SLACK`]: the card lays
-    /// out at 159pt and the window is [`overlay_height`]`(`[`NO_MATCH_ROWS`]`)`
-    /// = 164pt.
-    ///
-    /// **It was 11.0 and is now 5.0, because the card gained a control.** 3a's
-    /// footer now carries the *New login* button that opens design 3c -- the
-    /// destination it did not have when 3a shipped -- and a `row_button` is
-    /// taller than the hint text it sits beside. Six of the eleven points of
-    /// dead space went into it, which is what dead space at the bottom of a
-    /// frameless card is for. Five are left, and they are pinned exactly here
-    /// rather than bounded, for the reason they always were: a one-sided bound
-    /// cannot tell five points of deliberate slack from thirty points of a
-    /// body line that silently stopped being painted.
-    ///
-    /// The number is also the reason the button is a `row_button` and not a
-    /// `secondary_button`: with the taller control the card laid out at 167pt
-    /// in a 164pt window, i.e. with its only dismiss hint off the bottom edge
-    /// of a surface that cannot scroll.
-    ///
-    /// Slack in this direction is the safe direction. A window taller than its
-    /// card wastes eleven points; a window shorter than its card loses the
-    /// bottom of a frameless, always-on-top surface with no scrollbar and no
-    /// resize border -- and the bottom is where the only dismiss hint is.
-    const NO_MATCH_SLACK: f32 = 5.0;
-
     /// **`LOCKED_ROWS` is checked against the 3b card, in both directions**,
-    /// exactly as `NO_MATCH_ROWS` is against 3a -- and it is a separate test
-    /// over a separate measurement rather than a note that the two cards share
-    /// a drawer. Sharing is an implementation detail this test must not
+    /// and it is a separate test
+    /// over its own measurement rather than a note that it shares a drawer with
+    /// anything. Sharing is an implementation detail this test must not
     /// assume: a `draw_locked_card` that grew a third line, or stopped drawing
-    /// its body, would be invisible to 3a's test and to any assertion phrased
-    /// as "they are the same".
+    /// its body, would be invisible to any assertion phrased as "it is the same
+    /// card as some other one".
     ///
     /// The card is 3c's height evidence in miniature and for the same reason:
     /// the overlay is frameless, always-on-top, hardcoded in size and has no
@@ -5352,9 +5005,11 @@ mod geometry_tests {
 
     /// How much taller than it needs to be the LOCKED card's window is.
     ///
-    /// **Its own constant, and deliberately not [`NO_MATCH_SLACK`]** even
-    /// though the two are equal again. The history is the whole argument for
-    /// keeping them apart: both cards were 153pt in a 164pt window (slack 11);
+    /// **Its own constant, measured against this card and no other.** 3a had
+    /// a slack constant of its own, equal to this one again by the end, and it
+    /// was deleted with 3a's card rather than shared. The history is the whole
+    /// argument for never having merged them: both cards were 153pt in a
+    /// 164pt window (slack 11);
     /// 3a's footer then gained the *New login* button and became 159pt (slack
     /// 5) while 3b, which had no button it could honour, stayed at 11; and now
     /// 3b's footer carries [`UNLOCK_LABEL`], so it is 159pt too and this
@@ -5367,90 +5022,18 @@ mod geometry_tests {
     /// button is not being drawn. It moved by exactly the six points 3a's did,
     /// which is what says the same `draw_notice_card` drew both.
     ///
-    /// Slack in this direction is the safe direction, for the reason
-    /// [`NO_MATCH_SLACK`] spells out: a window taller than its card wastes
+    /// Slack in this direction is the safe direction: a window taller than its
+    /// card wastes
     /// five points, and a window shorter than its card loses the bottom of a
     /// frameless, always-on-top surface -- which is where the Esc hint, and
     /// now the *Unlock* button, are.
     const LOCKED_SLACK: f32 = 5.0;
 
-    /// **3b offers no route to 3c, and 3a does** -- read off the two painted
-    /// cards, not off the argument `draw_notice_card` is handed.
-    ///
-    /// This replaces `the_two_notice_cards_are_the_same_height`, which was
-    /// true only while the two cards had identical footers and would now fail
-    /// for a reason unrelated to what it was written to catch. What is worth
-    /// asserting in its place is the thing that made them differ, and it is a
-    /// safety claim rather than a layout one: design 3c ends in
-    /// `VaultCache::create_item`, which needs a vault this process can open,
-    /// so a *New login* button on the locked card would be an offer it cannot
-    /// honour -- the same defect as the locked card's own correction, which
-    /// was a card claiming something about a vault it could not read.
-    #[test]
-    fn the_locked_card_offers_no_new_login_button() {
-        let on_3a = notice_glyphs(|ui| draw_no_match_card(ui, APP));
-        let on_3b = notice_glyphs(|ui| draw_locked_card(ui, APP));
-
-        // Both of 3a's buttons, checked the same way: `SEARCH_VAULT_LABEL`'s
-        // own reason for staying off 3b is different from `NEW_LOGIN_LABEL`'s
-        // (there is nothing to search while locked, rather than nothing to
-        // write to), but the property is the same one and neither may drift.
-        for label in [NEW_LOGIN_LABEL, SEARCH_VAULT_LABEL] {
-            assert_eq!(
-                on_3a.iter().filter(|g| *g == label).count(),
-                1,
-                "control: 3a does not paint the {label:?} button either, so the \
-                 assertion below proves nothing. Painted: {on_3a:?}"
-            );
-            assert_eq!(
-                on_3b.iter().filter(|g| *g == label).count(),
-                0,
-                "the locked card paints a {label:?} button. Neither of 3a's two offers can \
-                 be honoured against a vault this process cannot open, so the user is \
-                 offered something that cannot happen. Painted: {on_3b:?}"
-            );
-        }
-    }
-
-    /// **3b offers the unlock, and 3a does not** -- the positive half of the
-    /// test above, read off the two painted cards rather than off the argument
-    /// `draw_notice_card` is handed.
-    ///
-    /// Without this, the locked card's only button could stop being drawn --
-    /// by an empty `LOCKED_BUTTONS`, or by the footer strip losing its button
-    /// branch -- with `the_locked_card_offers_no_new_login_button` still green,
-    /// because that test only says which buttons must NOT be there. A card
-    /// that offers nothing is exactly what this work exists to change.
-    ///
-    /// The exclusion runs the other way too: `UNLOCK_LABEL` must not appear on
-    /// 3a. That card is shown only when the vault is readable, so an unlock
-    /// there would be asking for a master password nothing needs.
-    #[test]
-    fn the_locked_card_offers_the_unlock_and_the_no_match_card_does_not() {
-        let on_3a = notice_glyphs(|ui| draw_no_match_card(ui, APP));
-        let on_3b = notice_glyphs(|ui| draw_locked_card(ui, APP));
-
-        assert_eq!(
-            on_3b.iter().filter(|g| *g == UNLOCK_LABEL).count(),
-            1,
-            "the locked card paints no {UNLOCK_LABEL:?} button. The card is back to being a \
-             notice the user cannot act on, and the only unlock left to them is the ~95 MB \
-             window this whole path exists to avoid. Painted: {on_3b:?}"
-        );
-        assert_eq!(
-            on_3a.iter().filter(|g| *g == UNLOCK_LABEL).count(),
-            0,
-            "the no-match card paints an {UNLOCK_LABEL:?} button. It is shown only when the \
-             vault is readable, so it would be offering to unlock what is already open. \
-             Painted: {on_3a:?}"
-        );
-    }
-
     /// Every [`OverlayAction`] has an answer on the locked card, and the table
     /// is what says which.
     ///
-    /// [`every_no_match_action_has_an_answer`]'s sibling and written for the
-    /// same reason: `LockedApp::ui` needs a real always-on-top window, so the
+    /// Written for the reason its deleted 3a-card sibling was: `LockedApp::ui`
+    /// needs a real always-on-top window, so the
     /// mapping is the only part of that body a test can execute, and the three
     /// answers this card cannot produce are pinned rather than left to a
     /// wildcard.
@@ -5488,110 +5071,119 @@ mod geometry_tests {
         }
     }
 
-    /// **3a's footer fits across the card, and this is what says so.**
+    /// **Neither of the account picker's two offers may appear on 3b.**
     ///
-    /// The second button cost no HEIGHT -- it shares one `ui.horizontal` with
-    /// the first and with the Esc hint, which is why [`NO_MATCH_SLACK`] did
-    /// not move when it was added. What it costs is width, on a window that is
-    /// a fixed [`OVERLAY_WIDTH`] with no resize border and no scrollbar, so a
-    /// footer that overran would put the last control past the right-hand edge
-    /// with no way to reach it -- the same unreachable-control failure the
-    /// height constants exist for, along the other axis.
+    /// `NEW_LOGIN_LABEL` and `SEARCH_VAULT_LABEL` are the empty account
+    /// picker's rows now (`crate::picker_prompt::empty_label` returns these
+    /// very constants), and they must stay off the locked card for two
+    /// different reasons that amount to the same rule. *New login* ends in
+    /// `VaultCache::create_item`, a write through `bw serve` against an
+    /// unlocked vault, so it is an offer this process cannot honour while
+    /// locked; *Search vault* would open the vault window onto a list that is
+    /// empty because the vault is locked and reads as "nothing found".
     ///
-    /// Measured through `theme::row_button_width`, which lays the galley the
-    /// button will really lay, rather than against a second copy of the
-    /// button's numbers.
+    /// This used to be phrased as a comparison against design 3a's egui card,
+    /// with 3a as its own control. That card is gone -- 3a is the bare-Win32
+    /// picker's empty mode -- so the control is now
+    /// `the_locked_card_offers_the_unlock`, which reads a label that IS on
+    /// this card off the same painted output.
     #[test]
-    fn the_no_match_footer_fits_across_the_card() {
-        /// The footer frame's horizontal inner margin, both sides. Written
-        /// here as the number `draw_notice_card` passes, so a change to that
-        /// margin that made the strip narrower fails here.
-        const SIDE_MARGINS: f32 = 12.0 * 2.0;
-        /// The `add_space` after each button in the strip.
-        const GAP: f32 = 8.0;
+    fn the_locked_card_offers_neither_of_the_pickers_two_offers() {
+        let on_3b = notice_glyphs(|ui| draw_locked_card(ui, APP));
+        for label in [NEW_LOGIN_LABEL, SEARCH_VAULT_LABEL] {
+            assert_eq!(
+                on_3b.iter().filter(|g| *g == label).count(),
+                0,
+                "the locked card paints a {label:?} button. Neither offer can be honoured                  against a vault this process cannot open, so the user is offered something                  that cannot happen. Painted: {on_3b:?}"
+            );
+        }
+    }
 
-        let ctx = styled_ctx();
-        let mut buttons = 0.0;
-        let mut widest_label = "";
-        let _ = ctx.run_ui(sized(overlay_height(NO_MATCH_ROWS)), |ui| {
-            for (label, _) in NO_MATCH_BUTTONS {
-                let w = theme::row_button_width(ui, label);
-                if w > buttons {
-                    widest_label = label;
-                }
-                buttons += w + GAP;
-            }
-        });
-
-        assert!(
-            buttons > 0.0,
-            "control: {} buttons measured 0pt wide, so the comparison below is vacuous",
-            NO_MATCH_BUTTONS.len()
-        );
+    /// **3b offers the unlock** -- the positive half of the test above, read
+    /// off the painted card rather than off the argument `draw_notice_card`
+    /// is handed.
+    ///
+    /// Without this, the locked card's only button could stop being drawn --
+    /// by an empty `LOCKED_BUTTONS`, or by the footer strip losing its button
+    /// branch -- with the exclusion test above still green, because that test
+    /// only says which buttons must NOT be there. A card that offers nothing
+    /// is exactly what this work exists to change.
+    #[test]
+    fn the_locked_card_offers_the_unlock() {
+        let on_3b = notice_glyphs(|ui| draw_locked_card(ui, APP));
         assert_eq!(
-            NO_MATCH_BUTTONS.len(),
-            2,
-            "3a is drawn with {} footer buttons rather than two. This test's headroom was \
-             chosen for two; re-measure it rather than deleting this line",
-            NO_MATCH_BUTTONS.len()
-        );
-
-        let strip = OVERLAY_WIDTH - SIDE_MARGINS;
-        // The hints are not measured here -- `footer_hints` lays two chips and
-        // a word and has no width oracle of its own -- so the bound is the
-        // buttons plus a hint lane wide enough for `Esc Dismiss`. It is
-        // deliberately generous: this test exists to catch a footer that has
-        // run out of room, and the click sweep in
-        // `no_click_on_the_no_match_card_ever_answers_a_fill` is what proves
-        // every button is actually hittable inside the real window.
-        const HINT_LANE: f32 = 110.0;
-        assert!(
-            buttons + HINT_LANE <= strip,
-            "3a's footer wants {buttons}pt of buttons plus a {HINT_LANE}pt hint lane, which \
-             is more than the {strip}pt the strip has inside a {OVERLAY_WIDTH}pt window. The \
-             widest label is {widest_label:?}. This window cannot be resized and cannot \
-             scroll, so the overflow is a control the user cannot reach"
+            on_3b.iter().filter(|g| *g == UNLOCK_LABEL).count(),
+            1,
+            "the locked card paints no {UNLOCK_LABEL:?} button. The card is back to being a              notice the user cannot act on, and the only unlock left to them is the ~95 MB              window this whole path exists to avoid. Painted: {on_3b:?}"
         );
     }
 
-    /// Every [`OverlayAction`] the no-match card can produce has an answer,
-    /// and the two that close it without one are named.
+
+    /// **The locked card claims nothing about whether a match exists.**
     ///
-    /// `NoMatchApp::ui` cannot be executed by any test here -- it needs an
-    /// `eframe::Frame` and a real always-on-top window -- so the table it
-    /// consults is tested instead of the function that consults it. Before
-    /// [`no_match_answer_of`] existed this was an `if` and a `matches!` that
-    /// had to agree about the same list of variants, in exactly the place
-    /// nothing could check them.
+    /// This is the whole content of the correction, and it is asserted about
+    /// the strings themselves rather than about the painted card, so it holds
+    /// however the card is later laid out.
+    ///
+    /// It was written with 3a's own primary line as the forbidden string;
+    /// that card and `no_match_text` are gone, so what remains is the
+    /// phrase list, which is the part that never depended on 3a existing. A
+    /// locked vault does not know whether it has a login for this app -- the
+    /// match engine that would say so is exactly what the lock cleared -- and
+    /// no line on this card may imply otherwise.
     #[test]
-    fn every_no_match_action_has_an_answer() {
-        assert_eq!(
-            no_match_answer_of(&OverlayAction::None),
-            None,
-            "an idle frame closed the card"
+    fn the_locked_card_claims_nothing_about_a_match() {
+        let (primary, secondary) = locked_text(APP);
+        for line in [&primary, &secondary] {
+            for phrase in ["No saved login", "logins for", "nothing for"] {
+                assert!(
+                    !line.contains(phrase),
+                    "the locked card says {line:?}, which contains {phrase:?} -- a claim about \
+                     the contents of a vault this process cannot read"
+                );
+            }
+        }
+        assert!(
+            primary.contains("locked"),
+            "control: the locked card does not say it is locked, so the assertions above are \
+             about a card that says nothing useful at all"
         );
-        assert_eq!(
-            no_match_answer_of(&OverlayAction::Dismiss),
-            Some(NoMatchAnswer::Dismissed),
-            "the ✕ did not dismiss"
+        assert!(
+            secondary.contains(APP),
+            "control: the locked card never names the window it appeared over"
         );
-        assert_eq!(
-            no_match_answer_of(&OverlayAction::NewLogin),
-            Some(NoMatchAnswer::NewLogin),
-            "`New login` did not reach 3c"
-        );
-        assert_eq!(
-            no_match_answer_of(&OverlayAction::SearchVault),
-            Some(NoMatchAnswer::SearchVault),
-            "`Search vault` did not reach the vault window -- the button is inert"
-        );
-        // The unreachable one, pinned rather than left to a wildcard: a fill
-        // this card cannot produce must not be read as anything but "close".
-        assert_eq!(
-            no_match_answer_of(&OverlayAction::Fill(FillChoice::UserTabPass)),
-            Some(NoMatchAnswer::Dismissed),
-            "an impossible Fill on 3a was read as something other than a dismissal"
-        );
+    }
+
+    /// **The locked card says what it is for, inside its window.**
+    ///
+    /// Not a smoke test, and not the same claim as
+    /// [`the_locked_card_fits_the_window_it_asks_for`], which measures
+    /// `ui.min_rect().bottom()` and therefore cannot see a line elided to
+    /// "ledgerlin…" or a run painted past an edge. The header, the body's two
+    /// lines and the footer's one hint are the entire content, and the body's
+    /// first line is the only place the app is named. Each is found as exactly
+    /// one laid-out glyph run -- so an elided line has no match and fails --
+    /// and each is asserted to be inside the window the overlay actually asks
+    /// for. This window is frameless, always-on-top and has no scrollbar and
+    /// no title bar to drag.
+    #[test]
+    fn the_locked_card_names_the_app_and_the_way_out_inside_its_window() {
+        let height = overlay_height(LOCKED_ROWS);
+        let ink = painted_locked(APP, height);
+        let win = window(height);
+
+        let (primary, secondary) = locked_text(APP);
+        let mut checked = 0;
+        for text in [LOCKED_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
+            let rect = glyph_run(&ink, text);
+            assert!(
+                fits(rect, win),
+                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
+                 asks the OS for. There is no scrollbar and no title bar to drag"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have covered all four strings");
     }
 
     /// Every glyph run a notice card paints, laid out unconstrained.
@@ -5656,8 +5248,8 @@ mod geometry_tests {
 
     /// How much taller than it needs to be the 3c card's window is.
     ///
-    /// Measured, not chosen, exactly as [`NO_MATCH_SLACK`] and [`LOCKED_SLACK`]
-    /// are, and pinned exactly rather than bounded for the same reason: a
+    /// Measured, not chosen, exactly as [`LOCKED_SLACK`] is, and pinned
+    /// exactly rather than bounded for the same reason: a
     /// one-sided bound cannot tell deliberate dead space from a row that has
     /// stopped being drawn -- and this card has four rows to lose one of.
     const SAVE_LOGIN_SLACK: f32 = 10.0;
@@ -5671,7 +5263,7 @@ mod geometry_tests {
     /// falls off the bottom of 3a is a dismiss hint; what falls off the bottom
     /// of this one is *Save*, or the password field the user is typing into.
     ///
-    /// So, in the idiom `NO_MATCH_SLACK` set:
+    /// So, in the idiom [`LOCKED_SLACK`] set:
     ///
     /// * the card must **fit** `overlay_height(SAVE_LOGIN_ROWS)`;
     /// * it must **not fit** one [`ROW_HEIGHT`] less, which is the half that
@@ -6051,7 +5643,8 @@ mod geometry_tests {
     /// **3c offers the way in to 3d**, and it is on the Password row.
     ///
     /// Read out of the painted 3c card, in the idiom
-    /// `the_locked_card_offers_no_new_login_button` set: a link that is
+    /// `the_locked_card_offers_neither_of_the_pickers_two_offers` set: a link
+    /// that is
     /// computed but not painted is a destination the user cannot reach.
     #[test]
     fn the_save_login_card_paints_the_way_into_the_generator() {
@@ -6591,167 +6184,10 @@ mod geometry_tests {
     }
 
 
-    /// **The locked card claims nothing about whether a match exists.**
-    ///
-    /// This is the whole content of the correction, and it is asserted about
-    /// the strings themselves rather than about the painted card, so it holds
-    /// however the card is later laid out. 3a's own primary line is the
-    /// forbidden phrase: if it ever appears here, the locked state has become
-    /// the thing it replaced.
-    #[test]
-    fn the_locked_card_claims_nothing_about_a_match() {
-        let (primary, secondary) = locked_text(APP);
-        let (forbidden, _) = no_match_text(APP);
-        for line in [&primary, &secondary] {
-            assert_ne!(
-                line, &forbidden,
-                "the locked card is drawing 3a's own claim. A locked vault does not know \
-                 whether it has a login for this app -- the match engine that would say so is \
-                 exactly what the lock cleared"
-            );
-            for phrase in ["No saved login", "logins for", "nothing for"] {
-                assert!(
-                    !line.contains(phrase),
-                    "the locked card says {line:?}, which contains {phrase:?} -- a claim about \
-                     the contents of a vault this process cannot read"
-                );
-            }
-        }
-        assert!(
-            primary.contains("locked"),
-            "control: the locked card does not say it is locked, so the assertions above are \
-             about a card that says nothing useful at all"
-        );
-        assert!(
-            secondary.contains(APP),
-            "control: the locked card never names the window it appeared over"
-        );
-    }
-
-    /// The card's height is a function of the font and nothing else -- and in
-    /// particular **not** of `app_name`, which is `window_label`'s answer and
-    /// therefore a string a user or the app they ran chooses.
-    ///
-    /// This is the exact defect the matched card was found to have: two plain
-    /// wrapping labels in a fixed-height window, measured off one short
-    /// fixture. A one-row card overflowed its 164pt window at 189pt. The
-    /// fixtures below are the same adversarial four.
-    #[test]
-    fn no_app_name_a_user_can_supply_makes_the_no_match_card_taller() {
-        let baseline = no_match_card_height(APP);
-        let mut checked = 0;
-        for fixture in FIXTURES {
-            let height = no_match_card_height(fixture.app);
-            assert_eq!(
-                height, baseline,
-                "the {:?} fixture's app name made the no-match card {height}pt instead of \
-                 {baseline}pt. The window is a fixed {}pt with no scrollbar, so the difference \
-                 is clipped off the bottom -- and the bottom is where the only dismiss hint is",
-                fixture.name,
-                overlay_height(NO_MATCH_ROWS)
-            );
-            checked += 1;
-        }
-        assert_eq!(checked, FIXTURES.len(), "the loop must have covered every fixture");
-
-        // Positive control on the instrument: it CAN see a taller card. A
-        // measurement that returned a constant would pass the loop above
-        // whatever the card did.
-        assert!(
-            no_match_card_height(APP) < {
-                let ctx = styled_ctx();
-                let mut needed = f32::NAN;
-                let _ = ctx.run_ui(sized(700.0), |ui| {
-                    draw_overlay_card_rows(ui, APP, ITEM, Some(USER), &four_choices());
-                    needed = ui.min_rect().bottom();
-                });
-                needed
-            },
-            "control: the instrument reports the same height for a one-body no-match card and \
-             a four-row matched card, so it is not measuring height at all"
-        );
-    }
-
-    /// **The card says what it is for**, and it says it inside the window.
-    ///
-    /// Not a smoke test: the header's "No match", the body's two lines and the
-    /// footer's one hint are the entire content, and the body's first line is
-    /// the only place the app is named. Each is found as exactly one laid-out
-    /// glyph run -- so a line elided to "No saved login for ledgerlin…" has no
-    /// match and fails -- and each is asserted to be inside the window the
-    /// overlay actually asks for.
-    #[test]
-    fn the_no_match_card_names_the_app_and_the_way_out_inside_its_window() {
-        let height = overlay_height(NO_MATCH_ROWS);
-        let ink = painted_no_match(APP, height);
-        let win = window(height);
-
-        let (primary, secondary) = no_match_text(APP);
-        let mut checked = 0;
-        for text in [NO_MATCH_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
-            let rect = glyph_run(&ink, text);
-            assert!(
-                fits(rect, win),
-                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
-                 asks the OS for. There is no scrollbar and no title bar to drag"
-            );
-            checked += 1;
-        }
-        assert_eq!(checked, 4, "the loop must have covered all four strings");
-
-        // And the one string that must NOT be here: this card offers no fill,
-        // so a footer promising Enter would be the card contradicting itself.
-        assert!(
-            !ink.iter().any(|i| i.glyphs.as_deref() == Some("Enter Fill")),
-            "the no-match card's footer offers `Enter Fill`. There is no item behind this \
-             window and nothing for Enter to fill"
-        );
-    }
-
-    /// **The locked card says what it is for, inside its window** -- 3a's
-    /// content test, run against 3b's own strings.
-    ///
-    /// The header is the only painted thing that distinguishes the two cards,
-    /// so it is read here, and 3a's primary line is asserted absent from the
-    /// paint as well as from the strings: a `draw_locked_card` that called
-    /// `no_match_text` would pass every height assertion above and put the lie
-    /// straight back on the screen.
-    #[test]
-    fn the_locked_card_names_the_app_and_the_way_out_inside_its_window() {
-        let height = overlay_height(LOCKED_ROWS);
-        let ink = painted_locked(APP, height);
-        let win = window(height);
-
-        let (primary, secondary) = locked_text(APP);
-        let mut checked = 0;
-        for text in [LOCKED_LABEL, primary.as_str(), secondary.as_str(), "Esc Dismiss"] {
-            let rect = glyph_run(&ink, text);
-            assert!(
-                fits(rect, win),
-                "{text:?} is painted at {rect:?}, outside the {height}pt window the overlay \
-                 asks the OS for. There is no scrollbar and no title bar to drag"
-            );
-            checked += 1;
-        }
-        assert_eq!(checked, 4, "the loop must have covered all four strings");
-
-        let (forbidden, _) = no_match_text(APP);
-        assert!(
-            !ink.iter().any(|i| i.glyphs.as_deref() == Some(forbidden.as_str())),
-            "the locked card painted {forbidden:?}. That is a statement about the contents of \
-             a vault this process cannot read, which is the defect 3b exists to correct"
-        );
-        assert!(
-            !ink.iter().any(|i| i.glyphs.as_deref() == Some(NO_MATCH_LABEL)),
-            "the locked card is wearing the no-match card's header, so the only painted thing \
-             that tells the two apart says the wrong one"
-        );
-    }
-
     /// **Esc dismisses, as it does in every other overlay state** -- and Enter
     /// does not, because there is nothing to fill.
     ///
-    /// `NoMatchApp::ui` needs an `eframe::Frame` and a real always-on-top
+    /// `LockedApp::ui` needs an `eframe::Frame` and a real always-on-top
     /// window and can never be executed here, which is exactly why the
     /// decision is `no_match_keyboard_action` and not an `if` inside it.
     #[test]
@@ -6848,171 +6284,4 @@ mod geometry_tests {
         );
     }
 
-    /// The header's ✕ dismisses, which matters more on this card than on any
-    /// other: the window is raised in response to ANOTHER app being
-    /// foregrounded, which is exactly the case Windows' foreground lock
-    /// refuses keyboard focus for -- so Esc may never arrive, and the ✕ is the
-    /// only way out that does not depend on it.
-    #[test]
-    fn the_no_match_cards_close_control_dismisses_it() {
-        let height = overlay_height(NO_MATCH_ROWS);
-        let ctx = styled_ctx();
-        // Warm-up frame: the header Frame must have been laid out once before
-        // its rect can be interacted with.
-        let _ = ctx.run_ui(sized(height), |ui| {
-            draw_no_match_card(ui, APP);
-        });
-
-        // Where the ✕ is: the close control the matched card's header uses, at
-        // the right-hand end of the header strip. Found by painting rather
-        // than by arithmetic, so a moved header moves the click with it.
-        let close = {
-            let ink = painted_no_match(APP, height);
-            let segs: Vec<&Ink> = ink
-                .iter()
-                .filter(|i| {
-                    i.glyphs.is_none()
-                        && i.tile.is_none()
-                        && i.rect.width() < 20.0
-                        && i.rect.height() < 20.0
-                        && i.rect.left() > OVERLAY_WIDTH - 60.0
-                })
-                .collect();
-            assert!(
-                !segs.is_empty(),
-                "no close control was painted in the no-match card's header, so this window \
-                 has no mouse-operable way out at all"
-            );
-            let mut r = segs[0].rect;
-            for s in &segs[1..] {
-                r = r.union(s.rect);
-            }
-            r.center()
-        };
-
-        let press = |down: bool| egui::RawInput {
-            events: vec![
-                egui::Event::PointerMoved(close),
-                egui::Event::PointerButton {
-                    pos: close,
-                    button: egui::PointerButton::Primary,
-                    pressed: down,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-            ..sized(height)
-        };
-
-        let mut down = OverlayAction::None;
-        let _ = ctx.run_ui(press(true), |ui| down = draw_no_match_card(ui, APP));
-        assert_eq!(
-            down,
-            OverlayAction::None,
-            "the card dismissed on mouse-DOWN. egui decides a click on the release, and a card \
-             that acts on the press acts on a gesture the user can still drag away from"
-        );
-
-        let mut up = OverlayAction::None;
-        let _ = ctx.run_ui(press(false), |ui| up = draw_no_match_card(ui, APP));
-        assert_eq!(
-            up,
-            OverlayAction::Dismiss,
-            "clicking the ✕ did not dismiss the no-match card. With Esc not guaranteed to \
-             reach a window raised behind the foreground lock, this leaves an always-on-top \
-             card with no way out"
-        );
-    }
-
-    /// The card can never answer `Fill`. There is no item behind it, so the
-    /// variant is unreachable **by construction** -- and this is what says so
-    /// about the drawing rather than about the doc comment: no click anywhere
-    /// on the card produces one.
-    #[test]
-    fn no_click_on_the_no_match_card_ever_answers_a_fill() {
-        let height = overlay_height(NO_MATCH_ROWS);
-        let ctx = styled_ctx();
-        let _ = ctx.run_ui(sized(height), |ui| {
-            draw_no_match_card(ui, APP);
-        });
-
-        let mut dismissals = 0;
-        let mut new_logins = 0;
-        let mut searches = 0;
-        let mut probed = 0;
-        let mut y = 2.0;
-        while y < height {
-            let mut x = 2.0;
-            while x < OVERLAY_WIDTH {
-                let at = egui::pos2(x, y);
-                let press = |down: bool| egui::RawInput {
-                    events: vec![
-                        egui::Event::PointerMoved(at),
-                        egui::Event::PointerButton {
-                            pos: at,
-                            button: egui::PointerButton::Primary,
-                            pressed: down,
-                            modifiers: egui::Modifiers::default(),
-                        },
-                    ],
-                    ..sized(height)
-                };
-                let _ = ctx.run_ui(press(true), |ui| {
-                    draw_no_match_card(ui, APP);
-                });
-                let mut answer = OverlayAction::None;
-                let _ = ctx.run_ui(press(false), |ui| answer = draw_no_match_card(ui, APP));
-                match answer {
-                    OverlayAction::Fill(choice) => panic!(
-                        "clicking ({x}, {y}) on the no-match card answered Fill({choice:?}). \
-                         There is no item behind this card, so whatever that would type comes \
-                         from somewhere it must not"
-                    ),
-                    OverlayAction::Dismiss => dismissals += 1,
-                    // The two controls on this card, counted rather than
-                    // ignored: the `> 0` assertions below are the control that
-                    // the sweep really reaches the footer buttons, which is
-                    // where a control could be pushed out of the window. BOTH
-                    // are counted, because a second button that fell off the
-                    // right-hand edge would leave the first one still hit and
-                    // a single counter still satisfied.
-                    OverlayAction::NewLogin => new_logins += 1,
-                    OverlayAction::SearchVault => searches += 1,
-                    // Not a control on THIS card: `NO_MATCH_BUTTONS` does not
-                    // name it, so a click that produced it would mean 3a is
-                    // painting 3b's button -- and offering to unlock a vault
-                    // this card was only shown because it could read.
-                    OverlayAction::Unlock => panic!(
-                        "clicking ({x}, {y}) on the no-match card answered Unlock. That button \
-                         belongs to the locked card, and this one is shown only when the vault \
-                         is readable"
-                    ),
-                    OverlayAction::None => {}
-                }
-                probed += 1;
-                x += 8.0;
-            }
-            y += 8.0;
-        }
-        assert!(probed > 100, "control: only {probed} points were clicked, which is not a sweep");
-        assert!(
-            dismissals > 0,
-            "control: {probed} clicks across the whole card produced no Dismiss either, so this \
-             sweep is not reaching the card's controls and the Fill assertion above is vacuous"
-        );
-        assert!(
-            new_logins > 0,
-            "control: {probed} clicks across the whole card never hit the `New login` button. 
-             Either the sweep misses the footer, or the button is outside the window it is 
-             drawn in -- which on a frameless always-on-top card with no scrollbar means the 
-             one route from 3a to 3c is unreachable"
-        );
-        assert!(
-            searches > 0,
-            "control: {probed} clicks across the whole card never hit the `Search vault` \
-             button. It is the SECOND button on a strip that also carries `New login` and the \
-             Esc hint, so this is the failure to expect if the footer has run out of width: \
-             the button is drawn past the right-hand edge of a 396pt window that cannot be \
-             resized or scrolled"
-        );
-    }
 }

@@ -11,6 +11,7 @@
 
 pub mod accounts;
 pub mod app;
+pub mod app_candidates;
 pub mod app_identity;
 pub mod app_match;
 /// The named Windows mutex the installer looks for before replacing this
@@ -70,6 +71,7 @@ pub mod match_engine;
 pub mod otpauth;
 pub mod overlay_ui;
 pub mod password_strength;
+pub mod picker_prompt;
 pub mod picker_ui;
 pub mod preflight_host;
 pub mod prefs_ui;
@@ -112,5 +114,6 @@ pub mod vault_cache;
 pub mod vault_disk_cache;
 pub mod vault_export;
 pub mod vault_window;
+pub mod win32_draw;
 pub mod window_list;
 pub mod window_watch;

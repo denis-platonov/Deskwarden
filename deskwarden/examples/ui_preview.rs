@@ -110,17 +110,10 @@ fn target_dir() -> PathBuf {
 enum Surface {
     /// The autofill overlay (design 2a).
     Overlay,
-    /// The autofill overlay with NOTHING to offer (design 3a): a window that
-    /// asks for a password and that the vault does not match.
-    ///
-    /// Its own surface rather than a variation of `Overlay`, because it is a
-    /// different card -- no avatar, no row, no Enter chip -- drawn by a
-    /// different function, and a state nobody renders is a state nobody looks
-    /// at.
-    OverlayNoMatch,
     OverlayLocked,
     /// The autofill overlay's save-a-new-login form (design 3c): four rows and
-    /// three answers, reached from `OverlayNoMatch`'s *New login* button.
+    /// three answers, reached from the account picker's empty card (design
+    /// 3a, now `deskwarden::picker_prompt`'s -- see `examples/picker_preview.rs`).
     ///
     /// **By far the tallest state the overlay has**, and the one this list
     /// most needs: a frameless, always-on-top window of a hardcoded height
@@ -479,7 +472,6 @@ fn pane_frame() -> egui::Frame {
 /// Every surface, in the order `--all` walks them.
 const ALL: &[Surface] = &[
     Surface::Overlay,
-    Surface::OverlayNoMatch,
     Surface::OverlayLocked,
     Surface::OverlaySaveLogin,
     Surface::OverlayGenerate,
@@ -541,7 +533,6 @@ impl Surface {
     fn stem(self) -> &'static str {
         match self {
             Surface::Overlay => "overlay",
-            Surface::OverlayNoMatch => "overlay_no_match",
             Surface::OverlayLocked => "overlay_locked",
             Surface::OverlaySaveLogin => "overlay_save_login",
             Surface::OverlayGenerate => "overlay_generate",
@@ -622,7 +613,7 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::Overlay | Surface::OverlayNoMatch | Surface::OverlayLocked => {
+            Surface::Overlay | Surface::OverlayLocked => {
                 egui::vec2(396.0, 164.0)
             }
             // Read off the module rather than written out: 3c is the one
@@ -1032,7 +1023,6 @@ impl eframe::App for Preview {
 
         match self.current() {
             Surface::Overlay => self.draw_overlay(root, &ctx),
-            Surface::OverlayNoMatch => self.draw_overlay_no_match(root, &ctx),
             Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
             Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
             Surface::OverlayGenerate
@@ -1191,22 +1181,9 @@ impl Preview {
         });
     }
 
-    /// Design 3a, drawn by the shipped function rather than re-implemented --
-    /// which is why `draw_no_match_card` is public.
-    fn draw_overlay_no_match(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            if overlay_ui::draw_no_match_card(ui, "Atlas Licence")
-                == overlay_ui::OverlayAction::Dismiss
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
-    /// Design 3b, drawn by the shipped function for the same reason 3a is:
-    /// this card and the no-match one differ by three strings, and a
-    /// re-implementation here could show either while the app showed the
-    /// other.
+    /// Design 3b, drawn by the shipped function rather than re-implemented,
+    /// which is why `draw_locked_card` is public. It is the last egui notice
+    /// card: 3a is now the bare-Win32 account picker's empty mode.
     fn draw_overlay_locked(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
         egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
             // Through `locked_answer_of`, the shipped mapping, rather than a

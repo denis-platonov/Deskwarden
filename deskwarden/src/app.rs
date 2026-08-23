@@ -746,6 +746,13 @@ fn confirmed_by_preflight(
         FillChoice::Just(field) => {
             crate::key_sequence::render(&[crate::key_sequence::Token::Field(field.clone())])
         }
+        // **Effectively `Saved`-only.** `UserTabPass` shares the arm because
+        // the match must be total, not because it can arrive here: it is the
+        // one choice `fill_action` answers `FillAction::Default` for, so it
+        // never reaches `confirmed_by_preflight` at all, and even if it did,
+        // `preflight_guard_for` answers `NotRequired` for it and the `else`
+        // above returns before this line. Do not read it as evidence that
+        // `UserTabPass` previews a stored sequence -- it has none to preview.
         FillChoice::UserTabPass | FillChoice::Saved => sequence_for(item),
     };
     // "Copy instead" is an escape from typing, not from the vault: it is the
@@ -1249,6 +1256,38 @@ pub const BROWSER_IMAGE_NAMES: &[&str] = &[
 
 /// Whether the foreground window belongs to a web browser.
 ///
+/// **The seventh input to [`disposition`], and it is which EVENT is being
+/// answered** -- an automatic foreground change, or the user pressing
+/// `CTRL+ALT+B`.
+///
+/// It exists because one function serves two events that are not the same
+/// question. Every suppressor above -- [`NeverForApp`], [`OverlayPrompts`],
+/// [`BrowserWindow`] -- and the [`HasPasswordField`] gate exist to stop
+/// Deskwarden putting a window in front of somebody who did not ask for one.
+/// A chord press IS somebody asking. Reading the suppressors on that path
+/// made the account picker unreachable for anyone who had turned the
+/// automatic prompt off, which is to say: the setting that exists to stop the
+/// card appearing uninvited also removed the only way to invite it.
+///
+/// **This is the same principle [`match_arms_hotkey`] already states on the
+/// matched side**, where arming `CTRL+ALT+B` is deliberately unconditional so
+/// that turning the prompt off falls back to the hotkey rather than turning
+/// autofill off. [`Trigger`] extends it to the unmatched side.
+///
+/// **It can only ever ADD an answer, never change one.**
+/// [`Trigger::Foreground`] is the whole of the behaviour that shipped, arm
+/// for arm; [`Trigger::Hotkey`] is read on the `Matched::No` branch and
+/// nowhere else, so the matched card is identical for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The window came to the front on its own. Nobody asked for anything,
+    /// so every suppressor and the field gate apply exactly as they did.
+    Foreground,
+    /// The user pressed `CTRL+ALT+B`. They asked, by name, so the answer is
+    /// the picker (or the unlock card) rather than silence.
+    Hotkey,
+}
+
 /// **The sixth input to [`disposition`]**, and it exists because the no-match
 /// card is structurally unable to be right in a browser. Every login page has
 /// a password field, so the probe answers `Yes` every time; and Deskwarden's
@@ -1485,6 +1524,7 @@ pub fn disposition<'a>(
     never: NeverForApp,
     prompts: OverlayPrompts,
     browser: BrowserWindow,
+    trigger: Trigger,
 ) -> Open<'a> {
     match matched {
         // A match is only representable when the engine holds entries, which
@@ -1492,35 +1532,49 @@ pub fn disposition<'a>(
         // here, and `a_matched_window_ignores_the_vault_state_too` pins that
         // the card the user gets for a recognised window is unchanged.
         Matched::Yes(item_id) => Open::Match(item_id),
-        Matched::No => match field {
-            // **`never` is read here and nowhere else in the tree**, so it can
-            // only ever silence the branch it was added for: an unmatched
-            // window with a password field. It does not reach `Matched::Yes`
-            // (see the arm above -- a *save* refusal is not a *fill* refusal),
-            // and it does not reach the `No | Unknown` arm, which is silent
-            // already and whose silence must go on coming from the field
-            // answer rather than from a list.
-            HasPasswordField::Yes if never == NeverForApp::Yes => Open::Nothing,
-            // The setting, and it lands here rather than on `Matched::Yes`
-            // for the reason in the doc above: the matched arm's gate is
-            // `match_disposition`, and it shares a line with the hotkey
-            // arming that must survive the prompt being off.
-            HasPasswordField::Yes if prompts == OverlayPrompts::Silenced => Open::Nothing,
-            // The browser, last of the three suppressors and the same shape
-            // as the two above: it can only ever turn a card into silence.
-            HasPasswordField::Yes if browser == BrowserWindow::Yes => Open::Nothing,
-            HasPasswordField::Yes => match vault {
+        // **The suppressors and the field gate are read on the automatic
+        // path and nowhere else.** They exist to stop this app interrupting
+        // somebody who did not ask; a `CTRL+ALT+B` press is somebody asking,
+        // so on that trigger the only question left is whether the vault can
+        // be read. "No account matches this app" is an answer; silence, to a
+        // user who just pressed the chord, is a broken shortcut. See
+        // [`Trigger`], and `match_arms_hotkey` for the same rule already
+        // stated on the matched side.
+        Matched::No => match trigger {
+            Trigger::Hotkey => match vault {
                 VaultAvailability::Readable => Open::NoMatch,
                 VaultAvailability::Locked => Open::Locked,
             },
-            // Both silence, and deliberately: a window we could not read is
-            // treated exactly as today's build treats every unmatched window.
-            // Guessing a card onto the screen from an unanswered question is
-            // the failure mode the third arm above exists to prevent, and
-            // `Unknown` is the case with the least evidence of all. Locked or
-            // readable makes no difference: neither is evidence that this
-            // window is asking for a password.
-            HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
+            Trigger::Foreground => match field {
+                // **`never` is read here and nowhere else in the tree**, so it can
+                // only ever silence the branch it was added for: an unmatched
+                // window with a password field. It does not reach `Matched::Yes`
+                // (see the arm above -- a *save* refusal is not a *fill* refusal),
+                // and it does not reach the `No | Unknown` arm, which is silent
+                // already and whose silence must go on coming from the field
+                // answer rather than from a list.
+                HasPasswordField::Yes if never == NeverForApp::Yes => Open::Nothing,
+                // The setting, and it lands here rather than on `Matched::Yes`
+                // for the reason in the doc above: the matched arm's gate is
+                // `match_disposition`, and it shares a line with the hotkey
+                // arming that must survive the prompt being off.
+                HasPasswordField::Yes if prompts == OverlayPrompts::Silenced => Open::Nothing,
+                // The browser, last of the three suppressors and the same shape
+                // as the two above: it can only ever turn a card into silence.
+                HasPasswordField::Yes if browser == BrowserWindow::Yes => Open::Nothing,
+                HasPasswordField::Yes => match vault {
+                    VaultAvailability::Readable => Open::NoMatch,
+                    VaultAvailability::Locked => Open::Locked,
+                },
+                // Both silence, and deliberately: a window we could not read is
+                // treated exactly as today's build treats every unmatched window.
+                // Guessing a card onto the screen from an unanswered question is
+                // the failure mode the third arm above exists to prevent, and
+                // `Unknown` is the case with the least evidence of all. Locked or
+                // readable makes no difference: neither is evidence that this
+                // window is asking for a password.
+                HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
+            },
         },
     }
 }
@@ -1916,21 +1970,6 @@ pub trait PromptPresenter {
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice>;
-    /// Shows design **3a** -- the card for a window with a password field that
-    /// nothing in the vault matches -- and returns when the user dismisses it.
-    ///
-    /// **No item argument, and no item in the answer.** There is nothing to
-    /// name; a signature that could carry an item id here is a signature
-    /// something can later fill in with a sentinel. See [`no_match_arm`].
-    ///
-    /// It does answer one bit -- whether the user clicked *New login* -- which
-    /// is 3a's button finally having a destination, not a promise about an
-    /// item. See [`overlay_ui::NoMatchAnswer`].
-    fn show_no_match(
-        &self,
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer;
     /// Shows design **3c** -- the save-a-new-login form -- and answers what the
     /// user decided together with what they typed.
     ///
@@ -1972,7 +2011,7 @@ pub trait PromptPresenter {
     /// focused while the vault cannot be read -- and returns when the user
     /// dismisses it.
     ///
-    /// A separate method rather than a flag on [`Self::show_no_match`], for the
+    /// A separate method rather than a flag on [`Self::show`], for the
     /// reason [`handle_no_match`] is separate from [`handle_match`]: the two
     /// cards make opposite claims about the vault, and a boolean that chose
     /// between them is a boolean something can pass wrongly.
@@ -1980,7 +2019,7 @@ pub trait PromptPresenter {
     /// **It answers now, and it still takes no item and returns none.** 3b's
     /// *Unlock* button has a destination -- [`crate::unlock_prompt`] -- and
     /// the route to it is this return value, exactly as
-    /// [`Self::show_no_match`]'s is the route to the vault window. What
+    /// the account picker's empty card is the route to the vault window. What
     /// [`overlay_ui::LockedAnswer`] can say is "the user asked to unlock" and
     /// nothing else: it names no item, authorises no fill, and carries no
     /// password. The card is still shown for a vault this process cannot read,
@@ -2010,9 +2049,6 @@ pub struct FnPresenter {
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
-    /// Asked to put design 3a on screen. Answers whether *New login* was
-    /// clicked; see [`PromptPresenter::show_no_match`].
-    pub show_no_match: fn(&str, Option<(f32, f32)>) -> overlay_ui::NoMatchAnswer,
     /// Asked to put design 3c on screen. See
     /// [`PromptPresenter::show_save_login`].
     #[allow(clippy::type_complexity)]
@@ -2049,14 +2085,6 @@ impl PromptPresenter for FnPresenter {
         choices: &[FillChoice],
     ) -> Option<FillChoice> {
         (self.show)(label, matched, position, choices)
-    }
-
-    fn show_no_match(
-        &self,
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer {
-        (self.show_no_match)(label, position)
     }
 
     fn show_save_login(
@@ -2099,7 +2127,6 @@ impl PromptPresenter for FnPresenter {
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: overlay_ui::show_prompt_overlay,
-    show_no_match: overlay_ui::show_no_match_overlay,
     show_locked: overlay_ui::show_locked_overlay,
     show_save_login: overlay_ui::show_save_login_overlay,
     show_generate: overlay_ui::show_generate_overlay,
@@ -2142,45 +2169,11 @@ pub fn prompt_arm<P: PromptPresenter>(
     presenter.show(label, matched.as_ref(), position, &choices)
 }
 
-/// **The whole of the no-match arm, as a pure function** -- the 3a sibling of
-/// [`prompt_arm`], and written the same way for the same reason.
-///
-/// It asks the presenter where the card goes and then shows it there. That is
-/// two lines, and both of them are exactly the two lines review 32 found could
-/// be silently wrong at a call site no test could reach: an overlay pinned to
-/// the top of the screen, or one opened for a window other than the one it
-/// names. Driven through a recording presenter, neither can be.
-///
-/// **The placement is asked about [`overlay_ui::NO_MATCH_ROWS`]**, which is
-/// the row count the 3a card is sized by. Asking about `0` -- or about a
-/// choice list this state does not have -- would clamp the card onto the work
-/// area using the wrong height, which on a window anchored near the bottom of
-/// the screen puts its footer, and its only dismiss hint, under the taskbar.
-///
-/// **The label is [`window_label`]**, not `exe_name`, for the reason
-/// `prompt_request` gives: a window matched through the title table belongs to
-/// a process whose name means nothing to the user. It matters more here than
-/// there -- this card's entire content is the name of the app it has nothing
-/// for, so a wrong name is the whole message being wrong.
-///
-/// **Nothing about an item crosses this function**, because there is no item.
-/// There is no id, no `VaultItem`, no [`PromptSubject`] and no cache: the
-/// re-prompt gate ([`permitted_by_reprompt`]) is defined over an existing item
-/// and so cannot be asked here, and this signature is why that is a
-/// type-level fact rather than a discipline.
-pub fn no_match_arm<P: PromptPresenter>(
-    presenter: &P,
-    window: &crate::window_watch::ForegroundEvent,
-) -> overlay_ui::NoMatchAnswer {
-    let position = presenter.position(window.hwnd, overlay_ui::NO_MATCH_ROWS);
-    presenter.show_no_match(window_label(&window.exe_name, &window.title), position)
-}
-
-/// **The whole of the 3c arm, as a pure function** -- [`no_match_arm`]'s
+/// **The whole of the 3c arm, as a pure function** -- [`prompt_arm`]'s
 /// sibling, written the same way and for the same two reasons.
 ///
-/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, not
-/// `NO_MATCH_ROWS`. The two are different numbers -- 3c is by far the tallest
+/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, and not
+/// about the card the user just left. The two differ -- 3c is by far the tallest
 /// state the overlay has -- and the clamp onto the monitor's work area is a
 /// function of the card's height, so asking about the card the user just left
 /// would put this card's *Save* button, its *Never* link and the bottom of its
@@ -2409,16 +2402,227 @@ pub fn route_save_answer(
 /// [`VaultCache::create_item`], which is the same route the edit form takes.
 ///
 /// Only the real presenter and the real create route are named on these lines;
-/// every decision is [`no_match_arm`]'s, [`save_login_arm`]'s and
+/// every decision is [`save_login_arm`]'s and
 /// [`route_save_answer`]'s, each of which a test drives with a recorder.
+/// **Where the favicon cache directory lives, threaded down from `main`.**
+///
+/// `main` computes it once, as `project_dirs.cache_dir().join("icons")`, and
+/// hands it here at startup. It is deliberately *not* recomputed in this file:
+/// a second derivation of that path is a second thing that has to agree with
+/// the first, and the one that disagreed would silently draw a card with no
+/// icons on it rather than fail.
+///
+/// A `OnceLock` and not a parameter because the only route to
+/// [`handle_no_match`] is `main`'s `NoMatchEnv::show`, an `fn` pointer whose
+/// shape is pinned by source text. `None` before it is set, and `None` is a
+/// card whose rows have no icons -- which is a shipped state, because an item
+/// with no URI never has one.
+static ICON_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Called once by `main`, with the directory it has already computed.
+pub fn set_icon_cache_dir(dir: std::path::PathBuf) {
+    let _ = ICON_CACHE_DIR.set(dir);
+}
+
+/// What the account picker's second step offers for one item.
+///
+/// `key_sequence::field_palette`'s answer verbatim -- the presence-only
+/// question, which asks whether a value is there and never what it is, so
+/// building this reads no secret. `crate::picker_prompt::palette_rows` is what
+/// decides which of them become rows, and carries the bound that keeps a
+/// fixed-size card honest.
+pub fn picker_palette(item: &VaultItem) -> crate::picker_prompt::Palette {
+    crate::picker_prompt::Palette {
+        fields: key_sequence::field_palette(item),
+        has_sequence: !sequence_for(item).is_empty(),
+    }
+}
+
+/// **What the account picker's choice means to the fill path.**
+///
+/// The picker answers in `crate::picker_prompt::Send`; every fill in this app
+/// goes through [`FillChoice`]; this is the one place the two meet.
+///
+/// **Deliberately a mapping onto the existing choice rather than a second
+/// dispatch route.** The obvious alternative -- build tokens with
+/// `picker_prompt::tokens_for`, resolve them, `sequence::plan`, and call
+/// `Injector::fill_sequence` from here -- reaches the same keystrokes for two
+/// of the three variants and *loses* everything [`fill_from_vault`] does
+/// around them: the master-password re-prompt gate ([`permitted_by_reprompt`]),
+/// the 4b preflight, the one-time-code fetch, and the outcome sink. A fill
+/// that skipped the re-prompt gate because it came from this card rather than
+/// from the overlay would be a hole opened by a routing decision, which is the
+/// worst way to open one.
+///
+/// The three arms, and the one that is not an identity:
+///
+/// * `Send::Field` is [`FillChoice::Just`]: `fill_action` renders exactly the
+///   token `tokens_for` produces, and plans it.
+/// * `Send::Sequence` is [`FillChoice::Saved`]: the item's own sequence
+///   through `key_sequence::parse`, which is what `tokens_for` does too.
+/// * `Send::All` is [`FillChoice::UserTabPass`], and this is the one that is
+///   not a token-for-token identity: `UserTabPass` is UI Automation's
+///   named-field fill with a `SendInput` username-Tab-password fallback, not a
+///   typed plan. What it types when it types is `key_sequence::DEFAULT_SEQUENCE`,
+///   which is token-for-token what `picker_prompt::tokens_for(&Send::All, ..)`
+///   produces -- pinned by `the_all_choice_types_what_the_default_fill_types`,
+///   so the two cannot drift. Collapsing the other way, and making this a
+///   plan, would delete the UI Automation path for this card alone.
+pub fn picker_choice(send: &crate::picker_prompt::Send) -> FillChoice {
+    match send {
+        crate::picker_prompt::Send::Field(field) => FillChoice::Just(field.clone()),
+        crate::picker_prompt::Send::Sequence => FillChoice::Saved,
+        crate::picker_prompt::Send::All => FillChoice::UserTabPass,
+    }
+}
+
+/// One `crate::picker_prompt::Offer` per candidate: the row, what it offers,
+/// and its cached icon.
+///
+/// **Nothing here fetches.** `favicon::read_cached_icon` reads a file that is
+/// already on disk or answers `None`; there is no network call on this path
+/// and there must never be one, because it sits between the hotkey and the
+/// card. A candidate whose item has left the snapshot between the ranking and
+/// this call is dropped rather than offered with an empty palette -- a row
+/// that offers nothing is a row that can only disappoint.
+pub fn picker_offers(
+    candidates: &[crate::app_candidates::Candidate],
+    items: &[VaultItem],
+) -> Vec<crate::picker_prompt::Offer> {
+    picker_offers_in(ICON_CACHE_DIR.get().map(std::path::PathBuf::as_path), candidates, items)
+}
+
+/// The same, with the icon cache directory passed in rather than read from the
+/// process-wide `OnceLock`.
+///
+/// **This is not a test seam; it is where the directory stops being ambient.**
+/// `ICON_CACHE_DIR` is set once, by `main`, so a caller that reads it can only
+/// ever see one directory for the life of the process -- which left the icon
+/// branch below unreachable from any test in the binary. The read now happens
+/// at the one production call site above, and everything that decides *which*
+/// icon an offer carries lives here, where it can be handed a directory.
+pub fn picker_offers_in(
+    dir: Option<&std::path::Path>,
+    candidates: &[crate::app_candidates::Candidate],
+    items: &[VaultItem],
+) -> Vec<crate::picker_prompt::Offer> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let item = items.iter().find(|i| i.id == candidate.id)?;
+            let icon = dir.and_then(|dir| {
+                crate::favicon::icon_domain_for(item)
+                    .and_then(|domain| crate::favicon::read_cached_icon(dir, &domain))
+            });
+            Some(crate::picker_prompt::Offer {
+                candidate: candidate.clone(),
+                palette: picker_palette(item),
+                icon,
+            })
+        })
+        .collect()
+}
+
+/// **The account picker's outcome as something `main` can carry out**, as a
+/// pure function.
+///
+/// It exists so the mapping is testable at all, for exactly the reason
+/// [`locked_follow_up`] exists: the only production
+/// caller is [`handle_no_match`], which raises a real always-on-top window.
+///
+/// `Cancelled` and `Unavailable` both answer `Nothing`, and they are not
+/// collapsed before they get here: `Unavailable` means the card could not be
+/// put on screen, which is worth the log line [`describe_picker_outcome`]
+/// writes, while `Cancelled` is the user saying no.
+pub fn picker_follow_up(
+    outcome: crate::picker_prompt::Outcome,
+    app_name: &str,
+) -> NoMatchFollowUp {
+    match outcome {
+        crate::picker_prompt::Outcome::Fill { id, send } => {
+            NoMatchFollowUp::Fill { item_id: id, choice: picker_choice(&send) }
+        }
+        crate::picker_prompt::Outcome::SearchVault => {
+            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
+        }
+        // *New login* opens the vault window at this app, which is the one
+        // door `main` already has -- see `NoMatchFollowUp::SearchVault`. It is
+        // deliberately NOT 3c's save-a-login form: that form is reached from
+        // the no-match card, which is the card the picker replaced precisely
+        // because there ARE saved logins that look like this app's.
+        crate::picker_prompt::Outcome::NewLogin => {
+            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
+        }
+        // The item's id rather than the app's name, because the id is what the
+        // user asked to edit and is what the vault window's search finds
+        // exactly one of.
+        crate::picker_prompt::Outcome::Edit(id) => NoMatchFollowUp::SearchVault(id),
+        crate::picker_prompt::Outcome::Cancelled
+        | crate::picker_prompt::Outcome::Unavailable => NoMatchFollowUp::Nothing,
+    }
+}
+
+/// The picker's offers for this window, **and the whole lifetime of the vault
+/// snapshot they were built from**.
+///
+/// The scan genuinely wants every item -- `app_candidates::candidates` ranks
+/// against the whole vault -- so a full [`VaultCache::items`] snapshot is
+/// taken. What must not happen is that snapshot outliving the scan:
+/// `items()` deep-clones every item *including every plaintext password*, into
+/// a `Vec` that does not zeroize, at a measured 5.66 MB and 46,494 allocations
+/// over a 1,663-item vault (see its own docstring, and commit `d29d440`, which
+/// removed exactly this pattern from the fill path). The account picker's card
+/// is modal and stays up for as long as the user looks at it, so a snapshot
+/// still bound at the `ask` call would be a non-zeroizing copy of the whole
+/// vault sitting in memory for that entire time.
+///
+/// Confining it to this function is what makes that a fact rather than a
+/// convention: the return type carries offers only -- palettes, names and PNG
+/// bytes, no secret -- so the clone is dropped here, at the `}`, before any
+/// caller can put a window on screen. `handle_no_match` therefore never names
+/// `items()` at all, which is what `the_vault_snapshot_does_not_outlive_the_scan`
+/// pins.
+fn picker_offers_for(
+    cache: &VaultCache,
+    window: &crate::window_watch::ForegroundEvent,
+) -> Vec<crate::picker_prompt::Offer> {
+    let items = cache.items();
+    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
+    picker_offers(&candidates, &items)
+}
+
 pub fn handle_no_match(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
 ) -> NoMatchFollowUp {
-    let answer = no_match_arm(&REAL_OVERLAY, window);
-    if answer != overlay_ui::NoMatchAnswer::NewLogin {
-        return no_match_follow_up(answer, window_label(&window.exe_name, &window.title));
+    // **The account picker comes first, and only when it has something to
+    // offer.** `app_candidates::candidates` is a looser matcher than
+    // `MatchEngine` on purpose -- see its module doc for why that is safe here
+    // and would not be there -- and an empty answer leaves every line below
+    // this one doing exactly what it did before.
+    let offers = picker_offers_for(cache, window);
+    let label = window_label(&window.exe_name, &window.title);
+    let outcome = crate::picker_prompt::ask(&offers, label);
+    log::info!(
+        "the account picker offered {} account(s) for {label} and was answered: {}",
+        offers.len(),
+        describe_picker_outcome(&outcome)
+    );
+    // **The empty card's *New login* is 3c's door, and the populated card's
+    // is not.** They are the same `Outcome` because they are the same offer on
+    // the same window, but they are made in two different situations and
+    // `picker_follow_up`'s own doc records the difference: with accounts on
+    // screen the user has already been shown logins that look like this app,
+    // so *New login* means "none of these" and the vault window is the honest
+    // answer; with nothing on screen it means what 3a's *New login* meant,
+    // which is "save one now". Everything else -- including *Search vault* and
+    // dismissal, in either mode -- goes through the one mapping.
+    let empty_cards_new_login =
+        offers.is_empty() && matches!(outcome, crate::picker_prompt::Outcome::NewLogin);
+    if !empty_cards_new_login {
+        return picker_follow_up(outcome, label);
     }
+
     let outcome = route_save_answer(
         save_login_flow(&REAL_OVERLAY, window, &|request| {
             // **The one generator, and it is `bw serve`'s.** Nothing in this
@@ -2463,7 +2667,7 @@ pub fn handle_no_match(
 /// list is exhaustive over what the overlay may ask `main` for, and it is.
 ///
 /// Three variants and not a `bool` or an `Option<String>`, for the reason
-/// [`overlay_ui::NoMatchAnswer`] is two variants: the value crosses
+/// [`overlay_ui::LockedAnswer`] is two variants: the value crosses
 /// `main::process_foreground_event` and lands in `run`'s loop, and "there is a
 /// string" is a worse way to say "open a window" than saying it.
 ///
@@ -2496,20 +2700,23 @@ pub enum NoMatchFollowUp {
     /// particular it carries no password, no session token and no item id: it
     /// is a request to ask, not the answer to anything.
     Unlock,
+    /// **The account picker was answered with a fill.** The user picked one of
+    /// the candidate accounts and then picked which of its fields to type.
+    ///
+    /// It carries the item's **id** and **which** field, never the field's
+    /// value -- the same rule `crate::picker_prompt::Outcome::Fill` is written
+    /// to, and for the same reason: a secret carried here would be a second,
+    /// non-zeroizing home for it, alive for as long as this value is. The
+    /// plaintext is fetched at dispatch by [`fill_from_vault`], the component
+    /// that already holds it.
+    ///
+    /// **It carries no `hwnd`**, for the reason [`Self::Unlock`] carries
+    /// nothing: the window this is about is the one `main` just handed to the
+    /// dispatch, so the caller already has it, and a copy here would be a
+    /// second description of one window that could disagree with the first.
+    Fill { item_id: String, choice: FillChoice },
 }
 
-/// [`overlay_ui::NoMatchAnswer`] as a [`NoMatchFollowUp`], **as a pure
-/// function**.
-///
-/// It exists so that the mapping is testable at all: the only production
-/// caller is [`handle_no_match`], which raises a real always-on-top window and
-/// so is the one thing on that path no test in this crate may execute.
-///
-/// [`overlay_ui::NoMatchAnswer::NewLogin`] answers `Nothing` here and that is
-/// not a hole: `handle_no_match` never reaches this function with it, because
-/// `NewLogin` means "run 3c" and 3c's own outcome is a save or a silence.
-/// Mapping it rather than making it unrepresentable keeps this function total,
-/// which is what lets a test walk all three answers.
 /// A [`window_label`] as something worth typing into the vault's search box:
 /// **the same name without a trailing `.exe`.**
 ///
@@ -2539,29 +2746,15 @@ pub fn search_query(label: &str) -> &str {
     label
 }
 
-pub fn no_match_follow_up(
-    answer: overlay_ui::NoMatchAnswer,
-    app_name: &str,
-) -> NoMatchFollowUp {
-    match answer {
-        overlay_ui::NoMatchAnswer::SearchVault => {
-            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
-        }
-        overlay_ui::NoMatchAnswer::Dismissed | overlay_ui::NoMatchAnswer::NewLogin => {
-            NoMatchFollowUp::Nothing
-        }
-    }
-}
-
 /// [`overlay_ui::LockedAnswer`] as a [`NoMatchFollowUp`], **as a pure
 /// function**.
 ///
-/// [`no_match_follow_up`]'s sibling, and it exists for the same reason: the
+/// [`picker_follow_up`]'s sibling, and it exists for the same reason: the
 /// only production caller is [`handle_locked`], which raises a real
 /// always-on-top window and so is the one thing on that path no test in this
 /// crate may execute.
 ///
-/// It takes no app name, where [`no_match_follow_up`] takes one. There is
+/// It takes no app name, where [`picker_follow_up`] takes one. There is
 /// nothing to name: an unlock is about *Deskwarden*, not about the app the
 /// card was shown over, and a query string threaded through here would be a
 /// string this follow-up has no use for and something later could act on.
@@ -2580,6 +2773,30 @@ pub fn locked_follow_up(answer: overlay_ui::LockedAnswer) -> NoMatchFollowUp {
 /// `Zeroizing` is moved into the `NewItem` and dropped with it -- but the item
 /// *name* and the app name are in it, and this is where what is said about
 /// them is decided.
+/// What a `crate::picker_prompt::Outcome` is written to the log as.
+///
+/// [`describe_outcome`]'s sibling, and a function for the same reason: "the
+/// log line never carries a secret, and never a name out of the user's own
+/// item" is a claim worth being able to test. The field is named through
+/// `picker_prompt::describe_send`, which spells the three built-in fields and
+/// says only "a custom field" for the fourth -- see that function for why a
+/// diagnostic written to a file on disk does not follow the one precedent this
+/// crate has for spelling such a name.
+pub fn describe_picker_outcome(outcome: &crate::picker_prompt::Outcome) -> String {
+    match outcome {
+        crate::picker_prompt::Outcome::Fill { id, send } => {
+            format!("fill vault item {id} with {}", crate::picker_prompt::describe_send(send))
+        }
+        crate::picker_prompt::Outcome::NewLogin => "a new login for this app".to_string(),
+        crate::picker_prompt::Outcome::SearchVault => "search the vault instead".to_string(),
+        crate::picker_prompt::Outcome::Edit(id) => format!("edit the binding on vault item {id}"),
+        crate::picker_prompt::Outcome::Cancelled => "dismissed".to_string(),
+        crate::picker_prompt::Outcome::Unavailable => {
+            "the card could not be put on screen".to_string()
+        }
+    }
+}
+
 pub fn describe_outcome(outcome: &SaveOutcome) -> String {
     match outcome {
         SaveOutcome::Created(Ok(id)) => format!("saved as vault item {id}"),
@@ -2591,13 +2808,13 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
     }
 }
 
-/// **The whole of the locked arm, as a pure function** -- [`no_match_arm`]'s
+/// **The whole of the locked arm, as a pure function** -- [`prompt_arm`]'s
 /// 3b sibling, written the same way and for the same two reasons: the
 /// placement must be computed for the window the card names, and it must be
 /// computed for the row count the card is *sized* by.
 ///
 /// **The placement is asked about [`overlay_ui::LOCKED_ROWS`]**, not
-/// `NO_MATCH_ROWS`, even though the two are equal today. The clamp onto the
+/// about any other card's, even though several are equal today. The clamp onto the
 /// monitor's work area is a function of the card's height, so asking about the
 /// other card's constant would be correct only by coincidence -- and would
 /// stop being correct the moment either card changed shape, silently, by
@@ -2605,7 +2822,7 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 ///
 /// **Nothing about an item or the vault crosses this function.** There is no
 /// id, no `VaultItem`, no cache and no [`Reprompt`] -- the same signature-level
-/// fact `no_match_arm` records, and it is stronger here: this path runs
+/// fact `prompt_arm` records, and it is stronger here: this path runs
 /// precisely when the vault cannot be read, so a parameter that could carry an
 /// item would be a parameter nothing could honestly fill.
 /// **It answers what the card answered, and nothing more.** The one thing 3b
@@ -3004,9 +3221,8 @@ mod tests {
         shown: std::cell::RefCell<Vec<Shown>>,
         /// The choice list each `show` was handed.
         offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
-        /// The label and placement each `show_no_match` was handed -- design
+        /// The label and placement each locked card was handed -- design
         /// 3a's own log, kept apart from `shown`.
-        no_match_shown: std::cell::RefCell<Vec<NoMatchShown>>,
         /// The label and placement each `show_locked` was handed -- design
         /// 3b's own log, kept apart from both of the others.
         locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
@@ -3044,25 +3260,6 @@ mod tests {
             ));
             self.offered.borrow_mut().push(choices.to_vec());
             self.answer.clone()
-        }
-
-        /// Design 3a goes into a log of its own rather than into `shown`: a
-        /// no-match card recorded as though it were a matched one would let
-        /// `no_match_arm` satisfy a test written about `prompt_arm`, and the
-        /// two states differ by exactly whether an item exists.
-        fn show_no_match(
-            &self,
-            label: &str,
-            position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.no_match_shown
-                .borrow_mut()
-                .push((label.to_string(), position));
-            // Dismissed, so this recorder never leads on into 3c: the tests
-            // that use it are about WHERE 3a opened and WHAT it was called,
-            // and a recorder that walked on to the save card would make every
-            // one of them a test of two cards.
-            overlay_ui::NoMatchAnswer::Dismissed
         }
 
         /// Design 3c goes into a log of its own too, for the reason 3a and 3b
@@ -3168,65 +3365,13 @@ mod tests {
         assert_eq!(shown[0].1, None);
     }
 
-    /// **Design 3a opens where it was told, for the window it names.**
-    ///
-    /// The 3a sibling of `the_overlay_opens_where_the_placement_answered_for_
-    /// that_window`, and it exists for the same reason: `handle_no_match`'s one
-    /// line is unreachable, so the two things `no_match_arm` does -- ask where
-    /// the card goes, and show it there -- would otherwise be exactly as
-    /// silently alterable as the matched arm's were (review 32's Important 1,
-    /// where mapping the placement's `y` to `0.0` pinned every overlay to the
-    /// top of the screen with the whole suite green).
-    #[test]
-    fn the_no_match_card_opens_where_the_placement_answered_for_that_window() {
-        let w = window("AtlasLicence.exe", "Atlas Licence");
-        let presenter = RecordingPresenter {
-            placement: Some((120.0, 340.0)),
-            ..Default::default()
-        };
-
-        no_match_arm(&presenter, &w);
-
-        assert_eq!(
-            presenter.asked_about.get(),
-            Some(w.hwnd),
-            "the placement was computed for a handle other than the window that has nothing \
-             matching it"
-        );
-        assert_eq!(
-            presenter.asked_rows.get(),
-            Some(overlay_ui::NO_MATCH_ROWS),
-            "the placement was asked about a row count other than the one the 3a card is \
-             SIZED by. The clamp onto the monitor's work area is a function of that height, so \
-             a wrong count puts the card's footer -- and its only dismiss hint -- under the \
-             taskbar on a window anchored near the bottom of the screen"
-        );
-        let shown = presenter.no_match_shown.borrow();
-        assert_eq!(shown.len(), 1, "the no-match card is shown exactly once");
-        assert_eq!(
-            shown[0].1,
-            Some((120.0, 340.0)),
-            "the card must open at the placement that was answered for this window"
-        );
-        assert!(
-            presenter.shown.borrow().is_empty(),
-            "the MATCHED card was raised for a window with no match. The two states differ by \
-             exactly whether an item exists, and this one has none"
-        );
-        assert!(
-            presenter.locked_shown.borrow().is_empty(),
-            "the LOCKED card was raised by `no_match_arm`. That card says Deskwarden cannot \
-             read the vault, which is the opposite of what this arm is called for"
-        );
-    }
-
     /// [`locked_arm`]'s half of the same claim: the card opens **where** the
     /// placement answered, and the placement is asked **about this window**
     /// and **about the row count the 3b card is sized by**.
     ///
     /// Written out rather than shared with the 3a test above, because the two
     /// arms are two functions with two constants, and a test parameterised
-    /// over them would pass if `locked_arm` were a call to `no_match_arm`.
+    /// over them would pass if `locked_arm` were a call to `prompt_arm`.
     #[test]
     fn the_locked_card_opens_where_the_placement_answered_for_that_window() {
         let w = window("AtlasLicence.exe", "Atlas Licence");
@@ -3255,12 +3400,6 @@ mod tests {
             shown[0].1,
             Some((120.0, 340.0)),
             "the card must open at the placement that was answered for this window"
-        );
-        assert!(
-            presenter.no_match_shown.borrow().is_empty(),
-            "`locked_arm` raised the NO-MATCH card. That card asserts there is no saved login \
-             for this app, which a locked vault cannot know -- and it is the whole reason 3b \
-             exists"
         );
         assert!(
             presenter.shown.borrow().is_empty(),
@@ -3308,7 +3447,7 @@ mod tests {
 
     /// The join between what 3b answered and what `main` does about it.
     ///
-    /// [`no_match_follow_up`]'s table has the same shape and the same reason:
+    /// [`picker_follow_up`]'s table has the same shape and the same reason:
     /// the only production caller is [`handle_locked`], which raises a real
     /// window, so this mapping is the one part of that line a test can read. A
     /// `Nothing` for `Unlock` is an inert button; an `Unlock` for `Dismissed`
@@ -3330,30 +3469,6 @@ mod tests {
                 !matches!(locked_follow_up(answer), NoMatchFollowUp::SearchVault(_)),
                 "the locked card asked to search a vault it cannot read, which opens a window \
                  onto an empty list that reads as `nothing found`"
-            );
-        }
-    }
-
-    /// **Only *Search vault* asks for a window**, and it asks with a query.
-    ///
-    /// The pair matters more than either half: `NewLogin` mapping to
-    /// `SearchVault` would open the vault instead of design 3c, and
-    /// `Dismissed` mapping to it would open the vault on every card the user
-    /// closed -- an always-on-top card whose ✕ opens a window is worse than
-    /// the silence 3a replaced.
-    #[test]
-    fn only_the_search_button_asks_for_a_window() {
-        assert_eq!(
-            no_match_follow_up(overlay_ui::NoMatchAnswer::SearchVault, "Ledgerline.exe"),
-            NoMatchFollowUp::SearchVault("Ledgerline".to_string()),
-            "`Search vault` asked for nothing, or asked with the wrong query"
-        );
-        for quiet in [overlay_ui::NoMatchAnswer::Dismissed, overlay_ui::NoMatchAnswer::NewLogin] {
-            assert_eq!(
-                no_match_follow_up(quiet, "Ledgerline.exe"),
-                NoMatchFollowUp::Nothing,
-                "{quiet:?} opened the vault window. Only one of 3a's controls may, and this \
-                 is not it"
             );
         }
     }
@@ -3389,40 +3504,6 @@ mod tests {
         assert_eq!(search_query("Кошелёк.exe"), "Кошелёк");
     }
 
-    /// **The label is `window_label`'s answer, and this card is the one place
-    /// that matters most.**
-    ///
-    /// Every other overlay state also names the item; 3a names nothing but the
-    /// app, so a raw `exe_name` for a title-matched Store frame is the entire
-    /// message being wrong -- "ApplicationFrameHost.exe" is the exact
-    /// complaint that produced `window_label` in the first place.
-    ///
-    /// `HOST` is a host process, which is the only case in which the two
-    /// answers differ; a card told `exe_name` fails here and a card told the
-    /// title passes, which is what makes this a test and not a restatement.
-    #[test]
-    fn the_no_match_card_is_told_the_window_label_and_not_the_exe_name() {
-        let w = window(HOST, "Speedtest");
-        let presenter = RecordingPresenter::default();
-
-        no_match_arm(&presenter, &w);
-
-        let shown = presenter.no_match_shown.borrow();
-        assert_eq!(shown.len(), 1);
-        assert_eq!(
-            shown[0].0, "Speedtest",
-            "the 3a card was told {:?}. That name means nothing to the user, and on this card \
-             it is the ONLY thing about their window that is on screen",
-            shown[0].0
-        );
-        assert_ne!(shown[0].0, HOST, "the raw executable name reached the card");
-        assert_eq!(
-            shown[0].1, None,
-            "control: no placement is not a placement of (0, 0) -- a `no_match_arm` that handed \
-             the card a fixed pair would pass the placement test above and fail this"
-        );
-    }
-
     /// The string spy, pointed at 3a: **no argument the card is given carries
     /// a raw executable name.**
     ///
@@ -3450,26 +3531,6 @@ mod tests {
             seen.iter().any(|s| s == "Speedtest"),
             "control: the window's real name never reached the card either, so the loop above \
              was asserting about nothing"
-        );
-    }
-
-    #[test]
-    fn nothing_the_no_match_card_is_given_carries_the_raw_exe_name() {
-        let spy = StringSpy::default();
-        no_match_arm(&spy, &window(HOST, "Speedtest"));
-
-        let seen = spy.seen.borrow();
-        assert!(!seen.is_empty(), "control: the spy recorded nothing, so it observed nothing");
-        for s in seen.iter() {
-            assert!(
-                !s.contains(HOST),
-                "the 3a card was handed {s:?}, which carries the frame host's executable name"
-            );
-        }
-        assert!(
-            seen.iter().any(|s| s == "Speedtest"),
-            "control: the window's real name never reached the card either, so the loop above \
-             passes for the wrong reason"
         );
     }
 
@@ -3708,19 +3769,6 @@ mod tests {
             None
         }
 
-        /// Design 3a's label lands in the same log as everything else: this
-        /// spy exists to catch a raw `exe_name` reaching ANY string the
-        /// overlay renders, and 3a's label is one -- indeed it is the only
-        /// string that card shows about the window.
-        fn show_no_match(
-            &self,
-            label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.seen.borrow_mut().push(label.to_string());
-            overlay_ui::NoMatchAnswer::Dismissed
-        }
-
         /// And so does design 3c's -- it names the app in its App row, which
         /// is the row the whole card is built around.
         fn show_save_login(
@@ -3842,15 +3890,6 @@ mod tests {
         ) -> Option<FillChoice> {
             self.log.borrow_mut().push("overlay shown");
             None
-        }
-
-        fn show_no_match(
-            &self,
-            _label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            self.log.borrow_mut().push("no-match card shown");
-            overlay_ui::NoMatchAnswer::Dismissed
         }
 
         fn show_save_login(
@@ -4003,20 +4042,6 @@ mod tests {
         Some(FillChoice::Just(key_sequence::FieldRef::Totp))
     }
 
-    static NO_MATCH_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
-        std::sync::Mutex::new(Vec::new());
-
-    fn recording_show_no_match(
-        label: &str,
-        position: Option<(f32, f32)>,
-    ) -> overlay_ui::NoMatchAnswer {
-        NO_MATCH_FORWARDED
-            .lock()
-            .unwrap()
-            .push((label.to_string(), position));
-        overlay_ui::NoMatchAnswer::Dismissed
-    }
-
     static SAVE_LOGIN_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
         std::sync::Mutex::new(Vec::new());
 
@@ -4077,7 +4102,6 @@ mod tests {
         let presenter = FnPresenter {
             position: recording_position,
             show: recording_show,
-            show_no_match: recording_show_no_match,
             show_locked: recording_show_locked,
             show_save_login: recording_show_save_login,
             show_generate: recording_show_generate,
@@ -4115,21 +4139,13 @@ mod tests {
         );
         assert_eq!(forwarded[0].2, Some((3.0, 4.0)));
 
-        // **The two no-item cards are forwarded to DIFFERENT functions**, and
-        // each to its own. `show_no_match` and `show_locked` have identical
-        // signatures, so a swap of the two fields -- which would show "no
-        // saved login" for a locked vault and "Deskwarden is locked" for a
-        // readable one, i.e. exactly the defect this state corrects, inverted
-        // -- compiles cleanly. Only reading both logs catches it.
+        // **The no-item card is forwarded to its own function**, with its own
+        // arguments. 3a used to sit beside it with an identical signature, so
+        // a swap of the two fields compiled and inverted the whole correction;
+        // 3a is the account picker's empty mode now, and what is left to read
+        // is that this card's label and placement arrive unaltered.
         drop(forwarded);
-        presenter.show_no_match("Atlas Licence.exe", Some((5.0, 6.0)));
         presenter.show_locked("Ledgerline.exe", Some((7.0, 8.0)));
-        assert_eq!(
-            *NO_MATCH_FORWARDED.lock().unwrap(),
-            vec![("Atlas Licence.exe".to_string(), Some((5.0, 6.0)))],
-            "the 3a card was not forwarded to the 3a function, or was handed the 3b call's \r
-             arguments"
-        );
         assert_eq!(
             *LOCKED_FORWARDED.lock().unwrap(),
             vec![("Ledgerline.exe".to_string(), Some((7.0, 8.0)))],
@@ -4190,17 +4206,16 @@ mod prompt_wiring_tests {
     const LOOKUP: &str = concat!("let lookup = || cache.", "get_by_id(item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
-    /// **The two no-item cards, each named in its own field.**
+    /// **The no-item card, named in its own field.**
     ///
-    /// `show_no_match` and `show_locked` have identical signatures, so
-    /// swapping the two values in [`REAL_OVERLAY`] compiles, warns about
-    /// nothing, and inverts the entire correction: a locked vault would be
-    /// told "No saved login for <app>" -- the defect 3b exists to remove --
-    /// and a readable one would be told Deskwarden is locked while it plainly
-    /// was not. `FnPresenter`'s forwarding test cannot see it, because the
-    /// swap is in the struct literal it does not build.
-    const REAL_SHOW_NO_MATCH: &str =
-        concat!("show_no_match: ", "overlay_ui::show_no_match_overlay,");
+    /// 3a's field used to sit beside this one, and the two had identical
+    /// signatures -- so swapping their values compiled, warned about nothing,
+    /// and inverted the whole correction. 3a is now the bare-Win32 account
+    /// picker's empty mode and has no field here at all, which is a stronger
+    /// answer than any needle: there is no longer a second value of this type
+    /// for this one to be swapped with. What is left to pin is that 3b's field
+    /// names the real function plainly, because `FnPresenter`'s forwarding
+    /// test cannot see the struct literal it does not build.
     const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "overlay_ui::show_locked_overlay,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
     /// it about the value it was HANDED. `match_disposition(true)` -- the
@@ -4308,16 +4323,11 @@ mod prompt_wiring_tests {
         let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
 
-        // The swap, planted both ways round, so each needle is shown to
-        // notice the other card's function being put in its field.
-        let planted = concat!("    show_no_match: ", "overlay_ui::show_no_match_overlay,");
-        assert_eq!(occurrences(planted, REAL_SHOW_NO_MATCH), 1, "planted: {planted}");
-        let swapped = concat!("    show_no_match: ", "overlay_ui::show_locked_overlay,");
-        assert_eq!(occurrences(swapped, REAL_SHOW_NO_MATCH), 0, "planted: {swapped}");
         let planted = concat!("    show_locked: ", "overlay_ui::show_locked_overlay,");
         assert_eq!(occurrences(planted, REAL_SHOW_LOCKED), 1, "planted: {planted}");
-        let swapped = concat!("    show_locked: ", "overlay_ui::show_no_match_overlay,");
-        assert_eq!(occurrences(swapped, REAL_SHOW_LOCKED), 0, "planted: {swapped}");
+        let wrapped =
+            concat!("    show_locked: ", "|_label, p| overlay_ui::show_locked_overlay(\"\", p),");
+        assert_eq!(occurrences(wrapped, REAL_SHOW_LOCKED), 0, "planted: {wrapped}");
 
         let planted = concat!("match match_disposition", "(prompt_on_match) {");
         assert_eq!(occurrences(planted, DISPOSITION_CALL), 1, "planted: {planted}");
@@ -4428,14 +4438,6 @@ mod prompt_wiring_tests {
         );
 
         assert_eq!(
-            occurrences(source(), REAL_SHOW_NO_MATCH),
-            1,
-            "expected {REAL_SHOW_NO_MATCH:?} exactly once in app.rs -- `REAL_OVERLAY`'s 3a \
-             field. Zero most likely means it has been swapped with the 3b field, which \
-             compiles and puts \"No saved login for <app>\" back in front of every user whose \
-             vault is merely locked"
-        );
-        assert_eq!(
             occurrences(source(), REAL_SHOW_LOCKED),
             1,
             "expected {REAL_SHOW_LOCKED:?} exactly once in app.rs -- `REAL_OVERLAY`'s 3b \
@@ -4497,6 +4499,15 @@ mod prompt_wiring_tests {
 /// find them and either fail forever or have to be weakened until it accepted
 /// them, and a scan weakened to accept a test's `UserTabPass` would accept
 /// production's too. What is being claimed is about what SHIPS.
+///
+/// **The one blind spot in the reshaped guard**: forms are matched against a
+/// call's text by substring, with nothing binding a form to a *position*, so
+/// two call sites in the same file that SWAPPED their entitlements would each
+/// still match exactly one form and this test would pass -- for `main.rs` that
+/// means the hotkey naming `FillChoice::Saved` and the picker forwarding
+/// `, choice,` could trade places unnoticed. Catching that needs the rows to
+/// name the call sites themselves, which nothing in the source text supports
+/// today.
 #[cfg(test)]
 mod fill_call_site_tests {
     // Split across two literals so `include_str!` of this very file does not
@@ -4505,22 +4516,41 @@ mod fill_call_site_tests {
     // and vice versa, and this repo has no `.gitattributes`.
     const CALL: &str = concat!("fill_from_vault", "(");
 
-    /// The choice each file's production calls must pass, and how many calls
-    /// that file has -- **one row per file, and the two rows differ**.
+    /// The choice each production call must pass -- **one form per CALL SITE,
+    /// and the count of a file's call sites is the length of its row**.
     ///
-    /// The form and the count live in the same row deliberately. A rule that
+    /// The forms and the count live in the same row deliberately. A rule that
     /// was global and a count that was per file is what let `main.rs` inherit
     /// `app.rs`'s `, choice,`; keeping them together means a call site that
     /// appears in either file has to be given a row's worth of thought, and
     /// the count assertion below fires before anything is accepted.
     ///
-    /// The count is also what stops a call site DELETED (rather than changed)
+    /// The length is also what stops a call site DELETED (rather than changed)
     /// passing this by leaving nothing to check.
-    const RULES: [(&str, &str, usize); 2] = [
-        // Forwards the overlay's own answer; see the module doc.
-        ("app.rs", ", choice,", 1),
-        // Names the preserving choice; there is no answer to forward.
-        ("main.rs", concat!("FillChoice", "::Saved"), 1),
+    ///
+    /// **It was one form per FILE, and `main.rs` growing a second call site is
+    /// what made that shape wrong.** A per-file form can only say "every call
+    /// in this file passes the same thing", and `main.rs` now has two calls
+    /// that are entitled to opposite things: the fill hotkey has no answer to
+    /// forward and must name the preserving choice, while the account picker's
+    /// fill has an answer the user gave twice -- a row, then a field -- and
+    /// must forward it. Widening `main.rs`'s single form to accept both would
+    /// have let the hotkey forward a binding again, which is the exact
+    /// regression this module exists to hold; so the row became a list, and
+    /// the loop below matches each call to exactly one form and each form to
+    /// exactly one call.
+    const RULES: [(&str, &[&str]); 2] = [
+        // `handle_match`: forwards the overlay's own answer; see the module doc.
+        ("app.rs", &[", choice,"]),
+        ("main.rs", &[
+            // The fill hotkey: names the preserving choice, because there is
+            // no answer to forward.
+            concat!("FillChoice", "::Saved"),
+            // The account picker's fill: forwards the choice destructured out
+            // of `NoMatchFollowUp::Fill`, which is the field the user picked
+            // on the card's second step.
+            ", choice,",
+        ]),
     ];
 
     /// The row for `name`, or a hard failure.
@@ -4529,11 +4559,11 @@ mod fill_call_site_tests {
     /// own would otherwise be checked against nothing, or -- worse, and this
     /// is the defect being closed -- against whatever rule happened to be
     /// lying around for another file.
-    fn rule(name: &str) -> (&'static str, usize) {
+    fn rule(name: &str) -> &'static [&'static str] {
         RULES
             .iter()
-            .find(|(n, _, _)| *n == name)
-            .map(|(_, form, count)| (*form, *count))
+            .find(|(n, _)| *n == name)
+            .map(|(_, forms)| *forms)
             .unwrap_or_else(|| {
                 panic!(
                     "{name} is scanned but has no rule of its own. Add a row to RULES saying \
@@ -4607,7 +4637,7 @@ mod fill_call_site_tests {
         );
         let args = argument_lists(planted);
         assert_eq!(args.len(), 2, "the scanner did not find both planted calls: {args:?}");
-        let (app_form, _) = rule("app.rs");
+        let app_form = rule("app.rs")[0];
         assert!(args[0].contains(app_form), "{}", args[0]);
         assert!(
             !args[1].contains(app_form),
@@ -4617,43 +4647,59 @@ mod fill_call_site_tests {
         assert_eq!(argument_lists("nothing here").len(), 0);
     }
 
-    /// **The two files' rules are not interchangeable, in both directions.**
+    /// **The hotkey's rule and a forwarding rule are not interchangeable, in
+    /// both directions.**
     ///
     /// This is the guard on the guard. The defect being closed was one rule
     /// accepting either spelling everywhere, so the cheapest way to "fix" a
-    /// future failure of the test below is to widen a row until it accepts the
-    /// other file's form again -- and that would be silent. So the forms are
-    /// pinned as mutually rejecting: `main.rs`'s form must reject the shape
-    /// `app.rs` really passes, and `app.rs`'s form must reject the shape
-    /// `main.rs` really passes. Merge them and this fails.
+    /// future failure of the test below is to widen a row until it accepts a
+    /// forwarded binding on the hotkey path again -- and that would be silent.
+    /// So the two forms are pinned as mutually rejecting: the hotkey's form
+    /// must reject the shape a forwarding call really passes, and a forwarding
+    /// form must reject the shape the hotkey really passes. Merge them and
+    /// this fails.
+    ///
+    /// **`main.rs` now carries both forms, and that is not a merge.** Its two
+    /// call sites are entitled to opposite things and the row lists both; what
+    /// this test still holds is that neither form accepts the other's shape,
+    /// which is what stops the hotkey being handed a binding.
     ///
     /// The two shapes are written the way the production call sites are
     /// written, whitespace included, so this is a positive control for each
-    /// row as well as a negative one for the other.
+    /// form as well as a negative one for the other.
     #[test]
     fn the_two_files_rules_are_not_interchangeable() {
         let forwards = "item_id, hwnd, choice, notifier";
         let names_it = concat!("hwnd,\ndeskwarden::app::FillChoice", "::Saved,\n&notifier,");
-        let (app_form, app_count) = rule("app.rs");
-        let (main_form, main_count) = rule("main.rs");
+        let forwarding = rule("app.rs")[0];
+        let hotkey = rule("main.rs")[0];
 
-        assert!(app_form != main_form, "the two rows have collapsed into one rule again");
-        assert!(app_count > 0 && main_count > 0, "a file is scanned but has nothing to check");
+        assert!(forwarding != hotkey, "the two forms have collapsed into one rule again");
+        for name in ["app.rs", "main.rs"] {
+            assert!(!rule(name).is_empty(), "{name} is scanned but has nothing to check");
+        }
 
-        assert!(app_form.contains("choice"), "app.rs's rule stopped being about forwarding");
-        assert!(forwards.contains(app_form), "app.rs's rule rejects what app.rs really passes");
+        assert!(forwarding.contains("choice"), "the forwarding rule stopped being about forwarding");
+        assert!(forwards.contains(forwarding), "the forwarding rule rejects what app.rs passes");
         assert!(
-            !names_it.contains(app_form),
-            "app.rs's rule accepts a call that names a literal instead of forwarding"
+            !names_it.contains(forwarding),
+            "the forwarding rule accepts a call that names a literal instead of forwarding"
         );
 
-        assert!(names_it.contains(main_form), "main.rs's rule rejects what main.rs really passes");
+        assert!(names_it.contains(hotkey), "the hotkey's rule rejects what main.rs really passes");
         assert!(
-            !forwards.contains(main_form),
-            "main.rs's rule accepts a forwarded binding. The hotkey has no answer to forward, \
-             so a binding there can hold ANY choice -- `let choice = FillChoice::UserTabPass;` \
-             is the whole regression, and it is one line"
+            !forwards.contains(hotkey),
+            "the hotkey's rule accepts a forwarded binding. The hotkey has no answer to \
+             forward, so a binding there can hold ANY choice -- `let choice = \
+             FillChoice::UserTabPass;` is the whole regression, and it is one line"
         );
+
+        // **And the picker's call site is entitled to forward, deliberately.**
+        // Its row's second form is the forwarding one, so `main.rs` really
+        // does hold both -- a row that had quietly dropped back to one form
+        // would fail here rather than pass by having nothing to disagree with.
+        assert_eq!(rule("main.rs").len(), 2, "main.rs's two call sites are not both listed");
+        assert_eq!(rule("main.rs")[1], forwarding);
 
         assert_eq!(RULES.len(), sources().len(), "a file is scanned with no rule, or vice versa");
     }
@@ -4702,33 +4748,49 @@ mod fill_call_site_tests {
         let mut checked = 0;
         for (name, source) in sources() {
             let args = argument_lists(&production_only(source));
-            let (form, expected) = rule(name);
+            let forms = rule(name);
+            let expected = forms.len();
             assert_eq!(
                 args.len(),
                 expected,
                 "{name} has {} production calls to the fill, not {expected}. A call site was \
-                 added or deleted: give it a row's worth of thought and update RULES \
-                 deliberately -- a new call site must not inherit the other file's rule",
+                 added or deleted: give it a row's worth of thought and add or remove a FORM \
+                 in that file's row -- a new call site must not inherit another one's rule",
                 args.len()
             );
             assert!(expected > 0, "{name} is scanned but has no call to check");
-            for arg in &args {
-                assert!(
-                    arg.contains(form),
-                    "a fill in {name} does not pass {form:?}, which is the ONLY choice that \
-                     file's call sites are entitled to pass. In main.rs that means the hotkey \
-                     no longer names the choice that preserves what it has always done, and \
-                     every stored auto-type sequence in every existing vault is retired on \
-                     that path; in app.rs it means `handle_match` no longer forwards the \
-                     user's own answer, so the row they clicked is not the row that is typed. \
-                     Its arguments are ({arg})"
+            // **One call per form and one form per call.** Matching each form
+            // to exactly one call is what stops a file with two call sites
+            // satisfying both rows with the same call and leaving the other
+            // unchecked -- which a plain "every call matches some form" would
+            // allow, and which on this path means the fill hotkey going
+            // unexamined.
+            for form in forms {
+                assert_eq!(
+                    args.iter().filter(|arg| arg.contains(form)).count(),
+                    1,
+                    "{name} does not have exactly one fill passing {form:?}. Each call site in \
+                     this file is entitled to ONE of the forms in its row: in main.rs that \
+                     means the hotkey names the choice that preserves what it has always done \
+                     -- lose it and every stored auto-type sequence in every existing vault is \
+                     retired on that path -- and the account picker forwards the field the \
+                     user picked. In app.rs it means `handle_match` forwards the user's own \
+                     answer, so the row they clicked is the row that is typed. The calls found \
+                     were {args:?}"
                 );
                 checked += 1;
+            }
+            for arg in &args {
+                assert!(
+                    forms.iter().any(|form| arg.contains(form)),
+                    "a fill in {name} passes none of the choices that file's call sites are \
+                     entitled to pass. Its arguments are ({arg})"
+                );
             }
         }
         assert_eq!(
             checked,
-            RULES.iter().map(|(_, _, c)| c).sum::<usize>(),
+            RULES.iter().map(|(_, forms)| forms.len()).sum::<usize>(),
             "the loop did not check every call it found"
         );
         assert!(checked > 0, "the loop visited nothing at all");
@@ -7334,7 +7396,8 @@ mod save_login_tests {
                 VaultAvailability::Readable,
                 NeverForApp::Yes,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Nothing,
             "the user pressed `Never for this app` and the no-match card came back anyway. A \
@@ -7347,7 +7410,8 @@ mod save_login_tests {
                 VaultAvailability::Locked,
                 NeverForApp::Yes,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Nothing,
             "a silenced app started showing the LOCKED card the moment the vault locked. 3b \
@@ -7364,7 +7428,8 @@ mod save_login_tests {
                 VaultAvailability::Readable,
                 NeverForApp::No,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::NoMatch
         );
@@ -7375,7 +7440,8 @@ mod save_login_tests {
                 VaultAvailability::Locked,
                 NeverForApp::No,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Locked
         );
@@ -7393,7 +7459,7 @@ mod save_login_tests {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Match("42"),
                     "a saved login stopped being offered because the user had once said \
                      `never save a login for this app`. Those are different questions, and \
@@ -7418,7 +7484,7 @@ mod save_login_tests {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 for never in [NeverForApp::Yes, NeverForApp::No] {
                     assert_eq!(
-                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown, BrowserWindow::No),
+                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                         Open::Nothing,
                         "a window with no match and no password field opened a card"
                     );
@@ -7434,8 +7500,8 @@ mod save_login_tests {
         for matched in [Matched::No, Matched::Yes("7")] {
             for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
                 for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
-                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No);
-                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No);
+                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground,);
+                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground,);
                     assert!(
                         with == Open::Nothing || with == without,
                         "with `never` this window opens {with:?} and without it {without:?}, \
@@ -7553,6 +7619,7 @@ mod disposition_tests {
                     NeverForApp::No,
                     OverlayPrompts::Silenced,
                     BrowserWindow::No,
+                    Trigger::Foreground,
                 ),
                 Open::Nothing,
                 "the prompt is off in Preferences and an unmatched window still opened a \
@@ -7586,6 +7653,7 @@ mod disposition_tests {
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
                 browser_window("ledgerline.exe"),
+                Trigger::Foreground,
             ),
             Open::NoMatch,
             "the no-match card has stopped appearing for the one case it is FOR. Both \
@@ -7601,6 +7669,7 @@ mod disposition_tests {
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
                 browser_window("ledgerline.exe"),
+                Trigger::Foreground,
             ),
             Open::Locked
         );
@@ -7624,6 +7693,7 @@ mod disposition_tests {
                 NeverForApp::No,
                 OverlayPrompts::Silenced,
                 BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Match("42"),
             "the unmatched-card gate has swallowed the matched arm too, so the hotkey \
@@ -7669,6 +7739,7 @@ mod disposition_tests {
                     never_for_app(&[], "firefox.exe"),
                     overlay_prompts(true),
                     browser_window("firefox.exe"),
+                    Trigger::Foreground,
                 ),
                 Open::Nothing,
                 "a browser opened an unmatched card ({vault:?}). Every login page has a \
@@ -7692,6 +7763,7 @@ mod disposition_tests {
                 never_for_app(&[], "palemoon.exe"),
                 overlay_prompts(true),
                 browser_window("palemoon.exe"),
+                Trigger::Foreground,
             ),
             Open::NoMatch
         );
@@ -7705,6 +7777,7 @@ mod disposition_tests {
                 never_for_app(&["palemoon.exe".to_string()], "palemoon.exe"),
                 overlay_prompts(true),
                 browser_window("palemoon.exe"),
+                Trigger::Foreground,
             ),
             Open::Nothing
         );
@@ -7728,6 +7801,7 @@ mod disposition_tests {
                     NeverForApp::No,
                     overlay_prompts(true),
                     browser_window(BROWSER_IMAGE_NAMES[0]),
+                    Trigger::Foreground,
                 ),
                 Open::Match("42"),
                 "an app-match rule the user wrote against a browser stopped being honoured"
@@ -7752,7 +7826,7 @@ mod disposition_tests {
                     for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
                         for browser in [BrowserWindow::Yes, BrowserWindow::No] {
                             assert_eq!(
-                                disposition(Matched::No, field, vault, never, prompts, browser),
+                                disposition(Matched::No, field, vault, never, prompts, browser, Trigger::Foreground),
                                 Open::Nothing,
                                 "a window with no match and no password field opened a card"
                             );
@@ -7776,6 +7850,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Shown,
                         BrowserWindow::No,
+                        Trigger::Foreground,
                     );
                     let silenced = disposition(
                         matched,
@@ -7784,6 +7859,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Silenced,
                         BrowserWindow::No,
+                        Trigger::Foreground,
                     );
                     let browsed = disposition(
                         matched,
@@ -7792,6 +7868,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Shown,
                         BrowserWindow::Yes,
+                        Trigger::Foreground,
                     );
                     for (with, what) in
                         [(silenced, "the prompt setting"), (browsed, "the browser rule")]
@@ -7866,13 +7943,13 @@ mod disposition_tests {
     #[test]
     fn an_ordinary_window_with_no_password_field_is_still_silence() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Nothing,
             "a window the vault does not know and that asks for no password now raises a card. \
              That is every editor, terminal and file manager the user focuses"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Nothing,
             "a window UI Automation could not answer for is being treated as a login window. \
              `Unknown` is the case with the LEAST evidence, and it is being read as the most"
@@ -7894,7 +7971,7 @@ mod disposition_tests {
         for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
             for field in [HasPasswordField::No, HasPasswordField::Unknown] {
                 assert_eq!(
-                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Nothing,
                     "an ordinary window raised a card with {field:?} and {vault:?}"
                 );
@@ -7909,18 +7986,18 @@ mod disposition_tests {
     #[test]
     fn a_password_field_with_no_match_opens_the_no_match_card() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::NoMatch
         );
         assert_eq!(
-            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Match("7"),
             "a matched window must still open the matched card -- the item id is what the fill \
              is resolved from"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             "the premise: the password-field answer actually decides something. Equal answers \
              mean the probe is being paid for and ignored"
         );
@@ -7942,14 +8019,14 @@ mod disposition_tests {
     #[test]
     fn a_locked_vault_never_claims_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Locked,
             "with the vault locked and the engine therefore empty, an unmatched login window \
              still opens the card that asserts there is no saved login for it"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             "the premise: the vault state actually decides something here. Equal answers mean \
              the third input is accepted and ignored, which is the defect unchanged"
         );
@@ -7967,13 +8044,13 @@ mod disposition_tests {
     #[test]
     fn an_empty_but_readable_vault_still_says_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::NoMatch,
             "a user whose vault genuinely has nothing for this app is now told Deskwarden is \
              locked instead, which is both false and useless to them"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Locked
         );
     }
@@ -8005,7 +8082,7 @@ mod disposition_tests {
     fn a_matched_window_ignores_the_field_answer_entirely() {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             assert_eq!(
-                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                 Open::Match("42"),
                 "a matched window's disposition changed with {field:?}, so the probe cannot be \
                  skipped on that branch after all"
@@ -8029,7 +8106,7 @@ mod disposition_tests {
                 HasPasswordField::Unknown,
             ] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Match("42"),
                     "a matched window's disposition changed with {field:?} and {vault:?}"
                 );
@@ -8046,7 +8123,7 @@ mod disposition_tests {
     fn the_matched_id_is_the_id_that_comes_back_out() {
         for id in ["7", "42", "a-uuid-shaped-thing"] {
             assert_eq!(
-                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                 Open::Match(id)
             );
         }
@@ -8193,6 +8270,221 @@ mod disposition_tests {
             "window 0 survived past the bound, so the memory grows without limit"
         );
     }
+
+    /// **Each suppressor silences the automatic card and does NOT silence the
+    /// chord.**
+    ///
+    /// The three suppressors exist for one reason between them: to stop
+    /// Deskwarden putting a window in front of somebody who did not ask for
+    /// one. `CTRL+ALT+B` is somebody asking, by name. So each is asserted
+    /// twice -- silent on `Foreground`, the picker on `Hotkey` -- and a
+    /// suppressor that leaked onto the hotkey path fails here rather than
+    /// shipping as "the shortcut does nothing in this app".
+    #[test]
+    fn every_suppressor_silences_the_automatic_card_and_none_of_them_silences_the_chord() {
+        let cases: [(&str, NeverForApp, OverlayPrompts, BrowserWindow); 3] = [
+            (
+                "the user's `Never for this app`",
+                NeverForApp::Yes,
+                OverlayPrompts::Shown,
+                BrowserWindow::No,
+            ),
+            (
+                "the `Prompt on match` setting turned off",
+                NeverForApp::No,
+                OverlayPrompts::Silenced,
+                BrowserWindow::No,
+            ),
+            (
+                "the browser exclusion",
+                NeverForApp::No,
+                OverlayPrompts::Shown,
+                BrowserWindow::Yes,
+            ),
+        ];
+        for (what, never, prompts, browser) in cases {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    HasPasswordField::Yes,
+                    VaultAvailability::Readable,
+                    never,
+                    prompts,
+                    browser,
+                    Trigger::Foreground,
+                ),
+                Open::Nothing,
+                "{what} stopped silencing the card that appears on its own. That is the \
+                 behaviour the owner's setting controls, and it must not move"
+            );
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    HasPasswordField::Yes,
+                    VaultAvailability::Readable,
+                    never,
+                    prompts,
+                    browser,
+                    Trigger::Hotkey,
+                ),
+                Open::NoMatch,
+                "{what} also swallowed a deliberate CTRL+ALT+B press. Every suppressor here \
+                 exists to stop Deskwarden interrupting UNINVITED; a chord press is the user \
+                 inviting it, so the answer they are owed is the account picker -- `no \
+                 accounts match this app` is useful, and silence reads as a broken shortcut"
+            );
+        }
+
+        // And all three at once, because one user can easily have all three
+        // true: a browser they pressed `Never` on, with the setting off. That
+        // is exactly the person for whom the chord must still work -- it is
+        // the owner's own configuration.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::Yes,
+                OverlayPrompts::Silenced,
+                BrowserWindow::Yes,
+                Trigger::Hotkey,
+            ),
+            Open::NoMatch,
+            "with every suppressor set at once the chord went silent. The suppressors stop \
+             uninvited cards; they are not a way to switch the shortcut off"
+        );
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::Yes,
+                OverlayPrompts::Silenced,
+                BrowserWindow::Yes,
+                Trigger::Foreground,
+            ),
+            Open::Nothing,
+            "control: the automatic path with every suppressor set is no longer silence"
+        );
+    }
+
+    /// **The field gate does not apply to the chord either.**
+    ///
+    /// `HasPasswordField::No` and `::Unknown` are the honest answers "we
+    /// looked and found none" and "we did not ask". Neither is evidence that
+    /// an automatic card is wanted, which is why both stay silent on
+    /// `Foreground`. Neither is a reason to refuse a user who pressed the
+    /// chord: they are sitting in front of the window, and they asked.
+    #[test]
+    fn a_window_with_no_password_field_still_opens_the_picker_for_the_chord() {
+        for field in [HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Readable,
+                    NeverForApp::No,
+                    OverlayPrompts::Shown,
+                    BrowserWindow::No,
+                    Trigger::Foreground,
+                ),
+                Open::Nothing,
+                "an unasked-for card appeared over a window whose password field answered \
+                 {field:?}. Guessing a card onto the screen from an unanswered question is \
+                 the whole failure this gate prevents"
+            );
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Readable,
+                    NeverForApp::No,
+                    OverlayPrompts::Shown,
+                    BrowserWindow::No,
+                    Trigger::Hotkey,
+                ),
+                Open::NoMatch,
+                "CTRL+ALT+B did nothing because the probe answered {field:?}. The probe \
+                 decides whether to INTERRUPT somebody, not whether to ANSWER them -- and \
+                 `Unknown` in particular means the question was never even put"
+            );
+        }
+    }
+
+    /// **A locked vault answers the chord with the unlock card, not silence
+    /// and not an empty picker.**
+    ///
+    /// Turning `Open::Locked` into `Open::NoMatch` here would put an account
+    /// picker over the window claiming no account matches, when the truth is
+    /// that nothing could be read. 3b is the card carrying *Unlock*, so this
+    /// is also what keeps the unlock route reachable from the chord.
+    #[test]
+    fn a_locked_vault_answers_the_chord_with_the_unlock_card() {
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Locked,
+                    NeverForApp::Yes,
+                    OverlayPrompts::Silenced,
+                    BrowserWindow::Yes,
+                    Trigger::Hotkey,
+                ),
+                Open::Locked,
+                "the chord over a locked vault answered something other than the unlock card \
+                 with {field:?}. An account picker here would claim `no account matches` for \
+                 a vault nothing could read, and the one route back -- the *Unlock* button -- \
+                 is on the card this arm is supposed to return"
+            );
+        }
+    }
+
+    /// **The trigger is read on the unmatched branch and nowhere else.**
+    ///
+    /// A sweep rather than a spot check: for every combination of the other
+    /// inputs, a MATCH answers identically for both triggers. A trigger that
+    /// reached the matched arm would change what pressing the chord does to a
+    /// window whose account is already known.
+    #[test]
+    fn the_trigger_never_changes_a_matched_windows_answer() {
+        let mut checked = 0;
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                for never in [NeverForApp::Yes, NeverForApp::No] {
+                    for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
+                        for browser in [BrowserWindow::Yes, BrowserWindow::No] {
+                            assert_eq!(
+                                disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    Trigger::Foreground,
+                                ),
+                                disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    Trigger::Hotkey,
+                                ),
+                                "the trigger changed a MATCHED window's answer ({field:?}, \
+                                 {vault:?}, {never:?}, {prompts:?}, {browser:?})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48, "the sweep did not cover every combination");
+    }
+
 }
 
 /// **The preflight gate, and the fact that it is in a gating POSITION.**
@@ -8424,14 +8716,6 @@ mod generate_flow_tests {
             unreachable!("the 3d flow never opens the matched card")
         }
 
-        fn show_no_match(
-            &self,
-            _label: &str,
-            _position: Option<(f32, f32)>,
-        ) -> overlay_ui::NoMatchAnswer {
-            unreachable!("the 3d flow never opens 3a")
-        }
-
         fn show_save_login(
             &self,
             form: SaveLoginForm,
@@ -8651,5 +8935,464 @@ mod generate_flow_tests {
         assert_eq!(outcome, SaveOutcome::Nothing);
         assert_eq!(*created.borrow(), 0, "a `Generate` created a vault item");
         assert_eq!(*silenced.borrow(), 0, "a `Generate` silenced the app forever");
+    }
+}
+
+/// **What the account picker's card is wired to, at the two seams that carry
+/// a decision.**
+///
+/// Nothing here opens a window, reads the real vault or touches the favicon
+/// cache: `picker_choice`, `picker_follow_up` and `picker_palette` are pure
+/// over values, which is why they are separate from `handle_no_match` at all
+/// -- that function raises a real always-on-top card and is the one thing on
+/// this path no test in this crate may execute.
+#[cfg(test)]
+mod picker_wiring_tests {
+    use super::*;
+    use crate::key_sequence::FieldRef;
+    use crate::picker_prompt::{Outcome as PickerOutcome, Palette, Send as PickerSend};
+
+    /// **The one arm of [`picker_choice`] that is not a token-for-token
+    /// identity, pinned.**
+    ///
+    /// `Send::All` maps to `FillChoice::UserTabPass`, which is UI Automation's
+    /// named-field fill rather than a typed plan -- so the mapping is only
+    /// honest for as long as what that fill *types*, when it falls back to
+    /// typing, is what `picker_prompt::tokens_for` says the choice types.
+    /// Those are two constants in two files, and this is the assertion that
+    /// stops them drifting: change either and this fails, rather than the card
+    /// quietly typing something other than what its own row promised.
+    /// **A window the configured engine matched can never reach the picker.**
+    ///
+    /// The design's Testing section names this case: the picker is the
+    /// unmatched window's card, and a matched window must never see it. The
+    /// only door to it is [`Open::NoMatch`] -- `main::process_foreground_event`
+    /// calls `handle_no_match`, which is what calls `picker_prompt::ask`, from
+    /// that arm and from no other -- so the property is exactly "`disposition`
+    /// does not answer `NoMatch` for a `Matched::Yes`".
+    ///
+    /// **It is swept, not spot-checked.** The other six inputs are three
+    /// suppressors, a field probe, a vault state and the [`Trigger`], and
+    /// every one of them already turns some *unmatched* window into a
+    /// different answer. This walks all of them against a match, so a
+    /// suppressor added later that reroutes rather than silences -- or an arm
+    /// reordered above the matched one, or a [`Trigger::Hotkey`] arm that
+    /// forgot the match is decided first -- fails here rather than putting an
+    /// account picker over a window whose account is already known.
+    #[test]
+    fn a_window_the_engine_matched_never_reaches_the_picker() {
+        let mut checked = 0;
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                for never in [NeverForApp::Yes, NeverForApp::No] {
+                    for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
+                        for browser in [BrowserWindow::Yes, BrowserWindow::No] {
+                        // **Both triggers, and the hotkey is the one that
+                        // matters most here.** It is the arm that ignores
+                        // every suppressor, so it is the arm most able to
+                        // reroute a matched window into the picker by
+                        // accident. Swept, not trusted.
+                        for trigger in [Trigger::Foreground, Trigger::Hotkey] {
+                                let open = disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    trigger,
+                                );
+                                assert_ne!(
+                                    open,
+                                    Open::NoMatch,
+                                    "a window the engine matched was routed to the unmatched card, \
+                                     which is the one door to `picker_prompt::ask`: the user would \
+                                     be asked to choose an account for a window whose account is \
+                                     already known ({field:?}, {vault:?}, {never:?}, {prompts:?}, \
+                                     {browser:?}, {trigger:?})"
+                                );
+                                assert_eq!(
+                                    open,
+                                    Open::Match("42"),
+                                    "a matched window's disposition changed with {field:?}, \
+                                     {vault:?}, {never:?}, {prompts:?}, {browser:?}, {trigger:?}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            96,
+            "the sweep did not cover every combination of the six inputs"
+        );
+
+        // POSITIVE CONTROL, so the sweep above cannot be satisfied by a
+        // `disposition` that never answers `NoMatch` at all: the same five
+        // inputs that never produced it for a match DO produce it for the
+        // unmatched window this card was written for.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::No,
+                OverlayPrompts::Shown,
+                BrowserWindow::No,
+                Trigger::Foreground,
+            ),
+            Open::NoMatch,
+            "control: nothing reaches the picker at all, so the sweep above proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_all_choice_types_what_the_default_fill_types() {
+        assert_eq!(
+            crate::picker_prompt::tokens_for(&PickerSend::All, None),
+            key_sequence::parse(key_sequence::DEFAULT_SEQUENCE),
+            "`Send::All` is routed to `FillChoice::UserTabPass`, whose SendInput fallback types \
+             `DEFAULT_SEQUENCE`. If the two stop agreeing, the picker's own row label promises \
+             one thing and the fill types another."
+        );
+        assert_eq!(picker_choice(&PickerSend::All), FillChoice::UserTabPass);
+    }
+
+    #[test]
+    fn one_field_and_a_saved_sequence_map_onto_the_choices_that_already_type_them() {
+        assert_eq!(
+            picker_choice(&PickerSend::Field(FieldRef::Totp)),
+            FillChoice::Just(FieldRef::Totp)
+        );
+        assert_eq!(picker_choice(&PickerSend::Sequence), FillChoice::Saved);
+    }
+
+    /// **The fill request carries an id and a choice, and no secret.**
+    ///
+    /// The type makes this true, which is the point -- but a later widening
+    /// that added a `password` field to the variant would compile, and this is
+    /// what would then have to be edited to let it through.
+    #[test]
+    fn a_picked_fill_names_the_item_and_the_field_and_carries_neither_value() {
+        let follow_up = picker_follow_up(
+            PickerOutcome::Fill { id: "id-1".to_string(), send: PickerSend::Field(FieldRef::Password) },
+            "Slack.exe",
+        );
+        assert_eq!(
+            follow_up,
+            NoMatchFollowUp::Fill {
+                item_id: "id-1".to_string(),
+                choice: FillChoice::Just(FieldRef::Password),
+            }
+        );
+    }
+
+    /// The two silences are silences, and the three requests are the one door
+    /// `main` already has.
+    #[test]
+    fn every_other_picker_outcome_is_a_silence_or_the_vault_window() {
+        assert_eq!(picker_follow_up(PickerOutcome::Cancelled, "Slack.exe"), NoMatchFollowUp::Nothing);
+        assert_eq!(
+            picker_follow_up(PickerOutcome::Unavailable, "Slack.exe"),
+            NoMatchFollowUp::Nothing,
+            "a card that could not be put on screen types nothing and opens nothing"
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::SearchVault, "Slack.exe"),
+            NoMatchFollowUp::SearchVault("Slack".to_string()),
+            "the `.exe` is stripped, because the vault's items are not called `Slack.exe` -- \
+             the same `search_query` the no-match card's own button goes through"
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::NewLogin, "Slack.exe"),
+            NoMatchFollowUp::SearchVault("Slack".to_string())
+        );
+        assert_eq!(
+            picker_follow_up(PickerOutcome::Edit("id-9".to_string()), "Slack.exe"),
+            NoMatchFollowUp::SearchVault("id-9".to_string()),
+            "editing a binding is about the ITEM the user chose, not about the app the card was \
+             shown over"
+        );
+    }
+
+    /// **A picked fill never opens a window on its way out**, which is the
+    /// property the two `main` routers have to keep: the fill is carried out
+    /// where the injector is, and by the time a follow-up reaches either of
+    /// them there is nothing left to do.
+    #[test]
+    fn a_picked_fill_asks_for_no_window() {
+        let follow_up =
+            NoMatchFollowUp::Fill { item_id: "id-1".to_string(), choice: FillChoice::Saved };
+        // The two routers live in `main.rs` and are not reachable from here;
+        // what this holds is the shape they match on -- a `Fill` is neither a
+        // `SearchVault` nor an `Unlock`, so neither router can route it to a
+        // window by falling through.
+        assert!(!matches!(follow_up, NoMatchFollowUp::SearchVault(_)));
+        assert!(!matches!(follow_up, NoMatchFollowUp::Unlock));
+    }
+
+    /// A fixture item, built the way the rest of this file builds one: from
+    /// JSON through the same `serde` path `bw serve` answers on, rather than
+    /// by naming every field of a struct that gains one every design turn.
+    fn login(username: &str, password: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"id-1","name":"Slack","type":1,"login":{{"username":"{username}","password":"{password}"}}}}"#
+        ))
+        .expect("the fixture item is valid")
+    }
+
+    /// The same fixture with nothing to type.
+    fn bare() -> VaultItem {
+        serde_json::from_str(r#"{"id":"id-1","name":"Slack","type":1}"#)
+            .expect("the fixture item is valid")
+    }
+
+    #[test]
+    fn the_palette_offered_is_the_presence_question_the_rest_of_the_app_asks() {
+        let item = login("ada", "hunter2");
+        let palette = picker_palette(&item);
+        assert_eq!(
+            palette,
+            Palette {
+                fields: key_sequence::field_palette(&item),
+                has_sequence: false,
+            },
+            "the picker asks the same question the sequence editor and the overlay ask, rather \
+             than a second one that could answer differently"
+        );
+    }
+
+    /// **An item with nothing to type still offers nothing**, so the card can
+    /// never show a row that could only fail.
+    #[test]
+    fn an_item_with_no_credentials_offers_no_rows() {
+        let palette = picker_palette(&bare());
+        assert!(crate::picker_prompt::palette_rows(&palette).is_empty());
+    }
+
+    /// **A candidate whose item is not in the snapshot is dropped, not offered
+    /// with an empty palette.**
+    ///
+    /// The ranking and the offer-building read the same `items()`, so this
+    /// cannot honestly happen -- but a row that offers nothing is a row that
+    /// can only disappoint, and the filter is what makes that a fact rather
+    /// than a coincidence of the call order.
+    #[test]
+    fn a_candidate_with_no_item_behind_it_is_not_offered() {
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: "gone".to_string(),
+            name: "Slack".to_string(),
+            username: "ada".to_string(),
+        }];
+        assert!(picker_offers(&candidates, &[login("ada", "hunter2")]).is_empty());
+    }
+
+    /// The offer really is built when the item IS there -- the control on the
+    /// test above, so its emptiness is a drop and not a function that returns
+    /// nothing for everything.
+    #[test]
+    fn a_candidate_with_an_item_behind_it_is_offered_with_that_items_palette() {
+        let item = login("ada", "hunter2");
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: "ada".to_string(),
+        }];
+        let offers = picker_offers(&candidates, std::slice::from_ref(&item));
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].palette, picker_palette(&item));
+        assert!(
+            offers[0].icon.is_none(),
+            "no favicon cache directory is set in a test, so nothing on this path reads a file"
+        );
+    }
+
+    /// **The log line names the item and the choice, and never a value.**
+    #[test]
+    fn the_picker_log_line_carries_no_secret_and_no_custom_field_name() {
+        let line = describe_picker_outcome(&PickerOutcome::Fill {
+            id: "id-1".to_string(),
+            send: PickerSend::Field(FieldRef::Custom("Recovery PIN".to_string())),
+        });
+        assert!(line.contains("id-1"), "the line must say which item: {line}");
+        assert!(
+            !line.contains("Recovery PIN"),
+            "a custom field's name is out of the user's own vault item and does not belong in a \
+             log file on disk: {line}"
+        );
+    }
+
+    /// A login with a URI, so `favicon::icon_domain_for` has a domain to
+    /// answer with -- the fixture above has no URIs and so can never carry an
+    /// icon whatever directory it is offered.
+    fn login_at(domain: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"id-1","name":"Slack","type":1,"login":{{"username":"ada","password":"hunter2","uris":[{{"uri":"https://{domain}/login"}}]}}}}"#
+        ))
+        .expect("the fixture item is valid")
+    }
+
+    /// A unique temp directory, in `favicon`'s own idiom. **Never
+    /// `%APPDATA%\Deskwarden`**: the icon cache this test writes into is the
+    /// real one's shape, not the real one.
+    fn unique_icon_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deskwarden-test-picker-icons-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    /// **The icon branch, actually taken.**
+    ///
+    /// The sibling test above asserts `icon.is_none()`, and it can only say
+    /// that because no directory is set -- which for as long as the directory
+    /// was read from a process-wide `OnceLock` meant the branch that puts a
+    /// PNG on an offer was unreachable from the whole test binary.
+    /// `picker_offers_in` takes the directory, so it can be handed one.
+    #[test]
+    fn an_offer_carries_the_icon_already_cached_for_its_items_domain() {
+        let dir = unique_icon_dir("hit");
+        let png = vec![137u8, 80, 78, 71, 13, 10, 26, 10];
+        crate::favicon::write_cached_icon(&dir, "slack.com", &png);
+
+        let item = login_at("slack.com");
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: "ada".to_string(),
+        }];
+
+        let offers = picker_offers_in(Some(&dir), &candidates, std::slice::from_ref(&item));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            offers[0].icon.as_deref(),
+            Some(png.as_slice()),
+            "the offer came back without the icon that is already on disk for its domain -- the \
+             card would draw a monogram for an item whose favicon was fetched long ago"
+        );
+
+        // The control: the same call with no directory answers no icon, so the
+        // assertion above is about the directory and not about a function that
+        // always finds something.
+        let without = picker_offers_in(None, &candidates, std::slice::from_ref(&item));
+        assert!(without[0].icon.is_none());
+    }
+
+    /// **The empty card is told the window label, not the exe name**, pinned
+    /// structurally.
+    ///
+    /// `empty_text` builds the card's entire message out of the one string it
+    /// is handed, so the difference between the two is the difference between
+    /// a card that says "Ledgerline" and a card that says "Ledgerline.exe".
+    /// `window_label` exists to make that choice once -- title first, exe name
+    /// only as a fallback -- and it was held by two tests over the pure
+    /// `no_match_arm` until that function was deleted with design 3a's window.
+    ///
+    /// The property now lives on the single `picker_prompt::ask` call inside
+    /// `handle_no_match`, where `label` and `window.exe_name` are both `&str`:
+    /// swapping them compiles, passes every type check, and silently makes the
+    /// card name the wrong thing. `handle_no_match` raises a real
+    /// always-on-top window over a real vault, so no test may execute it --
+    /// which is `the_vault_snapshot_does_not_outlive_the_scan_that_needs_it`'s
+    /// situation exactly, and this is its idiom: slice the function's body out
+    /// of the source and read it.
+    #[test]
+    fn the_empty_card_is_told_the_window_label_and_not_the_exe_name() {
+        let source = include_str!("app.rs");
+        // Split literals, in this crate's idiom: a whole needle would match
+        // its own declaration.
+        let start = source
+            .find(concat!("pub fn handle_no", "_match("))
+            .expect("`handle_no_match` is in this file");
+        // Line-based rather than a `"\n}\n"` needle, because that needle is
+        // vacuous on a CRLF checkout and this repo has no `.gitattributes`.
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        // Controls, so an extraction that silently stopped scanning -- a
+        // renamed function, a reformatted signature, a closing brace that
+        // moved -- cannot pass by finding nothing.
+        assert!(
+            body.contains(concat!("window_", "label(")),
+            "control: the slice being scanned is not the function that chooses the card's name"
+        );
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(")),
+            "control: the slice being scanned is not the function that raises the card"
+        );
+
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(&offers, label)")),
+            "`handle_no_match` no longer hands `picker_prompt::ask` the `window_label` it \
+             computed. `label` and `window.exe_name` are both `&str`, so the swap compiles -- \
+             and `empty_text` builds the whole of the card's message out of that one string, \
+             so the card would announce `Ledgerline.exe` where the user's window is called \
+             `Ledgerline`"
+        );
+        assert!(
+            !body.contains(concat!("ask(&offers, &window.", "exe_name")),
+            "`handle_no_match` is handing the card the raw executable name. `window_label` \
+             exists precisely to prefer the window's title over it"
+        );
+    }
+
+    /// **The plaintext vault snapshot does not outlive the scan that needs
+    /// it**, pinned structurally.
+    ///
+    /// `VaultCache::items()` deep-clones every item including every plaintext
+    /// password into a `Vec` that does not zeroize -- 5.66 MB and 46,494
+    /// allocations over a realistic vault, which is why `get_by_id` exists and
+    /// why commit `d29d440` took this pattern out of the fill path. The
+    /// account picker's card is modal: a snapshot still bound when
+    /// `picker_prompt::ask` is called sits in memory for as long as the user
+    /// looks at the card.
+    ///
+    /// The lifetime itself cannot be tested from here -- `handle_no_match`
+    /// needs a real vault and raises a real always-on-top window, so no test
+    /// may execute it. What is pinned instead is the structure that makes the
+    /// lifetime true: the snapshot is taken inside `picker_offers_for`, whose
+    /// return type carries offers and no items, so it is dropped at that
+    /// function's `}` -- and `handle_no_match`, the function that calls `ask`,
+    /// never names `items()` at all. This is the source-pin idiom
+    /// `the_save_goes_through_the_one_create_route_the_edit_form_uses` uses,
+    /// for the same reason.
+    #[test]
+    fn the_vault_snapshot_does_not_outlive_the_scan_that_needs_it() {
+        let source = include_str!("app.rs");
+        // Split literals, in this crate's idiom: a whole needle would match
+        // its own declaration.
+        let start = source
+            .find(concat!("pub fn handle_no", "_match("))
+            .expect("`handle_no_match` is in this file");
+        // Line-based rather than a `"\n}\n"` needle, because that needle is
+        // vacuous on a CRLF checkout and this repo has no `.gitattributes`.
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        assert!(
+            body.contains(concat!("picker_prompt::", "ask(")),
+            "control: the slice being scanned is not the function that raises the card"
+        );
+        assert!(
+            !body.contains(concat!("cache.", "items()")),
+            "`handle_no_match` takes a full `VaultCache::items()` snapshot itself. That clone \
+             holds every plaintext password in the vault, does not zeroize, and this function \
+             puts a modal card on screen -- so the copy would be alive for as long as the user \
+             looks at it. Take it inside `picker_offers_for`, which returns offers and no items \
+             and therefore drops it before the card is raised"
+        );
     }
 }
