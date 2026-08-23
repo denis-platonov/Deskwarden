@@ -1256,6 +1256,38 @@ pub const BROWSER_IMAGE_NAMES: &[&str] = &[
 
 /// Whether the foreground window belongs to a web browser.
 ///
+/// **The seventh input to [`disposition`], and it is which EVENT is being
+/// answered** -- an automatic foreground change, or the user pressing
+/// `CTRL+ALT+B`.
+///
+/// It exists because one function serves two events that are not the same
+/// question. Every suppressor above -- [`NeverForApp`], [`OverlayPrompts`],
+/// [`BrowserWindow`] -- and the [`HasPasswordField`] gate exist to stop
+/// Deskwarden putting a window in front of somebody who did not ask for one.
+/// A chord press IS somebody asking. Reading the suppressors on that path
+/// made the account picker unreachable for anyone who had turned the
+/// automatic prompt off, which is to say: the setting that exists to stop the
+/// card appearing uninvited also removed the only way to invite it.
+///
+/// **This is the same principle [`match_arms_hotkey`] already states on the
+/// matched side**, where arming `CTRL+ALT+B` is deliberately unconditional so
+/// that turning the prompt off falls back to the hotkey rather than turning
+/// autofill off. [`Trigger`] extends it to the unmatched side.
+///
+/// **It can only ever ADD an answer, never change one.**
+/// [`Trigger::Foreground`] is the whole of the behaviour that shipped, arm
+/// for arm; [`Trigger::Hotkey`] is read on the `Matched::No` branch and
+/// nowhere else, so the matched card is identical for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The window came to the front on its own. Nobody asked for anything,
+    /// so every suppressor and the field gate apply exactly as they did.
+    Foreground,
+    /// The user pressed `CTRL+ALT+B`. They asked, by name, so the answer is
+    /// the picker (or the unlock card) rather than silence.
+    Hotkey,
+}
+
 /// **The sixth input to [`disposition`]**, and it exists because the no-match
 /// card is structurally unable to be right in a browser. Every login page has
 /// a password field, so the probe answers `Yes` every time; and Deskwarden's
@@ -1492,6 +1524,7 @@ pub fn disposition<'a>(
     never: NeverForApp,
     prompts: OverlayPrompts,
     browser: BrowserWindow,
+    trigger: Trigger,
 ) -> Open<'a> {
     match matched {
         // A match is only representable when the engine holds entries, which
@@ -1499,35 +1532,49 @@ pub fn disposition<'a>(
         // here, and `a_matched_window_ignores_the_vault_state_too` pins that
         // the card the user gets for a recognised window is unchanged.
         Matched::Yes(item_id) => Open::Match(item_id),
-        Matched::No => match field {
-            // **`never` is read here and nowhere else in the tree**, so it can
-            // only ever silence the branch it was added for: an unmatched
-            // window with a password field. It does not reach `Matched::Yes`
-            // (see the arm above -- a *save* refusal is not a *fill* refusal),
-            // and it does not reach the `No | Unknown` arm, which is silent
-            // already and whose silence must go on coming from the field
-            // answer rather than from a list.
-            HasPasswordField::Yes if never == NeverForApp::Yes => Open::Nothing,
-            // The setting, and it lands here rather than on `Matched::Yes`
-            // for the reason in the doc above: the matched arm's gate is
-            // `match_disposition`, and it shares a line with the hotkey
-            // arming that must survive the prompt being off.
-            HasPasswordField::Yes if prompts == OverlayPrompts::Silenced => Open::Nothing,
-            // The browser, last of the three suppressors and the same shape
-            // as the two above: it can only ever turn a card into silence.
-            HasPasswordField::Yes if browser == BrowserWindow::Yes => Open::Nothing,
-            HasPasswordField::Yes => match vault {
+        // **The suppressors and the field gate are read on the automatic
+        // path and nowhere else.** They exist to stop this app interrupting
+        // somebody who did not ask; a `CTRL+ALT+B` press is somebody asking,
+        // so on that trigger the only question left is whether the vault can
+        // be read. "No account matches this app" is an answer; silence, to a
+        // user who just pressed the chord, is a broken shortcut. See
+        // [`Trigger`], and `match_arms_hotkey` for the same rule already
+        // stated on the matched side.
+        Matched::No => match trigger {
+            Trigger::Hotkey => match vault {
                 VaultAvailability::Readable => Open::NoMatch,
                 VaultAvailability::Locked => Open::Locked,
             },
-            // Both silence, and deliberately: a window we could not read is
-            // treated exactly as today's build treats every unmatched window.
-            // Guessing a card onto the screen from an unanswered question is
-            // the failure mode the third arm above exists to prevent, and
-            // `Unknown` is the case with the least evidence of all. Locked or
-            // readable makes no difference: neither is evidence that this
-            // window is asking for a password.
-            HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
+            Trigger::Foreground => match field {
+                // **`never` is read here and nowhere else in the tree**, so it can
+                // only ever silence the branch it was added for: an unmatched
+                // window with a password field. It does not reach `Matched::Yes`
+                // (see the arm above -- a *save* refusal is not a *fill* refusal),
+                // and it does not reach the `No | Unknown` arm, which is silent
+                // already and whose silence must go on coming from the field
+                // answer rather than from a list.
+                HasPasswordField::Yes if never == NeverForApp::Yes => Open::Nothing,
+                // The setting, and it lands here rather than on `Matched::Yes`
+                // for the reason in the doc above: the matched arm's gate is
+                // `match_disposition`, and it shares a line with the hotkey
+                // arming that must survive the prompt being off.
+                HasPasswordField::Yes if prompts == OverlayPrompts::Silenced => Open::Nothing,
+                // The browser, last of the three suppressors and the same shape
+                // as the two above: it can only ever turn a card into silence.
+                HasPasswordField::Yes if browser == BrowserWindow::Yes => Open::Nothing,
+                HasPasswordField::Yes => match vault {
+                    VaultAvailability::Readable => Open::NoMatch,
+                    VaultAvailability::Locked => Open::Locked,
+                },
+                // Both silence, and deliberately: a window we could not read is
+                // treated exactly as today's build treats every unmatched window.
+                // Guessing a card onto the screen from an unanswered question is
+                // the failure mode the third arm above exists to prevent, and
+                // `Unknown` is the case with the least evidence of all. Locked or
+                // readable makes no difference: neither is evidence that this
+                // window is asking for a password.
+                HasPasswordField::No | HasPasswordField::Unknown => Open::Nothing,
+            },
         },
     }
 }
@@ -7349,7 +7396,8 @@ mod save_login_tests {
                 VaultAvailability::Readable,
                 NeverForApp::Yes,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Nothing,
             "the user pressed `Never for this app` and the no-match card came back anyway. A \
@@ -7362,7 +7410,8 @@ mod save_login_tests {
                 VaultAvailability::Locked,
                 NeverForApp::Yes,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Nothing,
             "a silenced app started showing the LOCKED card the moment the vault locked. 3b \
@@ -7379,7 +7428,8 @@ mod save_login_tests {
                 VaultAvailability::Readable,
                 NeverForApp::No,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::NoMatch
         );
@@ -7390,7 +7440,8 @@ mod save_login_tests {
                 VaultAvailability::Locked,
                 NeverForApp::No,
                 OverlayPrompts::Shown,
-                BrowserWindow::No
+                BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Locked
         );
@@ -7408,7 +7459,7 @@ mod save_login_tests {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Match("42"),
                     "a saved login stopped being offered because the user had once said \
                      `never save a login for this app`. Those are different questions, and \
@@ -7433,7 +7484,7 @@ mod save_login_tests {
             for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
                 for never in [NeverForApp::Yes, NeverForApp::No] {
                     assert_eq!(
-                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown, BrowserWindow::No),
+                        disposition(Matched::No, field, vault, never, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                         Open::Nothing,
                         "a window with no match and no password field opened a card"
                     );
@@ -7449,8 +7500,8 @@ mod save_login_tests {
         for matched in [Matched::No, Matched::Yes("7")] {
             for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
                 for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
-                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No);
-                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No);
+                    let without = disposition(matched, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground,);
+                    let with = disposition(matched, field, vault, NeverForApp::Yes, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground,);
                     assert!(
                         with == Open::Nothing || with == without,
                         "with `never` this window opens {with:?} and without it {without:?}, \
@@ -7568,6 +7619,7 @@ mod disposition_tests {
                     NeverForApp::No,
                     OverlayPrompts::Silenced,
                     BrowserWindow::No,
+                    Trigger::Foreground,
                 ),
                 Open::Nothing,
                 "the prompt is off in Preferences and an unmatched window still opened a \
@@ -7601,6 +7653,7 @@ mod disposition_tests {
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
                 browser_window("ledgerline.exe"),
+                Trigger::Foreground,
             ),
             Open::NoMatch,
             "the no-match card has stopped appearing for the one case it is FOR. Both \
@@ -7616,6 +7669,7 @@ mod disposition_tests {
                 never_for_app(&[], "ledgerline.exe"),
                 overlay_prompts(true),
                 browser_window("ledgerline.exe"),
+                Trigger::Foreground,
             ),
             Open::Locked
         );
@@ -7639,6 +7693,7 @@ mod disposition_tests {
                 NeverForApp::No,
                 OverlayPrompts::Silenced,
                 BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::Match("42"),
             "the unmatched-card gate has swallowed the matched arm too, so the hotkey \
@@ -7684,6 +7739,7 @@ mod disposition_tests {
                     never_for_app(&[], "firefox.exe"),
                     overlay_prompts(true),
                     browser_window("firefox.exe"),
+                    Trigger::Foreground,
                 ),
                 Open::Nothing,
                 "a browser opened an unmatched card ({vault:?}). Every login page has a \
@@ -7707,6 +7763,7 @@ mod disposition_tests {
                 never_for_app(&[], "palemoon.exe"),
                 overlay_prompts(true),
                 browser_window("palemoon.exe"),
+                Trigger::Foreground,
             ),
             Open::NoMatch
         );
@@ -7720,6 +7777,7 @@ mod disposition_tests {
                 never_for_app(&["palemoon.exe".to_string()], "palemoon.exe"),
                 overlay_prompts(true),
                 browser_window("palemoon.exe"),
+                Trigger::Foreground,
             ),
             Open::Nothing
         );
@@ -7743,6 +7801,7 @@ mod disposition_tests {
                     NeverForApp::No,
                     overlay_prompts(true),
                     browser_window(BROWSER_IMAGE_NAMES[0]),
+                    Trigger::Foreground,
                 ),
                 Open::Match("42"),
                 "an app-match rule the user wrote against a browser stopped being honoured"
@@ -7767,7 +7826,7 @@ mod disposition_tests {
                     for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
                         for browser in [BrowserWindow::Yes, BrowserWindow::No] {
                             assert_eq!(
-                                disposition(Matched::No, field, vault, never, prompts, browser),
+                                disposition(Matched::No, field, vault, never, prompts, browser, Trigger::Foreground),
                                 Open::Nothing,
                                 "a window with no match and no password field opened a card"
                             );
@@ -7791,6 +7850,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Shown,
                         BrowserWindow::No,
+                        Trigger::Foreground,
                     );
                     let silenced = disposition(
                         matched,
@@ -7799,6 +7859,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Silenced,
                         BrowserWindow::No,
+                        Trigger::Foreground,
                     );
                     let browsed = disposition(
                         matched,
@@ -7807,6 +7868,7 @@ mod disposition_tests {
                         NeverForApp::No,
                         OverlayPrompts::Shown,
                         BrowserWindow::Yes,
+                        Trigger::Foreground,
                     );
                     for (with, what) in
                         [(silenced, "the prompt setting"), (browsed, "the browser rule")]
@@ -7881,13 +7943,13 @@ mod disposition_tests {
     #[test]
     fn an_ordinary_window_with_no_password_field_is_still_silence() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Nothing,
             "a window the vault does not know and that asks for no password now raises a card. \
              That is every editor, terminal and file manager the user focuses"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Unknown, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Nothing,
             "a window UI Automation could not answer for is being treated as a login window. \
              `Unknown` is the case with the LEAST evidence, and it is being read as the most"
@@ -7909,7 +7971,7 @@ mod disposition_tests {
         for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
             for field in [HasPasswordField::No, HasPasswordField::Unknown] {
                 assert_eq!(
-                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::No, field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Nothing,
                     "an ordinary window raised a card with {field:?} and {vault:?}"
                 );
@@ -7924,18 +7986,18 @@ mod disposition_tests {
     #[test]
     fn a_password_field_with_no_match_opens_the_no_match_card() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::NoMatch
         );
         assert_eq!(
-            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::Yes("7"), HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Match("7"),
             "a matched window must still open the matched card -- the item id is what the fill \
              is resolved from"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
-            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
+            disposition(Matched::No, HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             "the premise: the password-field answer actually decides something. Equal answers \
              mean the probe is being paid for and ignored"
         );
@@ -7957,14 +8019,14 @@ mod disposition_tests {
     #[test]
     fn a_locked_vault_never_claims_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Locked,
             "with the vault locked and the engine therefore empty, an unmatched login window \
              still opens the card that asserts there is no saved login for it"
         );
         assert_ne!(
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
-            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Locked, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
+            disposition(Matched::No, HasPasswordField::Yes, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             "the premise: the vault state actually decides something here. Equal answers mean \
              the third input is accepted and ignored, which is the defect unchanged"
         );
@@ -7982,13 +8044,13 @@ mod disposition_tests {
     #[test]
     fn an_empty_but_readable_vault_still_says_there_is_no_saved_login() {
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(true), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::NoMatch,
             "a user whose vault genuinely has nothing for this app is now told Deskwarden is \
              locked instead, which is both false and useless to them"
         );
         assert_eq!(
-            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+            disposition(Matched::No, HasPasswordField::Yes, vault_availability(false), NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
             Open::Locked
         );
     }
@@ -8020,7 +8082,7 @@ mod disposition_tests {
     fn a_matched_window_ignores_the_field_answer_entirely() {
         for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
             assert_eq!(
-                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                disposition(Matched::Yes("42"), field, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                 Open::Match("42"),
                 "a matched window's disposition changed with {field:?}, so the probe cannot be \
                  skipped on that branch after all"
@@ -8044,7 +8106,7 @@ mod disposition_tests {
                 HasPasswordField::Unknown,
             ] {
                 assert_eq!(
-                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                    disposition(Matched::Yes("42"), field, vault, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                     Open::Match("42"),
                     "a matched window's disposition changed with {field:?} and {vault:?}"
                 );
@@ -8061,7 +8123,7 @@ mod disposition_tests {
     fn the_matched_id_is_the_id_that_comes_back_out() {
         for id in ["7", "42", "a-uuid-shaped-thing"] {
             assert_eq!(
-                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No),
+                disposition(Matched::Yes(id), HasPasswordField::No, VaultAvailability::Readable, NeverForApp::No, OverlayPrompts::Shown, BrowserWindow::No, Trigger::Foreground),
                 Open::Match(id)
             );
         }
@@ -8208,6 +8270,221 @@ mod disposition_tests {
             "window 0 survived past the bound, so the memory grows without limit"
         );
     }
+
+    /// **Each suppressor silences the automatic card and does NOT silence the
+    /// chord.**
+    ///
+    /// The three suppressors exist for one reason between them: to stop
+    /// Deskwarden putting a window in front of somebody who did not ask for
+    /// one. `CTRL+ALT+B` is somebody asking, by name. So each is asserted
+    /// twice -- silent on `Foreground`, the picker on `Hotkey` -- and a
+    /// suppressor that leaked onto the hotkey path fails here rather than
+    /// shipping as "the shortcut does nothing in this app".
+    #[test]
+    fn every_suppressor_silences_the_automatic_card_and_none_of_them_silences_the_chord() {
+        let cases: [(&str, NeverForApp, OverlayPrompts, BrowserWindow); 3] = [
+            (
+                "the user's `Never for this app`",
+                NeverForApp::Yes,
+                OverlayPrompts::Shown,
+                BrowserWindow::No,
+            ),
+            (
+                "the `Prompt on match` setting turned off",
+                NeverForApp::No,
+                OverlayPrompts::Silenced,
+                BrowserWindow::No,
+            ),
+            (
+                "the browser exclusion",
+                NeverForApp::No,
+                OverlayPrompts::Shown,
+                BrowserWindow::Yes,
+            ),
+        ];
+        for (what, never, prompts, browser) in cases {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    HasPasswordField::Yes,
+                    VaultAvailability::Readable,
+                    never,
+                    prompts,
+                    browser,
+                    Trigger::Foreground,
+                ),
+                Open::Nothing,
+                "{what} stopped silencing the card that appears on its own. That is the \
+                 behaviour the owner's setting controls, and it must not move"
+            );
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    HasPasswordField::Yes,
+                    VaultAvailability::Readable,
+                    never,
+                    prompts,
+                    browser,
+                    Trigger::Hotkey,
+                ),
+                Open::NoMatch,
+                "{what} also swallowed a deliberate CTRL+ALT+B press. Every suppressor here \
+                 exists to stop Deskwarden interrupting UNINVITED; a chord press is the user \
+                 inviting it, so the answer they are owed is the account picker -- `no \
+                 accounts match this app` is useful, and silence reads as a broken shortcut"
+            );
+        }
+
+        // And all three at once, because one user can easily have all three
+        // true: a browser they pressed `Never` on, with the setting off. That
+        // is exactly the person for whom the chord must still work -- it is
+        // the owner's own configuration.
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::Yes,
+                OverlayPrompts::Silenced,
+                BrowserWindow::Yes,
+                Trigger::Hotkey,
+            ),
+            Open::NoMatch,
+            "with every suppressor set at once the chord went silent. The suppressors stop \
+             uninvited cards; they are not a way to switch the shortcut off"
+        );
+        assert_eq!(
+            disposition(
+                Matched::No,
+                HasPasswordField::Yes,
+                VaultAvailability::Readable,
+                NeverForApp::Yes,
+                OverlayPrompts::Silenced,
+                BrowserWindow::Yes,
+                Trigger::Foreground,
+            ),
+            Open::Nothing,
+            "control: the automatic path with every suppressor set is no longer silence"
+        );
+    }
+
+    /// **The field gate does not apply to the chord either.**
+    ///
+    /// `HasPasswordField::No` and `::Unknown` are the honest answers "we
+    /// looked and found none" and "we did not ask". Neither is evidence that
+    /// an automatic card is wanted, which is why both stay silent on
+    /// `Foreground`. Neither is a reason to refuse a user who pressed the
+    /// chord: they are sitting in front of the window, and they asked.
+    #[test]
+    fn a_window_with_no_password_field_still_opens_the_picker_for_the_chord() {
+        for field in [HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Readable,
+                    NeverForApp::No,
+                    OverlayPrompts::Shown,
+                    BrowserWindow::No,
+                    Trigger::Foreground,
+                ),
+                Open::Nothing,
+                "an unasked-for card appeared over a window whose password field answered \
+                 {field:?}. Guessing a card onto the screen from an unanswered question is \
+                 the whole failure this gate prevents"
+            );
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Readable,
+                    NeverForApp::No,
+                    OverlayPrompts::Shown,
+                    BrowserWindow::No,
+                    Trigger::Hotkey,
+                ),
+                Open::NoMatch,
+                "CTRL+ALT+B did nothing because the probe answered {field:?}. The probe \
+                 decides whether to INTERRUPT somebody, not whether to ANSWER them -- and \
+                 `Unknown` in particular means the question was never even put"
+            );
+        }
+    }
+
+    /// **A locked vault answers the chord with the unlock card, not silence
+    /// and not an empty picker.**
+    ///
+    /// Turning `Open::Locked` into `Open::NoMatch` here would put an account
+    /// picker over the window claiming no account matches, when the truth is
+    /// that nothing could be read. 3b is the card carrying *Unlock*, so this
+    /// is also what keeps the unlock route reachable from the chord.
+    #[test]
+    fn a_locked_vault_answers_the_chord_with_the_unlock_card() {
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            assert_eq!(
+                disposition(
+                    Matched::No,
+                    field,
+                    VaultAvailability::Locked,
+                    NeverForApp::Yes,
+                    OverlayPrompts::Silenced,
+                    BrowserWindow::Yes,
+                    Trigger::Hotkey,
+                ),
+                Open::Locked,
+                "the chord over a locked vault answered something other than the unlock card \
+                 with {field:?}. An account picker here would claim `no account matches` for \
+                 a vault nothing could read, and the one route back -- the *Unlock* button -- \
+                 is on the card this arm is supposed to return"
+            );
+        }
+    }
+
+    /// **The trigger is read on the unmatched branch and nowhere else.**
+    ///
+    /// A sweep rather than a spot check: for every combination of the other
+    /// inputs, a MATCH answers identically for both triggers. A trigger that
+    /// reached the matched arm would change what pressing the chord does to a
+    /// window whose account is already known.
+    #[test]
+    fn the_trigger_never_changes_a_matched_windows_answer() {
+        let mut checked = 0;
+        for field in [HasPasswordField::Yes, HasPasswordField::No, HasPasswordField::Unknown] {
+            for vault in [VaultAvailability::Readable, VaultAvailability::Locked] {
+                for never in [NeverForApp::Yes, NeverForApp::No] {
+                    for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
+                        for browser in [BrowserWindow::Yes, BrowserWindow::No] {
+                            assert_eq!(
+                                disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    Trigger::Foreground,
+                                ),
+                                disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    Trigger::Hotkey,
+                                ),
+                                "the trigger changed a MATCHED window's answer ({field:?}, \
+                                 {vault:?}, {never:?}, {prompts:?}, {browser:?})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 48, "the sweep did not cover every combination");
+    }
+
 }
 
 /// **The preflight gate, and the fact that it is in a gating POSITION.**
@@ -8694,13 +8971,14 @@ mod picker_wiring_tests {
     /// that arm and from no other -- so the property is exactly "`disposition`
     /// does not answer `NoMatch` for a `Matched::Yes`".
     ///
-    /// **It is swept, not spot-checked.** The other five inputs are three
-    /// suppressors, a field probe and a vault state, and every one of them
-    /// already turns some *unmatched* window into a different answer. This
-    /// walks all of them against a match, so a suppressor added later that
-    /// reroutes rather than silences -- or an arm reordered above the matched
-    /// one -- fails here rather than putting an account picker over a window
-    /// whose account is already known.
+    /// **It is swept, not spot-checked.** The other six inputs are three
+    /// suppressors, a field probe, a vault state and the [`Trigger`], and
+    /// every one of them already turns some *unmatched* window into a
+    /// different answer. This walks all of them against a match, so a
+    /// suppressor added later that reroutes rather than silences -- or an arm
+    /// reordered above the matched one, or a [`Trigger::Hotkey`] arm that
+    /// forgot the match is decided first -- fails here rather than putting an
+    /// account picker over a window whose account is already known.
     #[test]
     fn a_window_the_engine_matched_never_reaches_the_picker() {
         let mut checked = 0;
@@ -8709,36 +8987,48 @@ mod picker_wiring_tests {
                 for never in [NeverForApp::Yes, NeverForApp::No] {
                     for prompts in [OverlayPrompts::Shown, OverlayPrompts::Silenced] {
                         for browser in [BrowserWindow::Yes, BrowserWindow::No] {
-                            let open = disposition(
-                                Matched::Yes("42"),
-                                field,
-                                vault,
-                                never,
-                                prompts,
-                                browser,
-                            );
-                            assert_ne!(
-                                open,
-                                Open::NoMatch,
-                                "a window the engine matched was routed to the unmatched card, \
-                                 which is the one door to `picker_prompt::ask`: the user would \
-                                 be asked to choose an account for a window whose account is \
-                                 already known ({field:?}, {vault:?}, {never:?}, {prompts:?}, \
-                                 {browser:?})"
-                            );
-                            assert_eq!(
-                                open,
-                                Open::Match("42"),
-                                "a matched window's disposition changed with {field:?}, \
-                                 {vault:?}, {never:?}, {prompts:?}, {browser:?}"
-                            );
-                            checked += 1;
+                        // **Both triggers, and the hotkey is the one that
+                        // matters most here.** It is the arm that ignores
+                        // every suppressor, so it is the arm most able to
+                        // reroute a matched window into the picker by
+                        // accident. Swept, not trusted.
+                        for trigger in [Trigger::Foreground, Trigger::Hotkey] {
+                                let open = disposition(
+                                    Matched::Yes("42"),
+                                    field,
+                                    vault,
+                                    never,
+                                    prompts,
+                                    browser,
+                                    trigger,
+                                );
+                                assert_ne!(
+                                    open,
+                                    Open::NoMatch,
+                                    "a window the engine matched was routed to the unmatched card, \
+                                     which is the one door to `picker_prompt::ask`: the user would \
+                                     be asked to choose an account for a window whose account is \
+                                     already known ({field:?}, {vault:?}, {never:?}, {prompts:?}, \
+                                     {browser:?}, {trigger:?})"
+                                );
+                                assert_eq!(
+                                    open,
+                                    Open::Match("42"),
+                                    "a matched window's disposition changed with {field:?}, \
+                                     {vault:?}, {never:?}, {prompts:?}, {browser:?}, {trigger:?}"
+                                );
+                                checked += 1;
+                            }
                         }
                     }
                 }
             }
         }
-        assert_eq!(checked, 48, "the sweep did not cover every combination of the five inputs");
+        assert_eq!(
+            checked,
+            96,
+            "the sweep did not cover every combination of the six inputs"
+        );
 
         // POSITIVE CONTROL, so the sweep above cannot be satisfied by a
         // `disposition` that never answers `NoMatch` at all: the same five
@@ -8752,6 +9042,7 @@ mod picker_wiring_tests {
                 NeverForApp::No,
                 OverlayPrompts::Shown,
                 BrowserWindow::No,
+                Trigger::Foreground,
             ),
             Open::NoMatch,
             "control: nothing reaches the picker at all, so the sweep above proves nothing"
