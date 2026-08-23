@@ -584,6 +584,17 @@ const BUTTON_H: i32 = 32;
 /// the [`NEW_LOGIN_SHORTCUT`] chip beside it. See [`layout`].
 const SECONDARY_W: i32 = 168;
 
+/// The *Cancel* button's width: its label, and room for the [`ESC_SHORTCUT`]
+/// chip beside it, the same relationship [`SECONDARY_W`] has to
+/// [`NEW_LOGIN_SHORTCUT`]. Wider than the bare-label 84 px it used to be --
+/// `ESC` is a shorter chip than `CTRL+ALT+N`, so it does not need as much of
+/// an increase, but a chip drawn into a button never widened for it is a chip
+/// drawn over its own label. There is 86 px of slack between the two footer
+/// buttons and the card's left margin at [`SECONDARY_W`], so widening Cancel
+/// by this much still leaves both buttons on screen -- see
+/// `nothing_the_card_lays_out_falls_off_the_bottom_of_it`.
+const CANCEL_W: i32 = 104;
+
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Box2 {
@@ -649,7 +660,8 @@ pub fn layout(rows: usize) -> Layout {
 
     // Right-aligned, Cancel outermost: the choice that does nothing sits where
     // the eye leaves the card.
-    let cancel = Box2 { x: MARGIN_X + content_w - 84, y: list.bottom() + 12, w: 84, h: BUTTON_H };
+    let cancel =
+        Box2 { x: MARGIN_X + content_w - CANCEL_W, y: list.bottom() + 12, w: CANCEL_W, h: BUTTON_H };
     // Wider than Cancel because it carries its shortcut inside itself, the way
     // `theme::toolbar_button_with_shortcut` does: the label, then the chip,
     // in one pill that is clickable over the whole of it.
@@ -730,6 +742,15 @@ pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
 /// alone -- and it is read from this window's own pump while the card has
 /// focus, so no other application sees it.
 pub const NEW_LOGIN_SHORTCUT: &str = "CTRL+ALT+N";
+
+/// **The chord that cancels the card.**
+///
+/// Just `ESC`, not `CTRL+ALT+ESC`: this one was never a chord, it is the key
+/// Escape has always been -- `win32::next` answers `VK_ESCAPE` with
+/// `Event::Cancel` ahead of `IsDialogMessageW`, and has done so since before
+/// any of the other shortcuts existed. The chip only advertises it; it does
+/// not change what fires.
+pub const ESC_SHORTCUT: &str = "ESC";
 
 /// The chord shown on -- and accepted by -- the `index`th **candidate** row.
 ///
@@ -838,9 +859,9 @@ static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
 /// Nothing in this module decides anything. See [`run_with`].
 mod win32 {
     use super::{
-        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES, GONE,
-        LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST, MODE_PALETTE, NEW_LOGIN_SHORTCUT, PENDING,
-        PICKER_PROMPT_TITLE, ROW_CAP, SHOWN, TRUNCATED,
+        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES,
+        ESC_SHORTCUT, GONE, LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST, MODE_PALETTE,
+        NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP, SHOWN, TRUNCATED,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -2016,11 +2037,16 @@ mod win32 {
                     if hovered { ButtonSkin::secondary().hovered() } else { ButtonSkin::secondary() };
                 if let Some(fonts) = fonts {
                     let label = footer_label(id);
-                    // Only *New login* has a chord -- see `new_login_control`.
-                    let hint =
+                    // *Cancel* always shows `ESC` -- Escape cancels the card
+                    // in every mode, unlike *New login*, which `new_login_control`
+                    // hides under `MODE_PALETTE`.
+                    let hint = if id == ID_CANCEL {
+                        Some(ESC_SHORTCUT)
+                    } else {
                         (id == ID_SECONDARY && MODE.load(Ordering::SeqCst) != MODE_PALETTE)
                             .then_some(NEW_LOGIN_SHORTCUT)
-                            .map(|text| (text, fonts.hint));
+                    }
+                    .map(|text| (text, fonts.hint));
                     let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                     if focused {
                         rounded(
@@ -2996,6 +3022,38 @@ mod tests {
              `WM_KEYDOWN` arm ahead of `IsDialogMessageW` eats Tab, Shift+Tab, Space and Enter, \
              which is the whole of this card's focus traversal"
         );
+    }
+
+    /// **The *Cancel* button advertises the key that has always cancelled
+    /// it.**
+    ///
+    /// A source pin, not a paint assertion -- nothing here can open the
+    /// window `paint_control` draws into. What is decidable is that the
+    /// production code hands `ESC_SHORTCUT` to `draw_button_with_shortcut`
+    /// for `ID_CANCEL`, the same call `ID_SECONDARY` uses for
+    /// `NEW_LOGIN_SHORTCUT`, so the two footer buttons get their chips from
+    /// one function rather than a second chip style growing beside it.
+    #[test]
+    fn the_cancel_button_shows_its_escape_chip() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
+             test module as production"
+        );
+        assert!(
+            production.contains("if id == ID_CANCEL {\n                        Some(ESC_SHORTCUT)"),
+            "the production code no longer hands `ESC_SHORTCUT` to `ID_CANCEL`'s branch -- the \
+             Cancel button's chip is gone"
+        );
+        assert!(
+            production.contains("draw_button_with_shortcut"),
+            "control: this scan is not reading the function that paints the footer buttons"
+        );
+        assert_eq!(ESC_SHORTCUT, "ESC");
     }
 
     #[test]
