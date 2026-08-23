@@ -555,18 +555,34 @@ const MARGIN_TOP: i32 = 16;
 /// be the row's own height, so this is also the icon column's width.
 const ROW_H: i32 = 44;
 
-/// **How many rows the card has room for, and it is the same number in both
-/// steps.**
+/// **How many CANDIDATES the card has room for.**
 ///
 /// The card does not scroll and cannot be resized, so this is not a viewport
 /// onto a longer list -- it is the whole of what is reachable.
-/// [`crate::win32_draw::visible_rows`] always spends one of these slots on the
-/// *Search the vault* row -- the card's one route out of a wrong guess -- and
-/// that row's second line is what stops a truncation being silent.
+///
+/// **This is the candidate cap, not the row cap.** The *Search the vault* row
+/// -- the card's one route out of a wrong guess -- is drawn under every
+/// populated card, and it is a row the card is [`LIST_ROWS`] tall *for*, not
+/// one it takes from the candidates: spending a slot on it meant a list of
+/// exactly `ROW_CAP` matches showed `ROW_CAP - 1` of them and reported a
+/// truncation that had not happened.
 pub const ROW_CAP: usize = 5;
+
+/// **How many row slots the populated card lays out**: [`ROW_CAP`] candidates
+/// plus the *Search the vault* row that always follows them.
+///
+/// Every rectangle, every control and every bound in this module is measured
+/// against this rather than against [`ROW_CAP`], because this is the number of
+/// rows that can be on screen at once. The card is one row taller than the
+/// candidate cap and that is the whole of the difference.
+pub const LIST_ROWS: usize = ROW_CAP + 1;
 
 /// Button height. `theme::BUTTON_HEIGHT`.
 const BUTTON_H: i32 = 32;
+
+/// The *New login* / *Edit binding* button's width: its label, and room for
+/// the [`NEW_LOGIN_SHORTCUT`] chip beside it. See [`layout`].
+const SECONDARY_W: i32 = 168;
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,8 +624,8 @@ pub struct Layout {
 
 /// The card's geometry, for a list `rows` rows tall.
 ///
-/// **The two steps that share a live window are both laid out at [`ROW_CAP`],
-/// whichever of them is showing.** A window that shrank when the second step
+/// **The two steps that share a live window are both laid out at
+/// [`LIST_ROWS`], whichever of them is showing.** A window that shrank when the second step
 /// had fewer rows than the first would move its own Cancel button out from
 /// under the pointer at the moment the user is about to click it;
 /// `unlock_prompt::layout` reserves its error row for exactly that reason, and
@@ -619,8 +635,8 @@ pub struct Layout {
 /// **That argument does not reach the empty card.** `MODE_EMPTY` is decided
 /// once, in `open`, from an empty candidate slice, and never transitions to or
 /// from anything -- so sizing it to [`empty_rows`]`.len()` moves no control
-/// out from under a pointer that is already over it. Sizing it to `ROW_CAP`
-/// instead left 132 px of `theme::CARD` between its last offer and its Cancel
+/// out from under a pointer that is already over it. Sizing it to `LIST_ROWS`
+/// instead left a band of `theme::CARD` between its last offer and its Cancel
 /// button, which reads as a list that lost its rows rather than as a card with
 /// two.
 pub fn layout(rows: usize) -> Layout {
@@ -634,7 +650,11 @@ pub fn layout(rows: usize) -> Layout {
     // Right-aligned, Cancel outermost: the choice that does nothing sits where
     // the eye leaves the card.
     let cancel = Box2 { x: MARGIN_X + content_w - 84, y: list.bottom() + 12, w: 84, h: BUTTON_H };
-    let secondary = Box2 { x: cancel.x - 10 - 104, y: cancel.y, w: 104, h: BUTTON_H };
+    // Wider than Cancel because it carries its shortcut inside itself, the way
+    // `theme::toolbar_button_with_shortcut` does: the label, then the chip,
+    // in one pill that is clickable over the whole of it.
+    let secondary =
+        Box2 { x: cancel.x - 10 - SECONDARY_W, y: cancel.y, w: SECONDARY_W, h: BUTTON_H };
 
     let window = Box2 { x: 0, y: 0, w: WIDTH, h: cancel.bottom() + MARGIN_TOP };
     let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP, w: 20, h: 20 };
@@ -663,8 +683,9 @@ pub enum ListRow {
 /// **The *Search the vault* row is not the overflow notice.** It is the card's
 /// one route out of a wrong guess, so it is drawn whether or not anything
 /// overflowed; when candidates did have to be dropped, the same row carries
-/// that news in its second line rather than a second row doing it -- the card
-/// has no scrolling and no spare slot. See [`search_row_label`].
+/// that news in its second line rather than a second row doing it. It sits in
+/// [`LIST_ROWS`]' own extra slot, so it costs no candidate its place. See
+/// [`search_row_label`].
 pub fn populated_rows(candidates: usize) -> Vec<ListRow> {
     let (shown, truncated) = crate::win32_draw::visible_rows(candidates, ROW_CAP);
     let mut rows: Vec<ListRow> = (0..shown).map(ListRow::Candidate).collect();
@@ -687,6 +708,53 @@ pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
             "Look for it under another name"
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// The keyboard shortcuts, and the words that make them findable.
+//
+// Asked for by the app's owner after using the card: "add shortcuts like
+// Ctrl + Alt + 1 (2,3,4 for items in the list), New as well, Cancel (Esc)".
+// Escape already cancelled -- `win32::next` handles it ahead of
+// `IsDialogMessageW`, which only cancels for a real dialog box -- so nothing
+// here re-implements it.
+// ---------------------------------------------------------------------------
+
+/// **The chord that runs the *New login* offer.**
+///
+/// `CTRL+ALT+N` rather than a bare `N`: every control on this card is a
+/// `BUTTON`, and a bare letter is a mnemonic Windows may already be routing.
+/// `CTRL+ALT` is also the modifier pair the card's own hotkey (`CTRL+ALT+B`)
+/// is on, so the whole card answers to one chord family. It collides with
+/// nothing this crate registers -- `crate::hotkey` registers `CTRL+ALT+B`
+/// alone -- and it is read from this window's own pump while the card has
+/// focus, so no other application sees it.
+pub const NEW_LOGIN_SHORTCUT: &str = "CTRL+ALT+N";
+
+/// The chord shown on -- and accepted by -- the `index`th **candidate** row.
+///
+/// `None` past the candidate cap, and that is the point: the row after the
+/// candidates is *Search the vault*, which means something else entirely, and
+/// a digit that landed on it would be a trap. Numbering is what the user sees:
+/// `1` is the topmost row as drawn.
+pub fn row_shortcut(index: usize) -> Option<String> {
+    (index < ROW_CAP).then(|| format!("CTRL+ALT+{}", index + 1))
+}
+
+/// **Which candidate a digit chooses**, given how many candidate rows are
+/// actually on screen.
+///
+/// The one place the rule lives, read by the window's key handling and by the
+/// tests, so there is no second answer: a digit past the shown rows chooses
+/// nothing at all -- it does not beep, close the card, or fall through to the
+/// *Search the vault* row -- and no digit can ever reach that row, because the
+/// count this is measured against is the candidates' and not the rows'.
+pub fn candidate_for_digit(digit: u32, shown: usize) -> Option<usize> {
+    if !(1..=9).contains(&digit) {
+        return None;
+    }
+    let index = digit as usize - 1;
+    (index < shown.min(ROW_CAP)).then_some(index)
 }
 
 /// The `index`th row's rectangle, in logical pixels, on a card laid out for
@@ -770,9 +838,9 @@ static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
 /// Nothing in this module decides anything. See [`run_with`].
 mod win32 {
     use super::{
-        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES, GONE, MODE,
-        MODE_EMPTY, MODE_LIST, MODE_PALETTE, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
-        SHOWN, TRUNCATED,
+        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES, GONE,
+        LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST, MODE_PALETTE, NEW_LOGIN_SHORTCUT, PENDING,
+        PICKER_PROMPT_TITLE, ROW_CAP, SHOWN, TRUNCATED,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -803,7 +871,9 @@ mod win32 {
         WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_button, draw_row, rgb, ButtonSkin, RowState};
+    use crate::win32_draw::{
+        draw_button_with_shortcut, draw_row, rgb, ButtonSkin, RowState,
+    };
 
     /// Row `i` is control `ID_ROW + i`; the footer's two ids sit below them
     /// all, so a row id can never collide with a button id however many rows
@@ -886,6 +956,25 @@ mod win32 {
         }
     }
 
+    /// The keyboard chips' face, asked of the OS by the name
+    /// `crate::theme::GDI_MONO_FACE` gives it -- the same file
+    /// `theme::system_monospace` hands egui, so a chip on this card and a chip
+    /// in an egui window are the same typeface.
+    fn mono(px: i32) -> HFONT {
+        unsafe {
+            let mut lf = LOGFONTW {
+                lfHeight: -scale(px),
+                lfWeight: FW_NORMAL.0 as i32,
+                lfQuality: CLEARTYPE_QUALITY,
+                ..Default::default()
+            };
+            for (i, ch) in crate::theme::GDI_MONO_FACE.encode_utf16().take(31).enumerate() {
+                lf.lfFaceName[i] = ch;
+            }
+            CreateFontIndirectW(&lf)
+        }
+    }
+
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
@@ -894,6 +983,9 @@ mod win32 {
         name: HFONT,
         username: HFONT,
         button: HFONT,
+        /// The keyboard hints' face: `theme::GDI_MONO_FACE` at
+        /// `theme::CHIP_TEXT_PX`, which is what `theme::kbd_chip` renders in.
+        hint: HFONT,
     }
 
     impl Fonts {
@@ -905,12 +997,15 @@ mod win32 {
                 name: font(SEMIBOLD, 13),
                 username: font(REGULAR, 11),
                 button: font(SEMIBOLD, 12),
+                hint: mono(crate::theme::CHIP_TEXT_PX as i32),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.title, self.subtitle, self.name, self.username, self.button] {
+                for f in
+                    [self.title, self.subtitle, self.name, self.username, self.button, self.hint]
+                {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1208,7 +1303,7 @@ mod win32 {
         // Every slot gets a control whether or not this list fills it: the
         // second step reuses the same controls for its own rows, and creating
         // them lazily would mean creating a window from inside a repaint.
-        for index in 0..ROW_CAP {
+        for index in 0..LIST_ROWS {
             let Some(control) = child(
                 window,
                 w!("BUTTON"),
@@ -1306,6 +1401,20 @@ mod win32 {
                     if msg.message == WM_KEYDOWN && msg.wParam.0 as u16 == VK_ESCAPE.0 {
                         return Event::Cancel;
                     }
+                    // **Only the CTRL+ALT chords, and only while both are
+                    // down.** A blanket `WM_KEYDOWN` grab here would swallow
+                    // Tab and Enter before `IsDialogMessageW` ever saw them,
+                    // and that traversal is the whole of the card's keyboard
+                    // behaviour.
+                    if msg.message == WM_KEYDOWN && chord_held() && chord(msg.wParam.0 as u16) {
+                        if let Some(event) = take_pending() {
+                            return event;
+                        }
+                        // Ours, and it chose nothing -- a digit past the rows
+                        // on screen. Swallowed rather than dispatched, so it
+                        // cannot reach a control as a keystroke.
+                        continue;
+                    }
                     if !IsDialogMessageW(top, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
@@ -1321,6 +1430,73 @@ mod win32 {
             // Idle. Nothing on this card animates, so this is a plain wait for
             // the next message rather than a frame tick.
             std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+    }
+
+    /// Whether CTRL and ALT are both down right now.
+    ///
+    /// Read at the moment the key arrives rather than tracked across messages:
+    /// a modifier released while this window was not focused would otherwise
+    /// leave a flag set that nothing ever clears.
+    fn chord_held() -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
+        unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0) && (GetKeyState(VK_MENU.0 as i32) < 0) }
+    }
+
+    /// **What a CTRL+ALT chord does**, answering whether it was one of ours.
+    ///
+    /// Every arm goes through [`clicked`] -- the same function `WM_COMMAND`
+    /// calls when the row or the button is clicked -- so a shortcut and a
+    /// click are one path and not two, and `run_with` cannot tell them apart.
+    ///
+    /// A digit past the rows on screen is *ours and does nothing*: it answers
+    /// `true` so it is swallowed rather than typed into a control, and posts
+    /// no event, so the card neither beeps nor closes.
+    fn chord(vk: u16) -> bool {
+        // The virtual-key codes for the number row and for the letters are
+        // their ASCII values, which is what makes these comparisons honest.
+        const DIGIT_1: u16 = b'1' as u16;
+        const DIGIT_9: u16 = b'9' as u16;
+        const LETTER_N: u16 = b'N' as u16;
+        if (DIGIT_1..=DIGIT_9).contains(&vk) {
+            let digit = (vk - DIGIT_1 + 1) as u32;
+            // Only the first step numbers its rows: `MODE_PALETTE`'s rows are
+            // fields of one account and `MODE_EMPTY`'s are two offers, and
+            // neither was asked for. The count is the CANDIDATES', never the
+            // rows', so no digit can land on the *Search the vault* row.
+            if MODE.load(Ordering::SeqCst) == MODE_LIST {
+                let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+                if let Some(index) = super::candidate_for_digit(digit, shown) {
+                    clicked(ID_ROW + index);
+                }
+            }
+            return true;
+        }
+        if vk == LETTER_N {
+            if let Some(id) = new_login_control() {
+                clicked(id);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Which control *New login* is on in the step that is showing, or `None`
+    /// where the card does not offer it.
+    ///
+    /// The empty card's *New login* is a row rather than the footer button --
+    /// `apply_mode` hides that button there -- and the second step's footer
+    /// button is *Edit binding*, which is a different offer: a chord that
+    /// silently edited a binding because the user expected a new login would
+    /// be worse than one that did nothing at all.
+    fn new_login_control() -> Option<usize> {
+        match MODE.load(Ordering::SeqCst) {
+            MODE_LIST => Some(ID_SECONDARY),
+            MODE_EMPTY => super::empty_rows()
+                .iter()
+                .position(|action| *action == EmptyAction::NewLogin)
+                .map(|index| ID_ROW + index),
+            _ => None,
         }
     }
 
@@ -1353,7 +1529,7 @@ mod win32 {
     fn apply_mode(window: HWND) {
         let count = visible_row_count();
         unsafe {
-            for index in 0..ROW_CAP {
+            for index in 0..LIST_ROWS {
                 if let Ok(control) = GetDlgItem(window, (ID_ROW + index) as i32) {
                     let _ = ShowWindow(control, if index < count { SW_SHOW } else { SW_HIDE });
                 }
@@ -1387,15 +1563,15 @@ mod win32 {
     /// [`visible_row_count`].
     ///
     /// `MODE_LIST` and `MODE_PALETTE` are two steps of one live window, so
-    /// both are laid out at `ROW_CAP` whatever they are showing: see
+    /// both are laid out at `LIST_ROWS` whatever they are showing: see
     /// [`super::layout`] for why a window that resized between them would move
     /// its own Cancel button. `MODE_EMPTY` never transitions -- `open` decides
     /// it once and nothing sets it -- so it is sized to its own two offers.
     fn laid_out_rows() -> usize {
         if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
-            super::empty_rows().len().min(ROW_CAP)
+            super::empty_rows().len().min(LIST_ROWS)
         } else {
-            ROW_CAP
+            LIST_ROWS
         }
     }
 
@@ -1403,15 +1579,17 @@ mod win32 {
     fn visible_row_count() -> usize {
         let mode = MODE.load(Ordering::SeqCst);
         if mode == MODE_EMPTY {
-            super::empty_rows().len().min(ROW_CAP)
+            super::empty_rows().len().min(LIST_ROWS)
         } else if mode == MODE_PALETTE {
-            ENTRIES.lock().map(|e| e.len()).unwrap_or(0).min(ROW_CAP)
+            ENTRIES.lock().map(|e| e.len()).unwrap_or(0).min(LIST_ROWS)
         } else {
             // The candidates, plus the *Search the vault* row that always
-            // follows them: `visible_rows` reserved its slot, so this is
-            // never more than `ROW_CAP`.
+            // follows them. `visible_rows` capped the candidates at `ROW_CAP`
+            // and the card lays out `LIST_ROWS = ROW_CAP + 1` slots, so that
+            // row is one the card is tall for rather than one it takes from
+            // the candidates.
             let rows = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
-            (rows + 1).min(ROW_CAP)
+            (rows + 1).min(LIST_ROWS)
         }
     }
 
@@ -1838,6 +2016,12 @@ mod win32 {
                     if hovered { ButtonSkin::secondary().hovered() } else { ButtonSkin::secondary() };
                 if let Some(fonts) = fonts {
                     let label = footer_label(id);
+                    // Only *New login* has a chord -- see `new_login_control`.
+                    let hint =
+                        (id == ID_SECONDARY && MODE.load(Ordering::SeqCst) != MODE_PALETTE)
+                            .then_some(NEW_LOGIN_SHORTCUT)
+                            .map(|text| (text, fonts.hint));
+                    let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                     if focused {
                         rounded(
                             mem,
@@ -1852,9 +2036,13 @@ mod win32 {
                             right: whole.right - 2,
                             bottom: whole.bottom - 2,
                         };
-                        draw_button(mem, inner, &label, fonts.button, skin, scale(7));
+                        draw_button_with_shortcut(
+                            mem, inner, &label, fonts.button, skin, scale(7), hint, dpi,
+                        );
                     } else {
-                        draw_button(mem, whole, &label, fonts.button, skin, scale(7));
+                        draw_button_with_shortcut(
+                            mem, whole, &label, fonts.button, skin, scale(7), hint, dpi,
+                        );
                     }
                 }
             }
@@ -1907,6 +2095,7 @@ mod win32 {
     /// property that function exists to hold, and a second row painter is a
     /// second place for it to be got wrong.
     fn paint_row(hdc: HDC, rect: RECT, index: usize, state: RowState, fonts: &Fonts) {
+        let dpi = DPI_PERCENT.load(Ordering::SeqCst);
         if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
             let Some(action) = super::empty_rows().get(index).copied() else {
                 return;
@@ -1914,7 +2103,11 @@ mod win32 {
             let (name, says) = super::empty_label(action);
             let row =
                 Candidate { id: String::new(), name: name.to_string(), username: says.to_string() };
-            draw_row(hdc, rect, &row, state, fonts.name, fonts.username);
+            // The empty card's *New login* answers `NEW_LOGIN_SHORTCUT` too --
+            // see `new_login_control` -- so it says so.
+            let hint =
+                (action == EmptyAction::NewLogin).then_some((NEW_LOGIN_SHORTCUT, fonts.hint));
+            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, hint, dpi);
             return;
         }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
@@ -1923,13 +2116,19 @@ mod win32 {
             };
             let (name, says) = super::send_label(&send);
             let row = Candidate { id: String::new(), name, username: says.to_string() };
-            draw_row(hdc, rect, &row, state, fonts.name, fonts.username);
+            // No hint: the second step's rows are not numbered -- see `chord`.
+            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
             return;
         }
 
         let shown = SHOWN.lock().map(|s| s.clone()).unwrap_or_default();
         if let Some(candidate) = shown.get(index) {
-            draw_row(hdc, rect, candidate, state, fonts.name, fonts.username);
+            // **The shortcut is drawn on the row it runs.** A shortcut nobody
+            // can see is a shortcut nobody uses, and this chip is the only
+            // place the card says the digits exist.
+            let shortcut = super::row_shortcut(index);
+            let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
+            draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
             // The gutter `draw_row` deliberately leaves blank.
             if let Ok(icons) = ICONS.lock() {
                 if let Some(Some(icon)) = icons.get(index) {
@@ -1953,7 +2152,9 @@ mod win32 {
             name: name.to_string(),
             username: says.to_string(),
         };
-        draw_row(hdc, rect, &row, state, fonts.name, fonts.username);
+        // **No chip, because no digit reaches this row.** A number on it would
+        // be a trap: it is the one row that is not an account.
+        draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
@@ -2105,7 +2306,7 @@ mod card_tests {
     #[test]
     fn an_overflowing_list_still_says_it_was_cut_and_still_reaches_search() {
         let rows = populated_rows(9);
-        assert_eq!(rows.len(), ROW_CAP, "the card has room for exactly {ROW_CAP} rows");
+        assert_eq!(rows.len(), LIST_ROWS, "the card has room for exactly {LIST_ROWS} rows");
         assert_eq!(
             rows.last(),
             Some(&ListRow::SearchVault { truncated: true }),
@@ -2113,14 +2314,50 @@ mod card_tests {
         );
         assert_eq!(
             rows.iter().filter(|r| matches!(r, ListRow::Candidate(_))).count(),
-            ROW_CAP - 1,
-            "the search row occupies one of the cap's slots; showing {ROW_CAP} candidates AND it              would be one row past the bottom of a card that cannot scroll"
+            ROW_CAP,
+            "the search row has a slot of its own -- the card is {LIST_ROWS} rows tall for it -- \
+             so a truncated list still shows the full {ROW_CAP} candidates"
         );
         assert_eq!(
             search_row_label(true).1,
             "More accounts match than fit on this card",
             "the row is the only place the truncation is told now"
         );
+    }
+
+    /// **A list of exactly the cap is shown whole, and is not a truncation.**
+    ///
+    /// The regression this pin exists for: making the *Search the vault* row
+    /// permanent was right, but it took one of `ROW_CAP`'s slots, so a user
+    /// with exactly five matches saw four of them and was told the card had
+    /// cut the list. Nothing had been cut. The row is additional to the
+    /// candidates now -- the card is [`LIST_ROWS`] rows tall -- so the cap
+    /// means what it says.
+    #[test]
+    fn exactly_the_cap_shows_every_candidate_and_reports_no_truncation() {
+        let rows = populated_rows(ROW_CAP);
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, ListRow::Candidate(_))).count(),
+            ROW_CAP,
+            "{ROW_CAP} candidates fit a card whose cap is {ROW_CAP}, and one of them was dropped"
+        );
+        assert_eq!(
+            rows.last(),
+            Some(&ListRow::SearchVault { truncated: false }),
+            "nothing was cut, so the card must not say it was -- and it must still offer the \
+             route out of a wrong guess"
+        );
+        assert_eq!(rows.len(), LIST_ROWS);
+
+        // And the boundary above it still is one: the cap is a real cap.
+        let over = populated_rows(ROW_CAP + 1);
+        assert_eq!(
+            over.last(),
+            Some(&ListRow::SearchVault { truncated: true }),
+            "one more candidate than fits is a truncation, and a card that hid it silently is \
+             the defect this whole rule exists to prevent"
+        );
+        assert_eq!(over.len(), LIST_ROWS, "and the card does not grow to swallow it");
     }
 
     /// Every row the populated card plans is one the window has a control for
@@ -2130,12 +2367,12 @@ mod card_tests {
         for candidates in 0..12 {
             let rows = populated_rows(candidates);
             assert!(
-                rows.len() <= ROW_CAP,
-                "{candidates} candidates planned {} rows onto a card with room for {ROW_CAP}",
+                rows.len() <= LIST_ROWS,
+                "{candidates} candidates planned {} rows onto a card with room for {LIST_ROWS}",
                 rows.len()
             );
-            let last = row_at(ROW_CAP, rows.len() - 1);
-            assert!(last.bottom() <= layout(ROW_CAP).list.bottom());
+            let last = row_at(LIST_ROWS, rows.len() - 1);
+            assert!(last.bottom() <= layout(LIST_ROWS).list.bottom());
         }
     }
 
@@ -2155,10 +2392,15 @@ mod card_tests {
             .collect();
         let rows = palette_rows(&palette(customs, false));
         assert!(
-            rows.len() <= ROW_CAP,
-            "the second step offered {} rows onto a card with room for {ROW_CAP}, and this card \
-             does not scroll -- the rest would simply be unreachable",
+            rows.len() <= LIST_ROWS,
+            "the second step offered {} rows onto a card with room for {LIST_ROWS}, and this \
+             card does not scroll -- the rest would simply be unreachable",
             rows.len()
+        );
+        let last = row_at(LIST_ROWS, rows.len() - 1);
+        assert!(
+            last.bottom() <= layout(LIST_ROWS).list.bottom(),
+            "the second step's last row is outside the list area it shares with the first"
         );
         assert_eq!(
             rows,
@@ -2206,18 +2448,27 @@ mod card_tests {
     /// the one that would go first.
     #[test]
     fn nothing_the_card_lays_out_falls_off_the_bottom_of_it() {
-        let l = layout(ROW_CAP);
+        let l = layout(LIST_ROWS);
         assert!(l.subtitle.bottom() <= l.list.y);
         assert!(l.list.bottom() <= l.cancel.y);
         assert!(l.cancel.bottom() <= l.window.bottom());
         assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
         assert!(l.secondary.x >= 0, "the footer runs off the left edge of the card");
-        let last = row_at(ROW_CAP, ROW_CAP - 1);
+        let last = row_at(LIST_ROWS, LIST_ROWS - 1);
         assert!(
             last.bottom() <= l.list.bottom(),
             "the last row is outside the list area, and this card cannot scroll to it"
         );
         assert!(l.close_glyph.right() <= l.window.right());
+        // The bottom row of a full card is the *Search the vault* row, and it
+        // is the one that goes first if `LIST_ROWS` and `ROW_CAP` ever drift
+        // apart again.
+        assert_eq!(
+            populated_rows(ROW_CAP).len(),
+            LIST_ROWS,
+            "a full card plans {} rows onto {LIST_ROWS} laid-out slots",
+            populated_rows(ROW_CAP).len()
+        );
     }
 
     /// **The empty card is exactly as tall as the offers it has.**
@@ -2245,8 +2496,8 @@ mod card_tests {
              the same two under the same two names"
         );
         assert!(
-            rows.len() <= ROW_CAP,
-            "the empty card offered {} rows onto a card with room for {ROW_CAP}, and this card \
+            rows.len() <= LIST_ROWS,
+            "the empty card offered {} rows onto a card with room for {LIST_ROWS}, and this card \
              does not scroll -- the rest would simply be unreachable",
             rows.len()
         );
@@ -2265,8 +2516,8 @@ mod card_tests {
 
         // The window follows the list, so the dead band is not merely pushed
         // out of the card and into the gap above Cancel.
-        let full = layout(ROW_CAP);
-        let needed = full.window.h - ROW_H * (ROW_CAP - rows.len()) as i32;
+        let full = layout(LIST_ROWS);
+        let needed = full.window.h - ROW_H * (LIST_ROWS - rows.len()) as i32;
         assert_eq!(
             l.window.h,
             needed,
@@ -2380,6 +2631,7 @@ mod card_tests {
 mod tests {
     use super::*;
     use crate::key_sequence::{FieldRef, Token};
+    use std::sync::atomic::Ordering;
 
     fn one(name: &str) -> Vec<Candidate> {
         vec![Candidate {
@@ -2532,6 +2784,217 @@ mod tests {
                 has_sequence: false
             }),
             Outcome::Cancelled
+        );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // The keyboard shortcuts.
+    //
+    // Driven through the `PickerCalls` seam, so no window is opened: `press`
+    // is what the card's own `win32::chord` does with a digit -- it asks
+    // `candidate_for_digit`, the one function that decides -- and the fake
+    // `next` hands the resulting event to `run_with` exactly as the window
+    // procedure would. What is asserted is therefore the whole path from a
+    // keystroke to an `Outcome`, minus the pump.
+    // -----------------------------------------------------------------------
+
+    fn three() -> Vec<Candidate> {
+        ["Slack", "Ledgerline", "Northwind VPN"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Candidate {
+                id: format!("id-{}", i + 1),
+                name: name.to_string(),
+                username: format!("user{i}@example.com"),
+            })
+            .collect()
+    }
+
+    /// The event a digit produces on a card showing `shown` candidate rows,
+    /// or `None` where the card does nothing at all.
+    fn press(digit: u32, shown: usize) -> Option<Event> {
+        candidate_for_digit(digit, shown).map(Event::Chose)
+    }
+
+    /// Digit *n* fills from the *n*th row **as drawn**, and 1 is the top one.
+    #[test]
+    fn a_digit_chooses_the_row_it_is_drawn_on() {
+        for (digit, expected) in [(1u32, "id-1"), (2, "id-2"), (3, "id-3")] {
+            static PRESSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            PRESSED.store(digit, Ordering::SeqCst);
+            STEP.store(0, Ordering::SeqCst);
+            let calls = PickerCalls {
+                open: |_, _| Some(PickerWindow(1)),
+                protect: |_| true,
+                next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                    0 => press(PRESSED.load(Ordering::SeqCst), 3)
+                        .expect("a digit within the list chooses a row"),
+                    _ => Event::Sends(Send::Field(FieldRef::Password)),
+                },
+                show_palette: |_, _| {},
+                close: |_| {},
+            };
+            let outcome = run_with(&calls, &three(), "Slack.exe", |_| Palette {
+                fields: vec![FieldRef::Password],
+                has_sequence: false,
+            });
+            assert_eq!(
+                outcome,
+                Outcome::Fill {
+                    id: expected.to_string(),
+                    send: Send::Field(FieldRef::Password)
+                },
+                "CTRL+ALT+{digit} filled from the wrong account -- the numbering the user sees is \
+                 the rows as drawn, and an off-by-one here types one account's password into \
+                 another's login form"
+            );
+        }
+    }
+
+    /// **A digit past the rows on screen does nothing.** Not a beep, not a
+    /// dismissal, and above all not a fill: the card is showing three
+    /// accounts, so there is no fourth for `CTRL+ALT+4` to mean.
+    #[test]
+    fn a_digit_past_the_shown_rows_chooses_nothing() {
+        for digit in 4..=9 {
+            assert_eq!(
+                press(digit, 3),
+                None,
+                "CTRL+ALT+{digit} answered something on a card showing three accounts"
+            );
+        }
+        // And the card stays up: `run_with` is never handed an event at all,
+        // so the next thing it sees is whatever the user does next.
+        static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        STEP.store(0, Ordering::SeqCst);
+        let calls = PickerCalls {
+            open: |_, _| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| {
+                assert!(
+                    press(7, 3).is_none(),
+                    "the pump would have posted an event for a digit with no row"
+                );
+                assert_eq!(STEP.fetch_add(1, Ordering::SeqCst), 0, "the card was pumped twice");
+                Event::Cancel
+            },
+            show_palette: |_, _| panic!("nothing was chosen, so nothing may be offered"),
+            close: |_| {},
+        };
+        assert_eq!(
+            run_with(&calls, &three(), "Slack.exe", |_| Palette {
+                fields: vec![],
+                has_sequence: false
+            }),
+            Outcome::Cancelled
+        );
+    }
+
+    /// **No digit reaches the *Search the vault* row.**
+    ///
+    /// It is the one row on the card that is not an account, and a number on
+    /// it would be a trap: the user counting rows down the card would press
+    /// the digit under their eye and get the vault window instead of a fill.
+    /// The count digits are measured against is the CANDIDATES', so the row
+    /// below them is unreachable by construction, at every list length.
+    #[test]
+    fn no_digit_can_land_on_the_search_row() {
+        for candidates in 0..=ROW_CAP + 3 {
+            let (shown, _) = crate::win32_draw::visible_rows(candidates, ROW_CAP);
+            let rows = populated_rows(candidates);
+            let search = rows
+                .iter()
+                .position(|row| matches!(row, ListRow::SearchVault { .. }))
+                .expect("every populated card has the row");
+            for digit in 1..=9u32 {
+                let chosen = candidate_for_digit(digit, shown);
+                assert_ne!(
+                    chosen,
+                    Some(search),
+                    "with {candidates} candidates, CTRL+ALT+{digit} lands on the *Search the \
+                     vault* row"
+                );
+                if let Some(index) = chosen {
+                    assert!(
+                        matches!(rows.get(index), Some(ListRow::Candidate(_))),
+                        "CTRL+ALT+{digit} chose row {index}, which is not a candidate row"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The digits are on screen, and they say what they do.
+    ///
+    /// A shortcut nobody can see is a shortcut nobody uses. Every candidate
+    /// row the card can draw carries its own chip, they are all distinct, and
+    /// the row past the candidates carries none -- which is the drawn half of
+    /// [`no_digit_can_land_on_the_search_row`].
+    #[test]
+    fn every_numbered_row_says_which_chord_runs_it() {
+        let hints: Vec<String> = (0..ROW_CAP).map(|i| row_shortcut(i).expect("numbered")).collect();
+        assert_eq!(hints[0], "CTRL+ALT+1", "the topmost row as drawn is 1");
+        assert_eq!(hints.last().map(String::as_str), Some("CTRL+ALT+5"));
+        let unique: std::collections::BTreeSet<&String> = hints.iter().collect();
+        assert_eq!(unique.len(), hints.len(), "two rows offer the same chord");
+        assert_eq!(
+            row_shortcut(ROW_CAP),
+            None,
+            "the row after the candidates is *Search the vault*, and a chip on it would promise \
+             a chord that must never fire there"
+        );
+        assert_eq!(NEW_LOGIN_SHORTCUT, "CTRL+ALT+N");
+        assert!(
+            !hints.contains(&NEW_LOGIN_SHORTCUT.to_string()),
+            "*New login*'s chord is also a row's"
+        );
+    }
+
+    /// **Escape was already handled, and still is.**
+    ///
+    /// A source pin, because the key arrives in the card's own pump and no
+    /// test can open that window. What is decidable is that `next` still
+    /// answers `VK_ESCAPE` with `Event::Cancel` *before* `IsDialogMessageW`,
+    /// which only cancels for a real dialog box -- and that the chord handling
+    /// added beside it did not become a blanket `WM_KEYDOWN` grab, which would
+    /// swallow the Tab and Enter traversal that same call buys.
+    #[test]
+    fn escape_still_cancels_and_tab_still_traverses() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
+             test module as production"
+        );
+        assert!(
+            code.contains("IsDialogMessageW(top, &msg)"),
+            "control: the production cut does not contain the pump this rule is about"
+        );
+
+        let escape = code
+            .find("VK_ESCAPE.0 {")
+            .expect("`next` no longer answers Escape at all -- Cancel by keyboard is gone");
+        let traversal = code.find("IsDialogMessageW(top, &msg)").expect("checked above");
+        assert!(
+            escape < traversal,
+            "Escape is now handled after `IsDialogMessageW`, which only cancels for a real \
+             dialog box -- so this frameless card would swallow it and never close"
+        );
+        assert!(
+            code.contains("chord_held() && chord("),
+            "the CTRL+ALT chords are no longer gated on both modifiers being down. An ungated \
+             `WM_KEYDOWN` arm ahead of `IsDialogMessageW` eats Tab, Shift+Tab, Space and Enter, \
+             which is the whole of this card's focus traversal"
         );
     }
 

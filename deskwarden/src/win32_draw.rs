@@ -10,11 +10,11 @@
 //! egui reads, so a theme change moves both renderers at once.
 
 use crate::app_candidates::Candidate;
-use windows::Win32::Foundation::{COLORREF, RECT};
+use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC,
-    HFONT, PS_SOLID,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetTextExtentPoint32W, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HDC, HFONT, PS_SOLID,
     TRANSPARENT,
 };
 
@@ -91,6 +91,38 @@ impl ButtonSkin {
 /// and deleted before returning -- a leaked `HBRUSH` in a repaint path
 /// exhausts the handle table over a long-running daemon.
 pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonSkin, radius: i32) {
+    draw_button_with_shortcut(hdc, rect, label, font, skin, radius, None, 100);
+}
+
+/// Paint one button whose keyboard shortcut lives **inside** it.
+///
+/// `theme::toolbar_button_with_shortcut`'s idiom, in GDI: the design's markup
+/// is one element containing both runs -- the label, then its shortcut in the
+/// keyboard chip -- rather than a button with a chip floating beside it, so
+/// the whole pill is the thing the shortcut acts on. The label stays centred
+/// in what the chip leaves of the button, which is what keeps it from sliding
+/// under the chip on a narrow one.
+///
+/// `hint` of `None` is exactly [`draw_button`], which is why that function is
+/// this one with the argument left out rather than a second copy of the pill.
+///
+/// `RoundRect` does not antialias, so the corners are hard. That is the
+/// accepted cost of GDI: Direct2D would smooth them and was measured at
+/// 53.85 MB against this window's 1.79 MB.
+///
+/// Every GDI object created here (brush, pen, font selection) is restored
+/// and deleted before returning -- a leaked `HBRUSH` in a repaint path
+/// exhausts the handle table over a long-running daemon.
+pub fn draw_button_with_shortcut(
+    hdc: HDC,
+    rect: RECT,
+    label: &str,
+    font: HFONT,
+    skin: ButtonSkin,
+    radius: i32,
+    hint: Option<(&str, HFONT)>,
+    scale: i32,
+) {
     unsafe {
         let brush = CreateSolidBrush(skin.fill);
         let pen = match skin.border {
@@ -105,11 +137,17 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
         let _ = DeleteObject(brush);
         let _ = DeleteObject(pen);
 
+        // The chip first, so the label below is centred in what is left.
+        let hint_lane = match hint {
+            Some((text, hint_font)) => draw_hint_chip(hdc, rect, text, hint_font, scale),
+            None => 0,
+        };
+
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, skin.text);
         let old_font = SelectObject(hdc, font);
         let mut chars: Vec<u16> = label.encode_utf16().collect();
-        let mut rc = rect;
+        let mut rc = RECT { right: rect.right - hint_lane, ..rect };
         DrawTextW(
             hdc,
             &mut chars,
@@ -122,23 +160,82 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
 
 /// How many candidate rows to draw, and whether candidates were dropped.
 ///
-/// **The last slot is the *Search the vault* row, always.** The matcher that
-/// produced the candidates is loose on purpose, so a card whose two guesses
-/// are both wrong is an ordinary state; drawing that row only when the list
-/// overflowed took the one route out of a wrong guess away from exactly the
-/// cards most likely to be wrong. That is why the candidates get `cap - 1`
-/// slots and never `cap`.
+/// **`cap` is the candidate cap, not the row cap.** The *Search the vault*
+/// row is drawn under every populated card -- the matcher that produced the
+/// candidates is loose on purpose, so a card whose two guesses are both wrong
+/// is an ordinary state, and this window cannot scroll to a way out -- but it
+/// is a row the card is *additionally* tall for, never one that competes with
+/// the candidates for a slot. Spending a slot on it meant a list of exactly
+/// `cap` candidates showed `cap - 1` of them and reported a truncation that
+/// had not happened; see `picker_prompt::LIST_ROWS`, which is `ROW_CAP + 1`
+/// precisely so this function can hand back the full `cap`.
 ///
 /// **A cap that hides candidates without saying so is the defect this project
 /// keeps finding**, so the returned flag is still the truncation news -- it
-/// now decides what that row's second line says rather than whether the row
-/// is there at all. See `picker_prompt::populated_rows`.
+/// decides what that row's second line says rather than whether the row is
+/// there at all. See `picker_prompt::populated_rows`.
 pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
-    let room = cap.saturating_sub(1);
-    if total <= room {
+    if total <= cap {
         (total, false)
     } else {
-        (room, true)
+        (cap, true)
+    }
+}
+
+/// Paints one keyboard-hint chip, right-aligned inside `rect`, and answers how
+/// much of the row's width it took -- the chip plus the gap that keeps a
+/// truncated name from touching it.
+///
+/// **The design's chip, not a second one.** Every number and colour is
+/// `crate::theme`'s own [`crate::theme::CHIP_HEIGHT`],
+/// [`crate::theme::CHIP_PAD_X`], [`crate::theme::CHIP_RADIUS`] and
+/// [`crate::theme::CHIP_TEXT_PX`] -- the same four `theme::kbd_chip` paints
+/// with -- and it is *bordered* and drawn inside the row it belongs to rather
+/// than floating beside it, which is `theme::toolbar_button_with_shortcut`'s
+/// documented idiom: one surface carrying the label and its shortcut, so the
+/// whole of it is the thing the shortcut acts on.
+///
+/// Every GDI object created here is restored and deleted before returning,
+/// matching [`draw_button`] -- this runs in the daemon's repaint path.
+pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32) -> i32 {
+    let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
+    unsafe {
+        let chars: Vec<u16> = hint.encode_utf16().collect();
+        let old_font = SelectObject(hdc, font);
+        let mut size = SIZE::default();
+        let measured =
+            GetTextExtentPoint32W(hdc, &chars, &mut size).as_bool();
+        // A refusal is cosmetic, never a reason to lose the row: the chip is
+        // simply not drawn, and the row keeps its full text lane.
+        if !measured {
+            SelectObject(hdc, old_font);
+            return 0;
+        }
+        let h = px(crate::theme::CHIP_HEIGHT);
+        let w = size.cx + 2 * px(crate::theme::CHIP_PAD_X);
+        let gap = px(crate::theme::CHIP_PAD_X);
+        let right = rect.right - px(crate::theme::TEXT_CLIP_INSET);
+        let left = right - w;
+        let top = rect.top + ((rect.bottom - rect.top) - h) / 2;
+        let radius = px(crate::theme::CHIP_RADIUS) * 2;
+
+        let brush = CreateSolidBrush(rgb(crate::theme::CANVAS));
+        let pen = CreatePen(PS_SOLID, 1, rgb(crate::theme::BORDER_STRONG));
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(hdc, left, top, right, top + h, radius, radius);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+        let mut chars = chars;
+        let mut rc = RECT { left, top, right, bottom: top + h };
+        DrawTextW(hdc, &mut chars, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
+        w + gap
     }
 }
 
@@ -161,7 +258,16 @@ pub struct RowState {
 ///
 /// Every GDI object created here is restored and deleted before returning,
 /// matching [`draw_button`] -- this also runs in the daemon's repaint path.
-pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, name_font: HFONT, user_font: HFONT) {
+pub fn draw_row(
+    hdc: HDC,
+    rect: RECT,
+    candidate: &Candidate,
+    state: RowState,
+    name_font: HFONT,
+    user_font: HFONT,
+    hint: Option<(&str, HFONT)>,
+    scale: i32,
+) {
     unsafe {
         let fill = if state.selected {
             rgb(crate::theme::BLUE_WASH)
@@ -180,13 +286,21 @@ pub fn draw_row(hdc: HDC, rect: RECT, candidate: &Candidate, state: RowState, na
         let _ = DeleteObject(brush);
         let _ = DeleteObject(pen);
 
+        // The chip first, so the text lane below can stop short of it: a name
+        // drawn to the row's own edge would run underneath the hint, and
+        // `DT_END_ELLIPSIS` truncates against the rect it is given.
+        let hint_lane = match hint {
+            Some((text, font)) => draw_hint_chip(hdc, rect, text, font, scale),
+            None => 0,
+        };
+
         let gutter = rect.bottom - rect.top;
         let text_left = rect.left + gutter;
         // `DT_END_ELLIPSIS` truncates against the rect's right edge, so the
         // rect stops short of the row's: an ellipsis flush against the card's
         // edge reads as a cut rather than as "there is more". The left gutter
         // the icon lives in is untouched.
-        let text_right = rect.right - crate::theme::TEXT_CLIP_INSET as i32;
+        let text_right = rect.right - crate::theme::TEXT_CLIP_INSET as i32 - hint_lane;
 
         SetBkMode(hdc, TRANSPARENT);
 
@@ -272,10 +386,10 @@ mod tests {
         );
         let drawn = code.matches(concat!("Draw", "TextW(")).count();
         assert_eq!(
-            drawn, 3,
-            "control: win32_draw.rs draws text in three places -- a button label and a row's two \r
-             lines. It now draws it in {drawn}, so the counts below no longer mean what this \r
-             pin says they mean"
+            drawn, 4,
+            "control: win32_draw.rs draws text in four places -- a button label, a keyboard-hint \r
+             chip and a row's two lines. It now draws it in {drawn}, so the counts below no \r
+             longer mean what this pin says they mean"
         );
 
         assert_eq!(
@@ -286,6 +400,13 @@ mod tests {
              with nothing to say it was truncated. Both lines need the flag; the button label \r
              does not, because a button is sized to its own text. The needle carries the \r
              leading `|` so the import list is not counted as a third use"
+        );
+        assert!(
+            code.contains(concat!("TEXT_CLIP_", "INSET as i32 - hint_lane")),
+            "a row's text lane no longer stops short of its keyboard-hint chip. The chip is 
+             drawn inside the row, so a name measured against the row's own right edge runs 
+             underneath it -- and `DT_END_ELLIPSIS` would truncate against the wrong edge, so 
+             nothing would even mark it"
         );
         assert!(
             code.contains(concat!("rect.right - crate::theme::TEXT_CLIP_", "INSET as i32")),
@@ -304,32 +425,40 @@ mod tests {
     #[test]
     fn a_list_that_fits_shows_everything_and_reports_no_truncation() {
         assert_eq!(visible_rows(3, 5), (3, false));
-        assert_eq!(
-            visible_rows(4, 5),
-            (4, false),
-            "four candidates plus the always-drawn *Search the vault* row is exactly the cap"
-        );
+        assert_eq!(visible_rows(4, 5), (4, false));
+    }
+
+    /// **A list of exactly the cap is shown whole, and is not a truncation.**
+    ///
+    /// The *Search the vault* row used to take one of the cap's slots, so a
+    /// user with exactly five matches saw four of them and was told the card
+    /// had cut the list. Nothing had been cut: the card is simply one row
+    /// taller than the candidate cap, because that row is additional to the
+    /// candidates rather than in competition with them.
+    #[test]
+    fn a_list_of_exactly_the_cap_is_shown_whole_and_is_not_a_truncation() {
         assert_eq!(
             visible_rows(5, 5),
-            (4, true),
-            "the fifth candidate does not fit beside the search row, and a card that dropped it              silently is the defect this whole rule exists to prevent"
+            (5, false),
+            "five candidates against a cap of five is five candidates, and a card that dropped              one of them and reported an overflow was lying about both"
         );
     }
 
     #[test]
-    fn a_list_that_overflows_gives_up_a_row_to_say_so() {
+    fn a_list_that_overflows_gives_up_no_candidate_it_could_have_shown() {
+        assert_eq!(
+            visible_rows(6, 5),
+            (5, true),
+            "the sixth candidate is the first that genuinely does not fit"
+        );
         let (shown, overflow) = visible_rows(9, 5);
         assert!(overflow, "the user must be told the list was cut");
-        assert_eq!(
-            shown, 4,
-            "the overflow row occupies one of the cap's slots -- showing 5 candidates AND an \
-             overflow row would be 6 rows in a window sized for 5, and the last one is unreachable"
-        );
+        assert_eq!(shown, 5, "the cap is the candidate cap; the search row has a slot of its own");
     }
 
     #[test]
-    fn a_cap_of_one_still_leaves_room_to_say_there_is_more() {
-        assert_eq!(visible_rows(4, 1), (0, true));
+    fn a_cap_of_one_shows_that_one_and_says_there_is_more() {
+        assert_eq!(visible_rows(4, 1), (1, true));
     }
 
     #[test]

@@ -1062,14 +1062,35 @@ fn status_pill_impl(ui: &mut Ui, dot_color: Color32, text: &str, sense: Sense) -
 /// out taller than the design's. That gap widened when the monospace face
 /// became Consolas (see `system_monospace`), whose descent is deeper than
 /// the previously-used bundled face.
-const CHIP_HEIGHT: f32 = 18.0;
+pub const CHIP_HEIGHT: f32 = 18.0;
+
+/// The chip's text size, its horizontal padding and its corner radius, as
+/// [`kbd_chip`] paints them.
+///
+/// Public, and named rather than left as literals at [`kbd_chip`]'s call to
+/// [`paint_chip`], because the GDI renderer draws the same chip and cannot
+/// call into egui: `crate::win32_draw::draw_hint_chip` reads these four
+/// numbers so the picker card's shortcut hints are the design's chip rather
+/// than a second, nearly-identical one.
+pub const CHIP_TEXT_PX: f32 = 10.0;
+pub const CHIP_PAD_X: f32 = 6.0;
+pub const CHIP_RADIUS: f32 = 4.0;
+
+/// The GDI family name of the face [`system_monospace`] reads.
+///
+/// The same file (`%SystemRoot%\Fonts\consola.ttf`) by the name GDI knows it
+/// under, for callers that ask the OS for a font rather than handing egui
+/// bytes. It is here rather than in `crate::win32_draw` for the reason
+/// [`TEXT_CLIP_INSET`] is: the GDI renderer takes every face, colour and
+/// dimension from this module.
+pub const GDI_MONO_FACE: &str = "Consolas";
 
 /// Paints one keyboard-hint chip: `text` in 10px monospace, centered in a
 /// rounded box of exactly [`CHIP_HEIGHT`] with `pad_x` either side.
 fn paint_chip(ui: &mut Ui, text: &str, bg: Color32, fg: Color32, radius: u8, pad_x: f32) {
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_string(), FontId::new(10.0, FontFamily::Monospace), fg);
+        .layout_no_wrap(text.to_string(), FontId::new(CHIP_TEXT_PX, FontFamily::Monospace), fg);
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(galley.size().x + pad_x * 2.0, CHIP_HEIGHT),
         Sense::hover(),
@@ -1090,7 +1111,7 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
     } else {
         (CANVAS, TEXT_FAINT)
     };
-    paint_chip(ui, text, bg, fg, 4, 6.0);
+    paint_chip(ui, text, bg, fg, CHIP_RADIUS as u8, CHIP_PAD_X);
 }
 
 /// The Windows Hello panel's CTRL+H chip (design 3h: `font-size: 10px;

@@ -4,6 +4,7 @@
 //! cargo run --example picker_preview
 //! cargo run --example picker_preview -- --capturable
 //! cargo run --example picker_preview -- --few
+//! cargo run --example picker_preview -- --full
 //! cargo run --example picker_preview -- --empty
 //! ```
 //!
@@ -12,6 +13,19 @@
 //! while the row was not drawn and two wrong guesses had no way out but
 //! dismissing the card. The default fixture list overflows, so this flag is
 //! the one that shows the row saying "Look for it under another name".
+//!
+//! `--full` shows **exactly `ROW_CAP` candidates**: the card at its fullest
+//! without a truncation. This is the state the regression was in -- while the
+//! *Search the vault* row took one of the candidate cap's slots, a list of
+//! exactly five showed four of them and said the rest did not fit. The card
+//! is one row taller than the candidate cap now, so this fixture shows all
+//! five accounts, the search row under them saying nothing was cut, and every
+//! row's `CTRL+ALT+n` chip.
+//!
+//! **The keyboard shortcuts are on the card itself**: each candidate row
+//! carries the chip for the chord that fills from it, and *New login* carries
+//! `CTRL+ALT+N` inside its own button. `Esc` cancels, as it always has. Any
+//! fixture shows them; `--full` shows the whole run of digits at once.
 //!
 //! `--empty` shows the card's **empty mode**: the surface a user gets when
 //! nothing in the vault looks like the app they are in front of, which is by
@@ -101,6 +115,18 @@ fn fixtures() -> Vec<Offer> {
     ]
 }
 
+/// **Exactly the candidate cap, and so no truncation at all.**
+///
+/// `picker_prompt::ROW_CAP` candidates against a card that lays out
+/// `LIST_ROWS = ROW_CAP + 1` rows: every account is on screen, the *Search the
+/// vault* row sits under them saying nothing was cut, and the last digit chip
+/// on the card is `CTRL+ALT+5`. While the search row competed with the
+/// candidates for a slot, this fixture drew four accounts and claimed the
+/// fifth did not fit.
+fn full_fixtures() -> Vec<Offer> {
+    fixtures().into_iter().take(picker_prompt::ROW_CAP).collect()
+}
+
 /// **Two candidates, both plausibly wrong.** The reported state: the matcher
 /// is loose on purpose, so this card is ordinary -- and it must still offer
 /// the *Search the vault* row, here saying nothing was cut.
@@ -114,6 +140,13 @@ fn main() {
     let capturable = std::env::args().any(|arg| arg == "--capturable");
     if capturable {
         eprintln!("preview: capture exclusion is stubbed out, so this window can be screenshotted");
+    }
+    let full = std::env::args().any(|arg| arg == "--full");
+    if full {
+        eprintln!(
+            "preview: exactly {} candidates -- all of them shown, and no truncation reported",
+            picker_prompt::ROW_CAP
+        );
     }
     let few = std::env::args().any(|arg| arg == "--few");
     if few {
@@ -131,6 +164,8 @@ fn main() {
         Vec::new()
     } else if few {
         few_fixtures()
+    } else if full {
+        full_fixtures()
     } else {
         fixtures()
     };
