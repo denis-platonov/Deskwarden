@@ -9,7 +9,7 @@
 //! token. A direct backend derives those keys **here**.
 //!
 //! Nothing in this module is reachable from the running app yet, and that is
-//! deliberate. The three submodules are layered so that each can be checked
+//! deliberate. The four submodules are layered so that each can be checked
 //! without the one above it:
 //!
 //! * [`crypto`] -- the client-side cryptography, and **no I/O of any kind**.
@@ -21,11 +21,25 @@
 //!   may reach a real server, the real vault, `%APPDATA%` or `bw`.
 //! * [`sync`] -- the sync payload, decrypted and mapped into the
 //!   [`crate::vault_bridge`] shapes the rest of the app already depends on.
+//! * [`write`] -- the inverse of [`sync`]: an item re-encrypted into the wire
+//!   cipher shape. Its one non-obvious rule is the reason it is a module of
+//!   its own, and it is stated at the top of the file: a `PUT` replaces the
+//!   whole cipher, so the body is built by laying the modelled fields **over**
+//!   the JSON [`sync`] retained, never from the model alone.
 //!
-//! **Read-only.** There is no create, update, delete, folder write, Send or
-//! attachment path here, and no app wiring: nothing in this crate constructs
-//! an [`api::RestClient`]. Two-factor authentication is *recognised* and
-//! refused by name ([`api::RestError::TwoFactorRequired`]), not completed.
+//! **Item writes, and nothing else.** [`api`] gained create, update, trash,
+//! restore and hard delete for *ciphers*. There is still no folder write, no
+//! Send, no attachment upload and no app wiring: nothing in this crate
+//! constructs an [`api::RestClient`]. Two-factor authentication is
+//! *recognised* and refused by name
+//! ([`api::RestError::TwoFactorRequired`]), not completed.
+//!
+//! # What a write does not carry, and what that costs
+//!
+//! An item's attachments and `fido2Credentials` are still not *decrypted*
+//! ([`sync`]'s own doc says so). They now survive an edit -- they ride the
+//! retained JSON through [`write`] byte-for-byte, which is the whole point of
+//! that module -- but this crate cannot create, replace or delete one.
 //!
 //! # What is verified, and where the boundary now sits
 //!
@@ -70,3 +84,4 @@
 pub mod api;
 pub mod crypto;
 pub mod sync;
+pub mod write;

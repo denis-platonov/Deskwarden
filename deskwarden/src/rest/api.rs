@@ -113,6 +113,19 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(30);
 /// because the caller is the app.
 const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Total-time bound for a single cipher write.
+///
+/// Its own number, between the other two, and the reason is the shape of the
+/// request rather than caution: one cipher is small and bounded in a way
+/// `/api/sync` is not, so [`SYNC_DEADLINE`]'s two minutes would be two
+/// minutes of a user watching a save spinner for a request that is never
+/// going to land. It is the same 30s as [`AUTH_DEADLINE`] because it is the
+/// same shape of request -- small body, external host, the server's own work
+/// dominating -- and it is deliberately *not* shared with it: an auth
+/// deadline that someone later tunes for a slow KDF should not silently
+/// re-tune how long a save hangs for.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// How long before an access token's deadline it is treated as already
 /// expired.
 ///
@@ -187,6 +200,17 @@ pub enum RestError {
     /// means the grant was made without `offline_access`, or the server does
     /// not issue one.
     NoRefreshToken,
+    /// A cipher id that cannot be put in a URL path as it stands.
+    ///
+    /// Every id this client writes to came from a server, and a server sends
+    /// GUIDs -- so this is not expected to fire. It exists because the
+    /// alternative to checking is `format!("/api/ciphers/{id}")` with an id
+    /// holding a `/`, a `?` or a `..`, which is a request to a different
+    /// endpoint than the one the code reads as. Refusing is cheap; a
+    /// `DELETE` aimed somewhere else is not. Carries nothing: the id itself
+    /// is not a secret, but there is no reason to echo an unvalidated string
+    /// into an error that may be logged.
+    UnsafeId,
 }
 
 impl std::fmt::Display for RestError {
@@ -209,6 +233,7 @@ impl std::fmt::Display for RestError {
             Self::NoRefreshToken => {
                 f.write_str("this session has no refresh token and cannot be renewed")
             }
+            Self::UnsafeId => f.write_str("that item's id is not one this client will put in a URL"),
         }
     }
 }
@@ -389,6 +414,8 @@ pub struct RestClient {
     /// `/api/sync`, whose response size is unbounded by anything this client
     /// controls. See [`SYNC_DEADLINE`].
     sync_agent: TotalBounded,
+    /// The cipher write endpoints. See [`WRITE_DEADLINE`].
+    write_agent: TotalBounded,
 }
 
 impl RestClient {
@@ -399,6 +426,7 @@ impl RestClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, AUTH_DEADLINE),
             sync_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, SYNC_DEADLINE),
+            write_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, WRITE_DEADLINE),
         }
     }
 
@@ -540,22 +568,154 @@ impl RestClient {
     /// anyway. See the module docs on why both halves exist and why the retry
     /// happens exactly once.
     pub fn sync_refreshing(&self, session: &mut Session) -> Result<SyncResponse, RestError> {
+        self.refreshing(session, |session| self.sync(session))
+    }
+
+    // ---- writing one cipher -------------------------------------------------
+
+    /// `POST /api/ciphers` -- a new item.
+    ///
+    /// `body` is what [`crate::rest::write::encrypt_item`] produced, and this
+    /// function does not look inside it: the only thing it could usefully
+    /// check is already the mapper's job, and reading a mapped cipher here
+    /// would be one more place a plaintext could be logged from. **Nothing in
+    /// this function or below it formats `body`.**
+    ///
+    /// Returns the server's own copy of the created cipher -- still
+    /// encrypted, and carrying the `id` and `revisionDate` it assigned, which
+    /// is the only way the caller learns the new item's id.
+    pub fn create_cipher(
+        &self,
+        session: &mut Session,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = format!("{}/api/ciphers", self.base_url);
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.write_agent.post(&url), session).send_json(body))
+        })
+    }
+
+    /// `PUT /api/ciphers/{id}` -- an edit.
+    ///
+    /// # This replaces the whole cipher
+    ///
+    /// Whatever `body` omits, the server drops. That is the reason
+    /// [`crate::rest::write`] builds its body by laying the modelled fields
+    /// *over* the retained JSON rather than from the model alone, and it is
+    /// restated here because this is the function that does the damage if the
+    /// rule is ever broken upstream.
+    pub fn update_cipher(
+        &self,
+        session: &mut Session,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.cipher_url(id, "")?;
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.write_agent.put(&url), session).send_json(body))
+        })
+    }
+
+    /// `PUT /api/ciphers/{id}/delete` -- move to the trash.
+    ///
+    /// Reversible by [`Self::restore_cipher`], which is the whole reason it is
+    /// a separate endpoint from [`Self::hard_delete_cipher`] and the reason a
+    /// caller should reach for this one.
+    pub fn trash_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.cipher_url(id, "/delete")?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.put(&url), session).call())
+        })
+    }
+
+    /// `PUT /api/ciphers/{id}/restore` -- back out of the trash.
+    pub fn restore_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.cipher_url(id, "/restore")?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.put(&url), session).call())
+        })
+    }
+
+    /// `DELETE /api/ciphers/{id}` -- gone, with no trash to recover it from.
+    ///
+    /// Named `hard_delete` rather than `delete` so that no caller reaches for
+    /// it by autocomplete when they meant [`Self::trash_cipher`]. This module
+    /// will not decide for a caller which one they want, but it will make the
+    /// irreversible one the longer word.
+    pub fn hard_delete_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.cipher_url(id, "")?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
+        })
+    }
+
+    // ---- the plumbing ------------------------------------------------------
+
+    /// The token discipline every authenticated call in this module shares:
+    /// refresh proactively if the deadline is near, and refresh **once** and
+    /// retry if the server says 401 anyway.
+    ///
+    /// Factored out rather than repeated per endpoint because the "once" is
+    /// the part that is easy to get wrong in the fifth copy, and a retry loop
+    /// against a server that answers 401 to a fresh token is a login storm.
+    /// See the module docs for why both halves exist.
+    fn refreshing<T>(
+        &self,
+        session: &mut Session,
+        mut attempt: impl FnMut(&Session) -> Result<T, RestError>,
+    ) -> Result<T, RestError> {
         if session.needs_refresh_at(Instant::now()) && session.can_refresh() {
             // A failed proactive refresh is not fatal on its own -- the token
-            // may still have seconds left -- so the sync below is still
+            // may still have seconds left -- so the request below is still
             // attempted, and its own 401 is what decides.
             let _ = self.refresh(session);
         }
-        match self.sync(session) {
+        match attempt(session) {
             Err(RestError::Unauthorized) => {
                 self.refresh(session).map_err(|_| RestError::Unauthorized)?;
-                self.sync(session)
+                attempt(session)
             }
             other => other,
         }
     }
 
-    // ---- the plumbing ------------------------------------------------------
+    /// `{base}/api/ciphers/{id}{suffix}`, with the id checked first.
+    ///
+    /// See [`RestError::UnsafeId`] for why an id from a server is checked at
+    /// all.
+    fn cipher_url(&self, id: &str, suffix: &str) -> Result<String, RestError> {
+        if !is_url_path_safe(id) {
+            return Err(RestError::UnsafeId);
+        }
+        Ok(format!("{}/api/ciphers/{}{}", self.base_url, id, suffix))
+    }
+
+    /// Puts the bearer token on a request.
+    ///
+    /// `Zeroizing` for [`Self::sync`]'s reason, spelled once there and not
+    /// repeated at four call sites: the header value is the whole credential
+    /// with seven characters in front of it, and the copy this module owns is
+    /// the one that would otherwise persist in a freed page.
+    fn bearer(&self, request: ureq::Request, session: &Session) -> ureq::Request {
+        let header = Zeroizing::new(format!("Bearer {}", session.access_token.as_str()));
+        request.set("Authorization", &header)
+    }
+
+    /// A response whose *body* is not wanted, only its status.
+    ///
+    /// Separate from [`Self::value_from`] because the three endpoints that use
+    /// it answer with an empty body on success, and `into_json` on an empty
+    /// body is a parse failure -- which would turn a delete that worked into
+    /// an error the caller reports as a delete that did not.
+    fn unit_from(&self, response: Result<ureq::Response, ureq::Error>) -> Result<(), RestError> {
+        match response {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(401, _)) => Err(RestError::Unauthorized),
+            Err(ureq::Error::Status(400, body)) => Err(classify_400(body)),
+            Err(ureq::Error::Status(code, _)) => Err(RestError::Status(code)),
+            Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
+        }
+    }
 
     /// Turns a token endpoint's response into a [`Session`].
     fn session_from(
@@ -681,6 +841,18 @@ fn kdf_from(parsed: &PreloginResponse) -> Result<Kdf, RestError> {
         }
         Some(_) => Err(RestError::Parse("a KDF this client understands")),
     }
+}
+
+/// Whether a cipher id can be pasted into a URL path unchanged.
+///
+/// Deliberately narrow rather than an escaper: a Bitwarden cipher id is a
+/// GUID, so hex digits and hyphens is the whole of what a real one contains,
+/// and percent-encoding an id that is not one would send a well-formed
+/// request for a record that cannot exist. Refusing says the truer thing.
+fn is_url_path_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Standard base64 re-spelled as base64url without padding.
@@ -1256,4 +1428,286 @@ mod tests {
         assert!(printed[0].contains("redacted"), "{}", printed[0]);
         assert!(printed[1].contains("redacted"), "{}", printed[1]);
     }
+
+    // ---- the cipher write endpoints ----------------------------------------
+
+    /// A session for the write tests, obtained the same way the app would:
+    /// through a real grant against the mock server. There is no constructor
+    /// shortcut, because a `cfg(test)` seam into `Session` is exactly the
+    /// thing this crate bans.
+    fn granted(server: &mut mockito::Server) -> (RestClient, Session) {
+        server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "password".into(),
+            )]))
+            .with_body(token_body(3600))
+            .create();
+        let client = RestClient::new(server.url());
+        let session = client.password_grant("a@b.c", "HASH", &device()).expect("the grant");
+        (client, session)
+    }
+
+    /// A mapped cipher body, as `rest::write` produces one: encrypted values
+    /// and one plaintext the tests below can search for and must never find.
+    const SECRET: &str = "hunter2-never-on-the-wire";
+    fn encrypted_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "type": 1,
+            "name": "2.aWl2aXZpdml2aXZpdml2aQ==|Y2lwaGVydGV4dGNpcGhlcnRleHQ=|bWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWE=",
+            "login": {
+                "password": "2.aXZpdml2aXZpdml2aXZpdg==|c2VjcmV0Y2lwaGVydGV4dHM=|bWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWFjbWE=",
+            },
+            "reprompt": 1,
+        })
+    }
+
+    /// The whole of what a create must put on the wire: the method, the path,
+    /// the bearer header, and a body carrying ciphertext and no plaintext.
+    #[test]
+    fn a_create_posts_the_encrypted_body_with_the_bearer_token() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let body = encrypted_body();
+        let created = server
+            .mock("POST", "/api/ciphers")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(body.clone()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"object":"cipher","id":"server-assigned-id","revisionDate":"2024-07-07T07:07:07Z"}"#)
+            .expect(1)
+            .create();
+
+        let answer = client.create_cipher(&mut session, &body).expect("the create");
+        created.assert();
+        // The server's own copy comes back, which is how the caller learns the
+        // id it did not choose.
+        assert_eq!(answer.get("id").and_then(|v| v.as_str()), Some("server-assigned-id"));
+
+        // And the body really was ciphertext: the same assertion from the
+        // other side, on the exact bytes `match_body` accepted.
+        let sent = serde_json::to_string(&body).expect("serializable");
+        assert!(!sent.contains(SECRET), "a plaintext reached the request body");
+        assert!(
+            sent.contains("2.aXZpdml2aXZpdml2aXZpdg=="),
+            "the body did not carry the encrypted password at all"
+        );
+    }
+
+    /// An update is a `PUT` to the item's own path -- not a `POST`, and not to
+    /// the collection.
+    #[test]
+    fn an_update_puts_to_the_item_path_and_carries_only_ciphertext() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let body = encrypted_body();
+        let updated = server
+            .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(body.clone()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"object":"cipher","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
+            .expect(1)
+            .create();
+        // If the client ever posted an edit to the collection instead, this
+        // would match and the assertion below would fire.
+        let wrong = server.mock("POST", "/api/ciphers").with_status(200).create();
+
+        client
+            .update_cipher(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &body)
+            .expect("the update");
+        updated.assert();
+        assert!(!wrong.matched(), "an update was sent as a create");
+    }
+
+    /// The three status-only endpoints, each on its own path and method. They
+    /// answer with an empty body, which is the case `unit_from` exists for:
+    /// through `value_from` every one of these would be a parse failure on a
+    /// request that worked.
+    #[test]
+    fn trash_restore_and_hard_delete_each_hit_their_own_route_with_an_empty_body() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let trash = server
+            .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create();
+        let restore = server
+            .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/restore")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create();
+        let hard = server
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create();
+
+        client.trash_cipher(&mut session, id).expect("the trash");
+        client.restore_cipher(&mut session, id).expect("the restore");
+        client.hard_delete_cipher(&mut session, id).expect("the hard delete");
+        trash.assert();
+        restore.assert();
+        hard.assert();
+    }
+
+    /// The reactive half of the token discipline, on a write: one 401, one
+    /// refresh, one retry -- and the retry carries the **new** token and the
+    /// same body. `expect(1)` on each mock is what pins "exactly once".
+    #[test]
+    fn a_401_on_a_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let body = encrypted_body();
+        let stale = server
+            .mock("POST", "/api/ciphers")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(401)
+            .expect(1)
+            .create();
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "refresh_token".into(),
+            )]))
+            .with_body(r#"{"access_token":"AT-2","expires_in":3600,"refresh_token":"RT-2"}"#)
+            .expect(1)
+            .create();
+        let fresh = server
+            .mock("POST", "/api/ciphers")
+            .match_header("Authorization", "Bearer AT-2")
+            .match_body(mockito::Matcher::Json(body.clone()))
+            .with_body(r#"{"object":"cipher","id":"server-assigned-id"}"#)
+            .expect(1)
+            .create();
+
+        client.create_cipher(&mut session, &body).expect("the retried create");
+        stale.assert();
+        refresh.assert();
+        fresh.assert();
+    }
+
+    /// And the retry happens once on a write too. A server that keeps saying
+    /// 401 must not be hammered.
+    #[test]
+    fn a_write_against_a_dead_session_gives_up_instead_of_looping() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "refresh_token".into(),
+            )]))
+            .with_body(r#"{"access_token":"AT-2","expires_in":3600}"#)
+            .expect(1)
+            .create();
+        let deletes = server
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .with_status(401)
+            .expect(2)
+            .create();
+
+        let err = client
+            .hard_delete_cipher(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .expect_err("a dead session");
+        assert_eq!(err, RestError::Unauthorized);
+        refresh.assert();
+        deletes.assert();
+    }
+
+    /// An id that would change which URL is being addressed is refused before
+    /// a socket is opened. The mock asserting it was never called is the
+    /// point: the request must not happen at all.
+    #[test]
+    fn an_id_that_is_not_url_path_safe_is_refused_before_anything_is_sent() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
+        for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
+            assert_eq!(
+                client.hard_delete_cipher(&mut session, bad).expect_err("an unsafe id"),
+                RestError::UnsafeId,
+                "`{bad}` was accepted as a cipher id"
+            );
+        }
+        assert!(!any.matched(), "an unsafe id reached the network");
+    }
+
+    /// A write whose token is already past the skew refreshes **before** the
+    /// request rather than after a wasted round trip -- the proactive half,
+    /// on a write.
+    #[test]
+    fn a_write_with_an_expiring_token_refreshes_before_it_is_attempted() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "password".into(),
+            )]))
+            .with_body(token_body(0))
+            .create();
+        let client = RestClient::new(server.url());
+        let mut session = client.password_grant("a@b.c", "HASH", &device()).expect("the grant");
+
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "refresh_token".into(),
+            )]))
+            .with_body(r#"{"access_token":"AT-2","expires_in":3600}"#)
+            .expect(1)
+            .create();
+        let trash = server
+            .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
+            .match_header("Authorization", "Bearer AT-2")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create();
+
+        client
+            .trash_cipher(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .expect("the trash");
+        refresh.assert();
+        trash.assert();
+    }
+
+    /// A rejected write keeps the server's own words, the way every other
+    /// 400 in this module does -- and does not become a bare `Status(400)`.
+    #[test]
+    fn a_rejected_write_carries_the_servers_own_explanation() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        server
+            .mock("POST", "/api/ciphers")
+            .with_status(400)
+            .with_body(r#"{"error":"invalid_request","error_description":"Cipher type is required"}"#)
+            .create();
+        let err = client
+            .create_cipher(&mut session, &encrypted_body())
+            .expect_err("a rejected create");
+        assert_eq!(
+            err,
+            RestError::Rejected {
+                error: "invalid_request".to_string(),
+                description: "Cipher type is required".to_string(),
+            }
+        );
+    }
+
 }

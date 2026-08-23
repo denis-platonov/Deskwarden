@@ -317,13 +317,13 @@ fn unwrap_one_org(der: &[u8], org: &Organization) -> Result<SymmetricKey, Crypto
 /// A newtype over a borrowed-or-owned key rather than a bare reference,
 /// because a per-cipher key is *created* here and lives only as long as the
 /// cipher is being mapped.
-enum CipherKeys<'k> {
+pub(crate) enum CipherKeys<'k> {
     Shared(&'k SymmetricKey),
     Own(SymmetricKey),
 }
 
 impl CipherKeys<'_> {
-    fn key(&self) -> &SymmetricKey {
+    pub(crate) fn key(&self) -> &SymmetricKey {
         match self {
             Self::Shared(key) => key,
             Self::Own(key) => key,
@@ -332,7 +332,7 @@ impl CipherKeys<'_> {
 
     /// Works out which key a cipher's fields are under. See the module docs'
     /// step 5 for why this exists and what ignoring it would cost.
-    fn for_cipher<'k>(
+    pub(crate) fn for_cipher<'k>(
         keys: &'k VaultKeys,
         cipher: &Object,
     ) -> Result<CipherKeys<'k>, CryptoError> {
