@@ -49,18 +49,17 @@
 //! * `VaultCache`'s restore/unarchive path reads the item back with
 //!   `get_item` to refresh its `revisionDate` -- one full sync per gesture.
 //!
-//! # What this backend refuses, and why refusing is the answer
+//! # What this backend refuses
 //!
-//! **Three of the twenty** are [`VaultError::Unsupported`], each naming
-//! itself: the three folder writes. Each method's doc carries the argument;
-//! the shared half is that this crate would rather crash than answer a
-//! question it cannot answer, and an `Ok` with an empty list is the quietest
-//! possible wrong answer.
+//! **Nothing.** All twenty operations are implemented.
 //!
-//! There were six. Three have since been implemented, and how they were is
-//! worth reading beside the refusals, because in each case the refusal named
-//! the trap that the implementation then had to avoid rather than merely
-//! being replaced:
+//! There were six refusals, and they are worth reading about in the order
+//! they were lifted, because in every case the refusal named the trap the
+//! implementation then had to avoid rather than merely being replaced. The
+//! shared half of all six was that this crate would rather crash than answer
+//! a question it cannot answer, and an `Ok` for a write that did not happen
+//! is the quietest possible wrong answer -- so each of the six is now a write
+//! whose *answer is read back*:
 //!
 //! * [`RestBackend::archive_item`] and [`RestBackend::unarchive_item`] refused
 //!   for want of a route, and warned that faking one with an edit that sets
@@ -76,6 +75,24 @@
 //!   [`crate::password_gen`] is the generator, so that every backend reaches
 //!   one implementation -- passphrases included, from a word list installed
 //!   beside the executable and read only when one is asked for.
+//! * [`RestBackend::create_folder`], [`RestBackend::update_folder`] and
+//!   [`RestBackend::delete_folder`] refused for want of a folder endpoint,
+//!   and warned that a folder name is encrypted under the user key and that
+//!   deleting a folder has the user's whole vault downstream of it. The
+//!   routes are now in [`crate::rest::api`]; the name is encrypted by
+//!   [`crate::rest::write::encrypt_folder_name`], so this file holds no
+//!   ciphertext and no second encryptor; the two writes that get an answer
+//!   have it **decrypted and compared to the name that was sent** (see
+//!   `confirmed_folder`); and the delete edits no cipher, because the server
+//!   un-files the items itself and a client-side sweep would be a second,
+//!   partial opinion about a change already made.
+//!
+//! The one place the six do **not** agree with each other is what an empty
+//! response body means, and that disagreement is deliberate: it is
+//! [`RestError::BulkIdMissing`] for the archive routes, whose body is their
+//! only per-id evidence, and success for `delete_folder`, whose id is in the
+//! path and whose status is therefore already the answer about that id. Both
+//! sides of it are argued in [`crate::rest::api::RestClient::delete_folder`].
 
 use std::sync::Mutex;
 
@@ -85,8 +102,10 @@ use crate::app_match::AppMatch;
 use crate::otpauth::{self, OtpAuth};
 use crate::rest::api::{Authenticated, RestClient, RestError};
 use crate::rest::crypto::CryptoError;
-use crate::rest::sync::{DecryptedItem, DecryptedVault, VaultKeys, decrypt_cipher, decrypt_vault};
-use crate::rest::write::encrypt_item;
+use crate::rest::sync::{
+    DecryptedItem, DecryptedVault, VaultKeys, decrypt_cipher, decrypt_folder, decrypt_vault,
+};
+use crate::rest::write::{encrypt_folder_name, encrypt_item};
 use crate::vault_backend::VaultBackend;
 use crate::password_gen::PasswordGenError;
 use crate::vault_bridge::{
@@ -310,46 +329,103 @@ impl VaultBackend for RestBackend {
         self.update_item(&with_app_match(item, m))
     }
 
-    /// **Refused.** There is no folder endpoint in [`crate::rest::api`].
+    /// **Cost: one full sync, then one `POST /api/folders`.**
     ///
-    /// The Bitwarden API does have one (`POST /api/folders`), and writing it
-    /// is a task; inventing it inside a backend implementation is not, because
-    /// a folder name is encrypted under the user key and a folder write has
-    /// its own full-replace semantics to get right. Refusing here is the
-    /// honest state of this crate, and it is visible: a Folders sidebar that
-    /// says "couldn't create -- this backend can't" is a bug report, while one
-    /// that silently creates nothing is a mystery.
-    fn create_folder(&self, _name: &str) -> Result<Folder, VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "create_folder",
-            why: "this crate's REST client has no folder endpoints yet -- only ciphers -- and a \
-                  backend will not invent one",
-        })
+    /// The sync is for the keys and nothing else -- a folder name is
+    /// [`crate::rest::crypto::encrypt`]ed under the user key, and the user key
+    /// arrives on the sync payload, so a create cannot be one request here for
+    /// [`Self::create_item`]'s reason exactly.
+    ///
+    /// # This was a refusal, and what the refusal asked for
+    ///
+    /// It refused because [`crate::rest::api`] had no folder endpoint and
+    /// because "a folder name is encrypted under the user key" is not
+    /// something to work out inside a backend method. Both halves are now
+    /// answered somewhere that is not this file: the route is in
+    /// [`crate::rest::api::RestClient::create_folder`] and the encryption is
+    /// [`crate::rest::write::encrypt_folder_name`], which is the crate's one
+    /// encryptor reached through the crate's one mapper. **There is no
+    /// ciphertext in this method**, and no second way to build a folder body.
+    ///
+    /// # The answer is read back, and it is read back all the way
+    ///
+    /// The standard [`Self::archive_item`] set: a status is not a
+    /// confirmation. The server's echoed folder is decrypted with
+    /// [`decrypt_folder`] -- the *same* mapper a sync uses, so a written
+    /// folder and a listed one cannot disagree -- and three things must hold
+    /// or this is an error rather than an `Ok`: the answer must be a folder
+    /// at all, it must carry a non-empty `id`, and its name must decrypt back
+    /// to the name that was asked for. The last one is the one that matters:
+    /// it is the only check that would catch a server that stored something
+    /// other than what was sent, and it costs one AES-CBC decrypt of a folder
+    /// name.
+    fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+        let (_, keys) = self.synced()?;
+        let body = encrypt_folder_name(name, &keys).map_err(crypto_error)?;
+        let mut state = self.locked();
+        let answer = self.client.create_folder(&mut state.session, &body).map_err(rest_error)?;
+        drop(state);
+        confirmed_folder(&answer, name, None, &keys)
     }
 
-    /// **Refused**, for [`Self::create_folder`]'s reason exactly.
-    fn update_folder(&self, _id: &str, _name: &str) -> Result<Folder, VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "update_folder",
-            why: "this crate's REST client has no folder endpoints yet -- only ciphers -- and a \
-                  backend will not invent one",
-        })
+    /// **Cost: one full sync, then one `PUT /api/folders/{id}`.**
+    ///
+    /// [`Self::create_folder`]'s shape, with the id in the path and one more
+    /// thing checked in the answer: the folder the server echoes must be
+    /// **the folder that was asked about**. A rename whose answer carries a
+    /// different id is not this folder renamed, whatever its status said.
+    ///
+    /// **An id this vault does not hold is not created here.** The Bitwarden
+    /// folder `PUT` is not an upsert, and this method does not turn one into
+    /// one; a server that answers `404` reaches the caller as an error, which
+    /// is what a rename of something that is gone should be.
+    ///
+    /// The whole record is replaced, which for a folder is the name -- see
+    /// [`crate::rest::write::encrypt_folder_name`] on why that is a sentence
+    /// about a one-field model and not the cipher hazard in miniature.
+    fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
+        let (_, keys) = self.synced()?;
+        let body = encrypt_folder_name(name, &keys).map_err(crypto_error)?;
+        let mut state = self.locked();
+        let answer =
+            self.client.update_folder(&mut state.session, id, &body).map_err(rest_error)?;
+        drop(state);
+        confirmed_folder(&answer, name, Some(id), &keys)
     }
 
-    /// **Refused**, for [`Self::create_folder`]'s reason exactly.
+    /// **Cost: one `DELETE /api/folders/{id}`. No sync.**
     ///
-    /// Worth stating separately for this one: deleting a folder on Bitwarden
-    /// moves every item in it to no folder, so a guessed endpoint that half
-    /// worked would be a guess with the user's whole vault downstream of it.
-    fn delete_folder(&self, _id: &str) -> Result<(), VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "delete_folder",
-            why: "this crate's REST client has no folder endpoints yet -- only ciphers -- and a \
-                  backend will not invent one",
-        })
+    /// Nothing is encrypted, so nothing needs a key: the id is the whole
+    /// request, as it is for [`Self::delete_item`].
+    ///
+    /// # The items in the folder are not deleted, and this backend does not
+    /// # touch them
+    ///
+    /// The refusal this replaces warned that a half-working guess here would
+    /// be a guess with the user's whole vault downstream of it, so the fact is
+    /// worth stating where it is now true: deleting a folder on Bitwarden
+    /// **un-files** the items in it. Their `folderId` is cleared server-side
+    /// and they appear, intact, under no folder on the next sync. Nothing here
+    /// edits a cipher to make that happen -- a client-side sweep would be a
+    /// second opinion about a change the server already makes, and a partial
+    /// sweep is how items go missing.
+    ///
+    /// `bw serve` forwards `DELETE /object/folder/{id}` to this same server
+    /// route and likewise edits no item, so **the two backends agree**: a user
+    /// who deletes a folder on either one keeps every item that was in it.
+    ///
+    /// # An empty answer is a success
+    ///
+    /// Deliberately, and it is the opposite of what an empty answer means to
+    /// [`Self::archive_item`]. The argument is
+    /// [`crate::rest::api::RestClient::delete_folder`]'s: archive is a bulk
+    /// route whose body is its only per-id evidence, while this route's id is
+    /// in the path and its status *is* the answer about that id. Treating a
+    /// bodiless `204` as a failure here would report a delete that worked as
+    /// one that did not, and send the caller back to delete it again.
+    fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
+        let mut state = self.locked();
+        self.client.delete_folder(&mut state.session, id).map_err(rest_error)
     }
 
     /// **Cost: one full sync, then one `POST /api/ciphers`.**
@@ -668,6 +744,80 @@ impl VaultBackend for RestBackend {
 
 // ---- the small shared pieces -------------------------------------------------
 
+/// The folder a write actually produced, or a refusal saying it cannot be
+/// confirmed.
+///
+/// # This is the "never a false `Ok`" rule, for folders
+///
+/// Both folder writes answer with the server's own copy of the record, and
+/// this is the one place that copy is judged. A `200` says the request was
+/// accepted; it does not say the folder is now called what was asked for, and
+/// the difference between those two is a rename that silently did not happen.
+///
+/// Four things must hold, and every one of them is a `?` and not an `unwrap`
+/// -- the target is a self-hosted server that answers with a subset of
+/// Bitwarden's fields, so every step here is something it could have omitted:
+///
+/// 1. The answer decrypts as a folder at all ([`decrypt_folder`], the same
+///    mapper `GET /api/sync` goes through).
+/// 2. Its `id` is not empty -- a created folder with no id is a folder the
+///    caller cannot then rename, delete, or file anything into.
+/// 3. If `expected_id` is given, the answer is about *that* folder.
+/// 4. Its `name` decrypts back to exactly the `name` that was sent.
+///
+/// # Why the name is compared rather than trusted
+///
+/// It is the only check that distinguishes "the server stored this" from "the
+/// server answered". It also closes the failure that would be quietest: a
+/// name that did not decrypt comes out of [`decrypt_folder`] as the empty
+/// string with a recorded failure, and without this comparison a rename would
+/// return a [`Folder`] whose `name` is `""` -- straight into the Folders
+/// sidebar as a blank row, reported as a success.
+///
+/// **No secret reaches the error.** A folder name is vault plaintext, so the
+/// mismatch arm says that the name differs and does not say what either name
+/// was; the id is a server-assigned GUID that already appears in URLs, and is
+/// the only thing that makes the wrong-folder arm actionable.
+fn confirmed_folder(
+    answer: &serde_json::Value,
+    name: &str,
+    expected_id: Option<&str>,
+    keys: &VaultKeys,
+) -> Result<Folder, VaultError> {
+    let (folder, failures) = decrypt_folder(answer, keys).ok_or_else(|| {
+        VaultError::Parse(
+            "the folder the server answered with: it is not a folder record with an id".to_string(),
+        )
+    })?;
+    if folder.id.is_empty() {
+        return Err(VaultError::Parse(
+            "the folder the server answered with: it carries no id".to_string(),
+        ));
+    }
+    if let Some(expected) = expected_id {
+        if folder.id != expected {
+            return Err(VaultError::Http(format!(
+                "this write asked about the folder {expected} and the server answered about \
+                 {}, so the change cannot be confirmed",
+                folder.id
+            )));
+        }
+    }
+    if folder.name != name {
+        // `failures` is counted, not printed with its `why` alone, because
+        // the two cases read very differently to whoever sees this: a name
+        // that would not decrypt is a key problem, and a name that decrypted
+        // to something else is a server problem.
+        return Err(VaultError::Http(format!(
+            "the server accepted this folder write but the folder it answered with does not \
+             carry the name that was sent, so the change may not have been made ({} field(s) of \
+             the answer could not be decrypted)",
+            failures.len()
+        )));
+    }
+    Ok(folder)
+}
+
 /// Whether a cipher carries a non-null value at `key`.
 ///
 /// `deletedDate` and `archivedDate` both ride [`VaultItem::other`] (neither is
@@ -877,6 +1027,34 @@ mod tests {
         .to_string()
     }
 
+    /// A folder as a folder endpoint answers it: the id the server assigned
+    /// and the name **encrypted under the fixture user key**, which is the
+    /// only shape `confirmed_folder` can accept and the reason these tests
+    /// cannot be passed by a server echoing plaintext.
+    fn folder_answer(id: &str, name: &str) -> String {
+        serde_json::json!({
+            "object": "folder",
+            "id": id,
+            "name": enc(name),
+            "revisionDate": "2023-05-05T00:00:00.000000Z"
+        })
+        .to_string()
+    }
+
+    /// A bulk archive route's answer for one id, stamped or not.
+    fn archive_answer(id: &str, archived: bool) -> String {
+        let stamp = if archived {
+            serde_json::Value::String("2022-03-01T00:00:00.000000Z".to_string())
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::json!({
+            "object": "list",
+            "data": [{ "object": "cipher", "id": id, "archivedDate": stamp }]
+        })
+        .to_string()
+    }
+
     /// A logged-in backend against a `mockito` server that answers prelogin,
     /// the grant and `/api/sync`.
     ///
@@ -977,41 +1155,256 @@ mod tests {
         assert!(matches!(err, VaultError::Http(ref m) if m.contains("nope")), "{err:?}");
     }
 
-    /// **The heart of the refusal contract.** Every operation this backend
-    /// cannot do says so by name; none of them answers `Ok` with nothing in
-    /// it.
+    /// **The heart of the refusal contract, and there is nothing left in
+    /// it.** This backend refuses no operation.
     ///
-    /// One list rather than four tests, so that a refusal added later is one
-    /// line here and the shared property -- names the backend, names the
-    /// operation, gives a reason -- is stated once.
+    /// **This list used to be six, then four, then three, and is now
+    /// empty.** `archive_item`, `unarchive_item` and both halves of
+    /// `generate` went first; the three folder writes went last. Every one of
+    /// them was removed because it was implemented, not because the contract
+    /// loosened -- each is asserted against a real route in this file
+    /// (`an_archive_sends_a_batch_of_one_and_reads_the_answer_back`,
+    /// `a_password_and_a_passphrase_are_both_generated_locally`,
+    /// `a_folder_create_puts_the_encrypted_name_on_the_wire_and_learns_the_id`
+    /// and its neighbours).
     ///
-    /// **This list used to be six, then four, and is now three.**
-    /// `archive_item`, `unarchive_item` and both halves of `generate` were
-    /// removed from it because they were implemented, not because the contract
-    /// loosened: the first two are asserted against real routes in
-    /// `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`, and
-    /// `generate` in `a_password_and_a_passphrase_are_both_generated_locally`.
-    /// The passphrase half was the last to go: it is answered now from the
-    /// word list installed beside the executable, and what remains a refusal
-    /// there is a word list that is absent or does not verify, which is an
-    /// installation fault rather than a missing decision and so has no place
-    /// in a list of operations this backend cannot do.
+    /// So the test inverts: instead of listing what refuses, it drives every
+    /// operation that ever refused and asserts that **none** of them answers
+    /// [`VaultError::Unsupported`]. A refusal reintroduced by accident fails
+    /// here; a refusal reintroduced on purpose has to delete this test, which
+    /// is a thing a reviewer sees.
+    ///
+    /// The one `Unsupported` this backend can still produce is not an
+    /// operation refusal: `generate` maps a missing or altered passphrase
+    /// word list to it, which is an installation fault rather than a decision
+    /// this backend declined to take. The word list is present in this
+    /// checkout, so the call below exercises the ordinary path.
     #[test]
-    fn every_operation_this_backend_cannot_do_refuses_by_name() {
-        let (_server, backend) = logged_in();
-        let refusals: Vec<(&str, VaultError)> = vec![
-            ("create_folder", backend.create_folder("x").expect_err("refused")),
-            ("update_folder", backend.update_folder("f1", "x").expect_err("refused")),
-            ("delete_folder", backend.delete_folder("f1").expect_err("refused")),
+    fn no_operation_this_backend_offers_refuses_any_more() {
+        let (mut server, backend) = logged_in();
+        // Every folder route answers, so that a *refusal* is distinguishable
+        // from an ordinary transport or shape failure -- this test is about
+        // `Unsupported` and nothing else.
+        server
+            .mock("POST", "/api/folders")
+            .with_body(folder_answer("f9", "x"))
+            .expect_at_least(0)
+            .create();
+        server
+            .mock("PUT", "/api/folders/f1")
+            .with_body(folder_answer("f1", "x"))
+            .expect_at_least(0)
+            .create();
+        server.mock("DELETE", "/api/folders/f1").with_status(204).expect_at_least(0).create();
+        server
+            .mock("PUT", "/api/ciphers/archive")
+            .with_body(archive_answer("live-1", true))
+            .expect_at_least(0)
+            .create();
+        server
+            .mock("PUT", "/api/ciphers/unarchive")
+            .with_body(archive_answer("arch-1", false))
+            .expect_at_least(0)
+            .create();
+
+        let outcomes: Vec<(&str, Option<VaultError>)> = vec![
+            ("create_folder", backend.create_folder("x").err()),
+            ("update_folder", backend.update_folder("f1", "x").err()),
+            ("delete_folder", backend.delete_folder("f1").err()),
+            ("archive_item", backend.archive_item("live-1").err()),
+            ("unarchive_item", backend.unarchive_item("arch-1").err()),
+            (
+                "generate",
+                backend.generate(&GenerateRequest::Password(PasswordRecipe::default())).err(),
+            ),
         ];
-        for (expected, error) in refusals {
-            let VaultError::Unsupported { backend: who, operation, why } = error else {
-                panic!("{expected} did not refuse by name: {error:?}");
-            };
-            assert_eq!(operation, expected);
-            assert_eq!(who, BACKEND);
-            assert!(why.len() > 30, "{expected}'s reason is not a reason: {why}");
+        for (operation, outcome) in outcomes {
+            assert!(
+                !matches!(outcome, Some(VaultError::Unsupported { .. })),
+                "{operation} refuses again: {outcome:?}"
+            );
         }
+    }
+
+    // ---- the three folder writes -------------------------------------------
+
+    /// A folder name that would be unmistakable on the wire. Never a real
+    /// word, so a hit is a hit.
+    const FOLDER_NEEDLE: &str = "NEEDLE-folder-name-never-in-the-clear";
+
+    /// **The replacement for the create refusal.**
+    ///
+    /// Four things, and every one of them was a way the refusal could have
+    /// been lifted wrongly:
+    ///
+    /// 1. `POST`, to `/api/folders` -- not the cipher route, not a `PUT`.
+    /// 2. The bearer token is on it.
+    /// 3. The body carries the name as an **`EncString`** and the plaintext
+    ///    appears nowhere in it. This is the assertion that matters: the
+    ///    obvious wrong implementation of this method is `{"name": name}`,
+    ///    which is exactly what `bw serve`'s backend correctly sends to its
+    ///    own local process and exactly what must never leave this one.
+    /// 4. The created folder's `id` comes from the **answer**, because that
+    ///    is the only place it exists.
+    #[test]
+    fn a_folder_create_puts_the_encrypted_name_on_the_wire_and_learns_the_id() {
+        let (mut server, backend) = logged_in();
+        let post = server
+            .mock("POST", "/api/folders")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_request(|request| {
+                let body = request.utf8_lossy_body().expect("a body").to_string();
+                let json: serde_json::Value =
+                    serde_json::from_str(&body).expect("the body is JSON");
+                let name = json.get("name").and_then(|v| v.as_str()).expect("a name key");
+                !body.contains(FOLDER_NEEDLE)
+                    && name.starts_with("2.")
+                    && name.parse::<crate::rest::crypto::EncString>().is_ok()
+                    // A create has no id yet, and must not send an empty one.
+                    && json.get("id").is_none()
+            })
+            .with_body(folder_answer("f9", FOLDER_NEEDLE))
+            .expect(1)
+            .create();
+
+        let folder = backend.create_folder(FOLDER_NEEDLE).expect("the folder is created");
+        post.assert();
+        assert_eq!(folder.id, "f9", "the id must come from the server's answer");
+        assert_eq!(folder.name, FOLDER_NEEDLE);
+    }
+
+    /// **The replacement for the rename refusal.** The id is in the path, the
+    /// path is the *folder* one, and the name is still ciphertext.
+    ///
+    /// The cipher route is watched as well: a rename that reached
+    /// `/api/ciphers/...` would be this backend rewriting items in order to
+    /// rename a folder.
+    #[test]
+    fn a_folder_rename_puts_the_encrypted_name_to_the_folder_path() {
+        let (mut server, backend) = logged_in();
+        let put = server
+            .mock("PUT", "/api/folders/f1")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_request(|request| {
+                let body = request.utf8_lossy_body().expect("a body").to_string();
+                !body.contains(FOLDER_NEEDLE) && body.contains("2.")
+            })
+            .with_body(folder_answer("f1", FOLDER_NEEDLE))
+            .expect(1)
+            .create();
+        // Default expectation, so `matched()` means "was hit" -- see the
+        // archive test for why this is not an `expect(0)`.
+        let cipher_route = server.mock("PUT", "/api/ciphers/live-1").with_status(200).create();
+
+        let folder = backend.update_folder("f1", FOLDER_NEEDLE).expect("the rename lands");
+        put.assert();
+        assert_eq!(folder.id, "f1");
+        assert_eq!(folder.name, FOLDER_NEEDLE);
+        assert!(!cipher_route.matched(), "a folder rename touched a cipher");
+    }
+
+    /// **The replacement for the delete refusal**, and the two things that
+    /// refusal was most worried about.
+    ///
+    /// 1. `DELETE /api/folders/{id}` and nothing else. **No cipher is
+    ///    touched**: the server un-files the items itself, and a client-side
+    ///    sweep is how items go missing. The cipher routes are watched, and a
+    ///    hit on any of them fails this test.
+    /// 2. **An empty `204` is a success.** That is the deliberate difference
+    ///    from the archive routes, argued in `RestClient::delete_folder`, and
+    ///    it is pinned here because the opposite reading would send a caller
+    ///    back to delete an already-deleted folder.
+    ///
+    /// It also pays no sync: there is no key to fetch for a request that is
+    /// just an id, and the `expect(0)`-free idiom above is used again.
+    #[test]
+    fn a_folder_delete_hits_only_its_own_route_and_an_empty_answer_is_a_success() {
+        let (mut server, backend) = logged_in();
+        let delete = server.mock("DELETE", "/api/folders/f1").with_status(204).expect(1).create();
+        let cipher_edit = server.mock("PUT", "/api/ciphers/live-1").with_status(200).create();
+        let cipher_delete = server.mock("DELETE", "/api/ciphers/live-1").with_status(200).create();
+
+        backend.delete_folder("f1").expect("an empty 204 is a delete that happened");
+        delete.assert();
+        assert!(!cipher_edit.matched(), "a folder delete edited an item");
+        assert!(!cipher_delete.matched(), "a folder delete deleted an item");
+    }
+
+    /// The delete is id-only and pays for no sync, matching the cost its doc
+    /// claims -- the same shape as `the_archive_writes_do_not_pay_for_a_sync`,
+    /// with no `/api/sync` mock at all so a sync would be a refused
+    /// connection.
+    #[test]
+    fn a_folder_delete_does_not_pay_for_a_sync() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/identity/accounts/prelogin")
+            .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
+            .create();
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_body(r#"{"access_token":"AT-1","expires_in":3600}"#)
+            .create();
+        server.mock("DELETE", "/api/folders/f1").with_status(200).expect(1).create();
+        let client = RestClient::new(server.url());
+        let authenticated =
+            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let backend = RestBackend::new(client, authenticated);
+        backend.delete_folder("f1").expect("the delete, with no sync behind it");
+    }
+
+    /// **The false-`Ok` guard, which is why this stopped being a refusal
+    /// safely.**
+    ///
+    /// Every shape below is answered `200`. None of them proves the folder is
+    /// now called what was asked for, so none of them may be an `Ok`:
+    ///
+    /// * a body that is not a folder record at all;
+    /// * a folder with no `id`, which a caller could never then use;
+    /// * on a rename, a folder with a **different** id -- an answer about
+    ///   somebody else's folder;
+    /// * a name that is valid ciphertext of **something else** -- the server
+    ///   stored a different name;
+    /// * a name in the **clear** -- which does not decrypt, comes back as the
+    ///   empty string, and would otherwise reach the sidebar as a blank row
+    ///   reported as a success.
+    #[test]
+    fn a_folder_write_the_server_did_not_confirm_is_an_error_and_never_ok() {
+        let answers = [
+            ("not a folder", r#"{"object":"list","data":[]}"#.to_string()),
+            ("no id", serde_json::json!({ "name": enc(FOLDER_NEEDLE) }).to_string()),
+            (
+                "a different name",
+                serde_json::json!({ "id": "f1", "name": enc("something else") }).to_string(),
+            ),
+            (
+                "a plaintext name",
+                serde_json::json!({ "id": "f1", "name": FOLDER_NEEDLE }).to_string(),
+            ),
+        ];
+        for (what, body) in answers {
+            let (mut server, backend) = logged_in();
+            server.mock("POST", "/api/folders").with_body(body.clone()).create();
+            server.mock("PUT", "/api/folders/f1").with_body(body.clone()).create();
+
+            let created = backend.create_folder(FOLDER_NEEDLE);
+            assert!(created.is_err(), "a create was Ok on an answer that was {what}");
+            let renamed = backend.update_folder("f1", FOLDER_NEEDLE);
+            assert!(renamed.is_err(), "a rename was Ok on an answer that was {what}");
+        }
+
+        // And the one that only a rename can get wrong: the right shape,
+        // the right name, the wrong folder.
+        let (mut server, backend) = logged_in();
+        server
+            .mock("PUT", "/api/folders/f1")
+            .with_body(folder_answer("a-different-folder", FOLDER_NEEDLE))
+            .create();
+        let err = backend.update_folder("f1", FOLDER_NEEDLE).expect_err("the wrong folder");
+        assert!(
+            matches!(err, VaultError::Http(ref m) if m.contains("a-different-folder")),
+            "{err:?}"
+        );
     }
 
     /// **The replacement for two of the refusals that used to be in the list

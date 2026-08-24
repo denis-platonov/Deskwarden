@@ -387,6 +387,25 @@ impl VaultKeys {
         Ok((Self { user, orgs }, failures))
     }
 
+    /// The user key itself.
+    ///
+    /// **Only for values that are always wrapped under the user key and never
+    /// under an organisation's or a cipher's own** -- which, of everything
+    /// this crate writes, is exactly a folder's `name`. Folders are personal
+    /// on Bitwarden: there is no organisation folder, so there is no
+    /// `organizationId` to resolve and [`Self::owner_of`] has nothing to
+    /// choose between.
+    ///
+    /// `pub(crate)` and not `pub`, and it hands out a borrow rather than a
+    /// copy: [`crate::rest::write`] needs it to encrypt a folder name, and
+    /// nothing outside this crate has any business holding the user key.
+    /// Reaching for this to encrypt a *cipher* field would be a bug -- use
+    /// [`CipherKeys::for_cipher`], which is the thing that knows the answer
+    /// can be one of three keys.
+    pub(crate) fn user(&self) -> &SymmetricKey {
+        &self.user
+    }
+
     /// The key a cipher's *own* key is wrapped under, or that its fields are
     /// wrapped under when it has none.
     fn owner_of(&self, organization_id: Option<&str>) -> Option<&SymmetricKey> {
@@ -507,6 +526,32 @@ pub fn decrypt_cipher(
     let mut failures = Vec::new();
     let item = map_cipher(raw, keys, &mut failures)?;
     Some((item, failures))
+}
+
+/// **One folder, decrypted on its own** -- the folder write endpoints' answer.
+///
+/// `POST /api/folders` and `PUT /api/folders/{id}` reply with the server's own
+/// copy of the folder they just wrote: the `id` it assigned (the only place a
+/// created folder's id exists), its `revisionDate`, and the `name` still
+/// encrypted under the user key. This is [`decrypt_cipher`]'s counterpart for
+/// them, and it exists for the same two reasons -- a caller learns the id
+/// without a second `GET /api/sync`, and the answer is *read* rather than
+/// assumed.
+///
+/// It goes through the same [`map_folder`] the whole-sync path uses, so a
+/// written folder and a synced one cannot be decrypted two different ways.
+///
+/// Returns `None` for a value that is not a JSON object or has no `id`, on
+/// exactly [`decrypt_cipher`]'s terms. The failures are returned rather than
+/// pushed into a caller's list, because a single folder has no vault to
+/// belong to.
+pub fn decrypt_folder(
+    raw: &serde_json::Value,
+    keys: &VaultKeys,
+) -> Option<(Folder, Vec<DecryptFailure>)> {
+    let mut failures = Vec::new();
+    let folder = map_folder(raw, &keys.user, &mut failures)?;
+    Some((folder, failures))
 }
 
 /// One cipher.

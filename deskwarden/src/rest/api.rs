@@ -81,7 +81,7 @@ use zeroize::Zeroizing;
 use crate::http_agent::TotalBounded;
 use crate::rest::crypto::{CryptoError, Kdf, MasterKey, master_key};
 use crate::rest::sync::SyncResponse;
-use crate::rest::write::MappedCipher;
+use crate::rest::write::{MappedCipher, MappedFolder};
 
 /// Connect timeout. Larger than [`crate::vault_bridge`]'s three seconds, and
 /// the difference is the situation rather than caution: that one dials a Node
@@ -774,6 +774,95 @@ impl RestClient {
         }
     }
 
+    // ---- writing one folder -------------------------------------------------
+
+    /// `POST /api/folders` -- a new folder.
+    ///
+    /// `folder` is a [`MappedFolder`], which only
+    /// [`crate::rest::write::encrypt_folder_name`] can produce, for the reason
+    /// [`Self::create_cipher`] takes a [`MappedCipher`]: the body carries a
+    /// vault plaintext in encrypted form, and the type is what keeps a
+    /// hand-built one -- which for a folder would be the *cleartext* name --
+    /// out of this module. Nothing here formats the body.
+    ///
+    /// Returns the server's own copy: the `id` it assigned, which is the only
+    /// place a created folder's id exists, and the name still encrypted.
+    pub fn create_folder(
+        &self,
+        session: &mut Session,
+        folder: &MappedFolder,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = format!("{}/api/folders", self.base_url);
+        self.refreshing(session, |session| {
+            self.value_from(
+                self.bearer(self.write_agent.post(&url), session).send_json(folder.body()),
+            )
+        })
+    }
+
+    /// `PUT /api/folders/{id}` -- a rename.
+    ///
+    /// **This replaces the whole folder**, exactly as [`Self::update_cipher`]
+    /// does for a cipher -- but a folder has one writable field, so the whole
+    /// folder *is* the name and there is no unmodelled state to lose. See
+    /// [`crate::rest::write::encrypt_folder_name`], which is where that
+    /// difference is argued rather than assumed.
+    ///
+    /// Returns the server's own copy, on [`Self::create_folder`]'s terms.
+    pub fn update_folder(
+        &self,
+        session: &mut Session,
+        id: &str,
+        folder: &MappedFolder,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.folder_url(id)?;
+        self.refreshing(session, |session| {
+            self.value_from(
+                self.bearer(self.write_agent.put(&url), session).send_json(folder.body()),
+            )
+        })
+    }
+
+    /// `DELETE /api/folders/{id}` -- the folder, and only the folder.
+    ///
+    /// # What happens to the items in it
+    ///
+    /// They survive. Bitwarden un-files them: every cipher whose `folderId`
+    /// was this folder comes back from the next sync with no folder. Nothing
+    /// is deleted, nothing is trashed, and this client does **not** touch the
+    /// ciphers itself -- doing so would be a second, non-atomic opinion about
+    /// a change the server has already made correctly, and a partial one is
+    /// how items go missing. `bw serve`'s `DELETE /object/folder/{id}` reaches
+    /// the same server route and behaves the same way, so the two backends
+    /// agree.
+    ///
+    /// # An empty body is success here, unlike on the archive routes
+    ///
+    /// This goes through [`Self::unit_from`], so a `200` or `204` with no body
+    /// at all is `Ok(())` -- the opposite of
+    /// [`RestClient::bulk_archive`], where an empty body is
+    /// [`RestError::BulkIdMissing`]. That is not an inconsistency, it is the
+    /// same rule reaching different answers on two different shapes of route:
+    ///
+    /// * A **bulk** route's status covers the *request*, not each id inside
+    ///   it, so the body is the only per-id evidence there is and a missing
+    ///   body is a missing answer.
+    /// * This route carries its one id **in the path**. The status *is* the
+    ///   per-id answer: there is no other id it could be about, and a `404`
+    ///   or a `400` is how the server declines this exact folder. There is
+    ///   nothing left for a body to confirm.
+    ///
+    /// It is also the same reading [`Self::trash_cipher`],
+    /// [`Self::restore_cipher`] and [`Self::hard_delete_cipher`] already make
+    /// of their own empty answers, and a delete that returned an error for a
+    /// delete that worked would push a caller into deleting twice.
+    pub fn delete_folder(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.folder_url(id)?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
+        })
+    }
+
     // ---- the plumbing ------------------------------------------------------
 
     /// The token discipline every authenticated call in this module shares:
@@ -813,6 +902,21 @@ impl RestClient {
             return Err(RestError::UnsafeId);
         }
         Ok(format!("{}/api/ciphers/{}{}", self.base_url, id, suffix))
+    }
+
+    /// `{base}/api/folders/{id}`, with the id checked first.
+    ///
+    /// [`Self::cipher_url`]'s check applied to the other id this module puts
+    /// in a path, from the same [`is_url_path_safe`] -- so a folder id and a
+    /// cipher id cannot come to be validated by two different rules. See
+    /// [`RestError::UnsafeId`] for why a server-supplied id is checked at all;
+    /// the `DELETE` below is exactly the request that must not be aimed
+    /// somewhere else.
+    fn folder_url(&self, id: &str) -> Result<String, RestError> {
+        if !is_url_path_safe(id) {
+            return Err(RestError::UnsafeId);
+        }
+        Ok(format!("{}/api/folders/{}", self.base_url, id))
     }
 
     /// Puts the bearer token on a request.
@@ -1638,14 +1742,15 @@ mod tests {
         assert!(!production.contains("mockito"), "the cut left test code in the production half");
         assert!(tests.contains("mockito"), "the cut left no test code in the test half");
 
-        // Four body senders in the whole module, and no more. **This was
-        // three.** The fourth arrived with the archive routes, and the count
-        // was raised only after accounting for it below -- a guard whose
-        // number is bumped without naming the new caller is a guard with a
-        // hole in it.
+        // Six body senders in the whole module, and no more. **This was
+        // three, then four.** The fourth arrived with the archive routes; the
+        // fifth and sixth are the two folder writers, and the count was
+        // raised only after accounting for them below -- a guard whose number
+        // is bumped without naming the new caller is a guard with a hole in
+        // it.
         assert_eq!(
             production.matches("send_json(").count(),
-            4,
+            6,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -1653,6 +1758,15 @@ mod tests {
             production.matches("send_json(cipher.body())").count(),
             2,
             "a cipher endpoint stopped sending a MappedCipher"
+        );
+        // Two more are the folder writers, and both send a mapped folder --
+        // which is the type that makes the name ciphertext. A folder endpoint
+        // that stopped sending one would be a folder endpoint that had gained
+        // the ability to send a name in the clear.
+        assert_eq!(
+            production.matches("send_json(folder.body())").count(),
+            2,
+            "a folder endpoint stopped sending a MappedFolder"
         );
         // The third is prelogin, on the auth agent, which carries no vault data.
         assert_eq!(production.matches("self.auth_agent.post(url).send_json(body)").count(), 1);
@@ -1678,12 +1792,12 @@ mod tests {
         );
 
         // And nothing else in the module reaches for the write agent with a
-        // body: the three writers above are its only `post`/`put` with
+        // body: the five writers above are its only `post`/`put` with
         // content.
         assert_eq!(
             production.matches("self.write_agent.post(&url), session).send_json").count()
                 + production.matches("self.write_agent.put(&url), session).send_json").count(),
-            3,
+            5,
             "the write agent gained another body-carrying call"
         );
     }
@@ -1788,6 +1902,151 @@ mod tests {
         trash.assert();
         restore.assert();
         hard.assert();
+    }
+
+    // ---- the folder write endpoints ----------------------------------------
+
+    /// A body to send, out of `rest::write`'s folder mapper -- the only thing
+    /// that can produce one.
+    fn encrypted_folder() -> MappedFolder {
+        crate::rest::write::tests::a_mapped_folder()
+    }
+
+    /// The plaintext folder name these tests search the wire for and must
+    /// never find.
+    const FOLDER_SECRET: &str = crate::rest::write::tests::FOLDER_NEEDLE;
+
+    /// The whole of what the two folder writers put on the wire: the method,
+    /// the path, the bearer header, and a body whose name is **ciphertext**.
+    ///
+    /// The create and the rename are asserted together because the mistake
+    /// available is that one of them is the other: a create that `PUT`s, or a
+    /// rename that posts to the collection URL and quietly makes a second
+    /// folder.
+    #[test]
+    fn the_folder_writers_send_the_encrypted_name_to_their_own_routes() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let folder = encrypted_folder();
+        let body = folder.body().clone();
+        // Control: the fixture really is ciphertext, so the two assertions
+        // below are not passing over a body that has no name in it at all.
+        assert!(!body.to_string().contains(FOLDER_SECRET), "the fixture is not encrypted");
+        assert!(body.get("name").and_then(|v| v.as_str()).is_some_and(|n| n.starts_with("2.")));
+
+        let created = server
+            .mock("POST", "/api/folders")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(body.clone()))
+            .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
+            .expect(1)
+            .create();
+        let renamed = server
+            .mock("PUT", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(body))
+            .with_body(r#"{"object":"folder","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
+            .expect(1)
+            .create();
+
+        let answer = client.create_folder(&mut session, &folder).expect("the create");
+        assert_eq!(answer.get("id").and_then(|v| v.as_str()), Some("server-assigned-folder"));
+        client
+            .update_folder(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &folder)
+            .expect("the rename");
+        created.assert();
+        renamed.assert();
+    }
+
+    /// The delete is a `DELETE` on the folder's own path, and an answer with
+    /// **no body at all** is a success.
+    ///
+    /// That last half is the deliberate difference from the archive routes
+    /// above, where an empty body is `BulkIdMissing`. See
+    /// `RestClient::delete_folder` for why the two shapes of route read an
+    /// empty answer oppositely; this test is that decision written down
+    /// somewhere it can fail.
+    #[test]
+    fn a_folder_delete_takes_an_empty_body_as_a_success() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let deleted = server
+            .mock("DELETE", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(204)
+            .with_body("")
+            .expect(1)
+            .create();
+
+        client
+            .delete_folder(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .expect("an empty 204 is a delete that happened");
+        deleted.assert();
+    }
+
+    /// The token discipline, on a folder write: one 401, one refresh, one
+    /// retry carrying the **new** token and the same encrypted body.
+    ///
+    /// A folder write that gave up where a cipher write would have refreshed
+    /// is an inconsistency that only shows itself when a token expires
+    /// mid-session, so it is pinned rather than left to the shared helper
+    /// being shared.
+    #[test]
+    fn a_401_on_a_folder_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let folder = encrypted_folder();
+        let body = folder.body().clone();
+        let stale = server
+            .mock("POST", "/api/folders")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(401)
+            .expect(1)
+            .create();
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "refresh_token".into(),
+            )]))
+            .with_body(r#"{"access_token":"AT-2","expires_in":3600,"refresh_token":"RT-2"}"#)
+            .expect(1)
+            .create();
+        let fresh = server
+            .mock("POST", "/api/folders")
+            .match_header("Authorization", "Bearer AT-2")
+            .match_body(mockito::Matcher::Json(body))
+            .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
+            .expect(1)
+            .create();
+
+        client.create_folder(&mut session, &folder).expect("the retried create");
+        stale.assert();
+        refresh.assert();
+        fresh.assert();
+    }
+
+    /// And a folder id gets the same path check a cipher id does, before a
+    /// socket is opened.
+    #[test]
+    fn an_unsafe_id_is_refused_by_the_folder_routes_too() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let folder = encrypted_folder();
+        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
+        let put = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        for bad in ["../accounts", "a/b", "a?x=1", "", "a#b"] {
+            assert_eq!(
+                client.delete_folder(&mut session, bad).expect_err("an unsafe id"),
+                RestError::UnsafeId
+            );
+            assert_eq!(
+                client.update_folder(&mut session, bad, &folder).expect_err("an unsafe id"),
+                RestError::UnsafeId
+            );
+        }
+        assert!(!any.matched(), "an unsafe id reached the network");
+        assert!(!put.matched(), "an unsafe id reached the network");
     }
 
     /// The reactive half of the token discipline, on a write: one 401, one

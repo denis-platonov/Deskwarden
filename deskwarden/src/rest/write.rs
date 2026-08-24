@@ -202,6 +202,75 @@ pub fn encrypt_item(
     Ok(MappedCipher { body: Value::Object(out) })
 }
 
+/// A folder body **this module produced**, and the only thing
+/// [`crate::rest::api`] will send to `POST /api/folders` or
+/// `PUT /api/folders/{id}`.
+///
+/// [`MappedCipher`]'s type argument, applied to the other write this crate
+/// makes. A folder is a smaller thing -- one encrypted field -- but the
+/// failure available is the same one and it is worse in miniature: a
+/// hand-built `{"name": name}` somewhere in a backend would put a folder name
+/// on the wire **in the clear**, and it would look exactly like the body
+/// `bw serve`'s backend correctly sends to its own local process. The field is
+/// private and [`encrypt_folder_name`] is the only construction, so "this
+/// name is ciphertext" is checked by the compiler rather than remembered by a
+/// reviewer.
+///
+/// # No `Debug`, deliberately -- and for the same reason
+///
+/// The body holds an [`crate::rest::crypto::EncString`] rendered through its
+/// `Display`, which is the wire form. Nothing should format one, so nothing
+/// can.
+pub struct MappedFolder {
+    body: Value,
+}
+
+impl MappedFolder {
+    /// The JSON to send. `pub(crate)` and a borrow, on [`MappedCipher::body`]'s
+    /// terms exactly.
+    pub(crate) fn body(&self) -> &Value {
+        &self.body
+    }
+}
+
+/// One folder name, as a server-ready folder body.
+///
+/// Suitable as the body of both `POST /api/folders` and
+/// `PUT /api/folders/{id}` -- Bitwarden's folder model is a single field, so
+/// the create and the rename send the same shape and there is no third thing
+/// to get right.
+///
+/// # Under the user key, and there is no other candidate
+///
+/// A cipher needs [`CipherKeys::for_cipher`] because it may be an
+/// organisation's, or may carry a key of its own. **A folder is always
+/// personal**: Bitwarden has no organisation folder, a folder JSON has no
+/// `organizationId` and no `key`, and so the user key is not a default here --
+/// it is the only key the value can be under. That is why this takes
+/// [`VaultKeys::user`] rather than resolving anything.
+///
+/// # Nothing is laid over retained JSON, and that is not the cipher rule
+/// # being broken
+///
+/// [`encrypt_item`] must build over [`VaultItem::other`] because a cipher
+/// `PUT` replaces the whole record and this crate does not model every field
+/// of one. A folder has exactly one writable field. `id` and `revisionDate`
+/// are server-assigned and are not accepted from a client, so there is no
+/// unmodelled state for a folder body to preserve and nothing for a
+/// full-replace to destroy. Sending `{"name": ...}` alone is the whole record.
+///
+/// # Errors
+///
+/// [`CryptoError`] if the encryption fails, which at this point means the
+/// system CSPRNG did. Nothing has been sent anywhere -- nothing here sends.
+pub fn encrypt_folder_name(name: &str, keys: &VaultKeys) -> Result<MappedFolder, CryptoError> {
+    let mut out = Object::new();
+    // Through `put_text`, so the folder name is encrypted by the same two
+    // lines every cipher field is -- fresh IV per call included.
+    put_text(&mut out, "name", Some(name), keys.user())?;
+    Ok(MappedFolder { body: Value::Object(out) })
+}
+
 /// Writes one optional type object, or removes it.
 ///
 /// Removal rather than `"login": null`: a full-state PUT carrying an explicit
@@ -553,6 +622,88 @@ pub(crate) mod tests {
         });
         let (item, keys) = round_trip_in(cipher);
         encrypt_item(&item, &keys).expect("the fixture maps")
+    }
+
+    /// The plaintext folder name [`crate::rest::api`]'s folder tests search
+    /// the wire for and must never find.
+    pub(crate) const FOLDER_NEEDLE: &str = "NEEDLE-folder-never-on-the-wire";
+
+    /// A real [`MappedFolder`] for [`crate::rest::api`]'s tests, built the
+    /// honest way for [`a_mapped_folder`]'s neighbour's reason: those tests
+    /// *cannot* hand-build one, which is the whole point of the type.
+    pub(crate) fn a_mapped_folder() -> MappedFolder {
+        let (_, keys) = round_trip_in(serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "type": 1,
+            "name": enc(&key(1), "Example"),
+            "favorite": false,
+        }));
+        encrypt_folder_name(FOLDER_NEEDLE, &keys).expect("the fixture maps")
+    }
+
+    /// A folder name goes out as ciphertext and the plaintext is nowhere in
+    /// the body.
+    ///
+    /// The failure this guards is the smallest one in the file and the worst:
+    /// `{"name": name}` is a correct folder body for `bw serve`'s local
+    /// process and a plaintext leak against a real server, and the two are one
+    /// character apart in a diff.
+    #[test]
+    fn a_folder_name_is_encrypted_and_is_the_whole_body() {
+        let mapped = a_mapped_folder();
+        let body = mapped.body();
+        let printed = serde_json::to_string(body).expect("the body serialises");
+        assert!(!printed.contains(FOLDER_NEEDLE), "a folder name went out in the clear: {printed}");
+
+        let object = body.as_object().expect("an object");
+        assert_eq!(object.len(), 1, "a folder body carries more than the name: {printed}");
+        let name = object.get("name").and_then(|v| v.as_str()).expect("a name");
+        let parsed = name.parse::<EncString>().expect("the name is an EncString");
+        assert!(matches!(parsed, EncString::AesCbc256HmacSha256B64 { .. }));
+    }
+
+    /// Two folders of the same name do not share an IV, for
+    /// `no_two_encrypted_fields_share_an_iv`'s reason -- the encryption goes
+    /// through the same `put_text`, and this is what says so from the outside.
+    #[test]
+    fn two_encryptions_of_one_folder_name_differ() {
+        let (_, keys) = round_trip_in(serde_json::json!({
+            "id": "x", "type": 1, "name": enc(&key(1), "Example"), "favorite": false,
+        }));
+        let one = encrypt_folder_name("Work", &keys).expect("one");
+        let two = encrypt_folder_name("Work", &keys).expect("two");
+        assert_ne!(one.body(), two.body(), "two folder names shared an IV");
+    }
+
+    /// [`mapped_cipher_is_constructed_only_by_the_mapper`]'s other half, for
+    /// the folder body. A second construction anywhere in `src/` is what
+    /// would re-open the plaintext hole the type exists to close.
+    #[test]
+    fn a_mapped_folder_is_constructed_only_by_the_mapper() {
+        let needle = format!("MappedFolder{}{{ body", " ");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        assert!(files.len() > 20, "the source walk found only {} files", files.len());
+
+        let mut sites = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|_| panic!("{} is readable", path.display()))
+                .replace("\r\n", "\n");
+            for _ in 0..text.matches(&needle).count() {
+                sites.push(path.clone());
+            }
+        }
+        assert_eq!(sites.len(), 1, "a mapped folder is built outside the mapper: {sites:?}");
+        assert!(sites[0].ends_with("write.rs"), "{:?}", sites[0]);
+
+        let this = include_str!("write.rs").replace("\r\n", "\n");
+        let start =
+            this.find("pub fn encrypt_folder_name(").expect("encrypt_folder_name is in this file");
+        let body = &this[start..];
+        let end = body.find("\n}\n").expect("encrypt_folder_name has an end");
+        assert!(body[..end].contains(&needle), "the one construction is not inside the mapper");
     }
 
     /// **The acceptance test for this module.**
