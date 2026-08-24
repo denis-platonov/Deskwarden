@@ -1096,13 +1096,19 @@ pub struct Settings {
     /// **`true` (the default), and what an older `settings.json` without this
     /// field parses as** -- today's behaviour, unconditionally.
     ///
-    /// **Unused.** There is nothing for this to switch between yet: the
-    /// direct-REST backend in `crate::rest` is not wired into the app (see
-    /// `crate::vault_backend`), and it is the second implementation that
-    /// would make this flag mean something. It exists now only so that a
-    /// `settings.json` written before that wiring lands still has the key,
-    /// with the value that preserves current behaviour. **No Preferences row
-    /// reads or writes it.**
+    /// **Read by one pure function, and acted on by nothing.**
+    /// [`crate::backend_policy::choose`] is where this field and an account's
+    /// server URL become a backend, and that rule -- self-hosted *and* this
+    /// setting off, or else `bw serve`; unknown counts as official -- is
+    /// stated and table-tested there rather than at any call site.
+    ///
+    /// What is still missing is the startup path that would construct a
+    /// [`crate::rest::backend::RestBackend`] from that answer. Until it
+    /// exists, turning this off changes nothing, and that is deliberate:
+    /// `backend_policy::should_run`'s own doc says why a half-wired switch --
+    /// `bw serve` not started, nothing put in its place -- is worse than an
+    /// unwired one. **No Preferences row reads or writes it yet either**; the
+    /// row is drawn by whoever wires the construction, in the same change.
     pub use_official_bw_crypto: bool,
     pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --

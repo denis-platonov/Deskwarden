@@ -355,6 +355,50 @@ impl Session {
     pub fn can_refresh(&self) -> bool {
         self.refresh_token.is_some()
     }
+
+    /// The refresh token, for **persistence only** --
+    /// [`crate::user_key_store`] and nothing else.
+    ///
+    /// `pub(crate)`, borrowing rather than cloning, and named `expose` for
+    /// [`crate::rest::crypto::MasterKey::expose_bytes`]'s reasons, which apply
+    /// here with one difference: a refresh token is revocable and a master key
+    /// is not, so of the two secrets that store writes this is the *weaker*
+    /// one. It is still a bearer credential for the whole vault, and nothing
+    /// may format, log or send it anywhere but `/identity/connect/token`.
+    ///
+    /// `None` when the server sent no refresh token. A session that cannot be
+    /// refreshed is a session that cannot survive a restart, and the store
+    /// says so rather than writing a file that could never be revived.
+    pub(crate) fn expose_refresh_token(&self) -> Option<&Zeroizing<String>> {
+        self.refresh_token.as_ref()
+    }
+
+    /// A session rebuilt from nothing but a stored refresh token.
+    ///
+    /// The access token is **empty and the expiry is already past**, which is
+    /// not a placeholder but the accurate description of what has been
+    /// restored: the process that held the live bearer token exited, and all
+    /// that came back off disk is the right to ask for a new one.
+    ///
+    /// Both facts are load-bearing rather than cosmetic. [`Session::
+    /// needs_refresh_at`] answers `true` for an expiry in the past and
+    /// [`Session::can_refresh`] answers `true` for the token that is here, so
+    /// the first authenticated call made with this session refreshes *before*
+    /// it sends anything -- through `RestClient::refreshing`, which every
+    /// authenticated route in this module already goes through, with no new
+    /// path and no caller obliged to remember a warm-up step. And if that
+    /// refresh fails, the empty access token cannot accidentally work: the
+    /// request goes out with an empty bearer, the server answers 401, and the
+    /// caller gets [`RestError::Unauthorized`] -- which is the signal that the
+    /// stored credentials are dead and the master password has to be asked
+    /// for again.
+    pub(crate) fn from_refresh_token(refresh_token: Zeroizing<String>) -> Self {
+        Self {
+            access_token: Zeroizing::new(String::new()),
+            refresh_token: Some(refresh_token),
+            expires_at: Some(Instant::now()),
+        }
+    }
 }
 
 /// What a successful login yields: the session, and the master key the vault

@@ -118,6 +118,12 @@ pub mod updater;
 /// password without launching the app. Opens a window and never a GL context,
 /// which is the whole point -- see the module doc.
 pub mod unlock_prompt;
+/// One account's master key and refresh token, DPAPI-wrapped, at a path its
+/// caller chooses -- `session_store`'s idiom applied to a stronger secret.
+/// Only the direct-REST backend needs it, so nothing in the running app
+/// writes one yet; see its own docs for what a caller owes the user when a
+/// stored record stops working.
+pub mod user_key_store;
 /// The seam between the app and whatever is holding the vault: the twenty
 /// vault operations as a trait, implemented today only by `bw serve`'s
 /// client. Nothing about what any call does over the wire lives here.

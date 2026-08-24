@@ -328,7 +328,48 @@ pub fn master_key(password: &[u8], email: &str, kdf: Kdf) -> Result<MasterKey, C
     Ok(MasterKey(out))
 }
 
+/// The length of a [`MasterKey`]'s raw bytes.
+///
+/// Public only so [`crate::user_key_store`]'s on-disk record can be a
+/// fixed-size layout whose length check is written against the same constant
+/// the key itself is, rather than a `32` typed out a second time.
+pub const MASTER_KEY_LEN: usize = KEY_LEN;
+
 impl MasterKey {
+    /// The raw key bytes, for **persistence only**.
+    ///
+    /// # Read this before adding a second caller
+    ///
+    /// Every other operation on a master key is a method on this type
+    /// precisely so the bytes never leave it: [`MasterKey::stretch`] and
+    /// [`MasterKey::password_hash`] are the whole of what the vault needs,
+    /// and neither hands anything out. This one does hand them out, and it
+    /// exists for exactly one reason -- [`crate::user_key_store`] has to put
+    /// the key in a DPAPI-wrapped file so that a restart does not have to ask
+    /// for the master password again, and DPAPI takes bytes.
+    ///
+    /// It is `pub(crate)` and it must stay so. The return borrows rather than
+    /// copies, so reading it makes no new buffer to forget to wipe, and the
+    /// name says `expose` so that a call site reads as a decision.
+    ///
+    /// **Never format, log or send this.** A master key opens the whole
+    /// vault, for ever -- unlike a session token, it does not expire.
+    pub(crate) fn expose_bytes(&self) -> &[u8; MASTER_KEY_LEN] {
+        &self.0
+    }
+
+    /// The inverse of [`MasterKey::expose_bytes`], for the same one caller.
+    ///
+    /// Takes the array by value and moves it straight into a [`Zeroizing`],
+    /// so the only copy that survives the call is the wiped one. It does not
+    /// and cannot check that the bytes are a real key: nothing here can tell
+    /// a rotated key from a current one, and the only thing that can is the
+    /// server refusing the vault. See [`crate::user_key_store`]'s own doc for
+    /// what the caller is required to do about that.
+    pub(crate) fn from_bytes(bytes: [u8; MASTER_KEY_LEN]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
     /// **Key stretching**: HKDF-SHA256 *expand* over the master key.
     ///
     /// Expand only -- there is no extract step, and that is correct rather

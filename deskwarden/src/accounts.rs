@@ -182,6 +182,19 @@ pub fn hello_blob_path_for(config_dir: &Path, id: &AccountId) -> PathBuf {
     data_dir_for(config_dir, id).join("hello.bin")
 }
 
+/// The account's DPAPI-wrapped **master key and refresh token**, used only by
+/// the direct-REST backend. Same reasoning as [`session_path_for`], and it
+/// matters more here: see [`crate::user_key_store`] for why a store that
+/// resolved its own path could put one account's vault key in another
+/// account's slot.
+///
+/// Inside the account directory, so [`delete_account_dir`] removes it with
+/// everything else the account owns. There is no pre-accounts layout to
+/// migrate from -- this file has never existed anywhere but here.
+pub fn user_key_path_for(config_dir: &Path, id: &AccountId) -> PathBuf {
+    data_dir_for(config_dir, id).join("userkey.bin")
+}
+
 /// Mixed into `hello`'s existing domain-separation label so **one** Windows
 /// Hello credential seals a distinct key per account.
 ///
@@ -1019,6 +1032,11 @@ mod tests {
                 hello_blob_path_for(cfg, &a).file_name(),
                 Some(std::ffi::OsStr::new("hello.bin"))
             );
+            assert_eq!(user_key_path_for(cfg, &a).parent(), Some(dir.as_path()));
+            assert_eq!(
+                user_key_path_for(cfg, &a).file_name(),
+                Some(std::ffi::OsStr::new("userkey.bin"))
+            );
             assert_eq!(dir.file_name(), Some(std::ffi::OsStr::new(a.as_str())));
         }
     }
@@ -1036,6 +1054,12 @@ mod tests {
             assert_ne!(hello_blob_path_for(cfg, &a), PathBuf::from(r"C:\cfg\hello.bin"));
             assert!(session_path_for(cfg, &a).starts_with(accounts_root(cfg)));
             assert!(hello_blob_path_for(cfg, &a).starts_with(accounts_root(cfg)));
+            // The master key is the strongest of the three -- unlike a session
+            // token it does not expire -- so the rule that keeps one account's
+            // secret out of the shared directory is asserted for it too rather
+            // than left to be inferred from the other two.
+            assert_ne!(user_key_path_for(cfg, &a), PathBuf::from(r"C:\cfg\userkey.bin"));
+            assert!(user_key_path_for(cfg, &a).starts_with(accounts_root(cfg)));
             assert!(data_dir_for(cfg, &a).starts_with(accounts_root(cfg)));
             // Positive control on `starts_with` itself, which answers `true`
             // for a prefix that is a whole component: the shared config
@@ -2014,6 +2038,7 @@ mod tests {
             for id in [&doomed.id, &keeper.id] {
                 std::fs::write(session_path_for(cfg.path(), id), b"wrapped").unwrap();
                 std::fs::write(hello_blob_path_for(cfg.path(), id), b"sealed").unwrap();
+                std::fs::write(user_key_path_for(cfg.path(), id), b"wrapped-key").unwrap();
                 std::fs::create_dir_all(data_dir_for(cfg.path(), id).join("bw")).unwrap();
             }
 
@@ -2022,6 +2047,7 @@ mod tests {
             assert!(!data_dir_for(cfg.path(), &doomed.id).exists());
             assert!(!session_path_for(cfg.path(), &doomed.id).exists());
             assert!(!hello_blob_path_for(cfg.path(), &doomed.id).exists());
+            assert!(!user_key_path_for(cfg.path(), &doomed.id).exists());
             // The positive controls, without which every assertion above
             // passes against a call that deleted the whole accounts root:
             assert!(

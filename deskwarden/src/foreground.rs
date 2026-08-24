@@ -1129,7 +1129,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 58] = [
+        const OPENS_NO_WINDOW: [&str; 59] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1300,6 +1300,12 @@ mod tests {
             // one.
             "update_panel",
             "updater",
+            // One account's DPAPI-wrapped master key and refresh token: a
+            // path, two file reads and a byte layout. It draws nothing, and
+            // the master password it saves the user from being asked for is
+            // asked for by `unlock_prompt` and `login_ui`, which own those
+            // windows and are classified in their own right.
+            "user_key_store",
             // The seam trait over the twenty vault operations, plus the
             // delegating impl for `VaultBridge`. No route, no window: it
             // moves calls that already existed, unchanged, behind a name
