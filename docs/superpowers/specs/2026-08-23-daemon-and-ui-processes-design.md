@@ -1,0 +1,86 @@
+# The daemon and the UI as separate processes
+
+**Status:** designed, not started. Supersedes the "The shape" and "What this costs, honestly" sections of `2026-08-21-daemon-and-ui-split-design.md`. That document's *measurements* stand and are still the reason this work exists; several of the costs it predicted have since turned out not to be real, and this spec records why.
+
+## The problem, measured
+
+On the owner's machine, this build:
+
+| state | private | GPU driver loaded |
+| --- | --- | --- |
+| `--autostart`, tray-resident | **11.3 MB** | no — only the `opengl32.dll` stub |
+| after the vault window has been opened once | **128.6 MB** | `nvoglv64.dll`, `nvgpucomp64.dll` |
+| the picker card alone, as a standalone process | ~2 MB | no |
+
+Closing the vault window does not undo the second row. `2026-08-21`'s measurements established that the cost is the OpenGL driver's own committed arenas, that eframe already destroys the GL context, that explicit teardown changes nothing, and that the cost *ratchets* — roughly 4 MB per open/close cycle. **Only process exit returns it.**
+
+So a single-process app has two steady states and no way back from the second. One accidental double-click on the tray icon at 9am and Deskwarden is a 128 MB process until the machine reboots.
+
+## The shape
+
+**One executable, two modes.** Not two binaries.
+
+- **Daemon** — `deskwarden.exe --autostart`. Tray, global hotkey, match engine, `bw serve` ownership, and the bare-Win32 surfaces: the unlock prompt and the account picker. Never creates a GL context. Measured at 11.3 MB.
+- **UI** — `deskwarden.exe --ui <surface>`, spawned per window. The vault window, Preferences, the save-login form, the generator, the sequence editor, rehearsal. Pays the ~90-115 MB while open and **exits when its window closes**, which is the only mechanism that returns the driver's memory.
+
+**Why one binary and not two.** Two executables buy nothing the mode flag does not, and cost:
+
+- **Version skew.** A half-applied update leaves an old daemon talking to a new UI. With one file there is nothing to mismatch — this is why the old spec listed "version-matched protocol, two-part atomic update" as a cost and why that cost disappears here.
+- **Installer, updater, signing and uninstaller stay single-target.** The self-update replaces one binary today; making it two is where a partial failure leaves an unusable install.
+- **Single-instance stays one mutex.** The old spec warned about "doubled single-instance logic"; the takeover protocol took a full session to get right for one process and should not be written twice.
+
+## The UI needs nothing passed to it
+
+This is the finding that makes the split cheap, and it is why this spec supersedes the old one's central objection.
+
+`2026-08-21` said: *"Secrets cross a process boundary. Today the posture is 'one process; a password never leaves it'. Split, and the UI must ask for what it displays or types. A named pipe with a correct DACL can be done, but it is a new surface where none exists, and the kind that is hard to prove right."*
+
+**That is no longer true, and on inspection was never necessary.** Everything the UI needs is already on disk or is a constant:
+
+- **The session token** is DPAPI-wrapped per account at `accounts::session_path_for(config_dir, id)` (`session_store.rs`). DPAPI unwraps under the user's own credentials, so a second process running as that user loads it directly. No secret crosses any new boundary because no secret is transferred at all — each process independently unwraps the same file.
+- **The active account** is `Settings::active_account` in `settings.json`.
+- **The backend port** is `bw_serve::BW_SERVE_PORT`, a compile-time constant (8087) — and the UI is the same binary, so it already has the value.
+
+So the UI is launched with a mode and a surface, and reads the rest itself. **There is no pipe, no protocol, no DACL, and no rendezvous file.** `bw serve` is an HTTP API on localhost; the UI is one of its clients, exactly as the single process is today.
+
+**Nothing secret may ever go on a command line.** Command lines are readable by other processes on the machine. The mode and the surface name are not secrets; a session token or a password would be, and passing one this way would reintroduce a worse version of the boundary this design avoids.
+
+## Lifetimes
+
+**The daemon owns `bw serve`.** It is the orchestrator; the UI is a client of the backend it runs.
+
+**The UI is *not* a kill-on-close child of the daemon's job object.** The two are loosely coupled: a daemon restart — an update, a crash, a manual quit and relaunch — must not take an open vault window with it. When the daemon comes back it brings `bw serve` up on the same constant port, and the UI's next request succeeds. Recovery is a retry, not a handshake.
+
+**The consequence, and it is genuinely new surface:** quitting from the tray no longer closes an open vault window. It leaves a UI whose backend is gone. That window must say something honest — that Deskwarden is not running, with a way to start it — rather than hanging, silently failing, or showing a stale vault as though it were live. **This state cannot occur in the current single-process app, so nothing in the codebase handles it today, and it is the part of this design most likely to be got wrong first.**
+
+**One UI per surface, not per request.** Asking for the vault window while one is open must focus the existing one, not spawn a second. The window-per-surface identity needs an owner; the existing single-instance machinery is the precedent to follow rather than a second scheme.
+
+## The staleness question — open, deliberately
+
+If the user adds an app-match in the vault window, the daemon's match engine does not know. The options, cheapest first:
+
+1. **The daemon re-syncs when a UI process exits.** No IPC — a wait on the child handle. Cost: a match added stays inert until the window closes.
+2. **A named event the UI sets on any vault write**, which the daemon waits on. Carries no data, so it is not the pipe the old spec feared, but it is a second thing that must agree.
+3. **The daemon polls `bw serve`** on an interval. Simplest to reason about, wasteful, and picks up changes from other Bitwarden clients too, which 1 and 2 do not.
+
+**This is not decided.** The owner's stated position — "daemon can just reconnect to the UI app if restarted" — settles *restart resilience*, not staleness; they are different questions and conflating them would be a design decided by accident. Option 1 is the default if nobody chooses, because it adds nothing that can disagree.
+
+## What this costs, honestly
+
+**The UI pays the full ~90-115 MB every time it opens**, and now also pays process startup — `bw serve` is already warm, but eframe, the fonts and the driver are not. The single-process app pays this once; the split pays it per window. **For someone who lives in the vault window this is strictly worse.** The win is real only if the steady state is genuinely tray-idle.
+
+**Two processes are two things to observe.** A hung UI and a hung daemon look different, log to the same file, and will need to be told apart in a bug report.
+
+**The daemon must not outlive an uninstall.** It already must not, but a second long-lived process makes the failure more visible.
+
+**The 4 MB-per-cycle ratchet moves rather than disappears** for a user who opens and closes the vault window repeatedly *within one UI process* — but that process now exits, so the ratchet is bounded by one window's lifetime instead of the app's.
+
+## What is explicitly out of scope
+
+- **The overlay's rich states.** 3c (save-login) and 3d (generator) stay egui and become UI-mode surfaces. Redrawing them in Win32 is a separate question and is not required by this split.
+- **The `wgpu` renderer.** A D3D-backed renderer measured ~40-59 MB against OpenGL's ~102 MB on this machine and would roughly halve the UI's cost — but it is blocked on a `windows-core` version conflict and is independent of this work. Doing both is better than either; neither depends on the other.
+- **The REST backend.** `deskwarden/src/rest/` will let self-hosted users drop `bw serve` entirely. That changes *what* the daemon owns, not *whether* the daemon owns it, so it composes with this design rather than competing with it.
+
+## The rule that keeps it safe
+
+**Every surface lives in exactly one renderer.** If a card exists in both the daemon's Win32 and the UI's egui, that is the "two things that must agree" defect at the worst possible place — the surface that types passwords. A Win32 "no saved login" card and an egui save-login form are different cards, and *New login* is a handoff, not a duplicate. This rule was applied when the account picker replaced design 3a, and it is why that change deleted the egui card rather than adding a second one.
