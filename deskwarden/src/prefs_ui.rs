@@ -127,6 +127,88 @@ const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
      while the vault window is open; autofill is unaffected either way.";
 
+/// The direct-REST opt-out's label.
+///
+/// The owner's own words for the setting, kept as they were written. It names
+/// `bw` because that is what the row is about and what the user will see in
+/// Task Manager; the description is where the trade is spelled out.
+const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
+
+/// The description shown under the [`OFFICIAL_CRYPTO_LABEL`] toggle, in its
+/// two states.
+///
+/// A pure function of one fact, for [`disk_cache_description`]'s reason
+/// exactly: this is the text a user reads before accepting a security
+/// tradeoff, so it is asserted by tests rather than buried in an eframe
+/// closure where nothing can reach it.
+///
+/// Four properties the tests below hold, each deliberate:
+///
+///  * **it says what turning it off buys**, in the owner's terms -- "much
+///    lighter and faster" -- rather than making the user infer it from the
+///    absence of a background process;
+///  * **it says what turning it off costs, without a euphemism**: the
+///    passwords are stored in the app. Not "credentials are cached locally";
+///    the key that opens the vault is kept on this PC and it does not expire,
+///    which is the sentence [`crate::user_key_store`]'s own module doc opens
+///    with and the one a user has to weigh;
+///  * **it says the change takes effect on restart.** A setting that appears
+///    to do nothing when clicked is a setting the user clicks again, and the
+///    thing they would be clicking is the one that decides where their master
+///    key lives. See [`draw_general`]'s note for why a live switch is not on
+///    offer;
+///  * **when the row is unavailable it says why in the row**, readable without
+///    hovering -- the same rule the disk-cache row follows, and for the same
+///    reason: a ghosted control with no explanation reads as a bug.
+fn official_crypto_description(self_hosted: bool) -> &'static str {
+    if self_hosted {
+        "On, Deskwarden's vault goes through the official Bitwarden CLI, which holds your keys \
+         in a background process of its own.\n\n\
+         Off is much lighter and faster — Deskwarden talks to your server itself and no \
+         background process runs — but in that case your passwords are stored in the app: the \
+         key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
+         session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
+         Changing this takes effect the next time Deskwarden starts."
+    } else {
+        // Not a silent no-op under the same label, and not a hidden row. The
+        // owner's rule is "disabled if not self-hosted vault to avoid issues
+        // with Bitwarden": the alternative to `bw` is this app speaking the
+        // Bitwarden server protocol itself, which is a thing to do to your own
+        // server and not to somebody else's service. A hidden row would leave
+        // a self-hoster who has not finished setting up wondering where the
+        // setting went; a ghosted one with this sentence under it says
+        // exactly what would make it available.
+        "Only available on a self-hosted server. On bitwarden.com and bitwarden.eu — and until \
+         Deskwarden knows which server this account is on — the vault always goes through the \
+         official Bitwarden CLI."
+    }
+}
+
+/// Whether the signed-in account is on a positively self-hosted server, as
+/// this page can tell.
+///
+/// **Reached through [`crate::backend_policy::is_self_hosted`], never
+/// re-decided here.** That function is the rule the *startup* path spends, and
+/// a second host test on this page is how the row comes to be enabled for an
+/// account the app will not actually switch -- or, worse, ghosted for one it
+/// will. `backend_policy`'s own doc makes the same point about
+/// `favicon::bitwarden_cloud` having one implementation and three callers;
+/// this is the fourth caller and not a fourth copy.
+///
+/// Everything that is not a signed-in account with a readable self-hosted URL
+/// is `false`, including the moments before the status lands. Unknown counts
+/// as official, which is the safe direction: the row is ghosted for an instant
+/// on a self-hosted launch, rather than clickable for an account it could not
+/// serve.
+fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
+    match status {
+        Some(AccountStatus::SignedIn { server, .. }) => {
+            crate::backend_policy::is_self_hosted(server.as_deref())
+        }
+        _ => false,
+    }
+}
+
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
 /// has to weigh.
@@ -1451,10 +1533,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
         // The one read of the published status -- see `hotkey::availability`, and
         // `draw_shortcuts` for why it is a parameter from here down.
         Section::Shortcuts => draw_shortcuts(ui, crate::hotkey::availability()),
-        Section::SyncAndAccount => draw_not_yet(
-            ui,
-            "Signing in, syncing and locking are all done from the vault window.",
-        ),
+        Section::SyncAndAccount => draw_sync_and_account(ui, state),
         Section::Updates => draw_updates(ui, state),
         Section::About => draw_about(ui, state),
     }
@@ -3139,6 +3218,72 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
 /// copy of 3e's controls: all three look like a feature that is present and
 /// broken. A sentence saying what governs the behaviour today, and where it is
 /// set if it is set anywhere, is the whole content.
+/// **Sync & account**: which backend fetches this account's vault.
+///
+/// # Why here and not on General, beside the backend row
+///
+/// It was written for General. That page's card is one row from its ceiling:
+/// the window is a fixed 780 points with no page-level scroll region, and an
+/// eighth row -- with the three paragraphs this setting's copy has to carry --
+/// pushes the auto-lock row off the bottom. Measured, not guessed: with the
+/// row there, `general_paints_every_setting_that_actually_exists` stopped
+/// finding "Lock the vault after" at all.
+///
+/// A row nobody can scroll to is worse than a row on the next page along, and
+/// this page is the one the setting is actually about --
+/// [`Section::SyncAndAccount`]'s own subtitle, unchanged, is "The Bitwarden
+/// account this vault comes from", which is the question this row answers.
+/// The old placeholder said signing in and syncing are done from the vault
+/// window, which is still true and is not a setting.
+///
+/// # What the row is
+///
+/// [`child_toggle_row`], the same control the disk-cache row uses, for the
+/// same reason: the owner's rule is that the setting is unavailable off a
+/// self-hosted server ("to avoid issues with Bitwarden"), and a row that
+/// *vanishes* is a row a user cannot find out about. Ghosted, it says what
+/// would make it available, and it hands back the stored value unchanged --
+/// so a click on a server this backend cannot serve cannot select it.
+///
+/// # It takes effect on restart, and the copy says so
+///
+/// A live switch would have to stop `bw serve`, clear
+/// [`crate::vault_cache::VaultCache`] *and* the encrypted disk copy -- which
+/// is fingerprinted per account and **not** per backend, so the file the old
+/// backend wrote is a file the new one would happily adopt -- and then derive
+/// a master key this process may not hold, from a master-password prompt
+/// raised over whatever window the user opened Preferences from. Four
+/// irreversible steps and a prompt, to save a relaunch.
+///
+/// So `main` reads `use_official_bw_crypto` once, at startup, and keeps that
+/// value for the life of the process (`BackendSettlement`) -- including across
+/// an account switch, which re-runs the *choice* but not the *setting*.
+/// Nothing re-reads the field, which is why the sentence in
+/// [`official_crypto_description`] is true rather than aspirational.
+fn draw_sync_and_account(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        let self_hosted = account_is_self_hosted((state.account_source)());
+        state.settings.use_official_bw_crypto = child_toggle_row(
+            ui,
+            OFFICIAL_CRYPTO_LABEL,
+            official_crypto_description(self_hosted),
+            state.settings.use_official_bw_crypto,
+            self_hosted,
+        );
+        row_separator(ui);
+        // The placeholder's sentence, kept as a row rather than deleted: it is
+        // still the answer to "where do I sign in and sync from", and this
+        // page is still where somebody looks for it.
+        card_row(ui, |ui| {
+            row_text(
+                ui,
+                "Signing in, syncing and locking",
+                "All three are done from the vault window and from the tray, not from here.",
+            );
+        });
+    });
+}
+
 fn draw_not_yet(ui: &mut Ui, detail: &str) {
     card(ui, |ui| {
         card_row(ui, |ui| row_text(ui, NOT_YET_TITLE, detail));
@@ -5874,6 +6019,229 @@ mod tests {
         );
     }
 
+    // -- the backend row on Sync & account ---------------------------------
+
+    /// A signed-in status for a given server, as the shells publish one.
+    fn signed_in_on(server: Option<&str>) -> AccountStatus {
+        AccountStatus::SignedIn {
+            email: Some("someone@example.com".to_string()),
+            server: server.map(str::to_string),
+        }
+    }
+
+    /// A `SyncAndAccount` state whose account row answers "self-hosted".
+    ///
+    /// Through [`PrefsState::show_account_source`] and **never through
+    /// [`publish_account_status`]**: that writes the process-wide value the
+    /// rest of this suite -- which runs in parallel in one process -- reads,
+    /// and its own doc says so. A `fn` pointer per server rather than a
+    /// closure, because that is the seam's shape.
+    fn on_a_self_hosted_server() -> PrefsState {
+        fn source() -> Option<AccountStatus> {
+            Some(AccountStatus::SignedIn {
+                email: Some("someone@example.com".to_string()),
+                server: Some("https://vault.example.com".to_string()),
+            })
+        }
+        let mut state = PrefsState::new(Settings::default());
+        state.show(Section::SyncAndAccount);
+        state.show_account_source(source);
+        state
+    }
+
+    /// The same, on an official cloud.
+    fn on_an_official_cloud() -> PrefsState {
+        fn source() -> Option<AccountStatus> {
+            Some(AccountStatus::SignedIn {
+                email: Some("someone@example.com".to_string()),
+                server: Some("https://vault.bitwarden.com".to_string()),
+            })
+        }
+        let mut state = PrefsState::new(Settings::default());
+        state.show(Section::SyncAndAccount);
+        state.show_account_source(source);
+        state
+    }
+
+    /// The page draws the row, and it draws exactly one pill -- so the copy
+    /// assertions below are about a control that is really there.
+    #[test]
+    fn sync_and_account_paints_the_backend_row_and_one_pill() {
+        let painted = paint(Section::SyncAndAccount);
+        assert!(
+            painted.contains(OFFICIAL_CRYPTO_LABEL),
+            "the backend row is not on the page it moved to; got {:?}",
+            painted.strings()
+        );
+        assert_eq!(
+            painted.count_of_size(Vec2::new(40.0, 22.0)),
+            1,
+            "one 40x22 pill: `use_official_bw_crypto`, and nothing else"
+        );
+        // The sentence the old placeholder carried is still on the page: it is
+        // still the answer to "where do I sign in from".
+        assert!(
+            painted
+                .strings()
+                .iter()
+                .any(|t| t.contains("Signing in, syncing and locking")),
+            "the page dropped what it used to say; got {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **The row is not off the bottom of the window.**
+    ///
+    /// The reason it is on this page at all: General's card was one row from
+    /// its ceiling and this row's copy is three paragraphs. A row that is
+    /// painted but below the fold is a row nobody can reach -- the window has
+    /// no page-level scroll region -- so this asserts the position and not
+    /// merely the presence, on the same fixed body the window uses.
+    #[test]
+    fn the_backend_row_and_its_copy_both_fit_on_the_page() {
+        // The **enabled** copy, which is the long one -- three paragraphs, and
+        // the reason this row did not fit on General.
+        let ctx = styled_context();
+        let mut state = on_a_self_hosted_server();
+        let painted = frame(&ctx, &mut state, &[]);
+        let label = painted.ink_of(OFFICIAL_CRYPTO_LABEL);
+        assert!(
+            label.rect.max.y < BODY_SIZE.y,
+            "the row's label is painted at y={} on a body {} tall, so it is below the fold",
+            label.rect.max.y,
+            BODY_SIZE.y
+        );
+        let copy = painted.ink_of(official_crypto_description(true));
+        assert!(
+            copy.rect.max.y < BODY_SIZE.y,
+            "the row's description runs to y={} on a body {} tall",
+            copy.rect.max.y,
+            BODY_SIZE.y
+        );
+        // The positive control for the two above: General, which is the page
+        // this row was taken off, really does end above the fold as well --
+        // so the assertions are about a measurement that can distinguish the
+        // two rather than one that passes for everything.
+        let general = paint(Section::General);
+        assert!(
+            general.ink_of(AUTO_LOCK_LABEL).rect.max.y < BODY_SIZE.y,
+            "control: General's last row is itself below the fold, so this measurement says \
+             nothing about where the backend row would have landed"
+        );
+    }
+
+    /// **Ghosted off a self-hosted server, and a click cannot select it.**
+    ///
+    /// The owner's rule, measured on the value rather than on the paint: a
+    /// stray click on `bitwarden.com` must not put this app on a backend it
+    /// will not run there.
+    #[test]
+    fn the_backend_row_is_disabled_and_inert_on_an_official_cloud() {
+        let ctx = styled_context();
+        let mut state = on_an_official_cloud();
+        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.use_official_bw_crypto,
+            "a click on the ghosted pill changed the setting anyway"
+        );
+        assert!(
+            first
+                .strings()
+                .iter()
+                .any(|t| t.contains("Only available on a self-hosted server")),
+            "the ghosted row does not say why, so it reads as a bug; got {:?}",
+            first.strings()
+        );
+    }
+
+    /// **And on a self-hosted server it is live, and wired to that field.**
+    ///
+    /// The positive control for the test above -- without it, a row that was
+    /// inert for every server would pass that one -- and the wiring assertion
+    /// for this one: it is `use_official_bw_crypto` that moves and nothing
+    /// else on the page.
+    #[test]
+    fn the_backend_row_toggles_on_a_self_hosted_server_and_moves_only_its_own_field() {
+        let ctx = styled_context();
+        let mut state = on_a_self_hosted_server();
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            !state.settings.use_official_bw_crypto,
+            "the row did not turn off on a self-hosted server"
+        );
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(state.settings.use_official_bw_crypto, "and back on again");
+    }
+
+    /// **What the enabled copy has to say**, asserted as text rather than
+    /// trusted to a reviewer: this is what a user reads before deciding where
+    /// their master key lives.
+    #[test]
+    fn the_backend_rows_copy_states_the_gain_the_cost_and_the_restart() {
+        let copy = official_crypto_description(true);
+        assert!(
+            copy.contains("much lighter and faster"),
+            "the copy does not say what turning it off buys, in the owner's own words"
+        );
+        assert!(
+            copy.contains("your passwords are stored in the app"),
+            "the copy does not say what turning it off costs, without a euphemism"
+        );
+        assert!(
+            copy.contains("never expires"),
+            "the copy does not say the stored key outlives a session, which is the one \
+             property that makes it different from the session token this app already keeps"
+        );
+        assert!(
+            copy.contains("next time Deskwarden starts"),
+            "the copy does not say the change takes effect on restart, so a user who clicks it \
+             and sees nothing happen clicks it again"
+        );
+        // The disabled twin says what would make it available, and does not
+        // repeat the trade -- there is nothing to weigh on a server this
+        // backend will not serve.
+        let ghosted = official_crypto_description(false);
+        assert!(ghosted.contains("Only available on a self-hosted server"));
+        assert!(
+            !ghosted.contains("much lighter and faster"),
+            "the unavailable row offers a trade the user cannot take"
+        );
+    }
+
+    /// `account_is_self_hosted` answers through `backend_policy`, so the two
+    /// halves of this feature cannot disagree about which servers qualify.
+    #[test]
+    fn the_row_asks_backend_policy_which_servers_are_self_hosted() {
+        assert!(account_is_self_hosted(Some(signed_in_on(Some(
+            "https://vault.example.com"
+        )))));
+        // The substring trap, from this side too.
+        assert!(account_is_self_hosted(Some(signed_in_on(Some(
+            "https://vault.bitwarden.community"
+        )))));
+        assert!(!account_is_self_hosted(Some(signed_in_on(Some(
+            "https://vault.bitwarden.com"
+        )))));
+        assert!(!account_is_self_hosted(Some(signed_in_on(Some("")))));
+        // `None` server is bitwarden.com by definition, not "not known yet".
+        assert!(!account_is_self_hosted(Some(signed_in_on(None))));
+        assert!(!account_is_self_hosted(Some(AccountStatus::SignedOut)));
+        // And the moments before anything has been published: unknown counts
+        // as official, which is the direction that leaves the row ghosted
+        // rather than clickable for an account it could not serve.
+        assert!(!account_is_self_hosted(None));
+    }
+
     // -- sections with nothing behind them ---------------------------------
 
     #[test]
@@ -5882,7 +6250,12 @@ mod tests {
             (Section::Autofill, "Overlay behaviour is fixed for now."),
             (Section::NativeApps, "Matches are added from the tray's"),
             (Section::Security, "Auto-lock is on the General page."),
-            (Section::SyncAndAccount, "Signing in, syncing and locking are all done"),
+            // **`SyncAndAccount` is no longer one of these**, and its
+            // departure is the whole of what changed: it now carries the
+            // backend row (`draw_sync_and_account`), so it has a setting
+            // behind it and this rule -- which is about pages that do NOT --
+            // must not be asserted of it. The sentence it used to show is
+            // still on that page, as a row rather than as the empty state.
         ] {
             let painted = paint(section);
             assert!(
