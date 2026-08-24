@@ -1037,10 +1037,10 @@ fn save_error_message(e: &VaultError) -> String {
 /// ~20s from landing.
 fn spawn_readiness_probe(cache: &VaultCache) -> mpsc::Receiver<Result<(), String>> {
     let (ready_tx, ready_rx) = mpsc::channel();
-    let vault = cache.bridge().clone();
+    let vault = cache.backend_handle();
     std::thread::spawn(move || {
         let schedule = readiness_schedule(BACKEND_OP_TIMEOUT);
-        let result = wait_for_vault_ready(&vault, &schedule).map(|_items| ());
+        let result = wait_for_vault_ready(vault.as_ref(), &schedule).map(|_items| ());
         let _ = ready_tx.send(result);
     });
     ready_rx

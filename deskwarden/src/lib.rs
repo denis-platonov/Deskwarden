@@ -113,6 +113,10 @@ pub mod updater;
 /// password without launching the app. Opens a window and never a GL context,
 /// which is the whole point -- see the module doc.
 pub mod unlock_prompt;
+/// The seam between the app and whatever is holding the vault: the twenty
+/// vault operations as a trait, implemented today only by `bw serve`'s
+/// client. Nothing about what any call does over the wire lives here.
+pub mod vault_backend;
 pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;

@@ -33,12 +33,15 @@
 //! however the vault reached it).
 
 use crate::app_match::AppMatch;
+use crate::vault_backend::VaultBackend;
 use crate::vault_bridge::{
-    with_favorite, without_deleted_date, Folder, NewItem, VaultBridge,
+    with_favorite, without_deleted_date, Folder, NewItem,
     VaultError, VaultItem,
 };
 use crate::vault_disk_cache::{DiskCache, DiskCacheLoad};
-use std::sync::Mutex;
+#[cfg(test)]
+use crate::vault_bridge::VaultBridge;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// Which *era* of the snapshot a caller is talking about.
@@ -446,7 +449,19 @@ impl Snapshot {
 }
 
 pub struct VaultCache {
-    bridge: VaultBridge,
+    /// The vault backend, behind [`crate::vault_backend::VaultBackend`]
+    /// rather than as the concrete `bw serve` client it used to be. The only
+    /// implementation today is still that client, and nothing here knows
+    /// which one it is holding -- which is the entire point of the field's
+    /// type.
+    ///
+    /// `Arc` rather than `Box` because two callers need an owned handle that
+    /// outlives the borrow: the TOTP poll in `vault_window` and the readiness
+    /// probe in `picker_ui` both move one onto a detached thread. They used
+    /// to `cache.bridge().clone()` a `VaultBridge`, which was cheap for the
+    /// same reason this is -- the connection pools inside it were already
+    /// shared. See [`Self::backend_handle`].
+    bridge: Arc<dyn VaultBackend>,
     snapshot: Mutex<Snapshot>,
     /// The encrypted file, when there is a directory to put one in. `None`
     /// in the fixtures and in any use that has no business writing to disk;
@@ -536,9 +551,14 @@ pub enum PopulateOutcome {
 impl VaultCache {
     /// A cache that holds the vault in memory only. Nothing it does can
     /// reach the disk, because it has no file to reach.
-    pub fn new(bridge: VaultBridge) -> Self {
+    ///
+    /// Generic over the backend rather than taking `Arc<dyn VaultBackend>`
+    /// so that every existing caller -- and every test that wants a backend
+    /// of its own -- passes the value itself and this constructor does the
+    /// boxing. There is no second way to build one of these.
+    pub fn new(bridge: impl VaultBackend + 'static) -> Self {
         Self {
-            bridge,
+            bridge: Arc::new(bridge),
             snapshot: Mutex::new(Snapshot::default()),
             disk: None,
             disk_state: Mutex::new(DiskState::default()),
@@ -552,13 +572,13 @@ impl VaultCache {
     /// the persisting cache, an inert one: every method below returns early,
     /// and the test that says so asserts on the filesystem.
     pub fn with_disk_cache(
-        bridge: VaultBridge,
+        bridge: impl VaultBackend + 'static,
         disk: DiskCache,
         fingerprint: String,
         enabled: bool,
     ) -> Self {
         Self {
-            bridge,
+            bridge: Arc::new(bridge),
             snapshot: Mutex::new(Snapshot::default()),
             disk: Some(disk),
             disk_state: Mutex::new(DiskState {
@@ -569,10 +589,26 @@ impl VaultCache {
         }
     }
 
-    /// The underlying bridge, for the operations that genuinely need the
-    /// backend and are not cached: TOTP and `bw sync`.
-    pub fn bridge(&self) -> &VaultBridge {
-        &self.bridge
+    /// The underlying backend, for the operations that genuinely need it and
+    /// are not cached: TOTP, password generation, and the readiness probe.
+    ///
+    /// Named `bridge` still, because that is what its ~25 call sites call it
+    /// and renaming them is churn in a change whose whole claim is that it
+    /// changed no behaviour.
+    pub fn bridge(&self) -> &dyn VaultBackend {
+        self.bridge.as_ref()
+    }
+
+    /// The same backend as an **owned** handle, for a caller that moves it
+    /// onto a thread.
+    ///
+    /// Separate from [`Self::bridge`] rather than folded into it because the
+    /// two are different requests and only two call sites make this one --
+    /// the TOTP poll and the readiness probe, each of which detaches a thread
+    /// that must not borrow the cache. Cloning the `Arc` shares one backend;
+    /// it does not open a second connection pool.
+    pub fn backend_handle(&self) -> Arc<dyn VaultBackend> {
+        Arc::clone(&self.bridge)
     }
 
     /// Fills the snapshot from the backend. Called once per unlock, and
@@ -1578,9 +1614,9 @@ impl VaultCache {
     fn list_unless_superseded(
         &self,
         era: VaultEra,
-        fetch: impl FnOnce(&VaultBridge) -> Result<Vec<VaultItem>, VaultError>,
+        fetch: impl FnOnce(&dyn VaultBackend) -> Result<Vec<VaultItem>, VaultError>,
     ) -> Result<Option<Vec<VaultItem>>, VaultError> {
-        let fetched = fetch(&self.bridge);
+        let fetched = fetch(self.bridge());
         if self.epoch().era() != era {
             return Ok(None);
         }

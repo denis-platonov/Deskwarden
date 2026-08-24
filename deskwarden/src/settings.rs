@@ -1090,6 +1090,20 @@ pub struct Settings {
     /// value of the setting, and a weaker file under copy that promises one
     /// would be a misleading security claim.
     pub cache_vault_to_disk: bool,
+    /// Whether the app trusts `bw`'s own crypto implementation rather than
+    /// this crate's, for the operations where both exist.
+    ///
+    /// **`true` (the default), and what an older `settings.json` without this
+    /// field parses as** -- today's behaviour, unconditionally.
+    ///
+    /// **Unused.** There is nothing for this to switch between yet: the
+    /// direct-REST backend in `crate::rest` is not wired into the app (see
+    /// `crate::vault_backend`), and it is the second implementation that
+    /// would make this flag mean something. It exists now only so that a
+    /// `settings.json` written before that wiring lands still has the key,
+    /// with the value that preserves current behaviour. **No Preferences row
+    /// reads or writes it.**
+    pub use_official_bw_crypto: bool,
     pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
@@ -1184,6 +1198,7 @@ impl Default for Settings {
             clear_clipboard_on_quit: true,
             clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
             cache_vault_to_disk: false,
+            use_official_bw_crypto: true,
             never_save_for_apps: Vec::new(),
             vault_window: None,
             accounts: Vec::new(),
@@ -1316,6 +1331,7 @@ impl Settings {
             clear_clipboard_on_quit,
             clear_clipboard_seconds,
             cache_vault_to_disk,
+            use_official_bw_crypto,
             // Owned by the overlay, not by the preferences window: it is
             // written by `Self::persist_never_save_for_app` from inside the 3c
             // card, and the copy `main.rs` holds is stale the moment a user
@@ -1346,6 +1362,7 @@ impl Settings {
         on_disk.clear_clipboard_on_quit = *clear_clipboard_on_quit;
         on_disk.clear_clipboard_seconds = *clear_clipboard_seconds;
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
+        on_disk.use_official_bw_crypto = *use_official_bw_crypto;
         on_disk.save(path)
     }
 
@@ -1616,6 +1633,7 @@ mod tests {
             // The OPPOSITE of its own default (`false`), for the reason the
             // fields above give.
             cache_vault_to_disk: true,
+            use_official_bw_crypto: false,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             // Listed rather than `..Settings::default()` so this test keeps
@@ -1650,6 +1668,31 @@ mod tests {
         .unwrap();
         let loaded = Settings::load(&path);
         assert!(!loaded.cache_vault_to_disk);
+        assert!(!loaded.keep_backend_running);
+        assert_eq!(loaded.auto_lock_minutes, 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn official_bw_crypto_is_trusted_by_default() {
+        assert!(Settings::default().use_official_bw_crypto);
+    }
+
+    #[test]
+    fn an_older_settings_file_parses_trusting_official_bw_crypto() {
+        // Same guarantee as `an_older_settings_file_parses_with_the_disk_cache_off`,
+        // for the field this pass added: a settings.json written before
+        // `use_official_bw_crypto` existed has no such key, and must load as
+        // `true` -- today's behaviour, unconditionally -- not as `false`,
+        // which `bool`'s own `Default` would otherwise silently give it.
+        let path = temp_path("partial-official-bw-crypto");
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running": false, "auto_lock_minutes": 5}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(loaded.use_official_bw_crypto);
         assert!(!loaded.keep_backend_running);
         assert_eq!(loaded.auto_lock_minutes, 5);
         let _ = std::fs::remove_file(&path);
@@ -1826,6 +1869,7 @@ mod tests {
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
             cache_vault_to_disk: true,
+            use_official_bw_crypto: false,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             accounts: Vec::new(),
@@ -2393,6 +2437,7 @@ mod tests {
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
             cache_vault_to_disk: true,
+            use_official_bw_crypto: false,
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),

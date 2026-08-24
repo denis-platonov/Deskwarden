@@ -1129,7 +1129,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 56] = [
+        const OPENS_NO_WINDOW: [&str; 57] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1295,6 +1295,11 @@ mod tests {
             // one.
             "update_panel",
             "updater",
+            // The seam trait over the twenty vault operations, plus the
+            // delegating impl for `VaultBridge`. No route, no window: it
+            // moves calls that already existed, unchanged, behind a name
+            // that does not mention `bw`.
+            "vault_backend",
             "vault_bridge",
             "vault_cache",
             // **Judgement call, recorded rather than assumed**, and exactly

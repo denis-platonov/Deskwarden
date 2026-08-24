@@ -48,6 +48,7 @@ use deskwarden::injector::{
 };
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
+use deskwarden::vault_backend::VaultBackend;
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::picker_ui::SavedAppMatch;
 use deskwarden::vault_cache::{
@@ -634,7 +635,7 @@ fn main() {
     // file per account, so a switch cannot have one account's vault written
     // over another's.
     let cache = Arc::new(VaultCache::with_disk_cache(
-        vault.clone(),
+        vault,
         vault_disk_cache::DiskCache::new(
             &disk_cache_dir(&config_dir, active_account.as_ref()),
             vault_disk_cache::DiskCacheEnv::production(),
@@ -642,6 +643,14 @@ fn main() {
         disk_cache_fingerprint(active_account.as_ref()),
         settings.cache_vault_to_disk,
     ));
+    // The same backend, as a handle the startup path can hold and hand to
+    // threads. **Deliberately taken back out of the cache** rather than kept
+    // as a second `VaultBridge` beside it: the startup probes and the cache
+    // must be talking to the same object, and the way to guarantee that is
+    // for there to be exactly one, owned by the cache. Shadows the value
+    // moved in above, which is why nothing below can reach for the concrete
+    // type by accident.
+    let vault = cache.backend_handle();
     // **Before anything spawns `bw serve`.** A usable file means the vault
     // window has something to paint and the match engine has something to
     // arm from in milliseconds, instead of after the backend's ~8 s cold
@@ -1218,7 +1227,7 @@ fn main() {
         SETUP_MESSAGE,
         // ON A WORKER THREAD: the same probe, on the same schedule, that the
         // separate spinner window used to run behind itself.
-        move || wait_for_vault_ready(&vault_for_probe, &schedule_for_probe),
+        move || wait_for_vault_ready(vault_for_probe.as_ref(), &schedule_for_probe),
         // ON THE MAIN THREAD, in the frame that drains the worker. The cache
         // has to be filled BEFORE the vault frame is built, or the window's
         // first vault frame paints an empty vault as data.
@@ -1311,7 +1320,7 @@ fn main() {
                      (closed by the user: {abandoned}); trying the readiness probe again, \
                      without a window, before treating anything as actually broken"
                 );
-                match wait_for_vault_ready(&vault, &schedule) {
+                match wait_for_vault_ready(vault.as_ref(), &schedule) {
                     Ok(items) => items,
                     Err(e) => recover_from_failed_vault_wait(
                         &e,
@@ -6700,7 +6709,7 @@ fn resettle_session(
         authenticate,
         move |window| {
             wait_for_the_vault(
-                cache.bridge(),
+                &cache.backend_handle(),
                 schedule,
                 window,
                 account.clone(),
@@ -8581,15 +8590,15 @@ fn settle_a_tray_launch(mut probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome)
 ///
 /// `account` is the address the footer names, when the caller has one.
 fn wait_for_the_vault(
-    vault: &VaultBridge,
+    vault: &Arc<dyn VaultBackend>,
     schedule: &[Duration],
     window: ProbeWindow,
     account: Option<String>,
     offline: OfflineCopy,
 ) -> VaultReadyOutcome {
-    let worker_vault = vault.clone();
+    let worker_vault = Arc::clone(vault);
     let worker_schedule = schedule.to_vec();
-    let probe = move || wait_for_vault_ready(&worker_vault, &worker_schedule);
+    let probe = move || wait_for_vault_ready(worker_vault.as_ref(), &worker_schedule);
     match window {
         // **`offline` is unread on this arm, and that is the rule and not an
         // omission.** A silent wait draws no body, so there is no button to
@@ -8759,7 +8768,7 @@ fn offline_open_failure(load: &deskwarden::vault_disk_cache::DiskCacheLoad) -> &
 #[allow(clippy::too_many_arguments)]
 fn recover_from_failed_vault_wait(
     reason: &str,
-    vault: &VaultBridge,
+    vault: &Arc<dyn VaultBackend>,
     schedule: &[Duration],
     bw_serve_child: &mut Option<Child>,
     session_token: &mut String,
@@ -9336,7 +9345,7 @@ impl StartupWork {
     fn produce(
         token: &str,
         job: &Arc<Option<job_object::KillOnCloseJob>>,
-        vault: &VaultBridge,
+        vault: &Arc<dyn VaultBackend>,
         schedule: &[Duration],
         park: &EstatePark,
     ) -> Self {
@@ -9393,7 +9402,7 @@ impl StartupWork {
             Err(e) => Err(e.to_string()),
         };
         let items = match &child {
-            Ok(()) => wait_for_vault_ready(vault, schedule),
+            Ok(()) => wait_for_vault_ready(vault.as_ref(), schedule),
             // No backend, so there is nothing to probe -- and spending the whole
             // ~30s readiness deadline on a port nothing is listening on is the
             // same waste `resettle_session_with` already refuses to make.

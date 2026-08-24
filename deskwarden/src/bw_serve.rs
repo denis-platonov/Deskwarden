@@ -5,7 +5,10 @@
 //! and routinely takes multiple seconds), and running `bw sync`.
 
 use crate::bw_path::bw_command;
-use crate::vault_bridge::{VaultBridge, VaultItem};
+use crate::vault_backend::VaultBackend;
+#[cfg(test)]
+use crate::vault_bridge::VaultBridge;
+use crate::vault_bridge::VaultItem;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::{Child, Stdio};
 use std::time::Duration;
@@ -158,7 +161,7 @@ pub fn bw_serve_command(session_token: &str) -> Result<crate::bw_path::BareComma
 /// Returns the items on success (the caller needs them anyway to build the
 /// match engine), or a human-readable error describing the last failure.
 pub fn wait_for_vault_ready(
-    vault: &VaultBridge,
+    vault: &dyn VaultBackend,
     schedule: &[Duration],
 ) -> Result<Vec<VaultItem>, String> {
     let mut attempt = 0usize;

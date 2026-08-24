@@ -3325,7 +3325,7 @@ pub fn build_frame_with_search(
                             // under a countdown that keeps ticking as if
                             // it were live) is unchanged.
                             let item_id = item.id.clone();
-                            let bridge = cache.bridge().clone();
+                            let bridge = cache.backend_handle();
                             let tx = totp_tx.clone();
                             // Tagged with the vault state this poll is
                             // being fetched against, so a reload
