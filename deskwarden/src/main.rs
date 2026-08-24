@@ -48,7 +48,7 @@ use deskwarden::injector::{
 };
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
-use deskwarden::vault_backend::VaultBackend;
+use deskwarden::vault_backend::{self, VaultBackend};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::picker_ui::SavedAppMatch;
 use deskwarden::vault_cache::{
@@ -59,8 +59,8 @@ use deskwarden::app_match::AppMatch;
 use deskwarden::app_window;
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui,
-    prefs_ui, session_store, settings, tray, vault_disk_cache, vault_window,
-    window_watch,
+    prefs_ui, rest, session_store, settings, tray, user_key_store, vault_disk_cache,
+    vault_window, window_watch,
 };
 use semver::Version;
 use std::cell::RefCell;
@@ -619,7 +619,81 @@ fn main() {
         }
     };
 
-    let vault = VaultBridge::new(BW_SERVE_URL);
+    // =====================================================================
+    // **WHICH BACKEND HOLDS THIS ACCOUNT'S VAULT.**
+    //
+    // The slot is built empty and settled immediately, in that order and not
+    // as one expression, because the direct-REST arm's sink has to hold a
+    // handle to the very slot it fills -- a fresh sign-in, at any point in
+    // this process's life, adopts into this. See `settle_the_vault_backend`.
+    //
+    // On a `bw serve` account this is one `VaultBridge::new(BW_SERVE_URL)`
+    // put into a slot, which is what the line it replaced was, plus one
+    // pointer hop per vault operation against an operation that is a loopback
+    // HTTP request.
+    let vault_slot: vault_backend::SharedLateBoundBackend =
+        Arc::new(vault_backend::LateBoundBackend::empty());
+    // **The install is spelled HERE, in `fn main`, and not inside the helper
+    // that builds it.** `every_published_environment_is_installed_before_the_
+    // first_window` finds every module in this crate with an `install_env`
+    // entry point and requires `fn main` to name it above the first window --
+    // by reading THIS function's body, which is the only place it can tell
+    // "before the window" from "after". An install hidden one call deep would
+    // be invisible to that rule, and this environment is one the rule is
+    // exactly right about: `login_ui`'s sign-in worker reads it, and the
+    // startup window is a sign-in window.
+    let backend_env = settle_the_vault_backend(
+        config_dir.as_path(),
+        active_account.as_ref(),
+        settings.use_official_bw_crypto,
+        &vault_slot,
+    );
+    let backend_choice = backend_policy::install_env(backend_env)
+        .then(|| backend_policy::selected())
+        .unwrap_or_else(|| {
+            // `install_env` refuses only `DirectRest` with no login, which
+            // `settle_the_vault_backend` does not build. Handled rather than
+            // asserted: being wrong here is a launch with `bw serve` gated off
+            // and nothing in its place.
+            log::error!("the backend environment was refused; staying on `bw serve`");
+            vault_slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+            let _ = backend_policy::install_env(bw_serve_env());
+            backend_policy::VaultBackendChoice::BwServe
+        });
+    log::info!("this account's vault is served by {backend_choice:?}");
+    // What an account switch re-runs the decision above with. See
+    // `BackendSettlement`.
+    publish_backend_settlement(BackendSettlement {
+        config_dir: config_dir.clone(),
+        use_official_bw_crypto: settings.use_official_bw_crypto,
+        slot: Arc::clone(&vault_slot),
+    });
+
+    // **A cached `bw` session is not enough on a direct-REST account.**
+    //
+    // The `bw` session says `bw` can still read the vault; it says nothing
+    // about whether *this process* holds a master key that decrypts it. When
+    // the slot is empty here, there is no stored key or the server refused
+    // the one there was -- and the required answer to both is the same and is
+    // the reason this line exists: **ask**. Dropping the cached session is
+    // how this file asks; it is the existing, tested route to the sign-in
+    // card, and the card's own worker derives the key and fills the slot.
+    //
+    // The alternative -- carry on with an empty slot -- is a launch whose
+    // vault reads as empty for a reason nothing on screen explains, which is
+    // the worst failure mode available on this branch.
+    let cached_session = match (backend_choice, vault_slot.is_filled()) {
+        (backend_policy::VaultBackendChoice::DirectRest, false) => {
+            log::info!(
+                "this account has no usable stored master key, so this launch asks for the \
+                 master password even though its `bw` session is still good"
+            );
+            None
+        }
+        _ => cached_session,
+    };
+
+    let vault = Arc::clone(&vault_slot);
     // The vault window's reads and writes, and now autofill's own reads (see
     // `app::fill_from_vault`), go through this in-memory snapshot rather than
     // straight to `bw serve` -- see `vault_cache`'s module doc. Built once,
@@ -1085,7 +1159,15 @@ fn main() {
     // `bool::then` decides the same thing without spelling one, and is still
     // lazy, so `start_backend` is genuinely not called on a cache-first
     // launch rather than called and discarded.
-    bw_serve_child = (!cache_first).then(|| start_backend(&session_token, job_ref(&job)));
+    //
+    // **And not on a direct-REST account either**, which is the second
+    // condition on this line and the one Task A is about. `start_backend` is
+    // the one of the twelve entry points whose failure arm ends the process,
+    // so it is the one that cannot be gated inside `try_start_backend` like
+    // the other eleven: it would have to turn a `NotSelected` into a `Child`
+    // it does not have. It is gated here instead, on the same answer.
+    bw_serve_child = (!cache_first && backend_policy::bw_serve_is_selected())
+        .then(|| start_backend(&session_token, job_ref(&job)));
     // Assigned before either arm rather than by both: the tray arm opens no
     // window, so it has no vault session to report, and the visible arm
     // overwrites this with whatever its window came home holding.
@@ -7454,6 +7536,16 @@ fn switch_to_account(
 
     bw_path::set_active_data_dir(Some(accounts::data_dir_for(config_dir, &to.id)));
     *store = session_store::SessionStore::new(accounts::session_path_for(config_dir, &to.id));
+    // **The vault backend moves with the profile directory and the session
+    // store, in the same breath as both.** The incoming account may be
+    // direct-REST where the outgoing one was not, or the other way round, and
+    // an app that re-pointed two of the three would be reading one account's
+    // vault through the other account's backend. See
+    // `resettle_vault_backend_for`, which is also what installs (or
+    // uninstalls) the login window's direct-REST derivation, so the master
+    // password the resettle is about to ask for derives a key for the account
+    // it is actually being asked for.
+    resettle_vault_backend_for(to);
 
     let report = resettle(config_dir, to, store);
     let failure = match report {
@@ -7490,6 +7582,8 @@ fn switch_to_account(
     log::warn!("{failure}; returning to {}", from.email);
     bw_path::set_active_data_dir(previous_dir);
     *store = session_store::SessionStore::new(accounts::session_path_for(config_dir, &from.id));
+    // The rollback's third re-point, for the reason the forward path's is.
+    resettle_vault_backend_for(from);
     match resettle(config_dir, from, store) {
         // A decline is the user changing their mind, and the previous account
         // is back: there is nothing to report but the fact that nothing moved.
@@ -7556,7 +7650,7 @@ fn backend_is_running(child: &mut Option<Child>) -> bool {
 /// ask for it explicitly instead; this function only ever tears it back
 /// down again afterwards once the policy says it's no longer needed.
 fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running: bool) {
-    if backend_policy::should_run(keep_backend_running) {
+    if backend_policy::should_run(backend_policy::selected(), keep_backend_running) {
         return;
     }
     if backend_is_running(bw_serve_child) {
@@ -9139,6 +9233,296 @@ fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) 
     token
 }
 
+/// The `bw`-shaped device identifier for `id`, as a GUID.
+///
+/// [`accounts::AccountId`] is already sixteen bytes from the OS CSPRNG in
+/// lowercase hex, stable for as long as the account exists on this machine and
+/// -- by its own construction -- disclosing nothing about whose vault it is.
+/// That is exactly what [`deskwarden::rest::api::Device`] wants, so it is
+/// reused rather than a second random value being minted and stored: a second
+/// one would be a second thing to keep, and losing it would put a new entry in
+/// the user's device list on every launch.
+///
+/// Grouped 8-4-4-4-12 because Bitwarden's own server parses this field as a
+/// GUID. The bytes are unchanged; only the hyphens are added.
+fn device_id_for(id: &accounts::AccountId) -> String {
+    let hex = id.as_str();
+    // `AccountId::parse` already refuses anything that is not the fixed-length
+    // hex this splits, but a length check here rather than four slices that
+    // could panic: this string reaches a network request, and `bw_path`'s rule
+    // about not indexing what came off a disk applies to it too.
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return hex.to_string();
+    }
+    let mut out = String::with_capacity(36);
+    for (at, ch) in hex.chars().enumerate() {
+        if matches!(at, 8 | 12 | 16 | 20) {
+            out.push('-');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// **Decides which backend holds this account's vault, and puts it in `slot`.**
+///
+/// The one place [`backend_policy::choose`] is spent at startup and on an
+/// account switch, and the one place a
+/// [`deskwarden::rest::backend::RestBackend`] is constructed. It returns the
+/// choice it made rather than the caller re-deriving it, so that the answer
+/// this function acted on and the answer the caller acts on cannot differ.
+///
+/// # `BwServe` is byte-for-byte what it always was
+///
+/// One [`VaultBridge`] against `BW_SERVE_URL`, put in the slot before anything
+/// can ask it a question, and the environment `login_ui` reads *uninstalled*
+/// -- so the sign-in worker derives nothing, writes no key, and runs exactly
+/// the `bw login` it ran before this branch existed.
+///
+/// # `DirectRest` has two ways in, and only one of them is silent
+///
+/// * **A stored key that still works.** [`user_key_store::UserKeyStore::load`]
+///   answers an [`Authenticated`] whose session holds no access token and is
+///   expired by construction, so the probe below is what finds out whether the
+///   refresh token and the master key are both still good. That probe is one
+///   `GET /api/sync` -- the same round trip `bw sync` made on the other path
+///   -- and it is made **eagerly, here, before the window**, because the whole
+///   point is to learn the answer at a moment when asking again is normal.
+/// * **No stored key, or one the server refused.** The file is deleted and the
+///   slot is left empty. The caller's next act is to drop its cached `bw`
+///   session so that this launch shows the sign-in card, and the sign-in's own
+///   worker derives a fresh key and fills the slot through
+///   [`login_ui::DirectRestLogin::adopt`].
+///
+/// **There is no third way**, and that is the requirement rather than an
+/// implementation detail: a slot filled with a backend whose key no longer
+/// decrypts anything would give a vault that reads as empty, which is
+/// indistinguishable -- to the user and to the log -- from a vault that is.
+/// So the only fallback is asking.
+#[must_use = "the environment this returns has to be installed, or `login_ui`'s sign-in               worker derives nothing and the slot this filled is never refilled"]
+fn settle_the_vault_backend(
+    config_dir: &Path,
+    account: Option<&accounts::Account>,
+    use_official_bw_crypto: bool,
+    slot: &vault_backend::SharedLateBoundBackend,
+) -> backend_policy::BackendEnv {
+    use backend_policy::VaultBackendChoice;
+
+    let choice = backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        use_official_bw_crypto,
+    );
+
+    // Both arms of the `DirectRest` decision need an account with a server
+    // URL. `choose` cannot answer `DirectRest` without one -- `is_self_hosted`
+    // reads that URL's host -- so this pattern cannot fail on that arm; it is
+    // written as a fallible match rather than an `expect` because an `expect`
+    // here would be a panic in the launch path resting on a property of
+    // another module.
+    let direct = match (choice, account) {
+        (VaultBackendChoice::DirectRest, Some(account)) => match account.server_url.as_deref() {
+            Some(server_url) => Some((account, server_url.to_string())),
+            None => None,
+        },
+        _ => None,
+    };
+
+    let Some((account, server_url)) = direct else {
+        slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+        return bw_serve_env();
+    };
+
+    let key_store =
+        user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+
+    // The one construction, used by both ways in. A closure rather than two
+    // copies, so the stored-key path and the fresh-sign-in path cannot come to
+    // build different backends against different clients.
+    let build = {
+        let server_url = server_url.clone();
+        move |authenticated| {
+            Box::new(rest::backend::RestBackend::new(
+                rest::api::RestClient::new(server_url.clone()),
+                authenticated,
+            )) as Box<dyn vault_backend::VaultBackend>
+        }
+    };
+
+    if let Some(authenticated) = key_store.load() {
+        let backend = build(authenticated);
+        // **The probe.** One `list_items`, which is one `GET /api/sync` and a
+        // decryption of the whole vault. Its answer is discarded: the cache
+        // populates itself a moment later through its own epoch-guarded path,
+        // and a second opinion about the vault stored here would be a second
+        // cache. What is kept is the yes-or-no.
+        match backend.list_items() {
+            Ok(items) => {
+                log::info!(
+                    "the stored master key for this account still works ({} item(s) fetched \
+                     directly from the server); `bw serve` will not be started this launch",
+                    items.len()
+                );
+                slot.adopt(backend);
+            }
+            Err(e) => {
+                // The message, not the key: `VaultError`'s `Display` carries a
+                // status and a route. See `debug_leak_guard`.
+                log::warn!(
+                    "the stored master key for this account no longer works ({e:?}); deleting \
+                     it and asking for the master password again"
+                );
+                if let Err(e) = key_store.clear() {
+                    log::warn!("the stored master key could not be deleted ({e})");
+                }
+            }
+        }
+    } else {
+        log::info!(
+            "no usable stored master key for this account; the master password will be asked \
+             for and a key derived from it"
+        );
+    }
+
+    // The sink every login path in this app reaches without knowing it does.
+    // See `login_ui::DirectRestLogin::adopt`.
+    let adopt = {
+        let slot = Arc::clone(slot);
+        let key_store =
+            user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+        std::sync::Arc::new(move |authenticated: rest::api::Authenticated| {
+            // **Written before it is adopted**, so that a launch that crashes
+            // between the two still has the key it just derived and does not
+            // ask again. `save` answers `false` when the login carried no
+            // refresh token -- a session that cannot be revived after a
+            // restart -- which is not an error and not a reason to refuse the
+            // backend: this process has a working login either way, and the
+            // next launch simply asks.
+            match key_store.save(&authenticated) {
+                Ok(true) => log::info!("the derived master key was stored for the next launch"),
+                Ok(false) => log::info!(
+                    "this login carries no refresh token, so nothing was stored; the master \
+                     password will be asked for again next launch"
+                ),
+                Err(e) => log::warn!("the derived master key could not be stored ({e})"),
+            }
+            slot.adopt(build(authenticated));
+            log::info!("the direct-REST vault backend is live for this account");
+        }) as std::sync::Arc<dyn Fn(rest::api::Authenticated) + Send + Sync>
+    };
+
+    backend_policy::BackendEnv {
+        choice: VaultBackendChoice::DirectRest,
+        direct: Some(login_ui::DirectRestLogin {
+            server_url,
+            email: account.email.clone(),
+            device_id: device_id_for(&account.id),
+            authenticate: login_ui::derive_direct_rest,
+            adopt,
+        }),
+    }
+}
+
+/// The environment for an account served by `bw serve`: the choice, and no
+/// direct-REST login at all.
+///
+/// A function rather than a literal at each of the three sites that answer it,
+/// because the second half is the load-bearing one: a `BwServe` environment
+/// that still carried the *previous* account's login would hand the sign-in
+/// worker a server and an email belonging to somebody else, and a master
+/// password typed for this account would derive a key against that one.
+fn bw_serve_env() -> backend_policy::BackendEnv {
+    backend_policy::BackendEnv {
+        choice: backend_policy::VaultBackendChoice::BwServe,
+        direct: None,
+    }
+}
+
+/// [`backend_policy::install_env`], with the one thing to do when it refuses.
+///
+/// It refuses exactly one shape -- `DirectRest` with no login -- which
+/// [`settle_the_vault_backend`] does not build. Handled rather than asserted
+/// because the consequence of being wrong is a launch with `bw serve` gated
+/// off and nothing in its place, and the recovery is one line: put the bridge
+/// in the slot and stay on `bw serve`.
+fn install_backend_env(
+    env: backend_policy::BackendEnv,
+    slot: &vault_backend::SharedLateBoundBackend,
+) -> backend_policy::VaultBackendChoice {
+    let choice = env.choice;
+    if backend_policy::install_env(env) {
+        return choice;
+    }
+    log::error!("the backend environment was refused; staying on `bw serve`");
+    slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+    let _ = backend_policy::install_env(bw_serve_env());
+    backend_policy::VaultBackendChoice::BwServe
+}
+
+/// The three process-lifetime facts [`settle_the_vault_backend`] needs, so
+/// that an account switch can re-run it without carrying them.
+///
+/// # Why this is published rather than threaded
+///
+/// A switch has to re-point the vault backend for exactly the reason it has to
+/// re-point the profile directory and the session store: the account has
+/// changed, and one of the two accounts may be direct-REST while the other is
+/// not. The place that must do it is [`switch_to_account`], which is the one
+/// function every switch goes through -- the tray's, the vault window's, the
+/// one that follows adding an account, and the one that follows removing the
+/// active one.
+///
+/// That function takes five parameters and a resettle closure, and it is
+/// called from nine places, four of them production. Adding two more
+/// parameters would mean nine edits to give one function a value that is
+/// identical on every call and constant for the life of the process -- and
+/// would give the four production call sites four chances to pass a different
+/// one. So the facts are published once and read where they are needed, which
+/// is the same shape `backend_policy`'s own environment takes and for the same
+/// reason.
+///
+/// **`use_official_bw_crypto` is captured at startup and never re-read**, and
+/// that is Task C's rule expressed in the type rather than in a comment: the
+/// setting takes effect on the next launch, Preferences says so in the row
+/// itself, and a switch mid-session honours the value this process started
+/// with.
+struct BackendSettlement {
+    config_dir: std::path::PathBuf,
+    use_official_bw_crypto: bool,
+    slot: vault_backend::SharedLateBoundBackend,
+}
+
+static SETTLEMENT: std::sync::OnceLock<BackendSettlement> = std::sync::OnceLock::new();
+
+/// Publishes what an account switch needs to re-settle the vault backend.
+///
+/// Called once, from `main`, immediately after the first settlement. Never
+/// from a test: a `OnceLock` in a shared test process is a value the first
+/// test to run decides for every later one, and what this one holds is a
+/// backend slot.
+fn publish_backend_settlement(settlement: BackendSettlement) {
+    let _ = SETTLEMENT.set(settlement);
+}
+
+/// Re-points the vault backend at `account`, on the way into a switch and on
+/// the way back out of a failed one.
+///
+/// A no-op in any process where `main` has not published a settlement -- every
+/// test, and `examples/ui_preview` -- which leaves those processes on
+/// `bw serve`, the direction this branch's every default takes.
+fn resettle_vault_backend_for(account: &Account) {
+    let Some(settlement) = SETTLEMENT.get() else {
+        return;
+    };
+    let env = settle_the_vault_backend(
+        &settlement.config_dir,
+        Some(account),
+        settlement.use_official_bw_crypto,
+        &settlement.slot,
+    );
+    let choice = install_backend_env(env, &settlement.slot);
+    log::info!("after the switch, {}'s vault is served by {choice:?}", account.email);
+}
+
 /// Why `bw serve` could not be brought up.
 ///
 /// Distinguished rather than collapsed into a string because the two cases
@@ -9151,6 +9535,22 @@ enum BackendStartError {
     NoVerifiedCli(String),
     /// The `bw` process could not be spawned at all.
     Spawn(std::io::Error),
+    /// **This account is not served by `bw serve` at all**, so there was
+    /// nothing to start and nothing went wrong.
+    ///
+    /// A variant of the error type rather than a `Result<Option<Child>, _>`,
+    /// and the reason is what the twelve call sites do with it. Every one of
+    /// them already has an "it did not start, carry on without it" arm --
+    /// logging, reporting over the backend-op channel, leaving
+    /// `bw_serve_child` as `None` -- and that arm is *exactly* the correct
+    /// behaviour here. Widening the success type would instead give twelve
+    /// sites a new `Some`/`None` to get right, eleven of which would be
+    /// written correctly.
+    ///
+    /// The one caller for which this is not enough is `start_backend`, whose
+    /// failure arm ends the process; `main` does not call it on this path at
+    /// all. See its own doc.
+    NotSelected,
 }
 
 impl std::fmt::Display for BackendStartError {
@@ -9169,6 +9569,11 @@ impl std::fmt::Display for BackendStartError {
                 f,
                 "failed to spawn `bw serve` from the verified Bitwarden CLI path (see \
                  bw_path::resolve_bw_exe for where that path comes from): {e}"
+            ),
+            Self::NotSelected => write!(
+                f,
+                "this account's vault is served by the direct-REST backend, so `bw serve` was \
+                 not started -- which is the point of that backend rather than a failure"
             ),
         }
     }
@@ -9193,6 +9598,26 @@ fn try_start_backend(
     job: Option<&job_object::KillOnCloseJob>,
     port_grace: Duration,
 ) -> Result<Child, BackendStartError> {
+    // **THE GATE, and it is here because here is where all twelve meet.**
+    //
+    // `bw serve` is spawned by one expression in this crate
+    // (`bw_serve::bw_serve_command`) and this is its only production caller,
+    // so every one of the twelve entry points enumerated in
+    // `backend_policy::selected`'s doc funnels through this line. Gating a
+    // subset would produce the state this whole branch exists to avoid --
+    // reads answered by a `bw serve` nobody stopped, writes going straight to
+    // the server -- and gating them one at a time is how a subset happens.
+    // `no_path_reaches_bw_serve_without_consulting_the_policy` is what stops
+    // a thirteenth from arriving with its own spawn.
+    //
+    // **Before the port wait and before `bw sync`**, deliberately: neither is
+    // a thing a direct-REST account should pay for. The port wait is up to
+    // thirty seconds of a launch that has no port to wait for, and `bw sync`
+    // is a `Command::output()` with no timeout that would keep a `bw` profile
+    // this backend does not read up to date.
+    if !backend_policy::bw_serve_is_selected() {
+        return Err(BackendStartError::NotSelected);
+    }
     if !bw_serve::wait_for_port_free(bw_serve::BW_SERVE_PORT, port_grace) {
         return Err(BackendStartError::PortHeld(port_grace));
     }
@@ -9473,6 +9898,18 @@ fn account_details_source(
     }
 }
 
+/// **Never called on a direct-REST account**, and the guard is in `main`
+/// rather than in here.
+///
+/// This function's whole purpose is that a backend it cannot start ends the
+/// launch, so it has no arm for "there was nothing to start" and must not
+/// grow one: an arm here would have to answer with a `Child` it does not
+/// have. `main`'s one call site is gated on
+/// [`backend_policy::bw_serve_is_selected`] instead, so
+/// [`BackendStartError::NotSelected`] can never reach this body -- and if the
+/// gate were ever removed, this would fail loudly at the moment of the launch
+/// rather than quietly later, which is the right way round for the only fatal
+/// caller of the twelve.
 fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
     match try_start_backend(session_token, job, bw_serve::PORT_RELEASE_GRACE) {
         Ok(child) => child,
@@ -21607,7 +22044,15 @@ mod tests {
         for (banned, control) in [
             (concat!("bw_", "logout("), login_ui_source.as_str()),
             (concat!("remove_dir", "_all("), accounts_source.as_str()),
-            (concat!("remove_", "file("), production),
+            // **Controlled against `accounts.rs` and not against this file.**
+            // It used to be `production`, and that stopped being true when
+            // the switch-away stopped naming `session.bin` and started going
+            // through `accounts::clear_sign_in_secrets` -- which is where
+            // every `remove_file` in this app's account handling now lives,
+            // and which is the change this ban exists to keep. Left pointed
+            // at a file that no longer contains the spelling, the control
+            // fires and the ban below it never runs at all.
+            (concat!("remove_", "file("), accounts_source.as_str()),
             (concat!("AccountsState", "::new("), production),
             (
                 concat!("multi_account_", "availability("),
@@ -26202,7 +26647,14 @@ mod startup_shape_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 2,
+            // Four since the direct-REST branch: the two that were always
+            // here, plus `bw_serve_gate` (no path reaches `bw serve` without
+            // the backend policy having answered) and
+            // `vault_backend_choice_tests` (the startup decision that picks a
+            // backend). `below_cut`'s own reading of this file counts the
+            // same four.
+            modules,
+            4,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -26219,5 +26671,467 @@ mod startup_shape_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+/// **Nothing in this crate can spawn `bw serve` without the backend policy
+/// having answered first.**
+///
+/// # The defect this exists to make impossible
+///
+/// `bw serve` has twelve reachable entry points -- startup's two arms, the
+/// startup window's worker and its orphan-adoption retry, the tray's Sync
+/// item, the vault window's, "Add app...", `spawn_sync`'s
+/// start-if-not-running arm, the away-lock recovery, `open_vault_window`'s
+/// lock/re-auth recovery, `recover_from_failed_vault_wait`, and the account
+/// switch's resettle. Before this branch exactly one of them consulted
+/// `backend_policy`, and that one (`stop_backend_if_idle`) only ever STOPS
+/// the backend.
+///
+/// Gating a subset is the worst outcome available here: reads answered by a
+/// `bw serve` nobody stopped, writes going straight to the server, and a
+/// `VaultCache` holding whichever answered first. Gating them one at a time
+/// is exactly how a subset happens, and twelve names in a comment is how the
+/// thirteenth is missed.
+///
+/// # What is measured
+///
+/// The rule reads this crate's own source and rests on one structural fact:
+/// **`bw serve` is spawned from exactly one expression**, the
+/// `bw_serve::bw_serve_command` inside `try_start_backend`. So there is one
+/// place a gate has to be, and this asserts that
+///
+///  1. `bw_serve_command` is still mentioned in exactly the places it is
+///     mentioned today, so a thirteenth entry point cannot arrive with a
+///     spawn of its own and be gated by nothing;
+///  2. `try_start_backend` consults `backend_policy` **before** the port
+///     wait, the `bw sync` and the spawn -- so the gate cannot be a line that
+///     runs after the subprocess work has begun; and
+///  3. the one `start_backend` call in `fn main` -- the single entry point
+///     whose failure arm ends the process, and therefore the one that cannot
+///     be gated inside `try_start_backend` -- names the policy on its own
+///     statement.
+///
+/// A thirteenth entry point added next year reaches `bw serve` through
+/// `try_start_backend` like the other twelve and is covered the day it is
+/// written. One that reaches it any other way has to name
+/// `bw_serve_command`, and rule (1) is what fails then.
+///
+/// # Read over code, and over normalised line endings
+///
+/// Comment lines are dropped before anything is counted: this file discusses
+/// `try_start_backend` and `bw serve` in prose constantly, and a rule that
+/// counted those would fire on an edit to a sentence. Needles are split with
+/// `concat!` for this file's usual reason -- written whole, this module's own
+/// source would be a later occurrence of the very call it counts. And every
+/// source is normalised to `\n` first, because this is a CRLF checkout and
+/// the offset comparisons below would otherwise be measuring whichever files
+/// happen to have the line endings this test was written against.
+#[cfg(test)]
+mod bw_serve_gate {
+    /// `text` with comment lines blanked and line endings normalised.
+    fn code(text: &str) -> String {
+        text.replace("\r\n", "\n")
+            .lines()
+            .map(|line| if line.trim_start().starts_with("//") { "" } else { line })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// This file, without comments and with normalised line endings.
+    fn main_code() -> String {
+        code(include_str!("main.rs"))
+    }
+
+    /// Every mention of `bw_serve_command` in `src/`, as
+    /// `(file, count)` in path order.
+    ///
+    /// **Every mention and not "every production mention"**, deliberately.
+    /// Cutting each file at its first `#[cfg(test)]` is what the rest of this
+    /// crate's source pins do, and it is wrong for `main.rs`, whose first test
+    /// module sits four thousand lines above `try_start_backend` -- the cut
+    /// would have hidden the one call this whole rule is about. Brace-matching
+    /// out every `cfg(test)` module instead would be a parser, and one that
+    /// this crate's format strings (full of `{{`) would defeat.
+    ///
+    /// So the count includes the tests that name it, and the expected value
+    /// below says which those are. That makes the rule *louder*, not weaker:
+    /// a test that starts naming this function reds it and has to be
+    /// accounted for in the same commit, which is the review this rule exists
+    /// to force.
+    fn mentions_of_the_spawn() -> Vec<(String, usize)> {
+        let needle = concat!("bw_serve_com", "mand");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ must be readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = code(&std::fs::read_to_string(&path).expect("a readable source file"));
+                let count = text.matches(needle).count();
+                if count > 0 {
+                    let name = path
+                        .strip_prefix(&src)
+                        .expect("walked from src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((name, count));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn bw_serve_is_spawned_from_exactly_one_place_in_this_crate() {
+        let found = mentions_of_the_spawn();
+        let expected: Vec<(String, usize)> = vec![
+            // Two `bw_path` tests build the command to assert what it points
+            // at; neither spawns it.
+            ("bw_path.rs".to_string(), 2),
+            // The definition, and nothing else in the module that owns it.
+            ("bw_serve.rs".to_string(), 1),
+            // `job_object`'s own source pin, which asserts that this function
+            // still hands back a BARE command -- one name inside its needle
+            // and one in its failure message. It reads the text; it spawns
+            // nothing.
+            ("job_object.rs".to_string(), 2),
+            // `try_start_backend`'s spawn, plus the one mention inside this
+            // module's own failure message. Every other name in here is split
+            // with `concat!` precisely so that it is not counted.
+            ("main.rs".to_string(), 2),
+        ];
+        assert_eq!(
+            found, expected,
+            "the set of places that name `bw serve`'s command constructor has changed. Every \
+             one of the twelve entry points reaches the spawn through `main.rs`'s \
+             `try_start_backend`, which is where the backend policy is consulted; a second \
+             spawn site is a thirteenth entry point gated by nothing, and an app that reads \
+             from one backend while writing to the other is the failure this branch exists to \
+             prevent. If the change is deliberate, say in the commit message which of these it \
+             is and why the new site cannot start `bw serve` on a direct-REST account"
+        );
+    }
+
+    #[test]
+    fn the_policy_is_consulted_before_the_port_wait_the_sync_and_the_spawn() {
+        let source = main_code();
+        let body_at = source
+            .find(concat!("fn try_start_back", "end(\n    session_token: &str,"))
+            .expect("control: `try_start_backend` is no longer declared as this rule expects");
+        let body = &source[body_at..];
+
+        let gate = body
+            .find(concat!("backend_policy::bw_serve_is_sel", "ected()"))
+            .expect(
+                "`try_start_backend` does not consult `backend_policy` at all. It is the one \
+                 caller of `bw_serve_command`, so this is the whole of the gate: without it \
+                 every one of the twelve entry points starts `bw serve` on an account whose \
+                 vault is served directly over REST, and the user pays for the subprocess this \
+                 branch exists to remove while nothing on screen looks wrong",
+            );
+        let spawn = body.find(concat!("bw_serve::bw_serve_com", "mand(")).expect(
+            "control: the spawn is not below this declaration, so `gate` is being compared \
+             against an offset in some other function",
+        );
+        let port_wait = body
+            .find(concat!("bw_serve::wait_for_port_f", "ree("))
+            .expect("control: the port wait is not below this declaration either");
+        let sync = body
+            .find(concat!("bw_serve::run_bw_s", "ync("))
+            .expect("control: the `bw sync` is not below this declaration either");
+
+        assert!(
+            gate < port_wait && gate < sync && gate < spawn,
+            "`try_start_backend` consults the backend policy at byte {gate}, AFTER one of the \
+             three things it must gate: the port wait at {port_wait} (up to thirty seconds a \
+             direct-REST launch has no port to wait for), the `bw sync` at {sync} (an \
+             unbounded `Command::output()` keeping a `bw` profile this backend never reads up \
+             to date), and the spawn at {spawn}. The gate has to come first"
+        );
+    }
+
+    /// Control for the rule above: it can actually tell before from after.
+    ///
+    /// Without this, a `find` that answered `0` for everything -- or a slice
+    /// that started in the wrong place -- would satisfy every assertion in it
+    /// while proving nothing, which is the failure mode a source-reading test
+    /// is most prone to.
+    #[test]
+    fn the_gate_ordering_rule_can_tell_before_from_after() {
+        let gate = concat!("backend_policy::bw_serve_is_sel", "ected()");
+        let spawn = concat!("bw_serve::bw_serve_com", "mand(");
+        let early = format!("fn f() {{ if !{gate} {{ return; }} {spawn}); }}");
+        let late = format!("fn f() {{ {spawn}); if !{gate} {{ return; }} }}");
+        let at = |text: &str| {
+            (
+                text.find(gate).expect("the fixture names the gate"),
+                text.find(spawn).expect("the fixture names the spawn"),
+            )
+        };
+        let (gate_at, spawn_at) = at(&early);
+        assert!(gate_at < spawn_at, "the rule cannot see a correctly gated spawn");
+        let (gate_at, spawn_at) = at(&late);
+        assert!(
+            gate_at > spawn_at,
+            "the rule cannot see a spawn that happens before the gate, which is the only thing \
+             it exists to catch"
+        );
+    }
+
+    /// **The gate that could not go inside `try_start_backend`.**
+    ///
+    /// `start_backend` is `try_start_backend` plus a fatal dialog. It has no
+    /// arm for "there was nothing to start" and must not grow one -- an arm
+    /// there would have to answer with a `Child` it does not have -- so its
+    /// one call site, in `fn main`, is gated on the same answer instead.
+    #[test]
+    fn the_one_fatal_entry_point_is_gated_at_its_call_site() {
+        let source = main_code();
+        let call = concat!("start_back", "end(&session_token, job_ref(&job))");
+        assert_eq!(
+            source.matches(call).count(),
+            1,
+            "`main.rs` no longer has exactly one fatal backend start, so the gate asserted \
+             below is about one of several"
+        );
+        let at = source.find(call).expect("checked just above");
+        let statement_at = source[..at]
+            .rfind(concat!("bw_serve_ch", "ild = "))
+            .expect("control: the fatal start is not part of an assignment to `bw_serve_child`");
+        let statement = &source[statement_at..at];
+        assert!(
+            statement.contains(concat!("backend_policy::bw_serve_is_sel", "ected()")),
+            "the launch that starts `bw serve` fatally is not gated on the backend policy. On \
+             a direct-REST account this call ends the process with \"Deskwarden could not \
+             start its Bitwarden backend\" -- for a backend that account was never going to \
+             have. The statement reads: {statement:?}"
+        );
+        assert!(
+            statement.len() < 400,
+            "control: the statement slice is {} bytes, so the `contains` above could be \
+             finding a policy call that belongs to something else entirely",
+            statement.len()
+        );
+    }
+}
+
+/// The startup decision that chooses a vault backend, and the identifier the
+/// direct-REST one signs its device list entry with.
+///
+/// **No test in here touches the network, `%APPDATA%\Deskwarden`, a real
+/// account directory or a real `userkey.bin`.** Everything that would --
+/// `settle_the_vault_backend`'s direct-REST arm reads a key store and, if it
+/// finds one, makes a `GET /api/sync` -- is reached only through an account
+/// whose server URL is self-hosted, and the tests that want that arm supply a
+/// temp config directory with no key file in it, which is the arm that does
+/// no I/O beyond one `read` that fails.
+#[cfg(test)]
+mod vault_backend_choice_tests {
+    use super::*;
+
+    /// **One test at a time in here.**
+    ///
+    /// `settle_the_vault_backend` installs a process-wide environment
+    /// (`backend_policy::install_env`) and this suite runs its tests in
+    /// parallel, so two of these at once would each be reading the other's
+    /// choice. Every test below takes this first and leaves the environment
+    /// uninstalled.
+    static SETTLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_the_settle_lock() -> std::sync::MutexGuard<'static, ()> {
+        SETTLE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A temp directory that is never `%APPDATA%\Deskwarden`, with the
+    /// account directory already made -- the layout
+    /// `accounts::ensure_account_dir` produces, since `UserKeyStore` requires
+    /// its parent to exist and must never be the thing that creates one.
+    fn scratch_config(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-test-backend-{}-{}-{}",
+            label,
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a temp config directory");
+        dir
+    }
+
+    fn account_on(server_url: Option<&str>) -> Account {
+        Account {
+            id: accounts::AccountId::generate(),
+            email: "someone@example.com".to_string(),
+            server_url: server_url.map(str::to_string),
+        }
+    }
+
+    fn empty_slot() -> vault_backend::SharedLateBoundBackend {
+        Arc::new(vault_backend::LateBoundBackend::empty())
+    }
+
+    /// **The default launch: `bw serve`, a filled slot, and no environment.**
+    ///
+    /// The byte-for-byte arm. What matters as much as the choice is that the
+    /// slot is filled before this returns -- nothing in the launch below it
+    /// may meet a backend that answers `Unauthorized` on an account that was
+    /// never going to have credentials of its own.
+    #[test]
+    fn the_shipped_default_settles_on_bw_serve_with_the_bridge_already_in_the_slot() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("default");
+        let slot = empty_slot();
+        let env = settle_the_vault_backend(
+            &config,
+            Some(&account_on(Some("https://vault.example.com"))),
+            settings::Settings::default().use_official_bw_crypto,
+            &slot,
+        );
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(slot.is_filled(), "the launch would have met an empty slot");
+        assert!(backend_policy::bw_serve_is_selected());
+        assert!(backend_policy::direct_rest_login().is_none());
+    }
+
+    /// An account with no account list at all -- `StartupAccounts::
+    /// NoAccountList` -- settles the same way, and does not panic reaching for
+    /// an account that is not there.
+    #[test]
+    fn no_account_at_all_settles_on_bw_serve() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("no-account");
+        let slot = empty_slot();
+        let env = settle_the_vault_backend(&config, None, false, &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(slot.is_filled());
+    }
+
+    /// The setting off, but on an official cloud: still `bw serve`. The
+    /// owner's rule, spent here rather than only in `backend_policy`'s table.
+    #[test]
+    fn the_setting_off_on_an_official_cloud_still_settles_on_bw_serve() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("official");
+        let slot = empty_slot();
+        let env = settle_the_vault_backend(&config, Some(&account_on(None)), false, &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(slot.is_filled());
+        let env = settle_the_vault_backend(
+            &config,
+            Some(&account_on(Some("https://vault.bitwarden.com"))),
+            false,
+            &slot,
+        );
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+    }
+
+    /// **The direct-REST arm with no stored key: an EMPTY slot, on purpose.**
+    ///
+    /// This is the state `main` turns into "ask for the master password" by
+    /// dropping its cached `bw` session. The two things asserted are the two
+    /// halves of that: the slot is empty (so nothing can read a vault it
+    /// cannot decrypt) and the login window has something to derive with (so
+    /// the asking leads somewhere).
+    #[test]
+    fn direct_rest_with_no_stored_key_leaves_the_slot_empty_and_arms_the_sign_in() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("no-key");
+        let account = account_on(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        let slot = empty_slot();
+
+        let env = settle_the_vault_backend(&config, Some(&account), false, &slot);
+        assert_eq!(
+            install_backend_env(env, &slot),
+            backend_policy::VaultBackendChoice::DirectRest
+        );
+        assert!(
+            !slot.is_filled(),
+            "a direct-REST backend was constructed with no credentials, so this launch would \
+             read the account's vault as empty rather than asking for the master password"
+        );
+        assert!(
+            !backend_policy::bw_serve_is_selected(),
+            "`bw serve` is still selected on an account that settled on direct REST"
+        );
+        let login = backend_policy::direct_rest_login()
+            .expect("the sign-in has nothing to derive a master key with");
+        assert_eq!(login.server_url, "https://vault.example.com");
+        assert_eq!(login.email, account.email);
+        assert_eq!(login.device_id, device_id_for(&account.id));
+
+        // Put the process back: this is a process-wide environment and the
+        // suite runs in parallel.
+        backend_policy::uninstall_env();
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// **And settling back onto a `bw serve` account takes the environment
+    /// away with it.** The account switch's requirement: an app that
+    /// re-pointed the profile directory and the session store but left the
+    /// previous account's direct-REST login installed would derive a key for
+    /// one account out of the other one's master password.
+    #[test]
+    fn settling_back_onto_bw_serve_uninstalls_the_direct_rest_login() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("switch-back");
+        let direct = account_on(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &direct.id).expect("the account directory");
+        let slot = empty_slot();
+
+        let env = settle_the_vault_backend(&config, Some(&direct), false, &slot);
+        assert_eq!(
+            install_backend_env(env, &slot),
+            backend_policy::VaultBackendChoice::DirectRest
+        );
+        assert!(
+            backend_policy::direct_rest_login().is_some(),
+            "control: the environment this test is about was never installed"
+        );
+
+        let official = account_on(None);
+        let env = settle_the_vault_backend(&config, Some(&official), false, &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(
+            backend_policy::direct_rest_login().is_none(),
+            "the previous account's direct-REST login survived a switch to an account served \
+             by `bw serve`"
+        );
+        assert!(slot.is_filled(), "the switch left the incoming account with no backend");
+
+        backend_policy::uninstall_env();
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// The device identifier is the account's own id, hyphenated into a GUID
+    /// and otherwise unchanged -- so it is stable for as long as the account
+    /// is on this machine, and a second launch does not add a second entry to
+    /// the user's device list.
+    #[test]
+    fn the_device_id_is_the_account_id_grouped_as_a_guid() {
+        let id = accounts::AccountId::generate();
+        let device = device_id_for(&id);
+        assert_eq!(device.len(), 36, "not a GUID's shape: {device}");
+        assert_eq!(
+            device.match_indices('-').map(|(at, _)| at).collect::<Vec<_>>(),
+            vec![8, 13, 18, 23],
+            "the groups are not 8-4-4-4-12: {device}"
+        );
+        assert_eq!(
+            device.replace('-', ""),
+            id.as_str(),
+            "the identifier is not the account's own id, so it is not stable across launches"
+        );
+        // Stable, said as a property rather than inferred from the shape.
+        assert_eq!(device_id_for(&id), device);
     }
 }

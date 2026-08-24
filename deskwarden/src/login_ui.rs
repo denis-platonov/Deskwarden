@@ -5,12 +5,13 @@ use crate::accounts::{Account, AccountId};
 // and the active-profile form there would sign the existing account out and
 // replace it. See `profile_dir_for`.
 use crate::hello::{self, HelloState};
+use crate::rest::api::Authenticated;
 use crate::theme;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BwStatus {
@@ -2059,10 +2060,174 @@ fn probe_hello(scope: &Option<(PathBuf, AccountId)>) -> HelloState {
     }
 }
 
+// ---- the master password's boundary, and what does NOT cross it ------------
+
+/// The login the direct-REST backend needs, as a `fn` pointer.
+///
+/// **This is the whole of the resolution to "`RestClient::authenticate` needs
+/// the master password".** It does not get one. The password never leaves this
+/// module: the derivation is performed *here*, on the worker thread that
+/// already holds the plaintext for `bw login`, and what comes back is an
+/// [`Authenticated`] -- a session and a master key, neither of which is the
+/// password and neither of which can be turned back into it.
+///
+/// And that [`Authenticated`] does not cross the window's boundary either.
+/// It is handed to [`DirectRestLogin::adopt`], the sink `main` installed, from
+/// the same worker thread; the window's own answer is still the
+/// `Result<String, String>` session token it has always been. So this change
+/// does not invert the boundary the two allocator guards in
+/// `password_lifetime_tests` were built around -- it adds a second thing that
+/// must not cross it, and those guards were retargeted onto
+/// [`authenticate_then_wipe`], which is the function the new secret's whole
+/// life fits inside.
+///
+/// A `fn` pointer rather than a `cfg(test)` seam, which this crate bans, and
+/// rather than a trait object, because there is exactly one call: a test hands
+/// in its own function and gets a fixed [`Authenticated`] with no server, no
+/// socket and no six hundred thousand PBKDF2 iterations, while production
+/// hands in [`derive_direct_rest`].
+///
+/// `Err` is a **message for a log**, built by [`derive_direct_rest`] out of a
+/// [`crate::rest::api::RestError`], whose `Display` carries a status and a
+/// route and nothing of what was sent. Nothing here may put the password, the
+/// hash or the key into it.
+pub type AuthenticateFn = fn(
+    server_url: &str,
+    email: &str,
+    device_id: &str,
+    password: &[u8],
+) -> Result<Authenticated, String>;
+
+/// Everything the direct-REST derivation needs that the password is not, plus
+/// the one place its answer is allowed to go.
+///
+/// Built by [`crate::backend_policy::direct_rest_login`] out of the
+/// environment `main` installs, and owned rather than borrowed because the
+/// worker outlives the frame that builds it -- the same reason `enroll_hello`
+/// and `data_dir` are owned.
+#[derive(Clone)]
+pub struct DirectRestLogin {
+    /// The server the account is on. Only ever a positively self-hosted one:
+    /// [`crate::backend_policy::choose`] is what decides this value exists.
+    pub server_url: String,
+    /// The account's address, which is also the KDF's salt.
+    pub email: String,
+    /// A per-account, per-installation device identifier. See
+    /// [`crate::rest::api::Device`] and `main`'s own note on where it comes
+    /// from.
+    pub device_id: String,
+    /// See [`AuthenticateFn`].
+    pub authenticate: AuthenticateFn,
+    /// Where a derived login goes.
+    ///
+    /// `main` installs this, and what it does there is the whole of Task B's
+    /// second half: write the key to the account's [`crate::user_key_store`]
+    /// and put a [`crate::rest::backend::RestBackend`] into the
+    /// [`crate::vault_backend::LateBoundBackend`] the vault cache was built
+    /// around.
+    ///
+    /// **A sink and not a return value**, and that is what keeps every login
+    /// path in this app on one wiring. `run_login_flow_for`, `app_window`'s
+    /// startup card, its post-lock card, `reauthenticate`,
+    /// `recover_from_failed_vault_wait` and the account switch are six hosts
+    /// for this one window; a derived login handed *back* would have to be
+    /// carried by all six. Handed *sideways* it is carried by none, and there
+    /// is no host through which a master key can be forgotten.
+    pub adopt: std::sync::Arc<dyn Fn(Authenticated) + Send + Sync>,
+}
+
+/// What the user's device list calls this app.
+const DEVICE_NAME: &str = "Deskwarden";
+
+/// [`AuthenticateFn`] as production performs it: one [`crate::rest::api::
+/// RestClient`] against `server_url`, one `authenticate`.
+///
+/// Separate from the type alias so the production function has a name a reader
+/// can find, and so the seam's one production value is written in exactly one
+/// place.
+pub fn derive_direct_rest(
+    server_url: &str,
+    email: &str,
+    device_id: &str,
+    password: &[u8],
+) -> Result<Authenticated, String> {
+    let client = crate::rest::api::RestClient::new(server_url);
+    let device = crate::rest::api::Device::windows_desktop(device_id, DEVICE_NAME);
+    client
+        .authenticate(email, password, &device)
+        .map_err(|e| e.to_string())
+}
+
+/// **The plaintext master password's whole life, in one function that returns
+/// without it and without anything derived from it.**
+///
+/// Takes the plaintext by value, hands it to the three things that may see it
+/// -- the CLI, the Windows Hello enrolment, and the direct-REST derivation --
+/// and zeroizes it before returning, on every path. What comes back is the
+/// `bw` session token and nothing else.
+///
+/// Split out of [`spawn_auth`] so that it can be *measured*. The two
+/// allocator-watching guards in `password_lifetime_tests` drive this directly,
+/// with the probe as the password and closures in place of the CLI and the
+/// enrolment, so the boundary they watch includes the one this branch added.
+/// Inside a thread they could measure nothing: the watch is armed around a
+/// call, and a detached worker outlives it.
+///
+/// **Order matters, and it is the order the enrolment already used.** The
+/// derivation runs only when the CLI said yes, because a master key derived
+/// from a password that did not open the vault is a key whose first sync
+/// fails -- and this app's answer to that is to ask again, which it would have
+/// just finished doing.
+fn authenticate_then_wipe(
+    password: String,
+    run_cli: impl FnOnce(&str) -> Result<String, String>,
+    enroll: impl FnOnce(&str),
+    direct: Option<DirectRestLogin>,
+) -> Result<String, String> {
+    // **Taken into a `Zeroizing` on the first line, rather than wiped on the
+    // last one.** The body below now has three ways to unwind past that wipe
+    // -- the CLI spawn, the Hello enrolment, and the direct-REST derivation,
+    // which is the one this branch added and the one that does PBKDF2 and a
+    // network round trip. A trailing `password.zeroize()` covers none of them.
+    // `Zeroizing`'s `Drop` covers all three, and it is what
+    // `an_unwind_does_not_release_the_master_password_in_the_clear` was
+    // retargeted onto.
+    let password = Zeroizing::new(password);
+    let token = run_cli(&password);
+
+    if token.is_ok() {
+        enroll(&password);
+        if let Some(direct) = direct {
+            match (direct.authenticate)(
+                &direct.server_url,
+                &direct.email,
+                &direct.device_id,
+                password.as_bytes(),
+            ) {
+                // Straight into the sink, on this thread, without ever being
+                // bound to a name the window can reach.
+                Ok(authenticated) => (direct.adopt)(authenticated),
+                // Logged and not surfaced: the `bw` sign-in succeeded, so the
+                // window is finished and the user is signed in. What notices
+                // there is no direct-REST login is the vault backend itself --
+                // an unfilled `LateBoundBackend` answers `Unauthorized`, which
+                // is this app's existing "sign in again" and is exactly the
+                // right answer here.
+                Err(e) => log::warn!("the direct-REST login could not be derived: {e}"),
+            }
+        }
+    }
+
+    // No `zeroize()` here: `password` is a `Zeroizing`, so the wipe happens on
+    // the way out of this function whichever way it leaves -- including the
+    // three unwinds above, which a call here would not have covered.
+    token
+}
+
 fn spawn_auth(
     tx: std::sync::mpsc::Sender<Result<String, String>>,
     args: Vec<String>,
-    mut password: String,
+    password: String,
     // `Some` when the user asked for quick unlock this submit: the account
     // whose blob the password gets sealed into, owned because the worker
     // outlives this frame. Enrollment is per-account (`hello::enroll_for`) --
@@ -2074,19 +2239,30 @@ fn spawn_auth(
     // override to set and the CLI resolves its own.
     data_dir: Option<PathBuf>,
 ) {
+    // Read here rather than passed in, so that all four of this window's hosts
+    // get it without carrying it. `None` -- nothing installed, or this account
+    // is on `bw serve` -- is byte-for-byte the behaviour this function has
+    // always had.
+    let direct = crate::backend_policy::direct_rest_login();
     std::thread::spawn(move || {
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_bw_with_password(&arg_refs, &password, data_dir.as_deref());
+        let token = authenticate_then_wipe(
+            password,
+            |password| {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_bw_with_password(&arg_refs, password, data_dir.as_deref())
+            },
+            |password| {
+                if let Some((config_dir, id)) = &enroll_hello {
+                    match hello::enroll_for(config_dir, id, password) {
+                        Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
+                        Err(e) => log::warn!("could not enroll Windows Hello quick unlock: {e}"),
+                    }
+                }
+            },
+            direct,
+        );
 
-        if let (true, Some((config_dir, id))) = (result.is_ok(), &enroll_hello) {
-            match hello::enroll_for(config_dir, id, &password) {
-                Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
-                Err(e) => log::warn!("could not enroll Windows Hello quick unlock: {e}"),
-            }
-        }
-        password.zeroize();
-
-        let _ = tx.send(result);
+        let _ = tx.send(token);
     });
 }
 
@@ -3689,7 +3865,12 @@ mod login_entry_point_tests {
         );
         // And the one spawn that is not in that region: the worker thread.
         assert!(
-            SOURCE.contains(concat!("run_bw_with_password(&arg_refs, &password, data_dir", ".")),
+            // `password` and not `&password` since the worker's body moved
+            // into `authenticate_then_wipe`, which hands its closures a
+            // `&str`. What this control is about is the third argument, and
+            // that is unchanged: the directory is passed in, not read out of
+            // the process-global.
+            SOURCE.contains(concat!("run_bw_with_password(&arg_refs, password, data_dir", ".")),
             "control: the `bw login`/`bw unlock` worker still takes its directory as an \
              argument rather than reading a global"
         );
@@ -9243,6 +9424,111 @@ pub(crate) mod password_lifetime_tests {
         }
     }
 
+    // ---- the second boundary: the sign-in worker ---------------------------
+    //
+    // `RestClient::authenticate` needs the master password, and this window is
+    // built so that the plaintext never crosses its boundary. The resolution
+    // is that the derivation happens INSIDE that boundary, on the worker that
+    // already holds the plaintext for `bw login`, and that what leaves is an
+    // `Authenticated` -- handed sideways to the sink `main` installed, never
+    // back through the window.
+    //
+    // `authenticate_then_wipe` is the whole of the plaintext's life on that
+    // worker, so it is what the two guards below were retargeted onto. Neither
+    // guard lost anything: each still watches `LoginForm`'s `Drop` exactly as
+    // it did, and each now watches this as well, with its own control.
+
+    /// A login-shaped answer with no server behind it.
+    ///
+    /// **Fixed bytes, not derived from the password**, which is what makes an
+    /// assertion about the probe an assertion about the derivation rather than
+    /// about this fixture.
+    fn fake_authenticated() -> crate::rest::api::Authenticated {
+        crate::rest::api::Authenticated {
+            session: crate::rest::api::Session::from_refresh_token(zeroize::Zeroizing::new(
+                "not-a-real-refresh-token".to_string(),
+            )),
+            master_key: crate::rest::crypto::MasterKey::from_bytes(
+                [0x5A; crate::rest::crypto::MASTER_KEY_LEN],
+            ),
+        }
+    }
+
+    /// The production shape of an [`AuthenticateFn`]: it reads the password
+    /// and returns something that is not derived from it in the clear.
+    fn tidy_authenticate(
+        _server_url: &str,
+        _email: &str,
+        _device_id: &str,
+        password: &[u8],
+    ) -> Result<crate::rest::api::Authenticated, String> {
+        // Reads every byte, so this is not "a function that ignores its
+        // argument and therefore cannot leak it". `black_box` keeps the read
+        // from being optimised away.
+        let mut sum = 0u8;
+        for b in password {
+            sum = sum.wrapping_add(*b);
+        }
+        std::hint::black_box(sum);
+        Ok(fake_authenticated())
+    }
+
+    /// **The control**: an [`AuthenticateFn`] that does what a careless one
+    /// would -- copies the password onto the heap and lets the copy go.
+    ///
+    /// Without this, the assertions below would pass against an instrument
+    /// that cannot see a derivation leak at all, which is exactly the vacuity
+    /// this module has been bitten by before.
+    fn leaky_authenticate(
+        _server_url: &str,
+        _email: &str,
+        _device_id: &str,
+        password: &[u8],
+    ) -> Result<crate::rest::api::Authenticated, String> {
+        let copy = String::from_utf8(password.to_vec()).expect("the probe is UTF-8");
+        drop(copy);
+        Ok(fake_authenticated())
+    }
+
+    /// A [`DirectRestLogin`] around `authenticate`, with a sink that records
+    /// nothing but the fact it was reached.
+    ///
+    /// The strings here are built by the caller BEFORE the watch is armed --
+    /// this function only moves them -- so their own allocations are never
+    /// what a measurement below is about.
+    fn direct_rest(
+        authenticate: AuthenticateFn,
+        reached: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> DirectRestLogin {
+        let reached = std::sync::Arc::clone(reached);
+        DirectRestLogin {
+            server_url: "https://vault.example.com".to_string(),
+            email: "someone@example.com".to_string(),
+            device_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            authenticate,
+            adopt: std::sync::Arc::new(move |_authenticated| {
+                reached.store(true, std::sync::atomic::Ordering::Relaxed);
+            }),
+        }
+    }
+
+    /// Runs `authenticate_then_wipe` over a fresh copy of the probe, with a
+    /// CLI that succeeds and an enrolment that does nothing, and answers
+    /// whether the sink was reached.
+    ///
+    /// The `String` is built INSIDE, deliberately: what is being measured is
+    /// the plaintext's whole life, and a buffer allocated before the window
+    /// and freed inside it would be measured only half.
+    fn drive_the_worker(direct: Option<DirectRestLogin>) {
+        let answer = authenticate_then_wipe(
+            probe_password(),
+            |_password| Ok("session-token".to_string()),
+            |_password| {},
+            direct,
+        );
+        assert!(answer.is_ok(), "control: the fixture's CLI arm refused");
+    }
+
     /// **The exit the `close_on_success: false` host never takes.** A window
     /// the user typed a master password into and then closed: no answer ever
     /// arrives, so `apply_auth_result` never runs and `Drop` is the only thing
@@ -9263,6 +9549,50 @@ pub(crate) mod password_lifetime_tests {
              exit taken by every user who typed a password and then closed the window. Every \
              String field of the form holds the probe here, so this fires for a copy left in \
              `server_url`, `email` or `error` just as it does for `password` itself"
+        );
+
+        // **The same property at the boundary this branch added**, with its
+        // own control first. The window's own exits are covered above; this is
+        // the worker, where the plaintext now has a third reader.
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            plaintext_reached_the_allocator({
+                let leaky = direct_rest(leaky_authenticate, &reached);
+                move || drive_the_worker(Some(leaky))
+            }),
+            "control: a direct-REST derivation that copies the master password onto the heap \
+             and drops the copy went past unnoticed, so the assertion below is about an \
+             instrument that cannot see a leak in the one new reader of the plaintext"
+        );
+        assert!(
+            reached.load(std::sync::atomic::Ordering::Relaxed),
+            "control: the derivation was never reached at all, so neither measurement here is \
+             about a worker that did the work"
+        );
+
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            !plaintext_reached_the_allocator({
+                let tidy = direct_rest(tidy_authenticate, &reached);
+                move || drive_the_worker(Some(tidy))
+            }),
+            "the sign-in worker released the plaintext master password to the allocator. This \
+             is the boundary `RestClient::authenticate` had to be brought inside rather than \
+             the password taken out through: everything that reads the plaintext is inside \
+             `authenticate_then_wipe`, and what leaves is an `Authenticated`"
+        );
+        assert!(
+            reached.load(std::sync::atomic::Ordering::Relaxed),
+            "the derived login never reached the sink, so the measurement above is about a \
+             worker that derived nothing"
+        );
+
+        // And the arm that was there before this branch: no direct-REST login
+        // asked for, which is every `bw serve` account.
+        assert!(
+            !plaintext_reached_the_allocator(|| drive_the_worker(None)),
+            "the sign-in worker released the plaintext master password on the path that \
+             derives nothing at all -- the path every account was on before this branch"
         );
     }
 
@@ -9296,6 +9626,43 @@ pub(crate) mod password_lifetime_tests {
             "an unwind out of the login window released the plaintext master password (from \
              any String field of the form -- all four hold the probe here)"
         );
+
+        // **The same exit at the worker's boundary.** The worker has three
+        // ways to unwind past the end of `authenticate_then_wipe` -- the CLI
+        // spawn, the Hello enrolment, and the direct-REST derivation, which is
+        // the one this branch added and the one that does PBKDF2 and a network
+        // round trip. The panic is raised from inside the derivation, which is
+        // the deepest of the three and the only one that could not unwind at
+        // all before this change existed.
+        //
+        // Its control is the first assertion in this test: a bare `String`
+        // unwound past the allocator and WAS seen, so the negative below is
+        // about an instrument that is looking.
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let panicking = direct_rest(panicking_authenticate, &reached);
+                    drive_the_worker(Some(panicking));
+                }));
+            }),
+            "an unwind out of the direct-REST derivation released the plaintext master \
+             password. The wipe cannot be the last statement of `authenticate_then_wipe` for \
+             this reason: the buffer has to be a `Zeroizing`, whose `Drop` runs on the way out \
+             whichever way that is"
+        );
+    }
+
+    /// An [`AuthenticateFn`] that panics where a real one can: after the
+    /// password has been handed to it and before it has answered.
+    fn panicking_authenticate(
+        _server_url: &str,
+        _email: &str,
+        _device_id: &str,
+        password: &[u8],
+    ) -> Result<crate::rest::api::Authenticated, String> {
+        std::hint::black_box(password.len());
+        panic!("deliberate: unwinding out of a direct-REST derivation");
     }
 
     /// **The leak this module was written for, in the shape the single-window

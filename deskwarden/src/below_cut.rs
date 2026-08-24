@@ -820,8 +820,14 @@ mod tests {
         );
         assert_eq!(
             (modules, closes, depth),
-            (2, 2, 0),
-            "below `main.rs`'s cut there are no longer exactly two opened-and-closed test \
+            // Four since the direct-REST branch: the two that were always
+            // here, plus `bw_serve_gate` (the rule that no path reaches
+            // `bw serve` without the backend policy having answered) and
+            // `vault_backend_choice_tests` (the startup decision that picks a
+            // backend). Both are `#[cfg(test)] mod` at column 0 below the
+            // cut, which is exactly what this walk counts.
+            (4, 4, 0),
+            "below `main.rs`'s cut there are no longer exactly four opened-and-closed test \
              modules: {modules} opened, {closes} closed, ending at depth {depth}"
         );
         assert_eq!(
