@@ -34,16 +34,38 @@ the card that appears is no longer a dead end but a two-step picker:
 **1.79 MB** with its window on screen, against ~102 MB for any eframe window on
 the `glow` renderer.
 
-The `wgpu` alternative was probed on 2026-08-22 and is **blocked, not rejected**:
-`wgpu-hal 29.0.4` fails to compile against the `windows` crate it requires, at
-both 0.62.2 and 0.62.0, in a `windows-core` unification failure that has nothing
-to do with this crate's own `windows 0.58`. The comment at `Cargo.toml:102`
-attributing the `glow` choice to a clash with *this app's* pin is **wrong** and
-should be corrected when someone next touches it. A measured comparison exists:
-a wgpu/D3D11 egui app on the same machine sits at 39.8 MB working set, loading
-`dxgi.dll` and `d3d11.dll` but not `nvoglv64.dll`. If wgpu becomes buildable,
-that changes the arithmetic for the *vault window*; it does not change this
-card, which is small enough to hand-draw and frequent enough to be worth it.
+**The `wgpu` paragraph that stood here was wrong twice over, and was corrected
+on 2026-08-23 after the experiment was actually run.** It is replaced rather
+than deleted, because both errors are instructive.
+
+It said the build failure "has nothing to do with this crate's own
+`windows 0.58`", and that the comment at `Cargo.toml:102` blaming the `glow`
+choice on that pin was wrong. **That comment was right.** `gpu-allocator 0.28.0`
+declares `windows = ">=0.53, <=0.62"`, so cargo unifies it onto this crate's
+`0.58` while `wgpu-hal 29.0.4` hands it `0.62` types. Forcing a single
+`windows 0.62.0` across the graph makes `wgpu-hal` compile; the remaining work
+is then this crate's own 0.58 -> 0.62 migration, which is done on the
+`wgpu-renderer` branch and is memory-neutral to the byte.
+
+It also implied wgpu would roughly halve the app's memory, inferred from a
+different and far simpler egui application. **Measured on this app, in release,
+it is about three times worse:**
+
+| release build | private |
+| --- | --- |
+| glow (shipped) | 124.1 MB |
+| wgpu, all backends | 412.8 MB |
+| wgpu, DX12 only | 355.8 MB |
+
+wgpu enumerates its GL backend while selecting an adapter, so it loaded
+`nvoglv64.dll` -- the driver the switch was meant to avoid -- *on top of* D3D12;
+restricting to DX12 removed that and still left 355.8 MB. WARP, the software
+rasteriser, also loads on a machine with an NVIDIA GPU.
+
+**wgpu is rejected on measurement, not blocked on a build error.** The lesson
+worth keeping is the ordering: the inference came from another application, the
+recommendation came from the inference, and the measurement came last. It
+should have come first.
 
 **Design 3a moves.** The no-match card exists in egui today. The split's rule is
 that every surface lives in exactly one renderer -- a card drawn twice is the
