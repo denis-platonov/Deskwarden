@@ -51,7 +51,15 @@ So the UI is launched with a mode and a surface, and reads the rest itself. **Th
 
 **The UI is *not* a kill-on-close child of the daemon's job object.** The two are loosely coupled: a daemon restart — an update, a crash, a manual quit and relaunch — must not take an open vault window with it. When the daemon comes back it brings `bw serve` up on the same constant port, and the UI's next request succeeds. Recovery is a retry, not a handshake.
 
-**The consequence, and it is genuinely new surface:** quitting from the tray no longer closes an open vault window. It leaves a UI whose backend is gone. That window must say something honest — that Deskwarden is not running, with a way to start it — rather than hanging, silently failing, or showing a stale vault as though it were live. **This state cannot occur in the current single-process app, so nothing in the codebase handles it today, and it is the part of this design most likely to be got wrong first.**
+**A UI with no daemon exits by itself.** Quitting from the tray leaves an open vault window whose backend is gone. Rather than teach that window to explain itself, it ends: **no daemon, no UI.**
+
+The signal already exists and needs nothing new built. `app_mutex::APP_MUTEX_NAME` is a `Local\`-scoped named mutex the daemon holds for the life of the process, per logon session. The UI opens it to ask "is Deskwarden running?" — a question, not a claim, so it never contends for ownership.
+
+**It exits on sustained absence, not on the first miss.** Read literally, "exit when the tray is gone" and "the daemon can reconnect if restarted" contradict each other: a UI that quits the instant the mutex disappears leaves nothing for a restarted daemon to reconnect to, and an update — which stops the old daemon before starting the new one — would close every window the user had open. So absence is timed: a brief gap is a restart or an update and the UI waits and reconnects; a sustained gap means Deskwarden was quit, and the UI exits.
+
+**The exact grace period is not fixed here.** It must comfortably exceed a self-update's daemon-restart gap, because closing the user's windows during an update would be a worse bug than the one this rule fixes. Measure that gap and choose from it; do not guess a round number.
+
+**First launch is exempt, and this is the easy thing to get wrong.** A plain double-click on `deskwarden.exe` finds no mutex because no daemon is running *yet* — and must start one, not exit immediately. The rule is "a UI whose daemon *went away* exits", not "a UI that finds no daemon exits". Whatever implements this must be able to tell the two apart, and a test must pin the difference, because getting it backwards makes the application impossible to start by double-clicking and the failure looks like the binary is broken.
 
 **One UI per surface, not per request.** Asking for the vault window while one is open must focus the existing one, not spawn a second. The window-per-surface identity needs an owner; the existing single-instance machinery is the precedent to follow rather than a second scheme.
 
