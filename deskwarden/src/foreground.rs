@@ -1129,7 +1129,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 57] = [
+        const OPENS_NO_WINDOW: [&str; 58] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -1219,6 +1219,11 @@ mod tests {
             // nothing, and the picker and confirmation screens that will
             // draw what it returns are a later step and are not this module.
             "otpauth",
+            // This crate's password generator: a recipe in, a string out.
+            // Pure arithmetic over the OS CSPRNG, with no window, no dialog
+            // and no I/O beyond `getrandom`. The overlay that will show what
+            // it returns is a different module and is classified there.
+            "password_gen",
             "password_strength",
             // Wraps the QR decoder: an RGBA buffer in, a string out. Pure, with
             // no I/O at all -- the region capture that will feed it is a

@@ -212,6 +212,21 @@ pub enum RestError {
     /// is not a secret, but there is no reason to echo an unvalidated string
     /// into an error that may be logged.
     UnsafeId,
+    /// A **bulk** route answered successfully without reporting the id that
+    /// was sent to it as having changed.
+    ///
+    /// This is the variant that exists so that
+    /// [`RestClient::archive_cipher`] cannot report success for an item that
+    /// did not move. A bulk endpoint's overall status is not the conjunction
+    /// of its per-item outcomes -- a `200` can cover an id the server
+    /// silently declined -- so this module reads the answer's list and says
+    /// so when the id is not in it, or is in it in the wrong state. See
+    /// [`RestClient::bulk_archive`].
+    ///
+    /// Carries nothing. The id is the caller's own and it already has it;
+    /// echoing a server-supplied value into an error that may be logged buys
+    /// nothing here.
+    BulkIdMissing,
 }
 
 impl std::fmt::Display for RestError {
@@ -235,6 +250,10 @@ impl std::fmt::Display for RestError {
                 f.write_str("this session has no refresh token and cannot be renewed")
             }
             Self::UnsafeId => f.write_str("that item's id is not one this client will put in a URL"),
+            Self::BulkIdMissing => f.write_str(
+                "the server accepted the request but did not report that item as changed, so it \
+                 may not have been",
+            ),
         }
     }
 }
@@ -657,6 +676,104 @@ impl RestClient {
         })
     }
 
+    /// `PUT /api/ciphers/archive` -- into the archive.
+    ///
+    /// See [`Self::bulk_archive`] for the whole of the argument: the route is
+    /// a **bulk** one and this is the single-element case of it, and the
+    /// response is *checked* rather than assumed.
+    pub fn archive_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        self.bulk_archive(session, id, "archive", true)
+    }
+
+    /// `PUT /api/ciphers/unarchive` -- back out of the archive.
+    ///
+    /// **Not the same thing as [`Self::restore_cipher`]**, which un-*trashes*.
+    /// The two states are independent -- `deletedDate` and `archivedDate` are
+    /// separate fields on a cipher -- so neither route can stand in for the
+    /// other, and calling restore on an archived item is a request about the
+    /// wrong state. That distinction is the reason this is a route of its own
+    /// rather than a second caller of an existing one.
+    pub fn unarchive_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        self.bulk_archive(session, id, "unarchive", false)
+    }
+
+    /// The one implementation behind [`Self::archive_cipher`] and
+    /// [`Self::unarchive_cipher`].
+    ///
+    /// # A bulk route reached through a per-id signature
+    ///
+    /// Every other cipher write in this module puts the id in the path.
+    /// Archive does not: Bitwarden's archive is
+    /// `PUT /api/ciphers/{archive|unarchive}` with a body of `{"ids": [...]}`,
+    /// applying to as many ciphers as are listed. There is no per-id archive
+    /// route to call instead.
+    ///
+    /// [`crate::vault_backend::VaultBackend::archive_item`] is per-id, so the
+    /// adaptation is to send a **batch of one**. That is a faithful use of
+    /// the route rather than a trick: one id is a legal list, and the server
+    /// does with it exactly what it would do with it inside a longer one.
+    ///
+    /// # Why the answer is read, and not merely its status
+    ///
+    /// This is the part that matters, and it is the reason this function is
+    /// twenty lines rather than four.
+    ///
+    /// A bulk endpoint has an outcome per id, and an overall status that is
+    /// **not** the conjunction of them: a server can perfectly reasonably
+    /// answer `200` to "archive these three" having archived two, and
+    /// Bitwarden's own answer to this route is a list of the ciphers it
+    /// actually changed. So a caller that reads only the status has written
+    /// the failure this crate treats as worse than a crash -- an `Ok`
+    /// returned for an item that never moved. That is precisely the defect
+    /// [`crate::rest::backend::RestBackend::archive_item`] used to refuse in
+    /// order to avoid, and re-introducing it through a bulk route instead of
+    /// a faked `PUT` would be worse than the refusal, not better.
+    ///
+    /// So the response's list is searched for the id that was sent, and the
+    /// cipher found there must show the state that was asked for. An id the
+    /// server did not report back is [`RestError::BulkIdMissing`].
+    ///
+    /// # The state is judged by `archivedDate`, deliberately
+    ///
+    /// `archived` says which way: after an archive the echoed cipher must
+    /// carry a non-null `archivedDate`, and after an unarchive it must not.
+    ///
+    /// That is the **same predicate** [`crate::rest::backend`] filters
+    /// `list_archive` with, and it is the same one for a reason. If a server
+    /// answered an archive `200` without stamping `archivedDate`, the next
+    /// sync would not show the item as archived either -- so treating that as
+    /// success would produce an app that says an item was archived and a
+    /// list that does not contain it. Checking the field the reader reads is
+    /// what keeps the two halves of "archive" from disagreeing.
+    fn bulk_archive(
+        &self,
+        session: &mut Session,
+        id: &str,
+        route: &str,
+        archived: bool,
+    ) -> Result<(), RestError> {
+        // The id does not reach the URL here -- it rides the body -- so this
+        // is not the path-injection check its neighbours make. It is applied
+        // anyway so that no endpoint in this module accepts an id the others
+        // refuse, and because an id that is empty or full of punctuation
+        // would be matched against the response below and produce a confusing
+        // "the server did not report it" instead of an honest refusal.
+        if !is_url_path_safe(id) {
+            return Err(RestError::UnsafeId);
+        }
+        let url = format!("{}/api/ciphers/{}", self.base_url, route);
+        let body = serde_json::json!({ "ids": [id] });
+        let answer = self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.write_agent.put(&url), session).send_json(&body))
+        })?;
+        let reported = archived_state_of(&answer, id).ok_or(RestError::BulkIdMissing)?;
+        if reported == archived {
+            Ok(())
+        } else {
+            Err(RestError::BulkIdMissing)
+        }
+    }
+
     // ---- the plumbing ------------------------------------------------------
 
     /// The token discipline every authenticated call in this module shares:
@@ -772,6 +889,33 @@ impl RestClient {
             Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
         }
     }
+}
+
+/// Finds the cipher with this id in a bulk route's answer and reports whether
+/// it is archived, or `None` if the answer does not mention it at all.
+///
+/// # Tolerant about the envelope, strict about the item
+///
+/// Bitwarden answers a bulk cipher route with its list envelope --
+/// `{"object":"list","data":[...]}` -- and a smaller server may reasonably
+/// answer with the bare array. Both are read, because the envelope is
+/// presentation and nothing turns on which one arrived.
+///
+/// What is **not** tolerated is the item: an answer that does not contain a
+/// cipher with the requested id is `None`, which the caller turns into
+/// [`RestError::BulkIdMissing`] rather than into success. An answer that is
+/// not a list at all -- an empty body, `null`, an object -- is `None` for the
+/// same reason. A body that cannot report per-item success cannot be read as
+/// per-item success; see [`RestClient::bulk_archive`] for why that direction
+/// is the safe one.
+///
+/// `archivedDate` present and non-null is archived, matching
+/// [`crate::rest::backend`]'s own `is_archived` exactly. There is no `unwrap`
+/// on any of it: every step is an `Option` the server could have made empty.
+fn archived_state_of(answer: &serde_json::Value, id: &str) -> Option<bool> {
+    let list = answer.get("data").unwrap_or(answer).as_array()?;
+    let cipher = list.iter().find(|c| c.get("id").and_then(|v| v.as_str()) == Some(id))?;
+    Some(!matches!(cipher.get("archivedDate"), None | Some(serde_json::Value::Null)))
 }
 
 /// Reads a 400's body and decides which of the three things it is.
@@ -1419,6 +1563,8 @@ mod tests {
             RestError::Parse("an access token"),
             RestError::Crypto(CryptoError::MacMismatch),
             RestError::NoRefreshToken,
+            RestError::UnsafeId,
+            RestError::BulkIdMissing,
         ] {
             printed.push(error.to_string());
             printed.push(format!("{error:?}"));
@@ -1492,10 +1638,14 @@ mod tests {
         assert!(!production.contains("mockito"), "the cut left test code in the production half");
         assert!(tests.contains("mockito"), "the cut left no test code in the test half");
 
-        // Three body senders in the whole module, and no more.
+        // Four body senders in the whole module, and no more. **This was
+        // three.** The fourth arrived with the archive routes, and the count
+        // was raised only after accounting for it below -- a guard whose
+        // number is bumped without naming the new caller is a guard with a
+        // hole in it.
         assert_eq!(
             production.matches("send_json(").count(),
-            3,
+            4,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -1507,12 +1657,33 @@ mod tests {
         // The third is prelogin, on the auth agent, which carries no vault data.
         assert_eq!(production.matches("self.auth_agent.post(url).send_json(body)").count(), 1);
 
+        // The fourth is `bulk_archive`, and it is the one exception to "every
+        // body out of this module is a MappedCipher" -- so it is pinned to
+        // the literal it is allowed to be. That body is a list of **cipher
+        // ids**: server-assigned GUIDs which are already in this module's
+        // URLs, are not ciphertext and are not derived from any vault
+        // plaintext. There is nothing for a `MappedCipher` to protect here,
+        // and requiring one would mean encrypting an item in order to archive
+        // it. If this literal ever changes, this assertion fails and whoever
+        // changed it has to justify the new body here.
+        assert_eq!(
+            production.matches(r#"serde_json::json!({ "ids": [id] })"#).count(),
+            1,
+            "the archive body is no longer a bare list of ids"
+        );
+        assert_eq!(
+            production.matches("send_json(&body)").count(),
+            1,
+            "a second hand-built body appeared in rest::api"
+        );
+
         // And nothing else in the module reaches for the write agent with a
-        // body: the two writers above are its only `post`/`put` with content.
+        // body: the three writers above are its only `post`/`put` with
+        // content.
         assert_eq!(
             production.matches("self.write_agent.post(&url), session).send_json").count()
                 + production.matches("self.write_agent.put(&url), session).send_json").count(),
-            2,
+            3,
             "the write agent gained another body-carrying call"
         );
     }
@@ -1743,6 +1914,186 @@ mod tests {
             .expect("the trash");
         refresh.assert();
         trash.assert();
+    }
+
+    /// The archive routes: **bulk endpoints reached with a batch of one**,
+    /// which is how a per-id caller uses a route that has no per-id form.
+    ///
+    /// The body matcher is the assertion that matters. `ids` must be a
+    /// **list** holding exactly the one id -- a bare string, a second id, or
+    /// a differently spelled key all fail here rather than on a real server.
+    /// And the two directions are two routes: an unarchive that quietly used
+    /// `/restore` would not match.
+    #[test]
+    fn the_archive_routes_send_a_batch_of_one_and_are_two_distinct_routes() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let archive = server
+            .mock("PUT", "/api/ciphers/archive")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": [id] })))
+            .with_body(format!(
+                r#"{{"object":"list","data":[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]}}"#
+            ))
+            .expect(1)
+            .create();
+        let unarchive = server
+            .mock("PUT", "/api/ciphers/unarchive")
+            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": [id] })))
+            .with_body(format!(r#"{{"object":"list","data":[{{"id":"{id}","archivedDate":null}}]}}"#))
+            .expect(1)
+            .create();
+
+        client.archive_cipher(&mut session, id).expect("the archive");
+        client.unarchive_cipher(&mut session, id).expect("the unarchive");
+        archive.assert();
+        unarchive.assert();
+    }
+
+    /// **A bulk `200` is not a per-item success, and this is where that is
+    /// enforced.**
+    ///
+    /// Each body below is a perfectly successful HTTP response that does not
+    /// say the requested id was archived. Every one must be
+    /// [`RestError::BulkIdMissing`] -- an `Ok` here would be a caller told
+    /// its item moved when it did not, which is the exact defect the archive
+    /// operations were previously refused in order to avoid.
+    #[test]
+    fn a_bulk_answer_that_omits_or_contradicts_the_id_is_not_a_success() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let bodies = [
+            ("a list naming someone else", r#"{"object":"list","data":[{"id":"other"}]}"#.to_string()),
+            ("an empty list", r#"{"object":"list","data":[]}"#.to_string()),
+            ("no data key", r#"{"object":"list"}"#.to_string()),
+            ("a null body", "null".to_string()),
+            (
+                "the id in the wrong state",
+                format!(r#"{{"data":[{{"id":"{id}","archivedDate":null}}]}}"#),
+            ),
+        ];
+        for (what, body) in bodies {
+            let mut server = mockito::Server::new();
+            let (client, mut session) = granted(&mut server);
+            server.mock("PUT", "/api/ciphers/archive").with_status(200).with_body(body).create();
+            assert_eq!(
+                client.archive_cipher(&mut session, id).expect_err(what),
+                RestError::BulkIdMissing,
+                "an archive answered with {what} was reported as a success"
+            );
+        }
+    }
+
+    /// A `200` with **no body at all** is also not a success.
+    ///
+    /// Separate from the case list above because it fails at a different
+    /// place and it is worth being explicit about which: an empty body never
+    /// reaches [`archived_state_of`], because `value_from` cannot parse it
+    /// into JSON and answers `Parse("a JSON body")` first. That is a
+    /// different error but the same *answer* -- not `Ok` -- and this test
+    /// exists so that the property is asserted rather than assumed from one
+    /// layer's behaviour.
+    ///
+    /// This is a deliberate cost, and it is the one place these routes are
+    /// stricter than the rest of the module: [`RestClient::trash_cipher`] and
+    /// its neighbours use `unit_from` and accept an empty body precisely
+    /// because they answer with one. A bulk route may not, because an empty
+    /// body cannot say which of the ids it applied to -- so a server that
+    /// answers these routes with `204` and nothing else will get an error
+    /// here rather than a false success. That is the direction this crate
+    /// chose on purpose.
+    #[test]
+    fn a_bulk_answer_with_no_body_at_all_is_not_a_success_either() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        server.mock("PUT", "/api/ciphers/archive").with_status(200).with_body("").create();
+        let err = client.archive_cipher(&mut session, id).expect_err("an empty body");
+        assert!(
+            matches!(err, RestError::Parse(_) | RestError::BulkIdMissing),
+            "an archive answered with an empty body was not reported as a failure: {err:?}"
+        );
+    }
+
+    /// The envelope is presentation, so both spellings are read: Bitwarden's
+    /// `{"object":"list","data":[..]}` and a bare array. Nothing about
+    /// whether the item moved turns on which one arrived, and refusing the
+    /// bare array would refuse a smaller server for a cosmetic reason.
+    #[test]
+    fn a_bulk_answer_is_read_whether_or_not_it_carries_a_list_envelope() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        for body in [
+            format!(r#"{{"object":"list","data":[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]}}"#),
+            format!(r#"[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]"#),
+        ] {
+            let mut server = mockito::Server::new();
+            let (client, mut session) = granted(&mut server);
+            server.mock("PUT", "/api/ciphers/archive").with_body(body.clone()).create();
+            client.archive_cipher(&mut session, id).unwrap_or_else(|e| {
+                panic!("a valid archive answer was refused: {e:?} for {body}")
+            });
+        }
+    }
+
+    /// The id never reaches the URL on these routes -- it rides the body --
+    /// but it is checked all the same, so that no endpoint in this module
+    /// accepts an id its neighbours refuse. The mock never being hit is the
+    /// assertion: the refusal happens before a socket is opened.
+    #[test]
+    fn an_unsafe_id_is_refused_by_the_archive_routes_too() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let any = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
+            assert_eq!(
+                client.archive_cipher(&mut session, bad).expect_err("an unsafe id"),
+                RestError::UnsafeId,
+                "`{bad}` was accepted as a cipher id by archive"
+            );
+            assert_eq!(
+                client.unarchive_cipher(&mut session, bad).expect_err("an unsafe id"),
+                RestError::UnsafeId
+            );
+        }
+        assert!(!any.matched(), "an unsafe id reached the network");
+    }
+
+    /// The archive routes share the module's token discipline rather than
+    /// having their own: one 401, one refresh, one retry, and the retry
+    /// carries the new token. Worth pinning per endpoint family, because a
+    /// route added outside `refreshing` would work in every test that did not
+    /// look for this.
+    #[test]
+    fn a_401_on_an_archive_is_refreshed_once_and_retried() {
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let stale = server
+            .mock("PUT", "/api/ciphers/archive")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(401)
+            .expect(1)
+            .create();
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "refresh_token".into(),
+            )]))
+            .with_body(r#"{"access_token":"AT-2","expires_in":3600,"refresh_token":"RT-2"}"#)
+            .expect(1)
+            .create();
+        let fresh = server
+            .mock("PUT", "/api/ciphers/archive")
+            .match_header("Authorization", "Bearer AT-2")
+            .with_body(format!(r#"{{"data":[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]}}"#))
+            .expect(1)
+            .create();
+
+        client.archive_cipher(&mut session, id).expect("the retried archive");
+        stale.assert();
+        refresh.assert();
+        fresh.assert();
     }
 
     /// A rejected write keeps the server's own words, the way every other

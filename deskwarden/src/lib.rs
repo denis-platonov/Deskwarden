@@ -69,6 +69,11 @@ pub mod match_engine;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
 pub mod otpauth;
 pub mod overlay_ui;
+/// This crate's own password generator -- the one vault operation no server
+/// has an endpoint for. Beside the backends rather than inside one, because
+/// every backend that is not `bw serve` needs it. Passphrases are refused by
+/// name until a wordlist is a decision the owner has taken.
+pub mod password_gen;
 pub mod password_strength;
 pub mod picker_ui;
 pub mod preflight_host;

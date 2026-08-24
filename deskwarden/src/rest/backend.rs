@@ -51,13 +51,31 @@
 //!
 //! # What this backend refuses, and why refusing is the answer
 //!
-//! Four of the twenty are [`VaultError::Unsupported`], each naming itself:
-//! [`RestBackend::generate`], and the three folder writes. Two more --
-//! [`RestBackend::archive_item`] and [`RestBackend::unarchive_item`] -- are
-//! refused for a reason of their own. Each method's doc carries the argument;
+//! **Three of the twenty** are [`VaultError::Unsupported`], each naming
+//! itself: the three folder writes. Each method's doc carries the argument;
 //! the shared half is that this crate would rather crash than answer a
 //! question it cannot answer, and an `Ok` with an empty list is the quietest
 //! possible wrong answer.
+//!
+//! There were six. Three have since been implemented, and how they were is
+//! worth reading beside the refusals, because in each case the refusal named
+//! the trap that the implementation then had to avoid rather than merely
+//! being replaced:
+//!
+//! * [`RestBackend::archive_item`] and [`RestBackend::unarchive_item`] refused
+//!   for want of a route, and warned that faking one with an edit that sets
+//!   the server-assigned `archivedDate` would report success for a write the
+//!   server ignores. They now use real endpoints in [`crate::rest::api`] --
+//!   Bitwarden's **bulk** routes, sent a batch of one to fit the per-id
+//!   signature -- and the bulk answer is *read back*, because a bulk `200`
+//!   covers the request and not each id inside it. An id the server does not
+//!   report as archived is an error, not an `Ok`.
+//! * [`RestBackend::generate`] refused because there is no endpoint anywhere
+//!   and implementing it meant this crate deciding how strong its passwords
+//!   are. That decision was taken, and it was taken **outside this module**:
+//!   [`crate::password_gen`] is the generator, so that every backend reaches
+//!   one implementation. A *passphrase* is still refused by name, for want of
+//!   a wordlist.
 
 use std::sync::Mutex;
 
@@ -70,6 +88,7 @@ use crate::rest::crypto::CryptoError;
 use crate::rest::sync::{DecryptedItem, DecryptedVault, VaultKeys, decrypt_cipher, decrypt_vault};
 use crate::rest::write::encrypt_item;
 use crate::vault_backend::VaultBackend;
+use crate::password_gen::PasswordGenError;
 use crate::vault_bridge::{
     Folder, GenerateRequest, NewItem, VaultError, VaultItem, with_app_match,
 };
@@ -470,52 +489,52 @@ impl VaultBackend for RestBackend {
         Ok(vault.items.iter().filter(|d| is_archived(&d.item)).map(|d| d.item.clone()).collect())
     }
 
-    /// **Refused, and this is the refusal worth arguing about.**
+    /// **Cost: one `PUT /api/ciphers/archive`. No sync.**
     ///
-    /// `bw serve` has `POST /archive/item/{id}`. [`crate::rest::api`] has five
-    /// cipher endpoints and none of them is archive, so implementing this
-    /// would mean writing a new route -- and the route is the part that is not
-    /// known here. Bitwarden's own archive is a *bulk* endpoint taking a list
-    /// of ids, not the per-id shape this signature has, and the self-hosted
-    /// server this work was done against documents whole subsystems as not
-    /// implemented.
+    /// # This was a refusal, and what changed is the route, not the argument
     ///
-    /// **The alternative that must not be taken** is expressing an archive as
-    /// an ordinary edit that sets `archivedDate`. `archivedDate` is
-    /// server-assigned; a full-replace `PUT` carrying one would at best be
-    /// ignored -- returning `Ok` on an item that stayed exactly where it was,
-    /// which is the "reports success while doing nothing" failure this crate
-    /// treats as worse than a crash -- and at worst would corrupt a field the
-    /// server owns. `bw serve`'s own `archive_item` doc records that a 200
-    /// there does not even prove the state changed, on a route that really
-    /// exists.
+    /// It refused because [`crate::rest::api`] had no archive endpoint, and
+    /// because the two ways of faking one are both worse than saying no. That
+    /// reasoning still stands and is worth keeping in view, because it is
+    /// what the implementation now has to satisfy rather than sidestep:
     ///
-    /// So: a named refusal, and an open decision for the owner. See the
-    /// implementation report on this branch.
-    fn archive_item(&self, _id: &str) -> Result<(), VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "archive_item",
-            why: "this crate's REST client has no archive endpoint, and faking one with an edit \
-                  that sets `archivedDate` would report success for a write the server ignores",
-        })
+    /// * **An ordinary edit setting `archivedDate` is still forbidden.**
+    ///   That field is server-assigned; a full-replace `PUT` carrying one is
+    ///   at best ignored, which returns `Ok` on an item that stayed exactly
+    ///   where it was. Nothing below goes near [`Self::update_item`].
+    /// * **A bulk call read only for its status is the same defect wearing a
+    ///   real route.** A bulk endpoint answers `200` for the request, not for
+    ///   each id in it. [`crate::rest::api::RestClient::bulk_archive`] is
+    ///   therefore written to read the answer back and to fail with
+    ///   [`crate::rest::api::RestError::BulkIdMissing`] when the id it sent is
+    ///   not reported as archived -- and it judges that by `archivedDate`,
+    ///   the very field [`Self::list_archive`] filters on, so this method and
+    ///   that one cannot come to disagree about what "archived" means.
+    ///
+    /// The per-id signature is met by sending a **batch of one**, which is a
+    /// legal use of the route rather than a workaround; see that function for
+    /// the whole of it.
+    fn archive_item(&self, id: &str) -> Result<(), VaultError> {
+        let mut state = self.locked();
+        self.client.archive_cipher(&mut state.session, id).map_err(rest_error)
     }
 
-    /// **Refused**, for [`Self::archive_item`]'s reason.
+    /// **Cost: one `PUT /api/ciphers/unarchive`. No sync.**
     ///
-    /// Note that the two backends do not even *shape* this the same way:
-    /// `bw serve` has no unarchive route either and reaches it through
-    /// `POST /restore/item/{id}`, the same route as an un-trash, selected by
-    /// the item's state. The API's `restore` is a trash-only operation, so
-    /// [`Self::restore_item`] cannot quietly stand in for this one -- calling
-    /// it on an archived item would be a request about the wrong state.
-    fn unarchive_item(&self, _id: &str) -> Result<(), VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "unarchive_item",
-            why: "this crate's REST client has no archive endpoint, and the API's restore route \
-                  un-trashes rather than un-archives, so it cannot stand in",
-        })
+    /// A route of its own, and it has to be: the two backends do not even
+    /// *shape* this the same way. `bw serve` has no unarchive route and
+    /// reaches the state through `POST /restore/item/{id}`, the same route as
+    /// an un-trash, selected by the item's current state. The Bitwarden API's
+    /// restore is trash-only -- `deletedDate` and `archivedDate` are separate
+    /// fields -- so [`Self::restore_item`] must not stand in for this one,
+    /// and does not.
+    ///
+    /// Verified the same way round as [`Self::archive_item`]: the echoed
+    /// cipher must come back **without** an `archivedDate`, or this is an
+    /// error rather than a silent no-op.
+    fn unarchive_item(&self, id: &str) -> Result<(), VaultError> {
+        let mut state = self.locked();
+        self.client.unarchive_cipher(&mut state.session, id).map_err(rest_error)
     }
 
     /// **Cost: one `PUT /api/ciphers/{id}/restore`. No sync.**
@@ -591,25 +610,49 @@ impl VaultBackend for RestBackend {
         Ok(crate::vault_window::totp_add::code_at(&auth, now).map(|c| c.to_string()))
     }
 
-    /// **Refused. There is no server endpoint for this at all**, which
-    /// [`crate::vault_backend`]'s module docs say in as many words.
+    /// **Computed here. No server endpoint exists for this at all**, which
+    /// [`crate::vault_backend`]'s module docs say in as many words. **Cost:
+    /// no network, no sync.**
     ///
-    /// `bw serve`'s `GET /generate` is `bw`'s **own** generator: its wordlist,
-    /// its character classes, its ambiguous-character rules. A backend without
-    /// `bw` cannot ask anyone for a password, so implementing this would mean
-    /// *this crate writing a password generator* -- choosing an alphabet, an
-    /// entropy source and a passphrase wordlist, and quietly becoming the
-    /// thing that decides how strong every password this app creates is.
+    /// # One line, and that is the point
     ///
-    /// That is a decision for the owner of this crate, taken deliberately and
-    /// reviewed, not one slipped in as the last function of a backend
-    /// implementation. So it is refused by name and recorded as open.
-    fn generate(&self, _request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
-        Err(VaultError::Unsupported {
-            backend: BACKEND,
-            operation: "generate",
-            why: "the Bitwarden API has no password generator; supplying one would mean this \
-                  crate inventing its own, which is the owner's decision and not a backend's",
+    /// This refused, because implementing it meant *this crate writing a
+    /// password generator* -- choosing an alphabet, an entropy source and a
+    /// passphrase wordlist, and quietly becoming the thing that decides how
+    /// strong every password this app creates is. That was recorded as the
+    /// owner's decision rather than a backend's, and the decision has since
+    /// been taken.
+    ///
+    /// What it must **not** become is a generator living here.
+    /// [`crate::password_gen`] is a module beside the backends precisely so
+    /// that the next one, and `overlay_ui` which already builds a
+    /// [`crate::vault_bridge::PasswordRecipe`], reach the same generator
+    /// rather than growing a second. Two generators in one app is two answers
+    /// to how strong its passwords are, so this method is a call and a
+    /// mapping and holds no alphabet, no draw and no policy of its own.
+    ///
+    /// # A passphrase is still refused, and still by name
+    ///
+    /// [`crate::password_gen`] implements passwords and refuses passphrases,
+    /// because a passphrase needs a wordlist -- Bitwarden's is the EFF long
+    /// list of 7,776 words -- and an improvised one would look exactly like a
+    /// real passphrase while carrying a fraction of the entropy. That refusal
+    /// arrives here as [`crate::password_gen::PasswordGenError::NoWordlist`]
+    /// and is mapped to the same [`VaultError::Unsupported`] this method used
+    /// to return for everything, so a caller that asks for a passphrase still
+    /// gets a named refusal rather than a weak secret.
+    fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
+        crate::password_gen::generate(request).map_err(|e| match e {
+            // Not `Unsupported`: the operation *is* supported and no decision
+            // is missing -- this machine's CSPRNG failed, which is a fault a
+            // caller may retry. `Unsupported` would tell it never to.
+            PasswordGenError::Rng => VaultError::Http(e.to_string()),
+            PasswordGenError::NoWordlist => VaultError::Unsupported {
+                backend: BACKEND,
+                operation: "generate (passphrase)",
+                why: "generating a passphrase needs a wordlist, and this app carries none; \
+                      inventing a small one would produce a passphrase far weaker than it looks",
+            },
         })
     }
 }
@@ -717,7 +760,7 @@ mod tests {
     use crate::rest::api::Device;
     use crate::rest::crypto::tests::{key_from_64, seal};
     use crate::rest::crypto::{Kdf, SymmetricKey, master_key};
-    use crate::vault_bridge::PasswordRecipe;
+    use crate::vault_bridge::{PassphraseRecipe, PasswordRecipe};
 
     /// The master password every fixture below logs in with. Not a secret:
     /// nothing here reaches a real server, a real vault or `%APPDATA%`.
@@ -929,9 +972,17 @@ mod tests {
     /// cannot do says so by name; none of them answers `Ok` with nothing in
     /// it.
     ///
-    /// One list rather than six tests, so that a seventh refusal added later
-    /// is one line here and the shared property -- names the backend, names
-    /// the operation, gives a reason -- is stated once.
+    /// One list rather than four tests, so that a refusal added later is one
+    /// line here and the shared property -- names the backend, names the
+    /// operation, gives a reason -- is stated once.
+    ///
+    /// **This list used to be six and is now four.** `archive_item`,
+    /// `unarchive_item` and `generate` were removed from it because they were
+    /// implemented, not because the contract loosened: the first two are
+    /// asserted against real routes in
+    /// `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`, and
+    /// `generate` in `a_password_is_generated_locally_and_a_passphrase_is_not`
+    /// -- which also keeps a refusal, for the passphrase half.
     #[test]
     fn every_operation_this_backend_cannot_do_refuses_by_name() {
         let (_server, backend) = logged_in();
@@ -939,14 +990,11 @@ mod tests {
             ("create_folder", backend.create_folder("x").expect_err("refused")),
             ("update_folder", backend.update_folder("f1", "x").expect_err("refused")),
             ("delete_folder", backend.delete_folder("f1").expect_err("refused")),
-            ("archive_item", backend.archive_item("live-1").expect_err("refused")),
-            ("unarchive_item", backend.unarchive_item("arch-1").expect_err("refused")),
             (
-                "generate",
+                "generate (passphrase)",
                 backend
-                    .generate(&GenerateRequest::Password(PasswordRecipe::default()))
-                    .err()
-                    .expect("refused"),
+                    .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
+                    .expect_err("refused"),
             ),
         ];
         for (expected, error) in refusals {
@@ -957,6 +1005,207 @@ mod tests {
             assert_eq!(who, BACKEND);
             assert!(why.len() > 30, "{expected}'s reason is not a reason: {why}");
         }
+    }
+
+    /// **The replacement for two of the refusals that used to be in the list
+    /// above**, and the property that made them refusals in the first place.
+    ///
+    /// Three things at once, because they are one behaviour:
+    ///
+    /// 1. The per-id trait call reaches the **bulk** route with a body of
+    ///    exactly one id -- asserted on the wire, not inferred.
+    ///    `mockito::Matcher::Json` pins the whole body, so a second id, a
+    ///    differently spelled key or a bare string instead of a list all fail.
+    /// 2. It is a route of its own and **not** an edit: `expect(0)` on the
+    ///    item's `PUT` is what says the forbidden `archivedDate` fake was not
+    ///    taken instead.
+    /// 3. Archive and unarchive are **different** routes, so the second
+    ///    cannot quietly be `restore`.
+    #[test]
+    fn an_archive_sends_a_batch_of_one_and_reads_the_answer_back() {
+        let (mut server, backend) = logged_in();
+        let archive = server
+            .mock("PUT", "/api/ciphers/archive")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": ["live-1"] })))
+            .with_body(
+                r#"{"object":"list","data":[
+                    {"object":"cipher","id":"live-1",
+                     "archivedDate":"2022-03-01T00:00:00.000000Z"}]}"#,
+            )
+            .expect(1)
+            .create();
+        let unarchive = server
+            .mock("PUT", "/api/ciphers/unarchive")
+            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": ["arch-1"] })))
+            .with_body(
+                r#"{"object":"list","data":[
+                    {"object":"cipher","id":"arch-1","archivedDate":null}]}"#,
+            )
+            .expect(1)
+            .create();
+        // The edit route, which an archive must never reach.
+        // No `expect(0)`: mockito's `matched()` reports whether the expected
+        // hit count was *met*, so an `expect(0)` mock reads as matched when it
+        // was never called and this assertion would be inverted. Left at the
+        // default expectation, `matched()` means "was hit", which is the
+        // question being asked. Same idiom as `api`'s
+        // `an_id_that_is_not_url_path_safe_is_refused_before_anything_is_sent`.
+        let edit = server.mock("PUT", "/api/ciphers/live-1").with_status(200).create();
+
+        backend.archive_item("live-1").expect("the archive");
+        backend.unarchive_item("arch-1").expect("the unarchive");
+        archive.assert();
+        unarchive.assert();
+        assert!(!edit.matched(), "an archive was expressed as an edit setting `archivedDate`");
+    }
+
+    /// **The whole reason this stopped being a refusal safely.**
+    ///
+    /// A bulk endpoint's `200` covers the request, not each id inside it, so
+    /// a server can accept the call and decline the one id that was sent.
+    /// Every shape of that must be an error; an `Ok` here is the "reports
+    /// success while doing nothing" failure the refusal existed to prevent,
+    /// and it would be worse arriving through a real route than through a
+    /// fake one, because it would look correct.
+    ///
+    /// Four shapes, all answered `200`: a list with a different id, an empty
+    /// list, an id echoed back in the **wrong state** (archived asked for,
+    /// nothing stamped), and a body that is not a list at all and therefore
+    /// cannot report per-item success either.
+    #[test]
+    fn a_bulk_archive_that_did_not_move_this_id_is_an_error_and_never_ok() {
+        let bodies = [
+            ("another id", r#"{"object":"list","data":[{"id":"someone-else"}]}"#),
+            ("an empty list", r#"{"object":"list","data":[]}"#),
+            ("the wrong state", r#"{"object":"list","data":[{"id":"live-1","archivedDate":null}]}"#),
+            ("no list at all", r#"{"object":"cipher","id":"live-1"}"#),
+        ];
+        for (what, body) in bodies {
+            let (mut server, backend) = logged_in();
+            server
+                .mock("PUT", "/api/ciphers/archive")
+                .with_status(200)
+                .with_body(body)
+                .expect(1)
+                .create();
+            let err = backend.archive_item("live-1").expect_err(what);
+            assert!(
+                matches!(err, VaultError::Http(_)),
+                "an archive answered with {what} was not reported as a failure: {err:?}"
+            );
+        }
+    }
+
+    /// The mirror of the previous test for the other direction: an unarchive
+    /// whose echoed cipher still carries an `archivedDate` did not happen.
+    ///
+    /// Worth its own test rather than a fifth row above, because the
+    /// predicate is *inverted* here and a single implementation that ignored
+    /// the direction would pass the archive cases and fail only this one.
+    #[test]
+    fn an_unarchive_whose_item_is_still_stamped_is_an_error() {
+        let (mut server, backend) = logged_in();
+        server
+            .mock("PUT", "/api/ciphers/unarchive")
+            .with_body(
+                r#"{"object":"list","data":[
+                    {"id":"arch-1","archivedDate":"2022-02-01T00:00:00.000000Z"}]}"#,
+            )
+            .expect(1)
+            .create();
+        let err = backend.unarchive_item("arch-1").expect_err("still archived");
+        assert!(matches!(err, VaultError::Http(_)), "{err:?}");
+    }
+
+    /// The archive writes are id-only: neither pays for a full sync, matching
+    /// the cost their docs claim and the other id-only writes beside them.
+    #[test]
+    fn the_archive_writes_do_not_pay_for_a_sync() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/identity/accounts/prelogin")
+            .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
+            .create();
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_body(r#"{"access_token":"AT-1","expires_in":3600}"#)
+            .create();
+        // No `/api/sync` mock at all: a sync would be a connection refused.
+        server
+            .mock("PUT", "/api/ciphers/archive")
+            .with_body(r#"{"data":[{"id":"live-1","archivedDate":"2022-03-01T00:00:00.000000Z"}]}"#)
+            .expect(1)
+            .create();
+        let client = RestClient::new(server.url());
+        let authenticated =
+            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let backend = RestBackend::new(client, authenticated);
+        backend.archive_item("live-1").expect("the archive, with no sync behind it");
+    }
+
+    /// `list_archive` reads `archivedDate`, and so do the writes -- which is
+    /// the property that keeps the two from disagreeing about what
+    /// "archived" means.
+    ///
+    /// Asserted end to end: the same fixture item the sync reports as
+    /// archived is the one an unarchive is accepted for when the server
+    /// echoes it back unstamped, and a stamped echo is refused. If either
+    /// half ever moved to a different field, one of these two would fail.
+    #[test]
+    fn the_archive_reader_and_the_archive_writer_agree_on_the_field() {
+        let (mut server, backend) = logged_in();
+        let archived = backend.list_archive().expect("the archive listing");
+        let ids = archived.into_iter().map(|i| i.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["arch-1"], "the reader's idea of archived changed");
+        server
+            .mock("PUT", "/api/ciphers/unarchive")
+            .with_body(r#"{"data":[{"id":"arch-1","archivedDate":null}]}"#)
+            .create();
+        backend.unarchive_item("arch-1").expect("an unstamped echo is the success case");
+    }
+
+    /// **The other refusal that was implemented**: a password is generated,
+    /// a passphrase is still refused, and neither answer is invented here.
+    ///
+    /// The `expect(0)` mock is the load-bearing part. `generate` must not
+    /// acquire a route: there is no server endpoint for it anywhere, so a
+    /// generate that touched the network would mean this backend had invented
+    /// one. It is answered from [`crate::password_gen`] with no I/O at all.
+    #[test]
+    fn a_password_is_generated_locally_and_a_passphrase_is_not() {
+        let (mut server, backend) = logged_in();
+        // Default expectation, not `expect(0)` -- see the note in
+        // `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`.
+        let any = server.mock("GET", mockito::Matcher::Any).with_status(200).create();
+
+        let password = backend
+            .generate(&GenerateRequest::Password(PasswordRecipe::default()))
+            .expect("a generated password");
+        assert_eq!(password.len(), 20);
+        assert!(password.chars().any(|c| c.is_ascii_digit()), "not the recipe that was asked for");
+
+        let err = backend
+            .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
+            .expect_err("no wordlist");
+        let VaultError::Unsupported { why, .. } = &err else {
+            panic!("a passphrase was answered rather than refused: {err:?}");
+        };
+        assert!(why.contains("wordlist"), "the refusal does not name what is missing: {why}");
+
+        assert!(!any.matched(), "generate reached the network; there is no endpoint for it");
+    }
+
+    /// Two calls to `generate` do not agree, which is the cheapest possible
+    /// check that this backend is really delegating to the CSPRNG-backed
+    /// generator and has not grown a constant of its own.
+    #[test]
+    fn two_generated_passwords_differ() {
+        let (_server, backend) = logged_in();
+        let request = GenerateRequest::Password(PasswordRecipe::default());
+        let first = backend.generate(&request).expect("one");
+        let second = backend.generate(&request).expect("two");
+        assert_ne!(*first, *second);
     }
 
     /// A refusal must be distinguishable from a server that said no, because
