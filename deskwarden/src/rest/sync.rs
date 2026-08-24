@@ -212,6 +212,32 @@ impl DecryptedItem {
         Self { item, still_encrypted: Vec::new() }
     }
 
+    /// **This cipher's decryption record, carrying an edited copy of the
+    /// item.**
+    ///
+    /// The write path needs both halves of a [`DecryptedItem`], but the
+    /// [`crate::vault_backend::VaultBackend`] trait speaks bare
+    /// [`VaultItem`]s: a caller reads an item, edits it, and hands back a
+    /// `VaultItem` with the record gone. Re-deriving the record is what this
+    /// is for -- the backend finds the *same cipher* in a fresh sync and asks
+    /// it to carry the caller's edit.
+    ///
+    /// **Which fields are still ciphertext is a property of the cipher, not
+    /// of the edit.** `login.uri` and `passwordHistory[].password` are
+    /// decrypted in place inside [`VaultItem::other`] (see the module docs),
+    /// and a caller editing a username does not touch either. So the record
+    /// this cipher carried a moment ago is the record its edited copy needs.
+    ///
+    /// The direction this can be wrong in is the safe one, and it is the same
+    /// one [`Self::newly_composed`] documents: an over-full record leaves a
+    /// value the user can see and re-save, while the record being *empty* --
+    /// which is what a bare `newly_composed` would give -- encrypts, and
+    /// encryption is never the leaking direction.
+    #[must_use]
+    pub fn carrying(&self, item: VaultItem) -> Self {
+        Self { item, still_encrypted: self.still_encrypted.clone() }
+    }
+
     /// Whether `path` is a field this mapper *failed* to decrypt, so that
     /// whatever is at that path is still the server's ciphertext.
     pub(crate) fn is_still_encrypted(&self, path: &str) -> bool {
@@ -458,6 +484,29 @@ pub fn decrypt_vault(
     }
 
     Ok(DecryptedVault { items, folders, failures })
+}
+
+/// **One cipher, decrypted on its own** -- the write endpoints' answer.
+///
+/// `POST /api/ciphers` and `PUT /api/ciphers/{id}` reply with the server's own
+/// copy of the cipher they just wrote, still encrypted and carrying the `id`
+/// and the freshly bumped `revisionDate`. That answer is the *only* place a
+/// caller learns a created item's id, and the only non-stale `revisionDate`
+/// after an edit (see [`crate::vault_bridge::VaultBridge::update_item`] on
+/// what holding a stale one costs). Decrypting it here is what lets a write
+/// return the item without a second `GET /api/sync` behind it.
+///
+/// Returns `None` on the same terms as the whole-sync path: a value that is
+/// not a JSON object, or one with no `id`. The failures are returned rather
+/// than pushed into a caller's list, because a single cipher has no vault to
+/// belong to.
+pub fn decrypt_cipher(
+    raw: &serde_json::Value,
+    keys: &VaultKeys,
+) -> Option<(DecryptedItem, Vec<DecryptFailure>)> {
+    let mut failures = Vec::new();
+    let item = map_cipher(raw, keys, &mut failures)?;
+    Some((item, failures))
 }
 
 /// One cipher.

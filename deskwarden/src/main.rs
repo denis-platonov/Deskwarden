@@ -10761,7 +10761,12 @@ mod tests {
              is the only thing that would have noticed"
         );
         for later in [
-            concat!("wait_for_vault", "_ready(vault, schedule)"),
+            // `vault.as_ref()` and not `vault`: `produce` holds an
+            // `Arc<dyn VaultBackend>` since the backend seam landed, and this
+            // needle was left spelling the argument the way it read before
+            // that -- so the guard had stopped finding the call it is here to
+            // order and was failing outright rather than checking anything.
+            concat!("wait_for_vault", "_ready(vault.as_ref(), schedule)"),
             concat!("login_ui::check_bw_", "status_details_bounded()"),
         ] {
             let at = body

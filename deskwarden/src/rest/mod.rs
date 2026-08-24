@@ -82,6 +82,11 @@
 //!   correctness one.
 
 pub mod api;
+/// The four modules below, assembled into one
+/// [`crate::vault_backend::VaultBackend`]. No route, no cryptography and no
+/// mapping of its own -- and six of the twenty operations refused by name
+/// rather than faked. See its own docs for what one call costs.
+pub mod backend;
 pub mod crypto;
 pub mod sync;
 pub mod write;

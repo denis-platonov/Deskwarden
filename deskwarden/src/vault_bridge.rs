@@ -1048,6 +1048,34 @@ pub enum VaultError {
     /// keeps failing, which a plain `Http(String)` gives callers no clean way
     /// to detect without parsing the message.
     Unauthorized,
+    /// **The backend that received this call does not implement it, and will
+    /// not pretend to.**
+    ///
+    /// Not every [`crate::vault_backend::VaultBackend`] can do all twenty
+    /// operations: `bw serve` has a password generator and a folder API that
+    /// the Bitwarden server protocol simply has no endpoint for, and a direct
+    /// REST backend has to say so. The alternative -- answering `Ok` with an
+    /// empty list or an invented string -- is the failure this crate treats
+    /// as worse than a crash: a Folders sidebar that reads "none" on a vault
+    /// full of folders is indistinguishable, to the user and to the log, from
+    /// a vault that really has none.
+    ///
+    /// Distinct from [`Self::Http`] because the two need opposite responses:
+    /// `Http` means the server said no and a retry might work; this means no
+    /// request was made and no retry ever will.
+    ///
+    /// **All three fields are `&'static str` on purpose.** They are literals
+    /// written at the refusal site, so nothing derived from a vault, a
+    /// password, a key or a server response can reach a log line through a
+    /// `Debug` of this variant.
+    ///
+    /// * `backend` -- which implementation refused ("the direct-REST vault
+    ///   backend"), because a log line saying only "unsupported" does not say
+    ///   *by whom* on a crate that now has more than one.
+    /// * `operation` -- the trait method, spelled as the caller called it.
+    /// * `why` -- the reason, in a sentence, because "unsupported" without a
+    ///   cause is a bug report nobody can act on.
+    Unsupported { backend: &'static str, operation: &'static str, why: &'static str },
 }
 
 /// Turns a failed `ureq` call into a [`VaultError`], distinguishing a

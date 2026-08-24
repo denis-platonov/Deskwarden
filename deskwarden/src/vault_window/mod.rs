@@ -5717,6 +5717,10 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+        // A refusal, not a failure: nothing was sent, so nothing can be
+        // retried. The wording says "this vault backend" because the whole
+        // point of the variant is that a *different* backend can do it.
+        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
     };
     format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
 }
@@ -5780,6 +5784,10 @@ fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+        // A refusal, not a failure: nothing was sent, so nothing can be
+        // retried. The wording says "this vault backend" because the whole
+        // point of the variant is that a *different* backend can do it.
+        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
     };
     let (verb, unchanged) = match command {
         ListCommand::Archive => ("archive", "It's still in your vault."),
@@ -5858,6 +5866,10 @@ fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> S
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+        // A refusal, not a failure: nothing was sent, so nothing can be
+        // retried. The wording says "this vault backend" because the whole
+        // point of the variant is that a *different* backend can do it.
+        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
     };
     // Exhaustive with no catch-all, for [`move_failure_message`]'s reason: a
     // fifth write must be given its own wording rather than silently
@@ -5938,12 +5950,16 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the request",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+        // A refusal, not a failure: nothing was sent, so nothing can be
+        // retried. The wording says "this vault backend" because the whole
+        // point of the variant is that a *different* backend can do it.
+        VaultError::Unsupported { .. } => "this vault backend can't do that at all",
     };
     let tail = match e {
         // The only variant that has something further to ask of the user: the
         // draft is intact but nothing will save until the session is renewed.
         VaultError::Unauthorized => " You'll need to sign in again before saving.",
-        VaultError::Http(_) | VaultError::Parse(_) => "",
+        VaultError::Http(_) | VaultError::Parse(_) | VaultError::Unsupported { .. } => "",
     };
     GenerateFailure {
         message: format!(
