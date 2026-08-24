@@ -83,9 +83,33 @@ If the user adds an app-match in the vault window, the daemon's match engine doe
 
 **The 4 MB-per-cycle ratchet moves rather than disappears** for a user who opens and closes the vault window repeatedly *within one UI process* — but that process now exits, so the ratchet is bounded by one window's lifetime instead of the app's.
 
+## Amended 2026-08-23, after the startup was actually mapped
+
+`docs/superpowers/notes/2026-08-23-startup-role-map.md` traced the code this spec describes and overturned three of its claims. The corrections are here rather than edited invisibly into the text above, because the reasoning that produced the wrong version is worth keeping.
+
+**1. The fill path's surfaces cannot become UI processes. They must be redrawn in Win32.**
+
+The daemon opens **five** egui windows on its own autofill path today: the prompt overlay (2a), the locked card (3b), the save-login form (3c), the generator (3d), and the send preflight. `overlay_ui::show_prompt_overlay` and `show_locked_overlay` are the production presenter at `app.rs:2129`.
+
+They cannot move to a UI process, because they are not merely *shown* during a fill — they are *part of* it. They anchor to the target window's HWND, they sit next to the injector, and `preflight_host::show_preflight` takes the password as a `Zeroizing<String>` argument. Moving them would put a secret across a process boundary, which this design forbids for the reason stated above.
+
+So the only way the daemon stays free of a GL context is to **redraw them in Win32** — which the original text below lists as out of scope. That was wrong, and it is the largest single piece of work this split needs.
+
+**2. The 11.3 MB steady state does not survive first use, as measured.**
+
+That number was taken from a daemon that had never been asked to fill anything. On today's code the first `CTRL+ALT+B` on a matched app, or any fill against a locked vault, opens egui in the daemon and loads the OpenGL driver — permanently, since the arenas are never returned. **Any future measurement of the daemon must be taken after exercising the fill path**, or it measures nothing.
+
+**3. "The UI needs nothing passed to it" holds only for input, not for results.**
+
+It is true that a UI process can *start* from settings, the DPAPI session and the constant port. It is false that nothing needs to come back. The vault window's result carries six daemon-actionable outcomes — `locked`, `needs_reauth`, `edited_settings`, `switch_to`, `add_account`, `remove_account` — which drive teardown, re-auth and account re-pointing. Preferences returns a result and a process-global account status; "Add app…" needs `last_active_pid` and a live `VaultEra` from the shared cache.
+
+**A result channel is therefore required.** It carries no secrets, so it is still nothing like the pipe the 2026-08-21 spec feared, but the claim that this split needs no channel at all was wrong.
+
+**Also found, and not fixed:** the login flow needs the target account id passed explicitly during an account switch. Without it a UI process would overwrite the wrong account's `session.bin`. That is a latent bug in the current single-process code, not something this split introduces.
+
 ## What is explicitly out of scope
 
-- **The overlay's rich states.** 3c (save-login) and 3d (generator) stay egui and become UI-mode surfaces. Redrawing them in Win32 is a separate question and is not required by this split.
+- **The overlay's rich states — superseded, see the amendment above.** Originally: "3c (save-login) and 3d (generator) stay egui and become UI-mode surfaces. Redrawing them in Win32 is a separate question and is not required by this split." The map showed this is exactly backwards.
 - **The `wgpu` renderer.** A D3D-backed renderer measured ~40-59 MB against OpenGL's ~102 MB on this machine and would roughly halve the UI's cost — but it is blocked on a `windows-core` version conflict and is independent of this work. Doing both is better than either; neither depends on the other.
 - **The REST backend.** `deskwarden/src/rest/` will let self-hosted users drop `bw serve` entirely. That changes *what* the daemon owns, not *whether* the daemon owns it, so it composes with this design rather than competing with it.
 
