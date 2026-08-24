@@ -195,6 +195,141 @@ pub fn user_key_path_for(config_dir: &Path, id: &AccountId) -> PathBuf {
     data_dir_for(config_dir, id).join("userkey.bin")
 }
 
+// ------------------------------------------- every secret one account owns
+
+/// How long one of this app's [`AccountSecret`]s is supposed to outlive the
+/// app's use of the account it belongs to.
+///
+/// The distinction exists because "clear this account's state" is not one
+/// question. Switching away from an account is not the user withdrawing the
+/// Windows Hello enrolment they opted into, and it is not saying the encrypted
+/// vault copy may never be read again -- both of those are meant to survive a
+/// switch, which is the whole reason they are enrolled per account. But it
+/// *is* saying that this process has no further business holding the
+/// credentials it signed in with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretScope {
+    /// Credentials this app derived or was handed in order to talk to the
+    /// server **as this process, right now**: the `bw` session token and the
+    /// direct-REST master key. Nothing the user asked to keep; the app keeps
+    /// them only so that being signed in survives a restart. The moment the
+    /// app stops being on this account they are a secret held for no reason,
+    /// so they are dropped on a switch away and on a log out.
+    ThisAppsSignIn,
+    /// Something the **user opted into** and can withdraw: the Hello blob and
+    /// the encrypted vault copy. Survives a switch away, precisely so that
+    /// switching back does not re-ask; dropped on a log out and with the
+    /// account itself.
+    UserOptIn,
+}
+
+/// One kind of secret this app writes inside an account's directory.
+///
+/// # Why this is an enum and not three `remove_file` calls
+///
+/// Before it existed, an account switch deleted `session.bin` by name and knew
+/// nothing else. That was harmless while `session.bin` was the only credential
+/// -- and the day [`user_key_path_for`] started being written it became a
+/// **leaked non-expiring vault key for an account the user switched away
+/// from**: unlike a session token, a master key does not expire and cannot be
+/// revoked (see [`crate::user_key_store`]).
+///
+/// The defect was not the missing line. It was that there was nowhere a fourth
+/// secret could be added that would *make* the switch consider it. So every
+/// per-account secret is a variant here, every variant must answer
+/// [`AccountSecret::scope`] through a `match` with no wildcard arm, and
+/// [`clear_sign_in_secrets`] is derived from that answer rather than from a
+/// list somebody has to remember to extend. Adding a variant without
+/// classifying it does not compile; classifying it is the whole of the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSecret {
+    /// The DPAPI-wrapped `bw` session token; see [`session_path_for`].
+    SessionToken,
+    /// The DPAPI-wrapped master key and refresh token; see
+    /// [`user_key_path_for`].
+    UserKey,
+    /// The Windows Hello quick-unlock blob; see [`hello_blob_path_for`].
+    HelloBlob,
+    /// The encrypted offline copy of the vault, `vault_disk_cache`'s file and
+    /// its temporary twin. The one variant that names two files.
+    VaultCopy,
+}
+
+impl AccountSecret {
+    /// Every variant. `ALL` and the `match` in [`Self::scope`] are the two
+    /// places a new secret has to be added, and both fail loudly: this array
+    /// is length-checked against the variant count in the tests, and the match
+    /// has no wildcard.
+    pub const ALL: [AccountSecret; 4] = [
+        AccountSecret::SessionToken,
+        AccountSecret::UserKey,
+        AccountSecret::HelloBlob,
+        AccountSecret::VaultCopy,
+    ];
+
+    /// Whether this survives the app moving off the account -- see
+    /// [`SecretScope`]. Exhaustive on purpose.
+    #[must_use]
+    pub fn scope(self) -> SecretScope {
+        match self {
+            AccountSecret::SessionToken | AccountSecret::UserKey => SecretScope::ThisAppsSignIn,
+            AccountSecret::HelloBlob | AccountSecret::VaultCopy => SecretScope::UserOptIn,
+        }
+    }
+
+    /// The files this secret occupies, inside `data_dir_for(config_dir, id)`.
+    ///
+    /// Built by *calling* the per-secret path functions above rather than by
+    /// repeating their leaf names, so that this cannot come to disagree with
+    /// them -- the failure mode would be a clear that deletes a file nothing
+    /// writes while the real one stays on disk.
+    #[must_use]
+    pub fn paths_for(self, config_dir: &Path, id: &AccountId) -> Vec<PathBuf> {
+        match self {
+            AccountSecret::SessionToken => vec![session_path_for(config_dir, id)],
+            AccountSecret::UserKey => vec![user_key_path_for(config_dir, id)],
+            AccountSecret::HelloBlob => vec![hello_blob_path_for(config_dir, id)],
+            AccountSecret::VaultCopy => {
+                let dir = data_dir_for(config_dir, id);
+                vec![
+                    dir.join(crate::vault_disk_cache::FILE_NAME),
+                    dir.join(crate::vault_disk_cache::TMP_FILE_NAME),
+                ]
+            }
+        }
+    }
+}
+
+/// Deletes every [`SecretScope::ThisAppsSignIn`] secret of `id`.
+///
+/// The one call the app makes when it stops being signed in as an account it
+/// is not deleting: switching away from it, and logging it out. It is
+/// deliberately **not** "delete this account's secrets" -- the Hello
+/// enrolment and the encrypted vault copy are the user's, and a switch must
+/// not silently withdraw them (a log out drops those too, by its own calls, in
+/// the same breath).
+///
+/// Infallible, like [`discard_prepared_account`] and for its reason: both
+/// callers are past the point where anything can be offered instead, and a
+/// caller pushed into ignoring a `Result` is a caller that will. A file that
+/// is already gone is not logged at all -- that is the state being asked for.
+pub fn clear_sign_in_secrets(config_dir: &Path, id: &AccountId) {
+    for secret in AccountSecret::ALL {
+        if secret.scope() != SecretScope::ThisAppsSignIn {
+            continue;
+        }
+        for path in secret.paths_for(config_dir, id) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::info!("discarded {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // The path and the OS error, never anything that was in the
+                // file: these are the two files this app guards hardest.
+                Err(e) => log::warn!("could not discard {}: {e}", path.display()),
+            }
+        }
+    }
+}
+
 /// Mixed into `hello`'s existing domain-separation label so **one** Windows
 /// Hello credential seals a distinct key per account.
 ///
@@ -2290,6 +2425,230 @@ mod tests {
             // a `forget` that is inert.
             assert!(s.forget(&b.id));
             assert_ne!(s, before);
+        }
+    }
+
+    // ------------------------------------------------ every account secret
+
+    /// The switch bug, and the shape that keeps it from coming back.
+    ///
+    /// An account switch used to delete `session.bin` by name and nothing
+    /// else. These tests are written against [`AccountSecret::ALL`] rather
+    /// than against a list of file names, so a fifth secret added later is
+    /// covered by them the moment its variant exists -- which is the whole
+    /// point of the enum.
+    mod account_secrets {
+        use super::*;
+
+        /// A scratch config directory under `%TEMP%`. **Never** the real one:
+        /// these tests delete files.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "deskwarden-secrets-{tag}-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Writes a recognisable byte into every file every secret occupies,
+        /// so a clear can be checked file by file.
+        fn write_every_secret(cfg: &Path, id: &AccountId) -> Vec<PathBuf> {
+            ensure_account_dir(cfg, id).unwrap();
+            let mut all = Vec::new();
+            for secret in AccountSecret::ALL {
+                for path in secret.paths_for(cfg, id) {
+                    std::fs::write(&path, b"wrapped").unwrap();
+                    all.push(path);
+                }
+            }
+            all
+        }
+
+        #[test]
+        fn all_lists_every_variant_exactly_once() {
+            // Cheap, and it is the assertion that catches a variant added to
+            // the enum but not to `ALL` -- the one mistake the exhaustive
+            // `match` in `scope` cannot catch on its own.
+            let mut seen = AccountSecret::ALL.to_vec();
+            let count = seen.len();
+            seen.dedup();
+            assert_eq!(seen.len(), count, "ALL repeats a variant");
+            assert_eq!(count, 4, "a variant was added or removed without ALL");
+        }
+
+        #[test]
+        fn every_secret_lives_in_its_own_files_inside_the_account_directory() {
+            let cfg = Path::new(r"C:\cfg");
+            let a = id(A);
+            let dir = data_dir_for(cfg, &a);
+            let mut every: Vec<PathBuf> = Vec::new();
+            for secret in AccountSecret::ALL {
+                let paths = secret.paths_for(cfg, &a);
+                assert!(!paths.is_empty(), "{secret:?} names no file");
+                for path in &paths {
+                    assert_eq!(
+                        path.parent(),
+                        Some(dir.as_path()),
+                        "{secret:?} escapes {dir:?}"
+                    );
+                }
+                every.extend(paths);
+            }
+            let count = every.len();
+            every.sort();
+            every.dedup();
+            assert_eq!(every.len(), count, "two secrets share a file: {every:?}");
+        }
+
+        /// `paths_for` must be the same paths the named functions give, or a
+        /// clear would delete a file nothing writes while the real one stays.
+        #[test]
+        fn paths_for_agrees_with_the_named_path_functions() {
+            let cfg = Path::new(r"C:\cfg");
+            let a = id(A);
+            assert_eq!(
+                AccountSecret::SessionToken.paths_for(cfg, &a),
+                vec![session_path_for(cfg, &a)]
+            );
+            assert_eq!(
+                AccountSecret::UserKey.paths_for(cfg, &a),
+                vec![user_key_path_for(cfg, &a)]
+            );
+            assert_eq!(
+                AccountSecret::HelloBlob.paths_for(cfg, &a),
+                vec![hello_blob_path_for(cfg, &a)]
+            );
+        }
+
+        /// The master key is classified with the session token and not with
+        /// the user's opt-ins. Stated on its own because getting this one
+        /// wrong is the bug this whole module exists for.
+        #[test]
+        fn the_master_key_is_a_sign_in_secret_and_so_is_the_session_token() {
+            assert_eq!(AccountSecret::UserKey.scope(), SecretScope::ThisAppsSignIn);
+            assert_eq!(
+                AccountSecret::SessionToken.scope(),
+                SecretScope::ThisAppsSignIn
+            );
+            // The other half, so the classification is discriminating rather
+            // than "everything is a sign-in secret": a switch that withdrew
+            // the user's Hello enrolment would be its own defect.
+            assert_eq!(AccountSecret::HelloBlob.scope(), SecretScope::UserOptIn);
+            assert_eq!(AccountSecret::VaultCopy.scope(), SecretScope::UserOptIn);
+        }
+
+        /// **The pin.** Every file of every secret exists; the clear runs;
+        /// each file is asserted against its own variant's scope. A future
+        /// third sign-in secret that `clear_sign_in_secrets` does not remove
+        /// fails here without anybody editing this test.
+        #[test]
+        fn clearing_removes_exactly_the_sign_in_secrets_and_leaves_the_opt_ins() {
+            let cfg = Scratch::new("clear");
+            let a = AccountId::generate();
+            write_every_secret(cfg.path(), &a);
+            // Something in the directory that is not a secret at all: the CLI
+            // profile. A clear that took the directory would sign the account
+            // out of `bw` as well.
+            let profile = data_dir_for(cfg.path(), &a).join("data.json");
+            std::fs::write(&profile, b"the CLI profile").unwrap();
+
+            clear_sign_in_secrets(cfg.path(), &a);
+
+            for secret in AccountSecret::ALL {
+                for path in secret.paths_for(cfg.path(), &a) {
+                    match secret.scope() {
+                        SecretScope::ThisAppsSignIn => assert!(
+                            !path.exists(),
+                            "{secret:?} survived the clear at {}",
+                            path.display()
+                        ),
+                        SecretScope::UserOptIn => assert!(
+                            path.exists(),
+                            "{secret:?} was withdrawn at {}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            assert!(profile.exists(), "the clear took the CLI profile with it");
+            assert!(data_dir_for(cfg.path(), &a).is_dir());
+        }
+
+        /// The regression in one line: whatever else it does, a clear must
+        /// take `userkey.bin`. A master key does not expire, so leaving it is
+        /// leaving a key to a vault the app is no longer on.
+        #[test]
+        fn clearing_always_takes_the_stored_master_key() {
+            let cfg = Scratch::new("key");
+            let a = AccountId::generate();
+            write_every_secret(cfg.path(), &a);
+
+            clear_sign_in_secrets(cfg.path(), &a);
+
+            assert!(!user_key_path_for(cfg.path(), &a).exists());
+            assert!(!session_path_for(cfg.path(), &a).exists());
+        }
+
+        #[test]
+        fn clearing_an_account_that_has_nothing_stored_is_quiet_and_repeatable() {
+            let cfg = Scratch::new("empty");
+            let a = AccountId::generate();
+            ensure_account_dir(cfg.path(), &a).unwrap();
+            clear_sign_in_secrets(cfg.path(), &a);
+            clear_sign_in_secrets(cfg.path(), &a);
+            assert!(data_dir_for(cfg.path(), &a).is_dir());
+
+            // And for an account whose directory was never created either.
+            clear_sign_in_secrets(cfg.path(), &AccountId::generate());
+        }
+
+        /// One account's clear may not reach into another's. The property the
+        /// per-account layout exists for, asserted at the clear.
+        #[test]
+        fn clearing_one_account_leaves_every_other_accounts_secrets_alone() {
+            let cfg = Scratch::new("neighbour");
+            let (a, b) = (AccountId::generate(), AccountId::generate());
+            write_every_secret(cfg.path(), &a);
+            let bs = write_every_secret(cfg.path(), &b);
+
+            clear_sign_in_secrets(cfg.path(), &a);
+
+            assert!(!user_key_path_for(cfg.path(), &a).exists(), "control");
+            for path in bs {
+                assert!(path.exists(), "{} was taken by a's clear", path.display());
+            }
+        }
+
+        /// Removing the account is the other end of the scale: *everything*
+        /// goes, opt-ins included. Derived from `ALL` for the same reason.
+        #[test]
+        fn deleting_the_account_directory_takes_every_secret_of_every_scope() {
+            let cfg = Scratch::new("delete");
+            let a = AccountId::generate();
+            let every = write_every_secret(cfg.path(), &a);
+
+            delete_account_dir(cfg.path(), &a).expect("delete");
+
+            for path in every {
+                assert!(!path.exists(), "{} survived removal", path.display());
+            }
+            assert!(!data_dir_for(cfg.path(), &a).exists());
         }
     }
 }

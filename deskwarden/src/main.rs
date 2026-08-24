@@ -7461,16 +7461,21 @@ fn switch_to_account(
             *active_account = to.clone();
             // Only NOW. Until the switch has landed, the outgoing account is
             // still this app's account rather than an idle one.
-            let outgoing = accounts::session_path_for(config_dir, &from.id);
-            if let Err(e) = std::fs::remove_file(&outgoing) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!(
-                        "could not discard {}'s session token at {}: {e}",
-                        from.email,
-                        outgoing.display()
-                    );
-                }
-            }
+            //
+            // Every `SecretScope::ThisAppsSignIn` secret, not `session.bin`
+            // by name. This line used to name the file, which was harmless
+            // while the token was the only credential and became a **leaked
+            // non-expiring vault key** the moment `userkey.bin` started being
+            // written: a session token expires and can be revoked in the web
+            // vault, a master key does neither. `accounts::AccountSecret`'s
+            // own doc carries the rest of the argument, and its tests are
+            // what stop a fourth secret repeating this.
+            //
+            // Not the user's opt-ins: a switch away is not the user
+            // withdrawing their Windows Hello enrolment or saying the
+            // encrypted vault copy may never be read again. Those survive,
+            // which is why switching back does not re-ask.
+            accounts::clear_sign_in_secrets(config_dir, &from.id);
             log::info!("switched to {}", to.email);
             return SwitchOutcome::Switched;
         }
@@ -19470,6 +19475,82 @@ mod tests {
             accounts::session_path_for(cfg.path(), &b.id).exists(),
             "control: the switch deleted a token file, and it deleted the right one"
         );
+    }
+
+    /// A switch away takes **every** credential this app signed in with, and
+    /// leaves every opt-in the user made.
+    ///
+    /// The test above asserts `session.bin` is gone, and for a long time that
+    /// was the whole of what the switch deleted -- by name. The moment
+    /// `userkey.bin` started being written, that same code left a **master
+    /// key that does not expire and cannot be revoked** sitting beside an
+    /// account the user had walked away from.
+    ///
+    /// So this walks `accounts::AccountSecret::ALL` rather than naming files:
+    /// a third sign-in secret added later is asserted here on the commit that
+    /// adds its variant, with nobody having to remember this test exists.
+    #[test]
+    fn a_switch_away_takes_every_sign_in_secret_and_no_opt_in() {
+        use deskwarden::accounts::{AccountSecret, SecretScope};
+
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("secrets");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        for id in [&a.id, &b.id] {
+            accounts::ensure_account_dir(cfg.path(), id).expect("account directory");
+            for secret in AccountSecret::ALL {
+                for path in secret.paths_for(cfg.path(), id) {
+                    std::fs::write(&path, b"wrapped").expect("write");
+                }
+            }
+        }
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, _account, _store| ResettleReport::Settled,
+        );
+        assert_eq!(outcome, SwitchOutcome::Switched);
+
+        for secret in AccountSecret::ALL {
+            for path in secret.paths_for(cfg.path(), &a.id) {
+                match secret.scope() {
+                    SecretScope::ThisAppsSignIn => assert!(
+                        !path.exists(),
+                        "the outgoing account's {secret:?} outlived the switch at {}",
+                        path.display()
+                    ),
+                    // Switching away is not the user withdrawing their Hello
+                    // enrolment, and it is not saying the encrypted vault copy
+                    // may never be read again. Switching back must not re-ask.
+                    SecretScope::UserOptIn => assert!(
+                        path.exists(),
+                        "the switch withdrew the user's {secret:?} at {}",
+                        path.display()
+                    ),
+                }
+            }
+            // The control that keeps every negative above from passing on a
+            // switch that simply deleted the accounts root: the account being
+            // switched TO keeps everything it had.
+            for path in secret.paths_for(cfg.path(), &b.id) {
+                assert!(
+                    path.exists(),
+                    "the incoming account's {secret:?} was deleted at {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// The era machinery is what makes a switch safe against a fetch that was

@@ -2549,6 +2549,17 @@ pub fn build_login_frame(
                                 crate::vault_disk_cache::forget_for(
                                     &crate::accounts::data_dir_for(config_dir, id),
                                 );
+                                // And the credentials this app signed in
+                                // with: the `bw` session token, which the
+                                // logout just invalidated server-side and
+                                // which has no business staying on disk, and
+                                // the direct-REST `userkey.bin`, which is a
+                                // master key that does NOT expire and would
+                                // otherwise outlive the account's presence on
+                                // this machine entirely. Same call the
+                                // account switch makes, so the two cannot
+                                // drift; see `accounts::AccountSecret`.
+                                crate::accounts::clear_sign_in_secrets(config_dir, id);
                             }
                             hello_state = probe_hello(&hello_scope);
                             status = BwStatus::Unauthenticated;
@@ -3878,6 +3889,39 @@ mod login_entry_point_tests {
         // would be inert. Same for `state(` against `state_for(`.
         assert!(!concat!("hello", "::enroll_for(").contains(concat!("hello", "::enroll(")));
         assert!(!concat!("hello", "::state_for(").contains(concat!("hello", "::state(")));
+    }
+
+    /// A log out drops the credentials this app signed in with, and it drops
+    /// them through the **same call the account switch makes**.
+    ///
+    /// A source pin rather than a behavioural one, for this file's usual
+    /// reason: the log-out arm is inside `build_login_frame`'s per-frame
+    /// closure, and reaching it needs a real `bw logout` to have succeeded.
+    /// What it guards is the shape, not the bytes: `accounts` owns the list of
+    /// per-account secrets and the rule for which of them a sign-out drops
+    /// (`accounts::AccountSecret`), so a third secret added there is dropped
+    /// here too. A hand-written `remove_file(session_path_for(..))` in this
+    /// arm would pass every end-state assertion and quietly leave the
+    /// direct-REST master key on disk for an account the CLI no longer knows
+    /// -- which is exactly the defect the switch had.
+    #[test]
+    fn logging_out_drops_the_sign_in_secrets_through_the_shared_call() {
+        assert!(
+            SOURCE.contains(concat!("accounts", "::clear_sign_in_secrets(")),
+            "the log-out arm no longer drops this account's session token and stored master \
+             key at all"
+        );
+        for hand_rolled in [
+            concat!("remove_file(", "crate::accounts::session_path_for"),
+            concat!("remove_file(", "crate::accounts::user_key_path_for"),
+        ] {
+            assert!(
+                !SOURCE.contains(hand_rolled),
+                "this window deletes a per-account secret by name ({hand_rolled}) instead of \
+                 through `accounts::clear_sign_in_secrets`, so the next secret added will \
+                 not be dropped here"
+            );
+        }
     }
 }
 
