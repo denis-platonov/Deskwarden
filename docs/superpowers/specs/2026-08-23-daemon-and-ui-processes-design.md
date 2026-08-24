@@ -6,15 +6,40 @@
 
 On the owner's machine, this build:
 
-| state | private | GPU driver loaded |
-| --- | --- | --- |
-| `--autostart`, tray-resident | **11.3 MB** | no — only the `opengl32.dll` stub |
-| after the vault window has been opened once | **128.6 MB** | `nvoglv64.dll`, `nvgpucomp64.dll` |
-| the picker card alone, as a standalone process | ~2 MB | no |
+**Measured in private working set** -- the resident, process-private RAM that
+Task Manager's default column shows -- on the installed release 0.9.0. Commit
+(private bytes) is given beside it because earlier drafts of this spec quoted
+commit alone and thereby overstated the case by roughly double. **Quote the
+working set when arguing about value to a user; quote commit only when arguing
+about address space.**
+
+| state | private working set | commit | GPU driver loaded |
+| --- | --- | --- | --- |
+| `--autostart`, tray-resident, no window ever opened | **9.9 MB** | 11.5 MB | no |
+| vault window open | **60.7 MB** | 128.0 MB | `nvoglv64.dll` |
+| after that window is closed | **50.2 MB** | 95.3 MB | still loaded |
+| the picker card alone, as a standalone process | ~2 MB | ~2 MB | no |
+
+So closing the window returns **10.5 MB of the 50.8 it cost**, and the process
+stays at 50.2 MB resident for the rest of its life -- five times the pristine
+tray state. **The prize is therefore about 40 MB of RAM per user, not the ~90
+this document previously implied.**
 
 Closing the vault window does not undo the second row. `2026-08-21`'s measurements established that the cost is the OpenGL driver's own committed arenas, that eframe already destroys the GL context, that explicit teardown changes nothing, and that the cost *ratchets* — roughly 4 MB per open/close cycle. **Only process exit returns it.**
 
-So a single-process app has two steady states and no way back from the second. One accidental double-click on the tray icon at 9am and Deskwarden is a 128 MB process until the machine reboots.
+So a single-process app has two steady states and no way back from the second. One accidental double-click on the tray icon at 9am and Deskwarden holds 50 MB of resident RAM until it is restarted.
+
+**Memory is no longer the whole argument, and on these numbers it should not be
+the lead one.** Two other consequences of the split matter independently:
+
+* **The tray is blocked today.** `docs/superpowers/notes/2026-08-23-startup-role-map.md`
+  found that `app_window::run_from_vault` blocks the event-loop thread for the
+  window's entire life, and so do Preferences, "Add app...", the login flow and
+  every overlay card. Splitting fixes a responsiveness bug, not just a footprint.
+* **A crashed window currently takes the daemon with it**, and with it the tray,
+  the hotkey and `bw serve`.
+* **It is what comparable products do.** Keeper ships as separate processes, and
+  the owner names it as the standard this app is measured against.
 
 ## The shape
 
