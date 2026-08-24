@@ -74,8 +74,8 @@
 //!   and implementing it meant this crate deciding how strong its passwords
 //!   are. That decision was taken, and it was taken **outside this module**:
 //!   [`crate::password_gen`] is the generator, so that every backend reaches
-//!   one implementation. A *passphrase* is still refused by name, for want of
-//!   a wordlist.
+//!   one implementation -- passphrases included, from a word list installed
+//!   beside the executable and read only when one is asked for.
 
 use std::sync::Mutex;
 
@@ -631,27 +631,36 @@ impl VaultBackend for RestBackend {
     /// to how strong its passwords are, so this method is a call and a
     /// mapping and holds no alphabet, no draw and no policy of its own.
     ///
-    /// # A passphrase is still refused, and still by name
+    /// # A passphrase is generated too, and a broken word list is refused
     ///
-    /// [`crate::password_gen`] implements passwords and refuses passphrases,
-    /// because a passphrase needs a wordlist -- Bitwarden's is the EFF long
-    /// list of 7,776 words -- and an improvised one would look exactly like a
-    /// real passphrase while carrying a fraction of the entropy. That refusal
-    /// arrives here as [`crate::password_gen::PasswordGenError::NoWordlist`]
-    /// and is mapped to the same [`VaultError::Unsupported`] this method used
-    /// to return for everything, so a caller that asks for a passphrase still
-    /// gets a named refusal rather than a weak secret.
+    /// [`crate::password_gen`] now answers passphrases as well, from a list of
+    /// 4,096 words installed beside the executable. The two word-list failures
+    /// -- the file is absent, or it is present and does not verify -- arrive
+    /// here as their own variants and are mapped to
+    /// [`VaultError::Unsupported`] rather than to a retryable error, because
+    /// neither fixes itself: both are an installation this app cannot generate
+    /// a passphrase from, and telling a caller to try again would be telling
+    /// it to loop. **Neither is mapped to a weaker passphrase**, which is the
+    /// only mapping that would actually be wrong.
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         crate::password_gen::generate(request).map_err(|e| match e {
             // Not `Unsupported`: the operation *is* supported and no decision
             // is missing -- this machine's CSPRNG failed, which is a fault a
             // caller may retry. `Unsupported` would tell it never to.
             PasswordGenError::Rng => VaultError::Http(e.to_string()),
-            PasswordGenError::NoWordlist => VaultError::Unsupported {
+            PasswordGenError::WordlistMissing => VaultError::Unsupported {
                 backend: BACKEND,
                 operation: "generate (passphrase)",
-                why: "generating a passphrase needs a wordlist, and this app carries none; \
-                      inventing a small one would produce a passphrase far weaker than it looks",
+                why: "the word list a passphrase is built from is not installed beside this \
+                      application; generating from an improvised one would produce a passphrase \
+                      far weaker than it looks",
+            },
+            PasswordGenError::WordlistUnusable => VaultError::Unsupported {
+                backend: BACKEND,
+                operation: "generate (passphrase)",
+                why: "the word list installed beside this application is not the one it ships; \
+                      generating from a short or altered list would produce a passphrase far \
+                      weaker than it looks",
             },
         })
     }
@@ -976,13 +985,17 @@ mod tests {
     /// line here and the shared property -- names the backend, names the
     /// operation, gives a reason -- is stated once.
     ///
-    /// **This list used to be six and is now four.** `archive_item`,
-    /// `unarchive_item` and `generate` were removed from it because they were
-    /// implemented, not because the contract loosened: the first two are
-    /// asserted against real routes in
+    /// **This list used to be six, then four, and is now three.**
+    /// `archive_item`, `unarchive_item` and both halves of `generate` were
+    /// removed from it because they were implemented, not because the contract
+    /// loosened: the first two are asserted against real routes in
     /// `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`, and
-    /// `generate` in `a_password_is_generated_locally_and_a_passphrase_is_not`
-    /// -- which also keeps a refusal, for the passphrase half.
+    /// `generate` in `a_password_and_a_passphrase_are_both_generated_locally`.
+    /// The passphrase half was the last to go: it is answered now from the
+    /// word list installed beside the executable, and what remains a refusal
+    /// there is a word list that is absent or does not verify, which is an
+    /// installation fault rather than a missing decision and so has no place
+    /// in a list of operations this backend cannot do.
     #[test]
     fn every_operation_this_backend_cannot_do_refuses_by_name() {
         let (_server, backend) = logged_in();
@@ -990,12 +1003,6 @@ mod tests {
             ("create_folder", backend.create_folder("x").expect_err("refused")),
             ("update_folder", backend.update_folder("f1", "x").expect_err("refused")),
             ("delete_folder", backend.delete_folder("f1").expect_err("refused")),
-            (
-                "generate (passphrase)",
-                backend
-                    .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
-                    .expect_err("refused"),
-            ),
         ];
         for (expected, error) in refusals {
             let VaultError::Unsupported { backend: who, operation, why } = error else {
@@ -1165,15 +1172,17 @@ mod tests {
         backend.unarchive_item("arch-1").expect("an unstamped echo is the success case");
     }
 
-    /// **The other refusal that was implemented**: a password is generated,
-    /// a passphrase is still refused, and neither answer is invented here.
+    /// **The other refusal that was implemented**, now in both halves: a
+    /// password and a passphrase are each generated, and neither answer is
+    /// invented here.
     ///
-    /// The `expect(0)` mock is the load-bearing part. `generate` must not
+    /// The unmatched mock is the load-bearing part. `generate` must not
     /// acquire a route: there is no server endpoint for it anywhere, so a
     /// generate that touched the network would mean this backend had invented
-    /// one. It is answered from [`crate::password_gen`] with no I/O at all.
+    /// one. Both halves are answered from [`crate::password_gen`] -- the
+    /// passphrase reads one local file and nothing else.
     #[test]
-    fn a_password_is_generated_locally_and_a_passphrase_is_not() {
+    fn a_password_and_a_passphrase_are_both_generated_locally() {
         let (mut server, backend) = logged_in();
         // Default expectation, not `expect(0)` -- see the note in
         // `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`.
@@ -1185,13 +1194,12 @@ mod tests {
         assert_eq!(password.len(), 20);
         assert!(password.chars().any(|c| c.is_ascii_digit()), "not the recipe that was asked for");
 
-        let err = backend
+        let passphrase = backend
             .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
-            .expect_err("no wordlist");
-        let VaultError::Unsupported { why, .. } = &err else {
-            panic!("a passphrase was answered rather than refused: {err:?}");
-        };
-        assert!(why.contains("wordlist"), "the refusal does not name what is missing: {why}");
+            .expect("a generated passphrase");
+        // The default recipe: four words, `-`, capitalised, with a number.
+        assert_eq!(passphrase.split('-').count(), 4, "{}", &*passphrase);
+        assert_eq!(passphrase.chars().filter(char::is_ascii_digit).count(), 1);
 
         assert!(!any.matched(), "generate reached the network; there is no endpoint for it");
     }

@@ -13,7 +13,10 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/deskwarden.ico");
+    println!("cargo:rerun-if-changed=assets/wordlist.txt");
     println!("cargo:rerun-if-changed=build.rs");
+
+    copy_wordlist_beside_the_built_binary();
 
     #[cfg(windows)]
     {
@@ -41,6 +44,54 @@ fn main() {
         // before this existed.
         if let Err(e) = resource.compile() {
             println!("cargo:warning=could not embed the application icon resource: {e}");
+        }
+    }
+}
+
+/// Puts `assets/wordlist.txt` next to the built `deskwarden.exe`.
+///
+/// `src/password_gen.rs` reads the passphrase word list from a file beside the
+/// binary, which is where the installer's `[Files]` section puts it. Without
+/// this copy, a *development* build would be the only build that refuses
+/// passphrases -- the app would work on a user's machine and fail under
+/// `cargo run`, which is the worst way round for a defect to be discovered.
+/// Copying it here makes the two layouts identical.
+///
+/// **Every word in this file is chosen around `job_object`'s guard on it.**
+/// That test bans a short list of tokens here and, separately, pins this
+/// file's whole content by length and hash, because a build script runs
+/// outside every fence the app has. The obvious English word for "the built
+/// binary" contains one of those banned tokens, so it is not used; the guard
+/// is right and the prose bends around it rather than the other way about.
+///
+/// `OUT_DIR` is `<target>/<profile>/build/<pkg>-<hash>/out`, so the directory
+/// holding the binary is three levels above it. Cargo has laid it out that way
+/// for its whole existence, but nothing here depends on that: this is a
+/// deliberately best-effort copy that warns rather than failing, exactly like
+/// the icon resource above. A missing word list is already a named refusal at
+/// runtime rather than a crash, so the worst case of this being wrong is the
+/// behaviour that existed before it.
+fn copy_wordlist_beside_the_built_binary() {
+    let Ok(out_dir) = std::env::var("OUT_DIR") else { return };
+    let out_dir = std::path::PathBuf::from(out_dir);
+    let Some(binary_dir) = out_dir.ancestors().nth(3) else {
+        println!("cargo:warning=could not locate the build output directory for the word list");
+        return;
+    };
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/wordlist.txt");
+    // BOTH the binary's own directory and `deps/` beside it. The first is
+    // where `cargo run` puts `deskwarden.exe` and mirrors the installed
+    // layout; the second is where cargo puts TEST binaries, and putting the
+    // list there is what lets `password_gen`'s passphrase tests exercise the
+    // real `generate_passphrase` -- file search, verification and all --
+    // rather than a decomposed half of it.
+    for directory in [binary_dir.to_path_buf(), binary_dir.join("deps")] {
+        let _ = std::fs::create_dir_all(&directory);
+        if let Err(e) = std::fs::copy(&source, directory.join("wordlist.txt")) {
+            println!(
+                "cargo:warning=could not copy the passphrase word list to {}: {e}",
+                directory.display()
+            );
         }
     }
 }

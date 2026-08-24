@@ -88,6 +88,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "..\target\release\deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversion
+; The passphrase word list. `src/password_gen.rs` reads it from beside the
+; executable ON DEMAND rather than carrying it in the binary, so this line is
+; not optional decoration: without it the installed app refuses every
+; passphrase while a development build generates them happily, which is a
+; defect nobody sees until release. `WORDLIST_FILE` there is the same
+; spelling, and `the_installer_ships_the_wordlist_this_module_reads` reads
+; THIS FILE to hold the two together so the name cannot drift.
+Source: "..\assets\wordlist.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; Helper script for the bw-CLI bootstrap step below. `dontcopy` means it's
 ; bundled into the installer payload but not installed onto the user's
 ; system as an app file; it's pulled out on demand via

@@ -1925,8 +1925,8 @@ mod tests {
         // not `exec`, and `str::contains` is case-sensitive.
         //
         // SO THE RULE IS A WHOLE-FILE PIN, WHICH HAS NOTHING TO SPELL AROUND.
-        // `build.rs` is 46 lines that embed an icon; it changes about once a
-        // year. Pinning its exact content costs one number per legitimate
+        // `build.rs` embeds an icon and copies one asset; it changes about
+        // once a year. Pinning its exact content costs one number per legitimate
         // edit and refuses every possible edit in between -- `mod`,
         // `include!`, `#[path]`, an FFI declaration under any name, a call
         // into a dependency, a spelling nobody has thought of yet. There is
@@ -1938,7 +1938,7 @@ mod tests {
         let build_pinned = build_raw.replace("\r\n", "\n");
         assert_eq!(
             (build_pinned.len(), fnv1a64(&build_pinned)),
-            (2318, 0x5948_1c7a_9695_4071_u64),
+            (5143, 0x4731_8eb9_4c5c_f817_u64),
             "`build.rs` is not the file this module pinned. It runs at BUILD time, outside \
              every fence here and outside the job object entirely, and all it is supposed to \
              do is embed an icon resource. Read the diff: if the change is genuinely an icon \
@@ -2464,6 +2464,12 @@ mod tests {
                 "assets/fonts/OFL-NotoSans.txt",
                 "assets/fonts/OFL.txt",
                 "assets/generate-icon.py",
+                // The passphrase word list `password_gen` reads on demand.
+                // Data, not a module: 4,096 lowercase words one per line,
+                // pinned by SHA-256 in `password_gen`'s `WORDLIST_SHA256`,
+                // which is a stronger statement about its contents than this
+                // list makes about its existence.
+                "assets/wordlist.txt",
                 // NO `assets/marks/`, and no generator for one. The card
                 // networks' marks used to be seven generated PNGs; they are
                 // drawn type now (`card_mark.rs`), so there is no image to

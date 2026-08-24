@@ -25,9 +25,11 @@
 //!
 //! * [`GenerateRequest::Password`] -- generated here. It is a pure algorithm
 //!   over a fixed alphabet and needs no data this crate does not have.
-//! * [`GenerateRequest::Passphrase`] -- **refused by name**, and see
-//!   [`PasswordGenError::NoWordlist`] for why that refusal is the safe answer
-//!   rather than the lazy one.
+//! * [`GenerateRequest::Passphrase`] -- generated here too, from a word list
+//!   that is **a file installed beside the executable and read on demand**,
+//!   never bytes compiled into this binary. See [`generate_passphrase`] for
+//!   the whole of that argument, and [`PasswordGenError::WordlistUnusable`]
+//!   for why a list that does not verify is refused rather than used short.
 //!
 //! # The rules this file is written under
 //!
@@ -64,9 +66,13 @@
 //! JavaScript route would not. Those two are the whole of the difference that
 //! is known; they are also in the implementation report on this branch.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::vault_bridge::{GenerateRequest, PasswordRecipe};
+use crate::vault_bridge::{GenerateRequest, PassphraseRecipe, PasswordRecipe};
 
 // ---- the alphabets -----------------------------------------------------------
 //
@@ -137,25 +143,39 @@ pub enum PasswordGenError {
     /// the user, both of which are better than being handed a guessable
     /// string it has no way to recognise as one.
     Rng,
-    /// A passphrase was asked for, and this crate has no wordlist.
+    /// The wordlist a passphrase is drawn from could not be found.
     ///
-    /// # Why this is a refusal rather than a small wordlist
+    /// It is a file installed beside the executable (see [`WORDLIST_FILE`]
+    /// and [`wordlist_paths`]), not bytes compiled into this binary, because
+    /// it is needed only when somebody asks for a passphrase -- which is
+    /// rare -- and a list that is `include_str!`d is resident in the image
+    /// for the life of a process whose whole design is about staying small.
     ///
-    /// A passphrase's entire strength is the size of the list the words are
-    /// drawn from: Bitwarden uses the EFF long list, 7,776 words, which is
-    /// 12.9 bits per word -- a four-word passphrase is about 51 bits. A
-    /// hand-written or improvised list of a few hundred words looks exactly
-    /// like a real passphrase to the user and to this app's own strength
-    /// meter while carrying **less than half** the entropy, and neither the
-    /// user nor a reviewer can see the difference by looking at the output.
-    /// That is the failure this crate treats as worse than a crash: a wrong
-    /// answer indistinguishable from a right one.
+    /// **This is a refusal and never a fallback.** See
+    /// [`Self::WordlistUnusable`] for the argument, which applies identically
+    /// to "the file is not there": a passphrase improvised from whatever
+    /// words this module could reach looks exactly like a real one.
+    WordlistMissing,
+    /// The wordlist was found and **rejected**: the wrong number of words, a
+    /// duplicate, a word that is not four to eight lowercase letters, or
+    /// contents that do not match [`WORDLIST_SHA256`].
     ///
-    /// Shipping the EFF list is a data and licensing decision for the owner
-    /// of this crate and it has not been taken. Until it is, the honest
-    /// answer is this variant, and it says what is missing so that the person
-    /// reading the refusal knows exactly what would resolve it.
-    NoWordlist,
+    /// # Why a short list is refused rather than used
+    ///
+    /// A passphrase's entire strength is the size of the list its words are
+    /// drawn from. This crate's list is [`WORDLIST_WORDS`] words -- 2^12, so
+    /// exactly twelve bits a word and a four-word passphrase is 48 bits. A
+    /// file truncated to three hundred words yields about 8.2 bits a word,
+    /// roughly 33 bits over four words: **thirty thousand times weaker**, and
+    /// utterly indistinguishable from the real thing by looking at it. Neither
+    /// the user, nor this app's own strength meter, nor a reviewer reading the
+    /// output can tell the two apart.
+    ///
+    /// That is the failure this crate treats as worse than a crash -- a wrong
+    /// answer indistinguishable from a right one -- so the list is counted,
+    /// de-duplicated and hashed on every load and anything short of an exact
+    /// match arrives here.
+    WordlistUnusable,
 }
 
 impl std::fmt::Display for PasswordGenError {
@@ -165,8 +185,11 @@ impl std::fmt::Display for PasswordGenError {
                 "this computer's secure random number generator could not be read, so no password \
                  was generated",
             ),
-            Self::NoWordlist => f.write_str(
-                "generating a passphrase needs a wordlist, and this app does not carry one yet",
+            Self::WordlistMissing => f.write_str(
+                "the word list a passphrase is built from was not found beside this application,                  so no passphrase was generated",
+            ),
+            Self::WordlistUnusable => f.write_str(
+                "the word list a passphrase is built from is not the one this application ships,                  so no passphrase was generated",
             ),
         }
     }
@@ -184,9 +207,7 @@ impl std::error::Error for PasswordGenError {}
 pub fn generate(request: &GenerateRequest) -> Result<Zeroizing<String>, PasswordGenError> {
     match request {
         GenerateRequest::Password(recipe) => generate_password(recipe),
-        // See `PasswordGenError::NoWordlist`. This arm must not grow an
-        // improvised list of words.
-        GenerateRequest::Passphrase(_) => Err(PasswordGenError::NoWordlist),
+        GenerateRequest::Passphrase(recipe) => generate_passphrase(recipe),
     }
 }
 
@@ -514,6 +535,324 @@ impl Alphabets {
             Class::Any => &self.any,
         }
     }
+}
+
+// ---- the passphrase ----------------------------------------------------------
+//
+// Everything below is the second half of this module: the word list, the
+// checks it has to pass before a single word is drawn from it, and the draw
+// itself. The list is NOT here -- it is `assets/wordlist.txt`, a plain file of
+// one word per line, and that is deliberate on two counts. It is installed
+// beside the executable rather than compiled in, so it costs nothing until
+// somebody asks for a passphrase; and it is data rather than source, so
+// `no_wordlist_has_been_smuggled_into_this_module` can still say that this
+// file carries no words of its own.
+
+/// The file name the word list is installed under, beside the executable.
+///
+/// The installer's `[Files]` section writes it to `{app}`, and
+/// `the_installer_ships_the_wordlist_this_module_reads` reads that section to
+/// hold the two spellings together, so an installer that stopped shipping the
+/// file reds a test here rather than producing a build whose Generate button
+/// refuses passphrases on a user's machine and nowhere else.
+pub const WORDLIST_FILE: &str = "wordlist.txt";
+
+/// How many words the list must hold. **2^12, and the exponent is the point.**
+///
+/// A word is chosen with exactly twelve random bits (see [`draw_index`]).
+/// Because the count is a power of two, those twelve bits map onto the list
+/// one-to-one: there is no `%` to bias the low indices, and no rejection loop
+/// to write incorrectly. A list of 4,000 or 4,100 words would force one or the
+/// other back into this file, silently, and the resulting skew is invisible in
+/// the output -- which is exactly the defect [`uniform_below`] exists to keep
+/// out of the character generator.
+///
+/// It is also what makes the strength statable without arithmetic: twelve bits
+/// a word, so `n` words is `12n` bits, and the four-word default is 48.
+pub const WORDLIST_WORDS: usize = 4096;
+
+/// The twelve bits [`WORDLIST_WORDS`] is the size of.
+const WORDLIST_BITS: u32 = 12;
+
+/// The SHA-256 of the list's words joined by a newline.
+///
+/// # Why the hash is pinned, and why it is over the WORDS rather than the FILE
+///
+/// The count-and-uniqueness checks catch a truncated or duplicated list, which
+/// is the corruption that happens by accident. They do **not** catch a list
+/// that is still 4,096 unique words but not *these* 4,096 -- a file swapped
+/// for one of 4,096 near-identical variants of the same word, say, whose
+/// effective entropy is a fraction of what the count claims. This pin closes
+/// that: any edit at all to the list is a different digest and is refused.
+///
+/// It is computed over the parsed words joined with a newline, **not over the
+/// file's bytes**, and that is not laziness. This repository is checked out on
+/// Windows, where git may hand a working tree CRLF line endings; a digest over
+/// raw bytes would then be red on the machine the file was written on and
+/// green on CI, or the reverse. Hashing the parsed words makes the pin depend
+/// on the list rather than on the checkout, which is the property actually
+/// wanted.
+///
+/// Changing the list means changing this constant in the same commit, which is
+/// the visible edit a wordlist change ought to be.
+const WORDLIST_SHA256: [u8; 32] = [
+    0xc2, 0xc5, 0x5e, 0x59, 0x32, 0x5b, 0xf5, 0x66, 0xd9, 0x37, 0x56, 0x57, 0xc7, 0xda, 0x8f, 0x90,
+    0x0d, 0x0d, 0x1c, 0x16, 0x3d, 0xf9, 0x1a, 0xef, 0xbd, 0x38, 0x76, 0xfa, 0xe8, 0xb7, 0x7d, 0x6c,
+];
+
+/// `bw`'s floor on a passphrase's word count, which [`PassphraseRecipe::words`]
+/// records: the serve route clamps anything below this up to it.
+const MIN_WORDS: u32 = 3;
+
+/// A ceiling on the word count, and the same kind of bound [`MAX_LENGTH`] is:
+/// this is Rust reading a `u32` a UI or a future caller filled in, and without
+/// it a recipe asking for four billion words is a four-billion-word
+/// allocation inside a UI callback. Twenty is far above anything a Bitwarden
+/// client offers, so it cannot make a passphrase shorter than one a real
+/// client could ask for.
+const MAX_WORDS: u32 = 20;
+
+/// The directories the word list is looked for in, **in the order searched**.
+///
+/// 1. **Beside the executable**, which is where the installer's `[Files]`
+///    section puts it and where `build.rs` copies it in a development build,
+///    so the installed app and `cargo run` behave identically.
+/// 2. **`assets/` beside the executable** -- the layout a build that ships its
+///    assets in a subdirectory would use. Costless to look in, and it means
+///    one packaging choice later is not a code change here.
+///
+/// **The user's config directory is deliberately NOT on this list**, and that
+/// is the one interesting thing about this function.
+/// [`crate::brand_mark::search_dirs`] looks there *first*, precisely so a user
+/// can override what the app ships -- which is right for a card logo and would
+/// be a hole here: a user-writable word list is a file that anything running
+/// as the user can shrink to ten words, after which every passphrase this app
+/// generates is guessable and looks exactly as it did before. The list this
+/// app draws from is the list this app shipped, and [`WORDLIST_SHA256`] is the
+/// check that says so.
+///
+/// The list may be empty when the running executable's path cannot be read,
+/// which reaches the caller as [`PasswordGenError::WordlistMissing`].
+pub fn wordlist_paths() -> Vec<PathBuf> {
+    let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))
+    else {
+        return Vec::new();
+    };
+    vec![dir.join(WORDLIST_FILE), dir.join("assets").join(WORDLIST_FILE)]
+}
+
+/// One passphrase, from the OS CSPRNG and the installed word list.
+///
+/// # The list is loaded here and dropped here
+///
+/// There is no `OnceLock`, no `lazy_static` and no cached `Vec` anywhere in
+/// this module. The owner's requirement, in as many words: *"it's not even
+/// needed in memory until called (which is rare)"*. So the file is read on the
+/// call, verified, drawn from, and freed when this function returns. A
+/// passphrase costs one read of a 30 KB file the OS has almost certainly
+/// cached; a resident list costs that 30 KB for the life of a process that
+/// spends most of its life in the tray doing nothing.
+///
+/// # What is verified before a single word is drawn
+///
+/// [`verify`], and it refuses rather than degrades -- see
+/// [`PasswordGenError::WordlistUnusable`] for why a short list is the worst
+/// possible outcome here rather than a merely disappointing one.
+///
+/// # The draw
+///
+/// Twelve bits a word, from [`draw_index`], with no modulo and no rejection
+/// because [`WORDLIST_WORDS`] is 2^12. Every position draws from the whole
+/// list, which `every_word_position_draws_from_the_whole_list` measures.
+///
+/// # Where the digit goes
+///
+/// `include_number` puts one digit on one word, and **which word is chosen at
+/// random**. Appending it to the last word would be the same defect as
+/// building a password by overwriting its first characters with digits: a
+/// known position is a position removed from the search space, and
+/// `the_included_number_lands_on_every_word_not_just_the_last` is the test
+/// that says it is not.
+pub fn generate_passphrase(
+    recipe: &PassphraseRecipe,
+) -> Result<Zeroizing<String>, PasswordGenError> {
+    let words = load_wordlist()?;
+    let count = recipe.words.clamp(MIN_WORDS, MAX_WORDS) as usize;
+    let separator = separator_of(recipe);
+
+    // The chosen indices, and the word the digit lands on. Neither is the
+    // passphrase, but together with the list they ARE it, so both are wiped --
+    // the way `generate_password` wipes its plan for the same reason.
+    let mut chosen: Zeroizing<Vec<u16>> = Zeroizing::new(Vec::with_capacity(count));
+    for _ in 0..count {
+        chosen.push(draw_index()?);
+    }
+    let numbered: Zeroizing<usize> =
+        Zeroizing::new(if recipe.include_number { uniform_below(count)? } else { usize::MAX });
+    let digit: Zeroizing<u8> =
+        Zeroizing::new(if recipe.include_number { uniform_below(10)? as u8 } else { 0 });
+
+    // **Exact capacity, for the reason `generate_password` states**: the only
+    // way a half-built passphrase can be left in a freed page that `Zeroizing`
+    // never sees is a reallocation while it is being filled. Every word is
+    // four to eight ASCII bytes (`verify` guarantees it), capitalising an
+    // ASCII letter cannot change its length, the separator is one `char`, and
+    // the digit is one byte.
+    let mut capacity = if separator == NO_SEPARATOR {
+        0
+    } else {
+        separator.len_utf8() * count.saturating_sub(1)
+    };
+    if recipe.include_number {
+        capacity += 1;
+    }
+    for index in chosen.iter() {
+        match words.get(*index as usize) {
+            Some(word) => capacity += word.len(),
+            // Unreachable: `draw_index` returns strictly below
+            // `WORDLIST_WORDS` and `verify` guarantees the list is that long.
+            // An error rather than an `unwrap` because this file does not
+            // panic on a path a caller can reach, and a short passphrase is a
+            // wrong answer rather than a survivable one.
+            None => return Err(PasswordGenError::WordlistUnusable),
+        }
+    }
+
+    let mut out: Zeroizing<String> = Zeroizing::new(String::with_capacity(capacity));
+    for (position, index) in chosen.iter().enumerate() {
+        if position > 0 && separator != NO_SEPARATOR {
+            out.push(separator);
+        }
+        let Some(word) = words.get(*index as usize) else {
+            return Err(PasswordGenError::WordlistUnusable);
+        };
+        for (offset, letter) in word.chars().enumerate() {
+            if offset == 0 && recipe.capitalize {
+                out.push(letter.to_ascii_uppercase());
+            } else {
+                out.push(letter);
+            }
+        }
+        if recipe.include_number && position == *numbered {
+            out.push((b'0' + *digit) as char);
+        }
+    }
+    Ok(out)
+}
+
+/// The sentinel [`separator_of`] returns for "the words run together".
+///
+/// A NUL rather than an `Option<char>`: it is not a character any branch of
+/// that function can otherwise produce, and an `Option` unwrapped at every
+/// push site reads worse than the one comparison it saves.
+const NO_SEPARATOR: char = '\0';
+
+/// The separator this recipe really means, as one `char`.
+///
+/// [`PassphraseRecipe::separator`]'s doc is the specification and it was
+/// verified against `bw`'s own source: the route takes only the **first**
+/// character of anything longer than one, and reads the literal words `space`
+/// and `empty` as a space and as nothing at all.
+fn separator_of(recipe: &PassphraseRecipe) -> char {
+    match recipe.separator.as_str() {
+        "space" => ' ',
+        "empty" | "" => NO_SEPARATOR,
+        other => other.chars().next().unwrap_or(NO_SEPARATOR),
+    }
+}
+
+/// One index into the word list, from exactly [`WORDLIST_BITS`] bits of the OS
+/// CSPRNG.
+///
+/// Two bytes are drawn and the low twelve bits are kept. **This is not a
+/// modulo and it is not a rejection loop**: 2^16 is an exact multiple of 2^12,
+/// so masking partitions the 65,536 byte pairs into 4,096 classes of exactly
+/// sixteen -- every index is reachable by the same number of draws, which is
+/// the definition of unbiased. That property is a consequence of
+/// [`WORDLIST_WORDS`] being a power of two and is the whole reason that
+/// constant is not a round decimal number.
+///
+/// The four discarded bits are not a weakness; they are simply not asked for.
+fn draw_index() -> Result<u16, PasswordGenError> {
+    let mut bytes = [0u8; 2];
+    getrandom::getrandom(&mut bytes).map_err(|_| PasswordGenError::Rng)?;
+    let mask = (1u16 << WORDLIST_BITS) - 1;
+    Ok(u16::from_le_bytes(bytes) & mask)
+}
+
+/// Reads and verifies the installed word list.
+///
+/// The first candidate path that **exists** is the one used, and a file that
+/// exists but fails [`verify`] is an error rather than a reason to try the
+/// next: a search that fell through to a second directory because the first
+/// held a *broken* file is a search whose answer depends on which failure came
+/// first. That is [`crate::brand_mark::find_file`]'s rule, for the same
+/// reason.
+fn load_wordlist() -> Result<Vec<String>, PasswordGenError> {
+    for path in wordlist_paths() {
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|_| PasswordGenError::WordlistUnusable)?;
+        return verify(&text);
+    }
+    Err(PasswordGenError::WordlistMissing)
+}
+
+/// The four checks a candidate word list must pass, and why each is a check
+/// rather than an assumption.
+///
+/// 1. **Exactly [`WORDLIST_WORDS`] words.** Anything else and twelve bits no
+///    longer index the list one-to-one -- see [`draw_index`].
+/// 2. **Every word four to eight lowercase ASCII letters.** An apostrophe or
+///    an accent would collide with the separator and the capitalize rule; a
+///    word outside the length band is either confusable or a nuisance to
+///    dictate over a telephone.
+/// 3. **All unique.** A duplicate is a word with twice the probability inside
+///    a list whose length still claims full entropy. This is the failure that
+///    is invisible without a check, which is why the check is not optional.
+/// 4. **The digest matches [`WORDLIST_SHA256`].**
+///
+/// All four fail as [`PasswordGenError::WordlistUnusable`], one variant rather
+/// than four, because the caller's answer is the same for every one of them --
+/// refuse -- and four variants would be four opportunities to handle one of
+/// them by generating anyway.
+fn verify(text: &str) -> Result<Vec<String>, PasswordGenError> {
+    let mut words: Vec<String> = text.lines().map(|line| line.trim().to_string()).collect();
+    // A single trailing newline leaves no empty entry (`lines` does not yield
+    // one), but a file ending in several does. Those are dropped; an empty
+    // line in the MIDDLE is not, and fails the shape check below as it should.
+    while words.last().is_some_and(|word| word.is_empty()) {
+        words.pop();
+    }
+
+    if words.len() != WORDLIST_WORDS {
+        return Err(PasswordGenError::WordlistUnusable);
+    }
+    let well_formed = words
+        .iter()
+        .all(|w| (4..=8).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_lowercase()));
+    if !well_formed {
+        return Err(PasswordGenError::WordlistUnusable);
+    }
+    let unique: HashSet<&str> = words.iter().map(String::as_str).collect();
+    if unique.len() != WORDLIST_WORDS {
+        return Err(PasswordGenError::WordlistUnusable);
+    }
+
+    let mut hasher = Sha256::new();
+    for (index, word) in words.iter().enumerate() {
+        if index > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(word.as_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    if digest != WORDLIST_SHA256 {
+        return Err(PasswordGenError::WordlistUnusable);
+    }
+
+    Ok(words)
 }
 
 #[cfg(test)]
@@ -901,21 +1240,470 @@ mod tests {
         assert_ne!(*first, *second, "two generated passwords were identical");
     }
 
-    // ---- the refusal --------------------------------------------------------
+    // ---- the word list -------------------------------------------------------
 
-    /// A passphrase is refused by name, and the refusal is the wordlist one.
+    /// The shipped list, read from `assets/` rather than from beside the test
+    /// binary, so a test asserting a property of "the word list" is asserting
+    /// it of **the file that is committed and installed** and not of whatever
+    /// `build.rs` happened to copy.
+    fn shipped_wordlist_text() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/wordlist.txt"))
+            .expect("the shipped word list")
+    }
+
+    /// **The test the word list exists for**, and every clause of it is load
+    /// bearing.
     ///
-    /// This must stay a refusal until a real wordlist is a decision the owner
-    /// has taken. See [`PasswordGenError::NoWordlist`].
+    /// * **Exactly 4,096.** Not "about 4,000": 2^12 is what makes
+    ///   [`draw_index`] a mask rather than a modulo, so a list that drifted by
+    ///   one word would reintroduce bias into every passphrase this app makes.
+    /// * **All unique**, checked with a set rather than by eye. A duplicate is
+    ///   a word with twice the probability inside a list still claiming twelve
+    ///   bits, and it is invisible in a file of four thousand lines.
+    /// * **Lowercase `a`-`z` only**, four to eight characters. An apostrophe
+    ///   or an accent would collide with the separator and the capitalize
+    ///   rule; the length band is what keeps a word dictatable.
     #[test]
-    fn a_passphrase_is_refused_because_there_is_no_wordlist() {
-        let err = generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
-            .expect_err("no wordlist");
-        assert_eq!(err, PasswordGenError::NoWordlist);
-        assert!(
-            err.to_string().contains("wordlist"),
-            "the refusal does not say what is missing: {err}"
+    fn the_shipped_wordlist_is_four_thousand_and_ninety_six_unique_short_lowercase_words() {
+        let text = shipped_wordlist_text();
+        let words: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+
+        assert_eq!(
+            words.len(),
+            WORDLIST_WORDS,
+            "the word list holds {} words. It must hold exactly {WORDLIST_WORDS} = 2^{WORDLIST_BITS}, \
+             because that is what lets a word be chosen with {WORDLIST_BITS} bits and no modulo",
+            words.len()
         );
+
+        let unique: HashSet<&&str> = words.iter().collect();
+        assert_eq!(
+            unique.len(),
+            words.len(),
+            "the word list holds {} distinct words out of {}; a duplicate is a word with double \
+             the probability and a list with less entropy than its length claims",
+            unique.len(),
+            words.len()
+        );
+
+        for word in &words {
+            assert!(
+                (4..=8).contains(&word.len()),
+                "`{word}` is {} characters; the list is four to eight",
+                word.len()
+            );
+            assert!(
+                word.bytes().all(|b| b.is_ascii_lowercase()),
+                "`{word}` is not lowercase ASCII a-z"
+            );
+        }
+    }
+
+    /// And the shipped list is the list this module pins: [`verify`] accepts
+    /// it whole, hash included.
+    ///
+    /// Kept apart from the test above on purpose. That one states the
+    /// *properties* a reader can check by hand; this one states that the
+    /// running code agrees, so a hash constant left stale by an edit to the
+    /// list fails here with a name that says which of the two is wrong.
+    #[test]
+    fn the_shipped_wordlist_passes_the_verification_the_generator_applies() {
+        let words = verify(&shipped_wordlist_text()).expect("the shipped list must verify");
+        assert_eq!(words.len(), WORDLIST_WORDS);
+    }
+
+    /// Line endings do not decide whether the list verifies.
+    ///
+    /// This repository is checked out on Windows and git may hand the working
+    /// tree CRLF. [`WORDLIST_SHA256`] is over the parsed words for exactly
+    /// that reason, and this is the assertion that says so rather than a
+    /// paragraph hoping it is true.
+    #[test]
+    fn the_wordlist_verifies_under_either_line_ending() {
+        let unix = shipped_wordlist_text().replace("\r\n", "\n");
+        let dos = unix.replace('\n', "\r\n");
+        verify(&unix).expect("LF");
+        verify(&dos).expect("CRLF");
+    }
+
+    // ---- refusing rather than degrading --------------------------------------
+
+    /// **The check that stands between a good passphrase and one that looks
+    /// identical and is thirty thousand times weaker.**
+    ///
+    /// Four corruptions, each a way a word list really goes wrong, and every
+    /// one of them must be *refused* rather than used:
+    ///
+    /// 1. **Truncated** -- a partial write, a truncated download. 300 words is
+    ///    8.2 bits a word instead of twelve.
+    /// 2. **Duplicated** -- still 4,096 lines, one word twice and one missing.
+    ///    The count check cannot see this; the uniqueness check must.
+    /// 3. **Substituted** -- still 4,096 unique well-formed words, one of them
+    ///    changed. Only the hash pin sees this.
+    /// 4. **Malformed** -- a word with a character outside `a`-`z`.
+    #[test]
+    fn a_truncated_duplicated_substituted_or_malformed_list_is_refused_not_used() {
+        let text = shipped_wordlist_text().replace("\r\n", "\n");
+        let words: Vec<&str> = text.lines().map(str::trim).collect();
+
+        let mut truncated = words.clone();
+        truncated.truncate(300);
+
+        let mut duplicated = words.clone();
+        duplicated[4_000] = duplicated[0];
+
+        let mut substituted = words.clone();
+        substituted[100] = "zzzzzz";
+
+        let mut malformed = words.clone();
+        malformed[7] = "Wordlist";
+
+        for (name, broken) in [
+            ("truncated to 300 words", truncated),
+            ("4,096 lines with one word twice", duplicated),
+            ("4,096 unique words, one of them swapped", substituted),
+            ("a word that is not lowercase a-z", malformed),
+        ] {
+            let err = verify(&broken.join("\n"))
+                .err()
+                .unwrap_or_else(|| panic!("a list {name} was ACCEPTED; it must be refused"));
+            assert_eq!(err, PasswordGenError::WordlistUnusable, "{name}");
+        }
+    }
+
+    /// A missing file is its own named refusal, not a silent empty list.
+    #[test]
+    fn an_absent_word_list_is_refused_by_name() {
+        // `verify` is the half a test can reach without moving the running
+        // executable; the missing-file half is `load_wordlist`'s, and what is
+        // asserted here is that the two refusals are DIFFERENT so a user can
+        // be told which one happened.
+        assert_ne!(PasswordGenError::WordlistMissing, PasswordGenError::WordlistUnusable);
+        assert!(
+            PasswordGenError::WordlistMissing.to_string().contains("not found"),
+            "the refusal does not say the list is absent"
+        );
+    }
+
+    // ---- the draw ------------------------------------------------------------
+
+    /// **The distribution test, and the one this file's history says must be
+    /// proved to bite.**
+    ///
+    /// Every word position must draw from the whole list. The failure it
+    /// excludes is a selection that reaches only part of the file -- an index
+    /// masked to eleven bits, a `% 1000`, a list read short -- all of which
+    /// produce passphrases that look exactly right.
+    ///
+    /// # The measurement
+    ///
+    /// 60,000 words are drawn (15,000 four-word passphrases) and bucketed by
+    /// which sixteenth of the list they came from, 256 words a bucket. Each
+    /// bucket is a binomial with n = 60,000 and p = 1/16, expectation 3,750 and
+    /// standard deviation about 59.3. The tolerance is 400, nearly seven
+    /// standard deviations, so a false failure is well under one in a million
+    /// across all sixteen buckets.
+    ///
+    /// It also asserts the coarser thing directly: the lowest and highest
+    /// indices in the whole sample must sit inside the first and last buckets,
+    /// which no truncated selection can manage.
+    ///
+    /// # And it bites -- measured, not reasoned about
+    ///
+    /// [`draw_index`]'s mask was changed from `(1 << 12) - 1` to
+    /// `(1 << 11) - 1` -- one character, and exactly the defect described
+    /// above: half the list becomes unreachable and the other half comes up
+    /// twice as often. This test was run against that mutant and failed on
+    /// the first bucket it looked at, reporting **words 0..256 drawn 7,515
+    /// times against an expected 3,750, off by 3,765 with a tolerance of
+    /// 400** -- nine times the tolerance, and that was before it reached the
+    /// eight buckets it would have found empty. The mask was then restored
+    /// and the test passed.
+    #[test]
+    fn every_word_position_draws_from_the_whole_list() {
+        const ROUNDS: usize = 15_000;
+        const WORDS: usize = 4;
+        const BUCKETS: usize = 16;
+        const PER_BUCKET: usize = WORDLIST_WORDS / BUCKETS;
+        const EXPECTED: i64 = (ROUNDS * WORDS / BUCKETS) as i64;
+        const TOLERANCE: i64 = 400;
+
+        let list = verify(&shipped_wordlist_text()).expect("the shipped list");
+        let index_of: std::collections::HashMap<&str, usize> =
+            list.iter().enumerate().map(|(i, w)| (w.as_str(), i)).collect();
+
+        let recipe = PassphraseRecipe {
+            words: WORDS as u32,
+            separator: "-".to_string(),
+            capitalize: false,
+            include_number: false,
+        };
+
+        let mut counts = [0i64; BUCKETS];
+        let mut lowest = usize::MAX;
+        let mut highest = 0usize;
+        for _ in 0..ROUNDS {
+            let phrase = generate_passphrase(&recipe).expect("the shipped list and the CSPRNG");
+            let parts: Vec<&str> = phrase.split('-').collect();
+            assert_eq!(parts.len(), WORDS, "a {WORDS}-word passphrase came back as `{}`", &*phrase);
+            for part in parts {
+                let index = *index_of
+                    .get(part)
+                    .unwrap_or_else(|| panic!("`{part}` is not a word in the shipped list"));
+                counts[index / PER_BUCKET] += 1;
+                lowest = lowest.min(index);
+                highest = highest.max(index);
+            }
+        }
+
+        for (bucket, count) in counts.iter().enumerate() {
+            let deviation = (count - EXPECTED).abs();
+            assert!(
+                deviation <= TOLERANCE,
+                "words {}..{} of the list came up {count} times against an expected {EXPECTED} \
+                 (off by {deviation}, tolerance {TOLERANCE}); the selection is not drawing from \
+                 the whole list",
+                bucket * PER_BUCKET,
+                (bucket + 1) * PER_BUCKET
+            );
+        }
+        assert!(
+            lowest < PER_BUCKET,
+            "the lowest index drawn in {} words was {lowest}; the front of the list is not being \
+             reached",
+            ROUNDS * WORDS
+        );
+        assert!(
+            highest >= WORDLIST_WORDS - PER_BUCKET,
+            "the highest index drawn in {} words was {highest} of {WORDLIST_WORDS}; the end of \
+             the list is not being reached",
+            ROUNDS * WORDS
+        );
+    }
+
+    /// Two passphrases in a row do not agree. Cheap insurance against a cached
+    /// buffer or a clock seed, the same one the password side carries.
+    #[test]
+    fn two_passphrases_in_a_row_are_not_the_same() {
+        let recipe = PassphraseRecipe::default();
+        let first = generate_passphrase(&recipe).expect("the shipped list");
+        let second = generate_passphrase(&recipe).expect("the shipped list");
+        assert_ne!(*first, *second, "two generated passphrases were identical");
+    }
+
+    // ---- the recipe's documented semantics -----------------------------------
+
+    /// `words` is honoured, and clamped up to three the way the route clamps
+    /// it -- never down to a shorter passphrase than was asked for.
+    #[test]
+    fn the_word_count_is_honoured_and_clamped_up_to_three() {
+        for (asked, expected) in [(0u32, 3usize), (1, 3), (3, 3), (4, 4), (9, 9)] {
+            let recipe = PassphraseRecipe {
+                words: asked,
+                separator: " ".to_string(),
+                capitalize: false,
+                include_number: false,
+            };
+            let phrase = generate_passphrase(&recipe).expect("the shipped list");
+            assert_eq!(
+                phrase.split(' ').count(),
+                expected,
+                "asking for {asked} words produced `{}`",
+                &*phrase
+            );
+        }
+    }
+
+    /// The absurd recipe is bounded rather than allocated, the same decision
+    /// [`normalize`] records for a password's length.
+    #[test]
+    fn an_absurd_word_count_is_bounded_instead_of_allocating_forever() {
+        let recipe = PassphraseRecipe {
+            words: u32::MAX,
+            separator: "-".to_string(),
+            capitalize: false,
+            include_number: false,
+        };
+        let phrase = generate_passphrase(&recipe).expect("the shipped list");
+        assert_eq!(phrase.split('-').count(), MAX_WORDS as usize);
+    }
+
+    /// `separator`, in every shape [`PassphraseRecipe::separator`] documents:
+    /// a single character, only the FIRST character of anything longer, and
+    /// the two literal words that are not separators at all.
+    #[test]
+    fn the_separator_is_the_one_the_recipe_documents() {
+        let phrase = |separator: &str| {
+            let recipe = PassphraseRecipe {
+                words: 4,
+                separator: separator.to_string(),
+                capitalize: false,
+                include_number: false,
+            };
+            generate_passphrase(&recipe).expect("the shipped list").to_string()
+        };
+
+        assert_eq!(phrase("-").split('-').count(), 4, "a single character separator");
+        assert_eq!(phrase("+").split('+').count(), 4);
+        // Only the first character of a longer string.
+        let long = phrase("+++");
+        assert_eq!(long.split('+').count(), 4, "`+++` used more than its first character: {long}");
+        // The two literal words.
+        assert_eq!(phrase("space").split(' ').count(), 4, "`space` is a space");
+        for word in ["empty", ""] {
+            let joined = phrase(word);
+            assert!(
+                joined.bytes().all(|b| b.is_ascii_lowercase()),
+                "`{word}` left a separator in `{joined}`"
+            );
+            assert!(joined.len() >= 16, "`{word}` produced only `{joined}`");
+        }
+    }
+
+    /// `capitalize` capitalises the first letter of **every** word and nothing
+    /// else, and with it off the passphrase is all lowercase.
+    #[test]
+    fn capitalize_raises_the_first_letter_of_every_word_and_only_that() {
+        for _ in 0..200 {
+            let recipe = PassphraseRecipe {
+                words: 5,
+                separator: "-".to_string(),
+                capitalize: true,
+                include_number: false,
+            };
+            let phrase = generate_passphrase(&recipe).expect("the shipped list");
+            for word in phrase.split('-') {
+                let mut letters = word.chars();
+                let first = letters.next().expect("a non-empty word");
+                assert!(first.is_ascii_uppercase(), "`{word}` does not start capitalised");
+                assert!(
+                    letters.all(|c| c.is_ascii_lowercase()),
+                    "`{word}` capitalised more than its first letter"
+                );
+            }
+
+            let plain = generate_passphrase(&PassphraseRecipe { capitalize: false, ..recipe })
+                .expect("the shipped list");
+            assert!(
+                plain.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "`{}` is not all lowercase with capitalize off",
+                &*plain
+            );
+        }
+    }
+
+    /// `include_number` puts exactly one digit in the passphrase, and leaves
+    /// none there when it is off.
+    #[test]
+    fn include_number_adds_exactly_one_digit_and_none_when_off() {
+        let base = PassphraseRecipe {
+            words: 4,
+            separator: "-".to_string(),
+            capitalize: false,
+            include_number: true,
+        };
+        for _ in 0..300 {
+            let with = generate_passphrase(&base).expect("the shipped list");
+            assert_eq!(
+                with.chars().filter(char::is_ascii_digit).count(),
+                1,
+                "`{}` does not carry exactly one digit",
+                &*with
+            );
+            let without =
+                generate_passphrase(&PassphraseRecipe { include_number: false, ..base.clone() })
+                    .expect("the shipped list");
+            assert!(
+                !without.chars().any(|c| c.is_ascii_digit()),
+                "`{}` carries a digit with includeNumber off",
+                &*without
+            );
+        }
+    }
+
+    /// **The other half of "no bias"**, and the passphrase's version of
+    /// `a_forced_character_lands_in_every_position_not_just_the_first`.
+    ///
+    /// A generator that satisfies `include_number` by appending a digit to the
+    /// last word passes every test that merely counts digits, and has given
+    /// away the digit's position for nothing. So this counts positions: over
+    /// 8,000 six-word passphrases every one of the six words must have carried
+    /// the digit a plausible number of times.
+    ///
+    /// Each position is a binomial with n = 8,000 and p = 1/6: expectation
+    /// 1,333 and standard deviation about 33.3. The tolerance of 15% is four
+    /// hundred times the standard deviation twelve times over -- it cannot
+    /// flake -- while an implementation that always appends puts all 8,000 in
+    /// the last bin, 500% out.
+    #[test]
+    fn the_included_number_lands_on_every_word_not_just_the_last() {
+        const WORDS: usize = 6;
+        const ROUNDS: usize = 8_000;
+        let recipe = PassphraseRecipe {
+            words: WORDS as u32,
+            separator: "-".to_string(),
+            capitalize: false,
+            include_number: true,
+        };
+
+        let mut positions = [0usize; WORDS];
+        for _ in 0..ROUNDS {
+            let phrase = generate_passphrase(&recipe).expect("the shipped list");
+            let mut found = None;
+            for (index, word) in phrase.split('-').enumerate() {
+                if word.chars().any(|c| c.is_ascii_digit()) {
+                    assert!(found.is_none(), "`{}` carries two numbered words", &*phrase);
+                    found = Some(index);
+                }
+            }
+            positions[found.expect("a numbered word")] += 1;
+        }
+
+        let mean = ROUNDS as f64 / WORDS as f64;
+        for (index, count) in positions.iter().enumerate() {
+            let deviation = (*count as f64 - mean).abs() / mean;
+            assert!(
+                deviation <= 0.15,
+                "word {index} carried the digit {count} times against a mean of {mean:.0} across \
+                 all {WORDS} words ({:.1}% off); the digit is not being placed at random",
+                deviation * 100.0
+            );
+        }
+    }
+
+    /// The digit itself is a digit, and every one of the ten is reachable.
+    /// A generator that only ever appended `7` would pass the position test.
+    #[test]
+    fn the_included_digit_reaches_all_ten_values() {
+        let recipe = PassphraseRecipe {
+            words: 3,
+            separator: "-".to_string(),
+            capitalize: false,
+            include_number: true,
+        };
+        let mut seen = HashSet::new();
+        for _ in 0..600 {
+            let phrase = generate_passphrase(&recipe).expect("the shipped list");
+            for c in phrase.chars().filter(char::is_ascii_digit) {
+                seen.insert(c);
+            }
+        }
+        for digit in '0'..='9' {
+            assert!(seen.contains(&digit), "`{digit}` was never generated");
+        }
+    }
+
+    // ---- the dispatch and the installer --------------------------------------
+
+    /// A passphrase is generated by the function a backend calls, rather than
+    /// refused there. This is the wiring `RestBackend::generate` depends on.
+    #[test]
+    fn the_dispatch_generates_a_passphrase_rather_than_refusing_it() {
+        let phrase = generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
+            .expect("a passphrase");
+        // The default recipe: four words, `-`, capitalised, with a number.
+        assert_eq!(phrase.split('-').count(), 4, "{}", &*phrase);
+        assert_eq!(phrase.chars().filter(char::is_ascii_digit).count(), 1);
     }
 
     /// The dispatch does route a password request to the generator, so the
@@ -927,12 +1715,62 @@ mod tests {
         assert_eq!(password.len(), 20);
     }
 
-    /// This module carries no wordlist, asserted against the source text so
-    /// that "do not invent one" survives the next edit.
+    /// **The installer really ships the file this module reads.**
     ///
-    /// A wordlist is a large array of words; the shape it would arrive in is
-    /// a long list of quoted strings. This counts them, and a file that grew
-    /// hundreds is a file that grew a wordlist.
+    /// A generator that works in a development build and refuses in the
+    /// installed app is a defect nobody sees until release, so the installer
+    /// script is read here and required to install the word list to `{app}`,
+    /// under the name [`WORDLIST_FILE`] this module looks for.
+    #[test]
+    fn the_installer_ships_the_wordlist_this_module_reads() {
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/installer/deskwarden.iss"
+        ))
+        .expect("the installer script");
+        let line = script
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.starts_with(';') && l.contains(WORDLIST_FILE))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the installer no longer ships `{WORDLIST_FILE}`, so the installed app would \
+                     refuse every passphrase while a development build generated them"
+                )
+            });
+        assert!(line.starts_with("Source:"), "`{line}` is not a [Files] entry");
+        assert!(
+            line.contains(r"..\assets\wordlist.txt"),
+            "the installer ships something other than the committed list: `{line}`"
+        );
+        assert!(
+            line.contains(r#"DestDir: "{app}""#),
+            "the word list is not installed beside the executable, which is the only place \
+             `wordlist_paths` looks: `{line}`"
+        );
+    }
+
+    /// And `build.rs` puts it beside the executable in a development build, so
+    /// the two layouts are the same and `cargo run` is not the only build that
+    /// refuses passphrases.
+    #[test]
+    fn the_build_script_copies_the_wordlist_beside_the_executable() {
+        let build = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+            .expect("build.rs");
+        assert!(
+            build.contains("assets/wordlist.txt") && build.contains("wordlist.txt\""),
+            "build.rs no longer copies the word list beside the executable"
+        );
+    }
+
+    // ---- the refusals carry nothing ------------------------------------------
+
+    /// This module carries no wordlist *in its source*, asserted against the
+    /// source text so that "do not invent one" survives the next edit.
+    ///
+    /// The list this module uses is a file. What must never appear here is a
+    /// second, improvised one, and the shape it would arrive in is a long list
+    /// of quoted strings. This counts them.
     #[test]
     fn no_wordlist_has_been_smuggled_into_this_module() {
         let source = include_str!("password_gen.rs");
@@ -940,24 +1778,44 @@ mod tests {
         assert!(
             quoted < 400,
             "this file now holds {quoted} quote characters, which is enough to be an improvised \
-             wordlist; see `PasswordGenError::NoWordlist` for why one must not be invented here"
+             wordlist; the list belongs in `assets/wordlist.txt`, where it is counted, \
+             de-duplicated and hashed before use"
         );
     }
 
     /// No error may carry a generated secret, the way
     /// `rest::api`'s `no_error_can_carry_a_credential` says of that module.
-    /// Both variants are fieldless, so this is a check that they stay so.
+    /// Every variant is fieldless, so this is a check that they stay so.
     #[test]
     fn no_error_can_carry_a_generated_secret() {
         // A fieldless variant's `Debug` is exactly its name, so anything else
         // appearing here means a variant grew somewhere to put a secret.
         assert_eq!(format!("{:?}", PasswordGenError::Rng), "Rng");
-        assert_eq!(format!("{:?}", PasswordGenError::NoWordlist), "NoWordlist");
+        assert_eq!(format!("{:?}", PasswordGenError::WordlistMissing), "WordlistMissing");
+        assert_eq!(format!("{:?}", PasswordGenError::WordlistUnusable), "WordlistUnusable");
         // And the compiler's half: if a variant ever gains a field, this stops
         // compiling as written and whoever added it has to come back here.
         let _exhaustive: fn(PasswordGenError) -> u8 = |e| match e {
             PasswordGenError::Rng => 0,
-            PasswordGenError::NoWordlist => 1,
+            PasswordGenError::WordlistMissing => 1,
+            PasswordGenError::WordlistUnusable => 2,
         };
+        // Nor may a message quote anything that was generated. Every message
+        // is a fixed English sentence with no interpolation at all, which is
+        // asserted here as "it says the same thing every time": a message that
+        // grew a `{}` would differ between two calls that produced different
+        // secrets.
+        for error in [
+            PasswordGenError::Rng,
+            PasswordGenError::WordlistMissing,
+            PasswordGenError::WordlistUnusable,
+        ] {
+            assert!(!error.to_string().is_empty());
+            assert_eq!(error.to_string(), error.to_string());
+            assert!(
+                !error.to_string().chars().any(|c| c.is_ascii_digit()),
+                "an error message carries a digit, which a generated secret can be made of: {error}"
+            );
+        }
     }
 }
