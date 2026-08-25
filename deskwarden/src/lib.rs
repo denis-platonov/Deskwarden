@@ -53,6 +53,7 @@ pub mod favicon;
 pub mod file_picker;
 pub mod fill_stats;
 pub mod foreground;
+pub mod generate_prompt;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;

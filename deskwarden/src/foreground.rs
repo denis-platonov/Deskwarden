@@ -696,8 +696,16 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 12] = [
+    const OPENS_WINDOWS: [&str; 13] = [
         "app_window",
+        // Design 3d's password generator. The THIRD bare-Win32 window in this
+        // crate, and one for the same measured reason the other two are: an
+        // egui window costs ~50 MB of OpenGL driver arenas that nothing
+        // releases, against this card's low single-digit MB, and this card is
+        // on the daemon's own fill path. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise.
+        "generate_prompt",
         "loading_ui",
         "login_ui",
         "overlay_ui",
@@ -878,10 +886,19 @@ mod tests {
     /// password.** What it shows is which accounts this user holds for the app
     /// they are in front of, which is the thing a screen recorder should not
     /// be handed -- so the same one-call check applies to it, and the
-    /// assertion's message is worded for both.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 2] = [
+    /// assertion's message is worded for all three.
+    ///
+    /// **`generate_prompt` is the row the capture check exists for most.** The
+    /// unlock prompt protects a password being *typed in*; the picker protects
+    /// a list of account names. Design 3d paints a live generated password
+    /// **on screen in the clear**, deliberately -- it is a value the user has
+    /// to be able to read and re-type, and a masked generator is one nobody
+    /// can check. That is the one surface in this app where a screen recorder
+    /// running while the card is up would capture a credential outright.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 3] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
+        ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
@@ -1632,6 +1649,25 @@ mod tests {
         );
         assert!(!crate::picker_prompt::PICKER_PROMPT_TITLE.is_empty());
         assert!(!crate::unlock_prompt::UNLOCK_PROMPT_TITLE.is_empty());
+
+        // **The third bare-Win32 window**, design 3d's generator. It is opened
+        // from the daemon while 3c's egui window has been and will be up, and
+        // it is found by title like the two above.
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            "the generator and the account picker are both opened from the daemon and both \
+             found by title"
+        );
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE
+        );
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert!(!crate::generate_prompt::GENERATE_PROMPT_TITLE.is_empty());
 
         // **The 6b region overlay, the second viewport.** It is open alongside
         // the vault window too, and it takes the foreground deliberately -- so

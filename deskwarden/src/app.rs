@@ -2002,7 +2002,6 @@ pub trait PromptPresenter {
     fn show_generate(
         &self,
         label: &str,
-        position: Option<(f32, f32)>,
         generate: &dyn Fn(
             &crate::vault_bridge::GenerateRequest,
         ) -> Result<zeroize::Zeroizing<String>, String>,
@@ -2062,7 +2061,6 @@ pub struct FnPresenter {
     #[allow(clippy::type_complexity)]
     pub show_generate: fn(
         &str,
-        Option<(f32, f32)>,
         &dyn Fn(
             &crate::vault_bridge::GenerateRequest,
         ) -> Result<zeroize::Zeroizing<String>, String>,
@@ -2098,12 +2096,11 @@ impl PromptPresenter for FnPresenter {
     fn show_generate(
         &self,
         label: &str,
-        position: Option<(f32, f32)>,
         generate: &dyn Fn(
             &crate::vault_bridge::GenerateRequest,
         ) -> Result<zeroize::Zeroizing<String>, String>,
     ) -> Option<zeroize::Zeroizing<String>> {
-        (self.show_generate)(label, position, generate)
+        (self.show_generate)(label, generate)
     }
 
     fn show_locked(
@@ -2129,7 +2126,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     show: overlay_ui::show_prompt_overlay,
     show_locked: overlay_ui::show_locked_overlay,
     show_save_login: overlay_ui::show_save_login_overlay,
-    show_generate: overlay_ui::show_generate_overlay,
+    show_generate: crate::generate_prompt::show_generate_prompt,
 };
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
@@ -2200,11 +2197,14 @@ pub fn save_login_arm<P: PromptPresenter>(
 /// **The 3d arm**: [`save_login_arm`]'s sibling, and the only place design 3d
 /// is opened.
 ///
-/// **The placement is asked about [`overlay_ui::GENERATE_ROWS`]** and not
-/// about the card the user just left, for the reason `save_login_arm`'s doc
-/// gives: the clamp onto the monitor's work area is a function of the card's
-/// height, so the wrong height puts this card's *Save to vault* button under
-/// the taskbar for any window anchored near the bottom of the screen.
+/// **It asks for no placement, and 3c's sibling does.** 3d is
+/// `crate::generate_prompt`'s bare-Win32 card, which centres itself on the
+/// work area the way the daemon's other two Win32 cards do; the egui card it
+/// replaced anchored itself beside the field the user was in, and asking
+/// `position` about a card that does not read the answer would be this
+/// function computing a number for nobody. The anchoring is dropped
+/// deliberately -- `generate_prompt`'s `centred` carries the argument
+/// `picker_prompt` made when it dropped the no-match card's.
 pub fn generate_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
@@ -2212,12 +2212,7 @@ pub fn generate_arm<P: PromptPresenter>(
         &crate::vault_bridge::GenerateRequest,
     ) -> Result<zeroize::Zeroizing<String>, String>,
 ) -> Option<zeroize::Zeroizing<String>> {
-    let position = presenter.position(window.hwnd, overlay_ui::GENERATE_ROWS);
-    presenter.show_generate(
-        window_label(&window.exe_name, &window.title),
-        position,
-        generate,
-    )
+    presenter.show_generate(window_label(&window.exe_name, &window.title), generate)
 }
 
 /// How many times [`save_login_flow`] will hand the user from 3c to 3d and
@@ -2797,7 +2792,7 @@ pub fn handle_no_match(
             // `VaultBridge::generate` the edit form's own generator calls.
             cache.bridge().generate(request).map_err(|e| {
                 log::warn!("the overlay could not generate a password: {e:?}");
-                overlay_ui::GENERATE_FAILED_TEXT.to_string()
+                crate::generate_prompt::GENERATE_FAILED_TEXT.to_string()
             })
         }),
         // **The one item-creating route in this app**, the same
@@ -3449,14 +3444,15 @@ mod tests {
         fn show_generate(
             &self,
             label: &str,
-            position: Option<(f32, f32)>,
             _generate: &dyn Fn(
                 &crate::vault_bridge::GenerateRequest,
             ) -> Result<zeroize::Zeroizing<String>, String>,
         ) -> Option<zeroize::Zeroizing<String>> {
+            // **No placement to record.** 3d is a bare-Win32 card that centres
+            // itself, so `generate_arm` asks for none -- see its doc.
             self.generate_shown
                 .borrow_mut()
-                .push((label.to_string(), position));
+                .push((label.to_string(), None));
             None
         }
 
@@ -3950,7 +3946,6 @@ mod tests {
         fn show_generate(
             &self,
             label: &str,
-            _position: Option<(f32, f32)>,
             _generate: &dyn Fn(
                 &crate::vault_bridge::GenerateRequest,
             ) -> Result<zeroize::Zeroizing<String>, String>,
@@ -4069,7 +4064,6 @@ mod tests {
         fn show_generate(
             &self,
             _label: &str,
-            _position: Option<(f32, f32)>,
             _generate: &dyn Fn(
                 &crate::vault_bridge::GenerateRequest,
             ) -> Result<zeroize::Zeroizing<String>, String>,
@@ -4230,7 +4224,6 @@ mod tests {
     /// identical from the label alone.
     fn recording_show_generate(
         label: &str,
-        position: Option<(f32, f32)>,
         generate: &dyn Fn(
             &crate::vault_bridge::GenerateRequest,
         ) -> Result<zeroize::Zeroizing<String>, String>,
@@ -4238,7 +4231,7 @@ mod tests {
         GENERATE_FORWARDED
             .lock()
             .unwrap()
-            .push((label.to_string(), position));
+            .push((label.to_string(), None));
         generate(&crate::vault_bridge::GenerateRequest::Password(
             crate::vault_bridge::PasswordRecipe::default(),
         ))
@@ -8906,7 +8899,6 @@ mod generate_flow_tests {
         fn show_generate(
             &self,
             _label: &str,
-            _position: Option<(f32, f32)>,
             generate: &dyn Fn(&GenerateRequest) -> Result<zeroize::Zeroizing<String>, String>,
         ) -> Option<zeroize::Zeroizing<String>> {
             self.generate_calls.set(self.generate_calls.get() + 1);
@@ -8932,8 +8924,8 @@ mod generate_flow_tests {
     struct GeneratedKindRequest;
     impl GeneratedKindRequest {
         fn default_request() -> GenerateRequest {
-            overlay_ui::GeneratedKind::Characters
-                .recipe(overlay_ui::GeneratedKind::Characters.default_size())
+            crate::generate_prompt::GeneratedKind::Characters
+                .recipe(crate::generate_prompt::GeneratedKind::Characters.default_size())
         }
     }
 
@@ -8983,13 +8975,17 @@ mod generate_flow_tests {
         );
     }
 
-    /// **Each card is placed for its own height.**
+    /// **3c is placed for its own height, and 3d asks for no placement at
+    /// all.**
     ///
     /// The clamp onto the monitor's work area is computed from the card's
-    /// height, so asking about the card the user just left puts the other
-    /// one's controls under the taskbar for any window anchored near the
-    /// bottom of the screen. 3c and 3d are different heights, and this is
-    /// what fails if the flow asks about the wrong one.
+    /// height, so asking about the card the user just left would put 3c's
+    /// controls under the taskbar for any window anchored near the bottom of
+    /// the screen. 3d is not in this sequence because it is
+    /// `crate::generate_prompt`'s bare-Win32 card, which centres itself on the
+    /// work area -- a placement asked for on its behalf would be a number
+    /// computed for nobody, and a `position` call appearing between these two
+    /// is what fails here.
     #[test]
     fn each_card_is_placed_for_the_card_it_opens() {
         let generator = Generator::default();
@@ -9003,21 +8999,15 @@ mod generate_flow_tests {
         let _ = save_login_flow(&script, &window(), &generator.call());
         assert_eq!(
             *script.rows.borrow(),
-            vec![
-                overlay_ui::SAVE_LOGIN_ROWS,
-                overlay_ui::GENERATE_ROWS,
-                overlay_ui::SAVE_LOGIN_ROWS
-            ],
-            "the flow asked for a placement sized by the wrong card"
+            vec![overlay_ui::SAVE_LOGIN_ROWS, overlay_ui::SAVE_LOGIN_ROWS],
+            "the flow asked for a placement sized by the wrong card, or asked for one on \
+             behalf of 3d -- which centres itself and reads no answer"
         );
-        // The control that makes the sequence above mean something: the two
-        // constants really are different numbers, so a flow that used one for
-        // both would fail rather than coincide.
-        assert_ne!(
-            overlay_ui::SAVE_LOGIN_ROWS,
-            overlay_ui::GENERATE_ROWS,
-            "3c and 3d ask for the same window, so this test cannot tell them apart"
-        );
+        // The control that makes the sequence above mean something: 3d really
+        // was opened between the two openings of 3c, so the absence of a third
+        // placement is a fact about `generate_arm` and not about a card that
+        // never appeared.
+        assert_eq!(script.generate_calls.get(), 1, "3d was opened other than once");
     }
 
     /// **A dismissed generator changes nothing.**

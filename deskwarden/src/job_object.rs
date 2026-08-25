@@ -2467,6 +2467,7 @@ mod tests {
             vec![
                 "build.rs",
                 "examples/field_locator_probe.rs",
+                "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
