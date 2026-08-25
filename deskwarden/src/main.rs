@@ -1033,7 +1033,25 @@ fn main() {
     // way: there is nothing to boot in the background without a session, so
     // that arm shows the sign-in card whoever started it. See
     // [`launch_intent`] for what an install that predates the flag gets.
-    let launch = launch_intent(std::env::args().skip(1));
+    // **The refusal is spent here, and it is an exit.** No command line this
+    // app writes today contains `--ui`, so this arm is unreachable for every
+    // launch that exists -- which is exactly what makes exiting on it safe.
+    // What it must not do is fall through to `UserLaunch`: see
+    // [`UiLaunchRefusal`] for why every available fallback is a window the
+    // user did not ask for.
+    //
+    // Exit 2 rather than 1: 1 is already "another Deskwarden is running and
+    // would not stand down", and a bad command line is a different failure
+    // that a script driving this binary has to be able to tell apart.
+    let launch = match launch_intent(std::env::args().skip(1)) {
+        Ok(launch) => launch,
+        Err(refusal) => {
+            let message = refusal.message();
+            log::error!("this launch was refused: {message}");
+            message_box("Deskwarden", &message, MB_ICONWARNING | MB_OK);
+            std::process::exit(2);
+        }
+    };
     log::info!("this launch is a {launch:?}, so its first surface is {:?}", first_surface(launch));
 
     let mut estate = if let Some(token) = cached_session {
@@ -8547,6 +8565,115 @@ enum ProbeWindow {
 /// makes every login start look like a double-click forever.
 const AUTOSTART_FLAG: &str = "--autostart";
 
+/// **The flag the DAEMON passes when it spawns a window in a process of its
+/// own**, and nothing else does -- least of all the installer.
+///
+/// Deliberately not in `installer/deskwarden.iss`, and
+/// `the_ui_flag_is_the_apps_alone_and_the_installer_never_passes_it` is what
+/// keeps it out: a Run entry or a Start-menu shortcut carrying `--ui` would
+/// make every login start, or every double-click, open a bare window with no
+/// tray, no hotkey and no daemon behind it. The installer's one flag is
+/// [`AUTOSTART_FLAG`], and that guard is the other side of
+/// `the_installers_run_entry_passes_the_flag_the_app_reads`.
+const UI_FLAG: &str = "--ui";
+
+/// **Which window a UI process was asked for.**
+///
+/// The whole reason `--ui` takes an argument at all. A UI process exists to
+/// put exactly one surface on screen and then exit, so "which one" is not a
+/// detail of the launch -- it *is* the launch, and a `--ui` with nothing
+/// after it names no window to open.
+///
+/// One variant today. The design's list -- Preferences, the save-login form,
+/// the generator, the sequence editor, rehearsal -- is what this enum is
+/// shaped for, and each of those arrives as a variant here plus an arm
+/// wherever the surfaces are opened. Spelled as an enum rather than passed as
+/// a string precisely so that adding the second one is a compile error at
+/// every site that has to answer for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    /// The vault window: the item list, the detail pane, and every editor
+    /// reached from them. The expensive one, and the reason the split exists
+    /// -- see
+    /// `docs/superpowers/specs/2026-08-21-daemon-and-ui-split-design.md`.
+    Vault,
+}
+
+impl Surface {
+    /// The word that follows [`UI_FLAG`] on the command line.
+    ///
+    /// **One function for both directions.** [`Surface::parse`] is written
+    /// against this list rather than beside it, so a surface whose spelling
+    /// is changed here cannot keep being *parsed* under the old word -- which
+    /// is the two-places-that-must-agree defect this crate's guards exist for,
+    /// and it would show up as a daemon that spawns a process which refuses
+    /// its own command line.
+    fn as_arg(self) -> &'static str {
+        match self {
+            Surface::Vault => "vault",
+        }
+    }
+
+    /// **Every surface this app knows how to be asked for**, in one place, so
+    /// [`Surface::parse`] and the refusal's own message are built from the
+    /// same list.
+    const ALL: &'static [Surface] = &[Surface::Vault];
+
+    /// Reads a surface from the word after [`UI_FLAG`].
+    ///
+    /// `None` is a refusal, not a default -- see [`UiLaunchRefusal`].
+    fn parse(word: &str) -> Option<Surface> {
+        Surface::ALL.iter().copied().find(|surface| surface.as_arg() == word)
+    }
+
+    /// The surfaces, joined, for a refusal the user or the log has to read.
+    fn all_spelled_out() -> String {
+        Surface::ALL.iter().map(|s| s.as_arg()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// **A `--ui` launch that named no window, or named one this app does not
+/// have.**
+///
+/// Its own type, and a hard refusal, because the alternative is guessing --
+/// and the thing being guessed at is *which window to put on the user's
+/// screen*. A `--ui` that fell back to the vault window would open the vault
+/// on a command line that asked for something else, or for nothing; a `--ui`
+/// that fell back to an ordinary launch would quietly start a second full
+/// daemon. Neither is a smaller mistake than saying so.
+///
+/// It is also the shape that survives the surfaces arriving. Today exactly one
+/// word parses; when Preferences and the generator are surfaces too, an
+/// installer or a shortcut carrying a stale spelling has to fail loudly on the
+/// machine it is stale on, rather than opening whatever this version happens
+/// to list first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UiLaunchRefusal {
+    /// `--ui` with nothing after it.
+    NoSurface,
+    /// `--ui something-else`. Carries the word as it was written, so the log
+    /// line names the typo rather than describing it.
+    UnknownSurface(String),
+}
+
+impl UiLaunchRefusal {
+    /// What to say about it, in one place, so the log line and any future
+    /// dialog cannot drift apart.
+    fn message(&self) -> String {
+        match self {
+            UiLaunchRefusal::NoSurface => format!(
+                "`{UI_FLAG}` names no window to open. It must be followed by one of: {}",
+                Surface::all_spelled_out()
+            ),
+            UiLaunchRefusal::UnknownSurface(word) => format!(
+                "`{UI_FLAG} {word}` names no window this app has. It must be followed by one \
+                 of: {}",
+                Surface::all_spelled_out()
+            ),
+        }
+    }
+}
+
 /// **How this process was started**, which until now it could not tell.
 ///
 /// The owner: "if user launched it - it should show up (not go to tray), if it
@@ -8564,6 +8691,19 @@ enum LaunchIntent {
     /// Windows started this at sign-in, from the Run key. Nobody is waiting
     /// for it and nobody clicked anything.
     LoginAutostart,
+    /// **A window, spawned by the daemon, and nothing else.** Not a second
+    /// Deskwarden: it holds no tray icon, no global hotkey and no `bw serve`,
+    /// and it exists to show the one [`Surface`] it was asked for and then
+    /// exit -- which is the only mechanism that gives the OpenGL driver's
+    /// committed arenas back.
+    ///
+    /// Nothing in production produces this yet. It is parsed, and only
+    /// parsed; the startup path that answers it is the next task, and until
+    /// that exists a `--ui` launch is a command line no part of this app
+    /// writes. See this file's report at
+    /// `.superpowers/sdd/ui-process-split-report.md` for why the spawn is not
+    /// wired yet.
+    Ui(Surface),
 }
 
 /// Reads [`LaunchIntent`] off the command line.
@@ -8599,12 +8739,45 @@ enum LaunchIntent {
 /// A path containing the word is not the flag: `contains` over the joined
 /// command line would read `C:\--autostart tools\deskwarden.exe` as a login
 /// start.
-fn launch_intent<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> LaunchIntent {
-    if args.into_iter().any(|arg| arg.as_ref() == AUTOSTART_FLAG) {
+/// # `--ui` is answered FIRST, and it is the only argument that can fail
+///
+/// A command line carrying both flags is not a login autostart that also wants
+/// a window: it is a UI process, because [`UI_FLAG`] is written by exactly one
+/// writer -- the daemon -- and `AUTOSTART_FLAG` by exactly one other -- the
+/// installer's Run entry. If both ever appear together, the daemon's intent is
+/// the specific one and the autostart's is the ambient one, and reading it the
+/// other way round would start a full second daemon out of a spawn that asked
+/// for a window.
+///
+/// The failure is a [`UiLaunchRefusal`] rather than a fallback for the reason
+/// that type documents: every available fallback puts a window the user did
+/// not ask for onto their screen, or starts a daemon that was not wanted.
+fn launch_intent<S: AsRef<str>>(
+    args: impl IntoIterator<Item = S>,
+) -> Result<LaunchIntent, UiLaunchRefusal> {
+    // Collected rather than streamed, because the surface is the argument
+    // AFTER the flag and a single `any` cannot look ahead. Cheap: this is a
+    // command line, and it is read once per process.
+    let args: Vec<String> = args.into_iter().map(|arg| arg.as_ref().to_string()).collect();
+
+    // Whole-argument matching, exactly as `AUTOSTART_FLAG` is matched below
+    // and for the same reason: `C:\--ui tools\deskwarden.exe` is a path, not a
+    // request for a window.
+    if let Some(at) = args.iter().position(|arg| arg == UI_FLAG) {
+        return match args.get(at + 1) {
+            None => Err(UiLaunchRefusal::NoSurface),
+            Some(word) => match Surface::parse(word) {
+                Some(surface) => Ok(LaunchIntent::Ui(surface)),
+                None => Err(UiLaunchRefusal::UnknownSurface(word.clone())),
+            },
+        };
+    }
+
+    Ok(if args.iter().any(|arg| arg == AUTOSTART_FLAG) {
         LaunchIntent::LoginAutostart
     } else {
         LaunchIntent::UserLaunch
-    }
+    })
 }
 
 /// **Whether this launch puts a window on screen at all.**
@@ -8634,6 +8807,20 @@ fn first_surface(intent: LaunchIntent) -> FirstSurface {
     match intent {
         LaunchIntent::UserLaunch => FirstSurface::ShowTheWindow,
         LaunchIntent::LoginAutostart => FirstSurface::StayInTheTray,
+        // **A UI process shows its window; that is the entire process.**
+        //
+        // Answered here rather than left to a catch-all so that this file
+        // contains no arm reading "a launch this function was not taught
+        // about stays in the tray" -- which for a spawned window is a process
+        // that starts, opens nothing, and sits there holding a tray icon.
+        //
+        // It is NOT reached in production, and the report says why: `main`
+        // reads this decision a thousand lines below the single-instance
+        // takeover, so a `--ui` process routed through it would first ask the
+        // daemon that spawned it to stand down. The startup path that answers
+        // `Ui` before that point is the next task; this arm is the honest
+        // total answer until it exists.
+        LaunchIntent::Ui(_) => FirstSurface::ShowTheWindow,
     }
 }
 
@@ -11880,20 +12067,20 @@ mod tests {
     fn the_flag_is_what_separates_a_login_start_from_a_double_click() {
         assert_eq!(
             launch_intent(std::iter::empty::<&str>()),
-            LaunchIntent::UserLaunch,
+            Ok(LaunchIntent::UserLaunch),
             "a launch with no arguments is a double-click. Reading it as an autostart takes \
              the window away from every install that predates the flag -- which is every \
              install that exists"
         );
         assert_eq!(
             launch_intent([AUTOSTART_FLAG]),
-            LaunchIntent::LoginAutostart,
+            Ok(LaunchIntent::LoginAutostart),
             "the flag the installer's Run entry passes is not recognised, so a login start is \
              still indistinguishable from a double-click"
         );
         assert_eq!(
             launch_intent(["--some-other-thing", AUTOSTART_FLAG]),
-            LaunchIntent::LoginAutostart,
+            Ok(LaunchIntent::LoginAutostart),
             "the flag is only read when it is first; a future argument in front of it turns \
              every autostart back into a user launch"
         );
@@ -11901,7 +12088,7 @@ mod tests {
         // joined command line would read this as a login start.
         assert_eq!(
             launch_intent([r"C:\--autostart tools\deskwarden.exe"]),
-            LaunchIntent::UserLaunch,
+            Ok(LaunchIntent::UserLaunch),
             "the flag is being matched as a substring rather than as a whole argument"
         );
     }
@@ -11920,6 +12107,121 @@ mod tests {
             first_surface(LaunchIntent::LoginAutostart),
             FirstSurface::StayInTheTray,
             "the owner: \"if it autostart with minimized - it goes to tray\""
+        );
+        assert_eq!(
+            first_surface(LaunchIntent::Ui(Surface::Vault)),
+            FirstSurface::ShowTheWindow,
+            "a process spawned to BE a window that stays in the tray is a process that opens \
+             nothing and never exits"
+        );
+    }
+
+    /// **A `--ui` launch names its window, and one that does not is refused.**
+    ///
+    /// The whole point of the type: every fallback available here puts a
+    /// window on the user's screen that nothing asked for, or starts a second
+    /// full daemon out of a spawn that wanted neither.
+    #[test]
+    fn a_ui_launch_that_names_no_window_is_refused_rather_than_guessed() {
+        assert_eq!(
+            launch_intent([UI_FLAG, "vault"]),
+            Ok(LaunchIntent::Ui(Surface::Vault)),
+            "the daemon's own spelling of the vault surface does not parse, so every window it \
+             spawns would refuse its own command line"
+        );
+        assert_eq!(
+            launch_intent([UI_FLAG]),
+            Err(UiLaunchRefusal::NoSurface),
+            "`--ui` with nothing after it was answered with a window instead of a refusal"
+        );
+        assert_eq!(
+            launch_intent([UI_FLAG, "preferences"]),
+            Err(UiLaunchRefusal::UnknownSurface("preferences".to_string())),
+            "an unknown surface must be refused by name. A version that opened whatever it \
+             happened to list first would open the vault on a command line asking for \
+             something else"
+        );
+        assert_eq!(
+            launch_intent([UI_FLAG, AUTOSTART_FLAG]),
+            Err(UiLaunchRefusal::UnknownSurface(AUTOSTART_FLAG.to_string())),
+            "the word after `--ui` is the surface, whatever it looks like; skipping over one \
+             that starts with a dash would read `--ui --autostart` as `--ui` with no surface \
+             and then guess"
+        );
+        // A path that CONTAINS the flag is not the flag, exactly as for
+        // `AUTOSTART_FLAG`.
+        assert_eq!(
+            launch_intent([r"C:\--ui vault\deskwarden.exe"]),
+            Ok(LaunchIntent::UserLaunch),
+            "`--ui` is being matched as a substring rather than as a whole argument"
+        );
+    }
+
+    /// **`--ui` wins over `--autostart`**, and the direction matters.
+    ///
+    /// Read the other way round, a spawned window that somehow inherited the
+    /// Run entry's flag would come up as a full second daemon -- tray, hotkey,
+    /// `bw serve` and all -- which is the opposite of what the split is for.
+    #[test]
+    fn a_ui_launch_is_a_ui_launch_however_it_is_ordered() {
+        for args in [
+            vec![UI_FLAG, "vault", AUTOSTART_FLAG],
+            vec![AUTOSTART_FLAG, UI_FLAG, "vault"],
+        ] {
+            assert_eq!(
+                launch_intent(args.clone()),
+                Ok(LaunchIntent::Ui(Surface::Vault)),
+                "`{args:?}` was not read as a UI launch, so a spawned window would start a \
+                 second daemon"
+            );
+        }
+    }
+
+    /// **Every surface round-trips through its own word.**
+    ///
+    /// `as_arg` is what the daemon will WRITE onto the command line and
+    /// `parse` is what the spawned process READS off it. They are two
+    /// directions of one list here; if they are ever separated, this is what
+    /// notices.
+    #[test]
+    fn every_surface_parses_back_from_the_word_the_daemon_writes() {
+        for surface in Surface::ALL.iter().copied() {
+            assert_eq!(
+                Surface::parse(surface.as_arg()),
+                Some(surface),
+                "`{surface:?}` spells itself `{}` but does not parse back from it",
+                surface.as_arg()
+            );
+            assert!(
+                !surface.as_arg().starts_with('-'),
+                "`{surface:?}` spells itself `{}`, which reads as another flag rather than as \
+                 `{UI_FLAG}`'s argument",
+                surface.as_arg()
+            );
+        }
+        assert!(
+            Surface::all_spelled_out().contains(Surface::Vault.as_arg()),
+            "the refusal's message does not list the surfaces it is telling the reader to use"
+        );
+    }
+
+    /// **The installer must never pass the UI flag.**
+    ///
+    /// The other side of
+    /// `the_installers_run_entry_passes_the_flag_the_app_reads`: that guard
+    /// makes sure the installer passes the flag the app reads, and this one
+    /// makes sure it does not pass the flag it must not. A Run entry or a
+    /// shortcut carrying `--ui` would put a bare window with no tray, no
+    /// hotkey and no daemon behind it on screen at every sign-in -- or, once
+    /// the refusal above is reachable, a message box at every sign-in.
+    #[test]
+    fn the_ui_flag_is_the_apps_alone_and_the_installer_never_passes_it() {
+        let script = include_str!("../installer/deskwarden.iss");
+        assert!(
+            !script.contains(UI_FLAG),
+            "`installer/deskwarden.iss` mentions `{UI_FLAG}`. That flag is written by the \
+             daemon when it spawns a window and by nothing else; an installer that passes it \
+             turns a login start into a windowless process or a message box"
         );
     }
 
