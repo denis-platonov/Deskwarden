@@ -81,7 +81,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::rest::crypto::{CryptoError, SymmetricKey, encrypt};
-use crate::rest::sync::{CipherKeys, DecryptedItem, VaultKeys};
+use crate::rest::sync::{CipherKeys, DecryptedItem, Retained, VaultKeys};
 use crate::vault_bridge::{
     CardData, IdentityData, LoginData, SshKeyData, UriEntry, VaultField, VaultItem,
 };
@@ -163,6 +163,10 @@ pub fn encrypt_item(
     // function has already changed.
     let cipher_keys = CipherKeys::for_cipher(keys, &out)?;
     let key = cipher_keys.key();
+    // Everything the server sent that a `VaultItem` cannot hold: the
+    // ciphertext of every field that did not decrypt, and every `fields` /
+    // `uris` element that was not an object. See [`Retained`].
+    let retained = decrypted.retained();
 
     reencrypt_password_history(key, &mut out, decrypted)?;
 
@@ -171,8 +175,15 @@ pub fn encrypt_item(
     } else {
         out.insert("id".to_string(), Value::String(item.id.clone()));
     }
-    put_text(&mut out, "name", Some(item.name.as_str()), key)?;
-    put_text(&mut out, "notes", item.notes.as_deref().map(String::as_str), key)?;
+    put_text(&mut out, "name", Some("name"), Some(item.name.as_str()), key, retained)?;
+    put_text(
+        &mut out,
+        "notes",
+        Some("notes"),
+        item.notes.as_deref().map(String::as_str),
+        key,
+        retained,
+    )?;
 
     match item.item_type {
         Some(t) => out.insert("type".to_string(), Value::from(t)),
@@ -188,16 +199,17 @@ pub fn encrypt_item(
     // one is written as an empty array rather than guessed back into `null`.
     // The two mean the same thing to the server; inventing a `null` would be
     // claiming to know which one arrived.
-    let mut fields = Vec::with_capacity(item.fields.len());
-    for field in &item.fields {
-        fields.push(Value::Object(encrypt_field(key, field)?));
-    }
+    let fields = splice(&item.fields, "fields", retained, |field, index| {
+        encrypt_field(key, field, index, retained)
+    })?;
     out.insert("fields".to_string(), Value::Array(fields));
 
     put_object(&mut out, "login", item.login.as_ref(), |l| encrypt_login(key, l, decrypted))?;
-    put_object(&mut out, "card", item.card.as_ref(), |c| encrypt_card(key, c))?;
-    put_object(&mut out, "identity", item.identity.as_ref(), |i| encrypt_identity(key, i))?;
-    put_object(&mut out, "sshKey", item.ssh_key.as_ref(), |s| encrypt_ssh_key(key, s))?;
+    put_object(&mut out, "card", item.card.as_ref(), |c| encrypt_card(key, c, retained))?;
+    put_object(&mut out, "identity", item.identity.as_ref(), |i| {
+        encrypt_identity(key, i, retained)
+    })?;
+    put_object(&mut out, "sshKey", item.ssh_key.as_ref(), |s| encrypt_ssh_key(key, s, retained))?;
 
     Ok(MappedCipher { body: Value::Object(out) })
 }
@@ -265,9 +277,11 @@ impl MappedFolder {
 /// system CSPRNG did. Nothing has been sent anywhere -- nothing here sends.
 pub fn encrypt_folder_name(name: &str, keys: &VaultKeys) -> Result<MappedFolder, CryptoError> {
     let mut out = Object::new();
-    // Through `put_text`, so the folder name is encrypted by the same two
-    // lines every cipher field is -- fresh IV per call included.
-    put_text(&mut out, "name", Some(name), keys.user())?;
+    // Through `seal_text`, so the folder name is encrypted by the same two
+    // lines every cipher field is -- fresh IV per call included. There is no
+    // retention question here: the name being written is the one the user
+    // typed, never a value read back off a wire.
+    seal_text(&mut out, "name", Some(name), keys.user())?;
     Ok(MappedFolder { body: Value::Object(out) })
 }
 
@@ -301,6 +315,42 @@ fn put_object<T>(
 fn put_text(
     out: &mut Object,
     wire: &str,
+    path: Option<&str>,
+    plain: Option<&str>,
+    key: &SymmetricKey,
+    retained: &Retained,
+) -> Result<(), CryptoError> {
+    // **The one guard that keeps an undecryptable field alive.**
+    //
+    // A modelled field that failed to decrypt is `None` in the model and its
+    // key was stripped out of the catch-all, so both arms below would have
+    // removed it -- and `PUT /api/ciphers/{id}` replaces the whole cipher, so
+    // removed means destroyed in the user's real vault, on an autofill's
+    // `set_app_match` as readily as on an edit. `name` was worse: it becomes
+    // `""` rather than `None`, so the `Some` arm wrote a *valid encryption of
+    // the empty string* over the real one.
+    //
+    // The ciphertext the server sent is written straight back instead. As in
+    // `reencrypt_in_place`, this is decided by a recorded fact and never by
+    // looking at the value: `path` comes from what the decrypt pass actually
+    // did, so a plaintext that merely has `EncString` shape cannot take this
+    // branch and be sent in the clear.
+    if let Some(original) = path.and_then(|p| retained.ciphertext(p)) {
+        out.insert(wire.to_string(), Value::String(original.to_string()));
+        return Ok(());
+    }
+    seal_text(out, wire, plain, key)
+}
+
+/// Encrypts one optional string into `out[wire]`, or removes the key --
+/// with no view on what the decrypt pass did.
+///
+/// [`put_text`] is this plus the retention guard, and is what every cipher
+/// field goes through. This half exists on its own for the folder name, which
+/// has no decrypt pass behind it.
+fn seal_text(
+    out: &mut Object,
+    wire: &str,
     plain: Option<&str>,
     key: &SymmetricKey,
 ) -> Result<(), CryptoError> {
@@ -320,10 +370,82 @@ fn put_text(
 
 /// One custom field: label and value both encrypted, `type` and anything else
 /// carried through.
-fn encrypt_field(key: &SymmetricKey, field: &VaultField) -> Result<Object, CryptoError> {
+fn encrypt_field(
+    key: &SymmetricKey,
+    field: &VaultField,
+    index: Option<usize>,
+    retained: &Retained,
+) -> Result<Object, CryptoError> {
     let mut out = field.other.clone();
-    put_text(&mut out, "name", field.name.as_deref(), key)?;
-    put_text(&mut out, "value", field.value.as_deref().map(String::as_str), key)?;
+    let name_path = index.map(|i| format!("fields[{i}].name"));
+    let value_path = index.map(|i| format!("fields[{i}].value"));
+    put_text(&mut out, "name", name_path.as_deref(), field.name.as_deref(), key, retained)?;
+    put_text(
+        &mut out,
+        "value",
+        value_path.as_deref(),
+        field.value.as_deref().map(String::as_str),
+        key,
+        retained,
+    )?;
+    Ok(out)
+}
+
+/// Rebuilds one wire array from the model, splicing back the elements
+/// [`crate::rest::sync`] could not model.
+///
+/// # Why the index matters twice
+///
+/// `sync` spells a retained path with the element's **wire** index
+/// (`fields[2].value`), and it recorded the non-object elements at their wire
+/// indices too. Walking the reconstructed array by index restores wire order
+/// *and* gives each modelled element the index its retained paths were
+/// written under.
+///
+/// # When the caller has changed the array
+///
+/// A caller may add or remove elements between the sync and the write --
+/// [`crate::vault_bridge::with_app_match`] appends one the first time an app
+/// match is saved. An append leaves every earlier index meaning what it meant,
+/// so retention still applies. A **removal** shifts them, and a shifted index
+/// would write one field's ciphertext into another field: worse than the
+/// deletion it is meant to prevent. So retention is switched off for the whole
+/// array when the reconstruction came out *shorter* than the wire array, which
+/// is the pre-existing behaviour and destroys no more than it did before. The
+/// unmodellable elements are spliced back either way -- their index is a
+/// position, not a name, and putting one back in roughly the right place is
+/// never worse than dropping it.
+fn splice<T>(
+    modelled: &[T],
+    array: &str,
+    retained: &Retained,
+    mut encrypt_one: impl FnMut(&T, Option<usize>) -> Result<Object, CryptoError>,
+) -> Result<Vec<Value>, CryptoError> {
+    let mut raws = retained.raw_elements(array);
+    let total = modelled.len() + raws.len();
+    let aligned = match retained.recorded_len(array) {
+        Some(wire) => total >= wire,
+        None => true,
+    };
+    let mut out = Vec::with_capacity(total);
+    let mut rest = modelled.iter();
+    for index in 0..total {
+        if let Some(at) = raws.iter().position(|(i, _)| *i == index) {
+            out.push(raws.remove(at).1.clone());
+        } else if let Some(one) = rest.next() {
+            let path_index = if aligned { Some(index) } else { None };
+            out.push(Value::Object(encrypt_one(one, path_index)?));
+        }
+    }
+    // Anything the walk could not place -- a retained element whose recorded
+    // index is past the end of a shortened array, or a modelled element the
+    // indices ran out for. Appended rather than dropped, on the same terms.
+    for (_, raw) in raws {
+        out.push(raw.clone());
+    }
+    for one in rest {
+        out.push(Value::Object(encrypt_one(one, None)?));
+    }
     Ok(out)
 }
 
@@ -340,34 +462,72 @@ fn encrypt_login(
     // are_spelled_the_same_on_both_sides` is what makes a rename fail.
     reencrypt_in_place(key, &mut out, "uri", "login.uri", decrypted)?;
 
-    put_text(&mut out, "username", login.username.as_deref(), key)?;
-    put_text(&mut out, "password", login.password.as_deref().map(String::as_str), key)?;
-    put_text(&mut out, "totp", login.totp.as_deref().map(String::as_str), key)?;
+    let retained = decrypted.retained();
+    put_text(
+        &mut out,
+        "username",
+        Some("login.username"),
+        login.username.as_deref(),
+        key,
+        retained,
+    )?;
+    put_text(
+        &mut out,
+        "password",
+        Some("login.password"),
+        login.password.as_deref().map(String::as_str),
+        key,
+        retained,
+    )?;
+    put_text(
+        &mut out,
+        "totp",
+        Some("login.totp"),
+        login.totp.as_deref().map(String::as_str),
+        key,
+        retained,
+    )?;
 
-    let mut uris = Vec::with_capacity(login.uris.len());
-    for entry in &login.uris {
-        uris.push(Value::Object(encrypt_uri(key, entry)?));
-    }
+    let uris = splice(&login.uris, "login.uris", retained, |entry, index| {
+        encrypt_uri(key, entry, index, retained)
+    })?;
     out.insert("uris".to_string(), Value::Array(uris));
     Ok(out)
 }
 
 /// One URI entry. `match` -- a number here, a string over `bw serve` -- rides
 /// `other` in whatever form it arrived, which is the point of it being there.
-fn encrypt_uri(key: &SymmetricKey, entry: &UriEntry) -> Result<Object, CryptoError> {
+fn encrypt_uri(
+    key: &SymmetricKey,
+    entry: &UriEntry,
+    index: Option<usize>,
+    retained: &Retained,
+) -> Result<Object, CryptoError> {
     let mut out = entry.other.clone();
-    put_text(&mut out, "uri", entry.uri.as_deref(), key)?;
+    let path = index.map(|i| format!("login.uris[{i}].uri"));
+    put_text(&mut out, "uri", path.as_deref(), entry.uri.as_deref(), key, retained)?;
     Ok(out)
 }
 
-fn encrypt_card(key: &SymmetricKey, card: &CardData) -> Result<Object, CryptoError> {
+fn encrypt_card(
+    key: &SymmetricKey,
+    card: &CardData,
+    retained: &Retained,
+) -> Result<Object, CryptoError> {
     let mut out = card.other.clone();
-    put_text(&mut out, "cardholderName", card.cardholder_name.as_deref(), key)?;
-    put_text(&mut out, "brand", card.brand.as_deref(), key)?;
-    put_text(&mut out, "number", card.number.as_deref().map(String::as_str), key)?;
-    put_text(&mut out, "expMonth", card.exp_month.as_deref(), key)?;
-    put_text(&mut out, "expYear", card.exp_year.as_deref(), key)?;
-    put_text(&mut out, "code", card.code.as_deref().map(String::as_str), key)?;
+    let number = card.number.as_deref().map(String::as_str);
+    let code = card.code.as_deref().map(String::as_str);
+    for (wire, value) in [
+        ("cardholderName", card.cardholder_name.as_deref()),
+        ("brand", card.brand.as_deref()),
+        ("number", number),
+        ("expMonth", card.exp_month.as_deref()),
+        ("expYear", card.exp_year.as_deref()),
+        ("code", code),
+    ] {
+        let path = format!("card.{wire}");
+        put_text(&mut out, wire, Some(path.as_str()), value, key, retained)?;
+    }
     Ok(out)
 }
 
@@ -375,7 +535,11 @@ fn encrypt_card(key: &SymmetricKey, card: &CardData) -> Result<Object, CryptoErr
 /// [`crate::rest::sync`]'s stated reason: this is where a wire name and a
 /// struct field have to line up eighteen times, and a reader checking that
 /// `postal_code` goes to `postalCode` should be able to see it.
-fn encrypt_identity(key: &SymmetricKey, id: &IdentityData) -> Result<Object, CryptoError> {
+fn encrypt_identity(
+    key: &SymmetricKey,
+    id: &IdentityData,
+    retained: &Retained,
+) -> Result<Object, CryptoError> {
     let mut out = id.other.clone();
     for (wire, value) in [
         ("title", &id.title),
@@ -397,16 +561,27 @@ fn encrypt_identity(key: &SymmetricKey, id: &IdentityData) -> Result<Object, Cry
         ("passportNumber", &id.passport_number),
         ("licenseNumber", &id.license_number),
     ] {
-        put_text(&mut out, wire, value.as_deref(), key)?;
+        let path = format!("identity.{wire}");
+        put_text(&mut out, wire, Some(path.as_str()), value.as_deref(), key, retained)?;
     }
     Ok(out)
 }
 
-fn encrypt_ssh_key(key: &SymmetricKey, ssh: &SshKeyData) -> Result<Object, CryptoError> {
+fn encrypt_ssh_key(
+    key: &SymmetricKey,
+    ssh: &SshKeyData,
+    retained: &Retained,
+) -> Result<Object, CryptoError> {
     let mut out = ssh.other.clone();
-    put_text(&mut out, "privateKey", ssh.private_key.as_deref().map(String::as_str), key)?;
-    put_text(&mut out, "publicKey", ssh.public_key.as_deref(), key)?;
-    put_text(&mut out, "keyFingerprint", ssh.key_fingerprint.as_deref(), key)?;
+    let private = ssh.private_key.as_deref().map(String::as_str);
+    for (wire, value) in [
+        ("privateKey", private),
+        ("publicKey", ssh.public_key.as_deref()),
+        ("keyFingerprint", ssh.key_fingerprint.as_deref()),
+    ] {
+        let path = format!("sshKey.{wire}");
+        put_text(&mut out, wire, Some(path.as_str()), value, key, retained)?;
+    }
     Ok(out)
 }
 
@@ -434,8 +609,8 @@ fn reencrypt_password_history(
 }
 
 /// Encrypts `object[wire]` back into ciphertext -- unless [`crate::rest::sync`]
-/// recorded that `path` never decrypted, in which case what is there is still
-/// the server's own ciphertext and is left exactly as it was found.
+/// recorded that `path` never decrypted, in which case the ciphertext it
+/// recorded for that path is written back verbatim.
 ///
 /// # The guard is a recorded fact, not a look at the value
 ///
@@ -444,7 +619,7 @@ fn reencrypt_password_history(
 /// *secret* to decide how to treat the secret, and it gets the answer wrong
 /// for a plaintext that happens to have `EncString` shape -- by writing it to
 /// the server unencrypted. `path` comes from
-/// [`DecryptedItem::is_still_encrypted`], which answers from what the decrypt
+/// [`DecryptedItem::retained`], which answers from what the decrypt
 /// pass actually did.
 ///
 /// A path the record does not mention is encrypted. That is the safe default
@@ -461,12 +636,22 @@ fn reencrypt_in_place(
     path: &str,
     decrypted: &DecryptedItem,
 ) -> Result<(), CryptoError> {
-    let Some(text) = object.get(wire).and_then(|v| v.as_str()) else { return Ok(()) };
-    if decrypted.is_still_encrypted(path) {
-        // This field never decrypted on the way in, so the ciphertext is
-        // still sitting here and encrypting it again would bury it.
+    if let Some(original) = decrypted.retained().ciphertext(path) {
+        // This field did not decrypt in the sync this record came from, so
+        // the server's own ciphertext is what belongs here.
+        //
+        // **Written, not merely left alone.** Leaving it alone trusted the
+        // JSON in hand to match the record, and the two come from different
+        // moments (see `DecryptedItem::carrying`): if this value decrypted
+        // when the caller read the item and fails now -- re-keyed by another
+        // client, or a rotated `cipher.key` -- then what is sitting here is
+        // the user's **plaintext**, and skipping the encryption would `PUT` it
+        // to the server in the clear. The recorded ciphertext comes from the
+        // same sync as the record, so there is no second moment to disagree.
+        object.insert(wire.to_string(), Value::String(original.to_string()));
         return Ok(());
     }
+    let Some(text) = object.get(wire).and_then(|v| v.as_str()) else { return Ok(()) };
     // Borrowed into a wiped buffer rather than handed to `encrypt` straight
     // out of the `Value`, so that the one owned copy this function makes of a
     // historical password is one that wipes itself.
@@ -541,6 +726,513 @@ pub(crate) mod tests {
         assert!(vault.failures.is_empty(), "the fixture did not decrypt cleanly: {:?}", vault.failures);
         let item = vault.items.into_iter().next().expect("one item");
         (item, keys)
+    }
+
+    /// [`round_trip_in`] for a cipher that is **not** expected to decrypt
+    /// cleanly.
+    ///
+    /// The data-destruction tests below all work the same way: one field is
+    /// sealed under [`key(9)`], which this session has no way to reach, so the
+    /// read path records a failure for exactly that field and produces the
+    /// item without it. The write path then has to put the server's own
+    /// ciphertext back, because it is the only copy of that value left
+    /// anywhere -- and `PUT /api/ciphers/{id}` replaces the whole cipher.
+    fn round_trip_damaged(cipher: Value) -> (DecryptedItem, VaultKeys, Vec<String>) {
+        let (master, protected) = account();
+        let payload = serde_json::json!({
+            "profile": { "key": protected },
+            "ciphers": [cipher],
+            "folders": [],
+        });
+        let response: SyncResponse =
+            serde_json::from_value(payload).expect("the fixture parses as a sync");
+        let profile = response.profile.as_ref().expect("a profile");
+        let (keys, _) = VaultKeys::unwrap_from(&master, profile).expect("the user key unwraps");
+        let vault = decrypt_vault(&response, &master).expect("the fixture decrypts");
+        let failed = vault.failures.iter().map(|f| f.field.clone()).collect();
+        let item = vault.items.into_iter().next().expect("one item");
+        (item, keys, failed)
+    }
+
+    /// A key this session cannot reach, for sealing the one field each
+    /// destruction test damages.
+    fn foreign() -> SymmetricKey {
+        key(9)
+    }
+
+    /// The value at a `/`-separated path of the mapped body, as a string.
+    fn at<'b>(body: &'b Value, path: &str) -> Option<&'b str> {
+        let mut here = body;
+        for step in path.split('/') {
+            here = match step.parse::<usize>() {
+                Ok(index) => here.get(index)?,
+                Err(_) => here.get(step)?,
+            };
+        }
+        here.as_str()
+    }
+
+    /// One damaged field, end to end: the read path must record `path`, and
+    /// the mapped body must carry the server's ciphertext at `wire` unchanged.
+    ///
+    /// Every nesting level below calls this, so "the fix covers this level" is
+    /// one line per level rather than a paragraph each.
+    fn survives_a_write(cipher: Value, path: &str, wire: &str, sealed: &str) {
+        let (item, keys, failed) = round_trip_damaged(cipher);
+        assert!(
+            failed.iter().any(|f| f == path),
+            "the fixture was meant to fail to decrypt {path}, and failed to decrypt {failed:?}",
+        );
+        let written = mapped(&item, &keys);
+        assert_eq!(
+            at(&written, wire),
+            Some(sealed),
+            "{path} was not written back as the ciphertext the server sent; the PUT would have \
+             destroyed it",
+        );
+    }
+
+    #[test]
+    /// **The one that is worse in kind.** A name that does not decrypt becomes
+    /// `""`, and `put_text` used to encrypt that -- replacing the real name
+    /// with a *valid encryption of the empty string*. Not lost behind an
+    /// error: lost behind something that looks entirely correct.
+    fn an_undecryptable_name_is_not_overwritten_with_an_encryption_of_the_empty_string() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "Real name");
+        let cipher = serde_json::json!({
+            "id": "33333333-3333-3333-3333-333333333333",
+            "type": 1,
+            "name": sealed,
+            "favorite": false,
+            "login": { "username": enc(&k, "u") },
+        });
+        let (item, keys, failed) = round_trip_damaged(cipher);
+        assert!(failed.iter().any(|f| f == "name"), "{failed:?}");
+        assert_eq!(item.item.name, "", "the read path still blanks a name it cannot read");
+
+        let written = mapped(&item, &keys);
+        let on_the_wire = at(&written, "name").expect("a name on the wire");
+        assert_eq!(on_the_wire, sealed, "the real name was replaced");
+        // And say the failure in its own terms as well as by equality: an
+        // encryption of "" is a perfectly valid EncString, so the assertion
+        // above is the only thing between the user and a silent rename.
+        let opened = crate::rest::crypto::decrypt(
+            keys.user(),
+            &on_the_wire.parse::<EncString>().expect("an EncString"),
+        );
+        assert!(opened.is_err(), "the name on the wire must still be under the key it arrived under");
+    }
+
+    #[test]
+    /// The reviewer's own probe: a card whose `number` is ciphertext under
+    /// another key came out as `None` on the wire, and the `PUT` destroyed it.
+    fn an_undecryptable_card_number_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "4111111111111111");
+        survives_a_write(
+            serde_json::json!({
+                "id": "44444444-4444-4444-4444-444444444444",
+                "type": 3,
+                "name": enc(&k, "Card"),
+                "favorite": false,
+                "card": {
+                    "cardholderName": enc(&k, "A Person"),
+                    "number": sealed,
+                    "brand": enc(&k, "Visa"),
+                    "expMonth": enc(&k, "12"),
+                    "expYear": enc(&k, "2030"),
+                    "code": enc(&k, "123"),
+                },
+            }),
+            "card.number",
+            "card/number",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The top level, on a field that is genuinely optional -- so `None` on
+    /// the model meant "remove the key" and the note was gone.
+    fn an_undecryptable_note_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "the recovery phrase");
+        survives_a_write(
+            serde_json::json!({
+                "id": "55555555-5555-5555-5555-555555555555",
+                "type": 2,
+                "name": enc(&k, "Note"),
+                "favorite": false,
+                "notes": sealed,
+            }),
+            "notes",
+            "notes",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The `login` level. A TOTP seed is the whole of a second factor, and it
+    /// is the field an autofill's `set_app_match` would have deleted.
+    fn an_undecryptable_login_totp_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "JBSWY3DPEHPK3PXP");
+        survives_a_write(
+            serde_json::json!({
+                "id": "66666666-6666-6666-6666-666666666666",
+                "type": 1,
+                "name": enc(&k, "Login"),
+                "favorite": false,
+                "login": {
+                    "username": enc(&k, "u"),
+                    "password": enc(&k, "p"),
+                    "totp": sealed,
+                },
+            }),
+            "login.totp",
+            "login/totp",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The `login.uris` level, which is also an *array* level: the path
+    /// carries the wire index, and the write path has to rebuild the array
+    /// with the same indices for that path to still mean anything.
+    fn an_undecryptable_uri_entry_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "https://second.invalid");
+        survives_a_write(
+            serde_json::json!({
+                "id": "77777777-7777-7777-7777-777777777777",
+                "type": 1,
+                "name": enc(&k, "Login"),
+                "favorite": false,
+                "login": {
+                    "uris": [
+                        { "uri": enc(&k, "https://first.invalid"), "match": null },
+                        { "uri": sealed, "match": 0 },
+                    ],
+                },
+            }),
+            "login.uris[1].uri",
+            "login/uris/1/uri",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The `fields` level. A hidden custom field is a PIN or a recovery code
+    /// by the type's own documentation.
+    fn an_undecryptable_custom_field_value_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "812345");
+        survives_a_write(
+            serde_json::json!({
+                "id": "88888888-8888-8888-8888-888888888888",
+                "type": 1,
+                "name": enc(&k, "Login"),
+                "favorite": false,
+                "fields": [
+                    { "name": enc(&k, "Note"), "value": enc(&k, "plain"), "type": 0 },
+                    { "name": enc(&k, "Recovery code"), "value": sealed, "type": 1 },
+                ],
+                "login": { "username": enc(&k, "u") },
+            }),
+            "fields[1].value",
+            "fields/1/value",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// A custom field's **label** is data too, and it is the half most easily
+    /// forgotten: `map_field` says so on the way in, and the way out has to
+    /// agree.
+    fn an_undecryptable_custom_field_label_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "Recovery code");
+        survives_a_write(
+            serde_json::json!({
+                "id": "88888888-8888-8888-8888-888888888889",
+                "type": 1,
+                "name": enc(&k, "Login"),
+                "favorite": false,
+                "fields": [{ "name": sealed, "value": enc(&k, "812345"), "type": 1 }],
+                "login": { "username": enc(&k, "u") },
+            }),
+            "fields[0].name",
+            "fields/0/name",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The `identity` level, on the field an identity exists to hold.
+    fn an_undecryptable_identity_field_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "000-00-0000");
+        survives_a_write(
+            serde_json::json!({
+                "id": "99999999-9999-9999-9999-999999999999",
+                "type": 4,
+                "name": enc(&k, "Identity"),
+                "favorite": false,
+                "identity": {
+                    "firstName": enc(&k, "A"),
+                    "lastName": enc(&k, "Person"),
+                    "ssn": sealed,
+                },
+            }),
+            "identity.ssn",
+            "identity/ssn",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// The `sshKey` level, on the one field of an SSH key that is not
+    /// recoverable from the others.
+    fn an_undecryptable_ssh_private_key_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "-----BEGIN OPENSSH PRIVATE KEY-----");
+        survives_a_write(
+            serde_json::json!({
+                "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "type": 5,
+                "name": enc(&k, "Key"),
+                "favorite": false,
+                "sshKey": {
+                    "privateKey": sealed,
+                    "publicKey": enc(&k, "ssh-ed25519 AAAA"),
+                    "keyFingerprint": enc(&k, "SHA256:abc"),
+                },
+            }),
+            "sshKey.privateKey",
+            "sshKey/privateKey",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// `passwordHistory[].password` -- the in-place path that was already
+    /// guarded, kept as a regression now that the guard *writes* the recorded
+    /// ciphertext rather than leaving the JSON alone.
+    fn an_undecryptable_password_history_entry_survives_a_write() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "the old password");
+        survives_a_write(
+            serde_json::json!({
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "type": 1,
+                "name": enc(&k, "Login"),
+                "favorite": false,
+                "login": { "username": enc(&k, "u") },
+                "passwordHistory": [
+                    { "password": enc(&k, "older"), "lastUsedDate": "2024-01-01T00:00:00Z" },
+                    { "password": sealed, "lastUsedDate": "2024-02-02T00:00:00Z" },
+                ],
+            }),
+            "passwordHistory[1].password",
+            "passwordHistory/1/password",
+            &sealed,
+        );
+    }
+
+    #[test]
+    /// **A stale `other` paired with a fresh failure record must not put a
+    /// plaintext URI on the wire.**
+    ///
+    /// `login.uri` is decrypted *in place* inside `LoginData::other`. The
+    /// record handed to the write path comes from the sync just performed;
+    /// the JSON comes from whenever the caller read the item. If the value
+    /// decrypted then and fails now -- re-keyed by another client, a rotated
+    /// `cipher.key` -- the caller's `other["uri"]` holds the user's plaintext
+    /// while the record says "still encrypted". Skipping the encryption on
+    /// that record, which is what the old guard did, `PUT`s the URI to the
+    /// server in the clear.
+    ///
+    /// The record now carries the ciphertext as well as the path, so the write
+    /// path overwrites the stale value instead of trusting it.
+    fn a_stale_plaintext_uri_is_never_written_in_the_clear() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "https://private.invalid/secret-path");
+        let (record, keys, failed) = round_trip_damaged(serde_json::json!({
+            "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "type": 1,
+            "name": enc(&k, "Login"),
+            "favorite": false,
+            "login": { "username": enc(&k, "u"), "uri": sealed },
+        }));
+        assert!(failed.iter().any(|f| f == "login.uri"), "{failed:?}");
+
+        // The caller's older copy: read back when the value still decrypted,
+        // so its catch-all holds the plaintext.
+        let mut stale = record.item.clone();
+        let login = stale.login.as_mut().expect("a login");
+        login.other.insert(
+            "uri".to_string(),
+            Value::String("https://private.invalid/secret-path".to_string()),
+        );
+        let written = mapped(&record.carrying(stale), &keys);
+
+        let body = serde_json::to_string(&written).expect("the body serializes");
+        assert!(
+            !body.contains("private.invalid"),
+            "a plaintext URI reached the wire",
+        );
+        assert_eq!(
+            at(&written, "login/uri"),
+            Some(sealed.as_str()),
+            "the ciphertext recorded by the same sync as the record is what belongs here",
+        );
+    }
+
+    #[test]
+    /// A `fields` element that is not a JSON object is one the mappers cannot
+    /// model. It used to be dropped on the way in and destroyed on the way
+    /// out, because the write path rebuilds the array wholesale from the
+    /// model. It is now recorded with the index it arrived at and spliced
+    /// back, so the array leaves in the order it arrived.
+    fn a_non_object_fields_element_survives_a_write() {
+        let k = key(1);
+        let (item, keys, _) = round_trip_damaged(serde_json::json!({
+            "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "type": 1,
+            "name": enc(&k, "Login"),
+            "favorite": false,
+            "fields": [
+                "a bare string nobody has shipped yet",
+                { "name": enc(&k, "Label"), "value": enc(&k, "value"), "type": 0 },
+            ],
+            "login": { "username": enc(&k, "u") },
+        }));
+        let written = mapped(&item, &keys);
+        let fields = written.get("fields").and_then(|v| v.as_array()).expect("a fields array");
+        assert_eq!(fields.len(), 2, "an element was destroyed: {fields:?}");
+        assert_eq!(fields[0], serde_json::json!("a bare string nobody has shipped yet"));
+        assert!(fields[1].get("name").is_some(), "the modelled field is still second");
+    }
+
+    #[test]
+    /// [`a_non_object_fields_element_survives_a_write`], one level in, on the
+    /// other array the write path rebuilds wholesale.
+    fn a_non_object_uris_element_survives_a_write() {
+        let k = key(1);
+        let (item, keys, _) = round_trip_damaged(serde_json::json!({
+            "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+            "type": 1,
+            "name": enc(&k, "Login"),
+            "favorite": false,
+            "login": {
+                "username": enc(&k, "u"),
+                "uris": [
+                    { "uri": enc(&k, "https://a.invalid"), "match": null },
+                    42,
+                ],
+            },
+        }));
+        let written = mapped(&item, &keys);
+        let uris = written
+            .get("login")
+            .and_then(|v| v.get("uris"))
+            .and_then(|v| v.as_array())
+            .expect("a uris array");
+        assert_eq!(uris.len(), 2, "an element was destroyed: {uris:?}");
+        assert_eq!(uris[1], serde_json::json!(42));
+    }
+
+    #[test]
+    /// An **append** -- which is what `with_app_match` does the first time an
+    /// app match is saved -- must not shift the retained paths off their
+    /// fields. Every earlier index still means what it meant, so retention
+    /// still applies to them.
+    fn appending_a_custom_field_does_not_lose_an_undecryptable_one() {
+        let k = key(1);
+        let sealed = enc(&foreign(), "812345");
+        let (record, keys, failed) = round_trip_damaged(serde_json::json!({
+            "id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "type": 1,
+            "name": enc(&k, "Login"),
+            "favorite": false,
+            "fields": [{ "name": enc(&k, "Recovery code"), "value": sealed, "type": 1 }],
+            "login": { "username": enc(&k, "u") },
+        }));
+        assert!(failed.iter().any(|f| f == "fields[0].value"), "{failed:?}");
+
+        let edited = crate::vault_bridge::with_app_match(
+            &record.item,
+            &crate::app_match::AppMatch::for_process(
+                "Example.exe",
+                crate::app_match::TriggerMode::Prompt,
+            ),
+        );
+        let written = mapped(&record.carrying(edited), &keys);
+        assert_eq!(
+            at(&written, "fields/0/value"),
+            Some(sealed.as_str()),
+            "an autofill's app-match write destroyed a field it never touched",
+        );
+    }
+
+    #[test]
+    /// The paths the write path builds are [`crate::rest::sync`]'s own
+    /// spellings, at **every** level -- not just the two in-place ones. A
+    /// rename on either side silently switches the whole guard off, and this
+    /// is what makes that fail instead.
+    fn every_modelled_path_is_spelled_the_same_on_both_sides() {
+        let k = key(1);
+        let f = foreign();
+        // One cipher with every modelled field damaged at once. The read path
+        // names them; the write path must put every one of them back.
+        let cipher = serde_json::json!({
+            "id": "12121212-1212-1212-1212-121212121212",
+            "type": 1,
+            "name": enc(&f, "n"),
+            "notes": enc(&f, "notes"),
+            "favorite": false,
+            "fields": [{ "name": enc(&f, "l"), "value": enc(&f, "v"), "type": 1 }],
+            "login": {
+                "username": enc(&f, "u"),
+                "password": enc(&f, "p"),
+                "totp": enc(&f, "t"),
+                "uri": enc(&f, "uri"),
+                "uris": [{ "uri": enc(&f, "u0"), "match": null }],
+            },
+            "card": {
+                "cardholderName": enc(&f, "chn"),
+                "brand": enc(&f, "b"),
+                "number": enc(&f, "num"),
+                "expMonth": enc(&f, "1"),
+                "expYear": enc(&f, "2"),
+                "code": enc(&f, "c"),
+            },
+            "identity": { "firstName": enc(&f, "fn"), "ssn": enc(&f, "ssn") },
+            "sshKey": {
+                "privateKey": enc(&f, "priv"),
+                "publicKey": enc(&f, "pub"),
+                "keyFingerprint": enc(&f, "fp"),
+            },
+            "passwordHistory": [{ "password": enc(&f, "old"), "lastUsedDate": "2024-01-01T00:00:00Z" }],
+        });
+        let (item, keys, failed) = round_trip_damaged(cipher.clone());
+        assert!(failed.len() >= 20, "the fixture should damage every modelled field: {failed:?}");
+        let written = mapped(&item, &keys);
+
+        // Every path the read path recorded must be back on the wire, holding
+        // exactly what arrived. Walking `failed` rather than a hand-written
+        // list is what makes a *new* modelled field fail this test until the
+        // write path learns to keep it too.
+        for path in &failed {
+            let wire = path.replace("[", "/").replace("].", "/").replace(".", "/");
+            assert_eq!(
+                at(&written, &wire),
+                at(&cipher, &wire),
+                "the sync path {path} has no matching write path",
+            );
+        }
+        // `_` is unused elsewhere in this test; keep the key alive for the map.
+        let _ = k;
     }
 
     /// A cipher carrying a deliberate mix of things this crate models and
@@ -782,9 +1474,36 @@ pub(crate) mod tests {
                 "autofillOnPageLoad": null,
                 "unknownLoginKey": {"a": 1},
             },
+            // The other three nested catch-alls. They were `null` here, which
+            // left `CardData::other`, `IdentityData::other` and
+            // `SshKeyData::other` -- three of the six this module promises --
+            // unexercised by the test that exists to exercise them.
+            "card": {
+                "number": enc(&k, "4111111111111111"),
+                "brand": enc(&k, "Visa"),
+                "unknownCardKey": "kept",
+            },
+            "identity": {
+                "firstName": enc(&k, "A"),
+                "unknownIdentityKey": [1, {"deep": true}],
+            },
+            "sshKey": {
+                "privateKey": enc(&k, "priv"),
+                "unknownSshKey": {"b": 2},
+            },
         });
         let (item, keys) = round_trip_in(cipher);
         let written = mapped(&item, &keys);
+
+        let card = written.get("card").and_then(|v| v.as_object()).expect("a card");
+        assert_eq!(card.get("unknownCardKey"), Some(&serde_json::json!("kept")));
+        let identity = written.get("identity").and_then(|v| v.as_object()).expect("an identity");
+        assert_eq!(
+            identity.get("unknownIdentityKey"),
+            Some(&serde_json::json!([1, {"deep": true}])),
+        );
+        let ssh = written.get("sshKey").and_then(|v| v.as_object()).expect("an sshKey");
+        assert_eq!(ssh.get("unknownSshKey"), Some(&serde_json::json!({"b": 2})));
 
         let login = written.get("login").and_then(|v| v.as_object()).expect("a login");
         assert_eq!(login.get("unknownLoginKey"), Some(&serde_json::json!({"a": 1})));
@@ -1058,7 +1777,10 @@ pub(crate) mod tests {
         assert!(write_source.contains("fn reencrypt_in_place"), "write.rs was not read");
 
         // `login.uri`: recorded by `sync`'s `fail`, queried by `write`.
-        assert!(sync_source.contains(r#"fail("login.uri", why)"#), "sync renamed the login.uri path");
+        assert!(
+            sync_source.contains(r#"rec.fail("login.uri", why,"#),
+            "sync renamed the login.uri path"
+        );
         assert!(
             write_source.contains(r#""uri", "login.uri", decrypted"#),
             "write renamed the login.uri path"

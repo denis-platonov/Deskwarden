@@ -188,14 +188,131 @@ impl std::fmt::Display for DecryptFailure {
 /// is still where it was.
 pub struct DecryptedItem {
     pub item: VaultItem,
-    /// The JSON paths -- [`DecryptFailure::field`] spellings -- of every field
-    /// of this cipher that did **not** decrypt, and whose ciphertext therefore
-    /// survived untouched.
+    /// Everything this cipher carried that the [`VaultItem`] beside it cannot
+    /// hold: the ciphertext of every field that did **not** decrypt, and every
+    /// `fields`/`uris` element that was not a JSON object.
     ///
-    /// Only the two in-place paths are ever consulted; the rest cost nothing
-    /// and keeping the list whole means it says one thing ("these did not
-    /// decrypt") rather than a filtered subset a later reader has to re-derive.
-    still_encrypted: Vec<String>,
+    /// See [`Retained`] for why the ciphertext travels *here* rather than
+    /// being left behind in [`VaultItem::other`].
+    retained: Retained,
+}
+
+/// The part of a cipher that a [`VaultItem`] cannot represent, kept verbatim
+/// so [`crate::rest::write`] can put it back byte-for-byte.
+///
+/// # Why this exists at all
+///
+/// `PUT /api/ciphers/{id}` replaces the whole cipher, and the write path
+/// defends that by laying the modelled fields over [`VaultItem::other`]. That
+/// protects fields this crate does not model. It does **not** protect a field
+/// this crate *does* model but could not decrypt: the mapper strips every
+/// modelled key out of the catch-all, and a field that failed to decrypt is
+/// `None` in the model, so the write path used to remove the key and the
+/// server used to forget the value. A card number, a TOTP seed, an SSH
+/// private key -- destroyed by an autofill's `set_app_match`.
+///
+/// The name was worse in kind: a name that did not decrypt became `""`, and
+/// the write replaced the real ciphertext with a valid encryption of the
+/// empty string -- data lost behind something that looks correct.
+///
+/// # Why the ciphertext is kept *here* and not in `VaultItem::other`
+///
+/// Leaving the undecryptable ciphertext in the catch-all would work for the
+/// write path, but [`VaultItem::other`] is serialized (to the `bw` backend,
+/// to the cache) and read by the UI, so a modelled key would appear twice --
+/// exactly the duplicate `VaultItem::other`'s own doc forbids -- and a
+/// base64 blob would be handed to callers as if it were a value. Keeping it
+/// on the decryption record instead means the read side is unchanged and the
+/// write side is *told*, in the same voice it is already told which in-place
+/// values are still ciphertext.
+///
+/// # The paths are `sync`'s own spellings
+///
+/// [`DecryptFailure::field`]'s, exactly -- `card.number`,
+/// `fields[2].value`, `login.uris[0].uri`. `every_modelled_path_is_spelled_the_same_on_both_sides`
+/// is what makes a rename on one side fail.
+#[derive(Clone, Default)]
+pub struct Retained {
+    /// Path -> the ciphertext exactly as the server sent it.
+    ciphertext: std::collections::BTreeMap<String, String>,
+    /// Elements of `fields` / `login.uris` that were not JSON objects, with
+    /// the index they arrived at. The mappers cannot model them and used to
+    /// drop them, which destroyed them on the next write.
+    raw: Vec<(String, usize, serde_json::Value)>,
+    /// How long `fields` / `login.uris` were on the wire, so the write path
+    /// can tell whether the caller's edit still lines up index-for-index with
+    /// what was recorded.
+    lengths: std::collections::BTreeMap<String, usize>,
+}
+
+impl Retained {
+    /// The server's own ciphertext for `path`, if it did not decrypt.
+    pub(crate) fn ciphertext(&self, path: &str) -> Option<&str> {
+        self.ciphertext.get(path).map(String::as_str)
+    }
+
+    /// The non-object elements recorded for `array`, in wire order.
+    pub(crate) fn raw_elements(&self, array: &str) -> Vec<(usize, &serde_json::Value)> {
+        self.raw.iter().filter(|(a, _, _)| a == array).map(|(_, i, v)| (*i, v)).collect()
+    }
+
+    /// How long `array` was on the wire, if this record saw it at all.
+    pub(crate) fn recorded_len(&self, array: &str) -> Option<usize> {
+        self.lengths.get(array).copied()
+    }
+}
+
+/// Paths and counts only. A ciphertext is not a secret -- [`EncString`]'s own
+/// `Display` prints the wire form -- but nothing is served by printing one,
+/// and this type's whole contents would otherwise land in the sync warning
+/// `crate::rest::backend` logs.
+impl std::fmt::Debug for Retained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Retained")
+            .field("still_encrypted", &self.ciphertext.keys().collect::<Vec<_>>())
+            .field("raw_elements", &self.raw.iter().map(|(a, i, _)| (a, i)).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// One cipher's decryption, as it happens: the failures that will join the
+/// sync's list, and the [`Retained`] that will ride the item to the write
+/// path.
+///
+/// A struct rather than the `FnMut` closure the mappers used to take, because
+/// there are now two things to record -- a failure and a dropped array
+/// element -- and two closures would each want `&mut` to the same state.
+struct Recorder {
+    cipher_id: String,
+    failures: Vec<DecryptFailure>,
+    retained: Retained,
+}
+
+impl Recorder {
+    fn new(cipher_id: String) -> Self {
+        Self { cipher_id, failures: Vec::new(), retained: Retained::default() }
+    }
+
+    /// Records that `field` did not decrypt, and keeps the `ciphertext` that
+    /// did not -- the two halves of the same fact.
+    fn fail(&mut self, field: &str, why: CryptoError, ciphertext: &str) {
+        self.failures.push(DecryptFailure {
+            cipher_id: self.cipher_id.clone(),
+            field: field.to_string(),
+            why,
+        });
+        self.retained.ciphertext.insert(field.to_string(), ciphertext.to_string());
+    }
+
+    /// Keeps an array element the mappers cannot model.
+    fn keep_raw(&mut self, array: &str, index: usize, value: &serde_json::Value) {
+        self.retained.raw.push((array.to_string(), index, value.clone()));
+    }
+
+    /// Records how long an array was on the wire.
+    fn array_len(&mut self, array: &str, len: usize) {
+        self.retained.lengths.insert(array.to_string(), len);
+    }
 }
 
 impl DecryptedItem {
@@ -209,7 +326,7 @@ impl DecryptedItem {
     /// double-wrap a value the user can see and fix -- never send one in the
     /// clear.
     pub fn newly_composed(item: VaultItem) -> Self {
-        Self { item, still_encrypted: Vec::new() }
+        Self { item, retained: Retained::default() }
     }
 
     /// **This cipher's decryption record, carrying an edited copy of the
@@ -228,20 +345,38 @@ impl DecryptedItem {
     /// and a caller editing a username does not touch either. So the record
     /// this cipher carried a moment ago is the record its edited copy needs.
     ///
-    /// The direction this can be wrong in is the safe one, and it is the same
-    /// one [`Self::newly_composed`] documents: an over-full record leaves a
-    /// value the user can see and re-save, while the record being *empty* --
-    /// which is what a bare `newly_composed` would give -- encrypts, and
-    /// encryption is never the leaking direction.
+    /// # Two moments, and why they no longer have to agree
+    ///
+    /// That paragraph is true of the *cipher* and was not true of the two
+    /// things this call used to put together. The record comes from the sync
+    /// just performed; `item` comes from whenever the caller read it. If
+    /// `login.uri` decrypted then -- so the caller's `other["uri"]` holds
+    /// **plaintext** -- but fails now (the item was re-keyed by another
+    /// client, or its `cipher.key` rotated), the fresh record says "still
+    /// encrypted" while the stale JSON holds a plaintext URI. The write path
+    /// used to answer that by skipping the encryption and sending what was
+    /// there: the user's URI, `PUT` to the server in the clear.
+    ///
+    /// [`Retained`] closes that by carrying the *ciphertext itself* rather
+    /// than only the path. The write path no longer trusts the caller's JSON
+    /// for a path the record names -- it overwrites it with the ciphertext
+    /// recorded in the same moment as the record. Record and value are one
+    /// object from one sync, so there is no pair left to disagree.
+    ///
+    /// The direction this can still be wrong in is the safe one, and it is the
+    /// same one [`Self::newly_composed`] documents: a record naming a path
+    /// whose value the caller has since edited leaves a value the user can see
+    /// and re-save, while the record being *empty* -- which is what a bare
+    /// `newly_composed` would give -- encrypts, and encryption is never the
+    /// leaking direction.
     #[must_use]
     pub fn carrying(&self, item: VaultItem) -> Self {
-        Self { item, still_encrypted: self.still_encrypted.clone() }
+        Self { item, retained: self.retained.clone() }
     }
 
-    /// Whether `path` is a field this mapper *failed* to decrypt, so that
-    /// whatever is at that path is still the server's ciphertext.
-    pub(crate) fn is_still_encrypted(&self, path: &str) -> bool {
-        self.still_encrypted.iter().any(|failed| failed == path)
+    /// What the server sent, for everything the [`VaultItem`] cannot hold.
+    pub(crate) fn retained(&self) -> &Retained {
+        &self.retained
     }
 }
 
@@ -264,7 +399,7 @@ impl std::fmt::Debug for DecryptedItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecryptedItem")
             .field("item", &self.item)
-            .field("still_encrypted", &self.still_encrypted)
+            .field("retained", &self.retained)
             .finish()
     }
 }
@@ -578,17 +713,10 @@ fn map_cipher(
     // This cipher's own failures, collected locally before they join the
     // sync's list -- because they are also the answer to "which of this
     // item's values are still ciphertext", which is what [`DecryptedItem`]
-    // carries to the write path. One list, read two ways; see
-    // [`DecryptedItem`] on why that is the same fact rather than a second
+    // carries to the write path. One record, read two ways; see
+    // [`Retained`] on why that is the same fact rather than a second
     // bookkeeping structure.
-    let mut mine: Vec<DecryptFailure> = Vec::new();
-    let mut fail = |field: &str, why: CryptoError| {
-        mine.push(DecryptFailure {
-            cipher_id: id.clone(),
-            field: field.to_string(),
-            why,
-        });
-    };
+    let rec = &mut Recorder::new(id.clone());
 
     // `VaultItem::name` is a plain `String` and not `Zeroizing`, which is the
     // shape the rest of the app already has: a name is what is on screen in
@@ -596,26 +724,21 @@ fn map_cipher(
     // into a wiped buffer and only the copy that has to live in the struct
     // outlives it.
     let name =
-        text(key, cipher.get("name"), "name", &mut fail).map(|n| n.to_string()).unwrap_or_default();
-    let notes = text(key, cipher.get("notes"), "notes", &mut fail);
+        text(key, cipher.get("name"), "name", rec).map(|n| n.to_string()).unwrap_or_default();
+    let notes = text(key, cipher.get("notes"), "notes", rec);
 
     let fields = cipher
         .get("fields")
         .and_then(|v| v.as_array())
-        .map(|list| {
-            list.iter()
-                .enumerate()
-                .filter_map(|(i, f)| map_field(key, f, i, &mut fail))
-                .collect()
-        })
+        .map(|list| map_array(list, "fields", rec, |raw, i, rec| map_field(key, raw, i, rec)))
         .unwrap_or_default();
 
-    let login = cipher.get("login").and_then(|v| v.as_object()).map(|o| map_login(key, o, &mut fail));
-    let card = cipher.get("card").and_then(|v| v.as_object()).map(|o| map_card(key, o, &mut fail));
+    let login = cipher.get("login").and_then(|v| v.as_object()).map(|o| map_login(key, o, rec));
+    let card = cipher.get("card").and_then(|v| v.as_object()).map(|o| map_card(key, o, rec));
     let identity =
-        cipher.get("identity").and_then(|v| v.as_object()).map(|o| map_identity(key, o, &mut fail));
+        cipher.get("identity").and_then(|v| v.as_object()).map(|o| map_identity(key, o, rec));
     let ssh_key =
-        cipher.get("sshKey").and_then(|v| v.as_object()).map(|o| map_ssh_key(key, o, &mut fail));
+        cipher.get("sshKey").and_then(|v| v.as_object()).map(|o| map_ssh_key(key, o, rec));
 
     let item_type = cipher.get("type").and_then(serde_json::Value::as_i64);
     let folder_id =
@@ -627,10 +750,10 @@ fn map_cipher(
         other.remove(*modelled);
     }
     strip_null_type_objects(&mut other);
-    decrypt_password_history(key, &mut other, &mut fail);
+    decrypt_password_history(key, &mut other, rec);
 
-    let still_encrypted = mine.iter().map(|f| f.field.clone()).collect();
-    failures.append(&mut mine);
+    let retained = std::mem::take(&mut rec.retained);
+    failures.append(&mut rec.failures);
 
     Some(DecryptedItem {
         item: VaultItem {
@@ -647,8 +770,36 @@ fn map_cipher(
             favorite,
             other,
         },
-        still_encrypted,
+        retained,
     })
+}
+
+/// Maps one wire array, keeping the elements the mapper cannot model.
+///
+/// `map_field` and `map_uri` both return `None` for an element that is not a
+/// JSON object. Those used to be dropped by a `filter_map`, and since the
+/// write path rebuilds both arrays wholesale from the model, dropped meant
+/// **destroyed on the next write** -- the Critical one class narrower. They
+/// are recorded with the index they arrived at instead, and
+/// [`crate::rest::write`] splices them back.
+///
+/// The wire length is recorded too, so the write path can tell whether the
+/// caller's edited array still lines up index-for-index with this one.
+fn map_array<T>(
+    list: &[serde_json::Value],
+    array: &str,
+    rec: &mut Recorder,
+    mut map: impl FnMut(&serde_json::Value, usize, &mut Recorder) -> Option<T>,
+) -> Vec<T> {
+    rec.array_len(array, list.len());
+    let mut out = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        match map(raw, i, rec) {
+            Some(mapped) => out.push(mapped),
+            None => rec.keep_raw(array, i, raw),
+        }
+    }
+    out
 }
 
 /// The top-level keys [`VaultItem`] models as typed fields, and which
@@ -697,7 +848,7 @@ fn strip_null_type_objects(other: &mut Object) {
 fn decrypt_password_history(
     key: &SymmetricKey,
     other: &mut Object,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) {
     let Some(entries) = other.get_mut("passwordHistory").and_then(|v| v.as_array_mut()) else {
         return;
@@ -709,7 +860,7 @@ fn decrypt_password_history(
             Ok(plain) => {
                 object.insert("password".to_string(), serde_json::Value::String(plain.to_string()));
             }
-            Err(why) => fail(&format!("passwordHistory[{i}].password"), why),
+            Err(why) => rec.fail(&format!("passwordHistory[{i}].password"), why, cipher_text),
         }
     }
 }
@@ -719,13 +870,13 @@ fn map_field(
     key: &SymmetricKey,
     raw: &serde_json::Value,
     index: usize,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> Option<VaultField> {
     let field = raw.as_object()?;
     // The label is encrypted too, which is the thing most easily forgotten:
     // a user's custom field is called "Recovery code", and that is data.
-    let name = text(key, field.get("name"), &format!("fields[{index}].name"), fail);
-    let value = text(key, field.get("value"), &format!("fields[{index}].value"), fail);
+    let name = text(key, field.get("name"), &format!("fields[{index}].name"), rec);
+    let value = text(key, field.get("value"), &format!("fields[{index}].value"), rec);
     let mut other = field.clone();
     other.remove("name");
     other.remove("value");
@@ -735,17 +886,12 @@ fn map_field(
 fn map_login(
     key: &SymmetricKey,
     login: &Object,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> LoginData {
     let uris = login
         .get("uris")
         .and_then(|v| v.as_array())
-        .map(|list| {
-            list.iter()
-                .enumerate()
-                .filter_map(|(i, u)| map_uri(key, u, i, fail))
-                .collect()
-        })
+        .map(|list| map_array(list, "login.uris", rec, |raw, i, rec| map_uri(key, raw, i, rec)))
         .unwrap_or_default();
 
     let mut other = login.clone();
@@ -760,14 +906,14 @@ fn map_login(
             Ok(plain) => {
                 other.insert("uri".to_string(), serde_json::Value::String(plain.to_string()));
             }
-            Err(why) => fail("login.uri", why),
+            Err(why) => rec.fail("login.uri", why, text),
         }
     }
 
     LoginData {
-        username: text(key, login.get("username"), "login.username", fail).map(|u| u.to_string()),
-        password: text(key, login.get("password"), "login.password", fail),
-        totp: text(key, login.get("totp"), "login.totp", fail),
+        username: text(key, login.get("username"), "login.username", rec).map(|u| u.to_string()),
+        password: text(key, login.get("password"), "login.password", rec),
+        totp: text(key, login.get("totp"), "login.totp", rec),
         uris,
         other,
     }
@@ -777,28 +923,28 @@ fn map_uri(
     key: &SymmetricKey,
     raw: &serde_json::Value,
     index: usize,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> Option<UriEntry> {
     let entry = raw.as_object()?;
-    let uri = text(key, entry.get("uri"), &format!("login.uris[{index}].uri"), fail);
+    let uri = text(key, entry.get("uri"), &format!("login.uris[{index}].uri"), rec);
     let mut other = entry.clone();
     other.remove("uri");
     Some(UriEntry { uri: uri.map(|u| u.to_string()), other })
 }
 
-fn map_card(key: &SymmetricKey, card: &Object, fail: &mut impl FnMut(&str, CryptoError)) -> CardData {
+fn map_card(key: &SymmetricKey, card: &Object, rec: &mut Recorder) -> CardData {
     let mut other = card.clone();
     for modelled in ["cardholderName", "brand", "number", "expMonth", "expYear", "code"] {
         other.remove(modelled);
     }
     CardData {
-        cardholder_name: text(key, card.get("cardholderName"), "card.cardholderName", fail)
+        cardholder_name: text(key, card.get("cardholderName"), "card.cardholderName", rec)
             .map(|v| v.to_string()),
-        brand: text(key, card.get("brand"), "card.brand", fail).map(|v| v.to_string()),
-        number: text(key, card.get("number"), "card.number", fail),
-        exp_month: text(key, card.get("expMonth"), "card.expMonth", fail).map(|v| v.to_string()),
-        exp_year: text(key, card.get("expYear"), "card.expYear", fail).map(|v| v.to_string()),
-        code: text(key, card.get("code"), "card.code", fail),
+        brand: text(key, card.get("brand"), "card.brand", rec).map(|v| v.to_string()),
+        number: text(key, card.get("number"), "card.number", rec),
+        exp_month: text(key, card.get("expMonth"), "card.expMonth", rec).map(|v| v.to_string()),
+        exp_year: text(key, card.get("expYear"), "card.expYear", rec).map(|v| v.to_string()),
+        code: text(key, card.get("code"), "card.code", rec),
         other,
     }
 }
@@ -812,10 +958,10 @@ fn map_card(key: &SymmetricKey, card: &Object, fail: &mut impl FnMut(&str, Crypt
 fn map_identity(
     key: &SymmetricKey,
     id: &Object,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> IdentityData {
     let mut get = |wire: &str| {
-        text(key, id.get(wire), &format!("identity.{wire}"), fail).map(|v| v.to_string())
+        text(key, id.get(wire), &format!("identity.{wire}"), rec).map(|v| v.to_string())
     };
     let mapped = IdentityData {
         title: get("title"),
@@ -872,16 +1018,16 @@ const IDENTITY_WIRE_KEYS: &[&str] = &[
 fn map_ssh_key(
     key: &SymmetricKey,
     ssh: &Object,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> SshKeyData {
     let mut other = ssh.clone();
     for modelled in ["privateKey", "publicKey", "keyFingerprint"] {
         other.remove(modelled);
     }
     SshKeyData {
-        private_key: text(key, ssh.get("privateKey"), "sshKey.privateKey", fail),
-        public_key: text(key, ssh.get("publicKey"), "sshKey.publicKey", fail).map(|v| v.to_string()),
-        key_fingerprint: text(key, ssh.get("keyFingerprint"), "sshKey.keyFingerprint", fail)
+        private_key: text(key, ssh.get("privateKey"), "sshKey.privateKey", rec),
+        public_key: text(key, ssh.get("publicKey"), "sshKey.publicKey", rec).map(|v| v.to_string()),
+        key_fingerprint: text(key, ssh.get("keyFingerprint"), "sshKey.keyFingerprint", rec)
             .map(|v| v.to_string()),
         other,
     }
@@ -895,14 +1041,12 @@ fn map_folder(
 ) -> Option<Folder> {
     let folder = raw.as_object()?;
     let id = folder.get("id").and_then(|v| v.as_str())?.to_string();
-    let mut fail = |field: &str, why: CryptoError| {
-        failures.push(DecryptFailure {
-            cipher_id: id.clone(),
-            field: field.to_string(),
-            why,
-        });
-    };
-    let name = text(user, folder.get("name"), "name", &mut fail).unwrap_or_default();
+    // A folder has one encrypted field and no write path that lays fields
+    // over retained JSON -- a rename sends the name the user typed -- so the
+    // recorder here is only the failure list, spelled through the same type.
+    let rec = &mut Recorder::new(id.clone());
+    let name = text(user, folder.get("name"), "name", rec).unwrap_or_default();
+    failures.append(&mut rec.failures);
     let mut other = folder.clone();
     other.remove("id");
     other.remove("name");
@@ -922,13 +1066,17 @@ fn text(
     key: &SymmetricKey,
     value: Option<&serde_json::Value>,
     field: &str,
-    fail: &mut impl FnMut(&str, CryptoError),
+    rec: &mut Recorder,
 ) -> Option<Zeroizing<String>> {
     let raw = value?.as_str()?;
     match plaintext(key, raw) {
         Ok(plain) => Some(plain),
         Err(why) => {
-            fail(field, why);
+            // `raw` -- the ciphertext that did not open -- is kept as well as
+            // the fact that it did not. It is the only copy of the user's
+            // value left, and without it the write path removes the field and
+            // the server forgets it. See [`Retained`].
+            rec.fail(field, why, raw);
             None
         }
     }

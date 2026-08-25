@@ -195,6 +195,37 @@ impl RestBackend {
     /// dropped on the floor. The log carries **counts and field names only**
     /// -- [`crate::rest::sync::DecryptFailure`] holds nothing else by
     /// construction.
+    /// **The keys alone**, from the same `GET /api/sync` and without
+    /// decrypting a single cipher.
+    ///
+    /// [`VaultKeys::unwrap_from`] needs `response.profile` and nothing else,
+    /// so the three write paths that want a key and no items -- a folder
+    /// create, a folder rename, an item create -- were paying a whole-vault
+    /// decrypt (every field of every cipher, under every organisation key)
+    /// and then dropping the result on the floor. The round trip is the same;
+    /// what this saves is the CPU and the plaintexts that were briefly built
+    /// for nobody.
+    ///
+    /// [`Self::synced`] is still what an *edit* needs: it wants the item's
+    /// decryption record as well as the keys.
+    fn keys_only(&self) -> Result<VaultKeys, VaultError> {
+        let mut state = self.locked();
+        let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
+        let profile = response
+            .profile
+            .as_ref()
+            .ok_or_else(|| VaultError::Parse("the sync payload carries no profile".to_string()))?;
+        let (keys, failures) =
+            VaultKeys::unwrap_from(&state.master_key, profile).map_err(crypto_error)?;
+        if !failures.is_empty() {
+            log::warn!(
+                "{} organisation key(s) on this account could not be unwrapped: {failures:?}",
+                failures.len()
+            );
+        }
+        Ok(keys)
+    }
+
     fn synced(&self) -> Result<(DecryptedVault, VaultKeys), VaultError> {
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
@@ -360,7 +391,7 @@ impl VaultBackend for RestBackend {
     /// other than what was sent, and it costs one AES-CBC decrypt of a folder
     /// name.
     fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
-        let (_, keys) = self.synced()?;
+        let keys = self.keys_only()?;
         let body = encrypt_folder_name(name, &keys).map_err(crypto_error)?;
         let mut state = self.locked();
         let answer = self.client.create_folder(&mut state.session, &body).map_err(rest_error)?;
@@ -384,7 +415,7 @@ impl VaultBackend for RestBackend {
     /// [`crate::rest::write::encrypt_folder_name`] on why that is a sentence
     /// about a one-field model and not the cipher hazard in miniature.
     fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
-        let (_, keys) = self.synced()?;
+        let keys = self.keys_only()?;
         let body = encrypt_folder_name(name, &keys).map_err(crypto_error)?;
         let mut state = self.locked();
         let answer =
@@ -446,7 +477,7 @@ impl VaultBackend for RestBackend {
     /// nothing in it came from a server -- and is the safe direction for the
     /// two in-place values: every one of them is encrypted.
     fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
-        let (_, keys) = self.synced()?;
+        let keys = self.keys_only()?;
 
         let mut payload = new_item.to_payload();
         // `VaultItem::id` is not optional, and a create has no id yet.
