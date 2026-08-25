@@ -48,7 +48,7 @@
 
 use deskwarden::app::FillChoice;
 use deskwarden::key_sequence::FieldRef;
-use deskwarden::overlay_ui::OverlayMatch;
+use deskwarden::prompt_card::OverlayMatch;
 use deskwarden::prompt_card::{self, PromptCalls, REAL};
 
 /// The app the card is pretending to have been opened in front of. A fixture,

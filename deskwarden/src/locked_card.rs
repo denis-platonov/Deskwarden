@@ -190,7 +190,7 @@ pub const ESC_SHORTCUT: &str = "ESC";
 /// The footer hint's word.
 pub const DISMISS_LABEL: &str = "Dismiss";
 
-/// The number of `crate::overlay_ui::overlay_height` choice-row pitches the
+/// The number of `crate::app::overlay_height` choice-row pitches the
 /// caller's placement is computed from.
 ///
 /// Kept at the `1` the egui card was sized by, because it is the argument

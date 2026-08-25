@@ -68,7 +68,7 @@ use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
-use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, scratch_window, theme};
+use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
@@ -117,16 +117,11 @@ enum Surface {
     // **No design 3b here either.** The locked-vault card is
     // `deskwarden::locked_card` now, for the same reason and by the same
     // route; its preview is `examples/locked_preview.rs`.
-    /// The autofill overlay's save-a-new-login form (design 3c): four rows and
-    /// three answers, reached from the account picker's empty card (design
-    /// 3a, now `deskwarden::picker_prompt`'s -- see `examples/picker_preview.rs`).
-    ///
-    /// **By far the tallest state the overlay has**, and the one this list
-    /// most needs: a frameless, always-on-top window of a hardcoded height
-    /// with no `ScrollArea` anywhere, so a row or a button past the bottom
-    /// edge is unreachable, and the geometry tests can only say the card fits
-    /// -- not whether it reads as a form somebody would fill in.
-    OverlaySaveLogin,
+    // **No design 3c here either, and it was the last one.** The
+    // save-a-login card is `deskwarden::save_login_card` now -- bare Win32,
+    // no eframe anywhere -- and `deskwarden::overlay_ui`, the module that held
+    // every egui card the daemon showed, is gone with it. Its preview is
+    // `examples/save_login_preview.rs`.
     // **No design 3d here.** The generator card is
     // `deskwarden::generate_prompt` now -- bare Win32, no eframe anywhere --
     // and this walk drives egui surfaces through one `run_native`. Its
@@ -464,7 +459,6 @@ fn pane_frame() -> egui::Frame {
 
 /// Every surface, in the order `--all` walks them.
 const ALL: &[Surface] = &[
-    Surface::OverlaySaveLogin,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -520,7 +514,6 @@ impl Surface {
     /// looks for the same name every time.
     fn stem(self) -> &'static str {
         match self {
-            Surface::OverlaySaveLogin => "overlay_save_login",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -596,13 +589,6 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            // Read off the module rather than written out: 3c is the one
-            // overlay state that is NOT 164pt tall, and a preview rendered at
-            // the wrong height is a picture of a layout nobody ships.
-            Surface::OverlaySaveLogin => egui::vec2(
-                overlay_ui::OVERLAY_WIDTH,
-                overlay_ui::overlay_height(overlay_ui::SAVE_LOGIN_ROWS),
-            ),
             Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy => {
                 egui::vec2(470.0, 588.0)
             }
@@ -741,7 +727,7 @@ fn main() -> eframe::Result {
     } else if health {
         vec![Surface::VaultHealth]
     } else {
-        vec![Surface::OverlaySaveLogin]
+        vec![Surface::LoginUnlock]
     };
     let first = queue[0];
 
@@ -779,7 +765,7 @@ fn main() -> eframe::Result {
     } else if health {
         target_dir().join("ui_preview_vault_password_health.png")
     } else {
-        target_dir().join("ui_preview_overlay.png")
+        target_dir().join("ui_preview_login.png")
     };
 
     // Cloned before the closure takes it: the count check below outlives
@@ -798,8 +784,7 @@ fn main() -> eframe::Result {
                 // The app name a real 3c card would have been pre-filled with,
                 // and nothing else: the other three rows are what this app can
                 // actually know about the window, which is nothing.
-                save_login: overlay_ui::SaveLoginForm::new("Atlas Licence"),
-                screenshot,
+                    screenshot,
                 done: false,
                 frames: 0,
                 icons: None,
@@ -880,7 +865,6 @@ struct Preview {
     form: LoginForm,
     /// Form state for design 3c (typing works; Save doesn't -- there is no
     /// vault behind this example).
-    save_login: overlay_ui::SaveLoginForm,
     /// Capture and exit, rather than sit there being looked at.
     screenshot: bool,
     /// Every surface has been captured and `Close` has been asked for. The
@@ -968,7 +952,6 @@ impl eframe::App for Preview {
         self.frames += 1;
 
         match self.current() {
-            Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false),
             Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true),
             Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
@@ -1056,11 +1039,6 @@ impl eframe::App for Preview {
             ctx.request_repaint();
         }
 
-        if self.current() == Surface::OverlaySaveLogin
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter))
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
     }
 }
 
@@ -1104,29 +1082,6 @@ enum DetailShot {
 }
 
 impl Preview {
-    /// Design 3c, drawn by the shipped function rather than re-implemented,
-    /// which is why `draw_save_login_card` is public.
-    ///
-    /// **The last overlay card in this walk.** 2a and 3b are
-    /// `deskwarden::prompt_card` and `deskwarden::locked_card` now, and 3a has
-    /// been the account picker's empty mode since before them.
-    ///
-    /// The form is drawn **blank apart from the App row**, which is the state
-    /// the user is really shown: exactly one of the four rows can be
-    /// pre-filled, because `injector::ui_automation` has no username reader
-    /// and a password field's contents are not read. A preview that typed
-    /// plausible values into the other two would be a picture of a capture
-    /// this app does not make.
-    fn draw_overlay_save_login(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            if overlay_ui::draw_save_login_card(ui, &mut self.save_login)
-                != overlay_ui::SaveLoginAction::None
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
     fn draw_login(
         &mut self,
         root: &mut egui::Ui,

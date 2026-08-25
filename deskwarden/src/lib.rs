@@ -72,7 +72,6 @@ pub mod login_ui;
 pub mod match_engine;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
 pub mod otpauth;
-pub mod overlay_ui;
 pub mod password_strength;
 pub mod picker_prompt;
 pub mod picker_ui;
@@ -90,6 +89,7 @@ pub mod region_overlay;
 pub mod reprompt;
 /// `scan_history.json`: what the last twenty breach scans counted. Counts and
 /// timestamps only -- never a password, an item, or anything derived from one.
+pub mod save_login_card;
 pub mod scan_history;
 pub mod scratch_window;
 /// Copies one rectangle of the screen into a self-wiping buffer of pixels.

@@ -555,25 +555,43 @@ pub fn empty_rows() -> Vec<EmptyAction> {
     vec![EmptyAction::NewLogin, EmptyAction::SearchVault]
 }
 
+/// What the empty card's *New login* row says, and **the only card that may
+/// NOT carry it**.
+///
+/// `crate::locked_card` does not carry it, deliberately: design 3c ends in
+/// `VaultCache::create_item`, which is a write through `bw serve` against an
+/// unlocked vault, so a *New login* button on the locked card would be an offer
+/// the process cannot honour -- the same class of defect as the locked card's
+/// own correction (a card claiming something about a vault it cannot read).
+/// `locked_card::the_card_offers_only_the_unlock_it_can_honour` reads that
+/// card's painted runs rather than trusting the argument.
+///
+/// A constant for the reason [`crate::locked_card::LOCKED_LABEL`] is one: it is
+/// the string a test finds in the painted output rather than one it re-spells.
+/// **It lived in `overlay_ui` until that module was deleted**; it is here now
+/// because this is the card that offers it.
+pub const NEW_LOGIN_LABEL: &str = "New login";
+
+/// What the empty card's other row says, and **the only card that may NOT carry
+/// it**.
+///
+/// `crate::locked_card` does not carry it either, for a plainer reason than the
+/// one [`NEW_LOGIN_LABEL`] gives: while the vault is locked there is nothing to
+/// search, and a vault window opened with a query in its box would show an
+/// empty list that means "locked" and reads as "nothing found".
+pub const SEARCH_VAULT_LABEL: &str = "Search vault";
+
 /// What each empty-card row is called, and what it says it will do.
 ///
-/// **The names are [`crate::overlay_ui::NEW_LOGIN_LABEL`] and
-/// [`crate::overlay_ui::SEARCH_VAULT_LABEL`] themselves**, not copies of their
-/// words. Those two constants exist so that "3a offers exactly these two" is
-/// one string a test can find rather than one it re-spells, and the card that
-/// replaced 3a's window inherits the offers -- so it inherits the constants.
-/// Re-typing them here would be the second spelling they were written to
-/// prevent, and `overlay_ui`'s own
-/// `the_locked_card_offers_neither_of_the_pickers_two_offers` still reads them
-/// off the locked card to prove neither has strayed onto it.
+/// **The names are [`NEW_LOGIN_LABEL`] and [`SEARCH_VAULT_LABEL`] themselves**,
+/// not copies of their words. Those two constants exist so that "3a offers
+/// exactly these two" is one string a test can find rather than one it
+/// re-spells. Re-typing them here would be the second spelling they were
+/// written to prevent.
 pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
     match action {
-        EmptyAction::NewLogin => {
-            (crate::overlay_ui::NEW_LOGIN_LABEL, "Save a login for this app")
-        }
-        EmptyAction::SearchVault => {
-            (crate::overlay_ui::SEARCH_VAULT_LABEL, "Look for it under another name")
-        }
+        EmptyAction::NewLogin => (NEW_LOGIN_LABEL, "Save a login for this app"),
+        EmptyAction::SearchVault => (SEARCH_VAULT_LABEL, "Look for it under another name"),
     }
 }
 

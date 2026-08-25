@@ -8,7 +8,7 @@ use crate::injector::sequence;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::key_sequence;
 use crate::locked_card;
-use crate::overlay_ui;
+use crate::save_login_card;
 use crate::vault_bridge::{extract_app_match, VaultItem};
 use crate::vault_cache::VaultCache;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -19,26 +19,43 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
-/// The overlay's fixed width -- needed here to clamp its position on-screen
-/// before the window exists to measure.
+/// The anchor arithmetic for the daemon's cards, and **all that is left of
+/// `overlay_ui`.**
 ///
-/// **Imported, not re-declared.** This was a second `const OVERLAY_WIDTH: f32
-/// = 396.0` carrying a "must match `overlay_ui`" comment, and a comment is
-/// not an enforcement: `overlay_position`'s own tests assert against *this*
-/// file's copy, so the pair were self-consistent and blind to each other
-/// drifting apart. It is precisely the duplication `adcb346` deleted
-/// `OVERLAY_HEIGHT` to be rid of, left standing on the width. There is now
-/// one definition, in the module that hands it to `with_inner_size`, and this
-/// name is an alias for it.
+/// Every card the daemon shows is bare Win32 now, and each knows its own real
+/// height: `prompt_card::place` is handed `layout().window.h` and clamps
+/// against that. What `overlay_position` computes is the *anchor* those cards
+/// are then placed at -- a top-left corner beside the field the user is in,
+/// clamped onto the work area so it does not start off-screen.
 ///
-/// **The height is deliberately still not a constant here.** It was `164.0`,
-/// the one-row card's height, and the card grows by `ROW_HEIGHT` per choice
-/// row: a four-row card is 314pt, so clamping it as if it were 164pt leaves
-/// 150pt of a frameless, always-on-top, unscrollable window below the work
-/// area -- rows the user cannot see or click. The height comes from
-/// [`overlay_ui::overlay_height`] and the row count, from the one place that
-/// knows both.
-use crate::overlay_ui::OVERLAY_WIDTH;
+/// These three numbers are the egui overlay's geometry, kept because the anchor
+/// is still computed before any window exists to measure and a bottom clamp
+/// needs some idea of how tall the card will be. They are an approximation the
+/// window then corrects, and they are said to be one here rather than left
+/// looking like a size something is drawn at.
+///
+/// `OVERLAY_WIDTH` is the width the cards were anchored by; `overlay_height` is
+/// `CHROME_HEIGHT` plus `ROW_HEIGHT` per choice row, which is what makes the
+/// clamp a function of the row count rather than of the literal `164.0` it used
+/// to be -- a four-row card clamped as if it were one row put three of its rows
+/// under the taskbar.
+pub const OVERLAY_WIDTH: f32 = 396.0;
+
+/// Vertical pitch of ONE choice row, in the anchor arithmetic above.
+pub const ROW_HEIGHT: f32 = 50.0;
+
+/// Everything in a card that is NOT a choice row: margins, header, hairlines
+/// and footer.
+pub const CHROME_HEIGHT: f32 = 114.0;
+
+/// How tall a card of `rows` choice rows is taken to be, for the bottom clamp.
+///
+/// `rows.max(1)` because a card with no rows is not a shorter card: the
+/// matched-item card always paints at least one row, and a zero-row height
+/// would clamp its anchor as if the card were chrome alone.
+pub fn overlay_height(rows: usize) -> f32 {
+    CHROME_HEIGHT + ROW_HEIGHT * rows.max(1) as f32
+}
 /// Gap between the field/window edge and the overlay, so it doesn't sit
 /// flush against the thing it's about to fill.
 const OVERLAY_GAP: f32 = 10.0;
@@ -98,7 +115,7 @@ pub fn clamp_into_work_area(
 ) -> (f32, f32) {
     let (left, top, right, bottom) = work;
     let clamped_x = x.min(right - OVERLAY_WIDTH).max(left);
-    let clamped_y = y.min(bottom - overlay_ui::overlay_height(rows)).max(top);
+    let clamped_y = y.min(bottom - overlay_height(rows)).max(top);
     (clamped_x, clamped_y)
 }
 
@@ -1805,7 +1822,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
 /// `show_prompt_overlay` in the wrong order or quietly substitute one.
 pub struct PromptRequest<'a> {
     pub label: &'a str,
-    pub matched: Option<overlay_ui::OverlayMatch>,
+    pub matched: Option<crate::prompt_card::OverlayMatch>,
     pub position: Option<(f32, f32)>,
     /// The rows the overlay offers, in order; the first is the primary, and
     /// the one Enter takes.
@@ -1826,7 +1843,7 @@ pub struct PromptRequest<'a> {
 ///
 /// **A cache miss stays fillable.** `None` (the item could not be read back)
 /// answers the empty list, and an empty list is not "no rows": both
-/// [`overlay_ui::draw_overlay_card_rows`] and [`overlay_ui::overlay_height`]
+/// [`crate::prompt_card::rows`] and [`overlay_height`]
 /// treat it as the single matched-credential row the overlay has always
 /// painted, which answers [`FillChoice::Saved`] -- exactly the old behaviour,
 /// for exactly the case that used to be all of them. An item with no
@@ -1867,7 +1884,7 @@ pub fn prompt_choices(item: Option<&VaultItem>) -> Vec<FillChoice> {
 /// the item from the cache after the choice, as it already did.
 pub struct PromptSubject {
     /// What the card says it is offering; `None` on a cache miss.
-    pub matched: Option<overlay_ui::OverlayMatch>,
+    pub matched: Option<crate::prompt_card::OverlayMatch>,
     /// The rows to offer, in order; the first is the primary.
     pub choices: Vec<FillChoice>,
 }
@@ -1883,7 +1900,7 @@ pub fn prompt_subject(item: Option<&VaultItem>) -> PromptSubject {
     PromptSubject {
         matched: item.map(|item| {
             let username = item.login.as_ref().and_then(|l| l.username.clone());
-            overlay_ui::OverlayMatch {
+            crate::prompt_card::OverlayMatch {
                 item_name: item.name.clone(),
                 username: username.filter(|u| !u.is_empty()),
             }
@@ -1967,7 +1984,7 @@ pub trait PromptPresenter {
     fn show(
         &self,
         label: &str,
-        matched: Option<&overlay_ui::OverlayMatch>,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice>;
@@ -1976,7 +1993,7 @@ pub trait PromptPresenter {
     ///
     /// `None` is not a decision: it is the overlay refusing to stack a second
     /// window on itself. A user who dismisses the card answers
-    /// [`overlay_ui::SaveLoginAction::NotNow`], because "silence today" is a
+    /// [`save_login_card::SaveLoginAction::NotNow`], because "silence today" is a
     /// decision and is spelled as one.
     ///
     /// **It takes the form rather than a label**, which is the whole of the
@@ -1987,14 +2004,14 @@ pub trait PromptPresenter {
     /// generated password 3d just produced.
     fn show_save_login(
         &self,
-        form: overlay_ui::SaveLoginForm,
+        form: save_login_card::SaveLoginForm,
         position: Option<(f32, f32)>,
-    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>;
+    ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)>;
     /// Shows design **3d** -- the generator -- and answers the password the
     /// user chose to keep, or `None` if they dismissed it.
     ///
     /// `generate` is the round trip to `bw serve`, passed in rather than
-    /// reached for: `overlay_ui` has no vault handle, and **there is no
+    /// reached for: `save_login_card` has no vault handle, and **there is no
     /// generator in this crate** -- the randomness is the server's, which is
     /// the one property of this feature that must not be reimplemented.
     ///
@@ -2045,7 +2062,7 @@ pub struct FnPresenter {
     /// Asked to put it on screen; answers which row the user picked.
     pub show: fn(
         &str,
-        Option<&overlay_ui::OverlayMatch>,
+        Option<&crate::prompt_card::OverlayMatch>,
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
@@ -2053,10 +2070,10 @@ pub struct FnPresenter {
     /// [`PromptPresenter::show_save_login`].
     #[allow(clippy::type_complexity)]
     pub show_save_login: fn(
-        overlay_ui::SaveLoginForm,
+        save_login_card::SaveLoginForm,
         Option<(f32, f32)>,
     )
-        -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>,
+        -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)>,
     /// Asked to put design 3d on screen. See
     /// [`PromptPresenter::show_generate`].
     #[allow(clippy::type_complexity)]
@@ -2079,7 +2096,7 @@ impl PromptPresenter for FnPresenter {
     fn show(
         &self,
         label: &str,
-        matched: Option<&overlay_ui::OverlayMatch>,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice> {
@@ -2088,9 +2105,9 @@ impl PromptPresenter for FnPresenter {
 
     fn show_save_login(
         &self,
-        form: overlay_ui::SaveLoginForm,
+        form: save_login_card::SaveLoginForm,
         position: Option<(f32, f32)>,
-    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+    ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
         (self.show_save_login)(form, position)
     }
 
@@ -2126,7 +2143,7 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: crate::prompt_card::show_prompt_card,
     show_locked: crate::locked_card::show_locked_card,
-    show_save_login: overlay_ui::show_save_login_overlay,
+    show_save_login: save_login_card::show_save_login_card,
     show_generate: crate::generate_prompt::show_generate_prompt,
 };
 
@@ -2170,7 +2187,7 @@ pub fn prompt_arm<P: PromptPresenter>(
 /// **The whole of the 3c arm, as a pure function** -- [`prompt_arm`]'s
 /// sibling, written the same way and for the same two reasons.
 ///
-/// **The placement is asked about [`overlay_ui::SAVE_LOGIN_ROWS`]**, and not
+/// **The placement is asked about [`save_login_card::SAVE_LOGIN_ROWS`]**, and not
 /// about the card the user just left. The two differ -- 3c is by far the tallest
 /// state the overlay has -- and the clamp onto the monitor's work area is a
 /// function of the card's height, so asking about the card the user just left
@@ -2189,9 +2206,9 @@ pub fn prompt_arm<P: PromptPresenter>(
 pub fn save_login_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
-    form: overlay_ui::SaveLoginForm,
-) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
-    let position = presenter.position(window.hwnd, overlay_ui::SAVE_LOGIN_ROWS);
+    form: save_login_card::SaveLoginForm,
+) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
+    let position = presenter.position(window.hwnd, save_login_card::SAVE_LOGIN_ROWS);
     presenter.show_save_login(form, position)
 }
 
@@ -2238,7 +2255,7 @@ pub const GENERATE_HOPS: usize = 8;
 /// carrying the username they had already typed. Any other answer ends it.
 ///
 /// **The two cards alternate rather than nest** because the overlay is one
-/// window at a time: `overlay_ui::OVERLAY_OPEN` refuses to stack a second,
+/// window at a time: the daemon shows one card at a time,
 /// and `eframe::run_native` on this thread could not open one anyway. So the
 /// form is the thing that crosses between them, and it crosses by value.
 ///
@@ -2251,13 +2268,13 @@ pub fn save_login_flow<P: PromptPresenter>(
     generate: &dyn Fn(
         &crate::vault_bridge::GenerateRequest,
     ) -> Result<zeroize::Zeroizing<String>, String>,
-) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
     let mut form =
-        overlay_ui::SaveLoginForm::new(window_label(&window.exe_name, &window.title));
+        save_login_card::SaveLoginForm::new(window_label(&window.exe_name, &window.title));
     for _ in 0..GENERATE_HOPS {
         let (action, answered) = save_login_arm(presenter, window, form)?;
         form = answered;
-        if action != overlay_ui::SaveLoginAction::Generate {
+        if action != save_login_card::SaveLoginAction::Generate {
             return Some((action, form));
         }
         if let Some(password) = generate_arm(presenter, window, generate) {
@@ -2266,7 +2283,7 @@ pub fn save_login_flow<P: PromptPresenter>(
     }
     // Out of hops. `NotNow` and not `Never`: the strongest answer this card
     // offers is not one to reach by running out of something.
-    Some((overlay_ui::SaveLoginAction::NotNow, form))
+    Some((save_login_card::SaveLoginAction::NotNow, form))
 }
 
 /// The `NewItem` a filled-in 3c form becomes.
@@ -2281,14 +2298,14 @@ pub fn save_login_flow<P: PromptPresenter>(
 ///   has for it.
 /// * **username** and **password** are what the user typed. Both may be empty;
 ///   `vault_bridge` omits a blank one rather than POSTing `""`.
-/// * **folder** is `None`, always. See [`overlay_ui::FOLDER_ROW_TEXT`] for why
+/// * **folder** is `None`, always. See [`save_login_card::FOLDER_ROW_TEXT`] for why
 ///   the card states a folder rather than picking one, and
 ///   `the_new_login_is_unfiled_because_the_card_offers_no_folder` for the test
 ///   that holds the two together.
 ///
 /// It takes the form by value so the `Zeroizing` password is *moved* into the
 /// payload rather than copied out of a borrow and left behind in the form.
-pub fn new_login_item(form: overlay_ui::SaveLoginForm) -> crate::vault_bridge::NewItem {
+pub fn new_login_item(form: save_login_card::SaveLoginForm) -> crate::vault_bridge::NewItem {
     crate::vault_bridge::NewItem::login(
         form.app_name.clone(),
         form.username.clone(),
@@ -2325,8 +2342,8 @@ pub enum SaveOutcome {
 /// assert that *Not now* and *Never* really do different things, without a
 /// vault, a window or a disk anywhere near it.
 ///
-/// `create` is called **only** for [`overlay_ui::SaveLoginAction::Save`], and
-/// `silence` **only** for [`overlay_ui::SaveLoginAction::Never`]. Neither is
+/// `create` is called **only** for [`save_login_card::SaveLoginAction::Save`], and
+/// `silence` **only** for [`save_login_card::SaveLoginAction::Never`]. Neither is
 /// called for the other's answer and neither is called twice;
 /// `the_three_answers_do_three_different_things` counts both.
 ///
@@ -2336,7 +2353,7 @@ pub enum SaveOutcome {
 /// a card that never opened has not been answered, and must not be recorded as
 /// a "never".
 pub fn route_save_answer(
-    answer: Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)>,
+    answer: Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)>,
     create: impl FnOnce(&crate::vault_bridge::NewItem) -> Result<String, String>,
     silence: impl FnOnce(&str),
 ) -> SaveOutcome {
@@ -2344,8 +2361,8 @@ pub fn route_save_answer(
         return SaveOutcome::Nothing;
     };
     match action {
-        overlay_ui::SaveLoginAction::Save => SaveOutcome::Created(create(&new_login_item(form))),
-        overlay_ui::SaveLoginAction::Never => {
+        save_login_card::SaveLoginAction::Save => SaveOutcome::Created(create(&new_login_item(form))),
+        save_login_card::SaveLoginAction::Never => {
             let app = form.app_name.clone();
             silence(&app);
             SaveOutcome::Silenced(app)
@@ -2354,10 +2371,10 @@ pub fn route_save_answer(
         // all land here, and all of them mean "ask me again". The weakest
         // gestures a user can make must not be read as the strongest answer
         // the card offers.
-        overlay_ui::SaveLoginAction::NotNow | overlay_ui::SaveLoginAction::None => {
+        save_login_card::SaveLoginAction::NotNow | save_login_card::SaveLoginAction::None => {
             SaveOutcome::Nothing
         }
-        // **[`overlay_ui::SaveLoginAction::Generate`] is not a decision about
+        // **[`save_login_card::SaveLoginAction::Generate`] is not a decision about
         // the vault**, and it does not reach here through
         // [`save_login_flow`], which resolves it by opening design 3d and
         // asking 3c again. It is spelled out rather than folded into the arm
@@ -2366,7 +2383,7 @@ pub fn route_save_answer(
         // a flow that ended mid-hop, and the only safe reading of a card the
         // user never finished answering is "nothing, ask again".
         // `a_generate_that_escapes_the_flow_writes_nothing` holds it.
-        overlay_ui::SaveLoginAction::Generate => SaveOutcome::Nothing,
+        save_login_card::SaveLoginAction::Generate => SaveOutcome::Nothing,
     }
 }
 
@@ -3282,7 +3299,7 @@ mod tests {
     /// clicked.
     #[test]
     fn a_four_row_card_anchored_at_the_bottom_stays_inside_the_work_area() {
-        let height = overlay_ui::overlay_height(4);
+        let height = overlay_height(4);
         assert_eq!(height, 314.0, "the fixture is a card that is really taller");
 
         // Anchored well below where a card this tall can start.
@@ -3315,10 +3332,10 @@ mod tests {
         // is that there is ONE of it, and a re-declared local `const
         // OVERLAY_WIDTH` in this file would be picked up by a bare
         // `OVERLAY_WIDTH` here just as it would by the clamp -- leaving the
-        // two agreeing with each other and blind to `overlay_ui`. Naming the
+        // two agreeing with each other and blind to `save_login_card`. Naming the
         // module makes this an assertion about the width the WINDOW is built
         // at, which is the only width that matters.
-        assert_eq!(x, WORK.2 - crate::overlay_ui::OVERLAY_WIDTH);
+        assert_eq!(x, WORK.2 - OVERLAY_WIDTH);
     }
 
     #[test]
@@ -3343,7 +3360,7 @@ mod tests {
     fn no_card_the_overlay_can_show_is_clamped_off_the_bottom() {
         let mut checked = 0;
         for rows in 1..=4 {
-            let height = overlay_ui::overlay_height(rows);
+            let height = overlay_height(rows);
             let (_x, y) = clamp_into_work_area(WORK, 200.0, 9999.0, rows);
             assert!(y + height <= WORK.3, "{rows} rows: {y} + {height}");
             assert!(y >= WORK.1);
@@ -3355,7 +3372,7 @@ mod tests {
     // ---- The Prompt arm's wiring (review 32's Important 1) ----
 
     /// What the overlay was told, in a form a test can compare:
-    /// `overlay_ui::OverlayMatch` is a plain data carrier with no `PartialEq`,
+    /// `crate::prompt_card::OverlayMatch` is a plain data carrier with no `PartialEq`,
     /// and this is deliberately built from its fields rather than by cloning
     /// the type, so a field added to it and dropped on the way here is a
     /// compile error rather than a silently unchecked value.
@@ -3410,7 +3427,7 @@ mod tests {
         fn show(
             &self,
             label: &str,
-            matched: Option<&overlay_ui::OverlayMatch>,
+            matched: Option<&crate::prompt_card::OverlayMatch>,
             position: Option<(f32, f32)>,
             choices: &[FillChoice],
         ) -> Option<FillChoice> {
@@ -3429,9 +3446,9 @@ mod tests {
         /// four.
         fn show_save_login(
             &self,
-            form: overlay_ui::SaveLoginForm,
+            form: save_login_card::SaveLoginForm,
             position: Option<(f32, f32)>,
-        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+        ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
             self.save_login_shown
                 .borrow_mut()
                 .push((form.app_name.clone(), position));
@@ -3576,7 +3593,7 @@ mod tests {
     /// used to answer nothing at all, so the whole of "the *Unlock* button
     /// reaches anything" lives in this return value. Dropped -- an arm that
     /// showed the card and then answered `Dismissed` -- the button is inert,
-    /// which is the failure `overlay_ui::SEARCH_VAULT_LABEL`'s doc calls worse
+    /// which is the failure `crate::picker_prompt::SEARCH_VAULT_LABEL`'s doc calls worse
     /// than not drawing it at all.
     ///
     /// Both directions, from the same recorder, so the assertion cannot be
@@ -3916,7 +3933,7 @@ mod tests {
         fn show(
             &self,
             label: &str,
-            matched: Option<&overlay_ui::OverlayMatch>,
+            matched: Option<&crate::prompt_card::OverlayMatch>,
             _position: Option<(f32, f32)>,
             choices: &[FillChoice],
         ) -> Option<FillChoice> {
@@ -3936,9 +3953,9 @@ mod tests {
         /// is the row the whole card is built around.
         fn show_save_login(
             &self,
-            form: overlay_ui::SaveLoginForm,
+            form: save_login_card::SaveLoginForm,
             _position: Option<(f32, f32)>,
-        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+        ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
             self.seen.borrow_mut().push(form.app_name.clone());
             None
         }
@@ -4046,7 +4063,7 @@ mod tests {
         fn show(
             &self,
             _label: &str,
-            _matched: Option<&overlay_ui::OverlayMatch>,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
             _position: Option<(f32, f32)>,
             _choices: &[FillChoice],
         ) -> Option<FillChoice> {
@@ -4056,9 +4073,9 @@ mod tests {
 
         fn show_save_login(
             &self,
-            _form: overlay_ui::SaveLoginForm,
+            _form: save_login_card::SaveLoginForm,
             _position: Option<(f32, f32)>,
-        ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+        ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
             self.log.borrow_mut().push("save-login card shown");
             None
         }
@@ -4157,15 +4174,15 @@ mod tests {
         assert_eq!(offered.len(), 1, "the overlay is still shown");
         assert!(offered[0].is_empty());
         // The empty list is one painted row, and one row's worth of window --
-        // read out of `overlay_ui`, whose own tests own that promise.
+        // read out of `save_login_card`, whose own tests own that promise.
         assert_eq!(
             presenter.asked_rows.get(),
             Some(0),
             "the row count asked about is the list's length, not a fabricated 1"
         );
         assert_eq!(
-            overlay_ui::overlay_height(0),
-            overlay_ui::overlay_height(1),
+            overlay_height(0),
+            overlay_height(1),
             "an empty list must still be sized for the one row it paints"
         );
     }
@@ -4190,7 +4207,7 @@ mod tests {
 
     fn recording_show(
         label: &str,
-        matched: Option<&overlay_ui::OverlayMatch>,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice> {
@@ -4207,9 +4224,9 @@ mod tests {
         std::sync::Mutex::new(Vec::new());
 
     fn recording_show_save_login(
-        form: overlay_ui::SaveLoginForm,
+        form: save_login_card::SaveLoginForm,
         position: Option<(f32, f32)>,
-    ) -> Option<(overlay_ui::SaveLoginAction, overlay_ui::SaveLoginForm)> {
+    ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
         SAVE_LOGIN_FORWARDED
             .lock()
             .unwrap()
@@ -4275,7 +4292,7 @@ mod tests {
             "the row count is forwarded, not replaced with a default"
         );
 
-        let matched = overlay_ui::OverlayMatch {
+        let matched = crate::prompt_card::OverlayMatch {
             item_name: "Ledgerline".to_string(),
             username: Some("denis@example.com".to_string()),
         };
@@ -7354,7 +7371,7 @@ mod match_disposition_tests {
 #[cfg(test)]
 mod save_login_tests {
     use super::*;
-    use crate::overlay_ui::{SaveLoginAction, SaveLoginForm};
+    use crate::save_login_card::{SaveLoginAction, SaveLoginForm};
     use crate::vault_bridge::NewItem;
 
     const APP: &str = "tracker.exe";
@@ -7473,7 +7490,7 @@ mod save_login_tests {
                 assert_eq!(
                     folder_id, None,
                     "the new login is filed somewhere, and the card offers no folder to file \
-                     it in -- see `overlay_ui::FOLDER_ROW_TEXT`"
+                     it in -- see `save_login_card::FOLDER_ROW_TEXT`"
                 );
             }
             other => panic!("3c created something other than a login: {other:?}"),
@@ -8792,7 +8809,7 @@ mod preflight_guard_tests {
 #[cfg(test)]
 mod generate_flow_tests {
     use super::*;
-    use crate::overlay_ui::{SaveLoginAction, SaveLoginForm};
+    use crate::save_login_card::{SaveLoginAction, SaveLoginForm};
     use crate::vault_bridge::GenerateRequest;
 
     const APP: &str = "ledgerline.exe";
@@ -8869,7 +8886,7 @@ mod generate_flow_tests {
         fn show(
             &self,
             _label: &str,
-            _matched: Option<&overlay_ui::OverlayMatch>,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
             _position: Option<(f32, f32)>,
             _choices: &[FillChoice],
         ) -> Option<FillChoice> {
@@ -9001,7 +9018,7 @@ mod generate_flow_tests {
         let _ = save_login_flow(&script, &window(), &generator.call());
         assert_eq!(
             *script.rows.borrow(),
-            vec![overlay_ui::SAVE_LOGIN_ROWS, overlay_ui::SAVE_LOGIN_ROWS],
+            vec![save_login_card::SAVE_LOGIN_ROWS, save_login_card::SAVE_LOGIN_ROWS],
             "the flow asked for a placement sized by the wrong card, or asked for one on \
              behalf of 3d -- which centres itself and reads no answer"
         );

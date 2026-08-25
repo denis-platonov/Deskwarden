@@ -68,7 +68,20 @@
 //! the failures.
 
 use crate::app::FillChoice;
-use crate::overlay_ui::OverlayMatch;
+
+/// What the card shows about the matched vault item: enough for the user to
+/// recognize *which* credentials are about to be filled (design 2a shows the
+/// username with the item name under it), without ever putting the password
+/// itself on screen.
+///
+/// **It lived in `overlay_ui` until that module was deleted**, which is where
+/// every card in this crate was drawn before they were ported to bare Win32.
+/// It is here rather than in `app` because this is the module that paints it,
+/// and a type whose only reader is a painter belongs beside the painter.
+pub struct OverlayMatch {
+    pub item_name: String,
+    pub username: Option<String>,
+}
 
 /// The window handle [`run_with`] deals in.
 ///

@@ -18,7 +18,7 @@
 //!   again and refuses on its own terms. See
 //!   [`crate::vault_window::preflight::SendGate::confirm`].
 //!
-//! Same shape as [`crate::overlay_ui::show_prompt_overlay`]: a blocking
+//! Same shape as [`crate::prompt_card::show_prompt_card`]: a blocking
 //! `eframe::run_native` on the thread that was about to fill, with the answer
 //! read back out of an `Rc<RefCell<_>>` once the window is gone. That is what
 //! makes the confirmation happen *before* anything is typed rather than

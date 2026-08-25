@@ -46,7 +46,8 @@
 //! whatever they were typing into.
 //!
 //! `with_always_on_top` is likewise not the answer for ordinary windows. The
-//! overlay (`overlay_ui`) is topmost because it is a transient prompt drawn
+//! overlay (`save_login_card` and its five siblings) is topmost because each
+//! is a transient prompt drawn
 //! over another app; a vault window that outranks every other window on the
 //! desktop for as long as it is open is a worse bug than the one being fixed.
 //!
@@ -685,8 +686,8 @@ mod tests {
     /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front` holds
     /// that) or [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] (it does
     /// not, and carries the reason). This list used to claim to be "the modules
-    /// that test covers", which was false: `overlay_ui` was in it and covered
-    /// by nothing.
+    /// that test covers", which was false: the egui autofill overlay was in it
+    /// and covered by nothing.
     ///
     /// At this scope rather than inside
     /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
@@ -715,7 +716,6 @@ mod tests {
         "locked_card",
         "loading_ui",
         "login_ui",
-        "overlay_ui",
         "picker_ui",
         // The account picker's card. The SECOND bare-Win32 window in this
         // crate, and one for the same measured reason `unlock_prompt` is: an
@@ -724,9 +724,9 @@ mod tests {
         // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
         // holds its raise and which stopped being a one-row table for it.
         "picker_prompt",
-        // The 4b preflight confirmation. Excused from raising for the same
-        // reasons `overlay_ui` is, and for one more that is stronger -- see
-        // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
+        // The 4b preflight confirmation. **The one module left in
+        // `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`** -- the egui
+        // autofill overlay was the other, and it is gone. See its row there.
         "preflight_host",
         "prefs_ui",
         // Design 2a's matched-item card. The FOURTH bare-Win32 window in this
@@ -745,6 +745,13 @@ mod tests {
         // crate, and the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] stopped
         // being a one-row table -- see the argument on it.
         "region_overlay",
+        // Design 3c's save-a-login card. The SIXTH bare-Win32 window in this
+        // crate, and the one that retired `overlay_ui` -- the module that held
+        // every egui card the daemon showed. It is the tallest card in the
+        // crate, the only one with two text boxes, and the only one that holds
+        // a plaintext password in a control, which is why its capture exclusion
+        // is not optional. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "save_login_card",
         // The 4d rehearsal scratch window. The first window in this crate
         // `eframe` does not start a loop for -- it is an egui VIEWPORT, opened
         // inside the vault window's running loop. See
@@ -843,9 +850,9 @@ mod tests {
     /// whole screen; without the foreground those keys go to whatever the user
     /// was in, and Escape landing in someone else's app while a full-screen
     /// dimmed overlay sits on top of it with no way out is the worst failure
-    /// this feature has. `overlay_ui`'s and `preflight_host`'s other reason
-    /// does not apply either: both open under the literal `"Deskwarden"` that
-    /// three raising windows share, so a raise there could pick the wrong one.
+    /// this feature has. `preflight_host`'s other reason does not apply
+    /// either: it opens under the literal `"Deskwarden"` that three raising
+    /// windows share, so a raise there could pick the wrong one.
     /// `REGION_TITLE` is unique, so `raise_window`'s `find` is exact.
     const OPENS_A_VIEWPORT_AND_RAISES_IT: [(&str, &str, &str); 2] = [
         ("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE"),
@@ -938,47 +945,32 @@ mod tests {
     /// *Unlock* button that is the one offer this state can honour. What its
     /// capture exclusion protects is neither a password nor an account list
     /// but the name of the app this user is signing into.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 5] = [
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 6] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
         ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
         ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
+        ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
     /// The third category, and the one whose absence made the docstring on
-    /// `OPENS_WINDOWS` false as written: `overlay_ui` opens a window, has never
-    /// had a row in [`RAISING_SITES`], and nothing anywhere recorded that this
-    /// was a decision rather than the same omission that let `app_window` in
-    /// unguarded. "Not in the raise list" and "must not be in the raise list"
+    /// `OPENS_WINDOWS` false as written: the egui autofill overlay opened a
+    /// window, never had a row in [`RAISING_SITES`], and nothing anywhere
+    /// recorded that this was a decision rather than the same omission that
+    /// let `app_window` in unguarded. "Not in the raise list" and "must not be in the raise list"
     /// are different claims and now live in different places.
     ///
     /// The reason is carried in the source because it is the whole content of
     /// the exemption; the test below refuses a blank one, and refuses a module
     /// listed here that turns out to raise after all.
-    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 2] = [
+    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 1] = [
         (
         "preflight_host",
         include_str!("preflight_host.rs"),
         "The preflight is `with_always_on_top()`, so the OS already keeps it above everything.          It also opens while ANOTHER app is foreground -- it is the confirmation shown BEFORE a          sequence is typed into that app -- and it opens under the same literal `\"Deskwarden\"`          title `vault_window`, `app_window` and `loading_ui` all raise under, so a          `raise_window` here could bring one of those forward instead. And there is a reason          particular to this window: `preflight::verdict` was computed from the foreground          described a moment before it opened, and `dispatch_with` describes the foreground          again after it closes. A raise is a deliberate change to which window is in front,          made by the one surface in the app whose whole job is to tell the truth about which          window is in front.",
-    ),
-    (
-        "overlay_ui",
-        include_str!("overlay_ui.rs"),
-        "The autofill prompt is `with_always_on_top()`, so the OS already keeps it above \
-         everything and a raise would buy nothing. It is also the one window of ours that \
-         opens while ANOTHER app is foreground -- anchored beside the field the user is in, \
-         whose `hwnd` the fill is injected back into once the card is clicked -- so taking \
-         the foreground is the opposite of what this window wants. And it opens through \
-         `eframe::run_native(\"Deskwarden\", ..)` -- the same literal title THREE other \
-         windows open under: `vault_window`, `app_window` and `loading_ui`, all of which do \
-         raise. (It said \"two\" while there were three; the count is now the one \
-         `only_one_window_of_this_process_can_exist_at_a_time` reads off the sources.) \
-         `raise_window` matches this process's own windows BY TITLE and `pick` takes the \
-         FIRST match in `EnumWindows` order, so a raise here could just as easily bring one \
-         of those forward instead.",
     )];
 
     /// Every window this crate opens must actually ask to be raised, and must
@@ -1205,8 +1197,8 @@ mod tests {
     /// were independent hand-written lists that merely happened to agree, so a
     /// module could be dropped from the raise table and lose its raise with
     /// every assertion still passing -- `loading_ui` was demonstrably deletable
-    /// that way. It also let `overlay_ui` sit in `OPENS_WINDOWS` with no row in
-    /// the raise table at all and nothing recording why. Both are closed below,
+    /// that way. It also let the egui autofill overlay sit in `OPENS_WINDOWS`
+    /// with no row in the raise table at all and nothing recording why. Both are closed below,
     /// by requiring `OPENS_WINDOWS` to be exactly `RAISING_SITES` plus
     /// `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`, with nothing in two
     /// lists and nothing in none.
@@ -1512,7 +1504,7 @@ mod tests {
             // exemption from that forgery is structural, and it is the
             // exemption's own first sentence: the OS keeps this window above
             // everything because the window asks it to. `with_always_on_top(`
-            // appears exactly once in `overlay_ui.rs` and nowhere else in this
+            // appears exactly once in `preflight_host.rs` and nowhere else in this
             // crate, so this both holds the real excuse to its claim and fails
             // any module moved here that cannot make it.
             //
@@ -1526,7 +1518,7 @@ mod tests {
             //
             // **And over the production half, for the same reason the raise
             // guard is**: this is an exact count over another module's file,
-            // so a fixture in `overlay_ui.rs`'s own test modules spelling
+            // so a fixture in `preflight_host.rs`'s own test modules spelling
             // `with_always_on_top(` would take it to 2 and false-fire.
             let (production, cut) = production_half(source);
             assert!(cut > 0, "no test module was cut out of `{module}`");
@@ -1588,12 +1580,12 @@ mod tests {
     /// **The invariant that makes matching a window BY TITLE safe at all.**
     ///
     /// [`RAISING_SITES`] compares title *identifiers*; it never looks at their
-    /// values. **Five** modules open a window titled literally `"Deskwarden"`
+    /// values. **Four** modules open a window titled literally `"Deskwarden"`
     /// -- `vault_window`, `app_window` and `loading_ui`, which all raise, and
-    /// `overlay_ui` and `preflight_host`, which are excused. (This said "four"
-    /// while there were four, and went stale the day the preflight host
-    /// landed; a count in prose goes stale silently, which is why the one
-    /// below is asserted.) [`pick`] is a `find`, so if two of them were ever on
+    /// `preflight_host`, which is excused. (It said "five" while `overlay_ui`
+    /// was one of them, and that module is gone: every card the daemon shows
+    /// is bare Win32 now, each under a title of its own. A count in prose goes
+    /// stale silently, which is why the one below is asserted.) [`pick`] is a `find`, so if two of them were ever on
     /// screen together a raise would take whichever `EnumWindows` happened to
     /// hand back first, silently and non-deterministically.
     ///
@@ -1604,7 +1596,7 @@ mod tests {
     /// Serialisation is therefore not what makes it safe -- a unique title is,
     /// and that is asserted below rather than left in prose.
     ///
-    /// For the five that do share a title, the collision is not reachable
+    /// For the four that do share a title, the collision is not reachable
     /// today, and the reason is worth naming because it is the thing being
     /// pinned rather than the collision itself:
     ///

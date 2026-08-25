@@ -4017,7 +4017,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // **What it CAN ask for is one thing, and it is not a fill.** 3b
             // carries exactly one button, and it is *Unlock*: not a search of
             // a vault that cannot be read (see
-            // `overlay_ui::SEARCH_VAULT_LABEL`), and not a new login, which
+            // `picker_prompt::SEARCH_VAULT_LABEL`), and not a new login, which
             // ends in a write to a vault that cannot be opened. The answer is
             // carried out of here exactly as 3a's *Search vault* is -- as a
             // return value to `run`'s loop, which owns the session this
@@ -6568,7 +6568,7 @@ fn open_vault_window(
     // door but one: the overlay's 3a card answered *Search vault*. See
     // `RealVaultOps::initial_search` for why it is taken once rather than
     // re-applied to every window this call may open, and
-    // `overlay_ui::SEARCH_VAULT_LABEL` for how the answer got here.
+    // `picker_prompt::SEARCH_VAULT_LABEL` for how the answer got here.
     initial_search: Option<String>,
 ) -> SessionEstate {
     // A four-line constructor. Everything this function used to do is now

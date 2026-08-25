@@ -2473,6 +2473,7 @@ mod tests {
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
                 "examples/prompt_preview.rs",
+                "examples/save_login_preview.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/unlock_prompt_preview.rs",

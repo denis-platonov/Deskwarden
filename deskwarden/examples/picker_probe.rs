@@ -20,7 +20,7 @@
 //   bw list items --search <item name>
 // and check the `deskwarden:app-match` custom field is present.
 
-use deskwarden::overlay_ui::OverlayMatch;
+use deskwarden::prompt_card::OverlayMatch;
 use deskwarden::prompt_card::show_prompt_card;
 use deskwarden::picker_ui::run_picker;
 use deskwarden::vault_bridge::VaultBridge;
