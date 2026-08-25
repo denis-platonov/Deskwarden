@@ -589,10 +589,12 @@ const SECONDARY_W: i32 = 168;
 /// [`NEW_LOGIN_SHORTCUT`]. Wider than the bare-label 84 px it used to be --
 /// `ESC` is a shorter chip than `CTRL+ALT+N`, so it does not need as much of
 /// an increase, but a chip drawn into a button never widened for it is a chip
-/// drawn over its own label. There is 86 px of slack between the two footer
-/// buttons and the card's left margin at [`SECONDARY_W`], so widening Cancel
-/// by this much still leaves both buttons on screen -- see
-/// `nothing_the_card_lays_out_falls_off_the_bottom_of_it`.
+/// drawn over its own label. At the bare-label 84 px there was 86 px of slack
+/// between the footer pair and the card's left margin, so this 20 px went into
+/// slack the card already had: with [`SECONDARY_W`] beside it the pair now
+/// starts 66 px inside [`MARGIN_X`], and both buttons are still on screen --
+/// see `nothing_the_card_lays_out_falls_off_the_bottom_of_it`, which pins that
+/// against `MARGIN_X` rather than against the window's edge.
 const CANCEL_W: i32 = 104;
 
 /// One rectangle of the card, in logical pixels from the window's top left.
@@ -1324,6 +1326,16 @@ mod win32 {
         // Every slot gets a control whether or not this list fills it: the
         // second step reuses the same controls for its own rows, and creating
         // them lazily would mean creating a window from inside a repaint.
+        //
+        // **Created hidden, and `apply_mode` decides which come back.** The
+        // empty card is laid out for two rows but still makes six, so slots
+        // 2..6 are placed below its own footer and past the bottom of a 213 px
+        // window. Created `WS_VISIBLE` they were four blank buttons painted
+        // over the footer for the one frame between here and the
+        // `ShowWindow(SW_HIDE)` in `apply_mode` -- which runs after this loop,
+        // on a parent that is already up. `apply_mode` shows exactly the rows
+        // `visible_row_count` claims, in every mode, so nothing that should be
+        // on screen is left hidden by this.
         for index in 0..LIST_ROWS {
             let Some(control) = child(
                 window,
@@ -1340,7 +1352,7 @@ mod win32 {
         let Some(secondary) = child(
             window,
             w!("BUTTON"),
-            WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+            WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             l.secondary,
             ID_SECONDARY,
             button_font,
@@ -1350,7 +1362,7 @@ mod win32 {
         let Some(cancel) = child(
             window,
             w!("BUTTON"),
-            WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+            WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             l.cancel,
             ID_CANCEL,
             button_font,
@@ -1714,7 +1726,11 @@ mod win32 {
                 WINDOW_EX_STYLE(0),
                 class,
                 w!(""),
-                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | style),
+                // `WS_VISIBLE` is the CALLER's, not this helper's: a control
+                // created visible at a rectangle its mode does not use is on
+                // screen for the frame between `CreateWindowExW` and the
+                // `ShowWindow(SW_HIDE)` that `apply_mode` gets to afterwards.
+                WINDOW_STYLE(WS_CHILD.0 | style),
                 scale(at.x),
                 scale(at.y),
                 scale(at.w),
@@ -2477,15 +2493,31 @@ mod card_tests {
         let l = layout(LIST_ROWS);
         assert!(l.subtitle.bottom() <= l.list.y);
         assert!(l.list.bottom() <= l.cancel.y);
-        assert!(l.cancel.bottom() <= l.window.bottom());
+        // **Against the MARGIN, not against the window's edge.** The card's
+        // rule is `MARGIN_X` either side and `MARGIN_TOP` under the footer; a
+        // pin that only forbade a control leaving the window is 16 px slacker
+        // than the layout it guards, and would have watched `CANCEL_W` grow
+        // from 84 to 104 without a word. What is asserted is the rule.
+        assert!(
+            l.cancel.bottom() + MARGIN_TOP <= l.window.bottom(),
+            "the footer has eaten the card's bottom margin"
+        );
         assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
-        assert!(l.secondary.x >= 0, "the footer runs off the left edge of the card");
+        assert!(
+            l.secondary.x >= MARGIN_X,
+            "the footer pair has outgrown the card's left margin: it starts at {} px, inside \
+             MARGIN_X of {MARGIN_X}",
+            l.secondary.x
+        );
         let last = row_at(LIST_ROWS, LIST_ROWS - 1);
         assert!(
             last.bottom() <= l.list.bottom(),
             "the last row is outside the list area, and this card cannot scroll to it"
         );
-        assert!(l.close_glyph.right() <= l.window.right());
+        assert!(
+            l.close_glyph.right() <= l.window.right() - MARGIN_X,
+            "the close glyph has crossed the card's right margin"
+        );
         // The bottom row of a full card is the *Search the vault* row, and it
         // is the one that goes first if `LIST_ROWS` and `ROW_CAP` ever drift
         // apart again.
@@ -3039,19 +3071,40 @@ mod tests {
         let raw =
             std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
         let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        // Comments stripped, like the pins beside this one: the prose above
+        // the branch names both `ID_CANCEL` and `ESC_SHORTCUT`, and a scan
+        // that could not tell code from the comment explaining it would pass
+        // on the explanation alone.
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // **Whitespace-normalised, so this pin is about the code and not
+        // about its indentation.** Matching twenty-four exact spaces made a
+        // `rustfmt` reflow of `paint_control` -- a wrapped `if`, a renamed
+        // binding one line up -- fail as though the chip had been deleted. A
+        // false alarm on a pin is how pins get deleted. The claim is the
+        // same: `ID_CANCEL`'s branch is the one that yields `ESC_SHORTCUT`.
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             production.len() < raw.len(),
             "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
              test module as production"
         );
         assert!(
-            production.contains("if id == ID_CANCEL {\n                        Some(ESC_SHORTCUT)"),
+            flat.contains("if id == ID_CANCEL { Some(ESC_SHORTCUT)"),
             "the production code no longer hands `ESC_SHORTCUT` to `ID_CANCEL`'s branch -- the \
              Cancel button's chip is gone"
         );
         assert!(
-            production.contains("draw_button_with_shortcut"),
+            flat.contains("draw_button_with_shortcut"),
             "control: this scan is not reading the function that paints the footer buttons"
+        );
+        assert!(
+            flat.contains("ID_SECONDARY && MODE.load"),
+            "control: the whitespace-normalised scan is not reading `paint_control`'s hint \
+             branch at all, so the rule above could be matching some other text"
         );
         assert_eq!(ESC_SHORTCUT, "ESC");
     }

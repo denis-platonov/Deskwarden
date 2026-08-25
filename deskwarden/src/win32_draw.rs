@@ -182,6 +182,46 @@ pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
     }
 }
 
+/// Where a hint chip sits inside the surface it belongs to, and what it costs
+/// the label lane beside it. See [`hint_chip_lane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipLane {
+    /// The chip's left edge, never left of the rect's own.
+    pub left: i32,
+    /// The chip's right edge, inset from the rect's by `TEXT_CLIP_INSET`.
+    pub right: i32,
+    /// What the caller must take off the label's right edge: the chip plus
+    /// the gap that keeps a truncated name from touching it. Never wider than
+    /// the rect.
+    pub lane: i32,
+}
+/// Places the chip for a run of text `text_w` device pixels wide, right
+/// aligned inside `rect`.
+///
+/// **Clamped against the rect it was given, in both directions.** The chip is
+/// measured at runtime -- `GetTextExtentPoint32W` on the user's own hint font
+/// at the user's own DPI -- so its width is not a number this module chose,
+/// and nothing here bounds it against the button. Unclamped, a chip wider
+/// than its surface would put `left` to the left of `rect.left` and, worse,
+/// hand back a lane wider than the rect, which inverts the label rect
+/// [`draw_button_with_shortcut`] and [`draw_row`] derive by subtracting it --
+/// an inverted `RECT` is a `DrawTextW` that paints nothing, so a chip 1 px too
+/// wide would silently cost the row its name.
+///
+/// Today's arithmetic does not reach that: `CTRL+ALT+N` measures ~73 px inside
+/// a 168 px `SECONDARY_W`, and both sides scale linearly with DPI, so the
+/// ratio holds at every scaling factor. The clamp is the guarantee that a
+/// longer hint, a wider font or a narrower button degrades into a clipped chip
+/// rather than into a row with no text at all.
+pub fn hint_chip_lane(rect: RECT, text_w: i32, scale: i32) -> ChipLane {
+    let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
+    let width = (rect.right - rect.left).max(0);
+    let right = (rect.right - px(crate::theme::TEXT_CLIP_INSET)).max(rect.left);
+    let w = (text_w.max(0) + 2 * px(crate::theme::CHIP_PAD_X)).min(right - rect.left);
+    let gap = px(crate::theme::CHIP_PAD_X);
+    ChipLane { left: right - w, right, lane: (w + gap).min(width) }
+}
+
 /// Paints one keyboard-hint chip, right-aligned inside `rect`, and answers how
 /// much of the row's width it took -- the chip plus the gap that keeps a
 /// truncated name from touching it.
@@ -198,7 +238,6 @@ pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
 /// Every GDI object created here is restored and deleted before returning,
 /// matching [`draw_button`] -- this runs in the daemon's repaint path.
 pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32) -> i32 {
-    let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
     unsafe {
         let chars: Vec<u16> = hint.encode_utf16().collect();
         let old_font = SelectObject(hdc, font);
@@ -211,11 +250,9 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
             SelectObject(hdc, old_font);
             return 0;
         }
+        let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
+        let ChipLane { left, right, lane } = hint_chip_lane(rect, size.cx, scale);
         let h = px(crate::theme::CHIP_HEIGHT);
-        let w = size.cx + 2 * px(crate::theme::CHIP_PAD_X);
-        let gap = px(crate::theme::CHIP_PAD_X);
-        let right = rect.right - px(crate::theme::TEXT_CLIP_INSET);
-        let left = right - w;
         let top = rect.top + ((rect.bottom - rect.top) - h) / 2;
         let radius = px(crate::theme::CHIP_RADIUS) * 2;
 
@@ -235,7 +272,7 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
         let mut rc = RECT { left, top, right, bottom: top + h };
         DrawTextW(hdc, &mut chars, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old_font);
-        w + gap
+        lane
     }
 }
 
@@ -343,6 +380,57 @@ pub fn draw_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An oversized chip cannot invert the lane it leaves behind.**
+    ///
+    /// The chip's width comes from `GetTextExtentPoint32W` at runtime, so it
+    /// is not a number this module chose. Both callers derive the label's
+    /// rect by subtracting the returned lane from the surface's right edge,
+    /// and a lane wider than the surface makes `right < left` -- a `RECT`
+    /// `DrawTextW` paints nothing into, so the row would lose its name
+    /// entirely rather than show a clipped chip.
+    ///
+    /// A hint measured at ten times the button's width is not a string this
+    /// card has; it is the bound stated as a value, so the clamp cannot be
+    /// removed and still pass.
+    #[test]
+    fn an_oversized_hint_chip_cannot_invert_the_label_lane() {
+        let button = RECT { left: 0, top: 0, right: 168, bottom: 32 };
+        for scale in [100, 125, 150, 200, 300] {
+            let huge = hint_chip_lane(button, 1680, scale);
+            assert!(
+                huge.left >= button.left,
+                "at {scale}% the chip starts at {} px, left of the button's own {} px",
+                huge.left,
+                button.left
+            );
+            assert!(huge.right >= huge.left, "at {scale}% the chip's own rect is inverted");
+            assert!(
+                button.right - huge.lane >= button.left,
+                "at {scale}% the chip took a {} px lane out of a {} px button, so the label rect \
+                 the callers build from it is inverted and draws nothing",
+                huge.lane,
+                button.right - button.left
+            );
+        }
+        // CONTROL: the clamp is a bound on the bad case, not a flattening of
+        // the ordinary one. The real hints still get a lane proportional to
+        // their own width, and a wider run still costs more of the label.
+        let narrow = hint_chip_lane(button, 24, 100);
+        let wide = hint_chip_lane(button, 73, 100);
+        assert!(
+            narrow.lane < wide.lane && wide.lane < button.right - button.left,
+            "the clamp has eaten the ordinary case: `ESC` took {} px and `CTRL+ALT+N` {} px of a \
+             {} px button",
+            narrow.lane,
+            wide.lane,
+            button.right - button.left
+        );
+        // And a button with no room at all degrades rather than inverting.
+        let nothing = hint_chip_lane(RECT { left: 40, top: 0, right: 40, bottom: 32 }, 60, 100);
+        assert_eq!(nothing.left, 40);
+        assert_eq!(nothing.lane, 0);
+    }
 
     /// **Both of a row's lines end in an ellipsis rather than mid-glyph.**
     ///

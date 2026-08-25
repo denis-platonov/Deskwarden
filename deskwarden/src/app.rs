@@ -2624,13 +2624,33 @@ pub fn handle_no_match(
     // `FRIENDLY_NAME_BUDGET` -- an unreachable path, a binary with no
     // resource, a process that has already exited -- leaves `label` standing,
     // which is exactly what the card said before.
-    let friendly = crate::window_watch::process_image_path_for_pid(window.pid).and_then(|path| {
-        crate::app_identity::probe_display_name(&path, &window.exe_name, FRIENDLY_NAME_BUDGET)
-    });
+    //
+    // **Only when the card is going to say it.** `picker_prompt::headings`
+    // spells `card_name` in `MODE_EMPTY` alone; the populated card's heading
+    // is the fixed *Fill from vault*, so on the common path the probe bought a
+    // string nothing painted -- and charged up to `FRIENDLY_NAME_BUDGET` of a
+    // keystroke's latency, plus a thread per hotkey press, to buy it. The
+    // budget belongs on the one path that spends the answer.
+    let friendly = offers
+        .is_empty()
+        .then(|| {
+            crate::window_watch::process_image_path_for_pid(window.pid).and_then(|path| {
+                crate::app_identity::probe_display_name(
+                    &path,
+                    &window.exe_name,
+                    FRIENDLY_NAME_BUDGET,
+                )
+            })
+        })
+        .flatten();
     let card_name = friendly.as_deref().unwrap_or(label);
     let outcome = crate::picker_prompt::ask(&offers, card_name);
+    // `card_name` is the friendly name only on the empty card, which is the
+    // only card that shows one; on a populated card it is `window_label`'s
+    // own string, so the line says *window* rather than claiming a display
+    // name this path deliberately did not resolve.
     log::info!(
-        "the account picker offered {} account(s) for {card_name} and was answered: {}",
+        "the account picker offered {} account(s) for window {card_name} and was answered: {}",
         offers.len(),
         describe_picker_outcome(&outcome)
     );
