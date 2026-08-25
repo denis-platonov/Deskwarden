@@ -2007,10 +2007,15 @@ fn main() {
     // `rebuild_after_vault_window`, sweep the queue -- rather than through a
     // fourth copy of them.
     //
-    // Both call sites below write it and the one door reads it, which is why
-    // the seeding call (before the loop, where there is no `open_vault_window`
-    // to reach) does not need a second handler of its own: a card answered
-    // while seeding is honoured on the loop's first pass.
+    // **Every door writes it through `ask_for_a_vault_search` and nothing
+    // else**, so a door can ask for a search and can never clear one. See that
+    // function for why: the doors are spread down the loop body and the
+    // consumer is at the top, so a door writing the `Option` directly answers
+    // an ordinary event with `None` and erases a request a door above it just
+    // made. The one door reads it, which is why the seeding call (before the
+    // loop, where there is no `open_vault_window` to reach) does not need a
+    // second handler of its own: a card answered while seeding is honoured on
+    // the loop's first pass.
     let mut pending_vault_search: Option<String> = None;
 
     // The process id of the last real (not our own) foreground window, kept
@@ -2033,7 +2038,11 @@ fn main() {
         if event.pid != own_pid {
             last_active_pid = Some(event.pid);
         }
-        pending_vault_search = dispatch_with_the_unlock_door(
+        // Before the loop, so no consumer has run and nothing of anyone
+        // else's can be erased here -- routed through the same door as the
+        // other two anyway, so that "no door assigns it directly" stays true
+        // of every writer and the pin can say so without an exception.
+        ask_for_a_vault_search(&mut pending_vault_search, dispatch_with_the_unlock_door(
             &event,
             &mut estate,
             &injector,
@@ -2049,7 +2058,7 @@ fn main() {
             &config_dir,
             deskwarden::unlock_prompt::ask,
             deskwarden::app::Trigger::Foreground,
-        );
+        ));
     }
 
     // Tray menu clicks that arrived while one of this app's blocking windows
@@ -2878,7 +2887,7 @@ fn main() {
                     deskwarden::app::window_label(&event.exe_name, &event.title)
                 );
                 last_dispatched_hwnd = None;
-                if let Some(query) = dispatch_with_the_unlock_door(
+                ask_for_a_vault_search(&mut pending_vault_search, dispatch_with_the_unlock_door(
                     &event,
                     &mut estate,
                     &injector,
@@ -2894,13 +2903,7 @@ fn main() {
                     &config_dir,
                     deskwarden::unlock_prompt::ask,
                     deskwarden::app::Trigger::Hotkey,
-                ) {
-                    // Only when the card actually asked for one: a bare
-                    // assignment here would erase a search request the
-                    // foreground path made earlier in this same pass, which
-                    // the loop has not reached its door for yet.
-                    pending_vault_search = Some(query);
-                }
+                ));
             }
         }
 
@@ -3080,7 +3083,7 @@ fn main() {
             if event.pid != own_pid {
                 last_active_pid = Some(event.pid);
             }
-            pending_vault_search = dispatch_with_the_unlock_door(
+            ask_for_a_vault_search(&mut pending_vault_search, dispatch_with_the_unlock_door(
                 &event,
                 &mut estate,
                 &injector,
@@ -3096,9 +3099,47 @@ fn main() {
                 &config_dir,
                 deskwarden::unlock_prompt::ask,
                 deskwarden::app::Trigger::Foreground,
-            );
+            ));
         }
     }
+}
+
+/// Records a door's answer as `run`'s pending vault-search request.
+///
+/// **The only way any door writes `pending_vault_search`, and the reason it is
+/// a function at all: a door can ask for a search, and can never clear one.**
+/// The doors are spread across the loop body -- the hotkey one near the middle,
+/// the foreground one at the very bottom, the consumer near the top -- so a
+/// request one door makes is not consumed until the loop comes round again, and
+/// every door below it runs first. A door that wrote the `Option` directly would
+/// therefore answer an ordinary event with `None` and erase a request a door
+/// above it had just made; that is exactly how *Search the vault* on the
+/// account picker came to close the card and open nothing. Guarding one door
+/// against it -- which the hotkey door did, and the foreground door did not --
+/// leaves the hazard live at the others and at the fourth door somebody adds
+/// later, so the write is narrowed here instead: `None` in means nothing
+/// happens, wherever in the body the caller sits.
+///
+/// An unconsumed request wins over a later one. Two requests cannot both be
+/// served -- the consumer `take`s one and opens one window, deliberately -- and
+/// of the two, the one already waiting is the one the user asked for first.
+///
+/// `run` is not reachable from any test in this crate (see [`search_asked_for`]),
+/// so this function is where that wiring is actually held; see
+/// `a_door_can_only_ask_for_a_search`, and
+/// `no_door_assigns_the_pending_search_pin` for the doors going through it.
+fn ask_for_a_vault_search(pending: &mut Option<String>, asked: Option<String>) {
+    let Some(query) = asked else {
+        return;
+    };
+    if pending.is_some() {
+        // Never the query itself: this is a log line.
+        log::info!(
+            "a second door asked to search the vault before the first request opened a              window; keeping the first"
+        );
+        return;
+    }
+    *pending = Some(query);
 }
 
 /// The search query a [`NoMatchFollowUp`] asks for, if it asks for one.
@@ -23815,6 +23856,57 @@ mod tests {
             );
         }
 
+        /// **The reported defect, at the only place a test can reach it.**
+        ///
+        /// *Search the vault* on the account picker closed the card and opened
+        /// nothing. The doors that write `run`'s pending request are spread
+        /// down the loop body and the consumer sits at the top, so a request
+        /// made at one is not consumed until the next turn -- after every door
+        /// below it has answered its own event. When a door wrote the `Option`
+        /// directly, an ordinary foreground change (which asks for no search,
+        /// and which dismissing the picker itself produces) answered `None` and
+        /// erased the waiting query. The loop turns every 200 ms, so this was
+        /// not a race; it was the normal path.
+        ///
+        /// [`ask_for_a_vault_search`] is what makes it unreachable: `None` in
+        /// is a no-op, so no door can clear another's request no matter where
+        /// in the body it is added. The first assertion is the bug; the third
+        /// is the ordering rule; the fourth is the control that proves the
+        /// helper writes at all rather than being inert.
+        #[test]
+        fn a_door_can_only_ask_for_a_search() {
+            let mut pending = Some("Ledgerline".to_string());
+            ask_for_a_vault_search(&mut pending, None);
+            assert_eq!(
+                pending,
+                Some("Ledgerline".to_string()),
+                "a door that asked for nothing erased a request another door had already \
+                 made: the card closes and no window opens, which is the reported defect"
+            );
+
+            let mut pending = None;
+            ask_for_a_vault_search(&mut pending, None);
+            assert_eq!(pending, None, "nothing asked for, nothing invented");
+
+            let mut pending = Some("first".to_string());
+            ask_for_a_vault_search(&mut pending, Some("second".to_string()));
+            assert_eq!(
+                pending,
+                Some("first".to_string()),
+                "the consumer takes one and opens one window, so of two requests the one \
+                 already waiting -- asked for first -- is the one that must survive"
+            );
+
+            let mut pending = None;
+            ask_for_a_vault_search(&mut pending, Some("Ledgerline".to_string()));
+            assert_eq!(
+                pending,
+                Some("Ledgerline".to_string()),
+                "control: the helper never stores anything, so every assertion above is \
+                 reading a constant rather than the merge"
+            );
+        }
+
         /// **Finding 1, and the retirement of `Auto`, in one test.**
         ///
         /// The item's own `trigger` is `Auto` -- the mode that used to type
@@ -26252,7 +26344,9 @@ mod startup_shape_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 2,
+            // Three since `no_door_assigns_the_pending_search_pin` joined
+            // the two that were here.
+            modules, 3,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -26269,5 +26363,118 @@ mod startup_shape_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+/// **Source pin: no door assigns `pending_vault_search` directly.**
+///
+/// The established shape (`picker_prompt`'s `no_thread_quit_pin`,
+/// `job_object`'s scanners). `run` is not reachable from any test in this
+/// crate -- that is recorded at [`search_asked_for`], and it is why the
+/// *Search the vault* defect shipped with every test passing -- so the unit
+/// test over [`ask_for_a_vault_search`] proves the merge is safe but cannot
+/// prove the doors go through it. This does: nowhere in the file is the
+/// variable followed by a bare `=`. The one `let mut ... : Option<String> =
+/// None` that declares it is not such a line -- the type annotation sits
+/// between the name and the `=`, which is what separates a declaration from a
+/// write -- and it is asserted for separately below, as the control that
+/// proves the scan is reading this file at all. A fourth door added with a
+/// bare assignment fails here.
+///
+/// **Normalised first.** This is a CRLF checkout with no `.gitattributes`;
+/// scanning lines without trimming the carriage return makes every comparison
+/// below miss and the pin vacuous. The controls are what prove the scan did
+/// not silently read nothing.
+#[cfg(test)]
+mod no_door_assigns_the_pending_search_pin {
+    /// Split across two literals, in this crate's idiom: `include_str!` pulls
+    /// this module in too, so an unsplit needle would match itself.
+    const VARIABLE: &str = concat!("pending_vault", "_search");
+    const DECLARATION: &str = concat!("let mut pending_vault", "_search: Option<String> = None;");
+    const DOOR: &str = concat!("ask_for_a_vault", "_search(");
+
+    /// `main.rs` with CRLF normalised and every `//` comment stripped. Cutting
+    /// comments can only make the scan MISS an assignment, never invent one --
+    /// and the comments here name the variable on purpose, to explain what may
+    /// not be done to it.
+    fn source() -> Vec<String> {
+        include_str!("main.rs")
+            .lines()
+            .map(|line| {
+                let flat = line.trim_end();
+                match flat.find("//") {
+                    Some(at) => flat[..at].trim().to_string(),
+                    None => flat.trim().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// Lines that put something into the variable: the name, then an `=` that
+    /// is neither `==` nor part of a type annotation.
+    fn assignments(lines: &[String]) -> Vec<&String> {
+        lines
+            .iter()
+            .filter(|line| {
+                let Some(after) = line.split_once(VARIABLE).map(|(_, rest)| rest.trim_start())
+                else {
+                    return false;
+                };
+                after.starts_with('=') && !after.starts_with("==")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_door_asks_rather_than_assigns() {
+        let lines = source();
+        let raw = include_str!("main.rs");
+        if raw.contains("\r\n") {
+            // On a CRLF checkout the trim is load-bearing: without it the
+            // declaration below would never match and every assertion here
+            // would be reading an empty scan.
+            assert!(
+                !lines.iter().any(|line| line.contains('\r')),
+                "control: a carriage return survived normalisation, so the scan is comparing \
+                 against text that can never match"
+            );
+        }
+        assert!(
+            lines.iter().any(|line| line == DECLARATION),
+            "control: the declaration was not found, so the scan is reading nothing and would \
+             pass however the doors were written"
+        );
+        assert!(
+            lines.iter().filter(|line| line.contains(DOOR)).count() >= 4,
+            "control: fewer mentions of the merge helper than there are doors plus its own \
+             definition, so the doors are not going through it at all"
+        );
+
+        let found = assignments(&lines);
+        assert!(
+            found.is_empty(),
+            "a door assigns the pending search request directly instead of asking through the \
+             merge helper. A bare assignment answers an ordinary event with `None` and erases \
+             a request another door made earlier in the same pass, before the consumer at the \
+             top of the loop is reached again -- which is how *Search the vault* came to close \
+             the card and open nothing. Offending lines: {found:?}"
+        );
+
+        // Controls on the filter itself rather than on the file: a shape the
+        // pin MUST catch is fed through it here, so an edit that breaks the
+        // matching -- and would make the scan above pass by finding nothing,
+        // however the doors were written -- fails on these lines instead.
+        let planted = vec![format!("{VARIABLE} = dispatch_with_the_unlock_door(&event);")];
+        assert_eq!(
+            assignments(&planted).len(),
+            1,
+            "control: the scan does not recognise a bare assignment even when handed one, so \
+             its silence about this file means nothing"
+        );
+        assert!(
+            assignments(&[DECLARATION.to_string()]).is_empty(),
+            "control: the declaration is being read as a write, so the pin can never be \
+             satisfied by correct code"
+        );
     }
 }
