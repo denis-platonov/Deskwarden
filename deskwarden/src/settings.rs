@@ -1096,19 +1096,27 @@ pub struct Settings {
     /// **`true` (the default), and what an older `settings.json` without this
     /// field parses as** -- today's behaviour, unconditionally.
     ///
-    /// **Read by one pure function, and acted on by nothing.**
+    /// **Live, and it is the field with the most behind it.**
     /// [`crate::backend_policy::choose`] is where this field and an account's
     /// server URL become a backend, and that rule -- self-hosted *and* this
     /// setting off, or else `bw serve`; unknown counts as official -- is
-    /// stated and table-tested there rather than at any call site.
+    /// stated and table-tested there rather than at any call site. `main`'s
+    /// `settle_the_vault_backend` acts on the answer: it fills the vault slot
+    /// with a [`crate::rest::backend::RestBackend`] or with the `bw serve`
+    /// bridge, and `try_start_backend` refuses to spawn `bw serve` at all on
+    /// the direct-REST arm.
     ///
-    /// What is still missing is the startup path that would construct a
-    /// [`crate::rest::backend::RestBackend`] from that answer. Until it
-    /// exists, turning this off changes nothing, and that is deliberate:
-    /// `backend_policy::should_run`'s own doc says why a half-wired switch --
-    /// `bw serve` not started, nothing put in its place -- is worse than an
-    /// unwired one. **No Preferences row reads or writes it yet either**; the
-    /// row is drawn by whoever wires the construction, in the same change.
+    /// **Turning it back ON deletes the stored vault key.** The key
+    /// [`crate::user_key_store`] writes does not expire and cannot be
+    /// revoked, so the settlement that stops selecting direct REST is also
+    /// what removes it -- see `settle_the_vault_backend` and
+    /// `settling_off_direct_rest_deletes_the_stored_vault_key`.
+    ///
+    /// **Captured at startup and never re-read**, so the change takes effect
+    /// on the next launch; Preferences draws the row (see
+    /// `prefs_ui::official_crypto_description`), says so in the row itself,
+    /// and ghosts it with an explanation on an account that is not
+    /// self-hosted.
     pub use_official_bw_crypto: bool,
     pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --

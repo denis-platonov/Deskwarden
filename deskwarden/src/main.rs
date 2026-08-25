@@ -2497,6 +2497,7 @@ fn main() {
                         (Some(to), Some(state), Some(active)) => {
                             let from = active.clone();
                             let outcome = switch_to_account(
+                                REAL_BACKEND_REPOINT,
                                 &config_dir,
                                 &from,
                                 &to,
@@ -4303,18 +4304,48 @@ fn repopulate_and_refresh_after_unlock(
 /// recovery still works.
 fn restart_backend_after_unlock(
     engine: &mut MatchEngine,
-    start: impl FnOnce() -> Result<Child, BackendStartError>,
-) -> Option<Child> {
+    start: impl FnOnce() -> BackendStart,
+) -> BackendAfterUnlock {
     match start() {
-        Ok(child) => Some(child),
-        Err(e) => {
+        BackendStart::Started(child) => BackendAfterUnlock::Started(child),
+        // **C3.** A direct-REST account has no subprocess to restart, so
+        // there is nothing here that failed and nothing to stand down: the
+        // vault is reachable through `VaultCache::bridge` the whole time.
+        // Standing down here cleared the match engine on every unlock, every
+        // away-lock recovery and every re-auth of such an account, and then
+        // told the user to press "Sync" -- which was itself broken (C4).
+        BackendStart::NotSelected => {
+            log::info!(
+                "this account's vault is served directly over REST, so the unlock recovery has                  no `bw serve` to restart; carrying on with the vault the cache's own bridge                  answers from"
+            );
+            BackendAfterUnlock::NoSubprocess
+        }
+        BackendStart::Failed(e) => {
             stand_down_after_unlock(
                 engine,
                 &format!("the Bitwarden backend could not be restarted after unlocking ({e})"),
             );
-            None
+            BackendAfterUnlock::StoodDown
         }
     }
+}
+
+/// What [`restart_backend_after_unlock`] left behind.
+///
+/// Three answers rather than `Option<Child>`, because "no child, carry on"
+/// and "no child, autofill is down" need opposite handling by the caller and
+/// `None` said both. The middle arm is the direct-REST one.
+enum BackendAfterUnlock {
+    /// `bw serve` came up; the caller owns this child.
+    Started(Child),
+    /// Nothing had to come up: this account is served directly over REST.
+    /// The resettle continues to its readiness probe exactly as if a backend
+    /// had started, because as far as `VaultCache::bridge` is concerned one
+    /// has.
+    NoSubprocess,
+    /// `bw serve` was selected and would not start. Autofill has already been
+    /// stood down; the caller returns.
+    StoodDown,
 }
 
 /// Decides what the lock recovery does with the readiness probe's outcome:
@@ -6002,7 +6033,15 @@ impl VaultOps for RealVaultOps<'_> {
                 (Some(to), Some(state), Some(active)) => {
                     let from = active.clone();
                     let outcome =
-                        switch_to_account(deps.config_dir, &from, &to, active, store, &mut resettle);
+                        switch_to_account(
+                            REAL_BACKEND_REPOINT,
+                            deps.config_dir,
+                            &from,
+                            &to,
+                            active,
+                            store,
+                            &mut resettle,
+                        );
                     match outcome {
                         SwitchOutcome::Switched => {
                             // `adopt`, which moves this state's `active` and
@@ -6937,7 +6976,7 @@ fn resettle_session_with(
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
     session_token: &mut String,
     authenticate: impl FnOnce() -> Option<String>,
-    start: impl FnOnce(&str) -> Result<Child, BackendStartError>,
+    start: impl FnOnce(&str) -> BackendStart,
     probe: impl FnMut(ProbeWindow) -> VaultReadyOutcome,
 ) -> ResettleOutcome {
     // The account the *next* unlock lands on may not be this one (a
@@ -7013,10 +7052,14 @@ fn resettle_session_with(
     // nothing left to probe once no backend came up, so this returns
     // rather than spending the ~30s readiness deadline on a port nothing
     // is listening on.
-    let Some(child) = restart_backend_after_unlock(engine, || start(session_token)) else {
-        return ResettleOutcome::BackendNotStarted;
-    };
-    *bw_serve_child = Some(child);
+    match restart_backend_after_unlock(engine, || start(session_token)) {
+        BackendAfterUnlock::Started(child) => *bw_serve_child = Some(child),
+        // No child to track, and nothing wrong: fall through to the readiness
+        // probe and the repopulate, which is where a direct-REST account's
+        // vault actually comes back.
+        BackendAfterUnlock::NoSubprocess => *bw_serve_child = None,
+        BackendAfterUnlock::StoodDown => return ResettleOutcome::BackendNotStarted,
+    }
     // Captured here, *before* the readiness probe below, for the same
     // reason startup captures `startup_epoch` before its own probe: that
     // probe's `list_items()` is the fetch whose result seeds the cache
@@ -7194,7 +7237,15 @@ fn remove_account(
 
     if let Some(survivor) = &survivor {
         let from = state.active().clone();
-        match switch_to_account(config_dir, &from, survivor, active_account, store, resettle) {
+        match switch_to_account(
+            REAL_BACKEND_REPOINT,
+            config_dir,
+            &from,
+            survivor,
+            active_account,
+            store,
+            resettle,
+        ) {
             SwitchOutcome::Switched => state.adopt(survivor.clone()),
             other => {
                 return Err(format!(
@@ -7433,7 +7484,15 @@ fn add_account(
         return SwitchOutcome::RolledBack { reason };
     }
 
-    match switch_to_account(config_dir, &from, &added, active_account, store, resettle) {
+    match switch_to_account(
+        REAL_BACKEND_REPOINT,
+        config_dir,
+        &from,
+        &added,
+        active_account,
+        store,
+        resettle,
+    ) {
         SwitchOutcome::Switched => {
             state.adopt(added.clone());
             if let Err(e) =
@@ -7520,6 +7579,19 @@ fn add_account(
 /// can answer `None`, and that `None` is this function's `Declined`.
 // Called by the tray wiring in Task 11; see `ResettleReport` above.
 fn switch_to_account(
+    // **The seam I1 said was missing.** `resettle_vault_backend_for` reads a
+    // `BackendSettlement` `OnceLock` that `main` alone ever publishes, so in
+    // every test process it is a silent no-op -- which is why the five switch
+    // tests inject a `ResettleReport` directly and why no test could reach a
+    // direct-REST target at all. A `fn` pointer here is this crate's usual
+    // answer (see `REAL_NO_MATCH_CARD` and `REAL_PASSWORD_FIELD_PROBE`): the
+    // production binding is named and not called, and a test can watch the
+    // re-point happen in order against the rest of the sequence.
+    //
+    // FIRST rather than last so that the production binding is the first
+    // thing every call site reads, next to the config directory the re-point
+    // is relative to.
+    repoint: BackendRepoint,
     config_dir: &Path,
     from: &Account,
     to: &Account,
@@ -7545,7 +7617,7 @@ fn switch_to_account(
     // uninstalls) the login window's direct-REST derivation, so the master
     // password the resettle is about to ask for derives a key for the account
     // it is actually being asked for.
-    resettle_vault_backend_for(to);
+    repoint(to);
 
     let report = resettle(config_dir, to, store);
     let failure = match report {
@@ -7583,7 +7655,7 @@ fn switch_to_account(
     bw_path::set_active_data_dir(previous_dir);
     *store = session_store::SessionStore::new(accounts::session_path_for(config_dir, &from.id));
     // The rollback's third re-point, for the reason the forward path's is.
-    resettle_vault_backend_for(from);
+    repoint(from);
     match resettle(config_dir, from, store) {
         // A decline is the user changing their mind, and the previous account
         // is back: there is nothing to report but the fact that nothing moved.
@@ -7722,12 +7794,12 @@ enum BackendOp {
     /// `open_vault_window` made sure the backend was up before showing the
     /// window. No sync/populate/rebuild attached -- reads already come from
     /// `cache` regardless of whether this succeeded.
-    EnsureRunning(Result<Child, BackendStartError>),
+    EnsureRunning(BackendStart),
     /// The tray's "Sync" item: ensure the backend is running (`child` is
     /// `Some` only if this operation itself had to start it), then run
     /// `bw sync` and repopulate the cache.
     Sync {
-        child: Option<Result<Child, BackendStartError>>,
+        child: Option<BackendStart>,
         outcome: SyncOutcome,
     },
 }
@@ -7856,7 +7928,7 @@ fn apply_backend_op(
     tray_effects: &mut Vec<TrayEffect>,
 ) {
     match op {
-        BackendOp::EnsureRunning(Ok(child)) => {
+        BackendOp::EnsureRunning(BackendStart::Started(child)) => {
             if adopt_started_child(bw_serve_child, child) {
                 log::info!("bw serve started for the vault window");
             }
@@ -7867,7 +7939,16 @@ fn apply_backend_op(
             // be a stale "Syncing..." from an earlier wedged sync.
             tray_effects.push(TrayEffect::SyncIdle);
         }
-        BackendOp::EnsureRunning(Err(e)) => {
+        // Nothing was started because nothing needed starting. Not an error,
+        // and not silence either: the tray item still has to come back to
+        // idle, exactly as the started arm does.
+        BackendOp::EnsureRunning(BackendStart::NotSelected) => {
+            log::info!(
+                "the vault window needed no `bw serve`: this account is served directly over                  REST"
+            );
+            tray_effects.push(TrayEffect::SyncIdle);
+        }
+        BackendOp::EnsureRunning(BackendStart::Failed(e)) => {
             log::error!(
                 "could not start bw serve for the vault window (writes and TOTP will fail until \
                  the next attempt; reads still work from the cache): {e}"
@@ -7876,10 +7957,16 @@ fn apply_backend_op(
         }
         BackendOp::Sync { child, outcome } => {
             match child {
-                Some(Ok(c)) => {
+                Some(BackendStart::Started(c)) => {
                     adopt_started_child(bw_serve_child, c);
                 }
-                Some(Err(e)) => log::error!("sync could not start bw serve: {e}"),
+                // There was nothing to start, so `bw_serve_child` stays
+                // `None` and the sync below ran against the direct-REST
+                // bridge. See `spawn_sync`.
+                Some(BackendStart::NotSelected) => {}
+                Some(BackendStart::Failed(e)) => {
+                    log::error!("sync could not start bw serve: {e}")
+                }
                 None => {}
             }
             match settle_sync_outcome(outcome, cache) {
@@ -8016,30 +8103,13 @@ fn spawn_sync(
         // second full-vault `list_items` (~1.1s / 1.08 MB on a 1657-item
         // vault, measured in this repo), the same reuse review 16 made on
         // the unlock path. `Ok(None)` when nothing has listed it yet.
-        let start_failed = matches!(&child, Some(Err(_)));
-        let ready = if start_failed {
-            Err("bw serve could not be started".to_string())
-        } else if currently_running {
-            bw_serve::run_bw_sync(&session_token).map(|()| None)
-        } else {
-            // We just started `bw serve` ourselves. `try_start_backend`
-            // returns as soon as the child process is resumed -- it does
-            // *not* wait for `bw serve` (a bundled Node binary whose cold
-            // start regularly takes several seconds) to actually be
-            // listening. That gap is exactly why `wait_for_vault_ready`
-            // exists and why the startup path always calls it before its
-            // first `populate()`. Without the same wait here, `populate()`
-            // below would very often race a backend that isn't answering
-            // requests yet, fail with a connection error, and report "sync
-            // failed" even though `try_start_backend`'s own `bw sync` had
-            // completed successfully and the cache was never actually
-            // refreshed -- precisely the mode this tray item exists for
-            // (`keep_backend_running = false`, backend stopped at idle).
-            // The `currently_running` branch above needs no such wait: a
-            // backend that was already running before this click is, by
-            // definition, already past this race.
-            let schedule = readiness_schedule(READINESS_DEADLINE);
-            wait_for_vault_ready(cache.bridge(), &schedule).map(Some)
+        let ready = match sync_refresh_for(&child) {
+            SyncRefresh::ReportStartFailure => Err("bw serve could not be started".to_string()),
+            SyncRefresh::ExplicitBwSync => bw_serve::run_bw_sync(&session_token).map(|()| None),
+            SyncRefresh::WaitOnTheBridge => {
+                let schedule = readiness_schedule(READINESS_DEADLINE);
+                wait_for_vault_ready(cache.bridge(), &schedule).map(Some)
+            }
         };
 
         let outcome = match ready {
@@ -8049,6 +8119,53 @@ fn spawn_sync(
 
         let _ = tx.send(BackendOp::Sync { child, outcome });
     });
+}
+
+/// **How a tray Sync refreshes the vault, given what its start attempt
+/// produced.** C4's fix, as a total function over the three outcomes.
+///
+/// The old spelling was one line inside `spawn_sync`:
+/// `matches!(&child, Some(Err(_)))`, and it was true of `NotSelected` too.
+/// So a Sync on a direct-REST account -- from the tray or from the vault
+/// window -- answered `SyncOutcome::Failed("bw serve could not be started")`
+/// and never reached `cache.bridge()`, the `LateBoundBackend` that was
+/// holding a perfectly good REST backend the whole time. **A direct-REST
+/// vault could not be manually refreshed at all**, which is also the recovery
+/// C3's stand-down was telling the user to use.
+///
+/// Separated from the thread body so it can be tested: `spawn_sync` itself
+/// spawns a thread, consults the process-wide backend policy and does real
+/// I/O, none of which a test in this crate may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRefresh {
+    /// `bw serve` is this account's backend and it would not start. There is
+    /// nothing listening to refresh from; report it.
+    ReportStartFailure,
+    /// The backend was already running before the click, so it never got
+    /// `try_start_backend`'s free `bw sync` and is owed an explicit one.
+    ExplicitBwSync,
+    /// Wait for the vault through `VaultCache::bridge` and reuse the items
+    /// that wait lists.
+    ///
+    /// Two ways here, and they want the same thing. A `bw serve` this call
+    /// just started is not listening yet -- `try_start_backend` returns as
+    /// soon as the child is resumed, and the bundled Node binary's cold start
+    /// regularly takes seconds -- so without the wait, `populate()` races a
+    /// backend that is not answering and reports a failure for a `bw sync`
+    /// that actually succeeded. A direct-REST account has nothing to wait for
+    /// but reaches the vault through the same bridge, so the same call is
+    /// both its refresh and (harmlessly, on the first attempt) its wait.
+    WaitOnTheBridge,
+}
+
+fn sync_refresh_for(child: &Option<BackendStart>) -> SyncRefresh {
+    match child {
+        Some(BackendStart::Failed(_)) => SyncRefresh::ReportStartFailure,
+        Some(BackendStart::NotSelected) | Some(BackendStart::Started(_)) => {
+            SyncRefresh::WaitOnTheBridge
+        }
+        None => SyncRefresh::ExplicitBwSync,
+    }
 }
 
 /// **The freshness contract for a completed backend operation, in one
@@ -8890,8 +9007,15 @@ fn recover_from_failed_vault_wait(
         job_ref(job),
         bw_serve::PORT_RELEASE_GRACE_RESTART,
     ) {
-        Ok(child) => Some(child),
-        Err(e) => {
+        BackendStart::Started(child) => Some(child),
+        // **C1.** This was the second fatal caller, and it was ungated: on a
+        // direct-REST account it ended the process with a message about a
+        // backend that account was never going to have, from five call sites
+        // none of which knew to gate it. There is nothing to start here, so
+        // there is nothing to be fatal about -- the vault wait below runs
+        // against the direct-REST backend the slot already holds.
+        BackendStart::NotSelected => None,
+        BackendStart::Failed(e) => {
             log::error!("{e}");
             fatal_startup_error(&format!(
                 "Deskwarden could not start its Bitwarden backend after you signed \
@@ -9328,6 +9452,29 @@ fn settle_the_vault_backend(
     };
 
     let Some((account, server_url)) = direct else {
+        // **The key on disk goes with the decision.** `userkey.bin` holds a
+        // wrapped master key: it does not expire and cannot be revoked from
+        // the web vault, so a copy left behind after this account stopped
+        // being served over REST is a secret held for no reason -- kept from
+        // the very user who turned the setting off.
+        // `user_key_store::UserKeyStore::clear`'s own doc names this arm as
+        // the caller's obligation. Both ways into it are covered: the
+        // preference going back to the official crypto, and an account whose
+        // server URL moves to a cloud host.
+        //
+        // A failure is logged and not fatal -- there is nothing the user
+        // could do about a locked file here, and refusing to launch over it
+        // would be worse than the residue -- but it is logged at `error`,
+        // because it is the one outcome that leaves the secret in place.
+        if let Some(account) = account {
+            let key_store =
+                user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+            if let Err(e) = key_store.clear() {
+                log::error!(
+                    "this account is no longer served over REST, but its stored vault key                      could not be deleted: {e}"
+                );
+            }
+        }
         slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
         return bw_serve_env();
     };
@@ -9503,6 +9650,19 @@ fn publish_backend_settlement(settlement: BackendSettlement) {
     let _ = SETTLEMENT.set(settlement);
 }
 
+/// The production backend re-point, named and not called -- the same shape,
+/// and the same reason, as [`REAL_NO_MATCH_CARD`]. The one argument is the
+/// account, so there is no expression here for a mutation to hide in.
+const REAL_BACKEND_REPOINT: BackendRepoint = resettle_vault_backend_for;
+
+/// The shape of the switch's backend re-point seam, as a name.
+///
+/// An alias rather than the `fn` type spelled inline, for the reason
+/// [`NoMatchCard`] is one: the binding above is pinned by its source text in
+/// `the_switch_re_points_the_backend_through_the_seam`, and that needle may
+/// not contain a newline.
+type BackendRepoint = fn(&Account);
+
 /// Re-points the vault backend at `account`, on the way into a switch and on
 /// the way back out of a failed one.
 ///
@@ -9535,22 +9695,41 @@ enum BackendStartError {
     NoVerifiedCli(String),
     /// The `bw` process could not be spawned at all.
     Spawn(std::io::Error),
-    /// **This account is not served by `bw serve` at all**, so there was
-    /// nothing to start and nothing went wrong.
-    ///
-    /// A variant of the error type rather than a `Result<Option<Child>, _>`,
-    /// and the reason is what the twelve call sites do with it. Every one of
-    /// them already has an "it did not start, carry on without it" arm --
-    /// logging, reporting over the backend-op channel, leaving
-    /// `bw_serve_child` as `None` -- and that arm is *exactly* the correct
-    /// behaviour here. Widening the success type would instead give twelve
-    /// sites a new `Some`/`None` to get right, eleven of which would be
-    /// written correctly.
-    ///
-    /// The one caller for which this is not enough is `start_backend`, whose
-    /// failure arm ends the process; `main` does not call it on this path at
-    /// all. See its own doc.
+}
+
+/// **What one attempt to bring `bw serve` up actually produced**, and the
+/// reason it is not a `Result`.
+///
+/// "This account is not served by `bw serve` at all" used to be a variant of
+/// [`BackendStartError`], on the argument that every call site already had an
+/// "it did not start, carry on without it" arm and that arm was exactly
+/// right. **That argument held for the two startup arms and for nothing
+/// else.** Elsewhere the collapse produced four live failures: a second fatal
+/// caller that ended the process on a direct-REST account
+/// (`recover_from_failed_vault_wait`), a switch TO such an account that
+/// always rolled back reporting a backend that was never going to start, an
+/// unlock recovery that stood autofill down on every direct-REST unlock, and
+/// a tray Sync that reported "bw serve could not be started" instead of
+/// refreshing through the direct-REST bridge.
+///
+/// The shape is therefore a three-armed enum with **no `Result`, no `?` and
+/// no `unwrap_or`**: there is no expression that turns this into a `Child`
+/// while mentioning only one of the two non-`Started` arms. A thirteenth
+/// entry point has to write `NotSelected` and `Failed` out by name or it does
+/// not compile, which is the property the old shape could not have -- an
+/// `Err(_)` catch-all silently absorbed the non-failure, and that is exactly
+/// how C1-C4 shipped.
+#[must_use = "a backend start has three outcomes and dropping it decides none of them"]
+enum BackendStart {
+    /// `bw serve` was spawned; this is the child.
+    Started(Child),
+    /// **This account's vault is served directly over REST**, so there was
+    /// nothing to start and nothing went wrong. Every site treats this as
+    /// "proceed, there is no child process here" -- never as a failure, and
+    /// never fatally.
     NotSelected,
+    /// `bw serve` is the selected backend and it would not come up.
+    Failed(BackendStartError),
 }
 
 impl std::fmt::Display for BackendStartError {
@@ -9569,11 +9748,6 @@ impl std::fmt::Display for BackendStartError {
                 f,
                 "failed to spawn `bw serve` from the verified Bitwarden CLI path (see \
                  bw_path::resolve_bw_exe for where that path comes from): {e}"
-            ),
-            Self::NotSelected => write!(
-                f,
-                "this account's vault is served by the direct-REST backend, so `bw serve` was \
-                 not started -- which is the point of that backend rather than a failure"
             ),
         }
     }
@@ -9597,7 +9771,7 @@ fn try_start_backend(
     session_token: &str,
     job: Option<&job_object::KillOnCloseJob>,
     port_grace: Duration,
-) -> Result<Child, BackendStartError> {
+) -> BackendStart {
     // **THE GATE, and it is here because here is where all twelve meet.**
     //
     // `bw serve` is spawned by one expression in this crate
@@ -9616,10 +9790,10 @@ fn try_start_backend(
     // is a `Command::output()` with no timeout that would keep a `bw` profile
     // this backend does not read up to date.
     if !backend_policy::bw_serve_is_selected() {
-        return Err(BackendStartError::NotSelected);
+        return BackendStart::NotSelected;
     }
     if !bw_serve::wait_for_port_free(bw_serve::BW_SERVE_PORT, port_grace) {
-        return Err(BackendStartError::PortHeld(port_grace));
+        return BackendStart::Failed(BackendStartError::PortHeld(port_grace));
     }
 
     // Pull the latest vault state down before the match engine is built, so a
@@ -9633,8 +9807,10 @@ fn try_start_backend(
     // Spawned suspended and assigned to the job before it runs a single
     // instruction, so there is no window in which a crash of *this* process
     // could orphan an unlocked-vault server. See `job_object::spawn_in_job`.
-    let command =
-        bw_serve::bw_serve_command(session_token).map_err(BackendStartError::NoVerifiedCli)?;
+    let command = match bw_serve::bw_serve_command(session_token) {
+        Ok(command) => command,
+        Err(e) => return BackendStart::Failed(BackendStartError::NoVerifiedCli(e)),
+    };
     // Said once per spawn, not once per launch. `job == None` (the job object
     // could not be created -- see `main`) is the case with no backstop at
     // all: nothing kills this process's `bw serve` if we lose the handle, so
@@ -9657,11 +9833,13 @@ fn try_start_backend(
     // `bw_serve_command`, so the one act of leaving the kill-on-close job's
     // reach is written at the call site that is about to put it back into a
     // job. `main.rs` is one of the files `job_object`'s tree walk excuses.
-    job_object::spawn_in_job(
+    match job_object::spawn_in_job(
         job,
         job_object::JobCommand::wrap(command.into_jobless_command()),
-    )
-    .map_err(BackendStartError::Spawn)
+    ) {
+        Ok(child) => BackendStart::Started(child),
+        Err(e) => BackendStart::Failed(BackendStartError::Spawn(e)),
+    }
 }
 
 /// Startup variant of [`try_start_backend`]: there is nothing to fall back to
@@ -9801,7 +9979,7 @@ impl StartupWork {
         // pre-window seed's empty token an UNINITIALISED value with a
         // proof of non-observation rather than a false belief.
         let child = match try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE) {
-            Ok(child) => {
+            BackendStart::Started(child) => {
                 // In an `Option` on THIS side of the `with`, so that a
                 // `None` answer leaves the handle here to be stopped. The
                 // closure moves nothing it cannot give back.
@@ -9829,7 +10007,12 @@ impl StartupWork {
                 }
                 Ok(())
             }
-            Err(e) => Err(e.to_string()),
+            // One of the two startup arms the old shape really did get
+            // right: no child to park, nothing to stop, and the readiness
+            // probe below runs against the direct-REST backend the slot
+            // already holds.
+            BackendStart::NotSelected => Ok(()),
+            BackendStart::Failed(e) => Err(e.to_string()),
         };
         let items = match &child {
             Ok(()) => wait_for_vault_ready(vault.as_ref(), schedule),
@@ -9908,12 +10091,29 @@ fn account_details_source(
 /// [`backend_policy::bw_serve_is_selected`] instead, so
 /// [`BackendStartError::NotSelected`] can never reach this body -- and if the
 /// gate were ever removed, this would fail loudly at the moment of the launch
-/// rather than quietly later, which is the right way round for the only fatal
-/// caller of the twelve.
+/// rather than quietly later.
+///
+/// **Not "the only fatal caller of the twelve"**, which is what this doc used
+/// to say and which was never true: `recover_from_failed_vault_wait` ends the
+/// process on a `bw serve` that will not come up too, and is entitled to --
+/// it also runs pre-tray. What was wrong there was that it ended the process
+/// on a backend that was never going to start, which is C1.
+/// `the_only_fatal_backend_start_is_start_backends` now holds the real rule:
+/// those two, no third, and no `NotSelected` arm anywhere.
 fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
     match try_start_backend(session_token, job, bw_serve::PORT_RELEASE_GRACE) {
-        Ok(child) => child,
-        Err(e) => {
+        BackendStart::Started(child) => child,
+        // The gate at the one call site is what makes this unreachable, and
+        // this arm is deliberately NOT a `fatal_startup_error`: "there was
+        // nothing to start" is never something to tell a user about, and
+        // `the_only_fatal_backend_start_is_start_backends` pins that no
+        // `NotSelected` arm anywhere in this file ends the process. If the
+        // gate is ever removed this is a bug in the launch sequence, and it
+        // says so.
+        BackendStart::NotSelected => unreachable!(
+            "`start_backend` was called on an account whose vault is served directly over              REST. `fn main`'s call site is gated on `backend_policy::bw_serve_is_selected()`              precisely so this cannot happen; the gate has been removed or bypassed"
+        ),
+        BackendStart::Failed(e) => {
             log::error!("{e}");
             fatal_startup_error(&format!(
                 "Deskwarden could not start its Bitwarden backend.\n\n{e}"
@@ -12638,11 +12838,11 @@ mod tests {
         )]);
 
         let child = restart_backend_after_unlock(&mut engine, || {
-            Err(BackendStartError::PortHeld(Duration::from_secs(1)))
+            BackendStart::Failed(BackendStartError::PortHeld(Duration::from_secs(1)))
         });
 
         assert!(
-            child.is_none(),
+            matches!(child, BackendAfterUnlock::StoodDown),
             "there is no child to track -- and `bw_serve_child` must stay None so the next open \
              starts one rather than talking to a process nothing owns"
         );
@@ -12666,14 +12866,17 @@ mod tests {
             deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
 
-        let started = restart_backend_after_unlock(&mut engine, || {
-            std::process::Command::new("cmd")
-                .args(["/C", "exit"])
-                .spawn()
-                .map_err(BackendStartError::Spawn)
+        let started = restart_backend_after_unlock(&mut engine, || match std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+        {
+            Ok(child) => BackendStart::Started(child),
+            Err(e) => BackendStart::Failed(BackendStartError::Spawn(e)),
         });
 
-        let mut child = started.expect("a successful start must hand its child back");
+        let BackendAfterUnlock::Started(mut child) = started else {
+            panic!("a successful start must hand its child back")
+        };
         let _ = child.wait();
         assert!(
             engine.lookup(&foreground("notepad.exe")).is_some(),
@@ -12758,10 +12961,10 @@ mod tests {
             },
             |token| {
                 steps.borrow_mut().push(format!("start, token: {token}"));
-                std::process::Command::new("cmd")
-                    .args(["/C", "exit"])
-                    .spawn()
-                    .map_err(BackendStartError::Spawn)
+                match std::process::Command::new("cmd").args(["/C", "exit"]).spawn() {
+                    Ok(child) => BackendStart::Started(child),
+                    Err(e) => BackendStart::Failed(BackendStartError::Spawn(e)),
+                }
             },
             |_message| {
                 steps.borrow_mut().push("probe".to_string());
@@ -12872,7 +13075,7 @@ mod tests {
             &mut cached_status_details,
             &mut session_token,
             || Some("new-token".to_string()),
-            |_token| Err(BackendStartError::PortHeld(Duration::from_secs(1))),
+            |_token| BackendStart::Failed(BackendStartError::PortHeld(Duration::from_secs(1))),
             |_message| panic!("there is nothing to probe once no backend came up"),
         );
 
@@ -12888,6 +13091,137 @@ mod tests {
             "the re-authentication itself succeeded, and a later tray Sync starts a backend \
              from this token: throwing it away would make the named recovery fail"
         );
+    }
+
+    /// **C3.** A direct-REST unlock has no `bw serve` to restart, and the old
+    /// shape could not say so: `NotSelected` was a `BackendStartError`, the
+    /// `Err` arm stood autofill down, and it fired on **every** unlock, every
+    /// away-lock recovery and every re-auth of such an account -- clearing the
+    /// match engine and then telling the user to press "Sync", which was
+    /// itself broken (C4). Nothing failed here; there was nothing to start.
+    #[test]
+    fn a_direct_rest_unlock_has_nothing_to_restart_and_leaves_autofill_armed() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
+        )]);
+
+        let outcome = restart_backend_after_unlock(&mut engine, || BackendStart::NotSelected);
+
+        assert!(
+            matches!(outcome, BackendAfterUnlock::NoSubprocess),
+            "\"this account has no subprocess\" was reported as a backend that would not start"
+        );
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_some(),
+            "autofill was stood down on an account whose vault is reachable this whole time \
+             through `VaultCache::bridge`; the user is left with a dead match engine and the \
+             recovery they are pointed at (tray Sync) is the one C4 broke"
+        );
+    }
+
+    /// **C2 and C3 together, through the sequence rather than through one
+    /// arm of it.** A resettle onto a direct-REST account must SETTLE: no
+    /// child to track, the readiness probe still run, the cache refilled and
+    /// the engine armed from the incoming account's own items.
+    ///
+    /// Before the fix this returned `BackendNotStarted`, which the switch
+    /// turned into `ResettleReport::NotStarted` and then into a rollback
+    /// telling the user "the Bitwarden backend for X did not start" -- about
+    /// a backend that account was never going to have, and after the key had
+    /// already been written to `userkey.bin`. The probe never ran at all.
+    #[test]
+    fn a_direct_rest_resettle_settles_and_probes_without_starting_anything() {
+        let (_server, cache, mut engine, mut cached_status_details) =
+            an_app_signed_into_one_account();
+        let mut bw_serve_child = None;
+        let mut session_token = "old-token".to_string();
+        let mut probes = 0;
+
+        let outcome = resettle_session_with(
+            &cache,
+            &mut engine,
+            &mut bw_serve_child,
+            &mut cached_status_details,
+            &mut session_token,
+            || Some("new-token".to_string()),
+            |_token| BackendStart::NotSelected,
+            |_message| {
+                probes += 1;
+                VaultReadyOutcome::Ready(probe_items(&[("2", "next.exe")]))
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            ResettleOutcome::BackendStarted,
+            "an account that never needed a subprocess reported that no backend came up"
+        );
+        assert_eq!(
+            probes, 1,
+            "the readiness probe was skipped, so nothing repopulated the vault this account \
+             can reach perfectly well over REST"
+        );
+        assert!(
+            bw_serve_child.is_none(),
+            "there is no child on this path, and a `Some` here would be a process nothing owns"
+        );
+        assert!(
+            engine.lookup(&foreground("next.exe")).is_some()
+                && engine.lookup(&foreground("prev.exe")).is_none(),
+            "the incoming account's matches must be armed and the outgoing account's gone -- \
+             the same end state a `bw serve` account reaches"
+        );
+        assert!(cache.is_populated(), "and the cache refilled from the same items");
+        assert_eq!(session_token, "new-token");
+    }
+
+    /// **C4.** The tray's and the vault window's "Sync" on a direct-REST
+    /// account.
+    ///
+    /// The old spelling was `matches!(&child, Some(Err(_)))`, and
+    /// `NotSelected` was an `Err`, so a Sync answered "bw serve could not be
+    /// started" and never fell through to `cache.bridge()` -- the
+    /// `LateBoundBackend` holding a working REST backend the whole time. A
+    /// direct-REST vault could not be refreshed manually at all.
+    #[test]
+    fn a_sync_with_nothing_to_start_refreshes_through_the_bridge() {
+        assert_eq!(
+            sync_refresh_for(&Some(BackendStart::NotSelected)),
+            SyncRefresh::WaitOnTheBridge,
+            "a Sync on a direct-REST account reported a `bw serve` failure instead of \
+             refreshing through the backend that was going to answer it"
+        );
+
+        // The three controls, so the assertion above cannot pass on a
+        // function that answers `WaitOnTheBridge` to everything.
+        assert_eq!(
+            sync_refresh_for(&Some(BackendStart::Failed(BackendStartError::PortHeld(
+                Duration::from_secs(1)
+            )))),
+            SyncRefresh::ReportStartFailure,
+            "a `bw serve` that really would not start must still be reported"
+        );
+        assert_eq!(
+            sync_refresh_for(&None),
+            SyncRefresh::ExplicitBwSync,
+            "a backend that was already running never got `try_start_backend`'s free `bw \
+             sync` and is owed an explicit one"
+        );
+        // A real `Child`, because that is what the arm carries -- and the
+        // one this test owns is reaped rather than left behind.
+        let mut started = Some(BackendStart::Started(
+            std::process::Command::new("cmd").args(["/C", "exit"]).spawn().expect("a stub child"),
+        ));
+        assert_eq!(
+            sync_refresh_for(&started),
+            SyncRefresh::WaitOnTheBridge,
+            "a freshly started `bw serve` is not listening yet and must be waited for"
+        );
+        if let Some(BackendStart::Started(child)) = started.as_mut() {
+            let _ = child.wait();
+        }
     }
 
     /// **What the vault window is opened WITH, now that it is never opened
@@ -19679,7 +20013,9 @@ mod tests {
         fn a_backend_that_would_not_start_still_hands_the_sync_item_back() {
             let mut sink = Vec::new();
             let child = apply(
-                BackendOp::EnsureRunning(Err(BackendStartError::PortHeld(Duration::from_secs(1)))),
+                BackendOp::EnsureRunning(BackendStart::Failed(BackendStartError::PortHeld(
+                    Duration::from_secs(1),
+                ))),
                 &mut sink,
             );
             assert_eq!(
@@ -19726,7 +20062,7 @@ mod tests {
         fn the_sink_keeps_what_was_already_in_it() {
             let mut sink = vec![TrayEffect::SyncFailed];
             apply(
-                BackendOp::EnsureRunning(Err(BackendStartError::NoVerifiedCli(
+                BackendOp::EnsureRunning(BackendStart::Failed(BackendStartError::NoVerifiedCli(
                     "no bw.exe on record".to_string(),
                 ))),
                 &mut sink,
@@ -19836,6 +20172,174 @@ mod tests {
         stand_down_after_unlock(engine, "a test's backend did not come up");
     }
 
+    // **I1's seam, and the accounts it re-pointed.**
+    //
+    // `resettle_vault_backend_for` reads a `BackendSettlement` `OnceLock`
+    // that only `fn main` ever publishes, so in every test process it is a
+    // silent no-op -- which is why the five switch tests below inject a
+    // `ResettleReport` directly and why none of them could reach
+    // `try_start_backend` at all. C2 lived in exactly that hole. The `fn`
+    // pointer is what makes the re-point observable; this records the
+    // accounts it named, in order.
+    thread_local! {
+        static REPOINTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The test seam's re-point: record the account, move no backend.
+    fn record_repoint(account: &Account) {
+        REPOINTED.with(|seen| seen.borrow_mut().push(account.email.clone()));
+    }
+
+    fn repoints_so_far() -> Vec<String> {
+        REPOINTED.with(|seen| seen.borrow().clone())
+    }
+
+    /// **C2, end to end through the switch.**
+    ///
+    /// This is the test I1 said could not exist. The `resettle` closure runs
+    /// the REAL `resettle_session_with` -- the sequence the production switch
+    /// runs -- with a `start` that answers what a direct-REST account's
+    /// `try_start_backend` answers, and the seam above lets the re-point be
+    /// seen happening once, at the target, with no rollback behind it.
+    ///
+    /// Before the fix: `NotSelected` was an error, so
+    /// `restart_backend_after_unlock` stood autofill down and returned
+    /// `None`, the sequence answered `BackendNotStarted`, the switch read
+    /// `ResettleReport::NotStarted`, rolled back to A, and told the user "the
+    /// Bitwarden backend for b@example.com did not start". **Switching to a
+    /// direct-REST account was impossible**, and the message naming the
+    /// reason was false.
+    #[test]
+    fn a_switch_to_a_direct_rest_account_settles_instead_of_rolling_back() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("direct-rest-switch");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+        REPOINTED.with(|seen| seen.borrow_mut().clear());
+
+        let mut bw_serve_child = None;
+        let mut details = None;
+        let mut token = "a-token".to_string();
+
+        let outcome = switch_to_account(
+            record_repoint,
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, account, _store| {
+                assert_eq!(account.id, b.id, "only the switch itself should have run");
+                let settled = resettle_session_with(
+                    &cache,
+                    &mut engine,
+                    &mut bw_serve_child,
+                    &mut details,
+                    &mut token,
+                    || Some("b-token".to_string()),
+                    // What `try_start_backend` answers once the backend
+                    // policy has settled on direct REST for this account.
+                    |_token| BackendStart::NotSelected,
+                    |_message| VaultReadyOutcome::Ready(probe_items(&[("b-item", "code.exe")])),
+                );
+                match settled {
+                    ResettleOutcome::BackendStarted => ResettleReport::Settled,
+                    ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
+                }
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Switched,
+            "switching TO a direct-REST account rolled back, reporting a `bw serve` that was \
+             never going to be started for it"
+        );
+        assert_eq!(active.id, b.id, "the app is still reporting itself as A");
+        assert_eq!(
+            repoints_so_far(),
+            vec![b.email.clone()],
+            "the backend is re-pointed once, at the target, and a switch that landed must not \
+             have re-pointed back at the account it left"
+        );
+        assert!(
+            bw_serve_child.is_none(),
+            "a direct-REST switch must leave no child behind: there is no subprocess in this \
+             configuration and a `Some` here is one nothing owns"
+        );
+        assert!(
+            engine.lookup(&foreground("code.exe")).is_some(),
+            "the incoming account's matches are not armed, so the switch left autofill down"
+        );
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_none(),
+            "account A's match is still armed under account B's session"
+        );
+        assert!(
+            cache.items().iter().any(|i| i.id == "b-item"),
+            "the cache was not refilled from the account that was switched to"
+        );
+    }
+
+    /// The control for the seam: a switch that does NOT settle re-points
+    /// twice -- at the target on the way in and back at the outgoing account
+    /// on the way out -- so the assertion above is about a rollback that did
+    /// not happen rather than about a recorder that never fires.
+    #[test]
+    fn a_failed_switch_re_points_the_backend_back_through_the_same_seam() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("direct-rest-rollback");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+        REPOINTED.with(|seen| seen.borrow_mut().clear());
+
+        let outcome = switch_to_account(
+            record_repoint,
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, account, _store| {
+                if account.id == b.id {
+                    torn_down(&cache, &mut engine);
+                    ResettleReport::NotStarted
+                } else {
+                    settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+                    ResettleReport::Settled
+                }
+            },
+        );
+
+        assert!(matches!(outcome, SwitchOutcome::RolledBack { .. }));
+        assert_eq!(
+            repoints_so_far(),
+            vec![b.email.clone(), a.email.clone()],
+            "a rollback has to put the vault backend back where it was, through the same seam \
+             the way in used"
+        );
+    }
+
     /// The spec's own test, with the worst failure mode it protects against: a
     /// match left armed from account A, under account B's session, raises an
     /// autofill prompt whose fill can only ever end in an error -- or, if the
@@ -19867,6 +20371,7 @@ mod tests {
         );
 
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -19950,6 +20455,7 @@ mod tests {
         bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
 
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -20015,6 +20521,7 @@ mod tests {
         let a_items = probe_items(&[("a-item", "notepad.exe")]);
 
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -20079,6 +20586,7 @@ mod tests {
 
         let mut seen: Vec<(Option<std::path::PathBuf>, std::path::PathBuf)> = Vec::new();
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -20175,6 +20683,7 @@ mod tests {
         settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
 
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -20229,6 +20738,7 @@ mod tests {
         settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
 
         let outcome = switch_to_account(
+            |_| {},
             cfg.path(),
             &a,
             &b,
@@ -25033,11 +25543,11 @@ mod tests {
 
         /// A stub for the `bw serve` the resettle starts, so nothing in this
         /// module spawns the real backend. Reaped by the caller.
-        fn a_stub_backend() -> Result<Child, BackendStartError> {
-            std::process::Command::new("cmd")
-                .args(["/C", "exit"])
-                .spawn()
-                .map_err(BackendStartError::Spawn)
+        fn a_stub_backend() -> BackendStart {
+            match std::process::Command::new("cmd").args(["/C", "exit"]).spawn() {
+                Ok(child) => BackendStart::Started(child),
+                Err(e) => BackendStart::Failed(BackendStartError::Spawn(e)),
+            }
         }
 
         /// **The whole locked-fill path, driven through the real composition.**
@@ -26887,6 +27397,127 @@ mod bw_serve_gate {
         );
     }
 
+    /// **C1's pin: there is exactly ONE fatal backend start in this file.**
+    ///
+    /// The rule directly below only ever knew about `start_backend`, so it
+    /// passed for the whole life of C1 -- a second, ungated
+    /// `fatal_startup_error` in `recover_from_failed_vault_wait`, reached
+    /// from five call sites, that ended the process on a direct-REST account
+    /// with a message about a backend that account was never going to have.
+    /// Nothing failed there; `NotSelected` simply arrived at an arm written
+    /// for failures.
+    ///
+    /// So this counts the thing that actually matters: **how many
+    /// `BackendStart::Failed` arms end the process.** One, and it is
+    /// `start_backend`'s. And **no `BackendStart::NotSelected` arm ends the
+    /// process at all** -- that is the whole of C1, expressed as a rule a
+    /// fourteenth caller cannot pass by forgetting about.
+    #[test]
+    fn the_only_fatal_backend_start_is_start_backends() {
+        let source = main_code();
+        let fatal = concat!("fatal_startup_er", "ror(");
+
+        let failed_arm = concat!("BackendStart::Fail", "ed(e) =>");
+        let mut fatal_failures: Vec<String> = source
+            .match_indices(failed_arm)
+            .filter(|(at, _)| arm_body(&source, *at).contains(fatal))
+            .map(|(at, _)| enclosing_fn(&source, at))
+            .collect();
+        fatal_failures.sort();
+        assert_eq!(
+            fatal_failures,
+            vec![
+                // The retry after a fresh sign-in. Still pre-tray: this runs
+                // inside the startup window, so there is no running app to
+                // preserve and its own doc says so.
+                concat!("recover_from_failed_vault_", "wait").to_string(),
+                // The launch itself.
+                concat!("start_back", "end").to_string(),
+            ],
+            "the set of backend-start failures that END THE PROCESS has changed. Both of the \
+             two allowed ones are pre-tray: nothing is running yet, so there is nothing a \
+             dialog-and-exit costs the user. Every OTHER caller of `try_start_backend` runs \
+             with a tray, a hotkey and autofill already up, where a `bw serve` that would not \
+             come up -- most often a port its own predecessor has not released -- must be \
+             survived, not fatal. See `restart_backend_after_unlock`"
+        );
+
+        let not_selected_arm = concat!("BackendStart::NotSelec", "ted =>");
+        let fatal_not_selected: Vec<String> = source
+            .match_indices(not_selected_arm)
+            .filter(|(at, _)| arm_body(&source, *at).contains(fatal))
+            .map(|(at, _)| enclosing_fn(&source, at))
+            .collect();
+        assert!(
+            fatal_not_selected.is_empty(),
+            "\"this account is served directly over REST\" ends the process in {:?}. That is \
+             not a failure and there is nothing to report: there was no subprocess to start, \
+             and the vault is answered by `VaultCache::bridge` throughout",
+            fatal_not_selected
+        );
+    }
+
+    /// One match arm's body: from its pattern to whichever comes first, the
+    /// NEXT `BackendStart::` arm or 600 bytes.
+    ///
+    /// **The stop at the next arm is what makes the rule mean anything.** A
+    /// fixed window ran straight out of a `NotSelected => None,` arm and into
+    /// the `Failed` arm below it, so every `NotSelected` in the file looked
+    /// fatal. 600 bytes is the ceiling for an arm with no successor, and it
+    /// is long enough to hold a multi-line
+    /// `fatal_startup_error(&format!(...))`.
+    #[cfg(test)]
+    fn arm_body(source: &str, at: usize) -> &str {
+        let ceiling = (at + 600).min(source.len());
+        let from = at + concat!("BackendStart", "::").len();
+        let end = source[from..ceiling]
+            .find(concat!("BackendStart", "::"))
+            .map_or(ceiling, |next| from + next);
+        &source[at..end]
+    }
+
+    /// The name of the nearest top-level `fn` above `at`.
+    #[cfg(test)]
+    fn enclosing_fn(source: &str, at: usize) -> String {
+        let decl = source[..at]
+            .rfind("\nfn ")
+            .expect("control: nothing above this offset declares a top-level function");
+        source[decl + 4..]
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Control for the rule above: it can tell one fatal arm from two, and it
+    /// can tell a fatal arm from a surviving one. Without this, a `find` that
+    /// matched nothing would satisfy every assertion in it.
+    #[test]
+    fn the_fatal_backend_start_rule_can_count() {
+        let fatal = concat!("fatal_startup_er", "ror(");
+        let arm = concat!("BackendStart::Fail", "ed(e) =>");
+        let one = format!("\nfn start_backend() {{\n    match x {{ {arm} {fatal}\"x\"), }}\n}}\n");
+        let two = format!("{one}\nfn thirteenth() {{\n    match x {{ {arm} {fatal}\"y\"), }}\n}}\n");
+        let survives = format!("\nfn recover() {{\n    match x {{ {arm} stand_down(), }}\n}}\n");
+
+        let count = |text: &str| {
+            text.match_indices(arm).filter(|(at, _)| arm_body(text, *at).contains(fatal)).count()
+        };
+        assert_eq!(count(&one), 1, "the rule cannot see the one fatal arm that is allowed");
+        assert_eq!(
+            count(&two),
+            2,
+            "the rule cannot see an ADDITIONAL fatal arm, which is the whole of C1: a caller \
+             that ends the process arriving with nothing to red it"
+        );
+        assert_eq!(count(&survives), 0, "the rule calls a surviving arm fatal");
+        assert_eq!(
+            enclosing_fn(&one, one.find(arm).expect("the fixture names the arm")),
+            "start_backend",
+            "the rule cannot name the function a fatal arm is in"
+        );
+    }
+
     /// **The gate that could not go inside `try_start_backend`.**
     ///
     /// `start_backend` is `try_start_backend` plus a fatal dialog. It has no
@@ -27032,6 +27663,97 @@ mod vault_backend_choice_tests {
             &slot,
         );
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+    }
+
+    /// **The stored vault key does not outlive the decision that justified
+    /// it**, on either of the two ways the decision can be taken back.
+    ///
+    /// `userkey.bin` holds a wrapped master key. Unlike a session token it
+    /// does not expire and cannot be revoked from the web vault, so a copy
+    /// left on disk after this account stopped being served over REST is a
+    /// secret held for no reason -- kept from the very user who turned the
+    /// setting off. `user_key_store::UserKeyStore::clear`'s own doc names
+    /// this arm as the caller's obligation, and until this test nothing did
+    /// it or checked.
+    ///
+    /// No real key here: `clear` deletes a path, and what matters is that the
+    /// path is empty afterwards. Writing a byte string means this test never
+    /// makes a DPAPI call and never has a real master key to leak.
+    #[test]
+    fn settling_off_direct_rest_deletes_the_stored_vault_key() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("key-cleared");
+        let account = account_on(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        let key_path = accounts::user_key_path_for(&config, &account.id);
+        let slot = empty_slot();
+
+        // **Way one: the user turns `use_official_bw_crypto` back on.**
+        std::fs::write(&key_path, b"a stand-in for a wrapped master key").expect("the key file");
+        assert!(key_path.exists(), "control: there really is a key on disk to be left behind");
+        let env = settle_the_vault_backend(&config, Some(&account), true, &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(
+            !key_path.exists(),
+            "the setting is off and the account is back on `bw serve`, but its non-expiring, \
+             unrevocable vault key is still on disk at {}",
+            key_path.display()
+        );
+
+        // **Way two: the account's server URL moves to an official cloud
+        // host**, which takes the same arm for a different reason and had the
+        // same gap.
+        std::fs::write(&key_path, b"a stand-in for a wrapped master key").expect("the key file");
+        let moved = Account {
+            server_url: Some("https://vault.bitwarden.com".to_string()),
+            ..account.clone()
+        };
+        let env = settle_the_vault_backend(&config, Some(&moved), false, &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(
+            !key_path.exists(),
+            "this account's vault is no longer served over REST, and its stored key outlived \
+             the move at {}",
+            key_path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// The control the test above needs: an account that IS still served over
+    /// REST keeps its key. Without this, a `clear` moved one line too far up
+    /// -- deleting on every launch -- would satisfy every assertion there
+    /// while making the stored-key path dead code and re-asking for the
+    /// master password every single launch.
+    #[test]
+    fn settling_on_direct_rest_leaves_the_stored_key_alone() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("key-kept");
+        let account = account_on(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        let key_path = accounts::user_key_path_for(&config, &account.id);
+        // Not a record `UserKeyStore::parse` accepts, so the load below
+        // answers "no stored key" and makes no network call -- the same arm
+        // `direct_rest_with_no_stored_key_leaves_the_slot_empty_and_arms_the_sign_in`
+        // exercises. What is asserted is only that the FILE survives the
+        // choice.
+        std::fs::write(&key_path, b"not a record this parses").expect("the key file");
+        let slot = empty_slot();
+
+        let env = settle_the_vault_backend(&config, Some(&account), false, &slot);
+        assert_eq!(
+            install_backend_env(env, &slot),
+            backend_policy::VaultBackendChoice::DirectRest,
+            "control: this account really did settle on direct REST"
+        );
+        assert!(
+            key_path.exists(),
+            "the stored key was deleted on an account that is still served over REST, so the \
+             silent-relaunch path is dead and every launch re-asks for the master password"
+        );
+
+        backend_policy::uninstall_env();
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     /// **The direct-REST arm with no stored key: an EMPTY slot, on purpose.**

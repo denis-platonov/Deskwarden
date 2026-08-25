@@ -114,9 +114,13 @@ pub fn is_self_hosted(server_url: Option<&str>) -> bool {
 /// walk every combination without a server, a subprocess or a file. Same
 /// shape as [`should_run`] above and as `app::disposition`.
 ///
-/// **Nothing calls this yet.** The startup path that would act on it is not
-/// written; see [`should_run`]'s own note for why that is deliberate rather
-/// than forgotten.
+/// **Called once per settlement**, by `main`'s `settle_the_vault_backend` --
+/// at startup and again on every account switch, through the switch's
+/// backend re-point seam. Its answer is what fills the
+/// `vault_backend::LateBoundBackend` slot, what `install_env` publishes for
+/// `try_start_backend`'s gate to read, and -- on the arm that is NOT
+/// `DirectRest` -- what makes `main` delete any `userkey.bin` left over from
+/// a decision that has since been taken back.
 #[must_use]
 pub fn choose(server_url: Option<&str>, use_official_bw_crypto: bool) -> VaultBackendChoice {
     if is_self_hosted(server_url) && !use_official_bw_crypto {
@@ -265,13 +269,20 @@ fn with_env<T>(f: impl FnOnce(Option<&BackendEnv>) -> T) -> T {
 /// 12. the startup worker's orphan-adoption retry.
 ///
 /// **The list is not what is trusted.** It is written down because a reader
-/// deserves to know what was counted, but the guard is
-/// `no_path_reaches_bw_serve_without_consulting_the_policy` in `main.rs`,
-/// which reads this crate's own source, finds every caller of
-/// `bw_serve_command` and of `try_start_backend`, and fails if any of them can
-/// reach a spawn without this function's answer being between it and the
-/// process. A thirteenth added next year is covered on the day it is written;
-/// a list would not be.
+/// deserves to know what was counted, but the guard is the `bw_serve_gate`
+/// module in `main.rs` (there has never been a
+/// `no_path_reaches_bw_serve_without_consulting_the_policy`; this doc named a
+/// test that did not exist). That module reads this crate's own source,
+/// asserts that `bw_serve_command` is named in exactly the places it is named
+/// today, that `try_start_backend` consults this function BEFORE the port
+/// wait, the `bw sync` and the spawn, and that the one fatal call site in
+/// `fn main` is gated on it. A thirteenth added next year reaches the spawn
+/// through `try_start_backend` and is covered on the day it is written; a
+/// list would not be.
+///
+/// What it also holds, since the `NotSelected` rework:
+/// `the_only_fatal_backend_start_is_start_backends` fails if a caller starts
+/// ending the process over a backend that was never going to start.
 #[must_use]
 pub fn selected() -> VaultBackendChoice {
     with_env(|env| env.map_or(VaultBackendChoice::BwServe, |env| env.choice))

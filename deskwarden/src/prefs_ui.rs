@@ -164,8 +164,9 @@ fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
         "On, Deskwarden's vault goes through the official Bitwarden CLI, which holds your keys \
          in a background process of its own.\n\n\
-         Off is much lighter and faster — Deskwarden talks to your server itself and no \
-         background process runs — but in that case your passwords are stored in the app: the \
+         Off is much lighter and faster — Deskwarden talks to your server itself, so no \
+         background process keeps running (the Bitwarden CLI is still used to sign in) — but \
+         in that case your passwords are stored in the app: the \
          key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
          session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
          Changing this takes effect the next time Deskwarden starts."
