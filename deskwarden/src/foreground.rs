@@ -1244,7 +1244,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 57] = [
+        const OPENS_NO_WINDOW: [&str; 58] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1406,6 +1406,13 @@ mod tests {
             // one.
             "update_panel",
             "updater",
+            // The daemon/UI process boundary: a command-line plan, a small
+            // non-secret result file, and the exit-code carrier for it. It
+            // decides WHAT a spawned process is asked to open and reads what
+            // that process reported; the window itself belongs to
+            // `vault_window`, which is classified in its own right. Nothing
+            // here touches Win32 at all.
+            "ui_process",
             "vault_bridge",
             "vault_cache",
             // **Judgement call, recorded rather than assumed**, and exactly

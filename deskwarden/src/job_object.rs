@@ -1386,7 +1386,11 @@ mod tests {
         // readiness wait into `app_window::run_recovery`, which starts that
         // probe itself, once per attempt -- so the spawn that used to sit
         // behind `loading_ui::show_while` here is gone with the window it fed.
-        ("main.rs", 11),
+        // Twelve since the daemon/UI split: `run_as_a_ui_process` fetches the
+        // account details on a thread rather than in front of the window it
+        // has not opened yet -- the same 1-3s `bw` spawn, and the same reason,
+        // as the two `check_bw_status_details` spawns already counted here.
+        ("main.rs", 12),
         ("picker_ui.rs", 2),
         // One: the `bw unlock` behind the daemon's unlock prompt. It cannot be
         // inline for a reason stronger than the frame-loop one every entry

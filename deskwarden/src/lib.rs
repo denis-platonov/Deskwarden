@@ -116,6 +116,11 @@ pub mod updater;
 /// password without launching the app. Opens a window and never a GL context,
 /// which is the whole point -- see the module doc.
 pub mod unlock_prompt;
+/// The daemon/UI process boundary: what goes out on a `--ui` command line
+/// (a mode and a surface, never a secret) and what comes back (a small
+/// non-secret result file, plus the exit code that carries `locked` even if
+/// the file is lost).
+pub mod ui_process;
 pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;

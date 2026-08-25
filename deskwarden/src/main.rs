@@ -169,6 +169,45 @@ const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
 ];
 
 fn main() {
+    // **Which of the two processes this is, answered before anything else.**
+    //
+    // It is above the app mutex -- above the line whose own comment says it is
+    // first "before anything else in this process can fail" -- and that
+    // ordering is the whole of why a UI process is possible at all.
+    //
+    // `single_instance::resolve`, ~60 lines below, implements "the newest copy
+    // wins": a second Deskwarden asks the running one to stand down and takes
+    // the mutex. That is exactly right for a second *daemon* and exactly wrong
+    // for a spawned window. Routed through it, `deskwarden.exe --ui vault`
+    // would signal the quit event and **the daemon that spawned it would shut
+    // itself down** -- tray, hotkey and `bw serve` gone, from a click on Open
+    // Vault. The launch decision used to be read a thousand lines below here
+    // (see the `launch_intent` call further down, which is still where the
+    // daemon reads its own), so answering it here is a prerequisite for the
+    // spawn and not a tidy-up.
+    //
+    // Reading the command line cannot fail, allocate meaningfully or touch the
+    // disk, so nothing the mutex protects has moved: for a daemon launch the
+    // very next statement is the one that used to be first.
+    //
+    // `launch_intent` is called a second time below with the same arguments
+    // and is a pure function of them, so the daemon's behaviour on this line
+    // is to fall through -- deliberately, so that the daemon's startup reads
+    // exactly as it did before this branch existed.
+    match launch_intent(std::env::args().skip(1)) {
+        // The daemon, either flavour. Falls through into every line below.
+        Ok(LaunchIntent::UserLaunch) | Ok(LaunchIntent::LoginAutostart) => {}
+        // A window, and nothing else. It never takes the mutex, never asks
+        // anyone to stand down, and never comes back here.
+        Ok(LaunchIntent::Ui(surface)) => std::process::exit(run_as_a_ui_process(surface)),
+        // **Refused, not fallen back on.** See `UiLaunchRefusal`: every
+        // available fallback either opens a window nobody asked for or starts
+        // a second full daemon out of a command line that asked for a window.
+        // There is no log file yet -- `logging::init` is below -- so the
+        // refusal opens the file itself before it says anything.
+        Err(refusal) => std::process::exit(refuse_a_ui_launch(&refusal)),
+    }
+
     // **First, before anything else in this process can fail.**
     //
     // This creates the named mutex `installer/deskwarden.iss` names in
@@ -5648,12 +5687,254 @@ fn rebuild_the_vault_after_the_lock(
         })
 }
 
+/// **What a UI process exits with when it could not open its window at all.**
+///
+/// Deliberately outside the range [`deskwarden::ui_process::UiVaultResult`]'s
+/// bitfield uses (0-15), and that is the whole reason it is 64 rather than
+/// the 1, 2 or 3 a startup failure would ordinarily be given: exit 3 read as
+/// a result is `locked | needs_reauth`, so a UI process that failed before
+/// drawing anything would make the daemon tear down `bw serve` and demand the
+/// master password. A code that cannot be mistaken for an outcome is the
+/// cheapest way to make that impossible.
+const UI_COULD_NOT_START: i32 = 64;
+
+/// A `--ui` command line the app refused. Outside the bitfield for the reason
+/// [`UI_COULD_NOT_START`] is.
+const UI_LAUNCH_REFUSED: i32 = 65;
+
+/// The largest exit code the result bitfield can produce, and therefore the
+/// top of the range the daemon is willing to read as an outcome.
+const UI_RESULT_CODE_CEILING: i32 = deskwarden::ui_process::UiVaultResult::EXIT_LOCKED
+    | deskwarden::ui_process::UiVaultResult::EXIT_NEEDS_REAUTH
+    | deskwarden::ui_process::UiVaultResult::EXIT_ADD_ACCOUNT
+    | deskwarden::ui_process::UiVaultResult::EXIT_REMOVE_ACCOUNT;
+
+/// **Open the vault window in a process of its own, and bring its answer
+/// back.**
+///
+/// `None` means the window did not run here and the caller should open one
+/// in-process instead -- see [`RealVaultOps::open_window`], which is the one
+/// caller.
+///
+/// # The single most important line in this function is the one that is not
+/// here
+///
+/// **The child is not assigned to `deps.job`.** Every other child this app
+/// spawns goes through [`job_object::spawn_in_job`] and joins the
+/// kill-on-close job, which is exactly right for `bw serve` -- an orphaned
+/// backend serves a decrypted vault on localhost -- and exactly wrong for a
+/// window. A daemon restart is routine: an update stops the old process
+/// before starting the new one, and a crash or a manual quit does the same
+/// without warning. Assigned to the job, every one of those would close the
+/// vault window the user had open, mid-edit. The two processes are loosely
+/// coupled on purpose: when the daemon comes back it brings `bw serve` up on
+/// the same constant port and the window's next request succeeds. Recovery is
+/// a retry, not a handshake.
+///
+/// So the spawn is a plain `Command::spawn` and `spawn_in_job` is not called.
+/// Because an absence cannot be read, [`deskwarden::ui_process::UiSpawnPlan`]
+/// carries `joins_the_daemons_job: false` as a field a test can assert on.
+///
+/// `CREATE_BREAKAWAY_FROM_JOB` is a different question and is asked by
+/// [`deskwarden::ui_process::spawn_out_of_any_job`]: it is about a job
+/// *somebody else* put Deskwarden in, not about ours.
+///
+/// # Nothing secret is passed
+///
+/// Two words: the mode flag and the surface name. The child unwraps the same
+/// DPAPI-wrapped token from the same file under the same user's credentials,
+/// reads `settings.json` for the active account, and has `BW_SERVE_PORT` as a
+/// constant because it is the same binary. No token, no password and no vault
+/// item crosses -- in either direction.
+fn open_the_vault_window_in_its_own_process(config_dir: &Path) -> Option<VaultWindowSession> {
+    use std::os::windows::process::CommandExt as _;
+
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(e) => {
+            log::error!("could not name this executable to spawn a UI process ({e})");
+            return None;
+        }
+    };
+    let plan = deskwarden::ui_process::UiSpawnPlan::for_surface(program, Surface::Vault.as_arg());
+
+    let opened_at = Instant::now();
+    let spawned = deskwarden::ui_process::spawn_out_of_any_job(|breakaway| {
+        let mut command = std::process::Command::new(&plan.program);
+        command.args(&plan.args);
+        command.creation_flags(if breakaway {
+            bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+        } else {
+            bw_path::CREATE_NO_WINDOW
+        });
+        // **Not `job_object::spawn_in_job`.** See this function's doc; this
+        // is the line the whole split turns on.
+        command.spawn()
+    });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            log::error!(
+                "could not spawn a UI process for the vault window ({e}); opening it in the \
+                 daemon instead, which costs this process the OpenGL driver for the rest of \
+                 its life"
+            );
+            return None;
+        }
+    };
+    let pid = child.id();
+    log::info!(
+        "the vault window is process {pid} ({} {}), outside the kill-on-close job so a daemon \
+         restart cannot close it",
+        plan.program.display(),
+        plan.args.join(" ")
+    );
+
+    let status = match wait_for_the_ui_process(&mut child) {
+        Ok(status) => status,
+        Err(e) => {
+            log::error!("lost track of UI process {pid} ({e}); treating it as closed");
+            return Some(VaultWindowSession {
+                result: vault_window::VaultWindowResult {
+                    locked: false,
+                    needs_reauth: false,
+                    edited_settings: None,
+                    switch_to: None,
+                    add_account: false,
+                    remove_account: false,
+                    account_details: None,
+                },
+                relocked: false,
+            });
+        }
+    };
+
+    // Read before the file, so an unrecognisable code is reported as itself
+    // rather than silently becoming an outcome.
+    let code = status.code().unwrap_or(UI_COULD_NOT_START);
+    let from_exit_code = if (0..=UI_RESULT_CODE_CEILING).contains(&code) {
+        deskwarden::ui_process::UiVaultResult::from_exit_code(code)
+    } else {
+        if code != UI_COULD_NOT_START {
+            log::error!(
+                "UI process {pid} exited with {code}, which is not a result this app writes; \
+                 it panicked or was killed. Nothing from that window is acted on"
+            );
+        } else {
+            log::warn!("UI process {pid} could not open its window; see its lines above");
+        }
+        deskwarden::ui_process::UiVaultResult::default()
+    };
+
+    let path = deskwarden::ui_process::result_path(config_dir, pid);
+    let from_file = deskwarden::ui_process::read_result(&path);
+    deskwarden::ui_process::forget_result(&path);
+    let crossing = deskwarden::ui_process::UiVaultResult::union(from_file, from_exit_code);
+    log::info!(
+        "UI process {pid} lasted {:?} and came home with {crossing:?}",
+        opened_at.elapsed()
+    );
+
+    Some(VaultWindowSession {
+        result: vault_window::VaultWindowResult {
+            locked: crossing.locked,
+            needs_reauth: crossing.needs_reauth,
+            edited_settings: crossing.edited_settings,
+            switch_to: crossing.switch_to,
+            add_account: crossing.add_account,
+            remove_account: crossing.remove_account,
+            // **Deliberately not carried across.** See `ui_process`: it is a
+            // warm-cache optimisation, and its absence costs the next open
+            // one `bw status` spawn -- which is already what a window closed
+            // before its own fetch returned costs today.
+            account_details: None,
+        },
+        // **`false`, and it is the safe answer rather than an unknown one.**
+        // A UI process cannot lock in place: the lock's teardown stops and
+        // restarts `bw serve`, which belongs to the daemon. So a lock
+        // reported from over there has torn nothing down, and the recovery
+        // `run_vault_loop` has always run is the only one it will get.
+        relocked: false,
+    })
+}
+
+/// Wait for the UI process **while going on pumping this thread's message
+/// queue.**
+///
+/// A plain `child.wait()` would be a blocked message loop, and a Win32
+/// thread that stops pumping stops answering: the tray icon's hidden window
+/// belongs to this thread, so within seconds the shell would mark it not
+/// responding and the tray menu would not open at all. That is strictly worse
+/// than what this split replaces, where eframe pumped the same queue for the
+/// window's whole life.
+///
+/// **This is not the same as the tray loop iterating**, and the difference is
+/// worth stating: menu clicks are delivered to the tray's window procedure
+/// and queued on `MenuEvent`'s channel, exactly as they are today, and the
+/// daemon drains them when this returns. Making the daemon's loop run
+/// *alongside* an open window is Task 5's business, not this one's.
+///
+/// The wait is on the child's handle with a short timeout rather than
+/// `INFINITE`, so the loop's correctness rests on `try_wait` alone: whatever
+/// `MsgWaitForMultipleObjects` returns, the next pass asks the child directly.
+fn wait_for_the_ui_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE, QS_ALLINPUT,
+    };
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        unsafe {
+            let handles = [HANDLE(child.as_raw_handle())];
+            // 50ms: short enough that a missed wake costs nothing a user can
+            // see, long enough that this is not a spin.
+            let _ = MsgWaitForMultipleObjects(Some(&handles), false, 50, QS_ALLINPUT);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
+/// `CREATE_BREAKAWAY_FROM_JOB`, from `windows::Win32::System::Threading`.
+const CREATE_BREAKAWAY_FROM_JOB: u32 =
+    windows::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB.0;
+
 impl VaultOps for RealVaultOps<'_> {
     fn open_window(
         &mut self,
         mut est: SessionEstate,
         deps: &VaultDeps<'_>,
     ) -> (SessionEstate, VaultWindowSession) {
+        // **The window runs over there, not here.** Closing it is the only
+        // thing that gives the OpenGL driver's committed arenas back, and
+        // only process exit closes it in that sense -- see
+        // `open_the_vault_window_in_its_own_process`.
+        //
+        // The one carve-out is an initial search: the overlay's 3a card
+        // answers *Search vault* with the app's name, and there is no way to
+        // hand that to a UI process without putting it on a command line
+        // other processes can read. A vault search term is not a password,
+        // but it names an app the user is signed into, and the rule this
+        // design is built on is that the command line carries a mode and a
+        // surface and nothing else. So that one route keeps the in-process
+        // window, and pays the driver for it.
+        if self.initial_search.is_none() {
+            if let Some(session) = open_the_vault_window_in_its_own_process(deps.config_dir) {
+                return (est, session);
+            }
+            log::error!(
+                "falling back to opening the vault window inside the daemon; this process now \
+                 holds the graphics driver for the rest of its life"
+            );
+        }
         // Opening this window is the app's slowest visible action and the one a
         // user times with their own patience, so each stage of it says how long
         // it took. Without this the only honest answer to "why did that take ten
@@ -8780,6 +9061,237 @@ fn launch_intent<S: AsRef<str>>(
     })
 }
 
+/// A `--ui` command line this app will not act on, said out loud and then
+/// ended.
+///
+/// Returns the process's exit code rather than calling `exit` itself, so that
+/// `main`'s branch reads as one shape -- every arm of it ends the process on
+/// the same line -- and so that nothing here can be mistaken for a path that
+/// continues into the daemon's startup.
+///
+/// Exit 2, matching the identical refusal the daemon's own `launch_intent`
+/// read makes further down: from the caller's side both are the same failure
+/// and giving them two codes would only invite someone to tell them apart.
+fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
+    // The refusal happens above `logging::init`, so it opens the log itself.
+    // Silently, and best-effort: a refusal that could not be logged is still
+    // a refusal, and it still has a message box.
+    if let Some(config_dir) = settings::config_dir() {
+        let _ = logging::init(&config_dir);
+    }
+    let message = refusal.message();
+    log::error!("this launch was refused: {message}");
+    message_box("Deskwarden", &message, MB_ICONWARNING | MB_OK);
+    UI_LAUNCH_REFUSED
+}
+
+/// **The whole of a UI process**: put one surface on screen, report what the
+/// user did with it, and exit.
+///
+/// # What it deliberately does not do
+///
+/// Everything on the daemon's list, and each omission is what makes this
+/// process cheap and the daemon cheap in turn. There is no tray icon (a
+/// second one would be a second Deskwarden in the notification area), no
+/// `hotkey::register_fill_hotkey` (the chord is logon-session-wide and
+/// first-come-first-served, so registering it here would *steal*
+/// `CTRL+ALT+B` from the daemon), no `bw serve` spawn or job object (the
+/// daemon owns the backend; this process is one of its HTTP clients), no
+/// `MatchEngine`, no `window_watch` foreground thread, no update check, no
+/// `away_lock` registration, no `single_instance` participation and no app
+/// mutex. See `docs/superpowers/notes/2026-08-23-startup-role-map.md`, which
+/// is where that division was measured rather than guessed.
+///
+/// # What it does need, and where each piece comes from
+///
+/// Nothing is passed in but the surface. The rest is read here:
+///
+/// * `settings.json` for the preferences and the active account;
+/// * `accounts::resolve_startup` for which account this is, then
+///   `bw_path::set_active_data_dir` so the CLI and the token store are
+///   pointed at it *before* anything reads a token;
+/// * the DPAPI-wrapped session token from that account's own `session.bin`.
+///   DPAPI unwraps under the user's own credentials, so this process loads
+///   the same file the daemon does -- **no secret is transferred**, because
+///   no secret moves at all;
+/// * `BW_SERVE_URL`, a compile-time constant in this same binary.
+///
+/// # A missing token is a refusal, not a prompt
+///
+/// If `session.bin` is absent or the token is no longer unlocked, this
+/// process exits rather than putting a sign-in card on screen. Signing in is
+/// the daemon's business: the token it produces is what `bw serve` is started
+/// with, and a UI process that authenticated would hand the daemon a backend
+/// it did not start and a token it does not know about. Moving the sign-in
+/// flow across is Task 7 of the plan and is not done here.
+fn run_as_a_ui_process(surface: Surface) -> i32 {
+    let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
+    else {
+        return UI_COULD_NOT_START;
+    };
+    let config_dir = project_dirs.config_dir().to_path_buf();
+    if std::fs::create_dir_all(&config_dir).is_err() {
+        return UI_COULD_NOT_START;
+    }
+    let icon_cache_dir = project_dirs.cache_dir().join("icons");
+    deskwarden::app::set_icon_cache_dir(icon_cache_dir.clone());
+
+    // The same log file the daemon writes, which the spec already names as an
+    // observability cost of the split. The process id is in every line, so
+    // the two are told apart by that; this line is what says which id is
+    // which.
+    match logging::init(&config_dir) {
+        Ok(path) => log::info!(
+            "deskwarden ui process {} starting for the {surface:?} surface; logging to {}",
+            std::process::id(),
+            path.display()
+        ),
+        Err(e) => eprintln!("warning: {e}"),
+    }
+
+    // The same gate the daemon passes before anything spawns the CLI. The
+    // vault window reaches `bw` for a status fetch, an export and a Send, so
+    // this process needs the verified path recorded exactly as the daemon
+    // does -- and it must be the *verified* one for the same reason: a
+    // `bw.exe` appearing on disk later must never be the one that gets a
+    // session token.
+    let Some(bw_exe) = deskwarden::bw_path::resolve_bw_exe() else {
+        log::error!("a ui process could not resolve bw.exe; it will not open a window");
+        return UI_COULD_NOT_START;
+    };
+    if !bw_exe.exists() {
+        log::error!("a ui process found no bw.exe at {}", bw_exe.display());
+        return UI_COULD_NOT_START;
+    }
+    check_bw_signature(&bw_exe);
+    deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
+
+    let settings_path = config_dir.join("settings.json");
+    let settings = settings::Settings::load(&settings_path);
+    // This process is the one that makes the copies, so it is the one whose
+    // clearing timers matter. The daemon configures its own separately.
+    deskwarden::clipboard::configure(settings.clipboard_clearing());
+
+    let startup = accounts::resolve_startup(
+        &settings.accounts,
+        settings.active_account.as_ref(),
+        // A UI process never mints, never persists and never reports. If
+        // `settings.json` cannot be read, the daemon has already said so in
+        // this same log file, and a second copy of that error from a child
+        // process would only be noise.
+        None,
+    );
+    let (active_account, accounts_state) = match &startup {
+        accounts::StartupAccounts::Ready { active, accounts, .. } => (
+            Some(active.clone()),
+            // Built through the one constructor, exactly as `main` does, so
+            // the titlebar's switcher offers the same targets and refuses for
+            // the same reasons in both processes.
+            accounts::AccountsState::new(
+                bw_path::multi_account_availability(),
+                accounts.clone(),
+                active.id.clone(),
+            ),
+        ),
+        _ => (None, None),
+    };
+
+    // **Before anything reads a token.** Same order as the daemon's own
+    // startup, and load-bearing for the same reason: a token validated
+    // against the wrong CLI profile is silently re-authenticated, which reads
+    // to the user as "the update lost my login".
+    let session_path = match &active_account {
+        Some(a) => {
+            bw_path::set_active_data_dir(Some(accounts::data_dir_for(&config_dir, &a.id)));
+            accounts::session_path_for(&config_dir, &a.id)
+        }
+        None => config_dir.join("session.bin"),
+    };
+    let store = session_store::SessionStore::new(session_path);
+    let Some(session_token) = store.load() else {
+        log::error!(
+            "a ui process found no session token; signing in belongs to the daemon, so this \
+             window will not open"
+        );
+        return UI_COULD_NOT_START;
+    };
+
+    let cache = Arc::new(VaultCache::with_disk_cache(
+        VaultBridge::new(BW_SERVE_URL),
+        vault_disk_cache::DiskCache::new(
+            &disk_cache_dir(&config_dir, active_account.as_ref()),
+            vault_disk_cache::DiskCacheEnv::production(),
+        ),
+        disk_cache_fingerprint(active_account.as_ref()),
+        settings.cache_vault_to_disk,
+    ));
+    // Something to paint on the first frame, exactly as it is for the daemon.
+    // The window's own `spawn_vault_load` replaces it from `bw serve`.
+    let _ = cache.load_from_disk();
+
+    // Off the thread that has not opened the window yet -- the `bw` spawn is
+    // 1-3 seconds on Windows, and paid in front of the window it would be
+    // 1-3 seconds of nothing on screen. The window paints an empty avatar
+    // until this arrives.
+    let (details_tx, details_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = details_tx.send(login_ui::check_bw_status_details());
+    });
+
+    // Asked of the port rather than of a child handle: this process has no
+    // child. `bw serve` is the daemon's, and all this window needs to know is
+    // whether it may skip the readiness wait before its first `populate()`.
+    let backend_already_running = backend_is_listening();
+
+    let result = vault_window::run(
+        cache,
+        fill_stats::FillStats::new(config_dir.join("fill-stats.json")),
+        vault_window::AccountDetails::Pending(details_rx),
+        session_token,
+        icon_cache_dir,
+        settings.auto_lock(),
+        backend_already_running,
+        accounts_state,
+    );
+
+    // **The way home.** See `ui_process`: the file carries the two outcomes
+    // that have a payload, the exit code carries the four that do not, and
+    // the daemon takes the union so that a lost file cannot lose a lock.
+    let crossing = deskwarden::ui_process::UiVaultResult {
+        locked: result.locked,
+        needs_reauth: result.needs_reauth,
+        edited_settings: result.edited_settings,
+        switch_to: result.switch_to,
+        add_account: result.add_account,
+        remove_account: result.remove_account,
+    };
+    let path = deskwarden::ui_process::result_path(&config_dir, std::process::id());
+    if let Err(e) = deskwarden::ui_process::write_result(&path, &crossing) {
+        // Not fatal, and said plainly. Everything below survives it except an
+        // account switch and a preferences edit, and the exit code returned
+        // on the next line still carries the lock.
+        log::error!(
+            "a ui process could not write its result to {} ({e}); the daemon will act on the \
+             exit code alone",
+            path.display()
+        );
+    }
+    log::info!("ui process {} is done: {crossing:?}", std::process::id());
+    crossing.exit_code()
+}
+
+/// Whether anything is listening on `bw serve`'s constant port.
+///
+/// The UI process's answer to `backend_is_running`, which asks a `Child` this
+/// process does not have. A connect-and-drop rather than an HTTP request: the
+/// only question is whether the daemon's backend is up, and a TCP handshake
+/// answers it without a round trip through a vault.
+fn backend_is_listening() -> bool {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, bw_serve::BW_SERVE_PORT));
+    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
 /// **Whether this launch puts a window on screen at all.**
 ///
 /// Its own type rather than a `bool` on [`LaunchIntent`], because the two
@@ -9940,20 +10452,24 @@ mod tests {
     /// re-fixing, with the delay making it harder to notice rather than
     /// easier.
     ///
-    /// Source-level because none of the three sites is reachable from a test:
-    /// two are inside `run_tray_loop`, and the third is inside the vault
-    /// window's follow-up. Counted rather than merely found, so a site that
-    /// loses its call reds this instead of shipping.
+    /// Source-level because none of the four sites is reachable from a test:
+    /// two are inside `run_tray_loop`, the third is inside the vault window's
+    /// follow-up, and the fourth is the UI process's own startup. Counted
+    /// rather than merely found, so a site that loses its call reds this
+    /// instead of shipping.
     #[test]
     fn every_place_a_preference_edit_lands_reinstalls_the_clipboard_policy() {
         let source = include_str!("main.rs");
         let call = concat!("clipboard::config", "ure(");
         assert_eq!(
             source.matches(call).count(),
-            3,
-            "expected three `configure` calls -- startup, the tray's Preferences handler, and \
-             the vault window's `edited_settings` -- and found {}. A missing one is a clipboard \
-             preference that only takes effect on the next launch",
+            4,
+            "expected four `configure` calls -- the daemon's startup, the tray's Preferences \
+             handler, the vault window's `edited_settings`, and the UI process's own startup \
+             -- and found {}. A missing one is a clipboard preference that only takes effect \
+             on the next launch. The fourth is not a duplicate of the first: since the \
+             daemon/UI split the copies are MADE in the UI process, so it is that process \
+             whose clearing timers the preference has to reach",
             source.matches(call).count()
         );
         // The two edit sites take the value off the struct that was just
@@ -9970,11 +10486,13 @@ mod tests {
             1,
             "the vault window's follow-up no longer installs the settings it just saved"
         );
-        // And startup installs the file it just loaded.
+        // And both startups -- the daemon's and the UI process's -- install
+        // the file they just loaded. Four, because the needle is a suffix of
+        // the two above.
         assert_eq!(
             source.matches(concat!("settings.clipboard_clear", "ing()")).count(),
-            3,
-            "control: the three installs no longer read the value from a `Settings` at all"
+            4,
+            "control: the four installs no longer read the value from a `Settings` at all"
         );
     }
 
@@ -12223,6 +12741,191 @@ mod tests {
              daemon when it spawns a window and by nothing else; an installer that passes it \
              turns a login start into a windowless process or a message box"
         );
+    }
+
+    /// **The launch is read BEFORE the app mutex, and that ordering is the
+    /// whole of why a UI process is possible.**
+    ///
+    /// `single_instance::resolve` implements "the newest copy wins": a second
+    /// Deskwarden asks the running one to stand down and takes the mutex.
+    /// Right for a second daemon; catastrophic for a spawned window. Read
+    /// below that line, `deskwarden.exe --ui vault` would signal the quit
+    /// event and **the daemon that spawned it would shut itself down** --
+    /// tray, hotkey and `bw serve` gone, from a click on Open Vault.
+    ///
+    /// Held by reading the source because the defect is an ordering, and an
+    /// ordering inside `fn main` is reachable from no test: the first thing
+    /// the wrong order does is take a machine-wide named mutex.
+    #[test]
+    fn a_ui_launch_is_answered_above_the_mutex_and_the_single_instance_takeover() {
+        let main_body = body_of(production_half_of_this_file(), "fn main() {");
+        let ui = main_body
+            .find("run_as_a_ui_process(")
+            .expect("`main` no longer answers a `--ui` launch at all");
+        let mutex = main_body
+            .find(concat!("app_mutex::acq", "uire()"))
+            .expect("control: `main` no longer takes the app mutex, so this ordering is moot");
+        let takeover = main_body
+            .find(concat!("single_instance::res", "olve("))
+            .expect("control: `main` no longer resolves single-instance");
+
+        assert!(
+            ui < mutex,
+            "the `--ui` branch is below the app mutex. A spawned window would contend for the \
+             installer-visible mutex it must only ever ask about"
+        );
+        assert!(
+            ui < takeover,
+            "the `--ui` branch is below `single_instance::resolve`, so a spawned vault window \
+             asks the daemon that spawned it to stand down"
+        );
+    }
+
+    /// **A UI process does none of the daemon's work**, and each omission is
+    /// what makes it -- and the daemon it leaves behind -- cheap.
+    ///
+    /// Every one of these is invisible once working, which is exactly why it
+    /// is pinned: a tray icon registered here is a second Deskwarden in the
+    /// notification area, a `RegisterHotKey` here *steals* `CTRL+ALT+B` from
+    /// the daemon (the chord is logon-session-wide and first-come-first-
+    /// served), and a `bw serve` spawned here is a second backend fighting
+    /// the daemon's for the constant port.
+    #[test]
+    fn a_ui_process_registers_no_tray_no_hotkey_and_starts_no_backend() {
+        let body = body_of(production_half_of_this_file(), concat!("fn run_as_a_ui_", "process("));
+
+        // Control first: the slice really is the UI startup.
+        for present in [concat!("vault_window::", "run("), concat!("store.", "load()")] {
+            assert!(
+                body.contains(present),
+                "control: the sliced body does not contain {present:?}, so every exclusion \
+                 below would be about the wrong code:\n{body}"
+            );
+        }
+
+        for (needle, why) in [
+            (concat!("tray::build_", "tray("), "a second tray icon"),
+            (concat!("register_fill_", "hotkey("), "the global hotkey, stolen from the daemon"),
+            (concat!("start_bac", "kend("), "a second `bw serve` on the daemon's port"),
+            (concat!("MatchEngine::", "new("), "a match engine nothing consults"),
+            (concat!("window_wa", "tch::"), "a foreground watcher nothing reads"),
+            (concat!("KillOnCloseJob::", "new("), "a job object with nothing in it"),
+            (concat!("app_mutex::acq", "uire()"), "the mutex the daemon holds"),
+            (concat!("single_instance::", "resolve("), "a takeover of the daemon"),
+            (concat!("away_lock::register_on_this_", "process()"), "session notifications"),
+        ] {
+            assert!(
+                !body.contains(needle),
+                "a UI process does {needle:?}, which gives it {why}. The startup role map \
+                 (`docs/superpowers/notes/2026-08-23-startup-role-map.md`) is where this \
+                 division was measured:\n{body}"
+            );
+        }
+    }
+
+    /// **The UI process is spawned OUT of the kill-on-close job**, and this
+    /// is the single easiest line in the change to get wrong by reflex.
+    ///
+    /// Every other child this app starts goes through
+    /// `job_object::spawn_in_job` and joins the job, which is right for
+    /// `bw serve` -- an orphaned backend serves a decrypted vault on
+    /// localhost. It is wrong for a window: a daemon restart is routine (an
+    /// update stops the old process before starting the new one) and would
+    /// close the window the user had open, mid-edit.
+    ///
+    /// The absence is asserted here; the *presence* of the decision is a
+    /// readable field, `ui_process::UiSpawnPlan::joins_the_daemons_job`, with
+    /// its own test in that module. Both, because an absence in source and a
+    /// value in a struct fail in different ways.
+    #[test]
+    fn the_spawned_vault_window_is_not_a_member_of_the_daemons_job() {
+        let body = body_of(
+            production_half_of_this_file(),
+            concat!("fn open_the_vault_window_in_its_own_", "process("),
+        );
+        assert!(
+            body.contains(concat!("command.", "spawn()")),
+            "control: the sliced body does not spawn anything:\n{body}"
+        );
+        for (needle, why) in [
+            (
+                concat!("job_object::spawn_in_", "job("),
+                "which assigns it to the kill-on-close job, so a daemon restart closes the \
+                 user's open vault window",
+            ),
+            (
+                concat!("job.as", "sign("),
+                "which puts it in the kill-on-close job by hand",
+            ),
+        ] {
+            assert!(
+                !body.contains(needle),
+                "the UI process is spawned through {needle:?}, {why}:\n{body}"
+            );
+        }
+    }
+
+    /// **Nothing but a mode and a surface goes on the command line.**
+    ///
+    /// A Windows command line is readable by every process on the machine.
+    /// The plan is built by `ui_process::UiSpawnPlan::for_surface`, whose own
+    /// test asserts the argument list; this one asserts that the spawn site
+    /// hands that plan over verbatim rather than adding an argument of its
+    /// own on the way past -- which is how a session token or a search term
+    /// would arrive there.
+    #[test]
+    fn the_spawn_passes_the_plans_arguments_and_adds_none_of_its_own() {
+        let body = body_of(
+            production_half_of_this_file(),
+            concat!("fn open_the_vault_window_in_its_own_", "process("),
+        );
+        assert_eq!(
+            body.matches(concat!("command.a", "rgs(&plan.args)")).count(),
+            1,
+            "the spawn does not pass the plan's arguments verbatim:\n{body}"
+        );
+        assert_eq!(
+            body.matches(concat!("command.a", "rg(")).count(),
+            0,
+            "the spawn adds an argument of its own, which the plan's test cannot see:\n{body}"
+        );
+        assert_eq!(
+            body.matches(concat!("command.", "env(")).count(),
+            0,
+            "the spawn puts something in the child's environment. Everything the UI process \
+             needs it reads for itself; a value passed here is one that did not have to \
+             cross:\n{body}"
+        );
+    }
+
+    /// The two spellings of the mode flag, reconciled.
+    ///
+    /// `main.rs`'s `UI_FLAG` is what a launch is READ against;
+    /// `ui_process::UI_FLAG` is what a spawn WRITES. Two consts in two files
+    /// that must agree, which is the drift this crate's guards exist for: a
+    /// typo would make the daemon spawn a process that refuses its own
+    /// command line, and only at runtime, on a user's machine.
+    #[test]
+    fn the_flag_the_daemon_writes_is_the_flag_the_app_reads() {
+        assert_eq!(UI_FLAG, deskwarden::ui_process::UI_FLAG);
+    }
+
+    /// A UI process that failed to start must not be read as a result.
+    ///
+    /// The result bitfield uses 0-15. Exit 3 -- the obvious code for "could
+    /// not start" -- is `locked | needs_reauth` read as a result, which would
+    /// make the daemon tear down `bw serve` and demand the master password
+    /// because a child process could not find `bw.exe`.
+    #[test]
+    fn the_could_not_start_codes_cannot_be_mistaken_for_an_outcome() {
+        for code in [UI_COULD_NOT_START, UI_LAUNCH_REFUSED] {
+            assert!(
+                code > UI_RESULT_CODE_CEILING,
+                "exit {code} is inside the result bitfield's range, so a UI process that \
+                 never drew anything would be read as a window reporting outcomes"
+            );
+        }
+        assert_ne!(UI_COULD_NOT_START, UI_LAUNCH_REFUSED);
     }
 
     /// **The app and the installer must agree on the spelling**, and nothing
@@ -16479,6 +17182,52 @@ mod tests {
                     body.len()
                 );
                 methods += 1;
+                if name == "open_window" {
+                    // **The one permitted jump in the three, and it is
+                    // permitted by proof rather than by exception.**
+                    //
+                    // Since the daemon/UI split, `open_window`'s first act is
+                    // to try to run the window in a process of its own, and a
+                    // successful handoff has to leave the method with that
+                    // process's result. What made a jump dangerous here was
+                    // never the jump: it was a jump that skipped work already
+                    // begun -- half a teardown, a rebuild that never ran. So
+                    // the rule is not "no jump" but "no jump after anything
+                    // has started", and that is exactly what is asserted: at
+                    // most one `return`, and it must appear BEFORE the window
+                    // is handed to eframe, which is the first irreversible
+                    // step this method takes.
+                    let jumps = jumps_in(&body);
+                    assert!(
+                        jumps.len() <= 1 && jumps.iter().all(|j| *j == "return"),
+                        "`RealVaultOps::open_window` jumps with {jumps:?}. Exactly one \
+                         `return` is allowed here -- the handoff to the UI process, above \
+                         all of this method's work -- and nothing else:\n{body}"
+                    );
+                    let handoff = body
+                        .find(concat!("open_the_vault_window_in_its_own_", "process("))
+                        .expect(
+                            "`open_window` no longer tries to run the window in a process of \
+                             its own, so the daemon is paying for the OpenGL driver again",
+                        );
+                    let eframe = body.find(concat!("app_window::run_from_", "vault(")).expect(
+                        "control: the sliced body does not open a window at all",
+                    );
+                    assert!(
+                        handoff < eframe,
+                        "the UI-process handoff is below the in-daemon window, so the \
+                         daemon opens one first and the split has bought nothing:\n{body}"
+                    );
+                    if let Some(at) = body.find("return") {
+                        assert!(
+                            at < eframe,
+                            "`open_window` returns after handing a window to eframe, which \
+                             is the shape that shipped a silent lock failure in \
+                             v0.5.0:\n{body}"
+                        );
+                    }
+                    continue;
+                }
                 assert!(
                     jumps_in(&body).is_empty(),
                     "`RealVaultOps::{name}` jumps with {:?}:\n{body}",
