@@ -66,6 +66,8 @@ pub mod loading_ui;
 /// the user is reading. Store UTC, display local, never print "UTC".
 pub mod local_time;
 pub mod logging;
+/// Design 3b: the locked-vault card, in bare Win32.
+pub mod locked_card;
 pub mod login_ui;
 pub mod match_engine;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.

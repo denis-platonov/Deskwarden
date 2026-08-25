@@ -2469,6 +2469,7 @@ mod tests {
                 "examples/field_locator_probe.rs",
                 "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
+                "examples/locked_preview.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
                 "examples/prompt_preview.rs",

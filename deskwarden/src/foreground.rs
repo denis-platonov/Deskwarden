@@ -696,7 +696,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 14] = [
+    const OPENS_WINDOWS: [&str; 15] = [
         "app_window",
         // Design 3d's password generator. The THIRD bare-Win32 window in this
         // crate, and one for the same measured reason the other two are: an
@@ -706,6 +706,13 @@ mod tests {
         // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
         // holds its raise.
         "generate_prompt",
+        // Design 3b's locked-vault card. The FIFTH bare-Win32 window in this
+        // crate, and 2a's sibling in every respect: same width, same anchor,
+        // same reason. It is also the surface with the most to get wrong --
+        // it is shown for a vault this process CANNOT READ, so anything it
+        // claimed about the vault's contents would be a claim it has no
+        // standing to make. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "locked_card",
         "loading_ui",
         "login_ui",
         "overlay_ui",
@@ -924,11 +931,19 @@ mod tests {
     /// three raising windows share, so a raise could pick the wrong one -- is
     /// gone with the title: this card opens under `PROMPT_CARD_TITLE`, and it
     /// holds its own `HWND` and never needs to find one by name.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 4] = [
+    ///
+    /// **`locked_card` is 2a's sibling and follows it exactly.** It appears in
+    /// the same circumstance -- a password field was focused -- and answers
+    /// with a keyboard the same way: Esc dismisses it, and Enter presses the
+    /// *Unlock* button that is the one offer this state can honour. What its
+    /// capture exclusion protects is neither a password nor an account list
+    /// but the name of the app this user is signing into.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 5] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
         ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
+        ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**

@@ -3,18 +3,18 @@
 //! Interactive:
 //!
 //! ```text
-//! cargo run --example ui_preview            # the locked-vault card (design 3b)
+//! cargo run --example ui_preview            # the save-a-login form (design 3c)
 //! cargo run --example ui_preview -- --login # the login/unlock window (design 3h)
 //! ```
 //!
-//! The notice card closes on Enter/Esc/✕; the login preview just draws (its
+//! The save-a-login card closes on Enter/Esc/✕; the login preview just draws (its
 //! Continue does nothing here -- no `bw` is spawned from a preview).
 //!
 //! Self-screenshotting (for reviewing the design implementation without a
 //! human at the keyboard):
 //!
 //! ```text
-//! cargo run --example ui_preview -- --screenshot          # the locked card
+//! cargo run --example ui_preview -- --screenshot          # the 3c form
 //! cargo run --example ui_preview -- --login --screenshot  # the login window
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
@@ -114,9 +114,9 @@ enum Surface {
     // surfaces through one `run_native`. Its preview is
     // `examples/prompt_preview.rs`, beside `picker_preview`,
     // `generate_preview` and `unlock_prompt_preview` for the same reason.
-    /// Design 3b: the card for a window with a password field focused while
-    /// the vault cannot be read.
-    OverlayLocked,
+    // **No design 3b here either.** The locked-vault card is
+    // `deskwarden::locked_card` now, for the same reason and by the same
+    // route; its preview is `examples/locked_preview.rs`.
     /// The autofill overlay's save-a-new-login form (design 3c): four rows and
     /// three answers, reached from the account picker's empty card (design
     /// 3a, now `deskwarden::picker_prompt`'s -- see `examples/picker_preview.rs`).
@@ -464,7 +464,6 @@ fn pane_frame() -> egui::Frame {
 
 /// Every surface, in the order `--all` walks them.
 const ALL: &[Surface] = &[
-    Surface::OverlayLocked,
     Surface::OverlaySaveLogin,
     Surface::LoginUnlock,
     Surface::LoginSignin,
@@ -521,7 +520,6 @@ impl Surface {
     /// looks for the same name every time.
     fn stem(self) -> &'static str {
         match self {
-            Surface::OverlayLocked => "overlay_locked",
             Surface::OverlaySaveLogin => "overlay_save_login",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
@@ -598,7 +596,6 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::OverlayLocked => egui::vec2(396.0, 164.0),
             // Read off the module rather than written out: 3c is the one
             // overlay state that is NOT 164pt tall, and a preview rendered at
             // the wrong height is a picture of a layout nobody ships.
@@ -744,7 +741,7 @@ fn main() -> eframe::Result {
     } else if health {
         vec![Surface::VaultHealth]
     } else {
-        vec![Surface::OverlayLocked]
+        vec![Surface::OverlaySaveLogin]
     };
     let first = queue[0];
 
@@ -971,7 +968,6 @@ impl eframe::App for Preview {
         self.frames += 1;
 
         match self.current() {
-            Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
             Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false),
             Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true),
@@ -1060,7 +1056,7 @@ impl eframe::App for Preview {
             ctx.request_repaint();
         }
 
-        if self.current() == Surface::OverlayLocked
+        if self.current() == Surface::OverlaySaveLogin
             && ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1108,27 +1104,12 @@ enum DetailShot {
 }
 
 impl Preview {
-    /// Design 3b, drawn by the shipped function rather than re-implemented,
-    /// which is why `draw_locked_card` is public. It is the last egui notice
-    /// card: 3a is now the bare-Win32 account picker's empty mode.
-    fn draw_overlay_locked(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            // Through `locked_answer_of`, the shipped mapping, rather than a
-            // comparison against one variant: the card now carries an *Unlock*
-            // button, and a preview whose only live control did nothing when
-            // clicked would be showing a card that does not behave like the
-            // one the app ships. No prompt is opened here -- this is a preview,
-            // and the real unlock spawns `bw`.
-            if overlay_ui::locked_answer_of(&overlay_ui::draw_locked_card(ui, "Atlas Licence"))
-                .is_some()
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
-    /// Design 3c, drawn by the shipped function for the same reason 3a and 3b
-    /// are.
+    /// Design 3c, drawn by the shipped function rather than re-implemented,
+    /// which is why `draw_save_login_card` is public.
+    ///
+    /// **The last overlay card in this walk.** 2a and 3b are
+    /// `deskwarden::prompt_card` and `deskwarden::locked_card` now, and 3a has
+    /// been the account picker's empty mode since before them.
     ///
     /// The form is drawn **blank apart from the App row**, which is the state
     /// the user is really shown: exactly one of the four rows can be

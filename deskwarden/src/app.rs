@@ -7,6 +7,7 @@ use crate::injector::ui_automation;
 use crate::injector::sequence;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::key_sequence;
+use crate::locked_card;
 use crate::overlay_ui;
 use crate::vault_bridge::{extract_app_match, VaultItem};
 use crate::vault_cache::VaultCache;
@@ -2019,7 +2020,7 @@ pub trait PromptPresenter {
     /// *Unlock* button has a destination -- [`crate::unlock_prompt`] -- and
     /// the route to it is this return value, exactly as
     /// the account picker's empty card is the route to the vault window. What
-    /// [`overlay_ui::LockedAnswer`] can say is "the user asked to unlock" and
+    /// [`locked_card::LockedAnswer`] can say is "the user asked to unlock" and
     /// nothing else: it names no item, authorises no fill, and carries no
     /// password. The card is still shown for a vault this process cannot read,
     /// so a signature that could carry an id would be one nothing could
@@ -2028,7 +2029,7 @@ pub trait PromptPresenter {
         &self,
         label: &str,
         position: Option<(f32, f32)>,
-    ) -> overlay_ui::LockedAnswer;
+    ) -> locked_card::LockedAnswer;
 }
 
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
@@ -2067,7 +2068,7 @@ pub struct FnPresenter {
     ) -> Option<zeroize::Zeroizing<String>>,
     /// Asked to put design 3b on screen. Answers whether *Unlock* was clicked;
     /// see [`PromptPresenter::show_locked`].
-    pub show_locked: fn(&str, Option<(f32, f32)>) -> overlay_ui::LockedAnswer,
+    pub show_locked: fn(&str, Option<(f32, f32)>) -> locked_card::LockedAnswer,
 }
 
 impl PromptPresenter for FnPresenter {
@@ -2107,7 +2108,7 @@ impl PromptPresenter for FnPresenter {
         &self,
         label: &str,
         position: Option<(f32, f32)>,
-    ) -> overlay_ui::LockedAnswer {
+    ) -> locked_card::LockedAnswer {
         (self.show_locked)(label, position)
     }
 }
@@ -2124,7 +2125,7 @@ impl PromptPresenter for FnPresenter {
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: crate::prompt_card::show_prompt_card,
-    show_locked: overlay_ui::show_locked_overlay,
+    show_locked: crate::locked_card::show_locked_card,
     show_save_login: overlay_ui::show_save_login_overlay,
     show_generate: crate::generate_prompt::show_generate_prompt,
 };
@@ -2828,7 +2829,7 @@ pub fn handle_no_match(
 /// list is exhaustive over what the overlay may ask `main` for, and it is.
 ///
 /// Three variants and not a `bool` or an `Option<String>`, for the reason
-/// [`overlay_ui::LockedAnswer`] is two variants: the value crosses
+/// [`locked_card::LockedAnswer`] is two variants: the value crosses
 /// `main::process_foreground_event` and lands in `run`'s loop, and "there is a
 /// string" is a worse way to say "open a window" than saying it.
 ///
@@ -2907,7 +2908,7 @@ pub fn search_query(label: &str) -> &str {
     label
 }
 
-/// [`overlay_ui::LockedAnswer`] as a [`NoMatchFollowUp`], **as a pure
+/// [`locked_card::LockedAnswer`] as a [`NoMatchFollowUp`], **as a pure
 /// function**.
 ///
 /// [`picker_follow_up`]'s sibling, and it exists for the same reason: the
@@ -2919,10 +2920,10 @@ pub fn search_query(label: &str) -> &str {
 /// nothing to name: an unlock is about *Deskwarden*, not about the app the
 /// card was shown over, and a query string threaded through here would be a
 /// string this follow-up has no use for and something later could act on.
-pub fn locked_follow_up(answer: overlay_ui::LockedAnswer) -> NoMatchFollowUp {
+pub fn locked_follow_up(answer: locked_card::LockedAnswer) -> NoMatchFollowUp {
     match answer {
-        overlay_ui::LockedAnswer::Unlock => NoMatchFollowUp::Unlock,
-        overlay_ui::LockedAnswer::Dismissed => NoMatchFollowUp::Nothing,
+        locked_card::LockedAnswer::Unlock => NoMatchFollowUp::Unlock,
+        locked_card::LockedAnswer::Dismissed => NoMatchFollowUp::Nothing,
     }
 }
 
@@ -2973,7 +2974,7 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 /// placement must be computed for the window the card names, and it must be
 /// computed for the row count the card is *sized* by.
 ///
-/// **The placement is asked about [`overlay_ui::LOCKED_ROWS`]**, not
+/// **The placement is asked about [`locked_card::LOCKED_ROWS`]**, not
 /// about any other card's, even though several are equal today. The clamp onto the
 /// monitor's work area is a function of the card's height, so asking about the
 /// other card's constant would be correct only by coincidence -- and would
@@ -2988,7 +2989,7 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 /// **It answers what the card answered, and nothing more.** The one thing 3b
 /// can now ask for is the master-password prompt, and this function neither
 /// opens it nor decides whether it may be opened: it forwards
-/// [`overlay_ui::LockedAnswer`] to `main::process_foreground_event`, which
+/// [`locked_card::LockedAnswer`] to `main::process_foreground_event`, which
 /// forwards it to `run`'s loop -- the one place in this process that owns the
 /// session, the backend child and the tray, and therefore the only place that
 /// may resettle any of them. Opened here instead, the unlock would be a second
@@ -2997,8 +2998,8 @@ pub fn describe_outcome(outcome: &SaveOutcome) -> String {
 pub fn locked_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
-) -> overlay_ui::LockedAnswer {
-    let position = presenter.position(window.hwnd, overlay_ui::LOCKED_ROWS);
+) -> locked_card::LockedAnswer {
+    let position = presenter.position(window.hwnd, locked_card::LOCKED_ROWS);
     presenter.show_locked(window_label(&window.exe_name, &window.title), position)
 }
 
@@ -3010,7 +3011,7 @@ pub fn locked_arm<P: PromptPresenter>(
 /// cache, no injector, no `FillStats` and no [`Reprompt`], so nothing it holds
 /// can type, count or unlock anything -- and that stays true now that it
 /// answers, because what it answers is a request rather than an authorisation.
-/// [`overlay_ui::LockedAnswer::Unlock`] names no item and carries no password;
+/// [`locked_card::LockedAnswer::Unlock`] names no item and carries no password;
 /// the caller that acts on it is `run`'s loop, and what it does there is the
 /// one resettle sequence this crate has.
 ///
@@ -3387,10 +3388,10 @@ mod tests {
         /// 3b's own log, kept apart from both of the others.
         locked_shown: std::cell::RefCell<Vec<NoMatchShown>>,
         /// What `show_locked` answers: whether the user pressed *Unlock*.
-        /// Defaults to [`overlay_ui::LockedAnswer::Dismissed`], so every test
+        /// Defaults to [`locked_card::LockedAnswer::Dismissed`], so every test
         /// that does not name it gets the card being closed rather than a
         /// master-password prompt being asked for.
-        locked_answer: overlay_ui::LockedAnswer,
+        locked_answer: locked_card::LockedAnswer,
         /// The label and placement each `show_save_login` was handed -- design
         /// 3c's own log, kept apart from all three of the others.
         save_login_shown: std::cell::RefCell<Vec<NoMatchShown>>,
@@ -3465,7 +3466,7 @@ mod tests {
             &self,
             label: &str,
             position: Option<(f32, f32)>,
-        ) -> overlay_ui::LockedAnswer {
+        ) -> locked_card::LockedAnswer {
             self.locked_shown
                 .borrow_mut()
                 .push((label.to_string(), position));
@@ -3550,7 +3551,7 @@ mod tests {
         );
         assert_eq!(
             presenter.asked_rows.get(),
-            Some(overlay_ui::LOCKED_ROWS),
+            Some(locked_card::LOCKED_ROWS),
             "the placement was asked about a row count other than the one the 3b card is \
              SIZED by. The clamp onto the work area is a function of that height, so a wrong \
              count puts the card's footer -- and its only dismiss hint -- under the taskbar"
@@ -3587,12 +3588,12 @@ mod tests {
         let w = window("AtlasLicence.exe", "Atlas Licence");
 
         let pressed = RecordingPresenter {
-            locked_answer: overlay_ui::LockedAnswer::Unlock,
+            locked_answer: locked_card::LockedAnswer::Unlock,
             ..Default::default()
         };
         assert_eq!(
             locked_arm(&pressed, &w),
-            overlay_ui::LockedAnswer::Unlock,
+            locked_card::LockedAnswer::Unlock,
             "pressing Unlock on 3b answered a dismissal, so the button does nothing and the \
              user is left with the ~95 MB window the card exists to spare them"
         );
@@ -3600,7 +3601,7 @@ mod tests {
         let dismissed = RecordingPresenter::default();
         assert_eq!(
             locked_arm(&dismissed, &w),
-            overlay_ui::LockedAnswer::Dismissed,
+            locked_card::LockedAnswer::Dismissed,
             "dismissing 3b asked for a master-password prompt. Closing a card the app put on \
              screen unprompted must cost the user nothing at all"
         );
@@ -3616,16 +3617,16 @@ mod tests {
     #[test]
     fn a_dismissed_locked_card_asks_for_no_unlock() {
         assert_eq!(
-            locked_follow_up(overlay_ui::LockedAnswer::Unlock),
+            locked_follow_up(locked_card::LockedAnswer::Unlock),
             NoMatchFollowUp::Unlock
         );
         assert_eq!(
-            locked_follow_up(overlay_ui::LockedAnswer::Dismissed),
+            locked_follow_up(locked_card::LockedAnswer::Dismissed),
             NoMatchFollowUp::Nothing
         );
         // And it never asks for the vault WINDOW, which is the other door
         // `main` has and the one that costs what this path avoids.
-        for answer in [overlay_ui::LockedAnswer::Unlock, overlay_ui::LockedAnswer::Dismissed] {
+        for answer in [locked_card::LockedAnswer::Unlock, locked_card::LockedAnswer::Dismissed] {
             assert!(
                 !matches!(locked_follow_up(answer), NoMatchFollowUp::SearchVault(_)),
                 "the locked card asked to search a vault it cannot read, which opens a window \
@@ -3961,9 +3962,9 @@ mod tests {
             &self,
             label: &str,
             _position: Option<(f32, f32)>,
-        ) -> overlay_ui::LockedAnswer {
+        ) -> locked_card::LockedAnswer {
             self.seen.borrow_mut().push(label.to_string());
-            overlay_ui::LockedAnswer::Dismissed
+            locked_card::LockedAnswer::Dismissed
         }
     }
 
@@ -4077,9 +4078,9 @@ mod tests {
             &self,
             _label: &str,
             _position: Option<(f32, f32)>,
-        ) -> overlay_ui::LockedAnswer {
+        ) -> locked_card::LockedAnswer {
             self.log.borrow_mut().push("locked card shown");
-            overlay_ui::LockedAnswer::Dismissed
+            locked_card::LockedAnswer::Dismissed
         }
     }
 
@@ -4245,12 +4246,12 @@ mod tests {
     fn recording_show_locked(
         label: &str,
         position: Option<(f32, f32)>,
-    ) -> overlay_ui::LockedAnswer {
+    ) -> locked_card::LockedAnswer {
         LOCKED_FORWARDED
             .lock()
             .unwrap()
             .push((label.to_string(), position));
-        overlay_ui::LockedAnswer::Dismissed
+        locked_card::LockedAnswer::Dismissed
     }
 
     /// The forwarding is the only code between [`REAL_OVERLAY`]'s named
@@ -4375,7 +4376,7 @@ mod prompt_wiring_tests {
     /// for this one to be swapped with. What is left to pin is that 3b's field
     /// names the real function plainly, because `FnPresenter`'s forwarding
     /// test cannot see the struct literal it does not build.
-    const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "overlay_ui::show_locked_overlay,");
+    const REAL_SHOW_LOCKED: &str = concat!("show_locked: ", "crate::locked_card::show_locked_card,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
     /// it about the value it was HANDED. `match_disposition(true)` -- the
     /// preference read out of the path, the prompt back on for everyone who
@@ -4482,10 +4483,10 @@ mod prompt_wiring_tests {
         let mutated = concat!("    show: ", "|_label, m, p, c| crate::prompt_card::show_prompt_card(\"\", m, p, c),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
 
-        let planted = concat!("    show_locked: ", "overlay_ui::show_locked_overlay,");
+        let planted = concat!("    show_locked: ", "crate::locked_card::show_locked_card,");
         assert_eq!(occurrences(planted, REAL_SHOW_LOCKED), 1, "planted: {planted}");
         let wrapped =
-            concat!("    show_locked: ", "|_label, p| overlay_ui::show_locked_overlay(\"\", p),");
+            concat!("    show_locked: ", "|_label, p| crate::locked_card::show_locked_card(\"\", p),");
         assert_eq!(occurrences(wrapped, REAL_SHOW_LOCKED), 0, "planted: {wrapped}");
 
         let planted = concat!("match match_disposition", "(prompt_on_match) {");
@@ -8915,7 +8916,7 @@ mod generate_flow_tests {
             &self,
             _label: &str,
             _position: Option<(f32, f32)>,
-        ) -> overlay_ui::LockedAnswer {
+        ) -> locked_card::LockedAnswer {
             unreachable!("the 3d flow never opens 3b")
         }
     }
