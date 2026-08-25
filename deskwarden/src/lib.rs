@@ -75,7 +75,9 @@ pub mod otpauth;
 pub mod password_strength;
 pub mod picker_prompt;
 pub mod picker_ui;
-pub mod preflight_host;
+/// Design 4b: the send preflight, in bare Win32. **The card that took the
+/// daemon's fill path to zero GL contexts** -- see the module doc.
+pub mod preflight_card;
 pub mod prefs_ui;
 /// Design 2a: the matched-item autofill prompt, in bare Win32.
 pub mod prompt_card;

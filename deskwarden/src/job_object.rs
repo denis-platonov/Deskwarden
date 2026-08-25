@@ -2472,6 +2472,7 @@ mod tests {
                 "examples/locked_preview.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
+                "examples/preflight_preview.rs",
                 "examples/prompt_preview.rs",
                 "examples/save_login_preview.rs",
                 "examples/ui_automation_probe.rs",

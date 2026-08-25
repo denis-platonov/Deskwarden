@@ -47,16 +47,19 @@
 //! the same shape the deserializer is tested against, so a fixture that stops
 //! parsing is a fixture that stopped describing the real thing. The breach
 //! cache is handed a check that panics if it is ever called (it is not:
-//! `check_breaches` is off), and the preflight is handed a [`SendTarget`]
-//! value rather than a real foreground window.
+//! `check_breaches` is off).
+//!
+//! **The 4b preflight is no longer one of these surfaces.** It was, while it
+//! was an egui window; it is bare Win32 now -- `deskwarden::preflight_card` --
+//! and it has its own preview, `examples/preflight_preview.rs`, for the reason
+//! the other Win32 cards do: this example walks egui surfaces through one
+//! `run_native`, and there is no egui in that card to walk.
 //!
 //! Every surface renders the exact draw function the app ships, never a copy,
 //! so what these PNGs show is what the real app shows.
 
 use deskwarden::breach::BreachCache;
 use deskwarden::hello::HelloState;
-use deskwarden::injector::target::SendTarget;
-use deskwarden::key_sequence::ResolveSource;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
@@ -64,7 +67,6 @@ use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
 use deskwarden::vault_window::password_health;
 use deskwarden::vault_window::sidebar::{self, SidebarFilter};
-use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
@@ -190,13 +192,6 @@ enum Surface {
     /// nothing of it is on that shot: a confirmation card is what happens
     /// AFTER a route has been chosen.
     TotpAddPicker,
-    /// The preflight, allowed: the rule's process is in front and the focused
-    /// control is masked, so the hold-to-send is offered.
-    PreflightAllowed,
-    /// The preflight, refused: a password sequence aimed at the wrong process
-    /// and an unmasked control, which is the state that must never grow a
-    /// send button.
-    PreflightRefused,
     /// The preferences window's Clipboard page, everything switched on --
     /// four live pills, the interval field, the always-on note and the reset
     /// button. The page 3e does not contain, so there is no drawing to
@@ -471,8 +466,6 @@ const ALL: &[Surface] = &[
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
-    Surface::PreflightAllowed,
-    Surface::PreflightRefused,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
     Surface::PrefsAbout,
@@ -526,8 +519,6 @@ impl Surface {
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
-            Surface::PreflightAllowed => "preflight_allowed",
-            Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
             // **Renamed from `prefs_about_*`, not merely re-pointed.** The
@@ -617,10 +608,6 @@ impl Surface {
             // state gets a little more room rather than a scroll bar.
             Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
-            Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
-                deskwarden::preflight_host::PREFLIGHT_WIDTH,
-                deskwarden::preflight_host::PREFLIGHT_HEIGHT,
-            ),
             // The shipped window is 1000x780 with a 40px chrome bar on top;
             // this draws the BODY, which is what `draw_prefs_body` is, so the
             // page lays out against exactly the width it has in the app.
@@ -731,9 +718,8 @@ fn main() -> eframe::Result {
     };
     let first = queue[0];
 
-    // Transparent and undecorated for every surface: the overlay and the
-    // preflight need it for their rounded corners, and the login window draws
-    // its own titlebar. The panes are drawn on their own opaque CANVAS frame
+    // Transparent and undecorated for every surface: the overlay needs it for
+    // its rounded corners, and the login window draws its own titlebar. The panes are drawn on their own opaque CANVAS frame
     // below, so transparency costs them nothing.
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size(first.size())
@@ -968,8 +954,6 @@ impl eframe::App for Preview {
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
-            Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
-            Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
             Surface::PrefsAbout => self.draw_prefs_about(root),
@@ -1058,8 +1042,6 @@ enum PaneKind {
     TotpAdd,
     /// Design 6a's picker, the front door onto the four routes.
     TotpPicker,
-    /// The preflight; `true` for the allowed state, `false` for the refusal.
-    Preflight(bool),
 }
 
 /// Which fixture the read pane is drawn from, and in what reveal state.
@@ -1814,10 +1796,6 @@ impl Preview {
                 PaneKind::TotpPicker => {
                     let _ = totp_add::draw_picker(ui, &mut fixtures.totp_picker);
                 }
-                PaneKind::Preflight(allowed) => {
-                    let state = if allowed { &mut fixtures.allowed } else { &mut fixtures.refused };
-                    let _ = preflight::draw(ui, state);
-                }
             });
     }
 }
@@ -1850,8 +1828,6 @@ struct Fixtures {
     record: RecordDraft,
     totp_add: TotpAdd,
     totp_picker: TotpAdd,
-    allowed: PreflightState,
-    refused: PreflightState,
     rehearsal: scratch_window::RehearsalView,
     rehearsal_arrived: String,
     /// The Password health screen's items -- see [`HEALTH_JSON`].
@@ -1954,8 +1930,6 @@ impl Fixtures {
             breaches: BreachCache::new(std::sync::Arc::new(|_, _| {
                 unreachable!("a preview must never check a password against a breach corpus")
             })),
-            allowed: preflight_state(true, &login, &totp),
-            refused: preflight_state(false, &login, &totp),
             rehearsal: rehearsal_view(),
             health: items(HEALTH_JSON),
             // What a text field really holds after the design's sequence: the
@@ -2336,39 +2310,6 @@ fn draw_progress_bar_cycle(root: &mut egui::Ui) {
                 ui.add_space(20.0);
             }
         });
-}
-
-/// The two preflight states.
-///
-/// `allowed`: the rule's own process is in front and the focused control is
-/// masked. `refused`: a different process, with an unmasked control -- both
-/// facts wrong at once, which is the state whose message has to name both.
-fn preflight_state(allowed: bool, item: &VaultItem, totp: &TotpState) -> PreflightState {
-    let target = if allowed {
-        SendTarget {
-            title: "Ledgerline \u{2014} Sign in".to_string(),
-            image_name: "ledgerline.exe".to_string(),
-            pid: 8124,
-            class_name: "Chrome_WidgetWin_1".to_string(),
-            focused_is_masked: true,
-        }
-    } else {
-        SendTarget {
-            title: "chat \u{2014} #finance".to_string(),
-            image_name: "teams.exe".to_string(),
-            pid: 5310,
-            class_name: "Chrome_WidgetWin_1".to_string(),
-            focused_is_masked: false,
-        }
-    };
-    let login = item.login.as_ref();
-    let source = ResolveSource {
-        username: login.and_then(|l| l.username.as_deref()).unwrap_or(""),
-        password: login.and_then(|l| l.password.as_deref()).map(|p| p.as_str()).unwrap_or(""),
-        custom: deskwarden::key_sequence::custom_pairs(item),
-        totp,
-    };
-    PreflightState::new(target, "ledgerline.exe", "{USERNAME}{TAB}{PASSWORD}{ENTER}", &source)
 }
 
 fn save_png(path: &PathBuf, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {

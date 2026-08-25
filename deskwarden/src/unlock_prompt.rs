@@ -2219,7 +2219,7 @@ mod tests {
     fn the_prompt_opens_under_a_title_no_other_window_of_ours_uses() {
         for other in [
             crate::vault_window::WINDOW_TITLE,
-            crate::preflight_host::PREFLIGHT_TITLE,
+            crate::preflight_card::PREFLIGHT_CARD_TITLE,
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::region_overlay::REGION_TITLE,
         ] {

@@ -6579,7 +6579,7 @@ mod fill_dispatch_tests {
         assert!(
             std::ptr::fn_addr_eq(
                 production.confirm_fn(),
-                crate::preflight_host::show_preflight
+                crate::preflight_card::show_preflight_card
                     as fn(
                         crate::vault_window::preflight::PreflightState,
                         zeroize::Zeroizing<String>,
