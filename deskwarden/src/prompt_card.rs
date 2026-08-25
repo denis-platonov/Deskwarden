@@ -86,15 +86,25 @@ pub struct PromptWindow(pub isize);
 /// and answer with another.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// The text the initials tile is built from -- **who** is being filled,
-    /// which is the username when there is one. Not [`Row::primary`]: once a
-    /// row is labelled by *what* it will type, initials of "Username + Tab +
-    /// Password" would name nothing.
-    pub avatar_of: String,
-    /// The bold line: the username, or what this row will type.
+    /// The row's own line: **what** pressing it will type.
     pub primary: String,
-    /// The faint line under it: the item, and the app it fills.
-    pub secondary: String,
+    /// **Who** is about to be typed -- the username, or the fallback when the
+    /// item has none.
+    ///
+    /// Carried on every row although it is the same string on all of them,
+    /// because the card's header block is built from row 0 and the seam
+    /// [`run_with`] takes is a `&[Row]` and nothing else. It is also the text
+    /// the initials tile is built from.
+    ///
+    /// **This is the regression this field exists to close.** The egui card
+    /// this replaced led every row with the username, and the port replaced it
+    /// with the fill choice -- so the card that exists so the user can
+    /// recognise *which* credentials are about to be typed into their window
+    /// stopped naming the account at all. Never a password: see the module
+    /// header.
+    pub account: String,
+    /// The faint line under the account: the item, and the app it fills.
+    pub context: String,
 }
 
 /// **How many rows the card has room for.**
@@ -129,26 +139,33 @@ pub fn rows(
     username: Option<&str>,
     choices: &[FillChoice],
 ) -> Vec<Row> {
-    let (primary, secondary) = row_text(app_name, item_name, username);
+    let (account, context) = account_lines(app_name, item_name, username);
     if choices.is_empty() {
-        return vec![Row { avatar_of: primary.clone(), primary, secondary }];
+        return vec![Row { primary: FillChoice::Saved.label(), account, context }];
     }
     choices
         .iter()
         .take(ROW_CAP)
         .map(|choice| Row {
-            avatar_of: primary.clone(),
             primary: choice.label(),
-            secondary: secondary.clone(),
+            account: account.clone(),
+            context: context.clone(),
         })
         .collect()
 }
 
-/// The two lines every row shares: who, and what it fills.
+/// **The card's account block**: who, and what it fills.
 ///
 /// Lifted from the egui card unchanged, including the fallback for an item
-/// that could not be read back from the vault at prompt time.
-fn row_text(app_name: &str, item_name: &str, username: Option<&str>) -> (String, String) {
+/// that could not be read back from the vault at prompt time. It was that
+/// card's ROW; here it is the header block above the choices, which is where
+/// it has to be once the rows are labelled by what they type rather than by
+/// whom -- one account named once, and the ways to type it under it.
+pub fn account_lines(
+    app_name: &str,
+    item_name: &str,
+    username: Option<&str>,
+) -> (String, String) {
     match (username, item_name.is_empty()) {
         (Some(u), false) => (u.to_string(), format!("{item_name} · fills {app_name}")),
         (Some(u), true) => (u.to_string(), format!("fills {app_name}")),
@@ -183,12 +200,28 @@ pub fn selected_row(focused: Option<usize>, count: usize) -> usize {
     }
 }
 
+/// **How many matches design 2a is ever about: one.**
+///
+/// This is the card the daemon opens when the vault has *a* login for the app
+/// in front of the user, and [`rows`] paints that one account's fill choices.
+/// The heading used to be handed the ROW count, so a single account offering
+/// four ways to be typed announced itself as "4 matches" -- four accounts,
+/// which the user does not have and the card is not showing. The egui card it
+/// replaced read "1 match" for the same state, and this is that number where
+/// the heading can be pinned to it. The choices are not matches; they are one
+/// match's ways of being typed, and the card lists them under the account they
+/// belong to.
+pub const MATCHES: usize = 1;
+
 /// The card's header line: `"1 match"` / `"4 matches"`.
-pub fn match_count_label(rows: usize) -> String {
-    if rows == 1 {
+///
+/// **Counts accounts, not rows.** See [`MATCHES`], which is what the card
+/// passes it.
+pub fn match_count_label(matches: usize) -> String {
+    if matches == 1 {
         "1 match".to_string()
     } else {
-        format!("{rows} matches")
+        format!("{matches} matches")
     }
 }
 
@@ -371,11 +404,30 @@ pub const WIDTH: i32 = 380;
 const MARGIN_X: i32 = 16;
 const MARGIN_TOP: i32 = 16;
 
-/// One row. The same [`crate::picker_prompt`] row height, because it is drawn
-/// by the same painter -- `crate::win32_draw::draw_row`, which takes the
-/// gutter to be the row's own height, so this is also the avatar column's
-/// width.
-const ROW_H: i32 = 44;
+/// One choice row.
+///
+/// **Shorter than [`crate::picker_prompt`]'s 44**, and it is a different kind
+/// of row now: the picker's rows are two lines and an icon gutter, and these
+/// are one line each -- the way this account can be typed. Who is being typed
+/// is said once, above them, in the account block. The height the card gives
+/// back here is very nearly the height the brand lockup and that block cost
+/// it, so the card is the same size it was.
+const ROW_H: i32 = 32;
+
+/// The account block's initials tile, and the gap between it and the two lines
+/// beside it. The tile's box is the same square [`crate::win32_draw::draw_row`]
+/// leaves as a gutter on the picker's rows, so the account's text column and
+/// the picker's start at the same inset from a card edge.
+const AVATAR_BOX: i32 = 40;
+const AVATAR_GAP: i32 = 10;
+
+/// How far into a choice row its label starts.
+///
+/// **The account block's text column, exactly**, so the four choices line up
+/// under the username they belong to rather than under its avatar. A choice
+/// row has no avatar of its own -- the account has one, and it is the same
+/// account on every row.
+const CHOICE_TEXT_INSET: i32 = AVATAR_BOX + AVATAR_GAP;
 
 /// The footer strip's height: the two keyboard hints and nothing else.
 const FOOTER_H: i32 = 30;
@@ -416,6 +468,25 @@ impl Box2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
+    /// The brand lockup's shield, and the wordmark beside it. **The card had
+    /// no brand at all after the port**, although it is the surface that opens
+    /// unbidden over whatever the user is typing into: the egui card carried
+    /// `theme::card_header`'s shield and letterspaced DESKWARDEN, and a
+    /// frameless always-on-top window that appears over another app's password
+    /// field and offers to type into it has to say whose window it is. The
+    /// compact lockup, not the login window's -- see
+    /// [`crate::win32_draw::draw_card_lockup`].
+    pub mark: Box2,
+    pub wordmark: Box2,
+    /// The account's initials tile.
+    pub avatar: Box2,
+    /// **The username**, in the card's bold line -- the account whose password
+    /// the choices below will type. See [`Row::account`].
+    pub account: Box2,
+    /// The faint line under it: the item, and the app it fills.
+    pub context: Box2,
+    /// The match count, **right-aligned on the lockup's line**, which is where
+    /// the egui card put it.
     pub title: Box2,
     pub close_glyph: Box2,
     pub header_rule: Box2,
@@ -446,9 +517,30 @@ pub fn layout(rows: usize) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
     let rows = rows.max(1).min(ROW_CAP) as i32;
 
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP, w: 20, h: 20 };
-    let title = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: content_w - 24, h: 20 };
-    let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
+    let lockup = crate::win32_draw::card_lockup();
+    let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
+    let wordmark =
+        Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
+    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
+    // The count, right-aligned into whatever the lockup and the ✕ leave. It is
+    // drawn `DT_RIGHT`, so a lane wider than the word is not a gap.
+    let title = Box2 {
+        x: wordmark.right() + 8,
+        y: MARGIN_TOP,
+        w: (close_glyph.x - 6) - (wordmark.right() + 8),
+        h: lockup.mark_h,
+    };
+
+    // The account block: who is about to be typed, said once, above the ways
+    // to type them.
+    let avatar =
+        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: AVATAR_BOX, h: AVATAR_BOX };
+    let text_x = avatar.right() + AVATAR_GAP;
+    let text_w = MARGIN_X + content_w - text_x;
+    let account = Box2 { x: text_x, y: avatar.y + 2, w: text_w, h: 19 };
+    let context = Box2 { x: text_x, y: account.bottom() + 1, w: text_w, h: 16 };
+
+    let header_rule = Box2 { x: 0, y: avatar.bottom() + 12, w: WIDTH, h: 1 };
 
     let list = Box2 {
         x: MARGIN_X,
@@ -476,6 +568,11 @@ pub fn layout(rows: usize) -> Layout {
 
     Layout {
         window,
+        mark,
+        wordmark,
+        avatar,
+        account,
+        context,
         title,
         close_glyph,
         header_rule,
@@ -567,8 +664,8 @@ static ROWS: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
 /// here exhausts the table over a session rather than over a run.
 mod win32 {
     use super::{
-        Box2, Event, PromptWindow, Row, DISMISS_LABEL, ENTER_SHORTCUT, ESC_SHORTCUT, FILL_LABEL,
-        GONE, PENDING, PROMPT_CARD_TITLE, ROWS, ROW_CAP,
+        Box2, Event, PromptWindow, Row, CHOICE_TEXT_INSET, DISMISS_LABEL, ENTER_SHORTCUT,
+        ESC_SHORTCUT, FILL_LABEL, GONE, PENDING, PROMPT_CARD_TITLE, ROWS, ROW_CAP,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -580,9 +677,10 @@ mod win32 {
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
-        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_CENTER, DT_LEFT, DT_NOPREFIX,
-        DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX,
-        PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DRAW_TEXT_FORMAT, DT_CENTER,
+        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_BOLD,
+        FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY,
+        TRANSPARENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -596,7 +694,7 @@ mod win32 {
         WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_hint_chip, draw_row, rgb, RowState};
+    use crate::win32_draw::{draw_card_lockup, draw_hint_chip, rgb};
 
     /// Row `i` is control `ID_ROW + i`.
     const ID_ROW: usize = 100;
@@ -689,6 +787,15 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
+        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
+        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
+        /// in.
+        brand: HFONT,
+        /// The match count. The design's card header sets its right-hand
+        /// status at the wordmark's size in `theme::TEXT_GHOST`, quieter than
+        /// the lockup beside it -- it is a count, not a heading, and this card
+        /// no longer has a heading at all now that the account block says what
+        /// the card is about.
         title: HFONT,
         name: HFONT,
         user: HFONT,
@@ -701,7 +808,8 @@ mod win32 {
         fn build() -> Self {
             use crate::theme::{BOLD, REGULAR, SEMIBOLD};
             Fonts {
-                title: font(BOLD, 14),
+                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
+                title: font(REGULAR, crate::win32_draw::card_lockup().word_px),
                 name: font(SEMIBOLD, 13),
                 user: font(REGULAR, 11),
                 avatar: font(SEMIBOLD, 11),
@@ -712,7 +820,9 @@ mod win32 {
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.title, self.name, self.user, self.avatar, self.hint, self.prose] {
+                for f in
+                    [self.brand, self.title, self.name, self.user, self.avatar, self.hint, self.prose]
+                {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1254,13 +1364,33 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
-                text(
+                paint_lockup(mem, &l, fonts.brand);
+                // **The count of ACCOUNTS, which on this card is always one.**
+                // `count` is the number of fill choices, and handing it here is
+                // exactly the bug `super::MATCHES` documents.
+                text_right(
                     mem,
                     fonts.title,
                     l.title,
-                    &super::match_count_label(count),
-                    crate::theme::INK,
+                    &super::match_count_label(super::MATCHES),
+                    crate::theme::TEXT_GHOST,
                 );
+
+                // The account block: WHO is about to be typed. Painted on the
+                // window rather than in a row, because it is the same account
+                // for every row and the rows say what will be typed, not whom.
+                let rows_now = view();
+                if let Some(row) = rows_now.first() {
+                    let avatar = RECT {
+                        left: scale(l.avatar.x),
+                        top: scale(l.avatar.y),
+                        right: scale(l.avatar.right()),
+                        bottom: scale(l.avatar.bottom()),
+                    };
+                    paint_avatar(mem, avatar, &row.account, fonts.avatar, false);
+                    text(mem, fonts.name, l.account, &row.account, crate::theme::INK);
+                    text(mem, fonts.user, l.context, &row.context, crate::theme::TEXT_FAINT);
+                }
 
                 // `Enter Fill` and `Esc Dismiss`. Both chips are
                 // `win32_draw`'s, so they are the same chip every other card
@@ -1326,27 +1456,7 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             if let (Some(fonts), Some(row)) = (fonts, rows.get(index)) {
-                let candidate = crate::app_candidates::Candidate {
-                    id: String::new(),
-                    name: row.primary.clone(),
-                    username: row.secondary.clone(),
-                };
-                draw_row(
-                    mem,
-                    whole,
-                    &candidate,
-                    RowState { selected, hovered },
-                    fonts.name,
-                    fonts.user,
-                    // The `Enter` chip goes on the selected row and only
-                    // there, because Enter fills that row and only that one.
-                    selected.then_some((ENTER_SHORTCUT, fonts.hint)),
-                    dpi,
-                );
-                // The initials tile, in the square gutter `draw_row` leaves
-                // blank on the left. It keeps showing WHO is being filled --
-                // the label already says what is being typed.
-                paint_avatar(mem, whole, &row.avatar_of, fonts.avatar, selected);
+                paint_choice(mem, whole, &row.primary, selected, hovered, fonts, dpi);
             }
             drop(guard);
 
@@ -1358,7 +1468,84 @@ mod win32 {
         }
     }
 
-    /// The initials tile, centred in the row's square left gutter.
+    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
+    /// the crate's one mark painter, which `unlock_prompt` also draws through.
+    /// What is this card's own is only the logical-to-device conversion, which
+    /// no other card's `Box2` type can share.
+    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
+        let dev = |b: Box2| RECT {
+            left: scale(b.x),
+            top: scale(b.y),
+            right: scale(b.right()),
+            bottom: scale(b.bottom()),
+        };
+        let tracking = scale(crate::win32_draw::card_lockup().tracking);
+        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
+    }
+
+    /// **One choice row: a single line saying what pressing it will type.**
+    ///
+    /// Not [`crate::win32_draw::draw_row`], and that is the point rather than
+    /// an omission: that painter draws a name over a username with a square
+    /// icon gutter beside them, which is right for the picker's list of
+    /// ACCOUNTS and wrong for a list of ways to type ONE account. The account
+    /// is named once, above, and these rows are indented to its text column so
+    /// they read as belonging to it.
+    ///
+    /// The background fills the whole row -- including the indent -- before
+    /// any text, so hover and selection never hug just the text; that
+    /// half-width highlight was reported as a defect on the vault window's
+    /// menu. Every GDI object created here is restored and deleted before
+    /// returning.
+    fn paint_choice(
+        hdc: HDC,
+        rect: RECT,
+        label: &str,
+        selected: bool,
+        hovered: bool,
+        fonts: &Fonts,
+        dpi: i32,
+    ) {
+        unsafe {
+            let fill = if selected {
+                crate::theme::BLUE_WASH
+            } else if hovered {
+                crate::theme::CARD_TINT
+            } else {
+                crate::theme::CARD
+            };
+            fill_rect(hdc, rect, fill);
+
+            // The chip first, so the label's lane can stop short of it:
+            // `DT_END_ELLIPSIS` truncates against the rect it is given, and a
+            // label drawn to the row's own edge would run under the chip.
+            let lane = if selected {
+                draw_hint_chip(hdc, rect, ENTER_SHORTCUT, fonts.hint, dpi)
+            } else {
+                0
+            };
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, rgb(crate::theme::INK));
+            let old_font = SelectObject(hdc, fonts.name);
+            let mut chars: Vec<u16> = label.encode_utf16().collect();
+            let mut rc = RECT {
+                left: rect.left + scale(CHOICE_TEXT_INSET),
+                top: rect.top,
+                right: rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane,
+                bottom: rect.bottom,
+            };
+            DrawTextW(
+                hdc,
+                &mut chars,
+                &mut rc,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            SelectObject(hdc, old_font);
+        }
+    }
+
+    /// The initials tile, centred in the square box it is given.
     fn paint_avatar(hdc: HDC, row: RECT, name: &str, font: HFONT, selected: bool) {
         unsafe {
             let gutter = row.bottom - row.top;
@@ -1439,6 +1626,28 @@ mod win32 {
 
     /// One run of text, left-aligned and vertically centred in `at`.
     fn text(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
+        text_aligned(hdc, font, at, run, colour, DT_LEFT)
+    }
+
+    /// [`text`], right-aligned. The match count and nothing else: it is the one
+    /// run on this card the design hangs off the right edge.
+    fn text_right(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
+        text_aligned(hdc, font, at, run, colour, DT_RIGHT)
+    }
+
+    /// **`DT_END_ELLIPSIS` on every run**, because two of them -- the account
+    /// line and the context under it -- are the user's own strings, and this
+    /// card cannot grow and cannot scroll. A name cut through a letter at the
+    /// box's edge reads as a rendering fault; one ending in "..." reads as
+    /// there being more.
+    fn text_aligned(
+        hdc: HDC,
+        font: HFONT,
+        at: Box2,
+        run: &str,
+        colour: eframe::egui::Color32,
+        align: DRAW_TEXT_FORMAT,
+    ) {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(colour));
@@ -1456,7 +1665,7 @@ mod win32 {
                 hdc,
                 &mut chars,
                 &mut rc,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
             SelectObject(hdc, old);
         }
@@ -1675,19 +1884,52 @@ mod tests {
 
     // ---- the rows ----------------------------------------------------------
 
+    /// **The card names the account, whatever it is offering.**
+    ///
+    /// This is the regression: the port labelled every row by the fill choice
+    /// and dropped the username from the card entirely, on the one surface
+    /// whose stated purpose is that the user can recognise WHICH credentials
+    /// are about to be typed into their window before they are typed.
     #[test]
-    fn a_row_leads_with_the_username_so_the_user_knows_whose_password_this_is() {
-        let drawn = rows(APP, "Ledgerline Desktop", Some("ada@example.com"), &[]);
-        assert_eq!(drawn.len(), 1);
-        assert_eq!(drawn[0].primary, "ada@example.com");
-        assert_eq!(drawn[0].secondary, "Ledgerline Desktop · fills Ledgerline");
+    fn every_row_carries_the_username_so_the_user_knows_whose_password_this_is() {
+        let every = vec![
+            FillChoice::UserTabPass,
+            FillChoice::Just(FieldRef::Username),
+            FillChoice::Just(FieldRef::Password),
+            FillChoice::Just(FieldRef::Totp),
+        ];
+        for choices in [Vec::new(), every] {
+            let drawn = rows(APP, "Ledgerline Desktop", Some("ada@example.com"), &choices);
+            assert!(!drawn.is_empty());
+            for row in &drawn {
+                assert_eq!(
+                    row.account, "ada@example.com",
+                    "a row of this card does not name the account it is offering"
+                );
+                assert_eq!(row.context, "Ledgerline Desktop · fills Ledgerline");
+            }
+        }
     }
 
     #[test]
-    fn a_row_falls_back_to_the_item_and_then_to_a_neutral_line() {
-        assert_eq!(rows(APP, "Ledgerline Desktop", None, &[])[0].primary, "Ledgerline Desktop");
-        assert_eq!(rows(APP, "", None, &[])[0].primary, "Saved credentials");
-        assert_eq!(rows(APP, "", Some("ada"), &[])[0].secondary, "fills Ledgerline");
+    fn a_card_with_no_choices_still_says_what_pressing_it_will_type() {
+        let drawn = rows(APP, "Ledgerline Desktop", Some("ada@example.com"), &[]);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(
+            drawn[0].primary,
+            FillChoice::Saved.label(),
+            "the empty-choice card answers `FillChoice::Saved` -- see `choice_at` -- so its one              row has to be labelled with what that will type"
+        );
+    }
+
+    #[test]
+    fn the_account_line_falls_back_to_the_item_and_then_to_a_neutral_line() {
+        assert_eq!(
+            rows(APP, "Ledgerline Desktop", None, &[])[0].account,
+            "Ledgerline Desktop"
+        );
+        assert_eq!(rows(APP, "", None, &[])[0].account, "Saved credentials");
+        assert_eq!(rows(APP, "", Some("ada"), &[])[0].context, "fills Ledgerline");
     }
 
     /// **Every choice row names the same account**, and is labelled by what it
@@ -1699,9 +1941,9 @@ mod tests {
         assert_eq!(drawn.len(), 2);
         for (row, choice) in drawn.iter().zip(&choices) {
             assert_eq!(row.primary, choice.label());
-            assert_eq!(row.secondary, "Ledgerline Desktop · fills Ledgerline");
+            assert_eq!(row.context, "Ledgerline Desktop · fills Ledgerline");
             assert_eq!(
-                row.avatar_of, "ada@example.com",
+                row.account, "ada@example.com",
                 "the initials tile names WHO is filled; initials of what is TYPED name nothing"
             );
         }
@@ -1750,10 +1992,29 @@ mod tests {
         assert_eq!(rows(APP, "x", Some("y"), &over).len(), ROW_CAP);
     }
 
+    /// **The heading counts what its word says.**
+    ///
+    /// The regression: the card handed this its ROW count, so one account
+    /// offering four ways to be typed announced "4 matches" -- four accounts,
+    /// which the user does not have and the card was not showing. The egui
+    /// card read "1 match" for the same state.
     #[test]
-    fn the_header_counts_the_rows_that_are_really_drawn() {
+    fn the_heading_counts_accounts_and_this_card_only_ever_has_one() {
         assert_eq!(match_count_label(1), "1 match");
         assert_eq!(match_count_label(4), "4 matches");
+        assert_eq!(
+            MATCHES, 1,
+            "design 2a is the card for ONE matched account; the rows under the account block are              that account's fill choices and not further matches"
+        );
+        assert_eq!(
+            match_count_label(MATCHES),
+            "1 match",
+            "the card's heading no longer reads `1 match` for the one account it is about"
+        );
+        // And the heading does not move with the choice list, at any length.
+        for choices in 1..=ROW_CAP {
+            assert_eq!(match_count_label(MATCHES), "1 match", "{choices} choices moved the count");
+        }
     }
 
     /// **The row wearing the `Enter` chip is the row Enter fills.**
@@ -1832,12 +2093,68 @@ mod tests {
             assert_eq!(l.window.w, WIDTH);
             assert_eq!((l.window.x, l.window.y), (0, 0));
 
+            // **The brand lockup**, which the port had dropped entirely.
+            let lockup = crate::win32_draw::card_lockup();
+            assert_eq!(
+                (l.mark.x, l.mark.y),
+                (MARGIN_X, MARGIN_TOP),
+                "the lockup does not start at the card's own top-left inset"
+            );
+            assert_eq!(l.mark.h, lockup.mark_h);
+            assert_eq!(
+                l.mark.w,
+                crate::win32_draw::mark_width(l.mark.h),
+                "the mark's box is not the design artboard's ratio, so the shield would be                  letterboxed inside it and drift away from the word beside it"
+            );
+            assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
+            assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
+            // The count shares the lockup's line, the way the egui card set it.
+            assert!(
+                l.wordmark.right() <= l.title.x,
+                "the match count is drawn over the wordmark"
+            );
+            assert!(l.title.w > 0, "the match count has no lane left to be drawn in");
+            assert_eq!(l.title.y, l.mark.y, "the match count has left the lockup's line");
+
+            // **The account block: the username, and what it fills.** This is
+            // the card's whole purpose -- see `Row::account`.
+            assert!(
+                l.mark.bottom() <= l.avatar.y,
+                "the account block runs into the brand lockup above it"
+            );
+            assert_eq!(l.avatar.x, MARGIN_X);
+            assert_eq!(l.avatar.w, l.avatar.h, "the initials tile is not square");
+            assert!(l.avatar.right() < l.account.x, "the username is drawn over its own tile");
+            assert_eq!(
+                l.account.x, l.context.x,
+                "the username and the line under it start at different insets"
+            );
+            assert!(l.account.bottom() <= l.context.y, "the account block's two lines overlap");
+            assert!(
+                l.context.bottom() <= l.header_rule.y,
+                "the account block's second line falls through the header rule"
+            );
+            assert_eq!(
+                l.account.right(),
+                WIDTH - MARGIN_X,
+                "the account block's text lane does not run to the card's own margin"
+            );
+            assert_eq!(
+                l.account.x - l.avatar.right(),
+                AVATAR_GAP,
+                "control: the account block's text no longer sits one `AVATAR_GAP` off its tile,                  so the choice indent derived from those two columns means something else now"
+            );
+            assert_eq!(
+                l.list.x + CHOICE_TEXT_INSET,
+                l.account.x,
+                "a choice row's label does not line up with the username it belongs to"
+            );
+
             assert!(l.title.right() <= l.close_glyph.x, "the header text runs under the ✕");
             assert!(
                 l.close_glyph.right() <= l.window.right() - MARGIN_X,
                 "the close glyph has crossed the card's right margin"
             );
-            assert!(l.title.bottom() <= l.header_rule.y);
             assert!(l.header_rule.bottom() <= l.list.y);
             assert_eq!(l.list.x, MARGIN_X);
             assert_eq!(

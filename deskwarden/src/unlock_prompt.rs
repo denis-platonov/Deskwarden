@@ -569,11 +569,11 @@ mod win32 {
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polygon, ReleaseDC, RoundRect,
+        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
         CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
@@ -1606,37 +1606,23 @@ mod win32 {
     }
 
     /// The brand mark, from `theme`'s own geometry and fills.
+    ///
+    /// **The painter itself lives in [`crate::win32_draw::draw_mark`] now.**
+    /// This window's copy was the crate's only GDI shield, and the four cards
+    /// ported after it went without one rather than grow a second; it moved
+    /// there so all five draw the same mark. What stays here is the one thing
+    /// that is this window's own: turning its logical [`Box2`] into the device
+    /// rect the shared painter takes.
     fn paint_mark(hdc: HDC, at: Box2) {
-        let outlines = crate::theme::quadrant_outlines();
-        let box_w = scale(at.w) as f32;
-        let box_h = scale(at.h) as f32;
-        let s = (box_w / 24.0).min(box_h / 28.0);
-        let ox = scale(at.x) as f32 + (box_w - 24.0 * s) / 2.0;
-        let oy = scale(at.y) as f32 + (box_h - 28.0 * s) / 2.0;
-
-        unsafe {
-            for (outline, fill_colour) in outlines.iter().zip(crate::theme::QUADRANT_FILLS) {
-                let points: Vec<POINT> = outline
-                    .iter()
-                    .map(|p| POINT {
-                        x: (ox + p.x * s).round() as i32,
-                        y: (oy + p.y * s).round() as i32,
-                    })
-                    .collect();
-                let brush = CreateSolidBrush(rgb(fill_colour));
-                // A `NULL_PEN` would leave a hairline gap between quadrants;
-                // a pen of the quadrant's own colour makes the four shapes
-                // meet exactly as they do in the vector original.
-                let pen = CreatePen(PS_SOLID, 1, rgb(fill_colour));
-                let old_brush = SelectObject(hdc, brush);
-                let old_pen = SelectObject(hdc, pen);
-                let _ = Polygon(hdc, &points);
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                let _ = DeleteObject(brush);
-                let _ = DeleteObject(pen);
-            }
-        }
+        crate::win32_draw::draw_mark(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+        );
     }
 
     /// The 3px indeterminate track, `theme::paint_progress_bar`'s proportions

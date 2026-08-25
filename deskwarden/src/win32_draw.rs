@@ -10,11 +10,11 @@
 //! egui reads, so a theme change moves both renderers at once.
 
 use crate::app_candidates::Candidate;
-use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetTextExtentPoint32W, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HDC, HFONT, PS_SOLID,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetTextExtentPoint32W, Polygon, RoundRect,
+    SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
     TRANSPARENT,
 };
 
@@ -276,6 +276,146 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
     }
 }
 
+// ---------------------------------------------------------------------------
+// The brand lockup
+//
+// **One mark painter for the whole crate.** `unlock_prompt` had the only GDI
+// copy of the shield; the four cards ported after it started straight at their
+// title and lost the brand entirely. Rather than a second painter per card,
+// the one that existed moved here -- `unlock_prompt::win32::paint_mark` now
+// calls straight into it -- so the daemon has exactly one place that knows
+// what the mark looks like, and it reads its geometry and its four fills out
+// of `theme` like everything else in this file.
+// ---------------------------------------------------------------------------
+
+/// **The card header lockup's logical geometry**, in the cards' own logical
+/// pixels at 100%.
+///
+/// One table, because four cards lay the same lockup out and four copies of
+/// "16, then 6, then 100" is four chances to disagree. `mark_h`, `word_px` and
+/// `tracking` are `theme`'s [`crate::theme::CARD_HEADER_MARK_H`],
+/// [`crate::theme::CARD_HEADER_WORD_PX`] and
+/// [`crate::theme::CARD_HEADER_TRACKING`] rounded to whole pixels -- GDI's
+/// `SetTextCharacterExtra` takes whole pixels and nothing finer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lockup {
+    pub mark_h: i32,
+    pub mark_w: i32,
+    /// The optical gap between the shield and the word. Wider than it looks
+    /// it should be because the artboard pads the shield's ink by two of its
+    /// own units on every side -- see [`crate::theme::mark_ink_rect`].
+    pub gap: i32,
+    pub word_w: i32,
+    pub word_px: i32,
+    pub tracking: i32,
+    /// The gap between the lockup's baseline box and whatever the card puts
+    /// under it -- its own title, or its header rule.
+    pub gap_below: i32,
+}
+
+/// [`Lockup`], for the card headers.
+pub fn card_lockup() -> Lockup {
+    let mark_h = crate::theme::CARD_HEADER_MARK_H.round() as i32;
+    Lockup {
+        mark_h,
+        mark_w: mark_width(mark_h),
+        gap: 6,
+        // "DESKWARDEN" is ten capitals of a bold 11px Archivo with a pixel of
+        // tracking on each. Measured rather than guessed would mean a DC, and
+        // `layout()` is deliberately pure; this is the measured width rounded
+        // up, and every card asserts the lane it leaves fits inside its own
+        // margins.
+        word_w: 100,
+        word_px: crate::theme::CARD_HEADER_WORD_PX.round() as i32,
+        tracking: crate::theme::CARD_HEADER_TRACKING.round() as i32,
+        gap_below: 12,
+    }
+}
+
+/// How wide the mark's box is at `height`, in the design's artboard ratio.
+///
+/// [`draw_mark`] letterboxes inside whatever box it is given, so a box of the
+/// wrong ratio would leave the shield floating in dead space and push the
+/// wordmark away from it. Every caller sizes its mark box through this.
+pub fn mark_width(height: i32) -> i32 {
+    let (aw, ah) = crate::theme::MARK_ARTBOARD;
+    ((height as f32) * aw / ah).round() as i32
+}
+
+/// **The Deskwarden shield**, fitted into `rect` in DEVICE pixels.
+///
+/// The design's four quadrants from [`crate::theme::quadrant_outlines`], in
+/// [`crate::theme::QUADRANT_FILLS`]' checkerboard tone order, scaled to fit
+/// `rect` without distorting the artboard and centred in whatever room is
+/// left over.
+///
+/// Every brush and pen is restored and deleted before returning, including on
+/// the path where a quadrant is degenerate: this runs in the daemon's repaint
+/// path.
+pub fn draw_mark(hdc: HDC, rect: RECT) {
+    let (aw, ah) = crate::theme::MARK_ARTBOARD;
+    let box_w = (rect.right - rect.left) as f32;
+    let box_h = (rect.bottom - rect.top) as f32;
+    if box_w <= 0.0 || box_h <= 0.0 {
+        return;
+    }
+    let s = (box_w / aw).min(box_h / ah);
+    let ox = rect.left as f32 + (box_w - aw * s) / 2.0;
+    let oy = rect.top as f32 + (box_h - ah * s) / 2.0;
+
+    unsafe {
+        for (outline, fill_colour) in
+            crate::theme::quadrant_outlines().iter().zip(crate::theme::QUADRANT_FILLS)
+        {
+            let points: Vec<POINT> = outline
+                .iter()
+                .map(|p| POINT {
+                    x: (ox + p.x * s).round() as i32,
+                    y: (oy + p.y * s).round() as i32,
+                })
+                .collect();
+            let brush = CreateSolidBrush(rgb(fill_colour));
+            // A `NULL_PEN` would leave a hairline gap between quadrants; a pen
+            // of the quadrant's own colour makes the four shapes meet exactly
+            // as they do in the vector original.
+            let pen = CreatePen(PS_SOLID, 1, rgb(fill_colour));
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, pen);
+            let _ = Polygon(hdc, &points);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(brush);
+            let _ = DeleteObject(pen);
+        }
+    }
+}
+
+/// **The card header's lockup**: the shield, and [`crate::theme::WORDMARK_CAPS`]
+/// set beside it in `font` with `tracking` whole pixels of letterspacing.
+///
+/// Both rects are DEVICE pixels and `tracking` is already scaled by the
+/// caller, because each card owns its own DPI factor.
+///
+/// This is the compact lockup the design's card headers carry
+/// ([`crate::theme::card_header`]) -- **not** the login window's, which sets
+/// "Deskwarden" at 25px over a tagline and is far too tall for a 380px card
+/// that also has to fit a list and a footer. `unlock_prompt` keeps that one
+/// because it is the one surface with the room for it.
+pub fn draw_card_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT, tracking: i32) {
+    draw_mark(hdc, mark);
+    unsafe {
+        let old = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(crate::theme::TEXT_SECONDARY));
+        SetTextCharacterExtra(hdc, tracking);
+        let mut chars: Vec<u16> = crate::theme::WORDMARK_CAPS.encode_utf16().collect();
+        let mut rc = word;
+        DrawTextW(hdc, &mut chars, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SetTextCharacterExtra(hdc, 0);
+        SelectObject(hdc, old);
+    }
+}
+
 /// Whether a row is under the pointer, selected, both or neither.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowState {
@@ -474,10 +614,8 @@ mod tests {
         );
         let drawn = code.matches(concat!("Draw", "TextW(")).count();
         assert_eq!(
-            drawn, 4,
-            "control: win32_draw.rs draws text in four places -- a button label, a keyboard-hint \r
-             chip and a row's two lines. It now draws it in {drawn}, so the counts below no \r
-             longer mean what this pin says they mean"
+            drawn, 5,
+            "control: win32_draw.rs draws text in five places -- a button label, a keyboard-hint chip, a row's two lines, and the brand lockup's wordmark. It now draws it in {drawn}, so the counts below no longer mean what this pin says they mean"
         );
 
         assert_eq!(

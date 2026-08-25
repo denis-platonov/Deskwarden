@@ -762,6 +762,14 @@ impl Box2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
+    /// The brand lockup's shield, and the wordmark beside it. **The card had
+    /// no brand at all after the port**: the egui card it replaced carried
+    /// `theme::card_header`'s shield and letterspaced DESKWARDEN, and a
+    /// frameless always-on-top window that lists the accounts this user holds
+    /// has to say whose window it is. The compact lockup, not the login
+    /// window's -- see [`crate::win32_draw::draw_card_lockup`].
+    pub mark: Box2,
+    pub wordmark: Box2,
     pub title: Box2,
     pub subtitle: Box2,
     /// The search box, in search mode only. `None` in every other mode, rather
@@ -811,7 +819,13 @@ pub fn layout(rows: usize) -> Layout {
 pub fn layout_for(rows: usize, search: bool) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let title = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: content_w, h: 21 };
+    let lockup = crate::win32_draw::card_lockup();
+    let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
+    let wordmark =
+        Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
+
+    let title =
+        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w, h: 21 };
     let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 17 };
     let search = search.then(|| Box2 {
         x: MARGIN_X,
@@ -836,9 +850,12 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
         Box2 { x: cancel.x - 10 - SECONDARY_W, y: cancel.y, w: SECONDARY_W, h: BUTTON_H };
 
     let window = Box2 { x: 0, y: 0, w: WIDTH, h: cancel.bottom() + MARGIN_TOP };
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP, w: 20, h: 20 };
+    // The ✕ moves up onto the lockup's line, which is where every card header
+    // in the design carries it -- and where it has to be now that the title is
+    // no longer the top line.
+    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
 
-    Layout { window, title, subtitle, search, list, secondary, cancel, close_glyph }
+    Layout { window, mark, wordmark, title, subtitle, search, list, secondary, cancel, close_glyph }
 }
 
 /// One row of the **populated** card, in the order they are drawn.
@@ -1284,6 +1301,10 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
+        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
+        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
+        /// in.
+        brand: HFONT,
         title: HFONT,
         subtitle: HFONT,
         name: HFONT,
@@ -1302,6 +1323,7 @@ mod win32 {
         fn build() -> Self {
             use crate::theme::{BOLD, REGULAR, SEMIBOLD};
             Fonts {
+                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
                 title: font(BOLD, 15),
                 subtitle: font(REGULAR, 12),
                 name: font(SEMIBOLD, 13),
@@ -1315,6 +1337,7 @@ mod win32 {
         fn destroy(&self) {
             unsafe {
                 for f in [
+                    self.brand,
                     self.title,
                     self.subtitle,
                     self.name,
@@ -2587,6 +2610,7 @@ mod win32 {
 
             if let Some(fonts) = fonts {
                 let (title_run, subtitle_run) = headings();
+                paint_lockup(mem, &l, fonts.brand);
                 text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
                 text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
             }
@@ -2838,6 +2862,21 @@ mod win32 {
         // **No chip, because no digit reaches this row.** A number on it would
         // be a trap: it is the one row that is not an account.
         draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
+    }
+
+    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
+    /// the crate's one mark painter, which `unlock_prompt` also draws through.
+    /// What is this card's own is only the logical-to-device conversion, which
+    /// no other card's `Box2` type can share.
+    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
+        let dev = |b: Box2| RECT {
+            left: scale(b.x),
+            top: scale(b.y),
+            right: scale(b.right()),
+            bottom: scale(b.bottom()),
+        };
+        let tracking = scale(crate::win32_draw::card_lockup().tracking);
+        crate::win32_draw::draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
@@ -3132,6 +3171,38 @@ mod card_tests {
     #[test]
     fn nothing_the_card_lays_out_falls_off_the_bottom_of_it() {
         let l = layout(LIST_ROWS);
+
+        // **The brand lockup**, which the port had dropped entirely and which
+        // this card now carries again. Pinned to the new truth rather than
+        // loosened: the card grew by the lockup's height plus its gap, and the
+        // window's own height assertions below are what hold that honest.
+        let lockup = crate::win32_draw::card_lockup();
+        assert_eq!(
+            (l.mark.x, l.mark.y),
+            (MARGIN_X, MARGIN_TOP),
+            "the lockup does not start at the card's own top-left inset"
+        );
+        assert_eq!(l.mark.h, lockup.mark_h);
+        assert_eq!(
+            l.mark.w,
+            crate::win32_draw::mark_width(l.mark.h),
+            "the mark's box is not the design artboard's ratio, so the shield would be              letterboxed inside it and drift away from the word beside it"
+        );
+        assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
+        assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
+        assert!(
+            l.wordmark.right() <= l.close_glyph.x,
+            "the wordmark runs under the ✕"
+        );
+        assert!(
+            l.wordmark.bottom() <= l.title.y,
+            "the card's title runs into the brand lockup above it"
+        );
+        assert!(
+            l.close_glyph.right() <= l.window.right() - MARGIN_X,
+            "the close glyph has crossed the card's right margin"
+        );
+
         assert!(l.subtitle.bottom() <= l.list.y);
         assert!(l.list.bottom() <= l.cancel.y);
         // **Against the MARGIN, not against the window's edge.** The card's

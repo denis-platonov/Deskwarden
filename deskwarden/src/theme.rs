@@ -644,7 +644,7 @@ pub fn paint_mark_tinted(painter: &egui::Painter, rect: Rect, tint: Color32) {
 }
 
 fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
-    let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
+    let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
     for (outline, fill) in quadrant_outlines().iter().zip(QUADRANT_FILLS) {
         let points: Vec<Pos2> = outline
@@ -671,7 +671,7 @@ fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
 /// Callers that need the shield optically aligned to something — rather
 /// than its artboard mathematically aligned — use this to compensate.
 pub fn mark_ink_rect(rect: Rect) -> Rect {
-    let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
+    let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
     Rect::from_min_max(
         origin + Vec2::new(2.0 * scale, 2.0 * scale),
@@ -1553,6 +1553,24 @@ pub fn toolbar_button_with_shortcut(ui: &mut Ui, label: &str, shortcut: &str) ->
     response
 }
 
+/// **The wordmark, in the card header's caps setting.** One constant, because
+/// the egui header below and the four Win32 cards' GDI header both set it, and
+/// a second literal would be a second brand free to drift from this one.
+pub const WORDMARK_CAPS: &str = "DESKWARDEN";
+
+/// The card header's mark height, the size its wordmark is set at, and the
+/// tracking on it (0.1em at 11px). Public for the Win32 cards, which lay the
+/// same lockup out in whole pixels rather than through egui.
+pub const CARD_HEADER_MARK_H: f32 = 16.0;
+pub const CARD_HEADER_WORD_PX: f32 = 11.0;
+pub const CARD_HEADER_TRACKING: f32 = 1.1;
+
+/// **The mark's design artboard**, `(width, height)`. [`quadrant_outlines`] is
+/// drawn in these coordinates, so anything fitting the mark into a box of its
+/// own -- egui's [`paint_mark`] and `win32_draw::draw_mark` alike -- scales
+/// against this pair rather than against two copies of 24 and 28.
+pub const MARK_ARTBOARD: (f32, f32) = (24.0, 28.0);
+
 /// The overlay/card header bar: 16px mark, letterspaced "DESKWARDEN", and a
 /// right-aligned status ("3 matches", the app name).
 pub fn card_header(ui: &mut Ui, right_text: &str) {
@@ -1575,9 +1593,15 @@ pub fn card_header_with_close(ui: &mut Ui, right_text: &str) -> bool {
 fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
     let mut dismissed = false;
     ui.horizontal(|ui| {
-        mark(ui, 16.0);
+        mark(ui, CARD_HEADER_MARK_H);
         // Real tracking (0.1em at 11px), not spaces between letters.
-        ui.label(letterspaced("DESKWARDEN", 11.0, BOLD, 1.1, TEXT_SECONDARY));
+        ui.label(letterspaced(
+            WORDMARK_CAPS,
+            CARD_HEADER_WORD_PX,
+            BOLD,
+            CARD_HEADER_TRACKING,
+            TEXT_SECONDARY,
+        ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if with_close {
                 dismissed = close_glyph(ui).clicked();

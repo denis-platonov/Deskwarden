@@ -711,6 +711,14 @@ impl Box2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
+    /// The brand lockup's shield, and the wordmark beside it. **The card had
+    /// no brand at all after the port**: the egui card it replaced carried
+    /// 's shield and letterspaced DESKWARDEN, and a
+    /// frameless always-on-top window that offers to put a password into the
+    /// user's vault has to say whose window it is. The compact lockup, not the
+    /// login window's -- see [].
+    pub mark: Box2,
+    pub wordmark: Box2,
     pub title: Box2,
     pub close_glyph: Box2,
     /// The hairline under the header, and the one over the footer.
@@ -753,8 +761,16 @@ pub struct Layout {
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP, w: 20, h: 20 };
-    let title = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: content_w - 24, h: 21 };
+    let lockup = crate::win32_draw::card_lockup();
+    let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
+    let wordmark =
+        Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
+    // The ✕ moves up onto the lockup's line, which is where every card header
+    // in the design carries it -- and where it has to be now that the title is
+    // no longer the top line.
+    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
+    let title =
+        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w - 24, h: 21 };
     let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
 
     let value = Box2 {
@@ -810,6 +826,8 @@ pub fn layout() -> Layout {
 
     Layout {
         window,
+        mark,
+        wordmark,
         title,
         close_glyph,
         header_rule,
@@ -916,7 +934,9 @@ mod win32 {
         WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_button_with_shortcut, draw_hint_chip, rgb, ButtonSkin};
+    use crate::win32_draw::{
+        draw_button_with_shortcut, draw_card_lockup, draw_hint_chip, rgb, ButtonSkin,
+    };
 
     const ID_NEW: usize = 101;
     const ID_MINUS: usize = 102;
@@ -1015,6 +1035,10 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at close.
     /// Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
+        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
+        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
+        /// in.
+        brand: HFONT,
         title: HFONT,
         /// The password's face: monospace, so `l` and `1` are distinguishable
         /// in a value the user has to be able to read off the screen.
@@ -1031,6 +1055,7 @@ mod win32 {
         fn build() -> Self {
             use crate::theme::{BOLD, REGULAR, SEMIBOLD};
             Fonts {
+                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
                 title: font(BOLD, 15),
                 value: mono(13),
                 prose: font(REGULAR, 12),
@@ -1042,7 +1067,15 @@ mod win32 {
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.title, self.value, self.prose, self.chip, self.button, self.hint] {
+                for f in [
+                    self.brand,
+                    self.title,
+                    self.value,
+                    self.prose,
+                    self.chip,
+                    self.button,
+                    self.hint,
+                ] {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1732,6 +1765,7 @@ mod win32 {
             rounded(mem, l.value, 8, crate::theme::CANVAS, None);
 
             if let Some(fonts) = fonts {
+                paint_lockup(mem, &l, fonts.brand);
                 text(mem, fonts.title, l.title, GENERATE_LABEL, crate::theme::INK);
 
                 // **The one place a secret is painted in this crate.** The
@@ -1962,6 +1996,21 @@ mod win32 {
         let skin =
             if kind == form.kind() { ButtonSkin::primary() } else { ButtonSkin::secondary() };
         (kind.label().to_string(), None, dim(skin), fonts.chip, l.kinds[index])
+    }
+
+    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
+    /// the crate's one mark painter, which `unlock_prompt` also draws through.
+    /// What is this card's own is only the logical-to-device conversion, which
+    /// no other card's `Box2` type can share.
+    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
+        let dev = |b: Box2| RECT {
+            left: scale(b.x),
+            top: scale(b.y),
+            right: scale(b.right()),
+            bottom: scale(b.bottom()),
+        };
+        let tracking = scale(crate::win32_draw::card_lockup().tracking);
+        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
@@ -2513,6 +2562,34 @@ mod tests {
     #[test]
     fn nothing_the_card_lays_out_falls_off_it() {
         let l = layout();
+
+
+        // **The brand lockup**, which the port had dropped entirely and which
+        // this card now carries again. Pinned to the new truth rather than
+        // loosened: the card grew by the lockup's height plus its gap, and the
+        // window's own height assertions below are what hold that honest.
+        let lockup = crate::win32_draw::card_lockup();
+        assert_eq!(
+            (l.mark.x, l.mark.y),
+            (MARGIN_X, MARGIN_TOP),
+            "the lockup does not start at the card's own top-left inset"
+        );
+        assert_eq!(l.mark.h, lockup.mark_h);
+        assert_eq!(
+            l.mark.w,
+            crate::win32_draw::mark_width(l.mark.h),
+            "the mark's box is not the design artboard's ratio, so the shield would be              letterboxed inside it and drift away from the word beside it"
+        );
+        assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
+        assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
+        assert!(
+            l.wordmark.right() <= l.close_glyph.x,
+            "the wordmark runs under the ✕"
+        );
+        assert!(
+            l.wordmark.bottom() <= l.title.y,
+            "the card's title runs into the brand lockup above it"
+        );
 
         assert!(l.title.right() <= l.close_glyph.x, "the header text runs under the ✕");
         assert!(
