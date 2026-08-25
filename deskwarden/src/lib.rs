@@ -76,6 +76,8 @@ pub mod picker_prompt;
 pub mod picker_ui;
 pub mod preflight_host;
 pub mod prefs_ui;
+/// Design 2a: the matched-item autofill prompt, in bare Win32.
+pub mod prompt_card;
 pub mod qr;
 pub mod record;
 /// The 6b dimmed full-screen surface a QR code is dragged out of. **At the

@@ -696,7 +696,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 13] = [
+    const OPENS_WINDOWS: [&str; 14] = [
         "app_window",
         // Design 3d's password generator. The THIRD bare-Win32 window in this
         // crate, and one for the same measured reason the other two are: an
@@ -722,6 +722,18 @@ mod tests {
         // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
         "preflight_host",
         "prefs_ui",
+        // Design 2a's matched-item card. The FOURTH bare-Win32 window in this
+        // crate, and the one the measured argument bites hardest on: it fires
+        // on every matched fill, so it is the most frequently opened surface
+        // in the product and it paid ~50 MB of unreleasable OpenGL driver
+        // arenas to be. It is also the one Win32 card that KEEPS its anchor --
+        // it appears unbidden, beside the field the user is in -- and, unlike
+        // the egui card it replaced, it takes the foreground, because its own
+        // footer advertises `Enter Fill` and `Esc Dismiss` and a window that
+        // never has focus cannot receive either. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise.
+        "prompt_card",
         // The 6b region-selection overlay. The SECOND egui viewport in this
         // crate, and the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] stopped
         // being a one-row table -- see the argument on it.
@@ -895,10 +907,28 @@ mod tests {
     /// to be able to read and re-type, and a masked generator is one nobody
     /// can check. That is the one surface in this app where a screen recorder
     /// running while the card is up would capture a credential outright.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 3] = [
+    /// **`prompt_card` is the row that changed the rule about raising.** The
+    /// three rows above it are answers to something the user asked for -- a
+    /// chord, a click, a locked vault they tried to fill from -- and they take
+    /// the foreground because they are typed into. Design 2a is not asked for
+    /// at all: it appears because a field was focused, and its egui ancestor
+    /// sat in [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] on the ground
+    /// that taking the foreground is "the opposite of what this window wants".
+    /// Two things retire that. The card's own footer advertises `Enter Fill`
+    /// and `Esc Dismiss`, and its ancestor's source admits in the same
+    /// paragraph that "Esc is not guaranteed to reach us at all" -- a card
+    /// that cannot be answered the way it says it can. And the fill costs
+    /// nothing for it: `injector::send_input::ensure_foreground` restores the
+    /// target window before any keystroke is sent. The other reason that row
+    /// gave -- that the egui overlay opened under the literal `"Deskwarden"`
+    /// three raising windows share, so a raise could pick the wrong one -- is
+    /// gone with the title: this card opens under `PROMPT_CARD_TITLE`, and it
+    /// holds its own `HWND` and never needs to find one by name.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 4] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
+        ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**

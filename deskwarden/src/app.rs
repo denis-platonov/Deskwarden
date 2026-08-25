@@ -2123,7 +2123,7 @@ impl PromptPresenter for FnPresenter {
 /// failing.
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
-    show: overlay_ui::show_prompt_overlay,
+    show: crate::prompt_card::show_prompt_card,
     show_locked: overlay_ui::show_locked_overlay,
     show_save_login: overlay_ui::show_save_login_overlay,
     show_generate: crate::generate_prompt::show_generate_prompt,
@@ -3881,22 +3881,23 @@ mod tests {
                 "the placement was computed for a card of a different height than the one \
                  that is drawn"
             );
-            // Observed out of the viewport production really asks the OS for,
-            // not recomputed from `overlay_height` here.
-            let requested = overlay_ui::overlay_options(&offered[0], None)
-                .viewport
-                .inner_size
-                .expect("the overlay viewport must request an inner size at all");
-            assert_eq!(requested.y, overlay_ui::overlay_height(rows));
-            heights.push(requested.y);
+            // Observed out of the geometry the card production really opens
+            // is laid out at, not recomputed from a row count here.
+            let requested = crate::prompt_card::layout(rows).window.h;
+            assert_eq!(
+                requested,
+                crate::prompt_card::layout(offered[0].len()).window.h,
+                "the card was laid out for a different number of rows than it was offered"
+            );
+            heights.push(requested);
             checked += 1;
         }
         assert_eq!(checked, 2, "the loop must have visited both fixtures");
-        // The control: the two fixtures disagree, so a viewport pinned to one
+        // The control: the two fixtures disagree, so a window pinned to one
         // row -- the historical size, and the mutation that looks like a
         // simplification -- cannot pass this test.
         assert_ne!(heights[0], heights[1]);
-        assert_eq!(heights[0], overlay_ui::overlay_height(1));
+        assert_eq!(heights[0], crate::prompt_card::layout(1).window.h);
     }
 
     /// A [`PromptPresenter`] that keeps **every `&str` it is handed**, from
@@ -4363,7 +4364,7 @@ mod prompt_wiring_tests {
     /// the whole-vault clone is a failure here too, not just a slower fill.
     const LOOKUP: &str = concat!("let lookup = || cache.", "get_by_id(item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
-    const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
+    const REAL_SHOW: &str = concat!("show: ", "crate::prompt_card::show_prompt_card,");
     /// **The no-item card, named in its own field.**
     ///
     /// 3a's field used to sit beside this one, and the two had identical
@@ -4476,9 +4477,9 @@ mod prompt_wiring_tests {
         let mutated = concat!("    position: ", "|hwnd| overlay_position(hwnd).map(|(x, _y)| (x, 0.0)),");
         assert_eq!(occurrences(mutated, REAL_POSITION), 0, "planted: {mutated}");
 
-        let planted = concat!("    show: ", "overlay_ui::show_prompt_overlay,");
+        let planted = concat!("    show: ", "crate::prompt_card::show_prompt_card,");
         assert_eq!(occurrences(planted, REAL_SHOW), 1, "planted: {planted}");
-        let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
+        let mutated = concat!("    show: ", "|_label, m, p, c| crate::prompt_card::show_prompt_card(\"\", m, p, c),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
 
         let planted = concat!("    show_locked: ", "overlay_ui::show_locked_overlay,");

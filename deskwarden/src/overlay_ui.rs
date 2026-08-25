@@ -1,6 +1,6 @@
 use crate::app::FillChoice;
 use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,8 +64,8 @@ pub const CHROME_HEIGHT: f32 = 114.0;
 /// window's top edge to the first row's top, plus the distance from the last
 /// row's bottom to the bottom of the space egui allocates for the card
 /// (footer strip, card stroke and the outer margin that holds the drop
-/// shadow), less one [`ROW_GAP`] — because the gap lives inside `ROW_HEIGHT`
-/// (see [`ROW_GAP`]) and would otherwise be counted twice.
+/// shadow), less one `ROW_GAP` — because the gap lives inside `ROW_HEIGHT`
+/// (see `ROW_GAP`) and would otherwise be counted twice.
 ///
 /// This is the number a test can fail. It is asserted equal to the measured
 /// value at all four row counts the overlay can show, so a font, a margin or
@@ -104,60 +104,7 @@ pub fn overlay_height(rows: usize) -> f32 {
     CHROME_HEIGHT + ROW_HEIGHT * rows.max(1) as f32
 }
 
-/// Opens the autofill overlay for `app_name`: a small, frameless,
-/// always-on-top card (design 2a — "no chrome") with the Deskwarden header,
-/// the matched credential row, and a keyboard-hint footer.
-///
-/// Returns `Some(choice)` — **which** row the user picked (clicked, or the
-/// first row if they pressed Enter) — and `None` if they dismissed it (the
-/// header's ✕, Esc, or closing the window).
-///
-/// `choices` are the rows to offer, in order; the **first** is the primary,
-/// the one Enter takes and the one drawn in the selected treatment. An empty
-/// slice paints the single matched-credential row the overlay has always
-/// painted and answers [`FillChoice::Saved`] for it.
-///
-/// `matched` is `None` when the item couldn't be read back from the vault at
-/// prompt time; the overlay still shows, it just can't name the credentials.
-///
-/// `anchor` is the top-left corner (screen pixels) to open the window at --
-/// computed by the caller (`app::overlay_position`) from where the matched
-/// field actually is, so the overlay reads as "next to the field" rather
-/// than wherever the OS defaults a new window to. `None` falls back to
-/// whatever the OS picks.
-/// **The window `show_prompt_overlay` asks the OS for** in order to show
-/// `choices` at `anchor`.
-///
-/// Extracted from `show_prompt_overlay` for one reason: `show_prompt_overlay`
-/// calls `eframe::run_native`, which opens a real always-on-top window, so no
-/// test in this crate may execute it — and the size it asks for was therefore
-/// the one number in the overlay that nothing could observe. It could be a
-/// literal `100.0`, or `overlay_height(1)` for a four-row card, and every
-/// geometry test in this module stayed green, because those tests build their
-/// own window out of `overlay_height` and then check the card against it. The
-/// card was always fine. It was the *window* that was never looked at.
-///
-/// `NativeOptions` and `ViewportBuilder` are plain structs with public
-/// fields, so a test can read `overlay_options(choices, None).viewport
-/// .inner_size` and paint a real card into exactly that many points. That is
-/// what `the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw`
-/// does, and it is the only assertion in this module about the requested size
-/// that is not built out of the number it is checking.
-///
-/// **It takes `choices`, not a row count**, deliberately: handing it the wrong
-/// number is the whole bug, so the one caller is not given the opportunity.
-/// `show_prompt_overlay`'s remaining share of the decision is the single line
-/// that passes its own `choices` along.
-///
-/// Sized for the rows it was actually given, not for one: a window built for
-/// one row that paints four clips the last three off a frameless card the user
-/// cannot scroll. `overlay_height` floors at one row, so the empty and
-/// one-choice cases are still 164.0.
-pub fn overlay_options(choices: &[FillChoice], anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
-    options_for_rows(choices.len(), anchor)
-}
-
-/// [`overlay_options`] with the row count named directly.
+/// The window a notice card of `rows` rows asks the OS for, at `anchor`.
 ///
 /// **Private, and it stays private.** `overlay_options`' doc explains why the
 /// public entry point takes the choice list rather than a count: handing it
@@ -182,62 +129,6 @@ fn options_for_rows(rows: usize, anchor: Option<(f32, f32)>) -> eframe::NativeOp
     }
 }
 
-pub fn show_prompt_overlay(
-    app_name: &str,
-    matched: Option<&OverlayMatch>,
-    anchor: Option<(f32, f32)>,
-    choices: &[FillChoice],
-) -> Option<FillChoice> {
-    if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
-        log::warn!(
-            "autofill overlay requested for {app_name} while one is already open in this \
-             process; ignoring rather than stacking a second window"
-        );
-        return None;
-    }
-
-    let app_name = app_name.to_string();
-    let (item_name, username) = match matched {
-        Some(m) => (m.item_name.clone(), m.username.clone()),
-        None => (String::new(), None),
-    };
-
-    // Same Rc<RefCell<_>> pattern as picker_ui::run_picker: the update
-    // closure/app is 'static and must move-capture its state, so a plain
-    // local bool can't be read back after the blocking call returns. A clone
-    // of the Rc is moved in; the original is read here once the blocking
-    // call returns (safe: same thread, no cross-thread sharing).
-    let chosen: Rc<RefCell<Option<FillChoice>>> = Rc::new(RefCell::new(None));
-    let choices = choices.to_vec();
-
-    let options = overlay_options(&choices, anchor);
-
-    let app = OverlayApp {
-        app_name,
-        item_name,
-        username,
-        choices,
-        chosen: chosen.clone(),
-    };
-
-    // `run_native` rather than `run_simple_native`, because the frameless
-    // card needs a transparent clear color behind its rounded corners, and
-    // only a full `eframe::App` impl can override `clear_color`.
-    let _ = eframe::run_native(
-        "Deskwarden",
-        options,
-        Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    );
-
-    OVERLAY_OPEN.store(false, Ordering::SeqCst);
-
-    let answer = chosen.borrow().clone();
-    answer
-}
-
 /// What the keyboard does to the two **notice** cards: **Esc dismisses, and
 /// that is all there is.**
 ///
@@ -252,105 +143,6 @@ pub fn show_prompt_overlay(
 /// no second argument for a swap to hide in -- the defect `keys`' newtypes
 /// exist to stop is not merely prevented here, it is unrepresentable.
 fn no_match_keyboard_action(escape: EscapePressed) -> OverlayAction {
-    if escape.pressed() {
-        return OverlayAction::Dismiss;
-    }
-    OverlayAction::None
-}
-
-struct OverlayApp {
-    app_name: String,
-    item_name: String,
-    username: Option<String>,
-    choices: Vec<FillChoice>,
-    chosen: Rc<RefCell<Option<FillChoice>>>,
-}
-
-/// The row Enter takes: the **primary**, which is the first.
-///
-/// A free function rather than an expression inside `ui`, because `ui` needs a
-/// real egui context and nothing in the test suite may open a window — so the
-/// keyboard's half of "which choice did the user pick" would otherwise be the
-/// one half no test could reach. With no choices at all the overlay is the
-/// card it has always been, whose one row is the item's saved sequence.
-fn primary_choice(choices: &[FillChoice]) -> FillChoice {
-    choices.first().cloned().unwrap_or(FillChoice::Saved)
-}
-
-impl eframe::App for OverlayApp {
-    // Transparent behind the card: without this the window would clear to
-    // the theme's opaque panel fill and the rounded corners would sit in a
-    // visible rectangle.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array()
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        // The overlay is keyboard-first (design 2a's footer: "↵ Fill · Esc
-        // Dismiss"): Enter fills, Esc dismisses, no focus juggling needed.
-        // The decision itself is `keyboard_action`, because this function
-        // cannot be called by a test -- it needs an `eframe::Frame` and a real
-        // window -- and "Esc dismisses" is not a claim that may live only
-        // where nothing can check it.
-        let keys = keyboard_action(
-            EnterPressed::read(&ctx),
-            EscapePressed::read(&ctx),
-            &self.choices,
-        );
-
-        let card = draw_overlay_card_rows(
-            ui,
-            &self.app_name,
-            &self.item_name,
-            self.username.as_deref(),
-            &self.choices,
-        );
-
-        let done = match if keys == OverlayAction::None { card } else { keys } {
-            OverlayAction::Fill(choice) => {
-                *self.chosen.borrow_mut() = Some(choice);
-                true
-            }
-            OverlayAction::Dismiss => true,
-            // All three unreachable, and by construction rather than by
-            // discipline: `draw_overlay_card_rows` never answers any of them
-            // -- only `draw_locked_card` does, through
-            // the button lists `draw_notice_card` is handed, and this card is
-            // handed none. Closing is what a matched overlay would have to do
-            // with an answer it cannot produce, and it is the same thing
-            // `Dismiss` does. `Unlock` in particular must not unlock anything
-            // here: this card is shown only for a vault that is already open.
-            OverlayAction::NewLogin | OverlayAction::SearchVault | OverlayAction::Unlock => true,
-            OverlayAction::None => false,
-        };
-
-        if done {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
-/// What the keyboard did to the card this frame.
-///
-/// **Esc answers [`OverlayAction::Dismiss`], never a fill.** It is the one
-/// control the user reaches for to say "no" to a window that appeared over the
-/// app they were typing in, and an Esc that answered `Some(primary)` would
-/// type their password into whatever has focus. That is a behavioural claim
-/// now rather than three statements inside `OverlayApp::ui`, which no test in
-/// this crate may execute.
-///
-/// Enter outranks Esc when a frame somehow carries both, which is the
-/// behaviour this had when the two were separate `if`s.
-fn keyboard_action(
-    enter: EnterPressed,
-    escape: EscapePressed,
-    choices: &[FillChoice],
-) -> OverlayAction {
-    if enter.pressed() {
-        return OverlayAction::Fill(primary_choice(choices));
-    }
     if escape.pressed() {
         return OverlayAction::Dismiss;
     }
@@ -488,134 +280,6 @@ pub enum OverlayAction {
     Unlock,
 }
 
-/// Draws the overlay card itself — header (mark, wordmark, match count,
-/// dismiss ✕), the matched credential row, and the keyboard-hint footer.
-///
-/// Public (rather than folded into `OverlayApp::update`) so the
-/// `ui_preview` example can render the exact card the app ships, not a
-/// re-implementation that could drift from it.
-pub fn draw_overlay_card(
-    ui: &mut egui::Ui,
-    app_name: &str,
-    item_name: &str,
-    username: Option<&str>,
-) -> OverlayAction {
-    draw_overlay_card_rows(ui, app_name, item_name, username, &[])
-}
-
-/// [`draw_overlay_card`] with an explicit list of choice rows.
-///
-/// An empty `choices` paints the single matched-credential row the overlay has
-/// always painted — which is what `draw_overlay_card` (and therefore the whole
-/// of production, until step 5 wires a choice list through) asks for. A
-/// non-empty `choices` paints one row per choice, labelled by
-/// [`FillChoice::label`].
-///
-/// The card is sized for `overlay_height(choices.len())`; because
-/// `overlay_height` floors at one row, the empty case and the one-choice case
-/// are the same height, and that height is the overlay's historical 164.0.
-///
-/// This is a separate function rather than an extra parameter on
-/// `draw_overlay_card` only because `draw_overlay_card`'s signature is what
-/// the `ui_preview` example calls, and this step owns exactly one file.
-pub fn draw_overlay_card_rows(
-    ui: &mut egui::Ui,
-    app_name: &str,
-    item_name: &str,
-    username: Option<&str>,
-    choices: &[FillChoice],
-) -> OverlayAction {
-    let mut action = OverlayAction::None;
-
-    let card = egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 18,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(36),
-        })
-        .outer_margin(Margin {
-            left: 4,
-            right: 12,
-            top: 2,
-            bottom: 20,
-        });
-
-    card.show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-
-        // Header: mark, wordmark, match count, and the dismiss ✕. The ✕ is
-        // the only mouse-operable way out of a `with_decorations(false)`
-        // window — there is no title bar to close, and the footer's "Esc
-        // Dismiss" is a label, not a control. It matters more than it looks:
-        // this window is raised in response to *another* app being
-        // foregrounded, which is exactly the situation Windows' foreground
-        // lock refuses keyboard focus for, so Esc is not guaranteed to reach
-        // us at all.
-        egui::Frame::new()
-            .inner_margin(Margin::symmetric(12, 9))
-            .show(ui, |ui| {
-                if theme::card_header_with_close(ui, &match_count_label(choices.len().max(1))) {
-                    action = OverlayAction::Dismiss;
-                }
-            });
-        theme::hairline(ui);
-
-        // The choice rows. With no choices this is the single matched
-        // credential row, in the selected treatment, exactly as before.
-        egui::Frame::new()
-            .inner_margin(Margin::same(6))
-            .show(ui, |ui| {
-                let (primary, secondary) = row_text(app_name, item_name, username);
-                if choices.is_empty() {
-                    if credential_row(ui, &primary, &primary, &secondary, true) {
-                        action = OverlayAction::Fill(FillChoice::Saved);
-                    }
-                } else {
-                    for (index, choice) in choices.iter().enumerate() {
-                        // Between rows only: with one row the card is byte-
-                        // for-byte the geometry it has always had, which is
-                        // what makes `overlay_height(1) == 164.0` true of the
-                        // drawing and not just of the arithmetic.
-                        if index > 0 {
-                            ui.add_space(ROW_GAP);
-                        }
-                        // The avatar keeps showing WHO is being filled, not
-                        // what is being typed -- the label already says that,
-                        // and initials of "Username + Tab + Password" would
-                        // name nothing.
-                        // `choice.clone()`, not `choices[0]` and not the
-                        // index: the row that was clicked is the row that
-                        // answers, or four rows are four ways to do one thing.
-                        if credential_row(ui, &primary, &choice.label(), &secondary, index == 0) {
-                            action = OverlayAction::Fill(choice.clone());
-                        }
-                    }
-                }
-            });
-
-        // Footer: keyboard hints on the tinted strip.
-        theme::hairline(ui);
-        egui::Frame::new()
-            .fill(theme::CARD_TINT)
-            .corner_radius(CornerRadius {
-                sw: 9,
-                se: 9,
-                ..CornerRadius::ZERO
-            })
-            .inner_margin(Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                theme::footer_hints(ui, &[("Enter", "Fill"), ("Esc", "Dismiss")]);
-            });
-    });
-
-    action
-}
-
 /// Design **3b**: the card for a window that asks for a password while the
 /// vault is **locked**.
 ///
@@ -682,7 +346,7 @@ const LOCKED_BUTTONS: &[(&str, OverlayAction)] = &[(UNLOCK_LABEL, OverlayAction:
 /// `picker_prompt::card_tests`.)
 ///
 /// `primary` and `secondary` are borrowed and both labels `.truncate()`, for
-/// the reason [`credential_row`]'s do: each carries one user-controlled string
+/// the reason the choice row the matched card used to draw's do: each carries one user-controlled string
 /// (`app::window_label`'s answer), wrapping is what made a one-row card 189pt
 /// tall in a 164pt window, and this window still cannot scroll.
 /// **`buttons` is what makes this card taller than an empty-footer one.** 3b
@@ -1008,7 +672,7 @@ pub enum LockedAnswer {
 /// it. As one total `match`, a new [`OverlayAction`] variant is a compile
 /// error here and `every_locked_action_has_an_answer` reads the table.
 ///
-/// [`OverlayAction::Fill`], [`OverlayAction::NewLogin`] and
+/// `OverlayAction::Fill`, [`OverlayAction::NewLogin`] and
 /// [`OverlayAction::SearchVault`] all map to [`LockedAnswer::Dismissed`]: all
 /// three are unreachable on this card by construction ([`LOCKED_BUTTONS`]
 /// names none of them, and there is no item to fill from), and the safe
@@ -1623,191 +1287,6 @@ impl eframe::App for SaveLoginApp {
     }
 }
 
-/// The two lines of the credential row: the recognizable identity on top
-/// (username when known, item name otherwise) and context underneath.
-fn row_text(app_name: &str, item_name: &str, username: Option<&str>) -> (String, String) {
-    match (username, item_name.is_empty()) {
-        (Some(u), false) => (u.to_string(), format!("{item_name} · fills {app_name}")),
-        (Some(u), true) => (u.to_string(), format!("fills {app_name}")),
-        (None, false) => (item_name.to_string(), format!("fills {app_name}")),
-        (None, true) => ("Saved credentials".to_string(), format!("fills {app_name}")),
-    }
-}
-
-/// Gap between two adjacent choice rows. Folded into [`ROW_HEIGHT`] rather
-/// than into [`CHROME_HEIGHT`], because there are `n - 1` gaps for `n` rows
-/// and `CHROME_HEIGHT` must not depend on `n`:
-///
-/// ```text
-/// chrome + n*tile + (n-1)*gap  ==  (CHROME_HEIGHT) + n*(tile + gap)
-/// ```
-///
-/// holds exactly when `CHROME_HEIGHT == chrome - gap`, i.e. when the gap
-/// belongs to the row. That identity is what lets `overlay_height` be `a + b*n`
-/// at all.
-const ROW_GAP: f32 = 4.0;
-
-/// The overlay header's match count, e.g. `"1 match"` / `"4 matches"`.
-///
-/// It was the literal `"1 match"` regardless of how many rows the card was
-/// about to draw — correct only for as long as the overlay showed exactly
-/// one, which is the thing the surrounding work exists to stop being true.
-/// `rows` is the row count the card really paints, which is
-/// `choices.len().max(1)` for the same reason `overlay_height` takes
-/// `rows.max(1)`: an empty slice still paints one row.
-fn match_count_label(rows: usize) -> String {
-    if rows == 1 {
-        "1 match".to_string()
-    } else {
-        format!("{rows} matches")
-    }
-}
-
-/// The width kept clear at the right-hand end of every choice row for the
-/// selected row's `Enter` chip.
-///
-/// The text column is sized `available - CHIP_LANE` rather than being allowed
-/// to take the whole row, because truncation needs a bound and the bound must
-/// leave the chip somewhere to be: a text column that ate the full width
-/// would push the `Enter` chip off the right edge of a window with no
-/// horizontal scrolling either.
-///
-/// It is reserved on **both** treatments, selected and not, so the two rows
-/// truncate at exactly the same place — a row whose text lane changed width
-/// when it became selected would re-truncate under the mouse.
-///
-/// Checked against the chip that is really painted, not chosen and left
-/// alone: `the_enter_chip_has_a_lane_of_its_own_and_the_text_stops_short_of_it`
-/// measures the painted chip and the painted text and asserts the chip fits
-/// inside the lane and no glyph run reaches into it.
-const CHIP_LANE: f32 = 56.0;
-
-/// One choice row. `selected` renders the emphasized treatment (blue wash,
-/// blue avatar, Enter chip); otherwise the neutral one.
-///
-/// **A row cannot grow the card, whatever its text says.** This is the
-/// module's first critical finding. The row used to be content-sized: two
-/// plain `ui.label`s that wrapped, in a card whose height is a fixed
-/// `CHROME_HEIGHT + n * ROW_HEIGHT` and a window that is
-/// `with_decorations(false)`, always-on-top, unresizable and has no scroll
-/// area anywhere. `secondary` is `format!("{item_name} · fills {app_name}")`
-/// — **two user-controlled strings** — and the geometry was measured off one
-/// short fixture. Measured on the shipped code, a four-row card was 396pt
-/// tall against a 314pt window with realistic names (82pt gone), 444pt with a
-/// name that has no spaces to wrap at (130pt gone), and 348pt with CJK (34pt
-/// gone). Even a ONE-row card overflowed its 164pt window at 177/189pt; the
-/// 10pt of [`CHROME_SLACK`] had been absorbing the mild end of it.
-///
-/// Enlarging the window is not the fix — a vault item's name is arbitrarily
-/// long, so there is no worst case to size for. So the two lines are
-/// **truncated to one line each** inside a text column of an explicit width
-/// ([`CHIP_LANE`]), which makes the row's height a function of the font and
-/// nothing else, and leaves the card at exactly the size it has always been
-/// for every string.
-///
-/// **Both `.truncate()` calls are load-bearing, and on different paths.**
-/// `secondary` is user-controlled on every path. `primary` is not: with a
-/// non-empty choice list it is [`FillChoice::label`], one of four compile-time
-/// constants, and with an EMPTY one — which is what `draw_overlay_card` and
-/// therefore the whole of production draws today — it is `row_text`'s first
-/// value, i.e. the **username, or the item name when there is none**. That
-/// asymmetry is why the primary's `.truncate()` was inert under test for a
-/// while: every geometry fixture drove the choice-list path, so the top line
-/// was always a constant and removing its bound changed nothing measurable.
-/// The two halves are covered by two tests, deliberately:
-/// `no_string_a_user_can_supply_makes_the_card_taller` (choice rows, hostile
-/// secondary) and
-/// `the_no_choices_card_production_draws_today_bounds_its_user_controlled_top_line`
-/// (no choices, hostile primary).
-///
-/// `avatar_of` is the text the initials tile is built from, which is NOT
-/// `primary` once a row is labelled by what it will type rather than by whose
-/// credentials it will type. Both treatments are the same height by
-/// construction — the row's height is the taller of the 28pt avatar and the
-/// two text lines, and neither the wash nor the chip is on that path — and
-/// `both_row_treatments_are_the_same_height` holds it there.
-///
-/// Returns true when clicked.
-fn credential_row(
-    ui: &mut egui::Ui,
-    avatar_of: &str,
-    primary: &str,
-    secondary: &str,
-    selected: bool,
-) -> bool {
-    let fill = if selected {
-        theme::BLUE_WASH
-    } else {
-        theme::CANVAS
-    };
-    let row = egui::Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::avatar(ui, &theme::initials(avatar_of), 28.0, selected);
-                ui.add_space(2.0);
-                // The text column is given an EXPLICIT width and its two
-                // labels TRUNCATE. Both halves are load-bearing; see
-                // [`CHIP_LANE`] and the module note above.
-                let text_width = (ui.available_width() - CHIP_LANE).max(1.0);
-                ui.vertical(|ui| {
-                    ui.set_width(text_width);
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.add(
-                        egui::Label::new(theme::semibold(primary, 13.0).color(theme::INK))
-                            .truncate(),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(secondary).size(11.0).color(theme::TEXT_FAINT),
-                        )
-                        .truncate(),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if selected {
-                        theme::kbd_chip(ui, "Enter", true);
-                    }
-                });
-            });
-        });
-
-    let response = row.response.interact(Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response.clicked()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn row_leads_with_the_username_when_known() {
-        let (primary, secondary) = row_text("ledgerline.exe", "Ledgerline", Some("a@b.com"));
-        assert_eq!(primary, "a@b.com");
-        assert_eq!(secondary, "Ledgerline · fills ledgerline.exe");
-    }
-
-    #[test]
-    fn row_falls_back_to_the_item_name_without_a_username() {
-        let (primary, secondary) = row_text("app.exe", "Postgres — Prod", None);
-        assert_eq!(primary, "Postgres — Prod");
-        assert_eq!(secondary, "fills app.exe");
-    }
-
-    #[test]
-    fn row_still_says_something_when_the_item_could_not_be_read() {
-        let (primary, secondary) = row_text("app.exe", "", None);
-        assert_eq!(primary, "Saved credentials");
-        assert_eq!(secondary, "fills app.exe");
-    }
-}
-
 /// The overlay's geometry, measured off frames the card actually paints.
 ///
 /// Why this exists at all: the overlay is a `with_decorations(false)`,
@@ -1830,7 +1309,6 @@ mod tests {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use crate::key_sequence::FieldRef;
     use eframe::egui::{epaint, Color32, Rect};
 
     // ---------------------------------------------------------------- ink
@@ -1984,8 +1462,6 @@ mod geometry_tests {
     }
 
     const APP: &str = "ledgerline.exe";
-    const ITEM: &str = "Ledgerline";
-    const USER: &str = "ada@example.com";
 
     /// One set of strings the card can be asked to draw.
     ///
@@ -1997,9 +1473,10 @@ mod geometry_tests {
     #[derive(Debug, Clone, Copy)]
     struct Fixture {
         name: &'static str,
+        /// The one string the two surviving cards in this file are measured
+        /// against. `item` and `user` went with the matched card, whose
+        /// secondary line was the only place they were concatenated.
         app: &'static str,
-        item: &'static str,
-        user: &'static str,
     }
 
     /// The fixture the module's numbers were originally measured from. It
@@ -2008,8 +1485,6 @@ mod geometry_tests {
     const SHORT: Fixture = Fixture {
         name: "short",
         app: APP,
-        item: ITEM,
-        user: USER,
     };
 
     /// Realistic, and long: a real vault item in a real organisation, and the
@@ -2018,8 +1493,6 @@ mod geometry_tests {
     const LONG: Fixture = Fixture {
         name: "long realistic names",
         app: "ledgerline-production-accounting-cluster-primary-host.exe",
-        item: "Ledgerline Production Accounting Cluster — Primary Vault Entry",
-        user: "ada.lovelace.administrator@ledgerline-production-accounting.example.com",
     };
 
     /// Wide glyphs: CJK is roughly twice the advance per character, so a name
@@ -2036,8 +1509,6 @@ mod geometry_tests {
     const CJK: Fixture = Fixture {
         name: "CJK",
         app: "銀行口座管理システム.exe",
-        item: "銀行口座管理システム本番環境の管理者資格情報エントリ",
-        user: "銀行口座管理システム本番環境管理者＠銀行口座管理システム.example.co.jp",
     };
 
     /// **Nothing to wrap at.** A word wrapper's escape hatch is a space; a
@@ -2046,111 +1517,15 @@ mod geometry_tests {
     const NO_SPACES: Fixture = Fixture {
         name: "no spaces",
         app: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
-        item: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        user: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     };
 
     /// Every fixture the card must survive, the short one first.
     const FIXTURES: [Fixture; 4] = [SHORT, LONG, CJK, NO_SPACES];
 
-    /// The four rows `app::fill_choices` can produce, in its own order.
-    fn four_choices() -> Vec<FillChoice> {
-        vec![
-            FillChoice::UserTabPass,
-            FillChoice::Just(FieldRef::Username),
-            FillChoice::Just(FieldRef::Password),
-            FillChoice::Just(FieldRef::Totp),
-        ]
-    }
 
-    /// Paints a real card with `choices` into a window of `height`, and
-    /// returns every painted thing with non-zero alpha.
-    ///
-    /// Zero-alpha shapes are DISCARDED here, at the source: a card whose rows
-    /// are painted fully transparent must look to every assertion below
-    /// exactly like a card with no rows, because that is what it looks like to
-    /// the user.
-    fn painted(choices: &[FillChoice], height: f32) -> Vec<Ink> {
-        painted_as(SHORT, choices, height)
-    }
 
-    /// [`painted`], for a card drawn with `fixture`'s strings rather than the
-    /// short ones.
-    fn painted_as(fixture: Fixture, choices: &[FillChoice], height: f32) -> Vec<Ink> {
-        painted_as_user(fixture, Some(fixture.user), choices, height)
-    }
 
-    /// [`painted_as`], with the username spelled out rather than assumed to be
-    /// present.
-    ///
-    /// `OverlayApp::ui` passes `self.username.as_deref()`, so `None` is a value
-    /// production ships, and on that arm the top line paints the ITEM NAME.
-    /// Every painting helper here hard-coded `Some(..)`, which is why the
-    /// fallback arm went unmeasured.
-    fn painted_as_user(
-        fixture: Fixture,
-        user: Option<&str>,
-        choices: &[FillChoice],
-        height: f32,
-    ) -> Vec<Ink> {
-        let ctx = styled_ctx();
-        let output = ctx.run_ui(sized(height), |ui| {
-            draw_overlay_card_rows(ui, fixture.app, fixture.item, user, choices);
-        });
-        let mut ink = Vec::new();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut ink);
-        }
-        ink.retain(|i| i.alpha > 0);
-        ink
-    }
 
-    /// Clicks the point `at` on a card drawn with `choices`, and returns what
-    /// the card answered on the frame the button came back up.
-    ///
-    /// Two frames on ONE context, not one: egui decides a click on the release,
-    /// and a press and a release squeezed into a single frame is not the
-    /// gesture the user makes. The first frame is the press (whose answer is
-    /// asserted to be `None` -- a card that "filled" on mouse-down would fill
-    /// the row the user dragged off), the second the release.
-    fn click_on(choices: &[FillChoice], at: egui::Pos2) -> OverlayAction {
-        let height = overlay_height(choices.len());
-        let ctx = styled_ctx();
-        // Warm-up frame: the row Frames must have been laid out once before
-        // their rects can be interacted with.
-        let _ = ctx.run_ui(sized(height), |ui| {
-            draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
-        });
-
-        let press = |down: bool| egui::RawInput {
-            events: vec![
-                egui::Event::PointerMoved(at),
-                egui::Event::PointerButton {
-                    pos: at,
-                    button: egui::PointerButton::Primary,
-                    pressed: down,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-            ..sized(height)
-        };
-
-        let mut on_press = OverlayAction::None;
-        let _ = ctx.run_ui(press(true), |ui| {
-            on_press = draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
-        });
-        assert_eq!(
-            on_press,
-            OverlayAction::None,
-            "the card answered on mouse-DOWN; a press the user drags away from is not a choice"
-        );
-
-        let mut on_release = OverlayAction::None;
-        let _ = ctx.run_ui(press(false), |ui| {
-            on_release = draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
-        });
-        on_release
-    }
 
     /// The clickable tiles of the choice rows, top to bottom.
     ///
@@ -2234,365 +1609,18 @@ mod geometry_tests {
         assert_eq!(overlay_height(4), 164.0 + 3.0 * ROW_HEIGHT);
     }
 
-    /// The load-bearing test. For one, two, three and four rows: every row's
-    /// clickable rect and every row's painted label are inside the window that
-    /// `overlay_height` sized.
-    ///
-    /// Both counters are the point. A walker that finds no tiles, or a loop
-    /// that never runs, satisfies every "is inside" assertion vacuously --
-    /// which is precisely how this codebase's instruments have gone blind
-    /// before.
-    #[test]
-    fn every_choice_row_is_inside_the_window_for_one_two_three_and_four_rows() {
-        let mut iterations = 0;
-        for n in 1..=4usize {
-            iterations += 1;
-            let choices = &four_choices()[..n];
-            let height = overlay_height(n);
-            let ink = painted(choices, height);
-            let tiles = row_tiles(&ink);
 
-            assert_eq!(
-                tiles.len(),
-                n,
-                "a {n}-row card painted {} row tiles; a card that draws fewer rows than it \
-                 was handed passes every geometry assertion below for free",
-                tiles.len()
-            );
 
-            for (index, tile) in tiles.iter().enumerate() {
-                assert!(
-                    fits(*tile, window(height)),
-                    "row {index} of {n} has its clickable rect at {tile:?}, outside the \
-                     {height}pt window -- and this window has no title bar, no resize \
-                     border and no scroll area, so the user could never reach it"
-                );
-            }
 
-            for (index, choice) in choices.iter().enumerate() {
-                let label = choice.label();
-                // The glyphs painted equal the label asked for: not elided,
-                // not wrapped into a second row, not laid out into none.
-                let painted_label = glyph_run(&ink, &label);
-                assert!(
-                    fits(painted_label, window(height)),
-                    "the label {label:?} (row {index} of {n}) has ink at {painted_label:?}, \
-                     outside the {height}pt window"
-                );
-                assert!(
-                    fits(painted_label, tiles[index].expand(1.0)),
-                    "the label {label:?} paints at {painted_label:?}, which is not inside \
-                     its own row tile {:?} -- the label and the clickable rect have come \
-                     apart",
-                    tiles[index]
-                );
-            }
-        }
-        assert_eq!(iterations, 4, "the loop must have covered 1, 2, 3 and 4 rows");
-    }
 
-    /// A four-row card is the tallest the overlay can be (`fill_choices`
-    /// yields at most four by construction), so it is the one that pushes the
-    /// footer and the dismiss control hardest.
-    #[test]
-    fn the_dismiss_control_and_the_footer_stay_inside_a_four_row_card() {
-        let height = overlay_height(4);
-        let ink = painted(&four_choices(), height);
-        let win = window(height);
 
-        // The ✕ is two 1.3pt line segments, not a glyph -- U+2715 resolves to
-        // nothing in this app's face, so `close_glyph` draws it. It is the
-        // ONLY mouse-operable way out of a decorationless window.
-        // Each arm spans 7.0pt (`arm = 3.5` either side of centre) and its
-        // visual bounding rect adds half its 1.3pt stroke on each end: 8.3
-        // square, measured off the painted shapes and matched by nothing else
-        // in the card (the mark's four paths are 5.7 x 6.9).
-        let arms: Vec<&Ink> = ink
-            .iter()
-            .filter(|i| {
-                i.tile.is_none()
-                    && i.glyphs.is_none()
-                    && (i.rect.width() - 8.3).abs() < 0.5
-                    && (i.rect.height() - 8.3).abs() < 0.5
-            })
-            .collect();
-        assert_eq!(
-            arms.len(),
-            2,
-            "expected the dismiss ✕'s two strokes; found {}",
-            arms.len()
-        );
-        for arm in &arms {
-            assert!(
-                fits(arm.rect, win),
-                "a stroke of the dismiss ✕ is at {:?}, outside the {height}pt window",
-                arm.rect
-            );
-        }
 
-        // The footer's keyboard hints.
-        for hint in ["Enter Fill", "Esc Dismiss"] {
-            let rect = glyph_run(&ink, hint);
-            assert!(
-                fits(rect, win),
-                "the footer hint {hint:?} paints at {rect:?}, outside the {height}pt window"
-            );
-        }
-
-        // The footer strip itself sits BELOW the last row, not over it.
-        let last_row = *row_tiles(&ink).last().expect("a four-row card has rows");
-        let footer = glyph_run(&ink, "Enter Fill");
-        assert!(
-            footer.top() >= last_row.bottom(),
-            "the footer's hints paint at {footer:?}, which overlaps the last row {last_row:?}"
-        );
-    }
-
-    #[test]
-    fn two_rows_never_overlap() {
-        let height = overlay_height(4);
-        let tiles = row_tiles(&painted(&four_choices(), height));
-        assert_eq!(tiles.len(), 4);
-        let mut pairs = 0;
-        for pair in tiles.windows(2) {
-            pairs += 1;
-            let (a, b) = (pair[0], pair[1]);
-            assert!(
-                b.top() >= a.bottom(),
-                "adjacent row tiles {a:?} and {b:?} intersect; one row is painting over \
-                 the other"
-            );
-        }
-        assert_eq!(pairs, 3, "four rows have exactly three adjacent pairs");
-    }
-
-    /// `ROW_HEIGHT` is measured, not chosen: it is the pitch two real rows are
-    /// actually painted at.
-    #[test]
-    fn a_row_occupies_exactly_one_row_height() {
-        let tiles = row_tiles(&painted(&four_choices(), overlay_height(4)));
-        assert_eq!(tiles.len(), 4);
-        let mut pitches = 0;
-        for pair in tiles.windows(2) {
-            pitches += 1;
-            let pitch = pair[1].top() - pair[0].top();
-            assert!(
-                (pitch - ROW_HEIGHT).abs() < 0.01,
-                "two rows are painted {pitch}pt apart, but `overlay_height` grows the \
-                 window by {ROW_HEIGHT}pt per row"
-            );
-        }
-        assert_eq!(pitches, 3);
-        for tile in &tiles {
-            assert!(
-                (tile.height() - (ROW_HEIGHT - ROW_GAP)).abs() < 0.01,
-                "a row tile is {}pt tall; ROW_HEIGHT - ROW_GAP is {}",
-                tile.height(),
-                ROW_HEIGHT - ROW_GAP
-            );
-        }
-    }
-
-    /// `overlay_height`'s `CHROME_HEIGHT` term does not depend on `n`, which
-    /// is only true if the inter-row gaps are inside `ROW_HEIGHT`. Measured
-    /// as: the slack left under the last painted thing is the same at one row
-    /// as at four.
-    #[test]
-    fn the_chrome_costs_the_same_at_one_row_as_at_four() {
-        let bottom_slack = |n: usize, choices: &[FillChoice]| {
-            let height = overlay_height(n);
-            let ink = painted(choices, height);
-            let footer = glyph_run(&ink, "Enter Fill");
-            height - footer.bottom()
-        };
-        let one = bottom_slack(1, &four_choices()[..1]);
-        let four = bottom_slack(4, &four_choices());
-        assert!(
-            (one - four).abs() < 0.01,
-            "a one-row card leaves {one}pt under its footer and a four-row card {four}pt; \
-             the chrome is not a constant, so `CHROME_HEIGHT + ROW_HEIGHT * n` is the \
-             wrong shape"
-        );
-        assert!(
-            one >= 0.0,
-            "the footer is already {}pt past the bottom of a one-row window",
-            -one
-        );
-    }
-
-    /// Both row treatments must be the same height, or `ROW_HEIGHT` is a
-    /// single number describing two different rows.
-    #[test]
-    fn both_row_treatments_are_the_same_height() {
-        let ink = painted(&four_choices(), overlay_height(4));
-        let tiles = row_tiles(&ink);
-        assert_eq!(tiles.len(), 4);
-        // Positive control: the two treatments really are DIFFERENT, so this
-        // is a claim about two variants and not about one drawn four times.
-        let fills: Vec<Color32> = ink
-            .iter()
-            .filter(|i| {
-                matches!(i.tile, Some((_, 8))) && i.rect.width() > OVERLAY_WIDTH / 2.0
-            })
-            .map(|i| match i.tile {
-                Some((fill, _)) => fill,
-                None => unreachable!(),
-            })
-            .collect();
-        assert_eq!(fills.len(), 4);
-        assert_eq!(fills[0], theme::BLUE_WASH, "the first row is the selected one");
-        assert!(
-            fills[1..].iter().all(|f| *f == theme::CANVAS),
-            "rows after the first are the neutral treatment; got {fills:?}"
-        );
-        let first = tiles[0].height();
-        for tile in &tiles[1..] {
-            assert!(
-                (tile.height() - first).abs() < 0.01,
-                "the selected row is {first}pt tall and a neutral one {}pt",
-                tile.height()
-            );
-        }
-    }
-
-    /// The card with no choices -- which is every card production draws until
-    /// step 5 -- is the card it has always been: one row, selected treatment,
-    /// same height, inside 164.
-    #[test]
-    fn a_card_with_no_choices_is_still_the_one_row_card() {
-        let ink = painted(&[], 164.0);
-        let tiles = row_tiles(&ink);
-        assert_eq!(tiles.len(), 1, "no choices means exactly one row, not none");
-        assert!(fits(tiles[0], window(164.0)));
-        let username = glyph_run(&ink, USER);
-        assert!(fits(username, window(164.0)));
-        // And it is byte-identical in geometry to the one-choice card's row.
-        let one_choice = row_tiles(&painted(&four_choices()[..1], overlay_height(1)));
-        assert_eq!(one_choice.len(), 1);
-        assert!(
-            (one_choice[0].height() - tiles[0].height()).abs() < 0.01
-                && (one_choice[0].top() - tiles[0].top()).abs() < 0.01,
-            "the choice row {:?} is not where the matched-credential row {:?} is",
-            one_choice[0],
-            tiles[0]
-        );
-    }
 
     // ------------------------------------------- which row answered, and how
 
-    /// **Click row `i`, get choice `i`.** The whole point of the step: four
-    /// rows that all answer `choices[0]` are four ways to do one thing, and
-    /// look exactly like four working rows to a test that only asks whether
-    /// a fill happened.
-    #[test]
-    fn each_row_answers_its_own_choice() {
-        let choices = four_choices();
-        let tiles = row_tiles(&painted(&choices, overlay_height(choices.len())));
-        assert_eq!(
-            tiles.len(),
-            choices.len(),
-            "the card lost a row before a single click was sent -- egui culls shapes that \
-             fall outside the screen rect, so a pushed-out row comes back as nothing"
-        );
 
-        let mut answers = Vec::new();
-        for (index, tile) in tiles.iter().enumerate() {
-            match click_on(&choices, tile.center()) {
-                OverlayAction::Fill(choice) => answers.push(choice),
-                other => panic!("row {index} at {tile:?} answered {other:?}, not a fill"),
-            }
-        }
 
-        assert_eq!(answers.len(), 4, "the loop must have clicked all four rows");
-        assert_eq!(
-            answers, choices,
-            "row i must answer choice i, in the order the rows are drawn"
-        );
-        // Pairwise distinct: a mapping that answers `choices[0]` for every row
-        // would satisfy a weaker per-row assertion against a fixture whose
-        // rows happened to repeat.
-        for (i, a) in answers.iter().enumerate() {
-            for b in &answers[i + 1..] {
-                assert_ne!(a, b, "two rows answered the same choice: {answers:?}");
-            }
-        }
-    }
 
-    /// Clicking nothing in particular answers nothing -- the control that
-    /// makes the test above about the ROWS rather than about clicking.
-    #[test]
-    fn a_click_that_lands_on_no_row_answers_nothing() {
-        let choices = four_choices();
-        let tiles = row_tiles(&painted(&choices, overlay_height(choices.len())));
-        assert_eq!(tiles.len(), 4);
-        // The footer strip, below every row.
-        let below = egui::pos2(OVERLAY_WIDTH / 2.0, tiles[3].bottom() + 12.0);
-        assert!(below.y < overlay_height(4), "the probe is inside the window");
-        assert_eq!(click_on(&choices, below), OverlayAction::None);
-    }
-
-    /// **Enter takes the PRIMARY row, which is the first one.**
-    ///
-    /// The fixture's first row is deliberately not the one any of the obvious
-    /// wrong implementations would reach for -- not `Saved` (the no-choices
-    /// fallback), not `UserTabPass` (the historical fill), and not the last
-    /// row -- so `enter fills the password field` is a claim about position
-    /// and not about which variant happens to be around.
-    #[test]
-    fn enter_takes_the_first_row() {
-        let choices = vec![
-            FillChoice::Just(FieldRef::Password),
-            FillChoice::UserTabPass,
-            FillChoice::Saved,
-        ];
-        // The fixture controls: the rows really do differ, so "the first" is a
-        // distinguishable answer.
-        assert_ne!(choices[0], choices[1]);
-        assert_ne!(choices[0], choices[2]);
-        assert_ne!(choices[0], *choices.last().unwrap());
-
-        assert_eq!(primary_choice(&choices), FillChoice::Just(FieldRef::Password));
-        // And through the keyboard, which is the path that actually reaches
-        // the user: Enter, not a click, not the card.
-        assert_eq!(
-            action(true, false, &choices),
-            OverlayAction::Fill(FillChoice::Just(FieldRef::Password))
-        );
-        // And with no choices at all -- the card production still draws --
-        // Enter is the fill it has always been.
-        assert_eq!(primary_choice(&[]), FillChoice::Saved);
-        assert_eq!(
-            action(true, false, &[]),
-            OverlayAction::Fill(FillChoice::Saved)
-        );
-    }
-
-    /// **Esc dismisses, and dismissing is not a fill.** An Esc that answered
-    /// `Some(primary)` -- one line, and the same shape as the Enter arm right
-    /// above it -- types the user's password into the app they just said no
-    /// to. Nothing else in this module could see it: `OverlayApp::ui` needs a
-    /// real window.
-    #[test]
-    fn escape_dismisses_and_answers_no_choice() {
-        let choices = four_choices();
-        assert_eq!(action(false, true, &choices), OverlayAction::Dismiss);
-        assert_eq!(action(false, true, &[]), OverlayAction::Dismiss);
-        // Not a fill of anything, spelled out so a `Fill` variant added later
-        // cannot slip past an equality against one particular value.
-        assert!(!matches!(
-            action(false, true, &choices),
-            OverlayAction::Fill(_)
-        ));
-        // The controls: the instrument does report fills, and reports nothing
-        // when nothing was pressed.
-        assert!(matches!(action(true, false, &choices), OverlayAction::Fill(_)));
-        assert_eq!(action(false, false, &choices), OverlayAction::None);
-        // Both at once: the fill wins, as it did when these were two `if`s.
-        assert_eq!(
-            action(true, true, &choices),
-            OverlayAction::Fill(choices[0].clone())
-        );
-    }
 
     /// **The residue of the swap, closed.**
     ///
@@ -2678,727 +1706,25 @@ mod geometry_tests {
         seen.expect("the frame body must have run")
     }
 
-    /// `keyboard_action` driven from a real frame carrying (or not carrying)
-    /// each of the two keys.
-    ///
-    /// The `assert_eq!` is a precondition, not a duplicate of
-    /// `each_key_reader_reads_the_key_it_is_named_after`: without it a frame
-    /// that silently carried no key would make every caller below assert
-    /// against `(false, false)` and pass for the wrong reason.
-    fn action(enter: bool, escape: bool, choices: &[FillChoice]) -> OverlayAction {
-        let mut keys = Vec::new();
-        if enter {
-            keys.push(egui::Key::Enter);
-        }
-        if escape {
-            keys.push(egui::Key::Escape);
-        }
-        let (enter_read, escape_read) = keys_down(&keys);
-        assert_eq!(
-            (enter_read.pressed(), escape_read.pressed()),
-            (enter, escape),
-            "the frame built for enter={enter}, escape={escape} was not read back as that, \
-             so nothing below is testing the case it names"
-        );
-        keyboard_action(enter_read, escape_read, choices)
-    }
 
     // ------------------------------------------- the window that is asked for
 
-    /// The inner size `show_prompt_overlay` will hand `eframe::NativeOptions`
-    /// for a card of `rows` rows.
-    ///
-    /// **Observed, not recomputed.** Nothing on this path mentions
-    /// `overlay_height`: the number comes back out of the same
-    /// `ViewportBuilder` that production puts into `NativeOptions`, so it
-    /// changes when, and only when, the window the user gets changes.
-    fn requested_inner_size(rows: usize) -> egui::Vec2 {
-        overlay_options(&four_choices()[..rows.min(4)], None)
-            .viewport
-            .inner_size
-            .expect("the overlay viewport must request an inner size at all")
-    }
 
-    /// Paints a real `rows`-row card into a window of exactly `height` points
-    /// and reports what did not survive it, or `Ok(())`.
-    ///
-    /// The shared instrument behind both the load-bearing assertion and its
-    /// positive control, so the control really does exercise the check it is
-    /// controlling rather than a lookalike.
-    ///
-    /// Everything a user must be able to see and click is checked, not just
-    /// the rows: the dismiss ✕ and the footer hints live BELOW the last row,
-    /// so a window short by less than one row clips them while every row
-    /// still fits. That is the failure a row-only check waves through.
-    ///
-    /// The row COUNT is the first thing asserted because egui culls shapes
-    /// entirely outside the screen rect: a row pushed off the bottom comes
-    /// back as *nothing at all*, and "every row I found is inside the window"
-    /// is trivially true of a card that lost one.
-    fn card_fits_in(rows: usize, height: f32) -> Result<(), String> {
-        card_fits_in_with(SHORT, rows, height)
-    }
 
-    /// [`card_fits_in`] for one particular fixture's strings.
-    fn card_fits_in_with(fixture: Fixture, rows: usize, height: f32) -> Result<(), String> {
-        let choices = &four_choices()[..rows];
-        let ink = painted_as(fixture, choices, height);
-        let win = window(height);
-        let tiles = row_tiles(&ink);
-        if tiles.len() != rows {
-            return Err(format!(
-                "a {rows}-row card ({}) in a {height}pt window painted {} row tiles; the \
-                 missing ones were culled for being off the window entirely",
-                fixture.name,
-                tiles.len()
-            ));
-        }
-        for (index, tile) in tiles.iter().enumerate() {
-            if !fits(*tile, win) {
-                return Err(format!(
-                    "row {index} of {rows} has its clickable rect at {tile:?}, outside the \
-                     {height}pt window"
-                ));
-            }
-        }
-        // The footer hints and the ✕: painted last, lowest in the card, and
-        // the only mouse-operable way out of a decorationless window.
-        // Each hint is laid out as one galley, key and label together --
-        // the same runs `the_chrome_costs_the_same_at_one_row_as_at_four`
-        // measures the footer by.
-        for text in ["Enter Fill", "Esc Dismiss"] {
-            let hits: Vec<&Ink> = ink
-                .iter()
-                .filter(|i| i.glyphs.as_deref() == Some(text))
-                .collect();
-            if hits.len() != 1 {
-                return Err(format!(
-                    "expected exactly one painted run reading {text:?} in a {height}pt window \
-                     for {rows} rows; found {} -- the footer is off the bottom of a window \
-                     with no scrollbar",
-                    hits.len()
-                ));
-            }
-            if !fits(hits[0].rect, win) {
-                return Err(format!(
-                    "the footer hint {text:?} paints at {:?}, outside the {height}pt window",
-                    hits[0].rect
-                ));
-            }
-        }
-        Ok(())
-    }
 
-    /// **The load-bearing assertion about the window itself, and the one this
-    /// module did not have.**
-    ///
-    /// `show_prompt_overlay` calls `eframe::run_native`, so no test may run
-    /// it; every other geometry test in this module therefore builds its own
-    /// window out of `overlay_height` and checks the card against that. Set
-    /// the real `with_inner_size` height to a literal `100.0` and all of them
-    /// stay green, because the card is fine and the *window* is the thing
-    /// nobody was looking at.
-    ///
-    /// This one starts from `overlay_viewport` — the same builder production
-    /// hands to `NativeOptions` — reads the size back out of it, and paints a
-    /// real card into exactly that many points. The screen rect is the
-    /// requested size; the requested size is not the screen rect's source.
-    /// Re-pointed at [`FIXTURES`], not just the short one. That is the second
-    /// half of the finding this test was written for: it was well built and
-    /// it proved the *fixture's* card fits, while the card the user's own
-    /// item name produces was 82 points too tall for the same window.
-    #[test]
-    fn the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw() {
-        let mut checked = 0;
-        for fixture in FIXTURES {
-            for rows in 1..=4usize {
-                let requested = requested_inner_size(rows);
-                assert_eq!(
-                    requested.x, OVERLAY_WIDTH,
-                    "the overlay asked for a {}pt-wide window",
-                    requested.x
-                );
-                if let Err(why) = card_fits_in_with(fixture, rows, requested.y) {
-                    panic!(
-                        "the window the overlay asks the OS for with {rows} choice(s) is \
-                         {}pt tall, and the card it then draws for the {:?} fixture does \
-                         not fit in it: {why}. This window is frameless and always-on-top \
-                         -- no title bar, no resize border, no scroll area -- so whatever \
-                         is outside it is gone.",
-                        requested.y, fixture.name
-                    );
-                }
-                checked += 1;
-            }
-        }
-        assert_eq!(
-            checked,
-            FIXTURES.len() * 4,
-            "the loop must have covered every fixture at 1, 2, 3 and 4 rows"
-        );
-    }
 
-    /// **A row cannot grow the card, whatever its text says.**
-    ///
-    /// `card_fits_in` above answers "did anything get clipped", which is the
-    /// user-visible question but a *derived* one: it can only ever see as far
-    /// as the window's edge. This asks the direct one — how tall is the card
-    /// egui lays out — in a window far too big to cull or constrain anything,
-    /// so an overflowing card is measured rather than truncated by the
-    /// instrument.
-    ///
-    /// The expected heights are the four spelled out in
-    /// `the_four_card_heights_the_chrome_was_measured_from`, and they are
-    /// **not** derived from `overlay_height`, `CHROME_HEIGHT` or
-    /// `MEASURED_CHROME`: an assertion built out of the constants it is
-    /// checking is arithmetic, not a measurement.
-    ///
-    /// On the shipped code this failed at every adversarial fixture: 396pt for
-    /// four realistic rows, 444 with no spaces, 348 with CJK, against a 314pt
-    /// window.
-    #[test]
-    fn no_string_a_user_can_supply_makes_the_card_taller() {
-        /// Far taller than any card, so nothing is culled and no layout is
-        /// constrained -- an overflow is reported, not hidden.
-        const ROOMY: f32 = 900.0;
-        /// What a 1/2/3/4-row card needs, measured, spelled out.
-        const NEEDED: [f32; 4] = [154.0, 204.0, 254.0, 304.0];
 
-        let mut checked = 0;
-        for fixture in FIXTURES {
-            for rows in 1..=4usize {
-                let choices = &four_choices()[..rows];
-                let ctx = styled_ctx();
-                let mut needed = f32::NAN;
-                let _ = ctx.run_ui(sized(ROOMY), |ui| {
-                    draw_overlay_card_rows(
-                        ui,
-                        fixture.app,
-                        fixture.item,
-                        Some(fixture.user),
-                        choices,
-                    );
-                    needed = ui.min_rect().bottom();
-                });
-                assert!(
-                    needed.is_finite() && needed > 0.0,
-                    "the card allocated no space at all for {:?}",
-                    fixture.name
-                );
-                assert_eq!(
-                    needed, NEEDED[rows - 1],
-                    "a {rows}-row card drawn with the {:?} fixture needs {needed}pt, not \
-                     {}pt. The row is content-sized again: its text grew the card, and \
-                     the window is a fixed {}pt with no scrollbar, no resize border and \
-                     no title bar, so the difference is gone for good.",
-                    fixture.name,
-                    NEEDED[rows - 1],
-                    overlay_height(rows)
-                );
-                checked += 1;
-            }
-        }
-        assert_eq!(checked, FIXTURES.len() * 4);
 
-        // THE CONTROL, and it is the load-bearing half: the fixtures must
-        // really be strings that a wrapping row would have wrapped. Without
-        // this, four short strings would pass the loop above and prove
-        // nothing at all. Laid out at the width the row's text column really
-        // gets, with wrapping ON -- which is what the row used to do.
-        let ctx = styled_ctx();
-        let width = text_column_width();
-        let mut wrapped = 0;
-        for fixture in FIXTURES.iter().filter(|f| f.name != SHORT.name) {
-            let (_, secondary) = row_text(fixture.app, fixture.item, Some(fixture.user));
-            let rows_taken = ctx.fonts_mut(|fonts| {
-                fonts
-                    .layout(
-                        secondary.clone(),
-                        egui::FontId::proportional(11.0),
-                        theme::TEXT_FAINT,
-                        width,
-                    )
-                    .rows
-                    .len()
-            });
-            assert!(
-                rows_taken > 1,
-                "the {:?} fixture's secondary line ({secondary:?}) fits on one line at \
-                 {width}pt even when wrapped, so it is not an adversarial fixture and the \
-                 assertions above prove nothing",
-                fixture.name
-            );
-            wrapped += 1;
-        }
-        assert_eq!(wrapped, FIXTURES.len() - 1);
 
-        // ...and the short fixture is the other side of the control: it does
-        // NOT wrap, which is exactly why measuring off it alone hid the bug.
-        let (_, short_secondary) = row_text(SHORT.app, SHORT.item, Some(SHORT.user));
-        assert_eq!(
-            ctx.fonts_mut(|fonts| fonts
-                .layout(
-                    short_secondary,
-                    egui::FontId::proportional(11.0),
-                    theme::TEXT_FAINT,
-                    width
-                )
-                .rows
-                .len()),
-            1
-        );
-    }
 
-    /// The width the row's text column really gets, computed the way
-    /// `credential_row` computes it, from the card's real geometry.
-    ///
-    /// Measured off the painted card rather than restated: the row tile's own
-    /// width, less the tile's 10pt horizontal inner margins, less the 28pt
-    /// avatar and the 2pt after it, less [`CHIP_LANE`].
-    fn text_column_width() -> f32 {
-        let tile = row_tiles(&painted(&four_choices()[..1], overlay_height(1)))[0];
-        tile.width() - 2.0 * 10.0 - 28.0 - 2.0 - CHIP_LANE
-    }
 
-    /// [`CHIP_LANE`] against the chip that is really painted.
-    ///
-    /// The row's text is bounded by being given an explicit width, and that
-    /// width is "everything except the chip's lane". If the lane were too
-    /// narrow the `Enter` chip would be pushed past the right-hand edge of a
-    /// window with no horizontal scrolling — trading a clipped row for a
-    /// clipped chip is not a fix. So the chip is measured where it lands, and
-    /// the text is asserted to stop before it.
-    ///
-    /// Both facts, and both are needed: a lane wide enough for the chip is
-    /// useless if the text is allowed to run underneath it.
-    #[test]
-    fn the_enter_chip_has_a_lane_of_its_own_and_the_text_stops_short_of_it() {
-        let mut checked = 0;
-        for fixture in FIXTURES {
-            let ink = painted_as(fixture, &four_choices()[..1], overlay_height(1));
-            let tile = row_tiles(&ink)[0];
-            let chip = ink
-                .iter()
-                .filter(|i| i.glyphs.as_deref() == Some("Enter"))
-                .map(|i| i.rect)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                chip.len(),
-                1,
-                "the selected row painted {} `Enter` chips for the {:?} fixture",
-                chip.len(),
-                fixture.name
-            );
-            let chip = chip[0];
-            assert!(
-                fits(chip, window(overlay_height(1))),
-                "the `Enter` chip paints at {chip:?} for the {:?} fixture, outside the \
-                 window; the text column took the lane",
-                fixture.name
-            );
-            // The lane really is a lane: the chip's ink starts within
-            // CHIP_LANE of the tile's right-hand inner edge.
-            assert!(
-                chip.left() >= tile.right() - CHIP_LANE - 0.5,
-                "the `Enter` chip starts at {} for the {:?} fixture, further left than the \
-                 {CHIP_LANE}pt lane reserved for it (tile right edge {})",
-                chip.left(),
-                fixture.name,
-                tile.right()
-            );
-            // And nothing else in the row reaches into it. The chip's own two
-            // runs are excluded by rect, not by glyphs, so a *label* that
-            // happened to read "Enter" is still caught.
-            for run in ink.iter().filter(|i| i.glyphs.is_some()) {
-                if run.rect == chip {
-                    continue;
-                }
-                if !tile.contains(run.rect.center()) {
-                    continue; // header and footer, not this row
-                }
-                assert!(
-                    run.rect.right() <= chip.left() + 0.5,
-                    "the row's text run {:?} for the {:?} fixture runs to {}, into the \
-                     `Enter` chip's lane which starts at {}",
-                    run.glyphs,
-                    fixture.name,
-                    run.rect.right(),
-                    chip.left()
-                );
-                checked += 1;
-            }
-        }
-        assert!(
-            checked >= FIXTURES.len() * 2,
-            "expected at least the two text lines of each fixture's row to have been \
-             checked against the chip; only {checked} runs were"
-        );
-    }
 
-    /// The header names the number of rows the card is really about to draw.
-    ///
-    /// It was the literal `"1 match"`, which was true only while the overlay
-    /// could show exactly one row. Both halves are checked against the
-    /// painted glyphs, not against the function: the string the user reads is
-    /// the claim.
-    #[test]
-    fn the_header_counts_the_rows_the_card_actually_draws() {
-        assert_eq!(match_count_label(1), "1 match");
-        assert_eq!(match_count_label(2), "2 matches");
-        assert_eq!(match_count_label(4), "4 matches");
-        // An empty slice still paints one row, so it is still one match.
-        assert_eq!(match_count_label(0.max(1)), "1 match");
 
-        // ...and on the card itself.
-        for (choices, expected) in [
-            (&four_choices()[..1], "1 match"),
-            (&four_choices()[..4], "4 matches"),
-        ] {
-            let ink = painted(choices, overlay_height(choices.len()));
-            glyph_run(&ink, expected);
-            let stale = if expected == "1 match" {
-                "4 matches"
-            } else {
-                "1 match"
-            };
-            assert_eq!(
-                ink.iter()
-                    .filter(|i| i.glyphs.as_deref() == Some(stale))
-                    .count(),
-                0,
-                "the header read {stale:?} on a {}-row card",
-                choices.len()
-            );
-        }
-        // The card production still draws with no choices at all.
-        glyph_run(&painted(&[], overlay_height(1)), "1 match");
-    }
-
-    /// POSITIVE CONTROL for the test above: `card_fits_in` can say no.
-    ///
-    /// Without this, a `card_fits_in` that returned `Ok(())` unconditionally
-    /// -- or one whose walker had gone blind -- would make the assertion above
-    /// green on any window size at all, which is precisely the shape of the
-    /// hole it was written to close.
-    ///
-    /// Both of the two ways a too-small window fails are exercised: 100pt is
-    /// tall enough for a single row and still loses the footer, and a
-    /// one-row-sized window loses three of four rows outright to culling.
-    #[test]
-    fn the_card_fit_check_can_actually_fail() {
-        let mutant = 100.0;
-        assert!(
-            mutant < requested_inner_size(1).y,
-            "the control window is not actually shorter than the real one"
-        );
-        let one_row_in_100 = card_fits_in(1, mutant);
-        assert!(
-            one_row_in_100.is_err(),
-            "a one-row card was declared to fit a {mutant}pt window; its footer is at the \
-             bottom of a 154pt card, so this check cannot fail and its passes mean nothing"
-        );
-        // ...and specifically for the reason claimed, not by accident.
-        assert!(
-            one_row_in_100.as_ref().unwrap_err().contains("Dismiss")
-                || one_row_in_100.as_ref().unwrap_err().contains("Fill"),
-            "expected the footer to be what did not fit; got {one_row_in_100:?}"
-        );
-
-        let four_rows_in_one = card_fits_in(4, overlay_height(1));
-        assert!(
-            four_rows_in_one.is_err(),
-            "four rows were declared to fit a one-row window"
-        );
-        assert!(
-            four_rows_in_one
-                .as_ref()
-                .unwrap_err()
-                .contains("painted 3 row tiles"),
-            "expected the fourth row to be culled and counted as missing; got \
-             {four_rows_in_one:?}"
-        );
-
-        // ... and the same instrument says yes to the window production
-        // really asks for, so it is discriminating on size and not simply
-        // always refusing.
-        assert_eq!(card_fits_in(4, requested_inner_size(4).y), Ok(()));
-    }
-
-    /// The requested window grows by exactly one row per row, measured off
-    /// the builder rather than off `overlay_height`.
-    ///
-    /// This is the half `the_window_..._fits_the_card_it_will_draw` cannot
-    /// catch on its own: a window 10pt too tall for every card still fits
-    /// every card. A window that stops growing does not.
-    #[test]
-    fn the_requested_window_grows_by_exactly_one_row_per_choice_row() {
-        let mut steps = 0;
-        for rows in 2..=4usize {
-            let step = requested_inner_size(rows).y - requested_inner_size(rows - 1).y;
-            assert!(
-                (step - ROW_HEIGHT).abs() < 0.01,
-                "going from {} rows to {rows} rows changed the requested window by {step}pt, \
-                 not by one {ROW_HEIGHT}pt row",
-                rows - 1
-            );
-            steps += 1;
-        }
-        assert_eq!(steps, 3);
-        // The floor: no choices is not a shorter window.
-        assert_eq!(requested_inner_size(0).y, requested_inner_size(1).y);
-        // And the belt to the measurement's braces: the requested size is
-        // the shared arithmetic every other test and `app::clamp_into_work_area`
-        // use, so the position clamp and the window cannot disagree.
-        for rows in 0..=4usize {
-            assert_eq!(
-                requested_inner_size(rows),
-                egui::vec2(OVERLAY_WIDTH, overlay_height(rows))
-            );
-        }
-    }
-
-    /// The anchor survives the extraction. `overlay_position` computes where
-    /// the card goes; a builder that dropped it would open every overlay
-    /// wherever Windows felt like, and no drawing test would notice.
-    #[test]
-    fn the_requested_window_opens_where_the_caller_anchored_it() {
-        let one = &four_choices()[..1];
-        assert_eq!(
-            overlay_options(one, Some((640.0, 480.0))).viewport.position,
-            Some(egui::pos2(640.0, 480.0))
-        );
-        // `None` means "let the OS pick", and must not become 0,0.
-        assert_eq!(overlay_options(one, None).viewport.position, None);
-        // The rest of what makes this window the overlay's window, so an
-        // extraction that quietly dropped one is a failure and not a silent
-        // change to a frameless always-on-top card.
-        let v = overlay_options(one, None).viewport;
-        assert_eq!(v.decorations, Some(false));
-        assert_eq!(v.transparent, Some(true));
-        assert_eq!(v.window_level, Some(egui::WindowLevel::AlwaysOnTop));
-        assert!(v.icon.is_some());
-    }
-
-    /// Belt to the measurement's braces, covering the ONE line of the sizing
-    /// decision a measurement cannot reach.
-    ///
-    /// `overlay_options` is measured directly, so everything inside it is
-    /// observable. What is left over is `show_prompt_overlay`'s own body,
-    /// which calls `eframe::run_native` and therefore cannot be executed by
-    /// any test here: it could hand `overlay_options` an empty slice, or
-    /// override the size afterwards with a second `with_inner_size`, and
-    /// nothing measurable would move. That residue is exactly two source
-    /// facts, and they are what this counts.
-    ///
-    /// Deliberately the *second* guard and not the first -- a pin proves
-    /// where a string is, not what the program does. Its job here is only to
-    /// keep the seam that the measurement observes attached to the seam
-    /// production uses.
-    #[test]
-    fn nothing_but_overlay_options_sizes_the_overlay_window() {
-        let source = include_str!("overlay_ui.rs");
-        // Split across two literals so they cannot match their own declarations.
-        let sizer = concat!("with_inner_", "size(");
-        assert_eq!(
-            source.matches(sizer).count(),
-            1,
-            "expected exactly one {sizer:?} in this module -- `overlay_options`'s, which \
-             `the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw` \
-             measures. A second one is a window size no test can see"
-        );
-        let call = concat!("overlay_options(&choices", ", anchor);");
-        assert_eq!(
-            source.matches(call).count(),
-            1,
-            "expected `show_prompt_overlay` to get its options from {call:?} exactly once, \
-             passing the SAME `choices` it is about to draw; the measured size is only the \
-             shipped size while it does"
-        );
-        // The counter's own controls: each needle finds itself exactly once,
-        // and the mutations they exist for are absent.
-        assert_eq!(sizer.matches(sizer).count(), 1);
-        assert_eq!(call.matches(call).count(), 1);
-        assert_eq!(source.matches(concat!("overlay_", "options(&[], anchor)")).count(), 0);
-    }
 
     // ------------------------------------------------- the chrome, measured
 
-    /// **[`CHROME_HEIGHT`] against the chrome the card actually paints.**
-    ///
-    /// It used to be derived from the number it was then asserted to produce:
-    /// `CHROME_HEIGHT == 164.0 - ROW_HEIGHT`, checked by
-    /// `assert_eq!(CHROME_HEIGHT + ROW_HEIGHT, 164.0)` -- pure arithmetic over
-    /// two constants, true of any consistent pair and false of none. It could
-    /// have been 40 or 240 and the suite would not have moved.
-    ///
-    /// So measure it, the way `ROW_HEIGHT` is measured: lay a real card out at
-    /// one, two, three and four rows in a window far too big to cull anything,
-    /// and ask egui how much space it took. The part that does not scale with
-    /// `n` is the chrome.
-    #[test]
-    fn the_chrome_constant_is_the_chrome_the_card_actually_paints() {
-        /// Comfortably taller than a four-row card, so nothing is culled and
-        /// the layout is the unconstrained one.
-        const ROOMY: f32 = 700.0;
 
-        let mut measurements = Vec::new();
-        for rows in 1..=4usize {
-            let choices = &four_choices()[..rows];
 
-            // What egui says the card needs: the bottom of the space
-            // `draw_overlay_card_rows` allocated, in a Ui that starts at y = 0
-            // exactly as `OverlayApp::ui`'s does.
-            let ctx = styled_ctx();
-            let mut needed = f32::NAN;
-            let _ = ctx.run_ui(sized(ROOMY), |ui| {
-                assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
-                draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
-                needed = ui.min_rect().bottom();
-            });
-            assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
-            assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
-
-            // Where the rows landed inside it.
-            let tiles = row_tiles(&painted(choices, ROOMY));
-            assert_eq!(
-                tiles.len(),
-                rows,
-                "a {rows}-row card painted {} tiles in a {ROOMY}pt window, where nothing can \
-                 be culled -- the measurement below would be of the wrong card",
-                tiles.len()
-            );
-
-            // The chrome, as the brief defines it: everything above the first
-            // row plus everything below the last. Less one ROW_GAP, because
-            // `ROW_HEIGHT` already carries the gap (see `ROW_GAP`) and the
-            // region from the first row's top to the last row's bottom is
-            // `n * ROW_HEIGHT - ROW_GAP`, one gap short.
-            let above = tiles[0].top() - 0.0;
-            let below = needed - tiles[rows - 1].bottom();
-            assert!(above > 0.0, "there is no header above the first row");
-            assert!(below > 0.0, "there is no footer below the last row");
-            measurements.push((rows, needed, above + below - ROW_GAP));
-        }
-        assert_eq!(measurements.len(), 4, "the loop must have covered 1, 2, 3 and 4 rows");
-
-        // 1. The chrome does not depend on the row count. If it did,
-        //    `overlay_height` could not be `a + b*n` at all.
-        for (rows, _, chrome) in &measurements {
-            assert!(
-                (chrome - measurements[0].2).abs() < 0.01,
-                "the chrome measures {chrome}pt at {rows} rows but {}pt at 1 row",
-                measurements[0].2
-            );
-        }
-        let measured = measurements[0].2;
-
-        // 2. It is the number the constant claims.
-        assert!(
-            (measured - MEASURED_CHROME).abs() < 0.5,
-            "the card paints {measured}pt of chrome, but MEASURED_CHROME says \
-             {MEASURED_CHROME}. Whichever moved, `overlay_height` is now describing a card \
-             that is not the one being drawn"
-        );
-
-        // 3. ... and the height actually requested is that chrome plus a row
-        //    per row plus the stated slack -- no more, and CRUCIALLY no less.
-        //    A `>= 0.0` bound here (which is what this test used to be) cannot
-        //    tell 10pt of deliberate slack from 30pt of a header that stopped
-        //    being drawn.
-        //
-        //    Deliberately NOT `assert_eq!(CHROME_HEIGHT - MEASURED_CHROME,
-        //    CHROME_SLACK)`. That is arithmetic over three constants, true of
-        //    any consistent triple -- the same shape of tautology this test
-        //    replaced. Every number below is measured off a real frame.
-        let mut checked = 0;
-        for (rows, needed, _) in &measurements {
-            let requested = requested_inner_size(*rows).y;
-            assert!(
-                requested >= *needed,
-                "a {rows}-row card needs {needed}pt and the window asks for {requested}pt"
-            );
-            assert!(
-                (requested - needed - CHROME_SLACK).abs() < 0.5,
-                "a {rows}-row card needs {needed}pt, the window asks for {requested}pt, and \
-                 the difference is not the {CHROME_SLACK}pt of slack this module documents"
-            );
-            checked += 1;
-        }
-        assert_eq!(checked, 4);
-    }
-
-    /// POSITIVE CONTROL for the measurement above.
-    ///
-    /// A `run_ui` whose `min_rect` came back unbounded, or a `sized()` that
-    /// ignored its argument, would make every "needs {n}pt" number above a
-    /// constant and the whole test a tautology in a new costume. These are the
-    /// four numbers it must have measured, spelled out: they are not derived
-    /// from `CHROME_HEIGHT`, `MEASURED_CHROME` or `overlay_height`, and if the
-    /// card's layout really does change, this is the test that says so out
-    /// loud rather than the one that quietly re-derives itself.
-    #[test]
-    fn the_four_card_heights_the_chrome_was_measured_from() {
-        let mut seen = Vec::new();
-        for rows in 1..=4usize {
-            let ctx = styled_ctx();
-            let mut needed = f32::NAN;
-            let _ = ctx.run_ui(sized(700.0), |ui| {
-                draw_overlay_card_rows(ui, APP, ITEM, Some(USER), &four_choices()[..rows]);
-                needed = ui.min_rect().bottom();
-            });
-            seen.push(needed);
-        }
-        assert_eq!(seen, vec![154.0, 204.0, 254.0, 304.0]);
-        // ... and the window really is taller than each of them by the slack.
-        assert_eq!(seen[0] + CHROME_SLACK, 164.0);
-    }
-
-    /// POSITIVE CONTROL for every "is inside the window" assertion above, and
-    /// for the row COUNT assertion beside them.
-    ///
-    /// Without this, a `fits` that answered `true` unconditionally, or a
-    /// window rect that was secretly unbounded, would make the whole module
-    /// green and blind. Four rows really do overflow a window sized for one,
-    /// and both instruments really do say so:
-    ///
-    /// * the third row is painted straddling the bottom edge, and `fits`
-    ///   rejects it;
-    /// * the fourth row falls entirely past the edge and egui's own culling
-    ///   drops its tile from `output.shapes` altogether -- so the tile count
-    ///   comes back 3 rather than 4. That is exactly the shape of the failure
-    ///   `every_choice_row_is_inside_the_window_...` counts for: a row that
-    ///   is off the window is not a row that is merely misplaced, it is a row
-    ///   that is *not there*, and an uncounted loop would call that a pass.
-    #[test]
-    fn the_fit_check_can_actually_fail() {
-        let short = overlay_height(1);
-        let ink = painted(&four_choices(), short);
-        let tiles = row_tiles(&ink);
-
-        assert_eq!(
-            tiles.len(),
-            3,
-            "four rows in a {short}pt window: expected the fourth to fall off the window \
-             entirely and be culled, leaving 3 painted tiles; found {}",
-            tiles.len()
-        );
-        assert!(
-            tiles.len() != 4,
-            "the row-count assertion cannot distinguish a four-row card from a \
-             three-row one"
-        );
-        let straddling = tiles[2];
-        assert!(
-            !fits(straddling, window(short)),
-            "the third row is at {straddling:?} in a {short}pt window and `fits` still \
-             said yes -- the fit check cannot fail, so its passes upstairs mean nothing"
-        );
-        assert!(straddling.bottom() > short);
-        // ... and the very same rect IS accepted by a window tall enough for
-        // it, so `fits` is discriminating on geometry and not simply always
-        // saying no.
-        assert!(fits(straddling, window(overlay_height(4))));
-    }
 
     /// POSITIVE CONTROL for the alpha filter. Nothing in the real card paints
     /// at alpha 0, so [`painted`]'s `retain` would be untestable dead code
@@ -3431,188 +1757,6 @@ mod geometry_tests {
         assert_eq!(row_tiles(&solid_out).len(), 1);
     }
 
-    /// **The top line is user-controlled too — on the path production
-    /// actually draws today — and its `.truncate()` was covered by nothing.**
-    ///
-    /// `no_string_a_user_can_supply_makes_the_card_taller` drives every
-    /// fixture through `four_choices()[..rows]`, and on THAT path
-    /// `credential_row`'s `primary` is `choice.label()`: one of four
-    /// compile-time constants. The user's own strings reached only the
-    /// *secondary* line. So removing `.truncate()` from the primary label
-    /// changed no measurement anywhere in this file, and the row's bound was
-    /// real for a reason other than the one the code claimed.
-    ///
-    /// The empty-choices path is the other one, and it is the one
-    /// `draw_overlay_card` takes — which is the whole of production until a
-    /// choice list is wired through — and the one `OverlayApp` takes whenever
-    /// `choices` is empty. There `primary` is `row_text(..).0`: the
-    /// **username, or the item name when there is no username**. Both
-    /// user-controlled, both on the top line, at 13pt semibold, in a
-    /// frameless always-on-top window with no scrollbar.
-    ///
-    /// Measured the same two ways as its sibling: the card's laid-out height
-    /// in a window far too big to cull or constrain anything, and the row
-    /// tile really painted into the window production asks the OS for --
-    /// counted BEFORE any geometry, because egui culls a shape that lands
-    /// entirely off the screen rect, so a clipped row comes back as nothing
-    /// at all rather than as a rect in the wrong place.
-    #[test]
-    fn the_no_choices_card_production_draws_today_bounds_its_user_controlled_top_line() {
-        /// Far taller than any card, so nothing is culled and no layout is
-        /// constrained -- an overflow is reported, not hidden.
-        const ROOMY: f32 = 900.0;
-        /// A no-choices card paints exactly one row, so it is the one-row
-        /// height, spelled out and not derived from `overlay_height`,
-        /// `CHROME_HEIGHT` or `MEASURED_CHROME`.
-        const NEEDED: f32 = 154.0;
-
-        let mut checked = 0;
-        // BOTH arms of the branch, because both ship. `OverlayApp::ui` passes
-        // `self.username.as_deref()`, so `None` is a real value on this path,
-        // and `row_text` then puts the ITEM NAME on the top line -- just as
-        // user-controlled, just as unbounded, and the arm this test's own
-        // commit message names. Every fixture used to go in as `Some(..)`, so
-        // the fallback was never driven at all.
-        for (fixture, user) in FIXTURES
-            .iter()
-            .flat_map(|f| [(f, Some(f.user)), (f, None)])
-        {
-            // The precondition, and it is the half that makes the rest mean
-            // anything: on this path the top line really is the user's own
-            // string. A row that had stopped painting it would pass the
-            // heights below while proving nothing.
-            let expected = user.unwrap_or(fixture.item);
-            let (primary, _) = row_text(fixture.app, fixture.item, user);
-            assert_eq!(
-                primary, expected,
-                "the no-choices row's primary line is no longer the user-controlled \
-                 string it is meant to be (user={user:?}), so this test is no longer \
-                 about one"
-            );
-
-            // How tall the card lays out, unconstrained.
-            let ctx = styled_ctx();
-            let mut needed = f32::NAN;
-            let _ = ctx.run_ui(sized(ROOMY), |ui| {
-                draw_overlay_card(ui, fixture.app, fixture.item, user);
-                needed = ui.min_rect().bottom();
-            });
-            assert!(
-                needed.is_finite() && needed > 0.0,
-                "the card allocated no space at all for {:?} (user={user:?})",
-                fixture.name
-            );
-            assert_eq!(
-                needed, NEEDED,
-                "the no-choices card drawn with the {:?} fixture (user={user:?}) needs \
-                 {needed}pt, not \
-                 {NEEDED}pt. Its TOP line is content-sized again: the username grew the \
-                 row, and the window is a fixed {}pt with no scrollbar, no resize border \
-                 and no title bar, so the difference is gone for good.",
-                fixture.name,
-                overlay_height(1)
-            );
-
-            // ... and in the window production really asks the OS for, the row
-            // and the footer are painted and inside it. Row tiles are COUNTED
-            // first: a row pushed entirely below the screen rect is culled, and
-            // a culled row has no rect to be outside anything.
-            let height = requested_inner_size(1).y;
-            let ink = painted_as_user(*fixture, user, &[], height);
-            let tiles = row_tiles(&ink);
-            assert_eq!(
-                tiles.len(),
-                1,
-                "the no-choices card ({:?}, user={user:?}) in the {height}pt window \
-                 production asks for painted {} row tiles, not one -- the row was culled \
-                 for being off the window entirely",
-                fixture.name,
-                tiles.len()
-            );
-            assert!(
-                fits(tiles[0], window(height)),
-                "the no-choices row for {:?} has its clickable rect at {:?}, outside the \
-                 {height}pt window",
-                fixture.name,
-                tiles[0]
-            );
-            for text in ["Enter Fill", "Esc Dismiss"] {
-                let hits = ink
-                    .iter()
-                    .filter(|i| i.glyphs.as_deref() == Some(text))
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    hits.len(),
-                    1,
-                    "expected exactly one painted run reading {text:?} for {:?} \
-                     (user={user:?}); the footer is off the bottom of a window with no \
-                     scrollbar",
-                    fixture.name
-                );
-                assert!(fits(hits[0].rect, window(height)));
-            }
-            checked += 1;
-        }
-        assert_eq!(
-            checked,
-            FIXTURES.len() * 2,
-            "control: the loop above did not run BOTH the `Some` and the `None` arm of \
-             every fixture, so one half of the branch is unmeasured again"
-        );
-
-        // THE CONTROL, and it is the load-bearing half -- the one the sibling
-        // test has for its secondary line and nothing had for the primary.
-        // These fixtures must really be strings a wrapping 13pt semibold label
-        // would have wrapped; otherwise four short names pass the loop above
-        // and prove nothing. Laid out at the width the row's text column really
-        // gets, in the font the label really uses, with wrapping ON -- which is
-        // what an untruncated `Label` does inside a `vertical` of a set width.
-        let ctx = styled_ctx();
-        let width = text_column_width();
-        let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-        let mut wrapped = 0;
-        // Both arms here too: a control that only ever measured the usernames
-        // would say nothing about the strings the `None` arm actually paints,
-        // which are the item names.
-        for (fixture, user) in FIXTURES
-            .iter()
-            .filter(|f| f.name != SHORT.name)
-            .flat_map(|f| [(f, Some(f.user)), (f, None)])
-        {
-            let (primary, _) = row_text(fixture.app, fixture.item, user);
-            let rows_taken = ctx.fonts_mut(|fonts| {
-                fonts
-                    .layout(primary.clone(), font.clone(), theme::INK, width)
-                    .rows
-                    .len()
-            });
-            assert!(
-                rows_taken > 1,
-                "the {:?} fixture's PRIMARY line ({primary:?}, user={user:?}) fits on one \
-                 line at {width}pt even when wrapped, so it is not an adversarial fixture \
-                 for the top label and the assertions above prove nothing about it",
-                fixture.name
-            );
-            wrapped += 1;
-        }
-        assert_eq!(wrapped, (FIXTURES.len() - 1) * 2);
-
-        // ... and the short fixture is the other side of the control: its
-        // username does NOT wrap, which is exactly why measuring off it alone
-        // left the primary label's bound untested.
-        for user in [Some(SHORT.user), None] {
-            let (short_primary, _) = row_text(SHORT.app, SHORT.item, user);
-            assert_eq!(
-                ctx.fonts_mut(|fonts| fonts
-                    .layout(short_primary, font.clone(), theme::INK, width)
-                    .rows
-                    .len()),
-                1,
-                "the short fixture's primary line (user={user:?}) wraps after all, so it \
-                 is no longer the other side of the control"
-            );
-        }
-    }
 
     /// **The key newtypes cannot be built out of a bare `bool`, by anyone.**
     ///
@@ -3730,9 +1874,12 @@ mod geometry_tests {
     /// This module's **production code**: everything above the first test
     /// module, comment-only lines dropped.
     ///
-    /// The cut is the `mod tests` opener rather than `#[cfg(test)]`, because
-    /// `mod keys` sits above it and a `cfg(test)` attribute added inside `keys`
-    /// would otherwise move the cut and hide the very thing being pinned.
+    /// The cut is the `mod geometry_tests` opener rather than `#[cfg(test)]`,
+    /// because `mod keys` sits above it and a `cfg(test)` attribute added
+    /// inside `keys` would otherwise move the cut and hide the very thing being
+    /// pinned. It was `mod tests` until the matched card left this file: that
+    /// module's every test was about the card, so it went with it, and a cut
+    /// aimed at an empty module is a cut that can be deleted by tidying.
     ///
     /// The literal is [`BELOW_CUT_MARKER`], `concat!`-split so that this file
     /// contains it exactly ONCE -- the occurrence the cut lands on -- which is
@@ -3742,15 +1889,15 @@ mod geometry_tests {
         let source = this_module_source();
         let end = source
             .find(BELOW_CUT_MARKER)
-            .expect("overlay_ui.rs has a `mod tests`");
+            .expect("overlay_ui.rs has a `mod geometry_tests`");
         // Control: the cut kept the production items and dropped the tests.
         let production = non_comment(&source[..end]);
         assert!(
-            production.contains("fn credential_row("),
-            "the production slice lost `credential_row`, so the cut is in the wrong place"
+            production.contains("fn show_save_login_overlay("),
+            "the production slice lost `show_save_login_overlay`, so the cut is in the wrong              place"
         );
         assert!(
-            !production.contains("fn row_leads_with_the_username_when_known"),
+            !production.contains("fn the_locked_card_fits_the_window_it_asks_for"),
             "the production slice still contains test code"
         );
         // What is below the cut -- the half this slice throws away, and so the
@@ -3798,7 +1945,7 @@ mod geometry_tests {
     /// occurrence in this file, and the uniqueness control below could not be
     /// written at all. It WAS unsplit until this test existed, and the cut
     /// landed on the right occurrence only because that one comes first.
-    const BELOW_CUT_MARKER: &str = concat!("mod te", "sts {");
+    const BELOW_CUT_MARKER: &str = concat!("mod geometry_te", "sts {");
 
     /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
     /// rather than source. Each is controlled below: it must still occur in
@@ -3991,7 +2138,7 @@ mod geometry_tests {
         //    matched above the real test modules, this anchor would fall below
         //    the cut instead of just above it.
         const LAST_PRODUCTION_ITEM: &str =
-            concat!("let response = row.response.", "interact(Sense::click());");
+            concat!("let card = draw_save_login_", "card(ui, &mut self.form);");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,
