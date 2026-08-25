@@ -62,11 +62,6 @@ pub enum Outcome {
     Fill { id: String, send: Send },
     /// The user asked to create a new login for this app.
     NewLogin,
-    /// The user asked to search the vault rather than pick from this card:
-    /// either because more candidates matched than fit on it, or because
-    /// **nothing** matched and the card offered the search as one of its two
-    /// actions. See [`empty_rows`].
-    SearchVault,
     /// The user asked to edit the chosen candidate's binding.
     Edit(String),
     /// The user declined. Nothing is armed.
@@ -82,13 +77,26 @@ pub enum Event {
     Cancel,
     /// The window went away underneath us. Treated exactly as `Cancel`.
     Closed,
-    /// Picked the candidate at this index into the slice `run_with` was
-    /// given.
+    /// Picked the row at this index: a candidate of the slice `run_with` was
+    /// given while the card is showing its list, or a **search result** while
+    /// it is in search mode. `run_with` knows which, and it is the only thing
+    /// that does.
     Chose(usize),
-    /// Asked to search the vault instead -- offered when the card is
-    /// truncated (see `crate::win32_draw::visible_rows`) and as one of the
-    /// two rows of the empty card (see [`empty_rows`]).
-    Overflow,
+    /// Asked to search the vault: the *Search the vault* row under every
+    /// populated card, and the *Search vault* row of the empty card (see
+    /// [`empty_rows`]).
+    ///
+    /// **This no longer leaves the card.** It switches the same window into
+    /// [`Outcome`]-less search mode -- a focused text box over the same list --
+    /// rather than answering an outcome that opened the ~100 MB vault window
+    /// to search a vault the daemon already holds in memory.
+    Search,
+    /// The search box's contents changed. Carries what is in it now, exactly
+    /// as the control has it.
+    ///
+    /// **Never a secret**: this is a filter the user typed, over item names,
+    /// on a card that shows names and usernames and nothing else.
+    Typed(String),
     /// Asked to create a new login for this app.
     NewLogin,
     /// Asked to edit the previously chosen candidate's binding.
@@ -114,6 +122,47 @@ pub struct Palette {
     pub has_sequence: bool,
 }
 
+/// **What one keystroke in the search box found**, capped, and how many there
+/// really were.
+///
+/// `offers` is at most the cap the searcher was given; `total` is the count
+/// **before** the cap. The two are separate because a card that hides matches
+/// without saying so is a defect this project treats as serious, and this card
+/// neither scrolls nor resizes -- so the difference between them is the only
+/// thing that can be said honestly about the rows that are not on screen. See
+/// [`search_overflow_label`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SearchResults {
+    /// The matches this card has room for, in the order they will be drawn.
+    pub offers: Vec<Offer>,
+    /// How many items matched in the whole vault, capped by nothing.
+    pub total: usize,
+}
+
+/// **The seam the card's search mode reaches the vault through.**
+///
+/// A bare `fn` pointer, this crate's idiom for a seam a test must be able to
+/// stand in for, and deliberately not a closure over a `VaultCache`: it is
+/// called from [`run_with`], which is drivable with no window and no vault.
+///
+/// # Nothing that crosses this is a secret
+///
+/// It answers in [`Offer`]s -- a [`Candidate`] (id, name, username), a
+/// [`Palette`] (presence of a field, never its value) and an icon -- which is
+/// the same type the candidate list is built from, and which the module doc
+/// already records as carrying no secret. The vault items themselves stay on
+/// the far side: `crate::app`'s implementation takes its snapshot, filters it
+/// through `crate::picker_ui::name_matches_filter` and drops the snapshot
+/// before it returns, so no plaintext password is alive while the card is up.
+///
+/// # Arguments
+///
+/// The query as the user typed it (this function lowercases, the card does
+/// not), and the cap -- how many matches the caller has room to draw. Capping
+/// *inside* the searcher is what keeps a keystroke against a 1,666-item vault
+/// from building 1,666 `Offer`s the card will throw all but five of away.
+pub type Searcher = fn(query: &str, cap: usize) -> SearchResults;
+
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
 /// desktop. Nothing here decides anything; every decision lives in
 /// [`run_with`].
@@ -135,6 +184,16 @@ pub struct PickerCalls {
     pub next: fn(PickerWindow) -> Event,
     /// Shows the field palette for the chosen candidate.
     pub show_palette: fn(PickerWindow, &Palette),
+    /// **Puts the card into search mode, or refreshes the rows it is already
+    /// showing.**
+    ///
+    /// The first call swaps the card in place -- a focused text box above the
+    /// same list, drawn by the same row painter -- and every later call is one
+    /// keystroke's worth of new rows. One pointer for both, rather than an
+    /// `enter_search` and a `set_results`, because the window does the same
+    /// thing either way and two pointers would be two chances for the mode and
+    /// its rows to disagree.
+    pub show_search: fn(PickerWindow, &SearchResults),
     /// Destroys the window and releases its resources.
     pub close: fn(PickerWindow),
 }
@@ -158,14 +217,32 @@ pub struct PickerCalls {
 /// **An empty `candidates` slice is not a refusal.** It is the card's empty
 /// mode -- design 3a's content, drawn by this card rather than by a second
 /// window (see [`empty_rows`]) -- and it needs no arm of its own here: its
-/// two rows answer [`Event::NewLogin`] and [`Event::Overflow`], which are the
-/// same two events the populated card's *New login* button and its overflow
-/// row answer, and they mean the same two things.
+/// two rows answer [`Event::NewLogin`] and [`Event::Search`], which are the
+/// same two events the populated card's *New login* button and its *Search the
+/// vault* row answer, and they mean the same two things.
+///
+/// # The third mode: search, on this card
+///
+/// [`Event::Search`] no longer produces an outcome. It switches the same
+/// window into search mode -- `search("", SEARCH_CAP)` for the first rows, then
+/// one call per [`Event::Typed`] -- and the rows it draws are answered by the
+/// same [`Event::Chose`] the candidate list is, leading to the same
+/// `show_palette` step and the same [`Outcome::Fill`]. **One dispatch path**,
+/// which is the whole reason the mode lives here rather than in a second
+/// window: the alternative was `Outcome::SearchVault`, which opened the ~100 MB
+/// egui vault window to search a vault the daemon already holds in memory, and
+/// which never gave that memory back to the process.
+///
+/// Search mode is entered and not left. [`Event::Cancel`] closes the card from
+/// it exactly as it does from every other mode -- see the module's `ESC`
+/// discussion in `win32::next`, which answers `VK_ESCAPE` ahead of
+/// `IsDialogMessageW` and has always meant "this card is done".
 pub fn run_with(
     calls: &PickerCalls,
     candidates: &[Candidate],
     app_name: &str,
     palette: fn(&str) -> Palette,
+    search: Searcher,
 ) -> Outcome {
     let Some(window) = (calls.open)(candidates, app_name) else {
         log::warn!("the account picker could not be put on screen");
@@ -181,7 +258,16 @@ pub fn run_with(
         );
     }
 
-    let mut chosen: Option<usize> = None;
+    // **The chosen item's id, not its row index.** A row index means one thing
+    // in the candidate list and another in the search results, and the card can
+    // move between them; an id means the same thing in both, and it is the only
+    // part of the choice `Outcome::Fill` and `Outcome::Edit` carry anyway.
+    let mut chosen: Option<String> = None;
+    // Set once, by `Event::Search`, and never cleared: search mode is entered
+    // and not left. While it is set, `Event::Chose` indexes `results` rather
+    // than `candidates`.
+    let mut searching = false;
+    let mut results = SearchResults::default();
 
     loop {
         match (calls.next)(window) {
@@ -189,32 +275,61 @@ pub fn run_with(
                 (calls.close)(window);
                 return Outcome::Cancelled;
             }
-            Event::Overflow => {
-                (calls.close)(window);
-                return Outcome::SearchVault;
+            Event::Search => {
+                if searching {
+                    // The row that enters the mode is gone once it is entered,
+                    // so this cannot honestly happen -- and re-entering would
+                    // throw away whatever the user had typed.
+                    continue;
+                }
+                searching = true;
+                // The empty query, so the mode opens showing something rather
+                // than an empty card the user has to type at to believe.
+                results = search("", SEARCH_CAP);
+                (calls.show_search)(window, &results);
+            }
+            Event::Typed(query) => {
+                if !searching {
+                    log::warn!(
+                        "the account picker was told the search box changed while it was not in \
+                         search mode; ignoring it"
+                    );
+                    continue;
+                }
+                results = search(&query, SEARCH_CAP);
+                (calls.show_search)(window, &results);
             }
             Event::NewLogin => {
                 (calls.close)(window);
                 return Outcome::NewLogin;
             }
             Event::Chose(index) => {
-                let Some(candidate) = candidates.get(index) else {
+                // The one place the two lists differ, and it is a lookup rather
+                // than a branch on behaviour: from here down a chosen row is a
+                // chosen row, whichever list it came out of.
+                let picked: Option<(String, Palette)> = if searching {
+                    results
+                        .offers
+                        .get(index)
+                        .map(|offer| (offer.candidate.id.clone(), offer.palette.clone()))
+                } else {
+                    candidates.get(index).map(|c| (c.id.clone(), palette(&c.id)))
+                };
+                let Some((id, palette)) = picked else {
                     log::warn!(
-                        "the account picker chose row {index} but only {len} candidates were \
-                         offered; the Win32 row list and the candidate slice have disagreed, \
-                         which would otherwise surface later as the picker typing the wrong \
-                         account's password -- ignoring the choice",
-                        len = candidates.len()
+                        "the account picker chose row {index} but only {len} rows were offered; \
+                         the Win32 row list and the list behind it have disagreed, which would \
+                         otherwise surface later as the picker typing the wrong account's \
+                         password -- ignoring the choice",
+                        len = if searching { results.offers.len() } else { candidates.len() }
                     );
                     continue;
                 };
-                chosen = Some(index);
-                let palette = palette(&candidate.id);
+                chosen = Some(id);
                 (calls.show_palette)(window, &palette);
             }
             Event::EditSelected => {
-                if let Some(candidate) = chosen.and_then(|index| candidates.get(index)) {
-                    let id = candidate.id.clone();
+                if let Some(id) = chosen.clone() {
                     (calls.close)(window);
                     return Outcome::Edit(id);
                 }
@@ -223,8 +338,7 @@ pub fn run_with(
                 );
             }
             Event::Sends(send) => {
-                if let Some(candidate) = chosen.and_then(|index| candidates.get(index)) {
-                    let id = candidate.id.clone();
+                if let Some(id) = chosen.clone() {
                     (calls.close)(window);
                     return Outcome::Fill { id, send };
                 }
@@ -493,13 +607,17 @@ pub fn empty_text(app_name: &str) -> (String, &'static str) {
 ///
 /// **An empty `offers` slice is a card, not a no-op.** It puts the empty mode
 /// on screen -- design 3a's content, naming `app_name` -- and answers
-/// [`Outcome::NewLogin`], [`Outcome::SearchVault`] or [`Outcome::Cancelled`].
-pub fn ask(offers: &[Offer], app_name: &str) -> Outcome {
+/// [`Outcome::NewLogin`] or [`Outcome::Cancelled`], or, if the user takes its
+/// *Search vault* row, whatever the search mode leads to.
+///
+/// `search` is the caller's [`Searcher`]: this module has no way to reach a
+/// vault and deliberately keeps none.
+pub fn ask(offers: &[Offer], app_name: &str, search: Searcher) -> Outcome {
     let candidates: Vec<Candidate> = offers.iter().map(|o| o.candidate.clone()).collect();
     if let Ok(mut slot) = OFFERS.lock() {
         *slot = offers.to_vec();
     }
-    let outcome = run_with(&REAL, &candidates, app_name, palette_of);
+    let outcome = run_with(&REAL, &candidates, app_name, palette_of, search);
     if let Ok(mut slot) = OFFERS.lock() {
         slot.clear();
     }
@@ -528,6 +646,7 @@ pub static REAL: PickerCalls = PickerCalls {
     protect: win32::protect,
     next: win32::next,
     show_palette: win32::show_palette,
+    show_search: win32::show_search,
     close: win32::close,
 };
 
@@ -580,6 +699,25 @@ pub const LIST_ROWS: usize = ROW_CAP + 1;
 /// Button height. `theme::BUTTON_HEIGHT`.
 const BUTTON_H: i32 = 32;
 
+/// The search box's height. `theme::SEARCH_FIELD_HEIGHT` -- design 2b's search
+/// box, which is deliberately shorter than a form field, and this is the same
+/// control doing the same job on a smaller surface. Pinned against `theme` by
+/// [`the_cards_dimensions_are_the_themes`], so a redesign there cannot leave
+/// this card drawing a box of its own invented height.
+const SEARCH_H: i32 = 34;
+
+/// The gap above and below the search box, which is the gap the card already
+/// has between its subtitle and its list.
+const SEARCH_GAP: i32 = 10;
+
+/// **How many search results the card has room for.**
+///
+/// The same [`ROW_CAP`] the candidate list uses, because it is the same list
+/// area with the same number of controls behind it. The card is [`LIST_ROWS`]
+/// slots tall, so the slot the *Search the vault* row held in the list is the
+/// slot the overflow notice holds here -- see [`search_overflow_label`].
+pub const SEARCH_CAP: usize = ROW_CAP;
+
 /// The *New login* / *Edit binding* button's width: its label, and room for
 /// the [`NEW_LOGIN_SHORTCUT`] chip beside it. See [`layout`].
 const SECONDARY_W: i32 = 168;
@@ -626,6 +764,12 @@ pub struct Layout {
     pub window: Box2,
     pub title: Box2,
     pub subtitle: Box2,
+    /// The search box, in search mode only. `None` in every other mode, rather
+    /// than a zero-height rectangle: a `Box2` with `h: 0` is a control the card
+    /// would still place, still hit-test and still paint a border around, and
+    /// "there is no search box here" is exactly the thing that must not be
+    /// expressible as a number.
+    pub search: Option<Box2>,
     /// The whole list area. Individual rows are [`row_at`].
     pub list: Box2,
     /// The footer's left button: *New login* in the first step, *Edit binding*
@@ -653,12 +797,33 @@ pub struct Layout {
 /// button, which reads as a list that lost its rows rather than as a card with
 /// two.
 pub fn layout(rows: usize) -> Layout {
+    layout_for(rows, false)
+}
+
+/// [`layout`], told whether the card is in **search mode**.
+///
+/// The one difference is the search box between the subtitle and the list, and
+/// the `SEARCH_H + SEARCH_GAP` it pushes everything below it down by. A second
+/// layout function would be a second set of rectangles that has to agree with
+/// the first; this is the same arithmetic with one box optionally in it, so
+/// `nothing_the_card_lays_out_falls_off_the_bottom_of_it` can be run over both
+/// shapes without either being a special case.
+pub fn layout_for(rows: usize, search: bool) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
     let title = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: content_w, h: 21 };
     let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 17 };
-    let list =
-        Box2 { x: MARGIN_X, y: subtitle.bottom() + 10, w: content_w, h: ROW_H * rows as i32 };
+    let search = search.then(|| Box2 {
+        x: MARGIN_X,
+        y: subtitle.bottom() + SEARCH_GAP,
+        w: content_w,
+        h: SEARCH_H,
+    });
+    let list_y = match search {
+        Some(box2) => box2.bottom() + SEARCH_GAP,
+        None => subtitle.bottom() + SEARCH_GAP,
+    };
+    let list = Box2 { x: MARGIN_X, y: list_y, w: content_w, h: ROW_H * rows as i32 };
 
     // Right-aligned, Cancel outermost: the choice that does nothing sits where
     // the eye leaves the card.
@@ -673,7 +838,7 @@ pub fn layout(rows: usize) -> Layout {
     let window = Box2 { x: 0, y: 0, w: WIDTH, h: cancel.bottom() + MARGIN_TOP };
     let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP, w: 20, h: 20 };
 
-    Layout { window, title, subtitle, list, secondary, cancel, close_glyph }
+    Layout { window, title, subtitle, search, list, secondary, cancel, close_glyph }
 }
 
 /// One row of the **populated** card, in the order they are drawn.
@@ -721,6 +886,85 @@ pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
         } else {
             "Look for it under another name"
         },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Search mode -- the same card, a focused text box, and the same rows.
+//
+// Asked for by the app's owner: "search should open the same text box and
+// focus on it where user can find something, not separate window, results
+// shown in the same window". The row that used to answer `Outcome::SearchVault`
+// -- and so open the ~100 MB egui vault window to search a vault the daemon
+// already holds in memory -- now switches this card into the mode below.
+// ---------------------------------------------------------------------------
+
+/// One row of the card in **search mode**, in the order they are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchRow {
+    /// The `usize`th of [`SearchResults::offers`].
+    Result(usize),
+    /// **The cap, said out loud.** Drawn only when the vault held more matches
+    /// than the card has room for. `shown` is what is on screen above it,
+    /// `total` is what matched.
+    Overflow { shown: usize, total: usize },
+    /// Nothing matched what was typed. A row rather than an empty list,
+    /// because an empty list on a card that does not scroll is
+    /// indistinguishable from a card that has stopped working.
+    Nothing,
+}
+
+/// The rows search mode draws for `shown` results out of `total` matches.
+///
+/// **Bounded by construction at [`LIST_ROWS`]**, exactly as [`populated_rows`]
+/// and [`palette_rows`] are, and for the same reason: this card neither scrolls
+/// nor resizes, so a row past the last slot is one the user can neither see nor
+/// reach. `shown` is [`SEARCH_CAP`] at most and the notice takes the one extra
+/// slot the card is [`LIST_ROWS`] tall for.
+pub fn search_rows(shown: usize, total: usize) -> Vec<SearchRow> {
+    let shown = shown.min(SEARCH_CAP);
+    if shown == 0 {
+        return vec![SearchRow::Nothing];
+    }
+    let mut rows: Vec<SearchRow> = (0..shown).map(SearchRow::Result).collect();
+    if total > shown {
+        rows.push(SearchRow::Overflow { shown, total });
+    }
+    rows
+}
+
+/// What a non-result row of search mode says, on its two lines.
+///
+/// **The overflow row names the number it is hiding.** A cap that drops matches
+/// without saying so is the defect this project keeps finding, and the *Search
+/// the vault* row's own truncation line -- see [`search_row_label`] -- is the
+/// precedent this follows rather than invents: the card says how many matched,
+/// how many it can show, and what the user can do about it.
+///
+/// `SearchRow::Result` has no text of its own: it is an account, drawn from its
+/// [`Candidate`] by the same row painter the candidate list uses.
+pub fn search_row_text(row: SearchRow) -> (String, String) {
+    match row {
+        SearchRow::Result(_) => (String::new(), String::new()),
+        SearchRow::Overflow { shown, total } => (
+            format!("{total} accounts match"),
+            format!("Showing the first {shown} -- keep typing to narrow it"),
+        ),
+        SearchRow::Nothing => (
+            "No matches".to_string(),
+            "Nothing in your vault is named like that".to_string(),
+        ),
+    }
+}
+
+/// Search mode's heading pair.
+///
+/// A function rather than literals at the paint site, for [`empty_text`]'s
+/// reason: the words the card shows are then the words a test can read.
+pub fn search_text() -> (&'static str, &'static str) {
+    (
+        "Search the vault",
+        "Type to filter your accounts. Nothing is typed until you pick one.",
     )
 }
 
@@ -784,7 +1028,14 @@ pub fn candidate_for_digit(digit: u32, shown: usize) -> Option<usize> {
 /// `rows` rows -- the same count [`layout`] was given, so the row and the list
 /// it sits in can never be measured against two different cards.
 pub fn row_at(rows: usize, index: usize) -> Box2 {
-    let list = layout(rows).list;
+    row_at_for(rows, false, index)
+}
+
+/// [`row_at`], told whether the card is in search mode -- the same flag
+/// [`layout_for`] takes, and read off the same `Layout`, so a row and the list
+/// it sits in can never be measured against two different cards.
+pub fn row_at_for(rows: usize, search: bool, index: usize) -> Box2 {
+    let list = layout_for(rows, search).list;
     Box2 { x: list.x, y: list.y + ROW_H * index as i32, w: list.w, h: ROW_H }
 }
 
@@ -802,6 +1053,11 @@ const MODE_PALETTE: isize = 1;
 /// Nothing in the vault looks like this app: design 3a's content, on this
 /// card. See [`empty_rows`].
 const MODE_EMPTY: isize = 2;
+/// **The card's search mode**: a focused text box over the same list, filtering
+/// the whole vault through the [`Searcher`] seam. Entered from the *Search the
+/// vault* row of either of the other two modes, and not left -- see
+/// [`run_with`].
+const MODE_SEARCH: isize = 3;
 
 /// The app the card is about, as [`empty_text`] needs it.
 ///
@@ -830,6 +1086,19 @@ static TRUNCATED: AtomicBool = AtomicBool::new(false);
 
 /// The second step's rows. Empty while the first step is showing.
 static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
+
+/// **Search mode's rows, as display strings and nothing else.**
+///
+/// [`Candidate`]s -- id, name, username -- exactly like [`SHOWN`], and for the
+/// same reason: the window has to paint them, and a window that could paint a
+/// secret is a window that can leak one. The [`Palette`] each result carries
+/// stays with [`run_with`], which is what needs it; the card never sees it.
+static SEARCH_SHOWN: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec::new());
+
+/// How many items matched the current query in the whole vault, before
+/// [`SEARCH_CAP`]. Read only by the overflow row, which is the one place the
+/// difference between this and `SEARCH_SHOWN.len()` is told.
+static SEARCH_TOTAL: AtomicIsize = AtomicIsize::new(0);
 
 /// The Win32 calls, and **nothing else**.
 ///
@@ -861,9 +1130,10 @@ static ENTRIES: std::sync::Mutex<Vec<Send>> = std::sync::Mutex::new(Vec::new());
 /// Nothing in this module decides anything. See [`run_with`].
 mod win32 {
     use super::{
-        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, APP_NAME, ENTRIES,
-        ESC_SHORTCUT, GONE, LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST, MODE_PALETTE,
-        NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP, SHOWN, TRUNCATED,
+        Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, SearchResults, SearchRow,
+        APP_NAME, ENTRIES, ESC_SHORTCUT, GONE, LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST,
+        MODE_PALETTE, MODE_SEARCH, NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
+        SEARCH_CAP, SEARCH_SHOWN, SEARCH_TOTAL, SHOWN, TRUNCATED,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -879,20 +1149,30 @@ mod win32 {
         AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
         DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
         HBITMAP, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY,
-        TRANSPARENT,
+        SetBkColor, TRANSPARENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
-        RegisterClassW, SendMessageW, SetForegroundWindow,
-        SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED,
-        BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG,
-        PM_REMOVE, SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
+        GetClientRect, GetDlgItem, GetWindowLongPtrW, GetWindowTextW, IsDialogMessageW,
+        LoadCursorW, MoveWindow, PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
+        SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+        BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, GWLP_WNDPROC, HMENU,
+        HTCAPTION, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
+        SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+        WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
         WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
         WS_VISIBLE,
     };
+
+    /// `EN_CHANGE`, the `EDIT` control's "your text changed" notification.
+    ///
+    /// Named here rather than left as a bare hex literal at the call, exactly
+    /// as `unlock_prompt` names `EM_SETSEL`: the `windows` crate does not
+    /// project the `EDIT` control's notification codes under the features this
+    /// crate enables, and enabling more of them re-pins `job_object.rs`'s
+    /// whole-file hash of `Cargo.toml`.
+    const EN_CHANGE: u32 = 0x0300;
 
     use crate::win32_draw::{
         draw_button_with_shortcut, draw_row, rgb, ButtonSkin, RowState,
@@ -904,6 +1184,9 @@ mod win32 {
     const ID_ROW: usize = 200;
     const ID_SECONDARY: usize = 101;
     const ID_CANCEL: usize = 102;
+    /// The search box. Below `ID_ROW` with the footer's two, so the `id <
+    /// ID_ROW` test in [`clicked`] keeps meaning "not a row".
+    const ID_SEARCH: usize = 103;
 
     const CLASS_NAME: PCWSTR = w!("DeskwardenAccountPicker");
 
@@ -1006,6 +1289,10 @@ mod win32 {
         name: HFONT,
         username: HFONT,
         button: HFONT,
+        /// The search box's face. The app's regular cut at the size a row's
+        /// name is set in, so what the user types reads as the same kind of
+        /// text as the rows it filters.
+        field: HFONT,
         /// The keyboard hints' face: `theme::GDI_MONO_FACE` at
         /// `theme::CHIP_TEXT_PX`, which is what `theme::kbd_chip` renders in.
         hint: HFONT,
@@ -1020,15 +1307,22 @@ mod win32 {
                 name: font(SEMIBOLD, 13),
                 username: font(REGULAR, 11),
                 button: font(SEMIBOLD, 12),
+                field: font(REGULAR, 13),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in
-                    [self.title, self.subtitle, self.name, self.username, self.button, self.hint]
-                {
+                for f in [
+                    self.title,
+                    self.subtitle,
+                    self.name,
+                    self.username,
+                    self.button,
+                    self.field,
+                    self.hint,
+                ] {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1181,6 +1475,10 @@ mod win32 {
         if let Ok(mut slot) = ENTRIES.lock() {
             slot.clear();
         }
+        if let Ok(mut slot) = SEARCH_SHOWN.lock() {
+            slot.clear();
+        }
+        SEARCH_TOTAL.store(0, Ordering::SeqCst);
 
         // **The cap, and the slot the *Search the vault* row always holds.**
         // See `win32_draw::visible_rows` and `super::populated_rows`: the last
@@ -1317,8 +1615,10 @@ mod win32 {
         // The handles are copied out and the guard dropped at the end of this
         // statement: `abandon` locks `FONTS` itself, so holding the guard
         // across the `child` calls below would deadlock the failure path.
-        let Some((name_font, button_font)) =
-            FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| (f.name, f.button)))
+        let Some((name_font, button_font, field_font)) = FONTS
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|f| (f.name, f.button, f.field)))
         else {
             return abandon(window);
         };
@@ -1371,6 +1671,45 @@ mod win32 {
         };
         subclass(secondary);
         subclass(cancel);
+
+        // **The search box, created here and shown only in `MODE_SEARCH`.**
+        //
+        // Created with the rest rather than when the mode is entered, for the
+        // reason the unused rows are: creating a window from inside the
+        // handling of a click on a window is a thing to avoid, and `apply_mode`
+        // already owns which controls are on screen.
+        //
+        // **Not subclassed.** Every other control here is a `BUTTON` whose
+        // painting this module takes over; an `EDIT` is a control the user
+        // types into, and comctl32's own procedure is what draws the caret, the
+        // selection and the horizontal scroll. What makes it look like this
+        // app's is the box the parent paints around it (see `paint`) and
+        // `WM_CTLCOLOREDIT`, which hands it the card's white and the app's ink
+        // -- exactly what `unlock_prompt` does with its password field.
+        //
+        // Inset inside the painted box by the same 10px `unlock_prompt` uses,
+        // and vertically centred in it, so the text sits off the border rather
+        // than against it.
+        let search_box = super::layout_for(LIST_ROWS, true)
+            .search
+            .expect("`layout_for(.., true)` is the search shape and always has the box");
+        if child(
+            window,
+            w!("EDIT"),
+            WS_TABSTOP.0 | ES_AUTOHSCROLL as u32,
+            Box2 {
+                x: search_box.x + 10,
+                y: search_box.y + (search_box.h - 20) / 2,
+                w: search_box.w - 20,
+                h: 20,
+            },
+            ID_SEARCH,
+            field_font,
+        )
+        .is_none()
+        {
+            return abandon(window);
+        }
 
         apply_mode(window);
 
@@ -1493,12 +1832,31 @@ mod win32 {
         const LETTER_N: u16 = b'N' as u16;
         if (DIGIT_1..=DIGIT_9).contains(&vk) {
             let digit = (vk - DIGIT_1 + 1) as u32;
-            // Only the first step numbers its rows: `MODE_PALETTE`'s rows are
-            // fields of one account and `MODE_EMPTY`'s are two offers, and
-            // neither was asked for. The count is the CANDIDATES', never the
-            // rows', so no digit can land on the *Search the vault* row.
-            if MODE.load(Ordering::SeqCst) == MODE_LIST {
-                let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+            // **The first step and search mode number their rows; the other
+            // two do not.** `MODE_PALETTE`'s rows are fields of one account
+            // and `MODE_EMPTY`'s are two offers, and neither was asked for.
+            //
+            // **A digit is numbered in search mode too, even though a text box
+            // has the keyboard there**, and that is a decision rather than an
+            // oversight. `CTRL+ALT+3` is a chord, not the character `3`: this
+            // arm is reached only with both modifiers down, and it is reached
+            // for every digit whether or not it chooses anything -- so the
+            // digit is swallowed here in every mode already and can never
+            // reach the box as a keystroke. Given that, making it choose the
+            // third result is strictly better than making it do nothing, and
+            // it is the same chord family on the same rows the user is looking
+            // at. A plain `3` still types a `3`.
+            //
+            // The count is the ACCOUNT rows', never the drawn rows', in both
+            // modes: no digit can land on the *Search the vault* row or on
+            // search mode's overflow notice.
+            let mode = MODE.load(Ordering::SeqCst);
+            if mode == MODE_LIST || mode == MODE_SEARCH {
+                let shown = if mode == MODE_SEARCH {
+                    SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0)
+                } else {
+                    SHOWN.lock().map(|s| s.len()).unwrap_or(0)
+                };
                 if let Some(index) = super::candidate_for_digit(digit, shown) {
                     clicked(ID_ROW + index);
                 }
@@ -1524,7 +1882,10 @@ mod win32 {
     /// be worse than one that did nothing at all.
     fn new_login_control() -> Option<usize> {
         match MODE.load(Ordering::SeqCst) {
-            MODE_LIST => Some(ID_SECONDARY),
+            // Search mode keeps the footer button, and it is still *New login*:
+            // "none of these" is exactly what a user who has searched their
+            // whole vault and found nothing means.
+            MODE_LIST | MODE_SEARCH => Some(ID_SECONDARY),
             MODE_EMPTY => super::empty_rows()
                 .iter()
                 .position(|action| *action == EmptyAction::NewLogin)
@@ -1543,6 +1904,49 @@ mod win32 {
         }
     }
 
+    /// **The longest filter the card will read out of its search box.**
+    ///
+    /// Not a limit on what can be typed -- the control takes whatever it is
+    /// given -- but a bound on the buffer this reads it into. A paste of a
+    /// megabyte is a filter that matches nothing, and reading all of it per
+    /// keystroke to prove that would be the slowest possible way to say so.
+    /// 256 characters is far longer than any vault item's name.
+    const QUERY_CAP: usize = 256;
+
+    /// What is in the search box right now.
+    ///
+    /// `GetWindowTextW` and not `WM_GETTEXT` through `SendMessageW`, because
+    /// this is an ordinary control with ordinary contents: `unlock_prompt`
+    /// reaches for the message form there so it can wipe the buffer it copied
+    /// into, and that is a password. This is a filter over item names.
+    fn search_query(window: HWND) -> String {
+        unsafe {
+            let Ok(control) = GetDlgItem(window, ID_SEARCH as i32) else {
+                return String::new();
+            };
+            let mut buffer = [0u16; QUERY_CAP];
+            let len = GetWindowTextW(control, &mut buffer);
+            if len <= 0 {
+                return String::new();
+            }
+            String::from_utf16_lossy(&buffer[..len as usize])
+        }
+    }
+
+    /// The card's white as a brush, for `WM_CTLCOLOREDIT`.
+    ///
+    /// A `OnceLock` and never deleted, exactly as `unlock_prompt::card_brush`
+    /// is: the value returned from `WM_CTLCOLOREDIT` is a handle the system
+    /// keeps using after the handler returns, so a brush created per message
+    /// and deleted would be a use-after-free -- and one created per message and
+    /// not deleted would leak one GDI object per repaint of a control the user
+    /// is typing into.
+    fn card_brush() -> HBRUSH {
+        static BRUSH: OnceLock<isize> = OnceLock::new();
+        HBRUSH(*BRUSH.get_or_init(|| unsafe { CreateSolidBrush(rgb(crate::theme::CARD)).0 as isize })
+            as *mut c_void)
+    }
+
     /// Swaps the card to its second step: the chosen account's fields.
     pub(super) fn show_palette(window: PickerWindow, palette: &Palette) {
         if let Ok(mut slot) = ENTRIES.lock() {
@@ -1553,16 +1957,106 @@ mod win32 {
         apply_mode(top);
     }
 
-    /// Shows exactly the controls this step has rows for, hides the rest, and
-    /// puts the keyboard on the first of them.
+    /// **Swaps the card into search mode, and refreshes its rows.**
+    ///
+    /// One entry point for both, as [`super::PickerCalls::show_search`] says:
+    /// the window does the same thing either way, and two would be two chances
+    /// for the mode and the rows behind it to disagree.
+    ///
+    /// **Only the display strings are kept.** `results.offers` carries a
+    /// `Palette` per row; that stays with `run_with`, which is what needs it,
+    /// and what is parked here is what the paint path has to have -- names and
+    /// usernames. No icon either: `make_icon` decodes at open, and a keystroke
+    /// is not a place to read the on-disk favicon cache.
+    pub(super) fn show_search(window: PickerWindow, results: &SearchResults) {
+        if let Ok(mut slot) = SEARCH_SHOWN.lock() {
+            *slot = results
+                .offers
+                .iter()
+                .take(SEARCH_CAP)
+                .map(|offer| offer.candidate.clone())
+                .collect();
+        }
+        SEARCH_TOTAL.store(results.total as isize, Ordering::SeqCst);
+        let entering = MODE.swap(MODE_SEARCH, Ordering::SeqCst) != MODE_SEARCH;
+        let top = hwnd(window.0);
+        apply_mode(top);
+        if entering {
+            // **Focused, so the user types immediately.** This is the whole of
+            // what was asked for -- "the same text box and focus on it" -- and
+            // it happens only on the way in: refocusing on every keystroke
+            // would put the caret back at the start of what was just typed.
+            unsafe {
+                if let Ok(control) = GetDlgItem(top, ID_SEARCH as i32) {
+                    let _ = SetFocus(control);
+                }
+            }
+        }
+    }
+
+    /// Whether the card is showing its search mode.
+    fn in_search() -> bool {
+        MODE.load(Ordering::SeqCst) == MODE_SEARCH
+    }
+
+    /// **This card's rectangles, for whichever mode is showing.**
+    ///
+    /// The one place the two arguments `super::layout_for` takes are decided,
+    /// so a control placed against one shape and hit-tested against another is
+    /// not expressible: every call below reads this.
+    fn card() -> super::Layout {
+        super::layout_for(laid_out_rows(), in_search())
+    }
+
+    /// Shows exactly the controls this step has rows for, hides the rest,
+    /// places them where this mode's layout puts them, and puts the keyboard on
+    /// the first of them.
     ///
     /// **Hiding is what stops an empty slot being a clickable nothing.** A
     /// `BUTTON` left visible with no label is still a tab stop and still posts
     /// `BN_CLICKED`.
+    ///
+    /// **And placing is what lets a mode change the card's shape.** Search mode
+    /// puts a box between the subtitle and the list, so every row and both
+    /// footer buttons move down and the window itself grows. `unlock_prompt`'s
+    /// argument against a window that resizes between steps -- it moves its own
+    /// Cancel button out from under a pointer that is about to click it -- is
+    /// answered rather than ignored: every transition into or out of this mode
+    /// is made by clicking a *row*, never the footer, so the pointer is never
+    /// over the button that moves.
     fn apply_mode(window: HWND) {
         let count = visible_row_count();
+        let l = card();
+        let rows = laid_out_rows();
+        let search = in_search();
         unsafe {
+            // The window first, so a control moved into the new area is not
+            // placed outside the client rect for a frame.
+            let _ = SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                scale(l.window.w),
+                scale(l.window.h),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            place(window, ID_SEARCH, {
+                let box2 = l.search.unwrap_or(l.subtitle);
+                Box2 {
+                    x: box2.x + 10,
+                    y: box2.y + (box2.h - 20) / 2,
+                    w: box2.w - 20,
+                    h: 20,
+                }
+            });
+            if let Ok(control) = GetDlgItem(window, ID_SEARCH as i32) {
+                let _ = ShowWindow(control, if search { SW_SHOW } else { SW_HIDE });
+            }
+            place(window, ID_SECONDARY, l.secondary);
+            place(window, ID_CANCEL, l.cancel);
             for index in 0..LIST_ROWS {
+                place(window, ID_ROW + index, super::row_at_for(rows, search, index));
                 if let Ok(control) = GetDlgItem(window, (ID_ROW + index) as i32) {
                     let _ = ShowWindow(control, if index < count { SW_SHOW } else { SW_HIDE });
                 }
@@ -1583,13 +2077,29 @@ mod win32 {
             // empty -- `palette_of` missing its item -- hides every row, and
             // focusing a hidden control puts the keyboard nowhere the user can
             // see it.
-            if count > 0 {
+            //
+            // **And never in search mode.** The keyboard belongs in the search
+            // box there: `apply_mode` runs on every keystroke, so moving focus
+            // to the first row here would take it off the box the user is
+            // typing into after the first character.
+            if count > 0 && !search {
                 if let Ok(control) = GetDlgItem(window, ID_ROW as i32) {
                     let _ = SetFocus(control);
                 }
             }
         }
         repaint(window);
+    }
+
+    /// Moves one control to a **logical** rectangle, scaling it as
+    /// `child` did when it created it.
+    fn place(window: HWND, id: usize, at: Box2) {
+        unsafe {
+            if let Ok(control) = GetDlgItem(window, id as i32) {
+                let _ =
+                    MoveWindow(control, scale(at.x), scale(at.y), scale(at.w), scale(at.h), true);
+            }
+        }
     }
 
     /// How many rows this step's card is **laid out** for -- which is not
@@ -1604,6 +2114,10 @@ mod win32 {
         if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
             super::empty_rows().len().min(LIST_ROWS)
         } else {
+            // Search mode included, and deliberately at the full height: its
+            // row count changes with every keystroke, and a card that grew and
+            // shrank as the user typed would move its own footer under their
+            // hand between one character and the next.
             LIST_ROWS
         }
     }
@@ -1611,7 +2125,11 @@ mod win32 {
     /// How many row controls this step is using.
     fn visible_row_count() -> usize {
         let mode = MODE.load(Ordering::SeqCst);
-        if mode == MODE_EMPTY {
+        if mode == MODE_SEARCH {
+            let shown = SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+            let total = SEARCH_TOTAL.load(Ordering::SeqCst).max(0) as usize;
+            super::search_rows(shown, total).len().min(LIST_ROWS)
+        } else if mode == MODE_EMPTY {
             super::empty_rows().len().min(LIST_ROWS)
         } else if mode == MODE_PALETTE {
             ENTRIES.lock().map(|e| e.len()).unwrap_or(0).min(LIST_ROWS)
@@ -1642,6 +2160,12 @@ mod win32 {
         if let Ok(mut slot) = ENTRIES.lock() {
             slot.clear();
         }
+        // Not secrets either, but they are item names out of this user's own
+        // vault, and nothing needs them once the card is down.
+        if let Ok(mut slot) = SEARCH_SHOWN.lock() {
+            slot.clear();
+        }
+        SEARCH_TOTAL.store(0, Ordering::SeqCst);
         if let Ok(mut slot) = PENDING.lock() {
             *slot = None;
         }
@@ -1791,6 +2315,16 @@ mod win32 {
                 paint(window);
                 LRESULT(0)
             }
+            // The search box sits inside a box the parent painted, so its own
+            // background has to be the card's white rather than the system's --
+            // `unlock_prompt`'s password field is themed the same way, by the
+            // same three calls.
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                SetBkColor(hdc, rgb(crate::theme::CARD));
+                SetTextColor(hdc, rgb(crate::theme::INK));
+                LRESULT(card_brush().0 as isize)
+            }
             // Frameless windows are dragged by their background.
             WM_NCHITTEST => {
                 let hit = DefWindowProcW(window, msg, wparam, lparam);
@@ -1817,6 +2351,17 @@ mod win32 {
             WM_COMMAND => {
                 let id = (wparam.0 & 0xffff) as i32;
                 let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+                // **`EN_CHANGE` before `BN_CLICKED`, because they collide.**
+                // Both are notification codes in the same 16 bits and
+                // `BN_CLICKED` is 0; the control id is what tells them apart,
+                // so the search box's notifications are taken by id first and
+                // never fall through to `clicked`.
+                if id == ID_SEARCH as i32 {
+                    if notification == EN_CHANGE && MODE.load(Ordering::SeqCst) == MODE_SEARCH {
+                        set_pending(Event::Typed(search_query(window)));
+                    }
+                    return LRESULT(0);
+                }
                 if notification == BN_CLICKED {
                     clicked(id as usize);
                 }
@@ -1859,6 +2404,7 @@ mod win32 {
         let mode = MODE.load(Ordering::SeqCst);
         let palette = mode == MODE_PALETTE;
         let empty = mode == MODE_EMPTY;
+        let search = mode == MODE_SEARCH;
         if id == ID_CANCEL {
             set_pending(Event::Cancel);
             return;
@@ -1885,8 +2431,19 @@ mod win32 {
             // no arm of its own for this mode.
             match super::empty_rows().get(index) {
                 Some(EmptyAction::NewLogin) => set_pending(Event::NewLogin),
-                Some(EmptyAction::SearchVault) => set_pending(Event::Overflow),
+                Some(EmptyAction::SearchVault) => set_pending(Event::Search),
                 None => {}
+            }
+            return;
+        }
+        if search {
+            // Only the result rows answer. The overflow notice and the "no
+            // matches" row are text, not offers -- clicking one and getting
+            // some account's field palette would be the card inventing a
+            // choice the user did not make.
+            let shown = SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+            if index < shown {
+                set_pending(Event::Chose(index));
             }
             return;
         }
@@ -1899,8 +2456,10 @@ mod win32 {
         let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
         if index >= shown {
             // The *Search the vault* row, which is the last row of every
-            // populated card -- see `super::populated_rows`.
-            set_pending(Event::Overflow);
+            // populated card -- see `super::populated_rows`. It no longer
+            // leaves this card: `run_with` answers it by switching the same
+            // window into search mode.
+            set_pending(Event::Search);
         } else {
             set_pending(Event::Chose(index));
         }
@@ -1949,7 +2508,7 @@ mod win32 {
     }
 
     fn in_close_glyph(lparam: LPARAM) -> bool {
-        let l = super::layout(laid_out_rows());
+        let l = card();
         let x = (lparam.0 & 0xffff) as i16 as i32;
         let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
         x >= scale(l.close_glyph.x)
@@ -1982,10 +2541,49 @@ mod win32 {
             fill(mem, client, crate::theme::WINDOW_BG);
             SetBkMode(mem, TRANSPARENT);
 
-            let l = super::layout(laid_out_rows());
+            let l = card();
             // The card the rows sit on, so a row's own white reads as part of
             // one surface rather than as five floating strips.
             rounded(mem, l.list, 8, crate::theme::CARD, Some((1, crate::theme::HAIRLINE)));
+
+            // The search box's own box, and its focus halo. The `EDIT` is a
+            // child sitting inside this, painted by comctl32 in the colours
+            // `WM_CTLCOLOREDIT` hands it -- the same division of labour
+            // `unlock_prompt` draws its password field with, and the same
+            // 3px `theme::FOCUS_RING` flush against the border's outer edge.
+            if let Some(field) = l.search {
+                let focused = GetDlgItem(window, ID_SEARCH as i32)
+                    .map(|control| GetFocus() == control)
+                    .unwrap_or(false);
+                if focused {
+                    rounded(
+                        mem,
+                        Box2 {
+                            x: field.x - 2,
+                            y: field.y - 2,
+                            w: field.w + 4,
+                            h: field.h + 4,
+                        },
+                        9,
+                        crate::theme::FOCUS_RING,
+                        None,
+                    );
+                }
+                rounded(
+                    mem,
+                    field,
+                    8,
+                    crate::theme::CARD,
+                    Some((
+                        1,
+                        if focused {
+                            crate::theme::BLUE
+                        } else {
+                            crate::theme::BORDER_STRONG
+                        },
+                    )),
+                );
+            }
 
             if let Some(fonts) = fonts {
                 let (title_run, subtitle_run) = headings();
@@ -2074,7 +2672,7 @@ mod win32 {
                         // the ring exists to draw. `layout` knows the button's
                         // logical size independently, so nothing has to divide
                         // device pixels back down and round badly doing it.
-                        let l = super::layout(laid_out_rows());
+                        let l = card();
                         let button = if id == ID_CANCEL { l.cancel } else { l.secondary };
                         rounded(
                             mem,
@@ -2123,6 +2721,10 @@ mod win32 {
                 let app = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
                 super::empty_text(&app)
             }
+            MODE_SEARCH => {
+                let (title, subtitle) = super::search_text();
+                (title.to_string(), subtitle)
+            }
             _ => (
                 "Fill from vault".to_string(),
                 "These accounts look like they belong to this app.",
@@ -2149,6 +2751,34 @@ mod win32 {
     /// second place for it to be got wrong.
     fn paint_row(hdc: HDC, rect: RECT, index: usize, state: RowState, fonts: &Fonts) {
         let dpi = DPI_PERCENT.load(Ordering::SeqCst);
+        if MODE.load(Ordering::SeqCst) == MODE_SEARCH {
+            let shown = SEARCH_SHOWN.lock().map(|s| s.clone()).unwrap_or_default();
+            let total = SEARCH_TOTAL.load(Ordering::SeqCst).max(0) as usize;
+            let Some(row) = super::search_rows(shown.len(), total).get(index).copied() else {
+                return;
+            };
+            match row {
+                SearchRow::Result(at) => {
+                    let Some(candidate) = shown.get(at) else { return };
+                    // **The same chip on the same rows.** A result is chosen by
+                    // the same chord a candidate is -- see `chord` -- so it
+                    // says so, from the same function.
+                    let shortcut = super::row_shortcut(at);
+                    let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
+                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
+                }
+                // **No chip on either.** Neither is an account, and a number on
+                // one would be a trap -- the same rule the *Search the vault*
+                // row is drawn under.
+                SearchRow::Overflow { .. } | SearchRow::Nothing => {
+                    let (name, says) = super::search_row_text(row);
+                    let row =
+                        Candidate { id: String::new(), name, username: says };
+                    draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
+                }
+            }
+            return;
+        }
         if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
             let Some(action) = super::empty_rows().get(index).copied() else {
                 return;
@@ -2607,6 +3237,141 @@ mod card_tests {
         );
     }
 
+    /// **Search mode's cap is a cap, and it says so.**
+    ///
+    /// The card neither scrolls nor resizes, so a result past the last slot is
+    /// one the user can neither see nor reach -- and a cap that hides matches
+    /// without saying so is the defect this project keeps finding. The overflow
+    /// row is where it is said, and it names the number.
+    #[test]
+    fn a_capped_search_says_how_many_it_is_not_showing() {
+        let rows = search_rows(SEARCH_CAP, 42);
+        assert_eq!(rows.len(), LIST_ROWS, "the card has room for exactly {LIST_ROWS} rows");
+        assert_eq!(
+            rows.last(),
+            Some(&SearchRow::Overflow { shown: SEARCH_CAP, total: 42 }),
+            "the capped search lost the row that says it was capped"
+        );
+        let (name, says) = search_row_text(SearchRow::Overflow { shown: SEARCH_CAP, total: 42 });
+        assert!(
+            name.contains("42"),
+            "the overflow row does not name how many matched, so the user cannot tell a cap \
+             from an answer: {name:?}"
+        );
+        assert!(
+            says.contains(&SEARCH_CAP.to_string()),
+            "the overflow row does not say how many of them are on screen: {says:?}"
+        );
+
+        // And the boundary below it is one: exactly the cap is the whole
+        // answer, and must not claim otherwise.
+        let exact = search_rows(SEARCH_CAP, SEARCH_CAP);
+        assert_eq!(
+            exact.len(),
+            SEARCH_CAP,
+            "a search that matched exactly the cap reported a truncation that did not happen -- \
+             the same off-by-one the *Search the vault* row was fixed for"
+        );
+        assert!(exact.iter().all(|row| matches!(row, SearchRow::Result(_))));
+    }
+
+    /// **Nothing matching is a row, not an empty card.**
+    ///
+    /// This card does not scroll and has no other content in search mode, so a
+    /// list drawn with no rows in it is indistinguishable from a card that has
+    /// stopped answering.
+    #[test]
+    fn a_search_that_matches_nothing_says_so() {
+        assert_eq!(search_rows(0, 0), vec![SearchRow::Nothing]);
+        let (name, says) = search_row_text(SearchRow::Nothing);
+        assert!(!name.is_empty() && !says.is_empty(), "the empty-result row says nothing at all");
+    }
+
+    /// Every row search mode plans is one the window has a control for and the
+    /// layout has a rectangle for, at every result count.
+    #[test]
+    fn the_search_cards_rows_all_fit_the_card() {
+        for shown in 0..=SEARCH_CAP {
+            for total in [shown, shown + 1, shown + 500] {
+                let rows = search_rows(shown, total);
+                assert!(
+                    rows.len() <= LIST_ROWS,
+                    "{shown} of {total} results planned {} rows onto a card with room for \
+                     {LIST_ROWS}",
+                    rows.len()
+                );
+                let last = row_at_for(LIST_ROWS, true, rows.len() - 1);
+                assert!(last.bottom() <= layout_for(LIST_ROWS, true).list.bottom());
+            }
+        }
+    }
+
+    /// **The search card's own geometry**, held to the same rule as the list's.
+    ///
+    /// The mode adds a control between the subtitle and the list, and this card
+    /// neither scrolls nor resizes to reach anything that fell off the bottom
+    /// because of it.
+    #[test]
+    fn nothing_the_search_card_lays_out_falls_off_the_bottom_of_it() {
+        let l = layout_for(LIST_ROWS, true);
+        let field = l.search.expect("the search shape has a search box");
+        assert!(l.subtitle.bottom() <= field.y, "the search box overlaps the subtitle");
+        assert!(field.bottom() <= l.list.y, "the search box overlaps the list");
+        assert!(field.x >= MARGIN_X && field.right() <= l.window.right() - MARGIN_X);
+        assert!(l.list.bottom() <= l.cancel.y);
+        assert!(
+            l.cancel.bottom() + MARGIN_TOP <= l.window.bottom(),
+            "the footer has eaten the search card's bottom margin"
+        );
+        assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
+        let last = row_at_for(LIST_ROWS, true, LIST_ROWS - 1);
+        assert!(
+            last.bottom() <= l.list.bottom(),
+            "the search card's last row is outside its list area, and this card cannot scroll"
+        );
+
+        // The mode costs exactly the box and its two gaps, and nothing else
+        // moved: a card that gained height for some other reason is a card
+        // whose layout has drifted from the list's.
+        let list = layout(LIST_ROWS);
+        assert_eq!(
+            l.window.h - list.window.h,
+            SEARCH_H + SEARCH_GAP,
+            "search mode changed the card's height by something other than its own box"
+        );
+        assert_eq!(l.title, list.title);
+        assert_eq!(l.subtitle, list.subtitle);
+        assert_eq!(
+            list.search, None,
+            "the list mode is laying out a search box it does not show, which is a control the \
+             user could tab into and a border the card would paint"
+        );
+    }
+
+    /// The card's dimensions are `theme`'s, and the search box is no exception.
+    #[test]
+    fn the_search_boxs_height_is_the_themes() {
+        assert_eq!(
+            SEARCH_H as f32,
+            crate::theme::SEARCH_FIELD_HEIGHT,
+            "the card's search box has grown a height of its own, so a redesign of design 2b's \
+             search box would leave this one behind"
+        );
+        assert_eq!(BUTTON_H as f32, crate::theme::BUTTON_HEIGHT);
+    }
+
+    /// Search mode says what it is and what to do.
+    #[test]
+    fn the_search_card_says_what_it_is() {
+        let (title, subtitle) = search_text();
+        assert!(!title.is_empty() && !subtitle.is_empty());
+        assert!(
+            subtitle.to_lowercase().contains("type"),
+            "the search card does not tell the user to type, which is the one thing its focused \
+             box is for: {subtitle:?}"
+        );
+    }
+
     /// The card says which app it has nothing for. A card that said only "no
     /// saved login" would be a card the user cannot tell apart from a card
     /// about some other window.
@@ -2700,7 +3465,17 @@ mod card_tests {
 mod tests {
     use super::*;
     use crate::key_sequence::{FieldRef, Token};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`Searcher`] for the tests that never enter search mode.
+    ///
+    /// It **panics** rather than answering nothing: a test that expected to
+    /// stay on the candidate list and quietly entered search mode instead
+    /// would otherwise pass on an empty result set, which is exactly the
+    /// silence these tests exist to catch.
+    fn no_search(_: &str, _: usize) -> SearchResults {
+        panic!("this card was not supposed to reach the vault search")
+    }
 
     fn one(name: &str) -> Vec<Candidate> {
         vec![Candidate {
@@ -2760,12 +3535,16 @@ mod tests {
                 }
             },
             show_palette: |_, _| {},
+            show_search: |_, _| {},
             close: |_| {},
         };
-        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
-            fields: vec![FieldRef::Password],
-            has_sequence: false,
-        });
+        let outcome = run_with(
+            &calls,
+            &one("Slack"),
+            "Slack.exe",
+            |_| Palette { fields: vec![FieldRef::Password], has_sequence: false },
+            no_search,
+        );
         assert_eq!(
             outcome,
             Outcome::Fill { id: "id-1".to_string(), send: Send::Field(FieldRef::Password) }
@@ -2797,6 +3576,7 @@ mod tests {
                 protect: |_| true,
                 next,
                 show_palette: |_, _| {},
+                show_search: |_, _| {},
                 close: |_| {},
             }
         }
@@ -2805,7 +3585,7 @@ mod tests {
         }
 
         assert_eq!(
-            run_with(&calls(|_| Event::NewLogin), &[], "Ledgerline.exe", empty),
+            run_with(&calls(|_| Event::NewLogin), &[], "Ledgerline.exe", empty, no_search),
             Outcome::NewLogin,
             "*New login* on the empty card is 3a's own button, and it must still lead somewhere"
         );
@@ -2816,14 +3596,42 @@ mod tests {
              for it now that the egui no-match window is gone"
         );
         assert_eq!(
-            run_with(&calls(|_| Event::Overflow), &[], "Ledgerline.exe", empty),
-            Outcome::SearchVault,
-            "*Search vault* on the empty card is 3a's other button"
-        );
-        assert_eq!(
-            run_with(&calls(|_| Event::Cancel), &[], "Ledgerline.exe", empty),
+            run_with(&calls(|_| Event::Cancel), &[], "Ledgerline.exe", empty, no_search),
             Outcome::Cancelled,
             "and dismissing it is still dismissing it"
+        );
+
+        // **And *Search vault* stays on this card.** It used to answer
+        // `Outcome::SearchVault`, which `main` spent the ~100 MB egui vault
+        // window on. It now reaches the vault through the searcher seam and
+        // shows the answer here: the card is never closed for it, so the only
+        // way this loop ends is the Cancel that follows.
+        static SEARCHED: AtomicUsize = AtomicUsize::new(0);
+        static SEARCH_STEP: AtomicUsize = AtomicUsize::new(0);
+        SEARCHED.store(0, Ordering::SeqCst);
+        SEARCH_STEP.store(0, Ordering::SeqCst);
+        let outcome = run_with(
+            &calls(|_| match SEARCH_STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Search,
+                _ => Event::Cancel,
+            }),
+            &[],
+            "Ledgerline.exe",
+            empty,
+            |query, cap| {
+                SEARCHED.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(query, "", "search mode opens on the unfiltered vault");
+                assert_eq!(cap, SEARCH_CAP);
+                SearchResults::default()
+            },
+        );
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(
+            SEARCHED.load(Ordering::SeqCst),
+            1,
+            "*Search vault* did not reach the vault at all. It is the empty card's only route \
+             to a login saved under another name, and the whole point of answering it here is \
+             that it must not open the ~100 MB vault window to do it"
         );
     }
 
@@ -2845,17 +3653,207 @@ mod tests {
                 _ => Event::Cancel,
             },
             show_palette: |_, _| panic!("there is no candidate to show a palette for"),
+            show_search: |_, _| {},
             close: |_| {},
         };
         assert_eq!(
-            run_with(&calls, &[], "Ledgerline.exe", |_| Palette {
-                fields: vec![],
-                has_sequence: false
-            }),
+            run_with(
+                &calls,
+                &[],
+                "Ledgerline.exe",
+                |_| Palette { fields: vec![], has_sequence: false },
+                no_search,
+            ),
             Outcome::Cancelled
         );
     }
 
+
+    // -----------------------------------------------------------------------
+    // Search mode: the same card, the same rows, the same dispatch.
+    // -----------------------------------------------------------------------
+
+    fn found(id: &str, name: &str) -> Offer {
+        Offer {
+            candidate: Candidate {
+                id: id.to_string(),
+                name: name.to_string(),
+                username: "ada@example.com".to_string(),
+            },
+            palette: Palette { fields: vec![FieldRef::Password], has_sequence: false },
+            icon: None,
+        }
+    }
+
+    /// **The whole point of the feature, end to end.**
+    ///
+    /// Asking to search does not close the card and does not answer an
+    /// outcome; it filters, the rows come back, and picking one goes through
+    /// the *same* `show_palette` step the candidate list leads to and produces
+    /// the same `Outcome::Fill`. One dispatch path, which is why the mode lives
+    /// on this card at all.
+    #[test]
+    fn a_searched_result_fills_through_the_same_step_a_candidate_does() {
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        static QUERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        static PALETTES: AtomicUsize = AtomicUsize::new(0);
+        STEP.store(0, Ordering::SeqCst);
+        CLOSED.store(0, Ordering::SeqCst);
+        PALETTES.store(0, Ordering::SeqCst);
+        QUERIES.lock().unwrap().clear();
+
+        let calls = PickerCalls {
+            open: |_, _| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                // The *Search the vault* row.
+                0 => Event::Search,
+                // One keystroke.
+                1 => Event::Typed("north".to_string()),
+                // The second result row.
+                2 => Event::Chose(1),
+                _ => Event::Sends(Send::Field(FieldRef::Password)),
+            },
+            show_palette: |_, palette| {
+                PALETTES.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    palette.fields,
+                    vec![FieldRef::Password],
+                    "the palette shown is not the one the search result carried"
+                );
+            },
+            show_search: |_, _| {},
+            close: |_| {
+                CLOSED.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let outcome = run_with(
+            &calls,
+            // The candidate list is deliberately NOT what is searched: a
+            // result index that fell through to this slice would fill from
+            // whatever happened to sit at it.
+            &one("Slack"),
+            "Slack.exe",
+            |_| panic!("a search result carries its own palette; the candidate lookup is wrong"),
+            |query, cap| {
+                QUERIES.lock().unwrap().push(query.to_string());
+                assert_eq!(cap, SEARCH_CAP);
+                SearchResults {
+                    offers: vec![
+                        found("id-north-1", "Northwind VPN"),
+                        found("id-north-2", "Northwind Payroll"),
+                    ],
+                    total: 2,
+                }
+            },
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Fill {
+                id: "id-north-2".to_string(),
+                send: Send::Field(FieldRef::Password)
+            },
+            "the second search result did not fill from the account it named. A row index means \
+             one thing in the candidate list and another in the results, and this is the \
+             mistake that types one account's password into another's login form"
+        );
+        assert_eq!(
+            *QUERIES.lock().unwrap(),
+            vec!["".to_string(), "north".to_string()],
+            "search mode must open on the unfiltered vault and refilter on the keystroke"
+        );
+        assert_eq!(PALETTES.load(Ordering::SeqCst), 1, "the *what should I type?* step was skipped");
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 1, "close runs once, on the way out");
+    }
+
+    /// **Asking to search closes nothing and answers no outcome.**
+    ///
+    /// The regression this guards is the one being removed: `Event::Search`
+    /// used to answer `Outcome::SearchVault`, which `main` spent the ~100 MB
+    /// egui vault window on -- to search a vault the daemon already holds in
+    /// memory, from a card that costs ~2 MB.
+    #[test]
+    fn asking_to_search_does_not_take_the_card_down() {
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        static CLOSED_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static SHOWN_ROWS: AtomicUsize = AtomicUsize::new(usize::MAX);
+        STEP.store(0, Ordering::SeqCst);
+        CLOSED_AT.store(usize::MAX, Ordering::SeqCst);
+        SHOWN_ROWS.store(usize::MAX, Ordering::SeqCst);
+
+        let calls = PickerCalls {
+            open: |_, _| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Search,
+                _ => Event::Cancel,
+            },
+            show_palette: |_, _| panic!("nothing was chosen"),
+            show_search: |_, results| {
+                SHOWN_ROWS.store(results.offers.len(), Ordering::SeqCst);
+                assert!(
+                    CLOSED_AT.load(Ordering::SeqCst) == usize::MAX,
+                    "the card was closed before it was asked to show search results"
+                );
+            },
+            close: |_| {
+                CLOSED_AT.store(STEP.load(Ordering::SeqCst), Ordering::SeqCst);
+            },
+        };
+        let outcome = run_with(&calls, &three(), "Slack.exe", no_search_palette, |_, _| {
+            SearchResults { offers: vec![found("id-1", "Slack")], total: 1 }
+        });
+        assert_eq!(
+            outcome,
+            Outcome::Cancelled,
+            "the only way out of search mode is the user leaving the card"
+        );
+        assert_eq!(
+            SHOWN_ROWS.load(Ordering::SeqCst),
+            1,
+            "the card was never handed the rows it asked for, so search mode showed nothing"
+        );
+    }
+
+    /// A result index the search did not produce fills nothing.
+    ///
+    /// The same rule `a_row_choice_on_an_empty_card_fills_nothing` holds for
+    /// the candidate list, and it matters more here: the results change on
+    /// every keystroke, so a stale click is a real race rather than a
+    /// hypothetical one.
+    #[test]
+    fn a_row_past_the_search_results_fills_nothing() {
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        STEP.store(0, Ordering::SeqCst);
+        let calls = PickerCalls {
+            open: |_, _| Some(PickerWindow(1)),
+            protect: |_| true,
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Search,
+                1 => Event::Chose(4),
+                _ => Event::Cancel,
+            },
+            show_palette: |_, _| panic!("there is no fifth result to show a palette for"),
+            show_search: |_, _| {},
+            close: |_| {},
+        };
+        assert_eq!(
+            run_with(&calls, &three(), "Slack.exe", no_search_palette, |_, _| SearchResults {
+                offers: vec![found("id-1", "Slack")],
+                total: 1,
+            }),
+            Outcome::Cancelled,
+            "a row index past the results fell through to the candidate slice, which would fill \
+             from an account the user never picked"
+        );
+    }
+
+    /// The palette lookup for tests that must never reach it: in search mode
+    /// the result carries its own, so a call here is a bug.
+    fn no_search_palette(_: &str) -> Palette {
+        panic!("a search result carries its own palette")
+    }
 
     // -----------------------------------------------------------------------
     // The keyboard shortcuts.
@@ -2903,12 +3901,16 @@ mod tests {
                     _ => Event::Sends(Send::Field(FieldRef::Password)),
                 },
                 show_palette: |_, _| {},
+                show_search: |_, _| {},
                 close: |_| {},
             };
-            let outcome = run_with(&calls, &three(), "Slack.exe", |_| Palette {
-                fields: vec![FieldRef::Password],
-                has_sequence: false,
-            });
+            let outcome = run_with(
+                &calls,
+                &three(),
+                "Slack.exe",
+                |_| Palette { fields: vec![FieldRef::Password], has_sequence: false },
+                no_search,
+            );
             assert_eq!(
                 outcome,
                 Outcome::Fill {
@@ -2950,13 +3952,17 @@ mod tests {
                 Event::Cancel
             },
             show_palette: |_, _| panic!("nothing was chosen, so nothing may be offered"),
+            show_search: |_, _| {},
             close: |_| {},
         };
         assert_eq!(
-            run_with(&calls, &three(), "Slack.exe", |_| Palette {
-                fields: vec![],
-                has_sequence: false
-            }),
+            run_with(
+                &calls,
+                &three(),
+                "Slack.exe",
+                |_| Palette { fields: vec![], has_sequence: false },
+                no_search,
+            ),
             Outcome::Cancelled
         );
     }
@@ -3146,12 +4152,16 @@ mod tests {
                 Event::Cancel
             },
             show_palette: |_, _| {},
+            show_search: |_, _| {},
             close: |_| {},
         };
-        let _ = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
-            fields: vec![],
-            has_sequence: false,
-        });
+        let _ = run_with(
+            &calls,
+            &one("Slack"),
+            "Slack.exe",
+            |_| Palette { fields: vec![], has_sequence: false },
+            no_search,
+        );
         assert!(
             PROTECTED_AT.load(Ordering::SeqCst) < PUMPED_AT.load(Ordering::SeqCst),
             "a window that can be typed into before it is excluded from capture is a window a \
@@ -3168,13 +4178,17 @@ mod tests {
             protect: |_| true,
             next: |_| Event::Closed,
             show_palette: |_, _| {},
+            show_search: |_, _| {},
             close: |_| CLOSED.store(true, Ordering::SeqCst),
         };
         assert_eq!(
-            run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
-                fields: vec![],
-                has_sequence: false
-            }),
+            run_with(
+                &calls,
+                &one("Slack"),
+                "Slack.exe",
+                |_| Palette { fields: vec![], has_sequence: false },
+                no_search,
+            ),
             Outcome::Cancelled
         );
         assert!(CLOSED.load(Ordering::SeqCst), "close runs on every exit path");
@@ -3187,13 +4201,17 @@ mod tests {
             protect: |_| true,
             next: |_| Event::Cancel,
             show_palette: |_, _| {},
+            show_search: |_, _| {},
             close: |_| {},
         };
         assert_eq!(
-            run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
-                fields: vec![],
-                has_sequence: false
-            }),
+            run_with(
+                &calls,
+                &one("Slack"),
+                "Slack.exe",
+                |_| Palette { fields: vec![], has_sequence: false },
+                no_search,
+            ),
             Outcome::Unavailable
         );
     }
@@ -3211,12 +4229,16 @@ mod tests {
                 _ => Event::Sends(Send::Field(FieldRef::Password)),
             },
             show_palette: |_, _| {},
+            show_search: |_, _| {},
             close: |_| CLOSED.store(true, Ordering::SeqCst),
         };
-        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |_| Palette {
-            fields: vec![FieldRef::Password],
-            has_sequence: false,
-        });
+        let outcome = run_with(
+            &calls,
+            &one("Slack"),
+            "Slack.exe",
+            |_| Palette { fields: vec![FieldRef::Password], has_sequence: false },
+            no_search,
+        );
         assert_eq!(
             outcome,
             Outcome::Fill { id: "id-1".to_string(), send: Send::Field(FieldRef::Password) }
@@ -3245,12 +4267,19 @@ mod tests {
                 *SHOWN_FIELDS.lock().unwrap() = palette.fields.clone();
                 SHOWN_HAS_SEQUENCE.store(palette.has_sequence as usize, Ordering::SeqCst);
             },
+            show_search: |_, _| {},
             close: |_| {},
         };
-        let outcome = run_with(&calls, &one("Slack"), "Slack.exe", |id| {
-            assert_eq!(id, "id-1");
-            Palette { fields: vec![FieldRef::Totp], has_sequence: true }
-        });
+        let outcome = run_with(
+            &calls,
+            &one("Slack"),
+            "Slack.exe",
+            |id| {
+                assert_eq!(id, "id-1");
+                Palette { fields: vec![FieldRef::Totp], has_sequence: true }
+            },
+            no_search,
+        );
         assert_eq!(outcome, Outcome::Cancelled);
         assert_eq!(*SHOWN_FIELDS.lock().unwrap(), vec![FieldRef::Totp]);
         assert_eq!(SHOWN_HAS_SEQUENCE.load(Ordering::SeqCst), 1);

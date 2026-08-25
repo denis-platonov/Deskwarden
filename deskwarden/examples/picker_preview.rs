@@ -27,6 +27,17 @@
 //! `CTRL+ALT+N` inside its own button. `Esc` cancels, as it always has. Any
 //! fixture shows them; `--full` shows the whole run of digits at once.
 //!
+//! **Search happens on this card.** Clicking *Search the vault* -- the last row
+//! of any populated card, or *Search vault* on the empty one -- switches the
+//! same window into its search mode: a focused text box between the subtitle
+//! and the list, and results drawn as rows by the same painter the candidates
+//! use. Picking one leads to the same *What should I type?* step. There is no
+//! second window and no egui anywhere on the path; the mode that used to answer
+//! this row opened the ~100 MB vault window to search a vault the daemon
+//! already held in memory. Any fixture reaches it -- the example's vault is
+//! `vault_fixture`, deliberately larger than the card's cap so the overflow
+//! notice is visible on an empty query.
+//!
 //! `--empty` shows the card's **empty mode**: the surface a user gets when
 //! nothing in the vault looks like the app they are in front of, which is by
 //! far the most common state this hotkey lands in. It is design 3a's content
@@ -179,14 +190,16 @@ fn main() {
                 protect: |_| true,
                 next: REAL.next,
                 show_palette: REAL.show_palette,
+                show_search: REAL.show_search,
                 close: REAL.close,
             },
             &offers.iter().map(|o| o.candidate.clone()).collect::<Vec<_>>(),
             APP_NAME,
             palette_of_fixture,
+            search_fixture_vault,
         )
     } else {
-        picker_prompt::ask(&offers, APP_NAME)
+        picker_prompt::ask(&offers, APP_NAME, search_fixture_vault)
     };
 
     match outcome {
@@ -195,11 +208,68 @@ fn main() {
             println!("would fill vault item {id} with: {label}");
         }
         Outcome::NewLogin => println!("new login"),
-        Outcome::SearchVault => println!("search vault"),
         Outcome::Edit(id) => println!("edit the binding for vault item {id}"),
         Outcome::Cancelled => println!("cancelled"),
         Outcome::Unavailable => println!("the window could not be opened"),
     }
+}
+
+/// **A made-up vault for the card's search mode**, wider than the candidate
+/// fixtures so the mode's own cap and its overflow notice are both reachable:
+/// an empty query matches all of these, which is more than
+/// `picker_prompt::SEARCH_CAP`, so the card opens the mode already saying how
+/// many it is not showing. Typing `north` narrows it to a handful; typing
+/// `zzz` shows the *No matches* row.
+fn vault_fixture() -> Vec<Offer> {
+    let login = || Palette {
+        fields: vec![FieldRef::Username, FieldRef::Password],
+        has_sequence: false,
+    };
+    let mut vault = fixtures();
+    for (i, name) in [
+        "Companies House",
+        "Fastmail",
+        "GitHub",
+        "Northwind Payroll",
+        "Post Office",
+        "Railcard",
+        "Stripe",
+        "Water board",
+    ]
+    .iter()
+    .enumerate()
+    {
+        vault.push(offer(
+            &format!("id-{}", 100 + i),
+            name,
+            "ada@example.com",
+            login(),
+        ));
+    }
+    vault
+}
+
+/// The example's [`picker_prompt::Searcher`].
+///
+/// A bare `fn` pointer, so it cannot close over the fixtures and rebuilds them
+/// -- which is what the shipped `app::search_parked_vault` does through its own
+/// parked slice. The predicate is the shipped one:
+/// `picker_ui::name_matches_filter`, the body of the vault window's own
+/// `item_matches_filter`, so this preview filters exactly as the daemon does.
+fn search_fixture_vault(query: &str, cap: usize) -> picker_prompt::SearchResults {
+    let filter = query.trim().to_lowercase();
+    let mut offers = Vec::new();
+    let mut total = 0usize;
+    for candidate in vault_fixture() {
+        if !deskwarden::picker_ui::name_matches_filter(&candidate.candidate.name, &filter) {
+            continue;
+        }
+        total += 1;
+        if offers.len() < cap {
+            offers.push(candidate);
+        }
+    }
+    picker_prompt::SearchResults { offers, total }
 }
 
 /// `run_with`'s palette argument is a bare `fn` pointer, so it cannot close

@@ -63,10 +63,29 @@ fn centered_position(width: f32, height: f32) -> [f32; 2] {
 /// Pure and separate from the UI so the search behaviour is testable without
 /// opening a window.
 pub fn item_matches_filter(item: &VaultItem, filter_lower: &str) -> bool {
+    name_matches_filter(&item.name, filter_lower)
+}
+
+/// **The rule itself**, over the one field it reads.
+///
+/// [`item_matches_filter`] is this function with a `VaultItem`'s name handed to
+/// it, and it is a wrapper rather than a second body on purpose: the account
+/// picker's in-card search (`crate::picker_prompt`'s search mode) filters rows
+/// that carry a name and a username and **no secret at all** -- there is no
+/// `VaultItem` on that surface to hand in, and the whole point of the seam it
+/// crosses is that there never will be. Two functions that each decided "does
+/// this match what was typed" would be two searches that start disagreeing the
+/// first time either is improved; one rule with two shapes cannot.
+///
+/// The filter arrives already lowercased for the reason above: a caller scans a
+/// vault in the thousands against one filter string per keystroke, so lowering
+/// it once outside the scan rather than once per item inside it is the
+/// difference between one allocation per keystroke and one per vault item.
+pub fn name_matches_filter(name: &str, filter_lower: &str) -> bool {
     if filter_lower.is_empty() {
         return true;
     }
-    item.name.to_lowercase().contains(filter_lower)
+    name.to_lowercase().contains(filter_lower)
 }
 
 /// A design-2a list row: icon (or, absent one, an initials avatar), primary

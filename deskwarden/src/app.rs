@@ -2542,9 +2542,14 @@ pub fn picker_follow_up(
         crate::picker_prompt::Outcome::Fill { id, send } => {
             NoMatchFollowUp::Fill { item_id: id, choice: picker_choice(&send) }
         }
-        crate::picker_prompt::Outcome::SearchVault => {
-            NoMatchFollowUp::SearchVault(search_query(app_name).to_string())
-        }
+        // **There is no `SearchVault` outcome any more, and that is the
+        // point.** Asking to search used to answer one, and `main` spent the
+        // ~100 MB egui vault window on it -- to search a vault this daemon
+        // already holds in memory, from a card that costs ~2 MB. The card now
+        // answers the request itself, in place, in its own search mode: see
+        // `picker_prompt::run_with`. Nothing routes out of the picker to that
+        // window for a search, so nothing here maps one.
+        //
         // *New login* opens the vault window at this app, which is the one
         // door `main` already has -- see `NoMatchFollowUp::SearchVault`. It is
         // deliberately NOT 3c's save-a-login form: that form is reached from
@@ -2582,13 +2587,119 @@ pub fn picker_follow_up(
 /// caller can put a window on screen. `handle_no_match` therefore never names
 /// `items()` at all, which is what `the_vault_snapshot_does_not_outlive_the_scan`
 /// pins.
+///
+/// **The search corpus is built here for the same reason and under the same
+/// bound.** The card's search mode filters the whole vault, not the
+/// candidates -- see [`search_parked_vault`] -- and the only place the whole
+/// vault exists is this snapshot. What leaves this function is
+/// [`crate::picker_prompt::Offer`]s either way: names, usernames, ids and
+/// field *presence*, and no secret. The plaintext still dies at the `}`.
 fn picker_offers_for(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
-) -> Vec<crate::picker_prompt::Offer> {
+) -> PickerCard {
     let items = cache.items();
     let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
-    picker_offers(&candidates, &items)
+    PickerCard { offers: picker_offers(&candidates, &items), corpus: picker_corpus(&items) }
+}
+
+/// What one press of the hotkey needs before a card can go up: the candidate
+/// rows, and the whole vault as rows the search mode can filter.
+///
+/// A named struct rather than a tuple so neither half can be handed to the
+/// wrong place: they are both `Vec<Offer>` and the compiler cannot tell them
+/// apart.
+struct PickerCard {
+    /// The accounts that look like this app. The card's first mode.
+    offers: Vec<crate::picker_prompt::Offer>,
+    /// **Every item in the vault**, in vault order, as search-mode rows.
+    corpus: Vec<crate::picker_prompt::Offer>,
+}
+
+/// The whole vault as picker rows: what search mode filters.
+///
+/// **No icons**, unlike [`picker_offers_in`]: an icon costs a read of the
+/// on-disk favicon cache, and a thousand of them at the moment the user presses
+/// a hotkey is a disk stall in front of a card that is supposed to appear
+/// instantly. The candidate rows -- at most `ROW_CAP` of them -- still carry
+/// theirs.
+///
+/// Items with no id are skipped for `app_candidates`' reason: there is nothing
+/// to fill from later, however well the row reads.
+fn picker_corpus(items: &[VaultItem]) -> Vec<crate::picker_prompt::Offer> {
+    items
+        .iter()
+        .filter(|item| !item.id.is_empty())
+        .map(|item| crate::picker_prompt::Offer {
+            candidate: crate::app_candidates::Candidate {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                username: item
+                    .login
+                    .as_ref()
+                    .and_then(|l| l.username.clone())
+                    .unwrap_or_default(),
+            },
+            palette: picker_palette(item),
+            icon: None,
+        })
+        .collect()
+}
+
+/// **The vault, as the account picker's search mode can see it.**
+///
+/// Parked by [`handle_no_match`] for the length of one card and cleared the
+/// moment it comes down. A static because
+/// [`crate::picker_prompt::Searcher`] is a bare `fn` pointer -- the crate's
+/// idiom for a seam a test must be able to stand in for -- and a `fn` pointer
+/// cannot close over a `&VaultCache`. This is the same shape
+/// `picker_prompt::OFFERS` already has for the same reason.
+///
+/// **It holds no secret.** Every element is an
+/// [`crate::picker_prompt::Offer`]: a `Candidate` (id, name, username) and a
+/// `Palette` (whether a field is present, never its value). The plaintext
+/// snapshot it was derived from died inside [`picker_offers_for`].
+static SEARCH_CORPUS: std::sync::Mutex<Vec<crate::picker_prompt::Offer>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// **The production [`crate::picker_prompt::Searcher`].**
+///
+/// One keystroke: lowercase the query once, scan the parked corpus, keep the
+/// first `cap` matches and count the rest.
+///
+/// **The predicate is `crate::picker_ui::name_matches_filter`**, which is the
+/// body of the vault window's own `item_matches_filter`. A second definition of
+/// "does this match what was typed" is how two searches start disagreeing, and
+/// this card's whole reason for existing is that it must answer the same
+/// question the vault window would.
+///
+/// # What a keystroke costs
+///
+/// One `to_lowercase` per candidate name -- 1,666 short allocations on the
+/// owner's vault -- plus a substring scan, and at most `cap` clones. That is
+/// tens to low hundreds of microseconds; the card's pump idles 8 ms between
+/// message batches, so the filter is far below the noise floor of the loop it
+/// runs in and nothing is debounced.
+fn search_parked_vault(query: &str, cap: usize) -> crate::picker_prompt::SearchResults {
+    let filter = query.trim().to_lowercase();
+    let Ok(corpus) = SEARCH_CORPUS.lock() else {
+        return crate::picker_prompt::SearchResults::default();
+    };
+    let mut offers = Vec::new();
+    let mut total = 0usize;
+    for offer in corpus.iter() {
+        if !crate::picker_ui::name_matches_filter(&offer.candidate.name, &filter) {
+            continue;
+        }
+        total += 1;
+        // **Counted before it is capped.** The card says how many matched, and
+        // a count that stopped at the cap would let it claim the cap was the
+        // whole answer.
+        if offers.len() < cap {
+            offers.push(offer.clone());
+        }
+    }
+    crate::picker_prompt::SearchResults { offers, total }
 }
 
 /// How long [`handle_no_match`] waits for the foreground app's version
@@ -2611,7 +2722,13 @@ pub fn handle_no_match(
     // `MatchEngine` on purpose -- see its module doc for why that is safe here
     // and would not be there -- and an empty answer leaves every line below
     // this one doing exactly what it did before.
-    let offers = picker_offers_for(cache, window);
+    let PickerCard { offers, corpus } = picker_offers_for(cache, window);
+    // **Parked for the card's search seam, and cleared when it comes down.**
+    // See `SEARCH_CORPUS`: no secret is in it, and a `fn` pointer cannot close
+    // over the cache it came from.
+    if let Ok(mut slot) = SEARCH_CORPUS.lock() {
+        *slot = corpus;
+    }
     let label = window_label(&window.exe_name, &window.title);
     // **The card says what the user calls the app, not what the file is
     // called.** `window_label` returns `Privado.exe` for a non-host process
@@ -2644,7 +2761,10 @@ pub fn handle_no_match(
         })
         .flatten();
     let card_name = friendly.as_deref().unwrap_or(label);
-    let outcome = crate::picker_prompt::ask(&offers, card_name);
+    let outcome = crate::picker_prompt::ask(&offers, card_name, search_parked_vault);
+    if let Ok(mut slot) = SEARCH_CORPUS.lock() {
+        slot.clear();
+    }
     // `card_name` is the friendly name only on the empty card, which is the
     // only card that shows one; on a populated card it is `window_label`'s
     // own string, so the line says *window* rather than claiming a display
@@ -2834,7 +2954,6 @@ pub fn describe_picker_outcome(outcome: &crate::picker_prompt::Outcome) -> Strin
             format!("fill vault item {id} with {}", crate::picker_prompt::describe_send(send))
         }
         crate::picker_prompt::Outcome::NewLogin => "a new login for this app".to_string(),
-        crate::picker_prompt::Outcome::SearchVault => "search the vault instead".to_string(),
         crate::picker_prompt::Outcome::Edit(id) => format!("edit the binding on vault item {id}"),
         crate::picker_prompt::Outcome::Cancelled => "dismissed".to_string(),
         crate::picker_prompt::Outcome::Unavailable => {
@@ -9136,8 +9255,14 @@ mod picker_wiring_tests {
         );
     }
 
-    /// The two silences are silences, and the three requests are the one door
+    /// The two silences are silences, and the two requests are the one door
     /// `main` already has.
+    ///
+    /// **Searching is no longer among them.** `Outcome::SearchVault` is gone:
+    /// the card answers a search request itself, in its own search mode, rather
+    /// than spending the ~100 MB vault window on a vault the daemon already
+    /// holds. *New login* and *Edit binding* still legitimately open that
+    /// window, and those are what is asserted here.
     #[test]
     fn every_other_picker_outcome_is_a_silence_or_the_vault_window() {
         assert_eq!(picker_follow_up(PickerOutcome::Cancelled, "Slack.exe"), NoMatchFollowUp::Nothing);
@@ -9147,14 +9272,10 @@ mod picker_wiring_tests {
             "a card that could not be put on screen types nothing and opens nothing"
         );
         assert_eq!(
-            picker_follow_up(PickerOutcome::SearchVault, "Slack.exe"),
+            picker_follow_up(PickerOutcome::NewLogin, "Slack.exe"),
             NoMatchFollowUp::SearchVault("Slack".to_string()),
             "the `.exe` is stripped, because the vault's items are not called `Slack.exe` -- \
              the same `search_query` the no-match card's own button goes through"
-        );
-        assert_eq!(
-            picker_follow_up(PickerOutcome::NewLogin, "Slack.exe"),
-            NoMatchFollowUp::SearchVault("Slack".to_string())
         );
         assert_eq!(
             picker_follow_up(PickerOutcome::Edit("id-9".to_string()), "Slack.exe"),
@@ -9162,6 +9283,103 @@ mod picker_wiring_tests {
             "editing a binding is about the ITEM the user chose, not about the app the card was \
              shown over"
         );
+    }
+
+    /// **The card's search reaches the vault, and nothing else crosses.**
+    ///
+    /// The corpus is what makes search-in-the-card possible at all, and the
+    /// two things worth holding about it are the two that could go wrong
+    /// quietly: it must carry no secret, and it must filter by the *same* rule
+    /// the vault window's own search box uses.
+    #[test]
+    fn the_search_corpus_carries_names_and_never_a_password() {
+        let items: Vec<VaultItem> = ["Northwind VPN", "Northwind Payroll", "Slack"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                serde_json::from_str::<VaultItem>(&format!(
+                    r#"{{"id":"id-{i}","name":"{name}","type":1,"login":{{"username":"ada@example.com","password":"hunter2-{i}"}}}}"#
+                ))
+                .expect("the fixture item is valid")
+            })
+            .collect();
+        // An item with no id is not a row: there would be nothing to fill from.
+        let mut items = items;
+        items.push(
+            serde_json::from_str::<VaultItem>(r#"{"id":"","name":"Northwind orphan","type":1}"#)
+                .expect("the fixture item is valid"),
+        );
+
+        let corpus = picker_corpus(&items);
+        assert_eq!(corpus.len(), 3, "an item with no id became a row nothing could fill from");
+        // The whole surface of a row, spelled out: a password reaching it is
+        // a password on a card, in a static, for as long as the user looks at
+        // it -- and `Offer` is the type whose whole promise is that it cannot.
+        let printed = format!("{corpus:?}");
+        for i in 0..3 {
+            assert!(
+                !printed.contains(&format!("hunter2-{i}")),
+                "a plaintext password reached the account picker's search corpus"
+            );
+        }
+        assert!(printed.contains("ada@example.com"), "control: the rows do carry the username");
+
+        // And the palettes are real: a search result leads to the *what should
+        // I type?* step, which is built from these.
+        assert!(
+            corpus[0].palette.fields.contains(&FieldRef::Password),
+            "a search result offers no fields, so picking one would show an empty second step"
+        );
+    }
+
+    /// **One rule, two searches.**
+    ///
+    /// The card's search and the vault window's search must answer the same
+    /// question, and they do it by being the same predicate rather than two
+    /// that agree today.
+    #[test]
+    fn the_cards_search_filters_by_the_vault_windows_own_rule() {
+        let items: Vec<VaultItem> = ["Northwind VPN", "Northwind Payroll", "Slack"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                serde_json::from_str::<VaultItem>(&format!(
+                    r#"{{"id":"id-{i}","name":"{name}","type":1}}"#
+                ))
+                .expect("the fixture item is valid")
+            })
+            .collect();
+        *SEARCH_CORPUS.lock().unwrap() = picker_corpus(&items);
+
+        let found = search_parked_vault("north", 5);
+        assert_eq!(found.total, 2, "case-insensitive substring of the name is the rule");
+        assert_eq!(found.offers.len(), 2);
+        for offer in &found.offers {
+            assert!(
+                crate::picker_ui::item_matches_filter(
+                    items
+                        .iter()
+                        .find(|item| item.id == offer.candidate.id)
+                        .expect("the row came from these items"),
+                    "north"
+                ),
+                "the card returned a row the vault window's own filter would have rejected"
+            );
+        }
+
+        // **The count is taken before the cap**, so the card can say how many
+        // it is not showing rather than claiming the cap was the answer.
+        let capped = search_parked_vault("", 1);
+        assert_eq!(capped.offers.len(), 1);
+        assert_eq!(
+            capped.total, 3,
+            "the total stopped at the cap, so the card's overflow row would report the cap back \
+             to the user as the whole answer -- a cap that hides matches without saying so"
+        );
+
+        // Nothing parked is no rows, not stale rows from the last card.
+        SEARCH_CORPUS.lock().unwrap().clear();
+        assert_eq!(search_parked_vault("north", 5), crate::picker_prompt::SearchResults::default());
     }
 
     /// **A picked fill never opens a window on its way out**, which is the
@@ -9377,7 +9595,7 @@ mod picker_wiring_tests {
         );
 
         assert!(
-            body.contains(concat!("picker_prompt::", "ask(&offers, card_name)")),
+            body.contains(concat!("picker_prompt::", "ask(&offers, card_name, ")),
             "`handle_no_match` no longer hands `picker_prompt::ask` the name it computed for \r
              the card. `card_name`, `label` and `window.exe_name` are all `&str`, so any swap \r
              compiles -- and `empty_text` builds the whole of the card's message out of that \r

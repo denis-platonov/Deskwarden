@@ -23772,8 +23772,14 @@ mod tests {
                 _cache: &VaultCache,
                 window: &window_watch::ForegroundEvent,
             ) -> NoMatchFollowUp {
+                // **`NewLogin`, because `SearchVault` no longer exists.** The
+                // card answers a search request in its own search mode now --
+                // it does not leave the card, so no outcome carries one out of
+                // the picker at all. *New login* is what still asks `main` for
+                // the vault window, through the same `search_query` mapping,
+                // so this stub is still the card's door onto that window.
                 deskwarden::app::picker_follow_up(
-                    deskwarden::picker_prompt::Outcome::SearchVault,
+                    deskwarden::picker_prompt::Outcome::NewLogin,
                     deskwarden::app::window_label(&window.exe_name, &window.title),
                 )
             }
