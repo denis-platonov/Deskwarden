@@ -2065,9 +2065,20 @@ mod win32 {
                     .map(|text| (text, fonts.hint));
                     let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                     if focused {
+                        // **The ring is given LOGICAL size, from `layout`.**
+                        // `rounded` scales everything it is handed, and `rc`
+                        // came back from `GetClientRect` in device pixels
+                        // already: passing it drew the ring at 1.5x the
+                        // control at 150%, running past the client area and
+                        // being clipped -- losing exactly the rounded corners
+                        // the ring exists to draw. `layout` knows the button's
+                        // logical size independently, so nothing has to divide
+                        // device pixels back down and round badly doing it.
+                        let l = super::layout(laid_out_rows());
+                        let button = if id == ID_CANCEL { l.cancel } else { l.secondary };
                         rounded(
                             mem,
-                            Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom },
+                            Box2 { x: 0, y: 0, w: button.w, h: button.h },
                             8,
                             crate::theme::FOCUS_RING,
                             None,
@@ -3243,5 +3254,174 @@ mod tests {
         assert_eq!(outcome, Outcome::Cancelled);
         assert_eq!(*SHOWN_FIELDS.lock().unwrap(), vec![FieldRef::Totp]);
         assert_eq!(SHOWN_HAS_SEQUENCE.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// **No `GetClientRect`-derived value reaches a scaling helper.**
+///
+/// The `win32` submodule's convention is that a [`Box2`] is LOGICAL -- `rounded`
+/// and `text` scale every coordinate they are handed -- while a `RECT` in that
+/// module is device pixels, because that is what `GetClientRect` returns and
+/// what `fill`, `draw_row` and `draw_button_with_shortcut` want. The focus ring
+/// on the footer buttons was built as a `Box2` out of a `GetClientRect` `RECT`,
+/// so it was scaled twice: at 150% it was drawn half again the size of the
+/// control, clipped by the client area, and lost the rounded corners it exists
+/// to draw.
+///
+/// No test can open the real window and this crate does not fake `scale()`, so
+/// what is pinned is what is decidable: this file's own source, in the crate's
+/// established shape ([`crate::unlock_prompt`]'s `no_thread_quit_pin`,
+/// [`crate::job_object`]'s scanners). Every `Box2` literal in the code that
+/// SHIPS is checked to mention none of the device-pixel names that the paint
+/// functions bind `GetClientRect` output to.
+///
+/// **Normalised first.** This is a CRLF checkout with no `.gitattributes`;
+/// slicing lines without trimming the carriage return makes the cut a no-op and
+/// the whole pin vacuous. The control tests below are what prove it did not
+/// silently scan nothing, or the wrong half.
+#[cfg(test)]
+mod no_device_pixels_in_a_logical_box_pin {
+    /// The names the paint functions bind device-pixel rectangles to: `rc` and
+    /// `client` straight out of `GetClientRect`, and `whole`, which is built
+    /// from `rc`. Split across two literals apiece, on one line, in this
+    /// crate's idiom: `include_str!` pulls this module in too.
+    const DEVICE: [&str; 3] = [concat!("r", "c."), concat!("who", "le."), concat!("clie", "nt.")];
+    const LOGICAL_LITERAL: &str = concat!("Box", "2 {");
+
+    /// `source` with CRLF normalised, every top-level `#[cfg(test)]` module
+    /// removed, and every `//` comment stripped.
+    ///
+    /// The module cut is line-based and anchored at column zero: a
+    /// `#[cfg(test)]` on its own unindented line, up to and including the next
+    /// unindented `}`. Every gated module in this file has that shape, and
+    /// `the_cut_really_discards_something` checks that rather than assuming it.
+    fn production_only(source: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in source.lines() {
+            let flat = line.trim_end();
+            if !skipping && flat == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if flat == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            // Comments only. A `//` inside a string literal would be cut too,
+            // but cutting too much can only make the scan MISS a literal, never
+            // invent one -- and the comment above the ring names `rc` on
+            // purpose, to explain what it must not be given.
+            let code = match flat.find("//") {
+                Some(at) => &flat[..at],
+                None => flat,
+            };
+            out.push_str(code);
+            out.push('\n');
+        }
+        assert!(!skipping, "a gated module never closed at column zero; the cut is unreliable");
+        out
+    }
+
+    fn source() -> String {
+        production_only(include_str!("picker_prompt.rs"))
+    }
+
+    /// Every `Box2 { .. }` literal in `code`, as the text between the brace
+    /// pair. These literals are flat -- no nested braces anywhere in this file
+    /// -- so the first `}` closes the one that was opened.
+    fn logical_literals(code: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = code;
+        while let Some(at) = rest.find(LOGICAL_LITERAL) {
+            let body = &rest[at + LOGICAL_LITERAL.len()..];
+            let end = body.find('}').expect("a `Box2 {` literal never closed");
+            found.push(body[..end].to_string());
+            rest = &body[end..];
+        }
+        found
+    }
+
+    /// Control: the cut discarded something, and this module with it.
+    #[test]
+    fn the_cut_really_discards_something() {
+        let whole_file = include_str!("picker_prompt.rs");
+        let kept = source();
+        assert!(!kept.is_empty(), "the cut kept nothing at all; the pin would be vacuous");
+        assert!(
+            kept.len() < whole_file.len(),
+            "the cut discarded nothing, so the gated modules -- including this one, which \
+             names the device-pixel bindings -- are still being scanned"
+        );
+        assert!(
+            !kept.contains("mod no_device_pixels_in_a_logical_box_pin"),
+            "this pin's own module survived the cut, so it would scan itself"
+        );
+    }
+
+    /// Control: the half that was KEPT is the painting half.
+    #[test]
+    fn the_kept_half_still_contains_the_paint_functions() {
+        let kept = source();
+        assert!(
+            kept.contains("fn paint_control"),
+            "the kept half no longer contains `paint_control`, so the pin is not scanning \
+             the code it exists to guard"
+        );
+        assert!(
+            kept.contains("fn rounded"),
+            "the kept half no longer contains `rounded`, the helper that does the scaling"
+        );
+    }
+
+    /// Control: the scan finds the literals that are really there, including
+    /// the ring's own.
+    #[test]
+    fn the_scan_finds_the_literals_it_is_meant_to_read() {
+        let found = logical_literals(&source());
+        assert!(
+            found.len() >= 8,
+            "only {} logical literals found in the shipping code; `layout` alone writes more \
+             than that, so the scanner is not reading this file",
+            found.len()
+        );
+        assert!(
+            found.iter().any(|body| body.contains("button.w")),
+            "the focus ring's own literal was not among those scanned"
+        );
+    }
+
+    /// Control: the scan would notice a device value if one were there.
+    #[test]
+    fn the_scan_would_notice_a_device_value() {
+        let planted = production_only(&format!(
+            "    {LOGICAL_LITERAL} x: 0, y: 0, w: rc.right, h: rc.bottom }}\n"
+        ));
+        let bodies = logical_literals(&planted);
+        assert_eq!(bodies.len(), 1, "the scanner did not read the planted literal");
+        assert!(
+            DEVICE.iter().any(|name| bodies[0].contains(name)),
+            "the scanner cannot see a device-pixel value that is present"
+        );
+    }
+
+    #[test]
+    fn no_logical_box_is_built_out_of_device_pixels() {
+        for body in logical_literals(&source()) {
+            for name in DEVICE {
+                assert!(
+                    !body.contains(name),
+                    "a `Box2` -- which every helper in the `win32` submodule scales itself -- \
+                     is built out of `{name}`, which is already device pixels from \
+                     `GetClientRect`. It will be scaled a second time: at 150% it is drawn \
+                     half again the size of the control, clipped by the client area, and the \
+                     rounded corners it exists to draw are the first thing lost. The logical \
+                     size is known from `layout()` without dividing device pixels back down. \
+                     The offending literal was: `{body}`"
+                );
+            }
+        }
     }
 }
