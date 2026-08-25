@@ -65,10 +65,11 @@
 //!   for want of a route, and warned that faking one with an edit that sets
 //!   the server-assigned `archivedDate` would report success for a write the
 //!   server ignores. They now use real endpoints in [`crate::rest::api`] --
-//!   Bitwarden's **bulk** routes, sent a batch of one to fit the per-id
-//!   signature -- and the bulk answer is *read back*, because a bulk `200`
-//!   covers the request and not each id inside it. An id the server does not
-//!   report as archived is an error, not an `Ok`.
+//!   `PUT /api/ciphers/{id}/archive` and `.../unarchive`, the per-id routes
+//!   the target server actually implements -- and the cipher the server
+//!   echoes back is *read*, because that stamp is server-assigned and no
+//!   status can report it. A cipher the server does not return archived is an
+//!   error, not an `Ok`.
 //! * [`RestBackend::generate`] refused because there is no endpoint anywhere
 //!   and implementing it meant this crate deciding how strong its passwords
 //!   are. That decision was taken, and it was taken **outside this module**:
@@ -88,11 +89,14 @@
 //!   partial opinion about a change already made.
 //!
 //! The one place the six do **not** agree with each other is what an empty
-//! response body means, and that disagreement is deliberate: it is
-//! [`RestError::BulkIdMissing`] for the archive routes, whose body is their
-//! only per-id evidence, and success for `delete_folder`, whose id is in the
-//! path and whose status is therefore already the answer about that id. Both
-//! sides of it are argued in [`crate::rest::api::RestClient::delete_folder`].
+//! response body means, and that disagreement is deliberate. Every one of
+//! these routes is path-scoped, so the shape of the URL is not what separates
+//! them -- what each call *asserts* is. An archive asserts the value of a
+//! server-assigned `archivedDate`, which only a body can carry, so an empty
+//! one is [`RestError::ArchiveNotConfirmed`]. A `delete_folder` asserts that
+//! a folder is gone, which the status already says, so an empty body is
+//! success. Both sides of it are argued in
+//! [`crate::rest::api::RestClient::delete_folder`].
 
 use std::sync::Mutex;
 
@@ -596,7 +600,7 @@ impl VaultBackend for RestBackend {
         Ok(vault.items.iter().filter(|d| is_archived(&d.item)).map(|d| d.item.clone()).collect())
     }
 
-    /// **Cost: one `PUT /api/ciphers/archive`. No sync.**
+    /// **Cost: one `PUT /api/ciphers/{id}/archive`. No sync.**
     ///
     /// # This was a refusal, and what changed is the route, not the argument
     ///
@@ -609,24 +613,28 @@ impl VaultBackend for RestBackend {
     ///   That field is server-assigned; a full-replace `PUT` carrying one is
     ///   at best ignored, which returns `Ok` on an item that stayed exactly
     ///   where it was. Nothing below goes near [`Self::update_item`].
-    /// * **A bulk call read only for its status is the same defect wearing a
-    ///   real route.** A bulk endpoint answers `200` for the request, not for
-    ///   each id in it. [`crate::rest::api::RestClient::bulk_archive`] is
-    ///   therefore written to read the answer back and to fail with
-    ///   [`crate::rest::api::RestError::BulkIdMissing`] when the id it sent is
-    ///   not reported as archived -- and it judges that by `archivedDate`,
-    ///   the very field [`Self::list_archive`] filters on, so this method and
-    ///   that one cannot come to disagree about what "archived" means.
+    /// * **A call read only for its status is the same defect wearing a real
+    ///   route.** `archivedDate` is assigned by the server, so a `200` says
+    ///   the request was accepted and not that the stamp was written.
+    ///   [`crate::rest::api::RestClient::archive_route`] is therefore written
+    ///   to read the echoed cipher back and to fail with
+    ///   [`crate::rest::api::RestError::ArchiveNotConfirmed`] when it does not
+    ///   show the state that was asked for -- and it judges that by
+    ///   `archivedDate`, the very field [`Self::list_archive`] filters on, so
+    ///   this method and that one cannot come to disagree about what
+    ///   "archived" means.
     ///
-    /// The per-id signature is met by sending a **batch of one**, which is a
-    /// legal use of the route rather than a workaround; see that function for
-    /// the whole of it.
+    /// The per-id signature is met by a per-id route, which is what the
+    /// target server has: it puts the id in the path exactly as trash and
+    /// restore do, and answers with the whole updated cipher. See that
+    /// function for the whole of it, including why the earlier **bulk**
+    /// spelling was a `404` against NodeWarden.
     fn archive_item(&self, id: &str) -> Result<(), VaultError> {
         let mut state = self.locked();
         self.client.archive_cipher(&mut state.session, id).map_err(rest_error)
     }
 
-    /// **Cost: one `PUT /api/ciphers/unarchive`. No sync.**
+    /// **Cost: one `PUT /api/ciphers/{id}/unarchive`. No sync.**
     ///
     /// A route of its own, and it has to be: the two backends do not even
     /// *shape* this the same way. `bw serve` has no unarchive route and
@@ -1443,38 +1451,37 @@ mod tests {
     ///
     /// Three things at once, because they are one behaviour:
     ///
-    /// 1. The per-id trait call reaches the **bulk** route with a body of
-    ///    exactly one id -- asserted on the wire, not inferred.
-    ///    `mockito::Matcher::Json` pins the whole body, so a second id, a
-    ///    differently spelled key or a bare string instead of a list all fail.
-    /// 2. It is a route of its own and **not** an edit: `expect(0)` on the
-    ///    item's `PUT` is what says the forbidden `archivedDate` fake was not
-    ///    taken instead.
+    /// 1. The per-id trait call reaches the **per-id** route, with the id in
+    ///    the path and no body at all -- asserted on the wire, not inferred.
+    ///    `match_body("")` is what says the old bulk `{"ids": [...]}` is gone;
+    ///    the path is what says the request goes where NodeWarden's routing
+    ///    table actually has a handler.
+    /// 2. It is a route of its own and **not** an edit: the item's plain
+    ///    `PUT` never being hit is what says the forbidden `archivedDate`
+    ///    fake was not taken instead.
     /// 3. Archive and unarchive are **different** routes, so the second
     ///    cannot quietly be `restore`.
     #[test]
-    fn an_archive_sends_a_batch_of_one_and_reads_the_answer_back() {
+    fn an_archive_reaches_the_per_id_route_and_reads_the_answer_back() {
         let (mut server, backend) = logged_in();
         let archive = server
-            .mock("PUT", "/api/ciphers/archive")
+            .mock("PUT", "/api/ciphers/live-1/archive")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": ["live-1"] })))
+            .match_body("")
             .with_body(
-                r#"{"object":"list","data":[
-                    {"object":"cipher","id":"live-1",
-                     "archivedDate":"2022-03-01T00:00:00.000000Z"}]}"#,
+                r#"{"object":"cipher","id":"live-1",
+                    "archivedDate":"2022-03-01T00:00:00.000000Z"}"#,
             )
             .expect(1)
             .create();
         let unarchive = server
-            .mock("PUT", "/api/ciphers/unarchive")
-            .match_body(mockito::Matcher::Json(serde_json::json!({ "ids": ["arch-1"] })))
-            .with_body(
-                r#"{"object":"list","data":[
-                    {"object":"cipher","id":"arch-1","archivedDate":null}]}"#,
-            )
+            .mock("PUT", "/api/ciphers/arch-1/unarchive")
+            .match_body("")
+            .with_body(r#"{"object":"cipher","id":"arch-1","archivedDate":null}"#)
             .expect(1)
             .create();
+        // The bulk route the client used to send, which nothing may reach now.
+        let bulk = server.mock("PUT", "/api/ciphers/archive").with_status(200).create();
         // The edit route, which an archive must never reach.
         // No `expect(0)`: mockito's `matched()` reports whether the expected
         // hit count was *met*, so an `expect(0)` mock reads as matched when it
@@ -1489,33 +1496,34 @@ mod tests {
         archive.assert();
         unarchive.assert();
         assert!(!edit.matched(), "an archive was expressed as an edit setting `archivedDate`");
+        assert!(!bulk.matched(), "an archive still reached the bulk route");
     }
 
     /// **The whole reason this stopped being a refusal safely.**
     ///
-    /// A bulk endpoint's `200` covers the request, not each id inside it, so
-    /// a server can accept the call and decline the one id that was sent.
-    /// Every shape of that must be an error; an `Ok` here is the "reports
-    /// success while doing nothing" failure the refusal existed to prevent,
-    /// and it would be worse arriving through a real route than through a
-    /// fake one, because it would look correct.
+    /// `archivedDate` is assigned by the **server**, so a `200` says the
+    /// request was accepted and not that the stamp was written. Every shape
+    /// of an accepted-but-unconfirmed answer must be an error; an `Ok` here
+    /// is the "reports success while doing nothing" failure the refusal
+    /// existed to prevent, and it would be worse arriving through a real
+    /// route than through a fake one, because it would look correct.
     ///
-    /// Four shapes, all answered `200`: a list with a different id, an empty
-    /// list, an id echoed back in the **wrong state** (archived asked for,
-    /// nothing stamped), and a body that is not a list at all and therefore
-    /// cannot report per-item success either.
+    /// Four shapes, all answered `200`: a cipher that is someone else, a
+    /// cipher with no id at all, the right cipher in the **wrong state**
+    /// (archived asked for, nothing stamped), and a body that is not a cipher
+    /// and therefore cannot report the state either.
     #[test]
-    fn a_bulk_archive_that_did_not_move_this_id_is_an_error_and_never_ok() {
+    fn an_archive_that_did_not_move_this_id_is_an_error_and_never_ok() {
         let bodies = [
-            ("another id", r#"{"object":"list","data":[{"id":"someone-else"}]}"#),
-            ("an empty list", r#"{"object":"list","data":[]}"#),
-            ("the wrong state", r#"{"object":"list","data":[{"id":"live-1","archivedDate":null}]}"#),
-            ("no list at all", r#"{"object":"cipher","id":"live-1"}"#),
+            ("another id", r#"{"object":"cipher","id":"someone-else"}"#),
+            ("no id at all", r#"{"object":"cipher","archivedDate":"2022-03-01T00:00:00.000000Z"}"#),
+            ("the wrong state", r#"{"object":"cipher","id":"live-1","archivedDate":null}"#),
+            ("no cipher at all", "null"),
         ];
         for (what, body) in bodies {
             let (mut server, backend) = logged_in();
             server
-                .mock("PUT", "/api/ciphers/archive")
+                .mock("PUT", "/api/ciphers/live-1/archive")
                 .with_status(200)
                 .with_body(body)
                 .expect(1)
@@ -1538,10 +1546,10 @@ mod tests {
     fn an_unarchive_whose_item_is_still_stamped_is_an_error() {
         let (mut server, backend) = logged_in();
         server
-            .mock("PUT", "/api/ciphers/unarchive")
+            .mock("PUT", "/api/ciphers/arch-1/unarchive")
             .with_body(
-                r#"{"object":"list","data":[
-                    {"id":"arch-1","archivedDate":"2022-02-01T00:00:00.000000Z"}]}"#,
+                r#"{"object":"cipher","id":"arch-1",
+                    "archivedDate":"2022-02-01T00:00:00.000000Z"}"#,
             )
             .expect(1)
             .create();
@@ -1564,8 +1572,11 @@ mod tests {
             .create();
         // No `/api/sync` mock at all: a sync would be a connection refused.
         server
-            .mock("PUT", "/api/ciphers/archive")
-            .with_body(r#"{"data":[{"id":"live-1","archivedDate":"2022-03-01T00:00:00.000000Z"}]}"#)
+            .mock("PUT", "/api/ciphers/live-1/archive")
+            .with_body(
+                r#"{"object":"cipher","id":"live-1",
+                    "archivedDate":"2022-03-01T00:00:00.000000Z"}"#,
+            )
             .expect(1)
             .create();
         let client = RestClient::new(server.url());
@@ -1590,8 +1601,8 @@ mod tests {
         let ids = archived.into_iter().map(|i| i.id).collect::<Vec<_>>();
         assert_eq!(ids, vec!["arch-1"], "the reader's idea of archived changed");
         server
-            .mock("PUT", "/api/ciphers/unarchive")
-            .with_body(r#"{"data":[{"id":"arch-1","archivedDate":null}]}"#)
+            .mock("PUT", "/api/ciphers/arch-1/unarchive")
+            .with_body(r#"{"object":"cipher","id":"arch-1","archivedDate":null}"#)
             .create();
         backend.unarchive_item("arch-1").expect("an unstamped echo is the success case");
     }
