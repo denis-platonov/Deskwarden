@@ -240,15 +240,19 @@ jobs:
           $parts += ""
           $parts += "---"
           $parts += ""
-          $parts += "**Note:** this build is unsigned. SignPath code-signing"
-          $parts += "integration is pending manual account approval; see"
-          $parts += "docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md."
-          $parts += ""
-          $parts += "Deskwarden's in-app updater verifies the installer it downloads"
-          $parts += "against the SHA-256 digest GitHub publishes for the asset, and"
-          $parts += "refuses to run it on any mismatch. That checks the bytes, not the"
-          $parts += "publisher -- it is not equivalent to a signed build. See"
-          $parts += "docs/code-signing-policy.md."
+          # ONE line, and last. It is a standing fact about every build rather
+          # than news about this one, and it used to be five lines under a
+          # rule -- which on a short release body was most of the panel. The
+          # detail it used to spell out lives in `docs/code-signing-policy.md`,
+          # which the line points at.
+          #
+          # NOT wrapped in emphasis. The panel's parser reads a link inside an
+          # emphasis run only when the run is NOTHING BUT that link, so
+          # `_words [link](url) words_` paints its own square brackets -- the
+          # defect this line is being shortened to stop causing.
+          $parts += ("This build is unsigned; the updater checks the installer's SHA-256 " +
+            "against the digest GitHub publishes. [Code-signing policy]" +
+            "($env:REPO_URL/blob/$env:REF_NAME/docs/code-signing-policy.md)")
 
           # UTF-8 without a BOM: the changelog has em dashes and a `⋮` in its
           # headings, and a BOM would arrive as stray characters at the head
