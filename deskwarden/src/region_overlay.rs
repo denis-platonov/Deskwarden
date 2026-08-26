@@ -1304,7 +1304,7 @@ mod tests {
     fn the_title_is_this_window_alone() {
         assert_ne!(REGION_TITLE, crate::vault_window::WINDOW_TITLE);
         assert_ne!(REGION_TITLE, crate::vault_window::rehearsal::SCRATCH_TITLE);
-        assert_ne!(REGION_TITLE, crate::preflight_host::PREFLIGHT_TITLE);
+        assert_ne!(REGION_TITLE, crate::preflight_card::PREFLIGHT_CARD_TITLE);
         assert!(!REGION_TITLE.is_empty());
     }
 }

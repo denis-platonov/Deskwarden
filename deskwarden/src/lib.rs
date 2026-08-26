@@ -11,6 +11,7 @@
 
 pub mod accounts;
 pub mod app;
+pub mod app_candidates;
 pub mod app_identity;
 pub mod app_match;
 /// The named Windows mutex the installer looks for before replacing this
@@ -52,6 +53,7 @@ pub mod favicon;
 pub mod file_picker;
 pub mod fill_stats;
 pub mod foreground;
+pub mod generate_prompt;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;
@@ -64,20 +66,26 @@ pub mod loading_ui;
 /// the user is reading. Store UTC, display local, never print "UTC".
 pub mod local_time;
 pub mod logging;
+/// Design 3b: the locked-vault card, in bare Win32.
+pub mod locked_card;
 pub mod login_ui;
 pub mod match_engine;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
 pub mod otpauth;
-pub mod overlay_ui;
 /// This crate's own password generator -- the one vault operation no server
 /// has an endpoint for. Beside the backends rather than inside one, because
 /// every backend that is not `bw serve` needs it. Passphrases are refused by
 /// name until a wordlist is a decision the owner has taken.
 pub mod password_gen;
 pub mod password_strength;
+pub mod picker_prompt;
 pub mod picker_ui;
-pub mod preflight_host;
+/// Design 4b: the send preflight, in bare Win32. **The card that took the
+/// daemon's fill path to zero GL contexts** -- see the module doc.
+pub mod preflight_card;
 pub mod prefs_ui;
+/// Design 2a: the matched-item autofill prompt, in bare Win32.
+pub mod prompt_card;
 pub mod qr;
 pub mod record;
 /// The 6b dimmed full-screen surface a QR code is dragged out of. **At the
@@ -94,6 +102,7 @@ pub mod reprompt;
 pub mod rest;
 /// `scan_history.json`: what the last twenty breach scans counted. Counts and
 /// timestamps only -- never a password, an item, or anything derived from one.
+pub mod save_login_card;
 pub mod scan_history;
 pub mod scratch_window;
 /// Copies one rectangle of the screen into a self-wiping buffer of pixels.
@@ -118,20 +127,26 @@ pub mod updater;
 /// password without launching the app. Opens a window and never a GL context,
 /// which is the whole point -- see the module doc.
 pub mod unlock_prompt;
+/// The daemon/UI process boundary: what goes out on a `--ui` command line
+/// (a mode and a surface, never a secret) and what comes back (a small
+/// non-secret result file, plus the exit code that carries `locked` even if
+/// the file is lost).
+pub mod ui_process;
 /// One account's master key and refresh token, DPAPI-wrapped, at a path its
 /// caller chooses -- `session_store`'s idiom applied to a stronger secret.
-/// Only the direct-REST backend needs it, so nothing in the running app
-/// writes one yet; see its own docs for what a caller owes the user when a
-/// stored record stops working.
+/// See its own docs for what a caller owes the user when a stored record
+/// stops working.
 pub mod user_key_store;
 /// The seam between the app and whatever is holding the vault: the twenty
-/// vault operations as a trait, implemented today only by `bw serve`'s
-/// client. Nothing about what any call does over the wire lives here.
+/// vault operations as a trait, implemented by `bw serve`'s client and by
+/// the direct-REST backend. Nothing about what any call does over the wire
+/// lives here.
 pub mod vault_backend;
 pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;
 pub mod vault_export;
 pub mod vault_window;
+pub mod win32_draw;
 pub mod window_list;
 pub mod window_watch;

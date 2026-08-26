@@ -12,7 +12,7 @@
 //   2. Open the process picker window (Task 11 `run_picker`). Pick a running
 //      process, choose a trigger mode, and click Save. Confirm the picker
 //      window closes and prints the saved AppMatch.
-//   3. Open the prompt overlay window (Task 11 `show_prompt_overlay`) twice:
+//   3. Open the autofill prompt card (`prompt_card::show_prompt_card`) twice:
 //      once to click Fill (should print `true`), once to click Dismiss
 //      (should print `false`).
 //
@@ -20,7 +20,8 @@
 //   bw list items --search <item name>
 // and check the `deskwarden:app-match` custom field is present.
 
-use deskwarden::overlay_ui::{show_prompt_overlay, OverlayMatch};
+use deskwarden::prompt_card::OverlayMatch;
+use deskwarden::prompt_card::show_prompt_card;
 use deskwarden::picker_ui::run_picker;
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::vault_cache::{PopulateOutcome, VaultCache};
@@ -78,10 +79,10 @@ fn main() {
     };
 
     println!("Opening overlay window -- click the row (or press Enter) this time...");
-    let filled = show_prompt_overlay("Test App", Some(&matched), None, &[]);
-    println!("show_prompt_overlay returned: {filled:?}");
+    let filled = show_prompt_card("Test App", Some(&matched), None, &[]);
+    println!("show_prompt_card returned: {filled:?}");
 
     println!("Opening overlay window again -- press Esc this time...");
-    let filled_again = show_prompt_overlay("Test App", Some(&matched), None, &[]);
-    println!("show_prompt_overlay returned: {filled_again:?}");
+    let filled_again = show_prompt_card("Test App", Some(&matched), None, &[]);
+    println!("show_prompt_card returned: {filled_again:?}");
 }

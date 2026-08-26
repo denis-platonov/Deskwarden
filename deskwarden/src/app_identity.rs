@@ -375,6 +375,41 @@ impl AppIdentityCache {
     }
 }
 
+/// What to call the app at `path`, for a caller that has no cache and one
+/// bounded moment to ask -- **or `None`, meaning "nothing better than the
+/// executable's own name was found".**
+///
+/// [`Cache::label`] is the answer for anything that repaints; this is the
+/// answer for a window that is opened once, looks at one path, and is gone.
+/// It reuses the same [`spawn_probe`] worker and the same [`display_name`]
+/// ordering, so there is exactly one version-resource reader in this crate
+/// and exactly one rule for what its output is called.
+///
+/// **Bounded by `budget`, because the read is the one this module was written
+/// to keep off a UI thread**: a drive letter is not proof of a local disk, and
+/// an unreachable path can stall a file open for the SMB timeout. The worker
+/// is not joined -- it ends when its file read does, its send into a bounded
+/// channel with no receiver simply fails, and the caller has already moved on.
+///
+/// `None` is returned for a timeout, a directory, and -- deliberately -- for a
+/// file whose resource named it nothing the caller did not already know: the
+/// point of asking is to improve on the executable's file name, so an answer
+/// equal to that file name is not an improvement and the caller keeps whatever
+/// it was going to say.
+pub fn probe_display_name(path: &str, process: &str, budget: Duration) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let probe = spawn_probe(path).recv_timeout(budget).ok()?;
+    if probe.directory {
+        return None;
+    }
+    let product = probe.product.as_deref().or(probe.store_name.as_deref());
+    let name = display_name(probe.description.as_deref(), product, path, process);
+    let bare = file_name_of(path).unwrap_or(process);
+    (name != bare).then_some(name)
+}
+
 /// Reads `path`'s version resource on a worker thread.
 ///
 /// The channel is bounded at one and the send is allowed to fail: if the window
@@ -842,6 +877,73 @@ mod tests {
         assert_eq!(file_name_of(r"C:\Program Files\"), None);
         assert_eq!(file_name_of("C:/"), None);
         assert_eq!(file_name_of(""), None);
+    }
+
+    /// **What the account picker's card ends up calling the app**, over the
+    /// three answers `app::handle_no_match` can get.
+    ///
+    /// The card is a real always-on-top window over a real foreground process,
+    /// so no test may raise it; what is decidable is the pure chain the call
+    /// site leans on, and it is pinned here rather than restated as
+    /// construction. `Ledgerline.exe` is what `app::window_label` answers for
+    /// a non-host process, so it is exactly the string the card must not show
+    /// when the binary knows better -- and exactly the string it must fall
+    /// back to when it does not.
+    #[test]
+    fn the_picker_names_the_app_and_falls_back_to_the_executable() {
+        let fallback = crate::app::window_label("Ledgerline.exe", "Invoices - Q3");
+        assert_eq!(fallback, "Ledgerline.exe", "control: a non-host window is named by its exe");
+
+        assert_eq!(
+            display_name(
+                Some("Ledgerline"),
+                Some("Northwind Suite"),
+                r"C:\Ledgerline.exe",
+                "Ledgerline.exe"
+            ),
+            "Ledgerline",
+            "a present `FileDescription` is what the user calls the app, so the card says \r
+             \"No saved login for Ledgerline\""
+        );
+        assert_eq!(
+            display_name(Some(" "), Some("Northwind Suite"), r"C:\Ledgerline.exe", "Ledgerline.exe"),
+            "Northwind Suite",
+            "a blank `FileDescription` is skipped -- taking it would render a card with no app \r
+             name at all in the middle of its sentence"
+        );
+        assert_eq!(
+            display_name(None, None, r"C:\Ledgerline.exe", "Ledgerline.exe"),
+            fallback,
+            "a binary with no version resource leaves the card saying exactly what \r
+             `window_label` would have said, which is what it said before this existed"
+        );
+    }
+
+    /// **An unreachable executable costs the card nothing.**
+    ///
+    /// `probe_display_name` answers `None` -- not a name derived from the path
+    /// -- so `handle_no_match`'s `unwrap_or(label)` keeps `window_label`'s
+    /// answer. The path is a local one that does not exist: no network, no
+    /// share, and `std::fs::metadata` fails on it immediately.
+    #[test]
+    fn an_unreachable_executable_yields_no_name_at_all() {
+        let missing = r"C:\deskwarden-does-not-exist\Ledgerline.exe";
+        assert!(
+            !std::path::Path::new(missing).exists(),
+            "control: this test's fixture path must not exist on the machine running it"
+        );
+        assert_eq!(
+            probe_display_name(missing, "Ledgerline.exe", Duration::from_millis(500)),
+            None,
+            "a file that cannot be read has told us nothing, and `file_name_of` is not an \r
+             answer -- returning `Some(\"Ledgerline.exe\")` would look like a resolved name to \r
+             a caller whose whole reason for asking was to improve on that string"
+        );
+        assert_eq!(
+            probe_display_name("", "Ledgerline.exe", Duration::from_millis(500)),
+            None,
+            "an empty path is a process whose image could not be resolved at all"
+        );
     }
 
     #[test]

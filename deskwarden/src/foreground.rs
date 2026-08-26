@@ -46,7 +46,8 @@
 //! whatever they were typing into.
 //!
 //! `with_always_on_top` is likewise not the answer for ordinary windows. The
-//! overlay (`overlay_ui`) is topmost because it is a transient prompt drawn
+//! overlay (`save_login_card` and its five siblings) is topmost because each
+//! is a transient prompt drawn
 //! over another app; a vault window that outranks every other window on the
 //! desktop for as long as it is open is a worse bug than the one being fixed.
 //!
@@ -220,6 +221,50 @@ pub fn own_window_titled(title: &str) -> Option<isize> {
     win32::own_windows().into_iter().find(|w| w.title == title).map(|w| w.hwnd)
 }
 
+/// Bring **another process's** window to the front.
+///
+/// The daemon spawned the vault window as `deskwarden.exe --ui vault`, so the
+/// window the user is asking for again is not one of this process's windows
+/// at all -- [`raise_this_process`] would find nothing and report
+/// [`Raised::NoWindow`]. Everything else is identical: the same `pick`, the
+/// same restore-then-activate-then-flash sequence in [`raise_on`], and the
+/// same reading of a refusal as a documented outcome rather than an error.
+///
+/// `Target::Any` because the daemon has no business knowing what the UI
+/// process titled its window -- the process id is the whole of what it holds,
+/// and it is the same id the child's result file is named by.
+pub fn raise_process(pid: u32) -> Raised {
+    raise_on(&ProcessDesktop { pid }, Target::Any)
+}
+
+/// [`Win32Desktop`] pointed at somebody else's process. Only `own_windows`
+/// differs; a handle is a handle once it has been found.
+pub struct ProcessDesktop {
+    pub pid: u32,
+}
+
+impl Desktop for ProcessDesktop {
+    fn own_windows(&self) -> Vec<OwnWindow> {
+        win32::windows_of(self.pid)
+    }
+
+    fn foreground(&self) -> isize {
+        win32::foreground()
+    }
+
+    fn restore(&self, hwnd: isize) {
+        win32::restore(hwnd);
+    }
+
+    fn set_foreground(&self, hwnd: isize) -> bool {
+        win32::set_foreground(hwnd)
+    }
+
+    fn flash(&self, hwnd: isize) {
+        win32::flash(hwnd);
+    }
+}
+
 /// The real desktop. Thin wrappers only: every decision is in [`raise_on`].
 pub struct Win32Desktop;
 
@@ -259,11 +304,31 @@ mod win32 {
     };
 
     pub fn own_windows() -> Vec<OwnWindow> {
-        let mut out: Vec<OwnWindow> = Vec::new();
+        windows_of(unsafe { GetCurrentProcessId() })
+    }
+
+    /// The top-level windows of one process, named by id.
+    ///
+    /// `own_windows` is this with our own id, which is how it stays the one
+    /// enumeration: the "belongs to us" filter was never anything but a pid
+    /// comparison, and the daemon now has a second pid it legitimately wants
+    /// the windows of -- the UI process it spawned.
+    pub fn windows_of(pid: u32) -> Vec<OwnWindow> {
+        let mut collected = Collecting { pid, out: Vec::new() };
         unsafe {
-            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut out as *mut Vec<OwnWindow> as isize));
+            let _ = EnumWindows(
+                Some(enum_proc),
+                LPARAM(&mut collected as *mut Collecting as isize),
+            );
         }
-        out
+        collected.out
+    }
+
+    /// What `enum_proc` is handed: which process to keep, and where to put
+    /// what it kept.
+    struct Collecting {
+        pid: u32,
+        out: Vec<OwnWindow>,
     }
 
     /// Collects this process's top-level windows. The *only* filter applied
@@ -274,9 +339,11 @@ mod win32 {
         // Every return is "keep enumerating"; there is no early stop.
         const CONTINUE: BOOL = BOOL(1);
 
+        let collecting = &mut *(lparam.0 as *mut Collecting);
+
         let mut owner_pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut owner_pid));
-        if owner_pid == 0 || owner_pid != GetCurrentProcessId() {
+        if owner_pid == 0 || owner_pid != collecting.pid {
             return CONTINUE;
         }
 
@@ -291,8 +358,7 @@ mod win32 {
 
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
-        let out = &mut *(lparam.0 as *mut Vec<OwnWindow>);
-        out.push(OwnWindow {
+        collecting.out.push(OwnWindow {
             hwnd: hwnd.0 as isize,
             title,
             visible: IsWindowVisible(hwnd).as_bool(),
@@ -685,8 +751,8 @@ mod tests {
     /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front` holds
     /// that) or [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] (it does
     /// not, and carries the reason). This list used to claim to be "the modules
-    /// that test covers", which was false: `overlay_ui` was in it and covered
-    /// by nothing.
+    /// that test covers", which was false: the egui autofill overlay was in it
+    /// and covered by nothing.
     ///
     /// At this scope rather than inside
     /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
@@ -696,21 +762,66 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 11] = [
+    const OPENS_WINDOWS: [&str; 15] = [
         "app_window",
+        // Design 3d's password generator. The THIRD bare-Win32 window in this
+        // crate, and one for the same measured reason the other two are: an
+        // egui window costs ~50 MB of OpenGL driver arenas that nothing
+        // releases, against this card's low single-digit MB, and this card is
+        // on the daemon's own fill path. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise.
+        "generate_prompt",
+        // Design 3b's locked-vault card. The FIFTH bare-Win32 window in this
+        // crate, and 2a's sibling in every respect: same width, same anchor,
+        // same reason. It is also the surface with the most to get wrong --
+        // it is shown for a vault this process CANNOT READ, so anything it
+        // claimed about the vault's contents would be a claim it has no
+        // standing to make. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "locked_card",
         "loading_ui",
         "login_ui",
-        "overlay_ui",
         "picker_ui",
-        // The 4b preflight confirmation. Excused from raising for the same
-        // reasons `overlay_ui` is, and for one more that is stronger -- see
-        // its row in `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`.
-        "preflight_host",
+        // The account picker's card. The SECOND bare-Win32 window in this
+        // crate, and one for the same measured reason `unlock_prompt` is: an
+        // egui window costs ~102 MB of OpenGL driver arenas that nothing
+        // releases against this card's low single-digit MB. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise and which stopped being a one-row table for it.
+        "picker_prompt",
+        // Design 4b's send preflight. The SEVENTH bare-Win32 window in this
+        // crate, and the one that emptied
+        // `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE` -- see that table,
+        // which is now zero rows and says why. It is also the card that took
+        // the daemon's whole fill path to zero GL contexts: with it ported,
+        // no window the daemon opens between a hotkey and a keystroke is an
+        // egui window. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is
+        // the table that holds its raise.
+        "preflight_card",
         "prefs_ui",
+        // Design 2a's matched-item card. The FOURTH bare-Win32 window in this
+        // crate, and the one the measured argument bites hardest on: it fires
+        // on every matched fill, so it is the most frequently opened surface
+        // in the product and it paid ~50 MB of unreleasable OpenGL driver
+        // arenas to be. It is also the one Win32 card that KEEPS its anchor --
+        // it appears unbidden, beside the field the user is in -- and, unlike
+        // the egui card it replaced, it takes the foreground, because its own
+        // footer advertises `Enter Fill` and `Esc Dismiss` and a window that
+        // never has focus cannot receive either. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
+        // holds its raise.
+        "prompt_card",
         // The 6b region-selection overlay. The SECOND egui viewport in this
         // crate, and the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] stopped
         // being a one-row table -- see the argument on it.
         "region_overlay",
+        // Design 3c's save-a-login card. The SIXTH bare-Win32 window in this
+        // crate, and the one that retired `overlay_ui` -- the module that held
+        // every egui card the daemon showed. It is the tallest card in the
+        // crate, the only one with two text boxes, and the only one that holds
+        // a plaintext password in a control, which is why its capture exclusion
+        // is not optional. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "save_login_card",
         // The 4d rehearsal scratch window. The first window in this crate
         // `eframe` does not start a loop for -- it is an egui VIEWPORT, opened
         // inside the vault window's running loop. See
@@ -801,17 +912,17 @@ mod tests {
     /// [`only_one_window_of_this_process_can_exist_at_a_time`].
     ///
     /// **`region_overlay` raises, and the decision is not the automatic one.**
-    /// Two windows in this crate are excused from raising precisely because
-    /// they are `with_always_on_top()`, and this one is too -- so the same
+    /// A window in this crate was once excused from raising precisely because
+    /// it was `with_always_on_top()`, and this one is too -- so the same
     /// argument appears to apply. It does not, for a reason particular to this
     /// window: always-on-top governs Z-order, not **focus**, and this surface
     /// has to receive keyboard input. Escape cancels it and `A` selects the
     /// whole screen; without the foreground those keys go to whatever the user
     /// was in, and Escape landing in someone else's app while a full-screen
     /// dimmed overlay sits on top of it with no way out is the worst failure
-    /// this feature has. `overlay_ui`'s and `preflight_host`'s other reason
-    /// does not apply either: both open under the literal `"Deskwarden"` that
-    /// three raising windows share, so a raise there could pick the wrong one.
+    /// this feature has. The egui preflight host's other reason does not apply
+    /// either: it opened under the literal `"Deskwarden"` that three raising
+    /// windows share, so a raise there could have picked the wrong one.
     /// `REGION_TITLE` is unique, so `raise_window`'s `find` is exact.
     const OPENS_A_VIEWPORT_AND_RAISES_IT: [(&str, &str, &str); 2] = [
         ("scratch_window", include_str!("scratch_window.rs"), "SCRATCH_TITLE"),
@@ -856,43 +967,112 @@ mod tests {
     /// What is unchanged is the obligation: a window that takes the foreground
     /// has to ask for it somewhere a test can see, and a refusal has to be a
     /// handled outcome rather than an ignored return value.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 1] =
-        [("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE")];
+    ///
+    /// **Widened to two rows rather than turned into a count**, for exactly
+    /// the reason [`OPENS_A_VIEWPORT_AND_RAISES_IT`] was: a crate-wide count
+    /// of `CreateWindowExW(` could only say "two bare-Win32 windows exist
+    /// somewhere", which one module opening both satisfies. So it is one row
+    /// per module, and every assertion in
+    /// [`the_bare_win32_window_this_crate_opens_asks_for_the_foreground`] is
+    /// per-module: that module's own source opens under its own title, asks
+    /// for the foreground exactly once, and excludes itself from capture
+    /// exactly once.
+    ///
+    /// **`picker_prompt` excludes itself from capture too, and it shows no
+    /// password.** What it shows is which accounts this user holds for the app
+    /// they are in front of, which is the thing a screen recorder should not
+    /// be handed -- so the same one-call check applies to it, and the
+    /// assertion's message is worded for all three.
+    ///
+    /// **`generate_prompt` is the row the capture check exists for most.** The
+    /// unlock prompt protects a password being *typed in*; the picker protects
+    /// a list of account names. Design 3d paints a live generated password
+    /// **on screen in the clear**, deliberately -- it is a value the user has
+    /// to be able to read and re-type, and a masked generator is one nobody
+    /// can check. That is the one surface in this app where a screen recorder
+    /// running while the card is up would capture a credential outright.
+    /// **`prompt_card` is the row that changed the rule about raising.** The
+    /// three rows above it are answers to something the user asked for -- a
+    /// chord, a click, a locked vault they tried to fill from -- and they take
+    /// the foreground because they are typed into. Design 2a is not asked for
+    /// at all: it appears because a field was focused, and its egui ancestor
+    /// sat in [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] on the ground
+    /// that taking the foreground is "the opposite of what this window wants".
+    /// Two things retire that. The card's own footer advertises `Enter Fill`
+    /// and `Esc Dismiss`, and its ancestor's source admits in the same
+    /// paragraph that "Esc is not guaranteed to reach us at all" -- a card
+    /// that cannot be answered the way it says it can. And the fill costs
+    /// nothing for it: `injector::send_input::ensure_foreground` restores the
+    /// target window before any keystroke is sent. The other reason that row
+    /// gave -- that the egui overlay opened under the literal `"Deskwarden"`
+    /// three raising windows share, so a raise could pick the wrong one -- is
+    /// gone with the title: this card opens under `PROMPT_CARD_TITLE`, and it
+    /// holds its own `HWND` and never needs to find one by name.
+    ///
+    /// **`locked_card` is 2a's sibling and follows it exactly.** It appears in
+    /// the same circumstance -- a password field was focused -- and answers
+    /// with a keyboard the same way: Esc dismisses it, and Enter presses the
+    /// *Unlock* button that is the one offer this state can honour. What its
+    /// capture exclusion protects is neither a password nor an account list
+    /// but the name of the app this user is signing into.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 7] = [
+        ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
+        ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
+        ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
+        ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
+        ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
+        ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
+        ("preflight_card", include_str!("preflight_card.rs"), "PREFLIGHT_CARD_TITLE"),
+    ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
     ///
     /// The third category, and the one whose absence made the docstring on
-    /// `OPENS_WINDOWS` false as written: `overlay_ui` opens a window, has never
-    /// had a row in [`RAISING_SITES`], and nothing anywhere recorded that this
-    /// was a decision rather than the same omission that let `app_window` in
-    /// unguarded. "Not in the raise list" and "must not be in the raise list"
+    /// `OPENS_WINDOWS` false as written: the egui autofill overlay opened a
+    /// window, never had a row in [`RAISING_SITES`], and nothing anywhere
+    /// recorded that this was a decision rather than the same omission that
+    /// let `app_window` in unguarded. "Not in the raise list" and "must not be in the raise list"
     /// are different claims and now live in different places.
     ///
     /// The reason is carried in the source because it is the whole content of
     /// the exemption; the test below refuses a blank one, and refuses a module
     /// listed here that turns out to raise after all.
-    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 2] = [
-        (
-        "preflight_host",
-        include_str!("preflight_host.rs"),
-        "The preflight is `with_always_on_top()`, so the OS already keeps it above everything.          It also opens while ANOTHER app is foreground -- it is the confirmation shown BEFORE a          sequence is typed into that app -- and it opens under the same literal `\"Deskwarden\"`          title `vault_window`, `app_window` and `loading_ui` all raise under, so a          `raise_window` here could bring one of those forward instead. And there is a reason          particular to this window: `preflight::verdict` was computed from the foreground          described a moment before it opened, and `dispatch_with` describes the foreground          again after it closes. A raise is a deliberate change to which window is in front,          made by the one surface in the app whose whole job is to tell the truth about which          window is in front.",
-    ),
-    (
-        "overlay_ui",
-        include_str!("overlay_ui.rs"),
-        "The autofill prompt is `with_always_on_top()`, so the OS already keeps it above \
-         everything and a raise would buy nothing. It is also the one window of ours that \
-         opens while ANOTHER app is foreground -- anchored beside the field the user is in, \
-         whose `hwnd` the fill is injected back into once the card is clicked -- so taking \
-         the foreground is the opposite of what this window wants. And it opens through \
-         `eframe::run_native(\"Deskwarden\", ..)` -- the same literal title THREE other \
-         windows open under: `vault_window`, `app_window` and `loading_ui`, all of which do \
-         raise. (It said \"two\" while there were three; the count is now the one \
-         `only_one_window_of_this_process_can_exist_at_a_time` reads off the sources.) \
-         `raise_window` matches this process's own windows BY TITLE and `pick` takes the \
-         FIRST match in `EnumWindows` order, so a raise here could just as easily bring one \
-         of those forward instead.",
-    )];
+    ///
+    /// # It is empty, and the table is kept anyway
+    ///
+    /// It held two modules and now holds none. The egui autofill overlay went
+    /// first, with `overlay_ui`; `preflight_host` -- design 4b's confirmation
+    /// -- went second, when that card was redrawn in bare Win32 as
+    /// `crate::preflight_card` and moved to
+    /// [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`]. Both of the reasons its row
+    /// gave expired at once: it opened under the literal `"Deskwarden"` three
+    /// raising windows share, and the Win32 card opens under a title of its
+    /// own and holds its own `HWND`; and it was `with_always_on_top()`, which
+    /// governs Z-order and not **focus** -- the card's send is a HELD KEY, and
+    /// a card without the foreground sends that key to the app it is standing
+    /// in front of, which for this card is a run of spaces typed into the very
+    /// password box the sequence was aimed at.
+    ///
+    /// The **third** reason on that row does not expire and is worth writing
+    /// down where it was lost: `preflight::verdict` is computed from the
+    /// foreground described a moment before the card opens, and
+    /// `dispatch_with` describes the foreground **again** after it closes. So
+    /// the raise is a deliberate change to which window is in front, made by
+    /// the one surface in the app whose whole job is to tell the truth about
+    /// which window is in front. What makes it safe is that it is not the
+    /// observation the gate acts on: the second description is taken after the
+    /// card is destroyed, and if it lands before the previous window is
+    /// reactivated the gate refuses -- which is the fail-safe direction.
+    ///
+    /// **An empty table is not a dead one.** It is still chained into
+    /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
+    /// where zero rows makes the classification claim strictly stronger --
+    /// *every* module that opens a window raises it -- and it is still the
+    /// only place a future exemption can be written, with the checks below
+    /// waiting for it. What it can no longer do is act as its own positive
+    /// control, so the control that asserted it was non-empty is gone and the
+    /// reason is recorded at that assertion.
+    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 0] = [];
 
     /// Every window this crate opens must actually ask to be raised, and must
     /// ask for the SAME title it opened under. Neither can be asserted by
@@ -1080,7 +1260,7 @@ mod tests {
             assert_eq!(
                 source.matches("SetWindowDisplayAffinity(").count(),
                 1,
-                "`{name}` shows a master password and does not exclude itself from screen                  capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
+                "`{name}` shows something a screen recorder must not be handed -- a master                  password, or the list of which accounts this user holds for the app in front                  of them -- and does not exclude itself from screen capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
             );
             assert_eq!(
                 source.matches("run_ui_native(").count(),
@@ -1118,8 +1298,8 @@ mod tests {
     /// were independent hand-written lists that merely happened to agree, so a
     /// module could be dropped from the raise table and lose its raise with
     /// every assertion still passing -- `loading_ui` was demonstrably deletable
-    /// that way. It also let `overlay_ui` sit in `OPENS_WINDOWS` with no row in
-    /// the raise table at all and nothing recording why. Both are closed below,
+    /// that way. It also let the egui autofill overlay sit in `OPENS_WINDOWS`
+    /// with no row in the raise table at all and nothing recording why. Both are closed below,
     /// by requiring `OPENS_WINDOWS` to be exactly `RAISING_SITES` plus
     /// `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`, with nothing in two
     /// lists and nothing in none.
@@ -1129,9 +1309,14 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 59] = [
+        const OPENS_NO_WINDOW: [&str; 62] = [
             "accounts",
             "app",
+            // A pure matching function over vault items: it scores and
+            // ranks the candidates for the account picker. No Win32, no
+            // window -- the card that lays out what it returns is drawn
+            // elsewhere.
+            "app_candidates",
             // Reads an executable's version resource and its shell icon.
             // Draws nothing itself; the edit form paints what it returns.
             "app_identity",
@@ -1300,6 +1485,13 @@ mod tests {
             // one.
             "update_panel",
             "updater",
+            // The daemon/UI process boundary: a command-line plan, a small
+            // non-secret result file, and the exit-code carrier for it. It
+            // decides WHAT a spawned process is asked to open and reads what
+            // that process reported; the window itself belongs to
+            // `vault_window`, which is classified in its own right. Nothing
+            // here touches Win32 at all.
+            "ui_process",
             // One account's DPAPI-wrapped master key and refresh token: a
             // path, two file reads and a byte layout. It draws nothing, and
             // the master password it saves the user from being asked for is
@@ -1329,6 +1521,11 @@ mod tests {
             // is the shell's, opened elsewhere; this module draws
             // nothing and calls no `run_ui_native`.
             "vault_export",
+            // GDI painting helpers -- brushes, text and blits -- called from
+            // an existing window's paint path. It creates no window of its
+            // own; whatever HWND it draws into was already created by its
+            // caller.
+            "win32_draw",
             "window_list",
             "window_watch",
         ];
@@ -1398,7 +1595,19 @@ mod tests {
              -- `vault_window` lives in `vault_window/mod.rs` and is the one row where those \
              differ: {raises:?}"
         );
-        assert!(!excused.is_empty(), "control: the exemption list is being read");
+        // **No control on `excused` being non-empty.** It is empty, and that
+        // is the point: `preflight_host` was the last row and design 4b is a
+        // bare-Win32 card that raises. An empty exemption list makes the
+        // reconciliation below a stronger claim rather than a weaker one --
+        // every module in `OPENS_WINDOWS` must now appear in a raise table --
+        // and the two loops that read it are kept for the next module that
+        // needs one. See the table's own docstring.
+        assert!(
+            excused.is_empty(),
+            "the exemption list has gained a row: {excused:?}. That is allowed, but the \r
+             control above was removed when it emptied -- reinstate the reasoning in that \r
+             table's docstring rather than leaving this assertion to fail"
+        );
 
         for module in OPENS_WINDOWS {
             assert!(
@@ -1440,9 +1649,10 @@ mod tests {
             // exemption from that forgery is structural, and it is the
             // exemption's own first sentence: the OS keeps this window above
             // everything because the window asks it to. `with_always_on_top(`
-            // appears exactly once in `overlay_ui.rs` and nowhere else in this
-            // crate, so this both holds the real excuse to its claim and fails
-            // any module moved here that cannot make it.
+            // was the real exemption's own structural claim, and it holds any
+            // module moved here to it: an egui window genuinely kept above
+            // everything by the OS says so in its builder. The table is empty
+            // today, so this loop runs zero times -- see its docstring.
             //
             // **Counted over `code()`, not the raw file.** Against the raw
             // `include_str!` bytes the whole M2E escape went green with one
@@ -1454,7 +1664,7 @@ mod tests {
             //
             // **And over the production half, for the same reason the raise
             // guard is**: this is an exact count over another module's file,
-            // so a fixture in `overlay_ui.rs`'s own test modules spelling
+            // so a fixture in an exempt module's own test modules spelling
             // `with_always_on_top(` would take it to 2 and false-fire.
             let (production, cut) = production_half(source);
             assert!(cut > 0, "no test module was cut out of `{module}`");
@@ -1516,12 +1726,12 @@ mod tests {
     /// **The invariant that makes matching a window BY TITLE safe at all.**
     ///
     /// [`RAISING_SITES`] compares title *identifiers*; it never looks at their
-    /// values. **Five** modules open a window titled literally `"Deskwarden"`
-    /// -- `vault_window`, `app_window` and `loading_ui`, which all raise, and
-    /// `overlay_ui` and `preflight_host`, which are excused. (This said "four"
-    /// while there were four, and went stale the day the preflight host
-    /// landed; a count in prose goes stale silently, which is why the one
-    /// below is asserted.) [`pick`] is a `find`, so if two of them were ever on
+    /// values. **Three** modules open a window titled literally `"Deskwarden"`
+    /// -- `vault_window`, `app_window` and `loading_ui`, and all three raise.
+    /// (It said "five" while `overlay_ui` was one of them, and "four" while
+    /// `preflight_host` was: both are gone, and every window the daemon shows
+    /// is bare Win32 now, each under a title of its own. A count in prose goes
+    /// stale silently, which is why the one below is asserted.) [`pick`] is a `find`, so if two of them were ever on
     /// screen together a raise would take whichever `EnumWindows` happened to
     /// hand back first, silently and non-deterministically.
     ///
@@ -1532,7 +1742,7 @@ mod tests {
     /// Serialisation is therefore not what makes it safe -- a unique title is,
     /// and that is asserted below rather than left in prose.
     ///
-    /// For the five that do share a title, the collision is not reachable
+    /// For the four that do share a title, the collision is not reachable
     /// today, and the reason is worth naming because it is the thing being
     /// pinned rather than the collision itself:
     ///
@@ -1583,23 +1793,63 @@ mod tests {
         // `pick`'s `find` non-deterministic for exactly as long as a rehearsal
         // is on screen -- which is when a `SendInput` burst is in flight.
         //
-        // Two comparisons and not one: these are the two title constants this
-        // module can name, and both spell the literal the other three windows
-        // also open under, so a `SCRATCH_TITLE` changed to `"Deskwarden"` fails
-        // here rather than in production.
+        // One comparison where there used to be two: the second named
+        // `preflight_host::PREFLIGHT_TITLE`, which was a second spelling of
+        // the same `"Deskwarden"` literal, and design 4b's card opens under a
+        // title of its own now. The literal is still shared by
+        // `vault_window`, `app_window` and `loading_ui`, and `WINDOW_TITLE` is
+        // the one of those three this module can name.
         assert_ne!(
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::vault_window::WINDOW_TITLE,
             "the rehearsal scratch window shares a title with a window it is open alongside"
         );
+        // Control on the comparison above: `WINDOW_TITLE` really is the shared
+        // literal, so an `assert_ne!` against it is an assertion about that
+        // literal and not about an unrelated name. Asserted against the string
+        // itself now that no second constant spells it.
+        assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
+
+        // **The two bare-Win32 windows.** Neither is an `eframe` window, so
+        // neither shares the `"Deskwarden"` literal the five above do -- but
+        // both are opened from the daemon while the tray's and the hotkey
+        // listener's helper windows already exist, and `pick` is a `find`. So
+        // their titles are asserted distinct from each other and from the
+        // shared literal, which is what keeps that `find` exact.
         assert_ne!(
-            crate::vault_window::rehearsal::SCRATCH_TITLE,
-            crate::preflight_host::PREFLIGHT_TITLE
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            "the account picker and the unlock prompt are both opened from the daemon and both              found by title"
         );
-        // Control on the pair above: those two constants really are the same
-        // string, so an `assert_ne!` against either is an assertion about the
-        // shared literal and not about two unrelated names.
-        assert_eq!(crate::vault_window::WINDOW_TITLE, crate::preflight_host::PREFLIGHT_TITLE);
+        assert_ne!(
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert_ne!(
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert!(!crate::picker_prompt::PICKER_PROMPT_TITLE.is_empty());
+        assert!(!crate::unlock_prompt::UNLOCK_PROMPT_TITLE.is_empty());
+
+        // **The third bare-Win32 window**, design 3d's generator. It is opened
+        // from the daemon while 3c's egui window has been and will be up, and
+        // it is found by title like the two above.
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            "the generator and the account picker are both opened from the daemon and both \
+             found by title"
+        );
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE
+        );
+        assert_ne!(
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::vault_window::WINDOW_TITLE
+        );
+        assert!(!crate::generate_prompt::GENERATE_PROMPT_TITLE.is_empty());
 
         // **The 6b region overlay, the second viewport.** It is open alongside
         // the vault window too, and it takes the foreground deliberately -- so
@@ -1614,7 +1864,7 @@ mod tests {
         );
         assert_ne!(
             crate::region_overlay::REGION_TITLE,
-            crate::preflight_host::PREFLIGHT_TITLE
+            crate::preflight_card::PREFLIGHT_CARD_TITLE
         );
         assert_ne!(
             crate::region_overlay::REGION_TITLE,

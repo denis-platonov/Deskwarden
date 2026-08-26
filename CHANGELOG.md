@@ -10,6 +10,44 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.10.0 - 2026-08-26
+
+### Pressing the hotkey on an app you have never bound now offers your accounts
+
+Until now, `CTRL+ALT+B` on an app you had not configured said Deskwarden had
+nothing for you -- even when your vault held the login. It only ever looked for
+apps you had explicitly bound.
+
+It now looks for accounts that plausibly belong to the window in front of you,
+by web address, by name, and by the words in the window's title, and lists what
+it finds. Pick one, then pick what to type: username, password, one-time code, a
+custom field, all of it, or the item's own saved sequence. Nothing is ever typed
+without you choosing it, which is what lets the search be generous.
+
+Press `S` to search the whole vault from the same card, `N` to start a new
+login, and `1` to `9` to pick straight off the list.
+
+### The vault window now gives its memory back when you close it
+
+Deskwarden's window is an accelerated graphics window, and the graphics driver
+never returns what it takes -- so once you had opened the window, this app held
+about 50 MB for the rest of the session, whether or not you ever opened it
+again.
+
+The window is now its own process, and closing it ends that process. Sitting in
+the tray, Deskwarden is back to roughly 10 MB and stays there. Closing the
+window also no longer freezes the tray icon or the hotkey while it is open, and
+a crash in the window no longer takes the rest of the app down with it.
+
+### Every small card is drawn by hand instead of by the graphics stack
+
+The cards that appear during a fill -- the offer to type a saved login, the
+"vault is locked" card, the offer to save a new login, the generator, the unlock
+prompt and the send confirmation -- no longer start a graphics context. They are
+drawn directly by Windows, cost under 2 MB each, and look the same. This is what
+keeps the tray at 10 MB even after you have used it.
+
+
 ### Filling a password is faster
 
 Every autofill used to make a private copy of your entire vault just to look up

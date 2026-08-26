@@ -569,13 +569,13 @@ mod win32 {
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polygon, ReleaseDC, RoundRect,
+        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
-        CLEARTYPE_QUALITY, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
         SRCCOPY, TRANSPARENT,
     };
@@ -583,10 +583,10 @@ mod win32 {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
-        PeekMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+        PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
         TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
-        ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG, PM_REMOVE,
+        ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE,
         SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
         WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONDOWN,
         WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD,
@@ -619,10 +619,10 @@ mod win32 {
     /// `theme`'s `Color32` as GDI's BGR `COLORREF`.
     ///
     /// One conversion, used everywhere, so that no hex value in this file is
-    /// a palette entry written out a second time.
-    fn rgb(c: eframe::egui::Color32) -> COLORREF {
-        COLORREF((c.r() as u32) | ((c.g() as u32) << 8) | ((c.b() as u32) << 16))
-    }
+    /// a palette entry written out a second time. Lives in
+    /// [`crate::win32_draw`] now, alongside [`crate::win32_draw::draw_button`]
+    /// which every button in this window paints through.
+    use crate::win32_draw::rgb;
 
     // ---- fonts -------------------------------------------------------------
 
@@ -1276,12 +1276,19 @@ mod win32 {
             }
             // Frameless windows are dragged by their background.
             WM_NCHITTEST => {
-                let hit = DefWindowProcW(window, msg, wparam, lparam);
-                if hit.0 == 1 {
-                    LRESULT(HTCAPTION as isize)
-                } else {
-                    hit
-                }
+                // **The close glyph is the one part of the background that is
+                // not a title bar.** It is painted by this window rather than
+                // being a child control, so answering `HTCAPTION` for the whole
+                // client area turned every press on it into a window drag and
+                // `WM_LBUTTONDOWN` below never fired -- the reported "clicking
+                // on X doesn't work". See `win32_draw::frameless_hit`, which is
+                // the pure half of this and the half the pin decides.
+                crate::win32_draw::frameless_hit_test(
+                    window,
+                    DefWindowProcW(window, msg, wparam, lparam),
+                    lparam,
+                    close_glyph_rect(),
+                )
             }
             WM_LBUTTONDOWN => {
                 if in_close_glyph(window, lparam) {
@@ -1313,8 +1320,20 @@ mod win32 {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // No thread quit is posted here, deliberately. `close` calls
+                // `DestroyWindow`, which dispatches this message SYNCHRONOUSLY on
+                // the calling thread, and this window is opened on the thread
+                // that goes on to run egui windows (`unlock_from_the_locked_card`
+                // returns into `resume_fill_after_unlock`, which opens the
+                // autofill overlay and the preflight window, both
+                // `eframe::run_native` on this same thread). A quit posted here
+                // is never drained -- `next` has already returned and no pump
+                // runs before the caller acts -- so the next `run_native` would
+                // take it out of `GetMessageW`, leave its loop before drawing,
+                // and silently return its default answer. `GONE` above is what
+                // `next` actually reads; a quit posted from OUTSIDE is still
+                // honoured by `next`'s own `WM_QUIT` branch.
                 GONE.store(true, Ordering::SeqCst);
-                PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(window, msg, wparam, lparam),
@@ -1373,15 +1392,28 @@ mod win32 {
             as *mut c_void)
     }
 
-    fn in_close_glyph(window: HWND, lparam: LPARAM) -> bool {
+    /// The close glyph's rect in DEVICE pixels.
+    ///
+    /// One derivation, read by both the hit test and `in_close_glyph`, so the
+    /// rect `WM_NCHITTEST` excuses from the drag and the rect `WM_LBUTTONDOWN`
+    /// answers on can never be two different rectangles.
+    fn close_glyph_rect() -> RECT {
         let l = super::layout();
-        let x = (lparam.0 & 0xffff) as i16 as i32;
-        let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+        RECT {
+            left: scale(l.close_glyph.x),
+            top: scale(l.close_glyph.y),
+            right: scale(l.close_glyph.right()),
+            bottom: scale(l.close_glyph.bottom()),
+        }
+    }
+
+    fn in_close_glyph(window: HWND, lparam: LPARAM) -> bool {
         let _ = window;
-        x >= scale(l.close_glyph.x)
-            && x < scale(l.close_glyph.right())
-            && y >= scale(l.close_glyph.y)
-            && y < scale(l.close_glyph.bottom())
+        crate::win32_draw::on_close_glyph(
+            (lparam.0 & 0xffff) as i16 as i32,
+            ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+            close_glyph_rect(),
+        )
     }
 
     // ---- painting ----------------------------------------------------------
@@ -1518,6 +1550,8 @@ mod win32 {
     }
 
     fn paint_button(button: HWND, id: isize) {
+        use crate::win32_draw::{draw_button, ButtonSkin};
+
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(button, &mut ps);
@@ -1529,24 +1563,21 @@ mod win32 {
             let disabled = primary && BUSY.load(Ordering::SeqCst);
             let focused = GetFocus() == button;
 
-            let (fill_colour, text_colour, border) = if primary {
-                (
-                    if disabled {
-                        crate::theme::BLUE_SOFT
-                    } else if hovered {
-                        crate::theme::BLUE_BRIGHT
-                    } else {
-                        crate::theme::BLUE
-                    },
-                    crate::theme::CARD,
-                    None,
-                )
+            // `ButtonSkin::primary`/`secondary` are the two looks this app
+            // has; `hovered` and `disabled` are states layered on top of
+            // whichever one applies, not a third and fourth palette.
+            let skin = if primary {
+                let skin = ButtonSkin::primary();
+                if disabled {
+                    skin.disabled()
+                } else if hovered {
+                    skin.hovered()
+                } else {
+                    skin
+                }
             } else {
-                (
-                    if hovered { crate::theme::CANVAS } else { crate::theme::CARD },
-                    crate::theme::INK,
-                    Some((1, crate::theme::BORDER_STRONG)),
-                )
+                let skin = ButtonSkin::secondary();
+                if hovered { skin.hovered() } else { skin }
             };
 
             let mem = CreateCompatibleDC(hdc);
@@ -1558,18 +1589,31 @@ mod win32 {
             fill(mem, rc, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
-            let whole = Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom };
-            if focused {
-                rounded(mem, whole, 8, crate::theme::FOCUS_RING, None);
-                rounded(mem, inset(whole, 2, 2, 2, 2), 7, fill_colour, border);
-            } else {
-                rounded(mem, whole, 7, fill_colour, border);
-            }
+            let whole = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom };
+            let radius = scale(7);
+            let label = if primary { "Unlock" } else { "Cancel" };
 
             let guard = FONTS.lock();
-            if let Some(fonts) = guard.as_ref().ok().and_then(|s| s.as_ref()) {
-                let label = if primary { "Unlock" } else { "Cancel" };
-                text(mem, fonts.button, whole, label, text_colour, DT_CENTER, 0);
+            let font = guard.as_ref().ok().and_then(|s| s.as_ref()).map(|fonts| fonts.button);
+            if let Some(font) = font {
+                if focused {
+                    rounded(
+                        mem,
+                        Box2 { x: 0, y: 0, w: rc.right, h: rc.bottom },
+                        8,
+                        crate::theme::FOCUS_RING,
+                        None,
+                    );
+                    let inner = RECT {
+                        left: whole.left + 2,
+                        top: whole.top + 2,
+                        right: whole.right - 2,
+                        bottom: whole.bottom - 2,
+                    };
+                    draw_button(mem, inner, label, font, skin, radius);
+                } else {
+                    draw_button(mem, whole, label, font, skin, radius);
+                }
             }
             drop(guard);
 
@@ -1582,37 +1626,23 @@ mod win32 {
     }
 
     /// The brand mark, from `theme`'s own geometry and fills.
+    ///
+    /// **The painter itself lives in [`crate::win32_draw::draw_mark`] now.**
+    /// This window's copy was the crate's only GDI shield, and the four cards
+    /// ported after it went without one rather than grow a second; it moved
+    /// there so all five draw the same mark. What stays here is the one thing
+    /// that is this window's own: turning its logical [`Box2`] into the device
+    /// rect the shared painter takes.
     fn paint_mark(hdc: HDC, at: Box2) {
-        let outlines = crate::theme::quadrant_outlines();
-        let box_w = scale(at.w) as f32;
-        let box_h = scale(at.h) as f32;
-        let s = (box_w / 24.0).min(box_h / 28.0);
-        let ox = scale(at.x) as f32 + (box_w - 24.0 * s) / 2.0;
-        let oy = scale(at.y) as f32 + (box_h - 28.0 * s) / 2.0;
-
-        unsafe {
-            for (outline, fill_colour) in outlines.iter().zip(crate::theme::QUADRANT_FILLS) {
-                let points: Vec<POINT> = outline
-                    .iter()
-                    .map(|p| POINT {
-                        x: (ox + p.x * s).round() as i32,
-                        y: (oy + p.y * s).round() as i32,
-                    })
-                    .collect();
-                let brush = CreateSolidBrush(rgb(fill_colour));
-                // A `NULL_PEN` would leave a hairline gap between quadrants;
-                // a pen of the quadrant's own colour makes the four shapes
-                // meet exactly as they do in the vector original.
-                let pen = CreatePen(PS_SOLID, 1, rgb(fill_colour));
-                let old_brush = SelectObject(hdc, brush);
-                let old_pen = SelectObject(hdc, pen);
-                let _ = Polygon(hdc, &points);
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                let _ = DeleteObject(brush);
-                let _ = DeleteObject(pen);
-            }
-        }
+        crate::win32_draw::draw_mark(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+        );
     }
 
     /// The 3px indeterminate track, `theme::paint_progress_bar`'s proportions
@@ -2209,7 +2239,7 @@ mod tests {
     fn the_prompt_opens_under_a_title_no_other_window_of_ours_uses() {
         for other in [
             crate::vault_window::WINDOW_TITLE,
-            crate::preflight_host::PREFLIGHT_TITLE,
+            crate::preflight_card::PREFLIGHT_CARD_TITLE,
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::region_overlay::REGION_TITLE,
         ] {
@@ -2259,5 +2289,119 @@ mod tests {
                 "`{family}` is not a bundled face"
             );
         }
+    }
+}
+
+/// The prompt's window procedure must not post a THREAD quit.
+///
+/// No test can open the real window, so this is a source pin in this crate's
+/// established shape ([`crate::app`]'s wiring tests, [`crate::job_object`]'s
+/// scanners): it reads this file back with `include_str!`, cuts the
+/// `#[cfg(test)]` modules away so only what SHIPS is scanned, strips `//`
+/// comments so the explanation at the `WM_DESTROY` arm may name the call it
+/// forbids, and asserts the call is absent.
+///
+/// **Normalised first.** This is a CRLF checkout with no `.gitattributes`;
+/// slicing or comparing lines without trimming the carriage return makes the
+/// cut a no-op and the whole pin vacuous. The control assertions below are
+/// what prove it did not silently scan nothing, or the wrong half.
+#[cfg(test)]
+mod no_thread_quit_pin {
+    // Split across two literals, on ONE line, in this crate's idiom:
+    // `include_str!` pulls this module in too, so a whole needle would match
+    // its own declaration, and a needle with a newline in it is vacuous on one
+    // of the two possible checkouts.
+    const FORBIDDEN: &str = concat!("PostQuit", "Message");
+    const DESTROY_ARM: &str = concat!("WM_DESTROY", " =>");
+
+    /// `source` with CRLF normalised, every top-level `#[cfg(test)]` module
+    /// removed, and every `//` comment stripped.
+    ///
+    /// The module cut is line-based and anchored at column zero: a
+    /// `#[cfg(test)]` on its own unindented line, up to and including the next
+    /// unindented `}`. Every gated module in this file has that shape, and
+    /// `the_cut_really_discards_something` checks that rather than assuming it.
+    fn production_only(source: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in source.lines() {
+            let flat = line.trim_end();
+            if !skipping && flat == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if flat == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            // Comments only: a `//` inside a string literal would be cut too,
+            // but nothing this pin reads about lives in one, and cutting too
+            // much can only make the scan MISS a comment, never invent a call.
+            let code = match flat.find("//") {
+                Some(at) => &flat[..at],
+                None => flat,
+            };
+            out.push_str(code);
+            out.push('\n');
+        }
+        assert!(!skipping, "a gated module never closed at column zero; the cut is unreliable");
+        out
+    }
+
+    fn source() -> String {
+        production_only(include_str!("unlock_prompt.rs"))
+    }
+
+    /// Control: the cut discarded something.
+    ///
+    /// A `production_only` that returned its input unchanged -- or an empty
+    /// string -- would make the pin below pass for the wrong reason.
+    #[test]
+    fn the_cut_really_discards_something() {
+        let whole = include_str!("unlock_prompt.rs");
+        let kept = source();
+        assert!(!kept.is_empty(), "the cut kept nothing at all; the pin would be vacuous");
+        assert!(
+            kept.len() < whole.len(),
+            "the cut discarded nothing, so the gated modules -- including this one,              which names the forbidden call -- are still being scanned"
+        );
+        // This module's own declaration is inside the half that was cut.
+        assert!(
+            !kept.contains("mod no_thread_quit_pin"),
+            "this pin's own module survived the cut, so it would scan itself"
+        );
+    }
+
+    /// Control: the half that was KEPT is the window procedure's.
+    ///
+    /// If the cut ever ate the production half instead, the pin would pass on
+    /// an empty-ish string forever. The `WM_DESTROY` arm is the exact line the
+    /// rule is about, so requiring it proves the scan is looking at it.
+    #[test]
+    fn the_kept_half_still_contains_the_destroy_arm() {
+        assert!(
+            source().contains(DESTROY_ARM),
+            "the kept half no longer contains the `WM_DESTROY` arm, so the pin below              is not scanning the code it exists to guard"
+        );
+    }
+
+    /// Control: the scan can see the call when it is really there.
+    #[test]
+    fn the_scan_would_notice_the_call() {
+        let planted = production_only(concat!("    PostQuit", "Message(0);\n"));
+        assert!(planted.contains(FORBIDDEN), "the scanner cannot see a call that is present");
+        // ...and not when it is only mentioned in a comment.
+        let commented = production_only(concat!("    // PostQuit", "Message(0);\n"));
+        assert!(!commented.contains(FORBIDDEN), "the comment strip does not work");
+    }
+
+    #[test]
+    fn the_unlock_prompt_never_posts_a_thread_quit() {
+        assert!(
+            !source().contains(FORBIDDEN),
+            "the unlock prompt posts a thread quit. `close` destroys this window              SYNCHRONOUSLY on the calling thread, and that thread goes on to run              egui windows: `unlock_from_the_locked_card` returns into              `resume_fill_after_unlock`, which opens the autofill overlay and the              preflight window. Nothing drains the quit in between, so the next              `eframe::run_native` takes it out of `GetMessageW`, leaves its loop              BEFORE it draws, and returns its default answer -- the fill the user              just unlocked for silently does nothing. `GONE` is what `next` reads;              the quit is redundant as well as harmful."
+        );
     }
 }

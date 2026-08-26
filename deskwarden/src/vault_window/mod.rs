@@ -544,7 +544,7 @@ pub fn build_frame_with_search(
     //
     // The exception is the autofill overlay's 3a card: it has just named the
     // app it found nothing for, and its *Search vault* button opens this
-    // window to look for that name (see `crate::overlay_ui::SEARCH_VAULT_LABEL`
+    // window to look for that name (see `crate::picker_prompt::SEARCH_VAULT_LABEL`
     // and `crate::app::NoMatchFollowUp`). An unfiltered list would make the
     // user retype a name the card was showing them a moment earlier.
     //

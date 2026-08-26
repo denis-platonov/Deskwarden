@@ -820,15 +820,23 @@ mod tests {
         );
         assert_eq!(
             (modules, closes, depth),
-            // Four since the direct-REST branch: the two that were always
-            // here, plus `bw_serve_gate` (the rule that no path reaches
+            // Six since the direct-REST branch met the process split, and
+            // each side of that merge had four: the two that were always
+            // here, `bw_serve_gate` (the rule that no path reaches
             // `bw serve` without the backend policy having answered) and
             // `vault_backend_choice_tests` (the startup decision that picks a
-            // backend). Both are `#[cfg(test)] mod` at column 0 below the
-            // cut, which is exactly what this walk counts.
-            (4, 4, 0),
-            "below `main.rs`'s cut there are no longer exactly four opened-and-closed test \
-             modules: {modules} opened, {closes} closed, ending at depth {depth}"
+            // backend) from one side, `no_door_assigns_the_pending_search_pin`
+            // and `the_daemon_never_blocks_on_a_ui_process_pin` from the
+            // other. All are `#[cfg(test)] mod` at column 0 below the cut,
+            // which is exactly what this walk counts.
+            (6, 6, 0),
+            "below `main.rs`'s cut there are no longer exactly six opened-and-closed test \
+             modules: {modules} opened, {closes} closed, ending at depth {depth}. THIS IS A \
+             REAL, NON-ENVIRONMENTAL FAILURE -- this test does no I/O and is not among the \
+             mockito-port-collision failures documented for this machine. Do not step over \
+             it: either a module below `main.rs`'s cut was added, removed, or stopped being a \
+             clean gated block, or verify every module down there is genuinely \
+             `#[cfg(test)]`-gated and test-only before touching this number."
         );
         assert_eq!(
             modules,

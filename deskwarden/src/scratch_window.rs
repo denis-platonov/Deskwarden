@@ -11,7 +11,7 @@
 //! in the sequence editor, which is painted inside `vault_window::run`'s
 //! `eframe::run_ui_native` closure. `winit` refuses to build a second event
 //! loop while that one is alive, so a second `eframe::run_*native` -- the way
-//! [`crate::preflight_host`] opens its window, from `main`'s dispatch loop
+//! the egui preflight host used to open its window, from `main`'s dispatch loop
 //! between windows -- was not available. The first version of this file
 //! answered that with `CreateWindowExW` and system `EDIT` controls, and it
 //! worked: it typed the samples and reported what arrived. It also had none of
