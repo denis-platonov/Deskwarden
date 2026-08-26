@@ -2354,6 +2354,15 @@ fn main() {
                 if let Some(child) = estate.child.as_mut() {
                     bw_serve::stop_bw_serve(child);
                 }
+                // **And the vault window, if one is open.** Everything above
+                // exists so that nothing decrypted outlives this moment, and
+                // a UI process left running is the largest such thing there
+                // is: the user's whole vault, on screen, with `bw serve` now
+                // dead behind it. The child is deliberately outside the
+                // kill-on-close job so that a daemon RESTART cannot close it;
+                // a quit is not a restart, and nothing is coming back. See
+                // `ui_process::farewell_to_an_open_window`.
+                ui_windows.close_on_quit(&config_dir);
                 std::process::exit(0);
             }
 
@@ -5887,6 +5896,42 @@ impl UiWindows {
     /// [`deskwarden::ui_process::reap_step`]. A crash or an external kill must
     /// not leave the daemon believing a window is open forever, because under
     /// the one-window rule that is an *Open Vault* that never opens again.
+    /// **Close the open window, because the daemon is quitting for good.**
+    ///
+    /// The decision -- that a *Quit* closes it and a restart does not -- is
+    /// [`deskwarden::ui_process::farewell_to_an_open_window`], which is where
+    /// the reasoning and the test are. This is its impure half: the kill, and
+    /// the result file the child will never have read for it.
+    ///
+    /// **Nothing is waited on**, here least of all: this runs on the way to
+    /// `process::exit`, and a window that will not die must not be able to
+    /// hold the quit open. `kill` is `TerminateProcess`; the exit below does
+    /// not depend on it having landed.
+    ///
+    /// The result the child might have written is deleted rather than read.
+    /// There is nothing left to act on it -- `bw serve` is already dead, the
+    /// cache is already cleared, and a lock is what quitting *is* -- and a
+    /// file nobody will ever read is one the user's config directory should
+    /// not keep.
+    fn close_on_quit(&mut self, config_dir: &Path) {
+        let reason = deskwarden::ui_process::DaemonExit::UserQuit;
+        if let deskwarden::ui_process::Farewell::CloseIt { pid } =
+            deskwarden::ui_process::farewell_to_an_open_window(reason, self.vault_pid())
+        {
+            let mut open = self.vault.take().expect("a pid means the slot is occupied");
+            log::info!(
+                "quit requested with the vault window (process {pid}) open; closing it rather \
+                 than leaving a decrypted vault on screen with nothing behind it"
+            );
+            if let Err(e) = open.child.kill() {
+                log::warn!("could not close the vault window's process {pid} ({e})");
+            }
+            deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
+                config_dir, pid,
+            ));
+        }
+    }
+
     fn poll_the_vault_window(
         &mut self,
         config_dir: &Path,

@@ -213,6 +213,51 @@ pub fn open_decision(already_open: Option<u32>) -> UiOpenDecision {
     }
 }
 
+/// **What a daemon that is going away for good does with the window it has
+/// open**, decided where a test can watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Farewell {
+    /// No UI process is open; there is nothing to do.
+    NothingOpen,
+    /// End this process before exiting.
+    CloseIt { pid: u32 },
+}
+
+/// Whether a shutting-down daemon leaves its UI window running.
+///
+/// **`Quit` closes it, and every other way the daemon can go away leaves it
+/// alone.** That distinction is the whole content of this function, and it is
+/// the same distinction [`UiSpawnPlan::joins_the_daemons_job`] is about, drawn
+/// one level up: a daemon *restart* -- an update, a crash, a manual kill --
+/// must not close the user's window, because the daemon comes back, brings
+/// `bw serve` up on the same port and the window's next request succeeds. A
+/// **Quit** is not a restart. Nothing comes back. The quit handler has just
+/// killed `bw serve`, cleared the vault cache, the breach results and the
+/// clipboard, precisely so that nothing decrypted outlives the moment the user
+/// said to go away -- and a vault window left running is a process still
+/// showing that user's entire decrypted vault, on screen, with no app behind
+/// it and no auto-lock timer that means anything any more. Leaving it is the
+/// one case where the loose coupling stops being a feature.
+///
+/// The cost is an edit in progress in that window, which is why this is not
+/// reached from anything but the tray's *Quit*.
+pub fn farewell_to_an_open_window(reason: DaemonExit, open: Option<u32>) -> Farewell {
+    match (reason, open) {
+        (DaemonExit::UserQuit, Some(pid)) => Farewell::CloseIt { pid },
+        _ => Farewell::NothingOpen,
+    }
+}
+
+/// Why the daemon is going away. See [`farewell_to_an_open_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonExit {
+    /// The tray's *Quit*: the user asked for the app to be gone.
+    UserQuit,
+    /// The process is ending and expects to be back -- an update swapping the
+    /// binary, or a crash. The window stays up.
+    Restart,
+}
+
 /// **The vault window's six daemon-actionable outcomes**, as they cross the
 /// process boundary.
 ///
@@ -473,6 +518,33 @@ mod tests {
             UiOpenDecision::FocusTheOpenOne { pid: 4242 },
             "two vault windows on one vault is two editors of the same records; the second              request brings the first window forward"
         );
+    }
+
+    #[test]
+    fn quitting_closes_the_vault_window_rather_than_leaving_it_showing_the_vault() {
+        assert_eq!(
+            farewell_to_an_open_window(DaemonExit::UserQuit, Some(4242)),
+            Farewell::CloseIt { pid: 4242 },
+            "the quit handler kills bw serve and clears the cache, the breach results and \
+             the clipboard so that nothing decrypted outlives the moment the user said to \
+             go away. A vault window left running is that user's whole decrypted vault, on \
+             screen, with no app behind it"
+        );
+    }
+
+    #[test]
+    fn a_restart_leaves_the_window_alone_because_the_daemon_is_coming_back() {
+        assert_eq!(
+            farewell_to_an_open_window(DaemonExit::Restart, Some(4242)),
+            Farewell::NothingOpen,
+            "an update or a crash must not close the user's open window mid-edit; that is \
+             the whole reason the child is not in the kill-on-close job"
+        );
+    }
+
+    #[test]
+    fn a_quit_with_no_window_open_has_nothing_to_close() {
+        assert_eq!(farewell_to_an_open_window(DaemonExit::UserQuit, None), Farewell::NothingOpen);
     }
 
     #[test]
