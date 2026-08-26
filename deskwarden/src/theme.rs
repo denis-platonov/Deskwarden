@@ -2195,6 +2195,25 @@ fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
 ///
 /// Square at the strip's own control height, so its hit target matches the
 /// 34px buttons beside it rather than being only as big as the mark.
+///
+/// # Its OFF state used to rest at `TEXT_FAINT`, and that was overshooting
+///
+/// Reported as "star on details page doesn't look as bold as the rest", and
+/// the report is right: [`kebab_button`], [`send_record_button`],
+/// [`add_totp_button`] and [`close_pane_button`] all rest at
+/// [`TEXT_SECONDARY`], and the star was the one control on the strip resting
+/// a shade paler than the rest of it, even though every mark here shares the
+/// same [`ICON_STROKE`]/[`STAR_STROKE`] weight -- so what read as "not as
+/// bold" was colour, not weight.
+///
+/// The old reasoning was "the star's fainter grey is the colour of a toggle
+/// that is OFF" -- see the note that reasoning left on
+/// [`send_record_button`] and [`close_pane_button`] -- and that is being
+/// overruled here, not silently dropped: a favourite that is off is still a
+/// live, always-clickable control sitting in a strip of live, always-
+/// clickable controls, and the strip reading as one weight of ink matters
+/// more than marking "off" with a second shade the rest of the strip does
+/// not use anywhere else.
 pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
@@ -2208,7 +2227,7 @@ pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
     } else if response.hovered() {
         INK
     } else {
-        TEXT_FAINT
+        TEXT_SECONDARY
     };
     paint_star(ui, rect.center(), STAR_OUTER, on, color);
     response
@@ -2271,8 +2290,9 @@ pub fn send_record_button(ui: &mut Ui) -> Response {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // The kebab's resting grey, not the star's: this is an action, and the
-    // star's fainter TEXT_FAINT is the colour of a toggle that is OFF.
+    // The strip's resting grey, TEXT_SECONDARY -- the star now rests here
+    // too; see the note on `star_toggle`'s doc for why its old, fainter
+    // resting colour was retired.
     let color = if response.hovered() { INK } else { TEXT_SECONDARY };
     let stroke = Stroke::new(ICON_STROKE, color);
     let c = rect.center();
@@ -2335,9 +2355,11 @@ pub fn send_record_button(ui: &mut Ui) -> Response {
 /// it only cost legibility on the one control that is on every detail pane.
 ///
 /// So it rests where its siblings rest, and darkens to [`INK`] on hover as
-/// they do. The favourite star's [`TEXT_FAINT`] is not the reference: that is
-/// the colour of a TOGGLE THAT IS OFF, and this is an action, which is the
-/// same distinction [`send_record_button`] makes in its own body.
+/// they do. (The favourite star used to rest a shade fainter, on the theory
+/// that [`TEXT_FAINT`] was the colour of a TOGGLE THAT IS OFF; see the note
+/// on [`star_toggle`]'s doc for why that no longer holds -- the star rests
+/// at [`TEXT_SECONDARY`] too now, so this control has no fainter sibling
+/// left to be confused with.)
 ///
 /// It still has no armed state, because closing a pane is undone by clicking
 /// the row again.
@@ -2389,9 +2411,9 @@ pub fn close_pane_button(ui: &mut Ui) -> Response {
 /// [`the_clock_codepoints_are_not_carried_by_this_apps_own_typeface`], which
 /// records both halves, and [`folder_mark`], where the same trap was found.
 ///
-/// The hover ink is [`send_record_button`]'s and not [`star_toggle`]'s: this
-/// is an action, and the star's fainter resting grey is the colour of a
-/// toggle that is OFF.
+/// The hover ink is [`send_record_button`]'s: the strip's own [`INK`] on
+/// hover, [`TEXT_SECONDARY`] at rest -- the same resting grey [`star_toggle`]
+/// now uses too.
 pub fn add_totp_button(ui: &mut Ui) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
@@ -4640,6 +4662,29 @@ mod drawn_icon_family_tests {
                 "the {on} star is being reported as an envelope"
             );
         }
+    }
+
+    /// **The star's OFF state rests at the strip's own resting grey, not a
+    /// fainter one.**
+    ///
+    /// Reported as "star on details page doesn't look as bold as the rest".
+    /// Of the strip's five controls, four -- [`kebab_button`],
+    /// [`send_record_button`], [`add_totp_button`] and [`close_pane_button`]
+    /// -- rest at [`TEXT_SECONDARY`]; only the star rested at the paler
+    /// [`TEXT_FAINT`], which is what read as thinner even though every mark
+    /// here shares the same [`ICON_STROKE`]/[`STAR_STROKE`] weight -- the
+    /// difference was colour, not weight.
+    #[test]
+    fn the_off_star_rests_at_the_strips_own_grey_not_a_fainter_one() {
+        let (_, marks) = control(|ui| star_toggle(ui, false));
+        let stars = icon_probe::stars(&egui::Shape::Vec(marks));
+        assert_eq!(stars.len(), 1, "star_toggle(false) painted no star");
+        assert_eq!(
+            stars[0].stroke, TEXT_SECONDARY,
+            "the off star rests at {:?}, not the strip's own resting grey \
+             ({:?}) that the kebab, envelope, clock and close mark share",
+            stars[0].stroke, TEXT_SECONDARY
+        );
     }
 
     /// The detail header's five controls, each drawn alone, in the order the
