@@ -221,6 +221,50 @@ pub fn own_window_titled(title: &str) -> Option<isize> {
     win32::own_windows().into_iter().find(|w| w.title == title).map(|w| w.hwnd)
 }
 
+/// Bring **another process's** window to the front.
+///
+/// The daemon spawned the vault window as `deskwarden.exe --ui vault`, so the
+/// window the user is asking for again is not one of this process's windows
+/// at all -- [`raise_this_process`] would find nothing and report
+/// [`Raised::NoWindow`]. Everything else is identical: the same `pick`, the
+/// same restore-then-activate-then-flash sequence in [`raise_on`], and the
+/// same reading of a refusal as a documented outcome rather than an error.
+///
+/// `Target::Any` because the daemon has no business knowing what the UI
+/// process titled its window -- the process id is the whole of what it holds,
+/// and it is the same id the child's result file is named by.
+pub fn raise_process(pid: u32) -> Raised {
+    raise_on(&ProcessDesktop { pid }, Target::Any)
+}
+
+/// [`Win32Desktop`] pointed at somebody else's process. Only `own_windows`
+/// differs; a handle is a handle once it has been found.
+pub struct ProcessDesktop {
+    pub pid: u32,
+}
+
+impl Desktop for ProcessDesktop {
+    fn own_windows(&self) -> Vec<OwnWindow> {
+        win32::windows_of(self.pid)
+    }
+
+    fn foreground(&self) -> isize {
+        win32::foreground()
+    }
+
+    fn restore(&self, hwnd: isize) {
+        win32::restore(hwnd);
+    }
+
+    fn set_foreground(&self, hwnd: isize) -> bool {
+        win32::set_foreground(hwnd)
+    }
+
+    fn flash(&self, hwnd: isize) {
+        win32::flash(hwnd);
+    }
+}
+
 /// The real desktop. Thin wrappers only: every decision is in [`raise_on`].
 pub struct Win32Desktop;
 
@@ -260,11 +304,31 @@ mod win32 {
     };
 
     pub fn own_windows() -> Vec<OwnWindow> {
-        let mut out: Vec<OwnWindow> = Vec::new();
+        windows_of(unsafe { GetCurrentProcessId() })
+    }
+
+    /// The top-level windows of one process, named by id.
+    ///
+    /// `own_windows` is this with our own id, which is how it stays the one
+    /// enumeration: the "belongs to us" filter was never anything but a pid
+    /// comparison, and the daemon now has a second pid it legitimately wants
+    /// the windows of -- the UI process it spawned.
+    pub fn windows_of(pid: u32) -> Vec<OwnWindow> {
+        let mut collected = Collecting { pid, out: Vec::new() };
         unsafe {
-            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut out as *mut Vec<OwnWindow> as isize));
+            let _ = EnumWindows(
+                Some(enum_proc),
+                LPARAM(&mut collected as *mut Collecting as isize),
+            );
         }
-        out
+        collected.out
+    }
+
+    /// What `enum_proc` is handed: which process to keep, and where to put
+    /// what it kept.
+    struct Collecting {
+        pid: u32,
+        out: Vec<OwnWindow>,
     }
 
     /// Collects this process's top-level windows. The *only* filter applied
@@ -275,9 +339,11 @@ mod win32 {
         // Every return is "keep enumerating"; there is no early stop.
         const CONTINUE: BOOL = BOOL(1);
 
+        let collecting = &mut *(lparam.0 as *mut Collecting);
+
         let mut owner_pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut owner_pid));
-        if owner_pid == 0 || owner_pid != GetCurrentProcessId() {
+        if owner_pid == 0 || owner_pid != collecting.pid {
             return CONTINUE;
         }
 
@@ -292,8 +358,7 @@ mod win32 {
 
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
-        let out = &mut *(lparam.0 as *mut Vec<OwnWindow>);
-        out.push(OwnWindow {
+        collecting.out.push(OwnWindow {
             hwnd: hwnd.0 as isize,
             title,
             visible: IsWindowVisible(hwnd).as_bool(),

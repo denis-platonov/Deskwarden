@@ -145,6 +145,74 @@ pub fn spawn_out_of_any_job<T>(
     }
 }
 
+/// **What the daemon does with one `try_wait` answer**, decided where a test
+/// can watch it.
+///
+/// The daemon's loop asks the open UI child once per iteration and must never
+/// block on it: a loop that blocks is a `CTRL+ALT+B` that sits on the hotkey
+/// channel until the window closes and then fills the wrong window, which is
+/// the defect this whole step exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reap {
+    /// Still running. The slot stays occupied and the one-window rule keeps
+    /// holding.
+    Keep,
+    /// The child is gone, and this is what it exited with -- `None` when
+    /// Windows gave no code at all.
+    Take { code: Option<i32> },
+}
+
+/// `try_wait`'s three answers, mapped onto the two things the daemon can do.
+///
+/// **An `Err` reaps.** `try_wait` fails when the handle is no longer a child
+/// this process can wait on -- it was already reaped, or the handle is
+/// invalid. Keeping the slot on that answer would leave the daemon believing
+/// a window is open forever, and under the one-window rule that is an *Open
+/// Vault* that can never open another one again for the life of the process.
+/// So the failure is treated as "gone", with no exit code, which is exactly
+/// what a killed child means anyway.
+///
+/// Taking `Result<Option<Option<i32>>, ()>`-shaped data rather than a
+/// `std::process::Child` is what makes this reachable at all: an
+/// `ExitStatus` cannot be constructed in a test on Windows, and a `Child`
+/// cannot be had without starting a process.
+pub fn reap_step(answer: Result<Option<Option<i32>>, ()>) -> Reap {
+    match answer {
+        Ok(None) => Reap::Keep,
+        Ok(Some(code)) => Reap::Take { code },
+        Err(()) => Reap::Take { code: None },
+    }
+}
+
+/// **One window per surface**, decided where a test can watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiOpenDecision {
+    /// Nothing is open for this surface; start one.
+    Spawn,
+    /// One is already open. Bring *that* one forward; do not start a second.
+    FocusTheOpenOne { pid: u32 },
+}
+
+/// Whether a request for a surface starts a process or focuses the one that
+/// is already there.
+///
+/// With the daemon's loop live while a window is open, the tray's *Open
+/// Vault* is clickable again the moment the first one appears -- which the
+/// blocking version made impossible and therefore never had to answer. Two
+/// vault windows on the same vault is two things that must agree, on the
+/// surface that edits it.
+///
+/// `already_open` is the child's process id, which is the daemon's whole
+/// record that a window exists: it is what the spawn returned, it is what the
+/// result file is named by, and it is what the focus below is aimed at. There
+/// is no second registry to disagree with it.
+pub fn open_decision(already_open: Option<u32>) -> UiOpenDecision {
+    match already_open {
+        Some(pid) => UiOpenDecision::FocusTheOpenOne { pid },
+        None => UiOpenDecision::Spawn,
+    }
+}
+
 /// **The vault window's six daemon-actionable outcomes**, as they cross the
 /// process boundary.
 ///
@@ -366,6 +434,44 @@ mod tests {
             attempts, 1,
             "a missing executable is not a job problem; retrying without breakaway would \
              fail identically and hide the real error behind the wrong one"
+        );
+    }
+
+    #[test]
+    fn a_running_child_is_left_alone() {
+        assert_eq!(reap_step(Ok(None)), Reap::Keep);
+    }
+
+    #[test]
+    fn an_exited_child_is_reaped_with_its_code() {
+        assert_eq!(reap_step(Ok(Some(Some(9)))), Reap::Take { code: Some(9) });
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_waited_on_is_still_reaped() {
+        assert_eq!(
+            reap_step(Err(())),
+            Reap::Take { code: None },
+            "a handle that can no longer be waited on means the window is gone. Kept, the              daemon believes one is open forever and the one-window rule then refuses every              later Open Vault for the life of the process"
+        );
+    }
+
+    #[test]
+    fn a_child_killed_without_a_code_is_reaped_too() {
+        assert_eq!(reap_step(Ok(Some(None))), Reap::Take { code: None });
+    }
+
+    #[test]
+    fn a_surface_with_nothing_open_spawns() {
+        assert_eq!(open_decision(None), UiOpenDecision::Spawn);
+    }
+
+    #[test]
+    fn a_surface_that_is_already_open_is_focused_rather_than_opened_again() {
+        assert_eq!(
+            open_decision(Some(4242)),
+            UiOpenDecision::FocusTheOpenOne { pid: 4242 },
+            "two vault windows on one vault is two editors of the same records; the second              request brings the first window forward"
         );
     }
 
