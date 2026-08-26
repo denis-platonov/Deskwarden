@@ -57,18 +57,60 @@ worry is not this path but the third one nobody has found.
 
 **Two binaries in one workspace, sharing one library crate.**
 
-* **`deskwarden.exe`** -- tray, global hotkey, match engine, the vault backend
-  (`bw serve` or direct REST), and the bare-Win32 surfaces: unlock prompt,
-  account picker, prompt card, locked card, save-login card, generator card,
-  send preflight. **Does not depend on `eframe` at all.**
-* **`deskwarden-ui.exe`** -- the vault window, Preferences, the sequence
-  editor, rehearsal. Depends on `eframe`. Pays the ~90-115 MB while open and
-  **exits when its window closes**, which is the only mechanism that returns
-  the driver's memory.
+* **`deskwarden-tray.exe`** -- tray, global hotkey, match engine, the vault
+  backend (`bw serve` or direct REST), and the bare-Win32 surfaces: unlock
+  prompt, account picker, prompt card, locked card, save-login card, generator
+  card, send preflight. **Does not depend on `eframe` at all.**
+* **`deskwarden.exe`** -- the vault window, Preferences, the sequence editor,
+  rehearsal. Depends on `eframe`. Pays the ~90-115 MB while open and **exits
+  when its window closes**, which is the only mechanism that returns the
+  driver's memory.
 
 The guarantee is structural: a binary that does not link `eframe` cannot load
-`nvoglv64.dll`, whatever a future edit to `main.rs` says. The rule stops being
-a rule.
+`nvoglv64.dll`, whatever a future edit says. The rule stops being a rule.
+
+### The names are this way round on purpose
+
+The first draft of this document had them swapped -- the tray as plain
+`deskwarden.exe` and the window as `deskwarden-ui.exe` -- on the reasoning
+that the daemon is the long-lived process and therefore the main one. That is
+an implementer's view of the system and not a user's.
+
+**`deskwarden.exe` is what a person double-clicks**, what a Start Menu
+shortcut points at, and what they look for in Task Manager when they want to
+know what the app is doing. Giving that name to a process which by design
+shows no window would mean the file called "Deskwarden" is the one that never
+looks like Deskwarden. The background piece takes the qualified name, because
+it is the one that needs explaining.
+
+It also keeps the shape the user already has: today `deskwarden.exe` opens the
+window when double-clicked, and after this change it still does. Nothing a
+user does by hand has to be relearned.
+
+**The cost of this choice is paid by existing installs, and it must not be
+paid silently.** Two things on disk already name `deskwarden.exe` and expect
+it to be the daemon:
+
+* **The autostart registry value.** `installer/deskwarden.iss:133` writes
+  `HKCU\...\CurrentVersion\Run\Deskwarden` as
+  `"{app}\deskwarden.exe" --autostart`. After the flip that value launches the
+  **window** binary with a flag meaning "stay in the tray" -- an app that opens
+  nothing at login and holds no tray icon, which is indistinguishable from
+  Deskwarden being broken. The upgrade has to rewrite that value to point at
+  `deskwarden-tray.exe`, and the rewrite has to happen for users who installed
+  before the split, not only for fresh installs.
+* **`--autostart` on the window binary must be answered, not ignored.** Even
+  with the registry rewritten, an old value can survive an interrupted
+  upgrade, and a user may have made their own shortcut. The window binary
+  therefore has to recognise the flag it no longer implements and hand off to
+  the tray binary rather than treat it as an unknown argument. `main.rs:9508`
+  already shows this file thinking carefully about how a login command line is
+  parsed; this is one more case for it.
+
+**The self-update replaces the binary it is running from**, which after the
+flip is not the same file as the one holding the app mutex. That is the same
+atomicity requirement stated under costs below, seen from the other end, and
+it is the reason the updater work gates this design rather than following it.
 
 ### What does NOT become a process, and why
 
@@ -108,14 +150,14 @@ itself asked to stand down. That was not reproduced, and it is not being
 claimed here as the same bug. It is offered as the shape of what this
 arrangement makes possible.
 
-A separate `deskwarden-ui.exe` does not contain the takeover, the app mutex
+A separate `deskwarden.exe` does not contain the takeover, the app mutex
 ownership, or `first_surface`. It cannot retire a daemon by any code path,
 because the code is not in it.
 
 ## What has to move
 
 **The startup window becomes a spawn.** On `FirstSurface::ShowTheWindow` the
-daemon spawns `deskwarden-ui.exe` rather than building the frame in-process.
+daemon spawns `deskwarden.exe` rather than building the frame in-process.
 Three things about that:
 
 * **The spinner stage moves with it.** The "one window: spinner, then vault"
@@ -176,10 +218,12 @@ The house defect is "a test that passes because it never reached the thing it
 names", and this design's whole claim is about something that *cannot* happen,
 which is the hardest kind of claim to test. So:
 
-* **The linker is the primary assertion.** `deskwarden.exe` must not depend on
-  `eframe`. A dependency-graph check in `job_object.rs`'s idiom -- read
-  `Cargo.toml`, not a list somebody maintains -- fails the day someone adds it
-  back.
+* **The linker is the primary assertion.** `deskwarden-tray.exe` must not
+  depend on `eframe`. A dependency-graph check in `job_object.rs`'s idiom --
+  read `Cargo.toml`, not a list somebody maintains -- fails the day someone
+  adds it back. Note the direction: it is the **tray** binary that is
+  constrained, and after the naming flip that is the one with the qualified
+  name, which is exactly the sort of detail a later reader gets backwards.
 * **A module-load check on the daemon.** After exercising the whole fill path
   and a startup, the daemon's loaded modules must not include `opengl32.dll`
   or `nvoglv64.dll`. This is the assertion that would have caught the defect
