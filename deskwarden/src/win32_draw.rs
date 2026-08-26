@@ -12,7 +12,8 @@
 use crate::app_candidates::Candidate;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetTextExtentPoint32W, Polygon, RoundRect,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, GetStockObject,
+    GetTextExtentPoint32W, HBRUSH, NULL_BRUSH, Polygon, Polyline, RoundRect,
     ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DT_CENTER,
     DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
@@ -415,6 +416,93 @@ pub fn draw_card_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT, tracking:
         DrawTextW(hdc, &mut chars, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         SetTextCharacterExtra(hdc, 0);
         SelectObject(hdc, old);
+    }
+}
+
+/// **One field mark, drawn into a row's square gutter.**
+///
+/// The geometry is [`crate::theme::field_mark_paths`]'s and none of this
+/// function's: the marks are strokes in one artboard, and what happens here is
+/// the artboard-to-device conversion and the GDI calls, exactly as
+/// [`draw_mark`] does for the shield. That is what keeps the picker's second
+/// step reading the same palette file the rest of the app does.
+///
+/// `gutter` is the row's icon column in DEVICE pixels -- the same square
+/// `crate::picker_prompt` blends a favicon into on the step before, so the two
+/// lists line up -- and `scale` is the card's DPI percentage.
+///
+/// Every pen and brush it makes is selected out and deleted before it returns,
+/// including on the path where a mark has no paths at all: this runs on every
+/// hover of every row.
+pub fn draw_field_mark(hdc: HDC, gutter: RECT, mark: crate::theme::FieldMark, scale: i32) {
+    use crate::theme::{MarkPathKind, FIELD_MARK_ARTBOARD, FIELD_MARK_SIDE, FIELD_MARK_STROKE};
+    unsafe {
+        let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
+        let side = px(FIELD_MARK_SIDE);
+        let unit = side as f32 / FIELD_MARK_ARTBOARD;
+        let left = gutter.left + ((gutter.right - gutter.left) - side) / 2;
+        let top = gutter.top + ((gutter.bottom - gutter.top) - side) / 2;
+        let at = |q: eframe::egui::Pos2| POINT {
+            x: left + (q.x * unit).round() as i32,
+            y: top + (q.y * unit).round() as i32,
+        };
+
+        let ink = rgb(crate::theme::TEXT_SECONDARY);
+        // At least one pixel: a stroke that rounded to zero is a mark that
+        // simply is not there, which is worse than a heavy one.
+        let pen = CreatePen(PS_SOLID, (FIELD_MARK_STROKE * unit).round().max(1.0) as i32, ink);
+        let brush = CreateSolidBrush(ink);
+        let old_pen = SelectObject(hdc, pen);
+        let old_brush = SelectObject(hdc, brush);
+
+        for shape in crate::theme::field_mark_shapes(mark) {
+            match shape {
+                // A real ellipse, not a sampled ring: a circle flattened to
+                // points and rounded to whole pixels at a 3-unit radius comes
+                // out an octagon, which is what the first render of these
+                // marks showed. `Ellipse` fills with the selected brush, so a
+                // stroked ring selects the stock hollow one for the call and
+                // puts the ink brush straight back -- there is nothing to
+                // delete, because a stock object is not ours.
+                crate::theme::MarkShape::Circle { centre, radius, filled } => {
+                    let c = at(*centre);
+                    let r = (radius * unit).round().max(1.0) as i32;
+                    if *filled {
+                        let _ = Ellipse(hdc, c.x - r, c.y - r, c.x + r, c.y + r);
+                    } else {
+                        let hollow = HBRUSH(GetStockObject(NULL_BRUSH).0);
+                        let previous = SelectObject(hdc, hollow);
+                        let _ = Ellipse(hdc, c.x - r, c.y - r, c.x + r, c.y + r);
+                        SelectObject(hdc, previous);
+                    }
+                }
+                crate::theme::MarkShape::Path { points, kind } => {
+                    let mut device: Vec<POINT> = points.iter().map(|q| at(*q)).collect();
+                    if device.len() < 2 {
+                        continue;
+                    }
+                    match kind {
+                        MarkPathKind::Filled => {
+                            let _ = Polygon(hdc, &device);
+                        }
+                        MarkPathKind::Closed => {
+                            // Stroked and closed, rather than `Polygon`,
+                            // which would FILL it.
+                            device.push(device[0]);
+                            let _ = Polyline(hdc, &device);
+                        }
+                        MarkPathKind::Open => {
+                            let _ = Polyline(hdc, &device);
+                        }
+                    }
+                }
+            }
+        }
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
     }
 }
 

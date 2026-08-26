@@ -1571,6 +1571,202 @@ pub const CARD_HEADER_TRACKING: f32 = 1.1;
 /// against this pair rather than against two copies of 24 and 28.
 pub const MARK_ARTBOARD: (f32, f32) = (24.0, 28.0);
 
+// ---------------------------------------------------------------------------
+// The field marks: one drawn icon per kind of thing the picker can type.
+//
+// STROKES, NOT GLYPHS, for the reason the detail pane's star, kebab, eye and
+// clock are strokes: a mark out of a fallback face nobody here chose brings
+// its own weight, optical size and baseline next to controls measured from
+// the design. These are drawn a second time over: the account picker is bare
+// Win32 with no egui anywhere on its path, so an `egui::Shape` would not
+// reach it at all -- what crosses that line is geometry, exactly as
+// [`quadrant_outlines`] already does for the shield.
+//
+// Points only, in one square artboard, with a kind saying how each path is to
+// be laid down. `win32_draw::draw_field_mark` scales them into device pixels
+// and strokes them with GDI; nothing here knows what a renderer is.
+// ---------------------------------------------------------------------------
+
+/// **The field marks' artboard**, a square. Every path below is drawn in
+/// `0.0..FIELD_MARK_ARTBOARD` on both axes, so a caller fitting a mark into a
+/// box scales against this one number.
+pub const FIELD_MARK_ARTBOARD: f32 = 20.0;
+
+/// The drawn side of a field mark inside a row's square gutter.
+///
+/// Smaller than the 24px a favicon is blended at, deliberately: a favicon is
+/// a picture with its own padding baked in, and a stroked mark drawn to the
+/// same 24 reads as the louder of the two. 20 puts this family's ink at the
+/// optical weight of the artwork it sits beside in the step before.
+pub const FIELD_MARK_SIDE: f32 = 20.0;
+
+/// The field marks' stroke, in artboard units.
+///
+/// Heavier than [`ICON_STROKE`]'s 1.3 because these are drawn at 20px rather
+/// than the detail strip's 34, and a 1.3 stroke on a 20px mark beside 13px
+/// Archivo Medium reads as a hairline sketch next to the row's own name.
+pub const FIELD_MARK_STROKE: f32 = 1.4;
+
+/// Which mark a row carries. One per kind of thing the picker can type, plus
+/// the sequence that runs several of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldMark {
+    /// A bust: the username.
+    Person,
+    /// A key: the password.
+    Key,
+    /// A clock face: the one-time code, which is the only field that expires.
+    Clock,
+    /// An arrow into a stop: *username, Tab, password*, which is the only
+    /// offer that types a key rather than a value.
+    TabArrow,
+    /// A run of steps: the item's own saved sequence.
+    Steps,
+    /// A luggage tag: a custom field, which is the only one whose name the
+    /// user chose.
+    Tag,
+}
+
+/// How one path of a mark is laid down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkPathKind {
+    /// Stroked from the first point to the last and no further.
+    Open,
+    /// Stroked and closed back onto its first point.
+    Closed,
+    /// Filled, and closed.
+    Filled,
+}
+
+/// One piece of one mark, in artboard coordinates.
+///
+/// **A circle is its own variant rather than a sampled path**, and that is
+/// not a nicety: a ring flattened to twenty-four points and then rounded to
+/// whole device pixels at a 3-unit radius comes out an octagon, which is
+/// exactly what the first render of these marks showed. A renderer with a
+/// real ellipse primitive -- GDI has one, egui has one -- draws the circle it
+/// was asked for at any size.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkShape {
+    /// A run of points, stroked or filled per [`MarkPathKind`].
+    Path { points: Vec<Pos2>, kind: MarkPathKind },
+    /// A circle, stroked when `filled` is false and filled when it is true.
+    Circle { centre: Pos2, radius: f32, filled: bool },
+}
+
+/// A stroked ring.
+fn mark_ring(cx: f32, cy: f32, r: f32) -> MarkShape {
+    MarkShape::Circle { centre: Pos2::new(cx, cy), radius: r, filled: false }
+}
+
+/// A filled dot.
+fn mark_dot(cx: f32, cy: f32, r: f32) -> MarkShape {
+    MarkShape::Circle { centre: Pos2::new(cx, cy), radius: r, filled: true }
+}
+
+/// An arc, open, from `from` to `to` radians. Sampled rather than a
+/// [`MarkShape::Circle`], because it is not one: no renderer here draws a
+/// partial ellipse the same way twice.
+fn mark_arc(cx: f32, cy: f32, r: f32, from: f32, to: f32, steps: usize) -> MarkShape {
+    let points = (0..=steps)
+        .map(|i| {
+            let t = from + (to - from) * i as f32 / steps as f32;
+            Pos2::new(cx + r * t.cos(), cy + r * t.sin())
+        })
+        .collect();
+    MarkShape::Path { points, kind: MarkPathKind::Open }
+}
+
+fn mark_line(x0: f32, y0: f32, x1: f32, y1: f32) -> MarkShape {
+    MarkShape::Path {
+        points: vec![Pos2::new(x0, y0), Pos2::new(x1, y1)],
+        kind: MarkPathKind::Open,
+    }
+}
+
+/// **Every piece of one mark**, in [`FIELD_MARK_ARTBOARD`] coordinates.
+///
+/// Built once and kept, for [`quadrant_outlines`]'s reason: the geometry is a
+/// compile-time constant in all but name -- it only needs float arithmetic a
+/// `const` cannot do -- and the caller is a repaint path that runs on every
+/// hover.
+pub fn field_mark_shapes(mark: FieldMark) -> &'static [MarkShape] {
+    static SHAPES: OnceLock<[Vec<MarkShape>; 6]> = OnceLock::new();
+    let all = SHAPES.get_or_init(build_field_marks);
+    &all[match mark {
+        FieldMark::Person => 0,
+        FieldMark::Key => 1,
+        FieldMark::Clock => 2,
+        FieldMark::TabArrow => 3,
+        FieldMark::Steps => 4,
+        FieldMark::Tag => 5,
+    }]
+}
+
+fn build_field_marks() -> [Vec<MarkShape>; 6] {
+    use std::f32::consts::PI;
+    let p = Pos2::new;
+
+    // A bust. The head is a ring rather than a disc so that the mark holds
+    // the same amount of white as the key and the clock beside it, and the
+    // shoulders are a wide, shallow arc: a deeper one reads as a bowl the
+    // head is sitting in.
+    let person = vec![
+        mark_ring(10.0, 7.0, 3.8),
+        mark_arc(10.0, 19.4, 7.0, PI * 1.22, PI * 1.78, 16),
+    ];
+
+    // A key, bow left. Two teeth, because one reads as a lollipop.
+    let key = vec![
+        mark_ring(6.2, 10.0, 3.9),
+        mark_line(10.1, 10.0, 17.2, 10.0),
+        mark_line(13.2, 10.0, 13.2, 13.8),
+        mark_line(16.4, 10.0, 16.4, 12.9),
+    ];
+
+    // A clock at three o'clock, the reading that gives the two hands the
+    // largest angle a face can show -- `CLOCK_HOUR_HAND`'s argument, applied
+    // to a mark drawn by a different renderer.
+    let clock = vec![
+        mark_ring(10.0, 10.0, 6.5),
+        mark_line(10.0, 10.0, 10.0, 5.2),
+        mark_line(10.0, 10.0, 14.1, 10.0),
+    ];
+
+    // Tab: an arrow that runs into a stop. The head is FILLED, which is what
+    // tells it apart from the outlined marks either side of it at 20px.
+    let tab_arrow = vec![
+        mark_line(2.6, 10.0, 11.6, 10.0),
+        MarkShape::Path {
+            points: vec![p(11.0, 6.0), p(11.0, 14.0), p(15.6, 10.0)],
+            kind: MarkPathKind::Filled,
+        },
+        mark_line(17.4, 4.8, 17.4, 15.2),
+    ];
+
+    // A run of steps: three lines, each led by a filled dot. A saved sequence
+    // is the one offer that is a list of actions rather than a single value,
+    // and this is the shape of a list.
+    let mut steps = Vec::new();
+    for row in 0..3 {
+        let y = 5.2 + row as f32 * 4.8;
+        steps.push(mark_dot(4.2, y, 1.4));
+        steps.push(mark_line(8.0, y, 16.4, y));
+    }
+
+    // A luggage tag with its eyelet: the custom field, whose name is the
+    // user's own and whose contents this card knows nothing about.
+    let tag = vec![
+        MarkShape::Path {
+            points: vec![p(10.4, 2.6), p(17.4, 2.6), p(17.4, 9.6), p(9.6, 17.4), p(2.6, 10.4)],
+            kind: MarkPathKind::Closed,
+        },
+        mark_dot(14.2, 5.8, 1.35),
+    ];
+
+    [person, key, clock, tab_arrow, steps, tag]
+}
+
 /// The overlay/card header bar: 16px mark, letterspaced "DESKWARDEN", and a
 /// right-aligned status ("3 matches", the app name).
 pub fn card_header(ui: &mut Ui, right_text: &str) {
@@ -3521,6 +3717,95 @@ fn rule(ui: &mut Ui, color: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every field mark stays inside its own artboard**, ink included.
+    ///
+    /// The marks are scaled into a row's square gutter by the number
+    /// [`FIELD_MARK_ARTBOARD`] gives, so a point outside it is ink outside
+    /// the box -- on a card with no scrolling and a hard edge one row away,
+    /// that is a mark drawn over its neighbour's text. The stroke counts:
+    /// what is checked is the outline plus half of [`FIELD_MARK_STROKE`],
+    /// which is where a stroked path's ink actually lands.
+    #[test]
+    fn no_field_mark_paints_outside_its_artboard() {
+        let half = FIELD_MARK_STROKE / 2.0;
+        let mut seen = 0;
+        for mark in [
+            FieldMark::Person,
+            FieldMark::Key,
+            FieldMark::Clock,
+            FieldMark::TabArrow,
+            FieldMark::Steps,
+            FieldMark::Tag,
+        ] {
+            let shapes = field_mark_shapes(mark);
+            assert!(!shapes.is_empty(), "{mark:?} has no geometry at all, so its gutter is blank");
+            for shape in shapes {
+                let (lo, hi) = match shape {
+                    MarkShape::Circle { centre, radius, .. } => (
+                        Pos2::new(centre.x - radius - half, centre.y - radius - half),
+                        Pos2::new(centre.x + radius + half, centre.y + radius + half),
+                    ),
+                    MarkShape::Path { points, .. } => {
+                        assert!(points.len() >= 2, "{mark:?} carries a path of fewer than two points");
+                        let mut lo = Pos2::new(f32::MAX, f32::MAX);
+                        let mut hi = Pos2::new(f32::MIN, f32::MIN);
+                        for q in points {
+                            lo = Pos2::new(lo.x.min(q.x - half), lo.y.min(q.y - half));
+                            hi = Pos2::new(hi.x.max(q.x + half), hi.y.max(q.y + half));
+                        }
+                        (lo, hi)
+                    }
+                };
+                assert!(
+                    lo.x >= 0.0 && lo.y >= 0.0,
+                    "{mark:?} paints ink at ({}, {}), left of or above its artboard",
+                    lo.x,
+                    lo.y
+                );
+                assert!(
+                    hi.x <= FIELD_MARK_ARTBOARD && hi.y <= FIELD_MARK_ARTBOARD,
+                    "{mark:?} paints ink at ({}, {}), past its {FIELD_MARK_ARTBOARD}-unit \
+                     artboard -- in a row's gutter that is ink over the row beside it",
+                    hi.x,
+                    hi.y
+                );
+                seen += 1;
+            }
+        }
+        // CONTROL: the walk actually visited geometry, so the bounds above
+        // are not a loop over nothing.
+        assert!(seen >= 6, "control: only {seen} shapes were measured across all six marks");
+    }
+
+    /// **The six field marks are six different pictures.**
+    ///
+    /// They sit one under another in the same list, and two rows drawn with
+    /// the same mark would say the two offers are the same thing -- which is
+    /// exactly the confusion the marks were added to remove.
+    #[test]
+    fn no_two_field_marks_are_the_same_geometry() {
+        let all = [
+            FieldMark::Person,
+            FieldMark::Key,
+            FieldMark::Clock,
+            FieldMark::TabArrow,
+            FieldMark::Steps,
+            FieldMark::Tag,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    field_mark_shapes(*a),
+                    field_mark_shapes(*b),
+                    "{a:?} and {b:?} draw the same picture"
+                );
+            }
+        }
+        // CONTROL: a mark equals itself, so the comparison above is a real
+        // one and not `PartialEq` refusing to match anything.
+        assert_eq!(field_mark_shapes(FieldMark::Key), field_mark_shapes(FieldMark::Key));
+    }
 
     #[test]
     fn initials_take_the_first_letter_of_the_first_two_words() {

@@ -450,6 +450,33 @@ pub fn send_label(send: &Send) -> (String, &'static str) {
     }
 }
 
+/// **Which drawn mark a [`Send`] carries.**
+///
+/// The second step's rows are the same list, in the same gutter, as the first
+/// step's accounts -- which draw a favicon there -- so a text-only row read as
+/// a different kind of list and the two steps did not line up. Reported as
+/// "Username\\Password - I'd create icons for consistency".
+///
+/// A function beside [`send_label`] rather than a match at the paint site, for
+/// that function's reason: what a choice looks like is decided once, where
+/// what it is called is decided, and a test can read both without opening a
+/// window. The geometry itself is [`crate::theme::field_mark_shapes`]'s.
+pub fn send_mark(send: &Send) -> crate::theme::FieldMark {
+    use crate::theme::FieldMark;
+    match send {
+        // The only offer that types a KEY rather than a value, so the only
+        // one whose mark is a key rather than a thing.
+        Send::All => FieldMark::TabArrow,
+        Send::Sequence => FieldMark::Steps,
+        Send::Field(FieldRef::Username) => FieldMark::Person,
+        Send::Field(FieldRef::Password) => FieldMark::Key,
+        // The one field that expires, which is what a clock says and no other
+        // mark in this set does.
+        Send::Field(FieldRef::Totp) => FieldMark::Clock,
+        Send::Field(FieldRef::Custom(_)) => FieldMark::Tag,
+    }
+}
+
 /// What a [`Send`] is called **in a log line**, which is not what it is called
 /// on screen.
 ///
@@ -1159,6 +1186,22 @@ pub const SEARCH_SHORTCUT: &str = "S";
 /// what fires.
 pub const ESC_SHORTCUT: &str = "ESC";
 
+/// **The key that runs *Edit binding***, the second step's footer button.
+///
+/// `B`, for *binding*, and it is the only letter this card offers that is
+/// free: `S` is search and `N` is *New login*, both of which the second step
+/// deliberately does not carry -- see [`win32::search_control`] and
+/// [`win32::new_login_control`], which answer `None` there -- and `E` was not
+/// taken instead because the offer is not "edit" in general, it is *this
+/// binding*, and a card that grows a second editable thing would then have
+/// two claims on the same letter.
+///
+/// Offered **only in the second step**, for the same reason the button's own
+/// label changes there: in the first step that button is *New login*, and a
+/// key that silently edited a binding because the user expected a new login
+/// would be worse than one that did nothing at all.
+pub const EDIT_BINDING_SHORTCUT: &str = "B";
+
 /// The key shown on -- and accepted by -- the `index`th **candidate** row.
 ///
 /// `None` past the candidate cap, and that is the point: the row after the
@@ -1168,6 +1211,37 @@ pub const ESC_SHORTCUT: &str = "ESC";
 /// thing. Numbering is what the user sees: `1` is the topmost row as drawn.
 pub fn row_shortcut(index: usize) -> Option<String> {
     (index < ROW_CAP).then(|| format!("{}", index + 1))
+}
+
+/// The key shown on -- and accepted by -- the `index`th row of the **second**
+/// step, on a step showing `rows` of them.
+///
+/// **Measured against the rows that are actually there**, which is the same
+/// rule [`candidate_for_digit`] holds the first step to and for the same
+/// reason: every row of this step is an offer, so unlike the first step there
+/// is no *Search the vault* row a digit must be kept off -- but a digit past
+/// the end is still a promise the card cannot keep.
+///
+/// The second step is at most four rows ([`palette_rows`]: *Username + Tab +
+/// Password* and the three fields, or a saved sequence alone), so the nine
+/// digits are never the binding constraint here; the bound is written against
+/// `rows` anyway, because a cap that is slack today is not an argument.
+pub fn palette_shortcut(index: usize, rows: usize) -> Option<String> {
+    palette_for_digit(index as u32 + 1, rows).map(|at| format!("{}", at + 1))
+}
+
+/// **Which second-step row a digit chooses**, given how many are on screen.
+///
+/// [`candidate_for_digit`]'s twin, and deliberately written the same way: one
+/// place decides, read by the window's key handling and by the chip the row
+/// draws, so the key a row advertises and the key that fires cannot become two
+/// answers.
+pub fn palette_for_digit(digit: u32, rows: usize) -> Option<usize> {
+    if !(1..=9).contains(&digit) {
+        return None;
+    }
+    let index = digit as usize - 1;
+    (index < rows.min(LIST_ROWS)).then_some(index)
 }
 
 /// **Where the highlight goes** when search mode's `Down` or `Up` is pressed,
@@ -1333,7 +1407,8 @@ static SEARCH_SEL: AtomicIsize = AtomicIsize::new(0);
 mod win32 {
     use super::{
         Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, SearchResults, SearchRow,
-        APP_NAME, ENTRIES, ESC_SHORTCUT, GONE, LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST,
+        APP_NAME, EDIT_BINDING_SHORTCUT, ENTRIES, ESC_SHORTCUT, GONE, LIST_ROWS, MODE,
+        MODE_EMPTY, MODE_LIST,
         MODE_PALETTE, MODE_SEARCH, NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
         FIELD_RADIUS, FIELD_RING_RADIUS, FOCUS_RING_W, SEARCH_CAP, SEARCH_SEL, SEARCH_SHORTCUT,
         SEARCH_SHOWN, SEARCH_TOTAL, SHOWN,
@@ -1616,6 +1691,16 @@ mod win32 {
             }
             Some(Icon { bitmap, w: width as i32, h: height as i32 })
         }
+    }
+
+    /// **A row's icon gutter**: the square `win32_draw::draw_row` leaves blank
+    /// on the left, which it takes to be the row's own height.
+    ///
+    /// Derived here once because both lists draw into it -- the first step a
+    /// favicon, the second a field mark -- and the two lining up is the whole
+    /// of what was asked for.
+    fn gutter_of(rect: RECT) -> RECT {
+        RECT { right: rect.left + (rect.bottom - rect.top), ..rect }
     }
 
     /// Blends one icon into the row's gutter, centred and square.
@@ -2048,22 +2133,36 @@ mod win32 {
         // their ASCII values, which is what makes these comparisons honest.
         const DIGIT_1: u16 = b'1' as u16;
         const DIGIT_9: u16 = b'9' as u16;
+        const LETTER_B: u16 = b'B' as u16;
         const LETTER_N: u16 = b'N' as u16;
         const LETTER_S: u16 = b'S' as u16;
         if (DIGIT_1..=DIGIT_9).contains(&vk) {
             let digit = (vk - DIGIT_1 + 1) as u32;
-            // **Only the first step numbers its rows.** `MODE_PALETTE`'s rows
-            // are fields of one account and `MODE_EMPTY`'s are two offers, and
-            // neither was asked for. Search mode never reaches here at all --
-            // its digits are characters, and `next` is what keeps them so.
-            //
-            // The count is the CANDIDATE rows', never the drawn rows': no
-            // digit can land on the *Search the vault* row.
-            if MODE.load(Ordering::SeqCst) == MODE_LIST {
+            // **Both steps number their rows now**, by two rules rather than
+            // one shared one, because the two lists are not the same shape:
+            // the first step's count is the CANDIDATE rows' and never the
+            // drawn rows', so no digit can land on the *Search the vault* row,
+            // while every row of the second step is an offer and the count is
+            // simply how many there are. `MODE_EMPTY`'s two rows carry their
+            // own letters instead, and search mode never reaches here at all
+            // -- its digits are characters, and `next` is what keeps them so.
+            let mode = MODE.load(Ordering::SeqCst);
+            if mode == MODE_LIST {
                 let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
                 if let Some(index) = super::candidate_for_digit(digit, shown) {
                     clicked(ID_ROW + index);
                 }
+            } else if mode == MODE_PALETTE {
+                let rows = ENTRIES.lock().map(|e| e.len()).unwrap_or(0);
+                if let Some(index) = super::palette_for_digit(digit, rows) {
+                    clicked(ID_ROW + index);
+                }
+            }
+            return true;
+        }
+        if vk == LETTER_B {
+            if let Some(id) = edit_binding_control() {
+                clicked(id);
             }
             return true;
         }
@@ -2184,6 +2283,17 @@ mod win32 {
                 .map(|index| ID_ROW + index),
             _ => None,
         }
+    }
+
+    /// Which control *Edit binding* is on in the step that is showing, or
+    /// `None` where the card does not offer it.
+    ///
+    /// [`new_login_control`]'s exact counterpart, and the two are disjoint on
+    /// purpose: the footer's one button is *New login* in every step but the
+    /// second and *Edit binding* only there, so a letter that fired in the
+    /// wrong step would run the offer the user was not looking at.
+    fn edit_binding_control() -> Option<usize> {
+        (MODE.load(Ordering::SeqCst) == MODE_PALETTE).then_some(ID_SECONDARY)
     }
 
     fn take_pending() -> Option<Event> {
@@ -2992,13 +3102,24 @@ mod win32 {
                     // letter the user is typing there, so the key does not
                     // fire and a chip promising it would be a lie. `ESC` is
                     // not dropped, because Escape still cancels in every mode.
+                    // The footer's other button carries whichever key runs
+                    // the offer it is showing: `N` for *New login*, `B` for
+                    // *Edit binding* in the second step -- the button that had
+                    // no key at all until it was asked for. Both are read off
+                    // the same `MODE` the label is, so the chip cannot outlive
+                    // the offer it names. In search mode the chip is dropped:
+                    // `N` is a letter the user is typing there, so the key
+                    // does not fire and a chip promising it would be a lie.
+                    // `ESC` is never dropped, because Escape cancels in every
+                    // mode.
                     let hint = if id == ID_CANCEL {
                         Some(ESC_SHORTCUT)
+                    } else if id != ID_SECONDARY || in_search() {
+                        None
+                    } else if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
+                        Some(EDIT_BINDING_SHORTCUT)
                     } else {
-                        (id == ID_SECONDARY
-                            && MODE.load(Ordering::SeqCst) != MODE_PALETTE
-                            && !in_search())
-                        .then_some(NEW_LOGIN_SHORTCUT)
+                        Some(NEW_LOGIN_SHORTCUT)
                     }
                     .map(|text| (text, fonts.hint));
                     let dpi = DPI_PERCENT.load(Ordering::SeqCst);
@@ -3147,14 +3268,24 @@ mod win32 {
             return;
         }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
+            let rows = ENTRIES.lock().map(|e| e.len()).unwrap_or(0);
             let Some(send) = ENTRIES.lock().ok().and_then(|e| e.get(index).cloned()) else {
                 return;
             };
             let (name, says) = super::send_label(&send);
             let row = Candidate { id: String::new(), name, username: says.to_string() };
-            // No hint: the second step's rows are not numbered -- see
-            // `shortcut`.
-            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
+            // **The digit is drawn on the row it runs**, the same chip and the
+            // same painter the first step's candidates carry. It used to say
+            // nothing at all and this step took no digits either; both halves
+            // moved together, so the chip is never a promise `shortcut` does
+            // not keep -- `super::palette_for_digit` is the one rule both read.
+            let shortcut = super::palette_shortcut(index, rows);
+            let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
+            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, hint, dpi);
+            // The gutter `draw_row` leaves blank -- the same square the step
+            // before blends a favicon into, which is what makes the two lists
+            // line up rather than merely both being lists.
+            crate::win32_draw::draw_field_mark(hdc, gutter_of(rect), super::send_mark(&send), dpi);
             return;
         }
 
@@ -3169,13 +3300,7 @@ mod win32 {
             // The gutter `draw_row` deliberately leaves blank.
             if let Ok(icons) = ICONS.lock() {
                 if let Some(Some(icon)) = icons.get(index) {
-                    let gutter = RECT {
-                        left: rect.left,
-                        top: rect.top,
-                        right: rect.left + (rect.bottom - rect.top),
-                        bottom: rect.bottom,
-                    };
-                    draw_icon(hdc, gutter, icon);
+                    draw_icon(hdc, gutter_of(rect), icon);
                 }
             }
             return;
@@ -4609,6 +4734,193 @@ mod tests {
         );
     }
 
+    /// **The second step's rows say which key runs them, and the key that
+    /// runs them is the key they say.**
+    ///
+    /// They were text-only and took no digits at all; both halves moved
+    /// together -- "shortcuts as well" -- and this is what holds them
+    /// together. One rule, [`palette_for_digit`], is read by the chip the row
+    /// draws and by the pump that answers the key, so a chip promising a key
+    /// that does nothing is not a state this card has.
+    #[test]
+    fn the_second_steps_rows_advertise_exactly_the_keys_they_answer() {
+        for rows in 0..=LIST_ROWS + 2 {
+            for index in 0..LIST_ROWS + 2 {
+                let chip = palette_shortcut(index, rows);
+                let digit = chip
+                    .as_deref()
+                    .map(|text| text.parse::<u32>().expect("a bare digit and nothing else"));
+                match digit {
+                    Some(digit) => assert_eq!(
+                        palette_for_digit(digit, rows),
+                        Some(index),
+                        "on a step of {rows} rows, row {index} draws the chip {digit} but that \
+                         key chooses a different row"
+                    ),
+                    None => assert!(
+                        index >= rows.min(LIST_ROWS),
+                        "row {index} of a step showing {rows} draws no chip, so its key is a \
+                         secret"
+                    ),
+                }
+            }
+            // No key may reach past the rows that are there: a digit on a
+            // step of two rows that chose a third would be the card acting on
+            // a row nobody can see.
+            for digit in 1..=9u32 {
+                if let Some(index) = palette_for_digit(digit, rows) {
+                    assert!(
+                        index < rows.min(LIST_ROWS),
+                        "{digit} chose row {index} on a step showing {rows} rows"
+                    );
+                }
+            }
+        }
+        // CONTROL: the ordinary case is numbered from the top, as drawn, and
+        // is not merely absent everywhere.
+        assert_eq!(palette_shortcut(0, 4).as_deref(), Some("1"));
+        assert_eq!(palette_shortcut(3, 4).as_deref(), Some("4"));
+        assert_eq!(palette_shortcut(4, 4), None);
+    }
+
+    /// **The key that runs *Edit binding* is a key nothing else on the card
+    /// wants.**
+    ///
+    /// The footer's second button had no key at all until it was asked for,
+    /// and the letters it could have taken are spoken for: `S` opens search,
+    /// `N` is *New login*, `Esc` cancels, and `1`...`9` are rows in both
+    /// steps now. A shortcut that collided would make one of two offers
+    /// unreachable rather than merely confusing.
+    #[test]
+    fn edit_bindings_key_is_not_a_key_this_card_already_spends() {
+        assert_eq!(EDIT_BINDING_SHORTCUT, "B");
+        for (other, what) in [
+            (NEW_LOGIN_SHORTCUT, "*New login*"),
+            (SEARCH_SHORTCUT, "*Search the vault*"),
+            (ESC_SHORTCUT, "Cancel"),
+        ] {
+            assert_ne!(
+                EDIT_BINDING_SHORTCUT, other,
+                "*Edit binding* took {what}'s key, so one of the two offers is unreachable"
+            );
+        }
+        assert!(
+            EDIT_BINDING_SHORTCUT.parse::<u32>().is_err(),
+            "*Edit binding* took a digit, which is a row's in both steps"
+        );
+        assert!(
+            !EDIT_BINDING_SHORTCUT.contains("CTRL") && !EDIT_BINDING_SHORTCUT.contains("ALT"),
+            "the card advertises a modifier chord again: CTRL+ALT is AltGr on German and Polish \
+             layouts, which is why this card has none"
+        );
+        // CONTROL: the letters this is compared against are still the letters
+        // the card offers, so the comparison is not vacuous.
+        assert_eq!((NEW_LOGIN_SHORTCUT, SEARCH_SHORTCUT), ("N", "S"));
+    }
+
+    /// **Every row of the second step carries a mark, and no two rows of one
+    /// card carry the same one.**
+    ///
+    /// Reported as "Username\\Password - I'd create icons for consistency":
+    /// the step before draws a favicon in every row's gutter, so a text-only
+    /// list beside it read as a different kind of list. A mark repeated
+    /// across two rows of one card would be worse than none -- it would say
+    /// the two offers are the same thing.
+    #[test]
+    fn no_two_rows_of_one_palette_carry_the_same_mark() {
+        let login = |fields: Vec<FieldRef>| Palette { fields, has_sequence: false };
+        for palette in [
+            login(vec![FieldRef::Username, FieldRef::Password]),
+            login(vec![FieldRef::Username, FieldRef::Password, FieldRef::Totp]),
+            login(vec![FieldRef::Username]),
+            login(vec![FieldRef::Password]),
+            login(vec![FieldRef::Totp]),
+            Palette { fields: vec![], has_sequence: true },
+        ] {
+            let rows = palette_rows(&palette);
+            let marks: Vec<_> = rows.iter().map(send_mark).collect();
+            let unique: std::collections::BTreeSet<_> =
+                marks.iter().map(|m| format!("{m:?}")).collect();
+            assert_eq!(
+                unique.len(),
+                marks.len(),
+                "a card offering {rows:?} draws one mark on two different rows"
+            );
+        }
+        // Every `Send` this card can build has a mark, the custom field
+        // included -- `send_label` names one, so this must too.
+        for send in [
+            Send::All,
+            Send::Sequence,
+            Send::Field(FieldRef::Username),
+            Send::Field(FieldRef::Password),
+            Send::Field(FieldRef::Totp),
+            Send::Field(FieldRef::Custom("PIN".to_string())),
+        ] {
+            let shapes = crate::theme::field_mark_shapes(send_mark(&send));
+            assert!(
+                !shapes.is_empty(),
+                "{:?} maps to a mark with nothing in it, so its gutter is blank",
+                send_mark(&send)
+            );
+        }
+        // CONTROL: the mark is a property of the offer and not of its
+        // position, so the same offer on two different cards draws the same
+        // thing.
+        assert_eq!(
+            send_mark(&Send::Field(FieldRef::Password)),
+            send_mark(&Send::Field(FieldRef::Password))
+        );
+        assert_ne!(send_mark(&Send::All), send_mark(&Send::Sequence));
+    }
+
+    /// **The second step's two new keys go through [`win32::clicked`]**, the
+    /// same function a mouse click calls.
+    ///
+    /// The card's standing one-path property, extended to the keys added
+    /// here: `run_with` must not be able to tell a shortcut from a click, or
+    /// the two grow different rules about what an offer means. A source pin
+    /// because `shortcut` is inside a `win32` module that needs a window to
+    /// run.
+    #[test]
+    fn the_second_steps_keys_click_the_controls_that_mean_them() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Normalised for the CRLF checkout before anything is sliced.
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
+             test module as production"
+        );
+        assert!(
+            flat.contains("fn shortcut(vk: u16) -> bool"),
+            "control: this scan is not reading the card's key map at all"
+        );
+        assert!(
+            flat.contains("if vk == LETTER_B { if let Some(id) = edit_binding_control() { \
+                           clicked(id); }"),
+            "`B` no longer clicks the control that means *Edit binding*, so the key and the \
+             mouse are two paths and `run_with` can tell them apart"
+        );
+        assert!(
+            flat.contains("if let Some(index) = super::palette_for_digit(digit, rows) { \
+                           clicked(ID_ROW + index); }"),
+            "the second step's digits no longer click the row they name"
+        );
+        assert!(
+            !flat.contains("fn shortcut(vk: u16) -> bool { set_pending"),
+            "control: the key map posts an event directly rather than clicking a control"
+        );
+    }
+
     /// **Search mode moves its highlight with the arrows and stops at both
     /// ends.**
     ///
@@ -4775,7 +5087,7 @@ mod tests {
             "control: this scan is not reading the function that paints the footer buttons"
         );
         assert!(
-            flat.contains("ID_SECONDARY && MODE.load"),
+            flat.contains("id != ID_SECONDARY || in_search()"),
             "control: the whitespace-normalised scan is not reading `paint_control`'s hint \
              branch at all, so the rule above could be matching some other text"
         );
@@ -4784,9 +5096,18 @@ mod tests {
         // `ESC` is not conditioned this way, and must not be: Escape cancels
         // in every mode.
         assert!(
-            flat.contains("&& !in_search()"),
+            flat.contains("id != ID_SECONDARY || in_search() { None }"),
             "the *New login* button still shows its `N` chip in search mode, where `N` is a \
              letter the user is typing and the key does not fire"
+        );
+        // **The second step's footer button advertises its own key.** It had
+        // none at all -- "Edit shortcut as well" -- and the chip is drawn from
+        // the same `MODE` its label is read from, so a chip naming an offer
+        // the button is not showing is not a state this branch has.
+        assert!(
+            flat.contains("MODE_PALETTE { Some(EDIT_BINDING_SHORTCUT)"),
+            "*Edit binding* no longer shows the key that runs it, so the second step's footer \
+             button is back to advertising nothing"
         );
         assert_eq!(ESC_SHORTCUT, "ESC");
     }
