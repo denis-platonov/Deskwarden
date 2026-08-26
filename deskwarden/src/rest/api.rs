@@ -2248,7 +2248,7 @@ mod tests {
             .expect(1)
             .create();
         let deletes = server
-            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
             .with_status(401)
             .expect(2)
             .create();

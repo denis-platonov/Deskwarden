@@ -1361,7 +1361,7 @@ mod tests {
         let (mut server, backend) = logged_in();
         let delete = server.mock("DELETE", "/api/folders/f1").with_status(204).expect(1).create();
         let cipher_edit = server.mock("PUT", "/api/ciphers/live-1").with_status(200).create();
-        let cipher_delete = server.mock("DELETE", "/api/ciphers/live-1").with_status(200).create();
+        let cipher_delete = server.mock("DELETE", "/api/ciphers/live-1/delete").with_status(200).create();
 
         backend.delete_folder("f1").expect("an empty 204 is a delete that happened");
         delete.assert();
@@ -1651,15 +1651,36 @@ mod tests {
         assert_ne!(*first, *second);
     }
 
-    /// A refusal must be distinguishable from a server that said no, because
-    /// the two call for opposite responses: retry, or never retry.
-    #[test]
-    fn a_refusal_is_not_a_transport_failure() {
-        let (_server, backend) = logged_in();
-        let refused = backend.create_folder("x").expect_err("refused");
-        assert!(!matches!(refused, VaultError::Http(_) | VaultError::Parse(_)), "{refused:?}");
-        assert!(!matches!(refused, VaultError::Unauthorized), "{refused:?}");
-    }
+    // **`a_refusal_is_not_a_transport_failure` was deleted here**, and the
+    // reasoning is kept because the test looked reasonable right up until it
+    // was examined.
+    //
+    // It asserted that a refusal (`VaultError::Unsupported`) is never
+    // mistakable for a transport failure, and it drove that through
+    // `create_folder`. When "The last three refusals answered: create, rename
+    // and delete a folder" landed, `create_folder` stopped refusing and
+    // started making a real request -- so against a `logged_in()` server,
+    // which mocks only prelogin, the token and the sync, it began answering
+    // `Http("the server answered 501")`: mockito's unmatched-route status.
+    // The test was left behind by its own feature, and it survived unnoticed
+    // because this crate's local runs are full of loopback failures on the
+    // author's machine and this looked like one more. CI found it the day the
+    // branch reached `main`.
+    //
+    // Repointing it was tried and does not work, which is the interesting
+    // part: **this backend has no reachable refusal left.** Every one of the
+    // twenty operations answers -- that is pinned, from the other direction,
+    // by `no_operation_this_backend_offers_refuses_any_more`. The only
+    // `Unsupported` it can still produce is `generate` meeting a missing or
+    // altered `assets/wordlist.txt`, and a test may not arrange that: it
+    // would have to remove a file the running crate reads. An over-long
+    // passphrase recipe does not do it either -- the generator caps the word
+    // count rather than refusing.
+    //
+    // So the invariant is not weakened here, it is unreachable, and a test
+    // that cannot reach what it names is the defect this project keeps
+    // finding. It is recorded as a comment rather than left as a passing
+    // assertion about nothing.
 
     /// **The rule `rest::write` exists for, checked through the backend.**
     ///
@@ -1828,7 +1849,7 @@ mod tests {
         let (mut server, backend) = logged_in();
         let trash = server.mock("PUT", "/api/ciphers/live-1/delete").create();
         let restore = server.mock("PUT", "/api/ciphers/trash-1/restore").create();
-        let purge = server.mock("DELETE", "/api/ciphers/trash-1").create();
+        let purge = server.mock("DELETE", "/api/ciphers/trash-1/delete").create();
 
         backend.delete_item("live-1").expect("the soft delete");
         backend.restore_item("trash-1").expect("the restore");
