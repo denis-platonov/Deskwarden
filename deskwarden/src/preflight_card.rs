@@ -753,7 +753,7 @@ mod win32 {
         GetClientRect, GetDlgItem, GetForegroundWindow, GetWindowLongPtrW, IsDialogMessageW,
         LoadCursorW, PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED,
-        BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG,
+        BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG,
         PM_REMOVE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
         WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MOUSEMOVE,
         WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST,
@@ -1365,12 +1365,19 @@ mod win32 {
             // one does not change which window is in front of the user's app,
             // only where the question sits on screen.
             WM_NCHITTEST => {
-                let hit = DefWindowProcW(window, msg, wparam, lparam);
-                if hit.0 == 1 {
-                    LRESULT(HTCAPTION as isize)
-                } else {
-                    hit
-                }
+                // **The close glyph is the one part of the background that is
+                // not a title bar.** It is painted by this window rather than
+                // being a child control, so answering `HTCAPTION` for the whole
+                // client area turned every press on it into a window drag and
+                // `WM_LBUTTONDOWN` below never fired -- the reported "clicking
+                // on X doesn't work". See `win32_draw::frameless_hit`, which is
+                // the pure half of this and the half the pin decides.
+                crate::win32_draw::frameless_hit_test(
+                    window,
+                    DefWindowProcW(window, msg, wparam, lparam),
+                    lparam,
+                    close_glyph_rect(),
+                )
             }
             WM_LBUTTONDOWN => {
                 if in_close_glyph(lparam) {
@@ -1452,14 +1459,27 @@ mod win32 {
         }
     }
 
-    fn in_close_glyph(lparam: LPARAM) -> bool {
+    /// The close glyph's rect in DEVICE pixels.
+    ///
+    /// One derivation, read by both the hit test and `in_close_glyph`, so the
+    /// rect `WM_NCHITTEST` excuses from the drag and the rect `WM_LBUTTONDOWN`
+    /// answers on can never be two different rectangles.
+    fn close_glyph_rect() -> RECT {
         let l = super::layout(&card_text());
-        let x = (lparam.0 & 0xffff) as i16 as i32;
-        let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-        x >= scale(l.close_glyph.x)
-            && x < scale(l.close_glyph.right())
-            && y >= scale(l.close_glyph.y)
-            && y < scale(l.close_glyph.bottom())
+        RECT {
+            left: scale(l.close_glyph.x),
+            top: scale(l.close_glyph.y),
+            right: scale(l.close_glyph.right()),
+            bottom: scale(l.close_glyph.bottom()),
+        }
+    }
+
+    fn in_close_glyph(lparam: LPARAM) -> bool {
+        crate::win32_draw::on_close_glyph(
+            (lparam.0 & 0xffff) as i16 as i32,
+            ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+            close_glyph_rect(),
+        )
     }
 
     // ---- painting ----------------------------------------------------------

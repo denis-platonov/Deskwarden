@@ -10,13 +10,15 @@
 //! egui reads, so a theme change moves both renderers at once.
 
 use crate::app_candidates::Candidate;
-use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetTextExtentPoint32W, Polygon, RoundRect,
-    SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DT_CENTER, DT_END_ELLIPSIS,
+    ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DT_CENTER,
+    DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
     TRANSPARENT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTCLIENT};
 
 /// `theme`'s `Color32` as GDI's BGR `COLORREF`.
 ///
@@ -416,6 +418,82 @@ pub fn draw_card_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT, tracking:
     }
 }
 
+// ---------------------------------------------------------------------------
+// The frameless cards' hit test.
+//
+// **Every card in this crate is frameless and is dragged by its background**,
+// so each one answers `WM_NCHITTEST` by turning `HTCLIENT` into `HTCAPTION`.
+// That is what made the close glyph unclickable on all seven of them: the
+// glyph is PAINTED BY THE PARENT rather than being a child control, so once
+// the whole client area reports itself as a title bar, a press on it starts a
+// window drag and `WM_LBUTTONDOWN` never fires there at all. The rows and the
+// footer buttons kept working only because they are child windows, with hit
+// tests of their own that this arm never sees.
+//
+// The decision lives here once rather than seven times, and the half that
+// decides is PURE: it takes `DefWindowProcW`'s answer, a point in CLIENT
+// pixels and the glyph's rect in the same pixels, and returns the code to
+// answer with. That is what lets the pin decide a hit test without opening a
+// window.
+// ---------------------------------------------------------------------------
+
+/// Whether a point in client pixels falls on a card's close glyph.
+///
+/// Half-open on the right and the bottom, which is the convention every
+/// card's own `in_close_glyph` already used: a rect's `right` column and
+/// `bottom` row belong to whatever is next to it, never to it.
+pub fn on_close_glyph(x: i32, y: i32, glyph: RECT) -> bool {
+    x >= glyph.left && x < glyph.right && y >= glyph.top && y < glyph.bottom
+}
+
+/// **What a frameless card answers to `WM_NCHITTEST`.**
+///
+/// `HTCAPTION` everywhere `DefWindowProcW` said `HTCLIENT` -- so the card is
+/// dragged by its background -- **except on the close glyph**, which stays
+/// `HTCLIENT` so that the press on it arrives as `WM_LBUTTONDOWN` and the
+/// card's own `in_close_glyph` gets to see it.
+///
+/// Anything that was not `HTCLIENT` to begin with is passed through untouched:
+/// a border, a corner or `HTNOWHERE` is the system's answer about a part of
+/// the window this card does not paint.
+pub fn frameless_hit(default_hit: isize, x: i32, y: i32, glyph: RECT) -> isize {
+    if default_hit == HTCLIENT as isize && !on_close_glyph(x, y, glyph) {
+        HTCAPTION as isize
+    } else {
+        default_hit
+    }
+}
+
+/// [`frameless_hit`] against a live window.
+///
+/// **`WM_NCHITTEST`'s `lparam` is in SCREEN pixels** and the glyph's rect is
+/// in client pixels, so the point is converted before the two are compared. A
+/// card that compared the screen point directly would appear to work with its
+/// window at the top left of a monitor and nowhere else, which is the reason
+/// this wrapper exists rather than each arm doing its own arithmetic.
+///
+/// A refusal from `ScreenToClient` leaves the point where it was -- a screen
+/// point, which answers `HTCAPTION` like any other background pixel. Dragging
+/// still works and the glyph simply does not answer, which is exactly the
+/// behaviour these cards already had.
+///
+/// # Safety
+///
+/// `window` must be a live window handle: this calls `ScreenToClient` on it.
+pub unsafe fn frameless_hit_test(
+    window: HWND,
+    default_hit: LRESULT,
+    screen: LPARAM,
+    glyph: RECT,
+) -> LRESULT {
+    let mut point = POINT {
+        x: (screen.0 & 0xffff) as i16 as i32,
+        y: ((screen.0 >> 16) & 0xffff) as i16 as i32,
+    };
+    let _ = ScreenToClient(window, &mut point);
+    LRESULT(frameless_hit(default_hit.0, point.x, point.y, glyph))
+}
+
 /// Whether a row is under the pointer, selected, both or neither.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowState {
@@ -520,6 +598,157 @@ pub fn draw_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The close glyph is the one part of a frameless card's background
+    /// that is not a title bar.**
+    ///
+    /// The reported defect, stated as the three answers a hit test has to
+    /// give: a point inside the glyph is `HTCLIENT` -- which is what lets the
+    /// press reach `WM_LBUTTONDOWN` and cancel the card -- and every other
+    /// background point, including one a single pixel outside the glyph, is
+    /// `HTCAPTION`, which is what still drags a window with no title bar.
+    ///
+    /// Decidable without a window, which is why it is a test at all: all
+    /// three answers come from `DefWindowProcW`'s code, a client point and a
+    /// rect, and none of them from a live `HWND`. Against the code this
+    /// replaced -- `if hit.0 == 1 { HTCAPTION } else { hit }`, with no glyph
+    /// anywhere in it -- the first assertion fails, because that arm answered
+    /// `HTCAPTION` for the glyph too and swallowed every click on the ✕.
+    #[test]
+    fn the_close_glyph_is_the_one_part_of_a_frameless_cards_background_that_is_not_a_title_bar() {
+        const CLIENT: isize = HTCLIENT as isize;
+        const CAPTION: isize = HTCAPTION as isize;
+        // A card's glyph, at the size every one of them lays out: a 20x20 box
+        // inset from the header's top right corner.
+        let glyph = RECT { left: 344, top: 14, right: 364, bottom: 34 };
+
+        for (x, y, what) in [
+            (glyph.left, glyph.top, "its top left corner"),
+            (glyph.right - 1, glyph.bottom - 1, "its bottom right corner"),
+            ((glyph.left + glyph.right) / 2, (glyph.top + glyph.bottom) / 2, "its centre"),
+        ] {
+            assert_eq!(
+                frameless_hit(CLIENT, x, y, glyph),
+                CLIENT,
+                "{what} of the close glyph answered the hit test as a title bar, so a press \
+                 there starts a window drag and `WM_LBUTTONDOWN` never fires -- the ✕ does \
+                 nothing, which is exactly what was reported"
+            );
+        }
+
+        // The background still drags the window: that is the property the
+        // `HTCAPTION` answer exists for, and fixing the glyph must not cost
+        // it.
+        for (x, y, what) in [
+            (190, 200, "the middle of the card"),
+            (16, 16, "the brand lockup"),
+            (190, 400, "the footer"),
+        ] {
+            assert_eq!(
+                frameless_hit(CLIENT, x, y, glyph),
+                CAPTION,
+                "{what} no longer drags the window, so a frameless card cannot be moved at all"
+            );
+        }
+
+        // One pixel outside the glyph on each side, which is the boundary the
+        // half-open rect draws. A rect read inclusively would answer `client`
+        // for the first two of these and leave a one-pixel dead strip along
+        // the card's edge.
+        for (x, y, what) in [
+            (glyph.left - 1, glyph.top, "just left of"),
+            (glyph.left, glyph.top - 1, "just above"),
+            (glyph.right, glyph.top, "just right of"),
+            (glyph.left, glyph.bottom, "just below"),
+        ] {
+            assert_eq!(
+                frameless_hit(CLIENT, x, y, glyph),
+                CAPTION,
+                "the point {what} the close glyph answered `HTCLIENT`, so the glyph's hit \
+                 target is not the rect it is painted into"
+            );
+        }
+
+        // CONTROL: an answer that was never `HTCLIENT` is the system's about
+        // a part of the window this card does not paint, and is passed
+        // through untouched -- on the glyph as anywhere else. A rewrite that
+        // returned `HTCLIENT` for the glyph unconditionally would pass every
+        // assertion above and fail this one.
+        use windows::Win32::UI::WindowsAndMessaging::{HTBOTTOMRIGHT, HTNOWHERE};
+        for other in [HTNOWHERE as isize, HTBOTTOMRIGHT as isize] {
+            assert_eq!(
+                frameless_hit(other, 190, 200, glyph),
+                other,
+                "control: a non-client hit code was rewritten by a card's hit test"
+            );
+            assert_eq!(
+                frameless_hit(other, glyph.left, glyph.top, glyph),
+                other,
+                "control: a non-client hit code over the glyph was rewritten by a card's hit \
+                 test"
+            );
+        }
+        // CONTROL: the two codes this decides between are not the same
+        // number, so the assertions above are distinguishing something.
+        assert_ne!(CLIENT, CAPTION, "control: `HTCLIENT` and `HTCAPTION` are the same value");
+    }
+
+    /// **Every frameless card in this crate answers its hit test through
+    /// [`frameless_hit_test`].**
+    ///
+    /// A defect class, not an instance. All seven cards were built from one
+    /// pattern -- `if hit.0 == 1 { HTCAPTION } else { hit }` -- and all seven
+    /// paint their ✕ on the parent, so all seven swallowed every click on it.
+    /// A source pin because the alternative is seven live windows; what it
+    /// buys is that the eighth card copied from any of them cannot quietly
+    /// reintroduce the arm.
+    #[test]
+    fn no_frameless_card_answers_its_whole_client_area_as_a_title_bar() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Normalised for the CRLF checkout, before anything is sliced out of
+        // it: a scan that matched against `\r\n`-terminated lines would find
+        // nothing at all and report every card as broken.
+        for card in [
+            "picker_prompt.rs",
+            "unlock_prompt.rs",
+            "generate_prompt.rs",
+            "prompt_card.rs",
+            "locked_card.rs",
+            "save_login_card.rs",
+            "preflight_card.rs",
+        ] {
+            let raw = std::fs::read_to_string(src.join(card)).unwrap().replace("\r\n", "\n");
+            let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+            let code: String = production
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            assert!(
+                flat.contains("WM_NCHITTEST"),
+                "control: {card} has no `WM_NCHITTEST` arm at all, so this scan is reading the \
+                 wrong file and the rules below could not fail"
+            );
+            assert!(
+                flat.contains("frameless_hit_test("),
+                "{card} answers `WM_NCHITTEST` without `win32_draw::frameless_hit_test`, so its \
+                 close glyph is inside the region it reports as a title bar and clicking the ✕ \
+                 does nothing"
+            );
+            assert!(
+                flat.contains("fn close_glyph_rect()"),
+                "control: {card} no longer derives its close glyph's rect once, so the rect the \
+                 hit test excuses and the rect `WM_LBUTTONDOWN` answers on can drift apart"
+            );
+            assert!(
+                !flat.contains("if hit.0 == 1 { LRESULT(HTCAPTION as isize) }"),
+                "{card} is back to answering `HTCAPTION` for its entire client area -- the \
+                 defect that made every card's ✕ unclickable"
+            );
+        }
+    }
 
     /// **An oversized chip cannot invert the lane it leaves behind.**
     ///
