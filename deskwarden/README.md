@@ -96,7 +96,7 @@ a previous run).
   visible to other processes), and its buffer is wiped after use.
 - The cached session token is encrypted at rest with DPAPI, and decrypted
   copies are wiped from memory after use.
-- While the vault is unlocked, deskwarden holds an in-memory snapshot of your
+- While the vault is unlocked, Deskwarden holds an in-memory snapshot of your
   vault items, so it can serve reads without `bw serve` running. Each item's
   password and TOTP seed are wrapped so they are zeroized on every drop of
   that snapshot — the vault locking, the app quitting, and every intermediate
@@ -136,4 +136,4 @@ a previous run).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).

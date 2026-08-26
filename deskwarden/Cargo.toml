@@ -2,7 +2,13 @@
 name = "deskwarden"
 version = "0.11.1"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-or-later"
+# NOT published to crates.io: this is a Windows application distributed as an
+# installer, not a library anyone should depend on. It is also what lets
+# `deny.toml` exclude this crate from the license allow-list via
+# `private.ignore` -- the alternative was adding AGPL-3.0-or-later to that
+# list, which would have silently permitted AGPL *dependencies* too.
+publish = false
 description = "Autofill Bitwarden credentials into native Windows applications. Unofficial and unaffiliated with Bitwarden, Inc."
 readme = "README.md"
 repository = "https://github.com/denis-platonov/deskwarden"

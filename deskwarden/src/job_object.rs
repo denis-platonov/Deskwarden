@@ -2157,7 +2157,14 @@ mod tests {
             // `0.10.0` and `0.11.0` are the same number of bytes. That is
             // exactly the case a length-only pin would miss, and the reason
             // this guard is a length AND a hash rather than either alone.
-            (11685, 0xb855_aace_bc15_321a_u64),
+            //
+            // **Re-pinned for the AGPL relicensing**, which is a `license`
+            // field and a `publish = false` beside it -- no dependency moved,
+            // no name added, removed or re-pointed, no `[patch]`/`[replace]`
+            // table, no path or fork, and `[build-dependencies]` still reads
+            // exactly `winresource = "0.1"`. 11685 -> 12075 bytes, all of it
+            // the new field and the comment above it.
+            (12075, 0xa718_829b_4b9c_d0fe_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
