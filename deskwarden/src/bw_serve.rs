@@ -156,10 +156,30 @@ pub fn bw_serve_command(session_token: &str) -> Result<crate::bw_path::BareComma
 ///
 /// `list_items` is deliberately the probe rather than a lighter ping: it is the
 /// operation the app actually depends on, so a success here proves both that
-/// the HTTP server is up *and* that the session it was handed is valid.
+/// the backend is up *and* that whatever credential it was handed is valid.
 ///
 /// Returns the items on success (the caller needs them anyway to build the
 /// match engine), or a human-readable error describing the last failure.
+///
+/// # It is generic over the backend, and its messages used to say otherwise
+///
+/// This takes `&dyn VaultBackend` and knows nothing about a subprocess. Its
+/// log line and its error nevertheless both read "bw serve", from when that
+/// was the only backend there was -- so a **direct-REST** launch, which
+/// starts no subprocess at all, announced `bw serve ready after 0 retries`
+/// three seconds after announcing that the vault was served by `DirectRest`.
+///
+/// That cost a real investigation on 2026-08-26: the message was read as
+/// evidence that an ungated entry point had started `bw serve` behind the
+/// backend policy, which would have been a serious defect, and a spec was
+/// written naming it as the first thing to fix. `bw.exe` was never running.
+/// The messages now name what this function actually observed, which is a
+/// backend answering.
+///
+/// **The module is still the wrong home for it** and that is not fixed here:
+/// nothing in this function is about `bw serve`, and it sits in `bw_serve.rs`
+/// because that is where the only caller used to be. Moving it is a rename
+/// across call sites and pins; saying so is cheaper than half-doing it.
 pub fn wait_for_vault_ready(
     vault: &dyn VaultBackend,
     schedule: &[Duration],
@@ -170,7 +190,7 @@ pub fn wait_for_vault_ready(
         match vault.list_items() {
             Ok(items) => {
                 log::info!(
-                    "bw serve ready after {attempt} retr{} ({} vault items)",
+                    "the vault backend answered after {attempt} retr{} ({} vault items)",
                     if attempt == 1 { "y" } else { "ies" },
                     items.len()
                 );
@@ -180,7 +200,7 @@ pub fn wait_for_vault_ready(
                 let last_error = format!("{e:?}");
                 if attempt >= schedule.len() {
                     return Err(format!(
-                        "bw serve did not become ready within the deadline; last error: {last_error}"
+                        "the vault backend did not become ready within the deadline; last error: {last_error}"
                     ));
                 }
                 log::debug!(

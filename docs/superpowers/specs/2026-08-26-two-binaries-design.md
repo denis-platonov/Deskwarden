@@ -134,6 +134,31 @@ but on disk the whole RustCrypto stack it pulls in (`rsa` and its fifteen-crate
 its own process would be paying a port and a lifecycle to save less than a
 megabyte of a binary that is already linked into both halves.
 
+**And a user who never chooses it never pays for it in memory, which is the
+whole point of it being a library.** Windows demand-pages an executable: code
+that is never executed is never faulted into the working set. So for someone
+on the `bw` backend, `rest` is 0.73 MB of *file* and approximately nothing
+resident -- no thread, no socket, no allocation, no page. That is a property a
+library has for free and a process cannot have at all:
+
+* A `rest.exe` started eagerly costs a process for users who will never call
+  it.
+* A `rest.exe` started lazily costs a spawn, a readiness probe, a port, and a
+  state where it is running when it should not be -- which is `bw serve`,
+  arrived at from the other direction.
+
+The same argument covers `password_gen` and is the reason its 4,096-word list
+is read from `assets/wordlist.txt` on demand rather than held in memory: the
+generator is used rarely, so the file stays on disk until someone asks for a
+passphrase.
+
+This is the general rule the split is drawn on, stated once: **a library costs
+disk when unused and memory only when called; a process costs memory whenever
+it exists.** `eframe` is split out because it cannot be "not called" -- opening
+a window loads a GPU driver whose arenas never come back, so the only way not
+to pay is to be a different process. Nothing else in this crate has that
+property.
+
 **`password_gen` stays a library.** It is a pure function over `getrandom` and
 a 29 KB wordlist read on demand. It draws nothing; the generator *card*
 (`generate_prompt.rs`) is bare Win32 and costs ~1.8 MB with no GL context.
