@@ -10,6 +10,64 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.11.0 - 2026-08-26
+
+### Self-hosted vaults can skip the Bitwarden CLI entirely
+
+If your vault is on your own server, Deskwarden can now talk to it directly
+instead of running the official Bitwarden CLI in the background. Turn off **Use
+official bw for crypto** on the Sync & account page and restart.
+
+What that changes, on a 1,666-item vault:
+
+- The background `bw` process is gone. It was holding about 118 MB.
+- Opening the vault window settles in about 20 milliseconds instead of about
+  200.
+- Deskwarden does the decryption itself, which means the key that unlocks your
+  vault is kept on this PC, protected by Windows. Unlike the session it
+  replaces, that key does not expire. The setting says so before you turn it
+  on, and this is the trade: less memory and more speed, against a stronger
+  secret at rest.
+
+The setting is only offered on a self-hosted server. On bitwarden.com and
+bitwarden.eu the vault always goes through the official CLI.
+
+**Signing in still uses the Bitwarden CLI**, including on this path, so the CLI
+is still installed. Accounts with two-factor authentication are refused by name
+rather than left to fail as a wrong password.
+
+### Two settings about the same thing became one card
+
+**Keep the Bitwarden backend running** used to live on the General page, two
+pages away from the switch that decides whether there is a backend at all --
+and with the direct connection selected it did nothing, while still looking
+like a live switch. It now sits directly under that switch on Sync & account,
+and goes quiet when there is no background process to keep running, with a
+sentence saying why.
+
+### Deskwarden generates its own passwords
+
+Password and passphrase generation used to be one more thing asked of the
+Bitwarden CLI. It is now done in Deskwarden, which is what lets the direct
+connection offer it at all. Passphrases come from a 4,096-word list, which is
+exactly 12 bits of entropy per word -- so the strength shown is a number that
+can be justified rather than estimated.
+
+### Fixed: an edit could quietly delete a field Deskwarden could not read
+
+On the direct connection, a field Deskwarden failed to decrypt -- a card
+number, a one-time-code seed, an SSH private key -- was dropped when the item
+was next saved, and an unreadable name was replaced with an empty one. Saving
+an app match during an ordinary autofill was enough to trigger it. Anything
+that cannot be decrypted is now carried through an edit byte for byte.
+
+### Fixed: archiving and un-archiving, and a delete that only trashed
+
+Both went to routes this app had guessed at. Archive reported that it might not
+have worked when it had, and **Delete forever** on an item that was not already
+in the trash moved it to the trash instead and reported success. Both are
+verified against a real server now.
+
 ## 0.10.0 - 2026-08-26
 
 ### Pressing the hotkey on an app you have never bound now offers your accounts

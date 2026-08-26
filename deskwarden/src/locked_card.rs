@@ -148,16 +148,25 @@ pub fn run_with(
         );
     }
 
-    loop {
-        match (calls.next)(window) {
-            Event::Cancel | Event::Closed => {
-                (calls.close)(window);
-                return Outcome::Dismissed;
-            }
-            Event::Unlock => {
-                (calls.close)(window);
-                return Outcome::Unlock;
-            }
+    // **One `next`, not a loop**, and the difference is `next`'s own
+    // contract: it "pumps until the user does something", so the pumping
+    // already happens inside it and every [`Event`] it can return is a
+    // decision. A `loop` here was a second pump around a first one whose
+    // every arm returns -- `clippy::never_loop` is right about it, and it was
+    // a denied lint failing this crate's `cargo clippy` rather than a style
+    // note.
+    //
+    // If an `Event` is ever added that means "keep waiting", it goes back to
+    // a loop and this comment is why the change is deliberate rather than a
+    // revert.
+    match (calls.next)(window) {
+        Event::Cancel | Event::Closed => {
+            (calls.close)(window);
+            Outcome::Dismissed
+        }
+        Event::Unlock => {
+            (calls.close)(window);
+            Outcome::Unlock
         }
     }
 }

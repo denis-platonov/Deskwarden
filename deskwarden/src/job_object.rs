@@ -2152,7 +2152,12 @@ mod tests {
             // already accounted for above and neither moved a dependency:
             // this hop is the arithmetic of the two landing together, not a
             // third edit.
-            (11685, 0x1278_8406_06b6_8be6_u64),
+            //
+            // **Re-pinned for 0.11.0**, and the length is unchanged because
+            // `0.10.0` and `0.11.0` are the same number of bytes. That is
+            // exactly the case a length-only pin would miss, and the reason
+            // this guard is a length AND a hash rather than either alone.
+            (11685, 0x58ad_c2a2_eb67_0119_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
