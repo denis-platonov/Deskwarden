@@ -70,9 +70,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sample = args.iter().any(|a| a == "--sample");
     let write = args.iter().any(|a| a == "--write");
+    let cleanup = args.iter().any(|a| a == "--cleanup");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if positional.len() != 2 {
-        eprintln!("usage: rest_probe <server-url> <email> [--sample] [--write]");
+        eprintln!("usage: rest_probe <server-url> <email> [--sample] [--write] [--cleanup]");
         eprintln!("  the master password is read from stdin, never from the command line");
         std::process::exit(2);
     }
@@ -239,6 +240,11 @@ fn main() {
         println!("  the grant returned no refresh token, so there is nothing to refresh");
     }
 
+    if cleanup {
+        cleanup_pass(RestBackend::new(client, authed), &vault);
+        return;
+    }
+
     if !write {
         println!();
         println!("read-only probe finished. Nothing was written to the vault.");
@@ -246,6 +252,67 @@ fn main() {
     }
 
     write_pass(RestBackend::new(client, authed));
+}
+
+/// The prefix every item this probe creates is named with.
+///
+/// One constant, used by [`write_pass`] to name what it makes and by
+/// [`cleanup_pass`] to find it. Two spellings is how a cleanup comes to miss
+/// the thing it is for.
+const PROBE_NAME_PREFIX: &str = "Deskwarden write probe";
+
+/// Destroys every item this probe has ever left behind, and nothing else.
+///
+/// # Why this exists rather than being unnecessary
+///
+/// It was written because a run of [`write_pass`] reported that it had
+/// purged its item and had not: against NodeWarden, `DELETE
+/// /api/ciphers/{id}` on a *live* cipher is the compat route, which
+/// soft-deletes and answers `200`. Two probe items sat in a real vault
+/// behind a line that said "the probe item is gone".
+///
+/// The route is fixed, so this should find nothing on a healthy run. It is
+/// kept anyway: a probe that can create items in a real vault should be able
+/// to prove none of its own are left, and "should find nothing" is a claim
+/// worth being able to check rather than assert.
+///
+/// # What it will not touch
+///
+/// Only items whose name starts with [`PROBE_NAME_PREFIX`]. Every id is
+/// printed before it is destroyed, so the output is a record of exactly what
+/// was removed.
+fn cleanup_pass(backend: RestBackend, vault: &deskwarden::rest::sync::DecryptedVault) {
+    println!("== cleanup ==");
+    let mine: Vec<&VaultItem> = vault
+        .items
+        .iter()
+        .map(|d| &d.item)
+        .filter(|i| i.name.starts_with(PROBE_NAME_PREFIX))
+        .collect();
+
+    if mine.is_empty() {
+        println!("  no probe items in the vault");
+        return;
+    }
+
+    println!("  {} probe item(s) to destroy:", mine.len());
+    let mut failed = 0usize;
+    for item in mine {
+        // `purge_item` is unconditional now, so no trash step first: a
+        // trash-then-purge would be two chances to fail where one is needed.
+        match backend.purge_item(&item.id) {
+            Ok(()) => println!("    {} destroyed", item.id),
+            Err(e) => {
+                println!("    {} FAILED: {e:?}", item.id);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        println!("  {failed} could not be destroyed and are still in the vault");
+        std::process::exit(1);
+    }
+    println!("  all gone");
 }
 
 /// The write half: one item, created here, exercised, and hard-deleted.
@@ -276,7 +343,7 @@ fn write_pass(backend: RestBackend) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = format!("Deskwarden write probe {nonce} -- safe to delete");
+    let name = format!("{PROBE_NAME_PREFIX} {nonce} -- safe to delete");
 
     // Values chosen so every one of them is a field the write path has to
     // carry across a PUT. The TOTP seed is a real base32 string because a

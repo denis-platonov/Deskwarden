@@ -707,14 +707,39 @@ impl RestClient {
         })
     }
 
-    /// `DELETE /api/ciphers/{id}` -- gone, with no trash to recover it from.
+    /// `DELETE /api/ciphers/{id}/delete` -- gone, with no trash to recover it
+    /// from.
     ///
     /// Named `hard_delete` rather than `delete` so that no caller reaches for
     /// it by autocomplete when they meant [`Self::trash_cipher`]. This module
     /// will not decide for a caller which one they want, but it will make the
     /// irreversible one the longer word.
+    ///
+    /// # The suffix, and why the bare route is wrong here
+    ///
+    /// This sent `DELETE /api/ciphers/{id}` -- Bitwarden's own hard-delete
+    /// route -- until a live run showed what NodeWarden does with it. That
+    /// path reaches `handleDeleteCipherCompat`, which is **conditional**: it
+    /// hard-deletes a cipher that is *already trashed* and otherwise falls
+    /// through to `handleDeleteCipher`, the soft delete. So a purge of a LIVE
+    /// item against this server returned `200` and put the item in the trash
+    /// instead of destroying it -- a call named `hard_delete` reporting
+    /// success for a soft delete.
+    ///
+    /// It went unnoticed because the app only purges from the trash view,
+    /// where `deletedAt` is already set and the compat route does the right
+    /// thing. The probe purged a restored item, which the app never does, and
+    /// two probe items survived a run that said it had cleaned up after
+    /// itself.
+    ///
+    /// `DELETE /api/ciphers/{id}/delete` is `handlePermanentDeleteCipher`,
+    /// which is unconditional: it deletes the attachments, deletes the
+    /// cipher, and answers `204` whatever state the cipher was in. Same path
+    /// as [`Self::trash_cipher`], different verb -- `PUT` trashes, `DELETE`
+    /// destroys -- which is NodeWarden's own pairing and not an invention
+    /// here.
     pub fn hard_delete_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
-        let url = self.cipher_url(id, "")?;
+        let url = self.cipher_url(id, "/delete")?;
         self.refreshing(session, |session| {
             self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
         })
@@ -1979,12 +2004,21 @@ mod tests {
             .with_body("")
             .expect(1)
             .create();
+        // `DELETE .../delete`, NOT `DELETE .../{id}`. The bare route is
+        // NodeWarden's `handleDeleteCipherCompat`, which soft-deletes a live
+        // cipher and answers 200 -- a purge that trashes. See
+        // `hard_delete_cipher`. The `bare` mock below is the assertion that
+        // this client no longer goes there.
         let hard = server
-            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
             .match_header("Authorization", "Bearer AT-1")
             .with_status(200)
             .with_body("")
             .expect(1)
+            .create();
+        let bare = server
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            .with_status(200)
             .create();
 
         client.trash_cipher(&mut session, id).expect("the trash");
@@ -1993,6 +2027,11 @@ mod tests {
         trash.assert();
         restore.assert();
         hard.assert();
+        assert!(
+            !bare.matched(),
+            "the purge went to the compat route, which trashes a live item instead of \
+             destroying it and reports success either way"
+        );
     }
 
     // ---- the folder write endpoints ----------------------------------------
