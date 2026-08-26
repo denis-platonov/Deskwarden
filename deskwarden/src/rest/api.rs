@@ -774,12 +774,26 @@ impl RestClient {
     /// This used to send Bitwarden's **bulk** archive -- `PUT
     /// /api/ciphers/archive` with `{"ids": [...]}` -- as a batch of one, to
     /// fit the per-id [`crate::vault_backend::VaultBackend::archive_item`]
-    /// signature. That was wrong against the server this backend exists for.
-    /// NodeWarden, the Cloudflare-Workers Bitwarden-compatible server, has no
-    /// bulk archive route in its routing table at all; what it has is
-    /// per-id -- `PUT`/`POST /api/ciphers/:id/archive` and
-    /// `/api/ciphers/:id/unarchive` -- so every archive and unarchive this
-    /// client sent was a `404`.
+    /// signature.
+    ///
+    /// **The reason given here for changing that was wrong, and the change
+    /// was right anyway.** This paragraph said NodeWarden -- the
+    /// Cloudflare-Workers Bitwarden-compatible server this backend exists for
+    /// -- "has no bulk archive route in its routing table at all", and that
+    /// every archive the client sent was therefore a `404`. It does have one:
+    /// `router-authenticated.ts` dispatches `PUT`/`POST /api/ciphers/archive`
+    /// to `handleBulkArchiveCiphers`, beside the per-id
+    /// `/api/ciphers/:id/archive` and `/api/ciphers/:id/unarchive`. Whatever
+    /// the bulk send was failing on, it was not the route's absence, and the
+    /// claim is corrected rather than quietly deleted because it was used as
+    /// the justification for the shape below.
+    ///
+    /// The shape below is still the right one, for a reason that does not
+    /// depend on the correction: a batch of one is a request whose overall
+    /// status is not the outcome of the id in it, and the trait's operation
+    /// is per-id. The per-id route matches what is being asked. It is also
+    /// the one that has now been driven against the real server and seen to
+    /// work, which the bulk one has not.
     ///
     /// So the id goes in the path, through [`Self::cipher_url`], exactly as
     /// it does for trash, restore and hard delete. **`PUT`** is the verb: the
