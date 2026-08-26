@@ -119,7 +119,7 @@ fn main() {
                 r.ciphers.len(),
                 r.folders.len(),
                 if r.profile.is_some() { "present" } else { "ABSENT" },
-                r.organizations.len(),
+                r.profile.as_ref().map_or(0, |p| p.organizations.len()),
             );
             r
         }
