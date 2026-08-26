@@ -53,6 +53,7 @@ pub mod favicon;
 pub mod file_picker;
 pub mod fill_stats;
 pub mod foreground;
+pub mod generate_prompt;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;
@@ -65,16 +66,21 @@ pub mod loading_ui;
 /// the user is reading. Store UTC, display local, never print "UTC".
 pub mod local_time;
 pub mod logging;
+/// Design 3b: the locked-vault card, in bare Win32.
+pub mod locked_card;
 pub mod login_ui;
 pub mod match_engine;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
 pub mod otpauth;
-pub mod overlay_ui;
 pub mod password_strength;
 pub mod picker_prompt;
 pub mod picker_ui;
-pub mod preflight_host;
+/// Design 4b: the send preflight, in bare Win32. **The card that took the
+/// daemon's fill path to zero GL contexts** -- see the module doc.
+pub mod preflight_card;
 pub mod prefs_ui;
+/// Design 2a: the matched-item autofill prompt, in bare Win32.
+pub mod prompt_card;
 pub mod qr;
 pub mod record;
 /// The 6b dimmed full-screen surface a QR code is dragged out of. **At the
@@ -85,6 +91,7 @@ pub mod region_overlay;
 pub mod reprompt;
 /// `scan_history.json`: what the last twenty breach scans counted. Counts and
 /// timestamps only -- never a password, an item, or anything derived from one.
+pub mod save_login_card;
 pub mod scan_history;
 pub mod scratch_window;
 /// Copies one rectangle of the screen into a self-wiping buffer of pixels.
@@ -109,6 +116,11 @@ pub mod updater;
 /// password without launching the app. Opens a window and never a GL context,
 /// which is the whole point -- see the module doc.
 pub mod unlock_prompt;
+/// The daemon/UI process boundary: what goes out on a `--ui` command line
+/// (a mode and a surface, never a secret) and what comes back (a small
+/// non-secret result file, plus the exit code that carries `locked` even if
+/// the file is lost).
+pub mod ui_process;
 pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;

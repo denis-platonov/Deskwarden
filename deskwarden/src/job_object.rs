@@ -1386,7 +1386,11 @@ mod tests {
         // readiness wait into `app_window::run_recovery`, which starts that
         // probe itself, once per attempt -- so the spawn that used to sit
         // behind `loading_ui::show_while` here is gone with the window it fed.
-        ("main.rs", 11),
+        // Twelve since the daemon/UI split: `run_as_a_ui_process` fetches the
+        // account details on a thread rather than in front of the window it
+        // has not opened yet -- the same 1-3s `bw` spawn, and the same reason,
+        // as the two `check_bw_status_details` spawns already counted here.
+        ("main.rs", 12),
         ("picker_ui.rs", 2),
         // One: the `bw unlock` behind the daemon's unlock prompt. It cannot be
         // inline for a reason stronger than the frame-loop one every entry
@@ -2043,10 +2047,16 @@ mod tests {
         let manifest = manifest_raw.replace("\r\n", "\n");
         assert_eq!(
             (manifest.len(), fnv1a64(&manifest)),
-            // Re-pinned for the 0.9.0 version bump: `version = "0.8.5"`
-            // became `"0.9.0"`, which is the same LENGTH -- so 8837 is
-            // unchanged and only the digest moves. No dependency was added,
-            // removed, re-pointed or re-featured by this commit.
+            // Re-pinned for the 0.10.0 version bump: `version = "0.9.0"`
+            // became `"0.10.0"`, one byte longer -- so 8837 becomes 8838 and
+            // the digest moves with it. **No dependency was added, removed,
+            // re-pointed or re-featured by this commit**, which is the only
+            // thing this pair exists to notice.
+            //
+            // Kept from the 0.9.0 bump, which changed only the digest because
+            // `"0.8.5"` and `"0.9.0"` are the same length. A version bump
+            // that does not change the length is the case most likely to be
+            // waved through without reading, which is why both are recorded.
             //
             // Re-pinned deliberately: three FEATURES were added to the
             // `windows` dependency that was already here --
@@ -2111,7 +2121,7 @@ mod tests {
             // appeared, and `[build-dependencies]` still reads exactly
             // `winresource = "0.1"`. 8522 -> 8837 bytes, all of it the
             // feature name and the comment above it.
-            (8837, 0x62bd_d4b7_fcdd_2235_u64),
+            (8838, 0x6ffe_79e1_4053_243f_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -2467,9 +2477,14 @@ mod tests {
             vec![
                 "build.rs",
                 "examples/field_locator_probe.rs",
+                "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
+                "examples/locked_preview.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
+                "examples/preflight_preview.rs",
+                "examples/prompt_preview.rs",
+                "examples/save_login_preview.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/unlock_prompt_preview.rs",

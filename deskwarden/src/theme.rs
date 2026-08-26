@@ -644,7 +644,7 @@ pub fn paint_mark_tinted(painter: &egui::Painter, rect: Rect, tint: Color32) {
 }
 
 fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
-    let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
+    let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
     for (outline, fill) in quadrant_outlines().iter().zip(QUADRANT_FILLS) {
         let points: Vec<Pos2> = outline
@@ -671,7 +671,7 @@ fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
 /// Callers that need the shield optically aligned to something — rather
 /// than its artboard mathematically aligned — use this to compensate.
 pub fn mark_ink_rect(rect: Rect) -> Rect {
-    let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
+    let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
     Rect::from_min_max(
         origin + Vec2::new(2.0 * scale, 2.0 * scale),
@@ -1062,14 +1062,35 @@ fn status_pill_impl(ui: &mut Ui, dot_color: Color32, text: &str, sense: Sense) -
 /// out taller than the design's. That gap widened when the monospace face
 /// became Consolas (see `system_monospace`), whose descent is deeper than
 /// the previously-used bundled face.
-const CHIP_HEIGHT: f32 = 18.0;
+pub const CHIP_HEIGHT: f32 = 18.0;
+
+/// The chip's text size, its horizontal padding and its corner radius, as
+/// [`kbd_chip`] paints them.
+///
+/// Public, and named rather than left as literals at [`kbd_chip`]'s call to
+/// [`paint_chip`], because the GDI renderer draws the same chip and cannot
+/// call into egui: `crate::win32_draw::draw_hint_chip` reads these four
+/// numbers so the picker card's shortcut hints are the design's chip rather
+/// than a second, nearly-identical one.
+pub const CHIP_TEXT_PX: f32 = 10.0;
+pub const CHIP_PAD_X: f32 = 6.0;
+pub const CHIP_RADIUS: f32 = 4.0;
+
+/// The GDI family name of the face [`system_monospace`] reads.
+///
+/// The same file (`%SystemRoot%\Fonts\consola.ttf`) by the name GDI knows it
+/// under, for callers that ask the OS for a font rather than handing egui
+/// bytes. It is here rather than in `crate::win32_draw` for the reason
+/// [`TEXT_CLIP_INSET`] is: the GDI renderer takes every face, colour and
+/// dimension from this module.
+pub const GDI_MONO_FACE: &str = "Consolas";
 
 /// Paints one keyboard-hint chip: `text` in 10px monospace, centered in a
 /// rounded box of exactly [`CHIP_HEIGHT`] with `pad_x` either side.
 fn paint_chip(ui: &mut Ui, text: &str, bg: Color32, fg: Color32, radius: u8, pad_x: f32) {
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_string(), FontId::new(10.0, FontFamily::Monospace), fg);
+        .layout_no_wrap(text.to_string(), FontId::new(CHIP_TEXT_PX, FontFamily::Monospace), fg);
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(galley.size().x + pad_x * 2.0, CHIP_HEIGHT),
         Sense::hover(),
@@ -1090,7 +1111,7 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
     } else {
         (CANVAS, TEXT_FAINT)
     };
-    paint_chip(ui, text, bg, fg, 4, 6.0);
+    paint_chip(ui, text, bg, fg, CHIP_RADIUS as u8, CHIP_PAD_X);
 }
 
 /// The Windows Hello panel's CTRL+H chip (design 3h: `font-size: 10px;
@@ -1532,6 +1553,220 @@ pub fn toolbar_button_with_shortcut(ui: &mut Ui, label: &str, shortcut: &str) ->
     response
 }
 
+/// **The wordmark, in the card header's caps setting.** One constant, because
+/// the egui header below and the four Win32 cards' GDI header both set it, and
+/// a second literal would be a second brand free to drift from this one.
+pub const WORDMARK_CAPS: &str = "DESKWARDEN";
+
+/// The card header's mark height, the size its wordmark is set at, and the
+/// tracking on it (0.1em at 11px). Public for the Win32 cards, which lay the
+/// same lockup out in whole pixels rather than through egui.
+pub const CARD_HEADER_MARK_H: f32 = 16.0;
+pub const CARD_HEADER_WORD_PX: f32 = 11.0;
+pub const CARD_HEADER_TRACKING: f32 = 1.1;
+
+/// **The mark's design artboard**, `(width, height)`. [`quadrant_outlines`] is
+/// drawn in these coordinates, so anything fitting the mark into a box of its
+/// own -- egui's [`paint_mark`] and `win32_draw::draw_mark` alike -- scales
+/// against this pair rather than against two copies of 24 and 28.
+pub const MARK_ARTBOARD: (f32, f32) = (24.0, 28.0);
+
+// ---------------------------------------------------------------------------
+// The field marks: one drawn icon per kind of thing the picker can type.
+//
+// STROKES, NOT GLYPHS, for the reason the detail pane's star, kebab, eye and
+// clock are strokes: a mark out of a fallback face nobody here chose brings
+// its own weight, optical size and baseline next to controls measured from
+// the design. These are drawn a second time over: the account picker is bare
+// Win32 with no egui anywhere on its path, so an `egui::Shape` would not
+// reach it at all -- what crosses that line is geometry, exactly as
+// [`quadrant_outlines`] already does for the shield.
+//
+// Points only, in one square artboard, with a kind saying how each path is to
+// be laid down. `win32_draw::draw_field_mark` scales them into device pixels
+// and strokes them with GDI; nothing here knows what a renderer is.
+// ---------------------------------------------------------------------------
+
+/// **The field marks' artboard**, a square. Every path below is drawn in
+/// `0.0..FIELD_MARK_ARTBOARD` on both axes, so a caller fitting a mark into a
+/// box scales against this one number.
+pub const FIELD_MARK_ARTBOARD: f32 = 20.0;
+
+/// The drawn side of a field mark inside a row's square gutter.
+///
+/// Smaller than the 24px a favicon is blended at, deliberately: a favicon is
+/// a picture with its own padding baked in, and a stroked mark drawn to the
+/// same 24 reads as the louder of the two. 20 puts this family's ink at the
+/// optical weight of the artwork it sits beside in the step before.
+pub const FIELD_MARK_SIDE: f32 = 20.0;
+
+/// The field marks' stroke, in artboard units.
+///
+/// Heavier than [`ICON_STROKE`]'s 1.3 because these are drawn at 20px rather
+/// than the detail strip's 34, and a 1.3 stroke on a 20px mark beside 13px
+/// Archivo Medium reads as a hairline sketch next to the row's own name.
+pub const FIELD_MARK_STROKE: f32 = 1.4;
+
+/// Which mark a row carries. One per kind of thing the picker can type, plus
+/// the sequence that runs several of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldMark {
+    /// A bust: the username.
+    Person,
+    /// A key: the password.
+    Key,
+    /// A clock face: the one-time code, which is the only field that expires.
+    Clock,
+    /// An arrow into a stop: *username, Tab, password*, which is the only
+    /// offer that types a key rather than a value.
+    TabArrow,
+    /// A run of steps: the item's own saved sequence.
+    Steps,
+    /// A luggage tag: a custom field, which is the only one whose name the
+    /// user chose.
+    Tag,
+}
+
+/// How one path of a mark is laid down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkPathKind {
+    /// Stroked from the first point to the last and no further.
+    Open,
+    /// Stroked and closed back onto its first point.
+    Closed,
+    /// Filled, and closed.
+    Filled,
+}
+
+/// One piece of one mark, in artboard coordinates.
+///
+/// **A circle is its own variant rather than a sampled path**, and that is
+/// not a nicety: a ring flattened to twenty-four points and then rounded to
+/// whole device pixels at a 3-unit radius comes out an octagon, which is
+/// exactly what the first render of these marks showed. A renderer with a
+/// real ellipse primitive -- GDI has one, egui has one -- draws the circle it
+/// was asked for at any size.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkShape {
+    /// A run of points, stroked or filled per [`MarkPathKind`].
+    Path { points: Vec<Pos2>, kind: MarkPathKind },
+    /// A circle, stroked when `filled` is false and filled when it is true.
+    Circle { centre: Pos2, radius: f32, filled: bool },
+}
+
+/// A stroked ring.
+fn mark_ring(cx: f32, cy: f32, r: f32) -> MarkShape {
+    MarkShape::Circle { centre: Pos2::new(cx, cy), radius: r, filled: false }
+}
+
+/// A filled dot.
+fn mark_dot(cx: f32, cy: f32, r: f32) -> MarkShape {
+    MarkShape::Circle { centre: Pos2::new(cx, cy), radius: r, filled: true }
+}
+
+/// An arc, open, from `from` to `to` radians. Sampled rather than a
+/// [`MarkShape::Circle`], because it is not one: no renderer here draws a
+/// partial ellipse the same way twice.
+fn mark_arc(cx: f32, cy: f32, r: f32, from: f32, to: f32, steps: usize) -> MarkShape {
+    let points = (0..=steps)
+        .map(|i| {
+            let t = from + (to - from) * i as f32 / steps as f32;
+            Pos2::new(cx + r * t.cos(), cy + r * t.sin())
+        })
+        .collect();
+    MarkShape::Path { points, kind: MarkPathKind::Open }
+}
+
+fn mark_line(x0: f32, y0: f32, x1: f32, y1: f32) -> MarkShape {
+    MarkShape::Path {
+        points: vec![Pos2::new(x0, y0), Pos2::new(x1, y1)],
+        kind: MarkPathKind::Open,
+    }
+}
+
+/// **Every piece of one mark**, in [`FIELD_MARK_ARTBOARD`] coordinates.
+///
+/// Built once and kept, for [`quadrant_outlines`]'s reason: the geometry is a
+/// compile-time constant in all but name -- it only needs float arithmetic a
+/// `const` cannot do -- and the caller is a repaint path that runs on every
+/// hover.
+pub fn field_mark_shapes(mark: FieldMark) -> &'static [MarkShape] {
+    static SHAPES: OnceLock<[Vec<MarkShape>; 6]> = OnceLock::new();
+    let all = SHAPES.get_or_init(build_field_marks);
+    &all[match mark {
+        FieldMark::Person => 0,
+        FieldMark::Key => 1,
+        FieldMark::Clock => 2,
+        FieldMark::TabArrow => 3,
+        FieldMark::Steps => 4,
+        FieldMark::Tag => 5,
+    }]
+}
+
+fn build_field_marks() -> [Vec<MarkShape>; 6] {
+    use std::f32::consts::PI;
+    let p = Pos2::new;
+
+    // A bust. The head is a ring rather than a disc so that the mark holds
+    // the same amount of white as the key and the clock beside it, and the
+    // shoulders are a wide, shallow arc: a deeper one reads as a bowl the
+    // head is sitting in.
+    let person = vec![
+        mark_ring(10.0, 7.0, 3.8),
+        mark_arc(10.0, 19.4, 7.0, PI * 1.22, PI * 1.78, 16),
+    ];
+
+    // A key, bow left. Two teeth, because one reads as a lollipop.
+    let key = vec![
+        mark_ring(6.2, 10.0, 3.9),
+        mark_line(10.1, 10.0, 17.2, 10.0),
+        mark_line(13.2, 10.0, 13.2, 13.8),
+        mark_line(16.4, 10.0, 16.4, 12.9),
+    ];
+
+    // A clock at three o'clock, the reading that gives the two hands the
+    // largest angle a face can show -- `CLOCK_HOUR_HAND`'s argument, applied
+    // to a mark drawn by a different renderer.
+    let clock = vec![
+        mark_ring(10.0, 10.0, 6.5),
+        mark_line(10.0, 10.0, 10.0, 5.2),
+        mark_line(10.0, 10.0, 14.1, 10.0),
+    ];
+
+    // Tab: an arrow that runs into a stop. The head is FILLED, which is what
+    // tells it apart from the outlined marks either side of it at 20px.
+    let tab_arrow = vec![
+        mark_line(2.6, 10.0, 11.6, 10.0),
+        MarkShape::Path {
+            points: vec![p(11.0, 6.0), p(11.0, 14.0), p(15.6, 10.0)],
+            kind: MarkPathKind::Filled,
+        },
+        mark_line(17.4, 4.8, 17.4, 15.2),
+    ];
+
+    // A run of steps: three lines, each led by a filled dot. A saved sequence
+    // is the one offer that is a list of actions rather than a single value,
+    // and this is the shape of a list.
+    let mut steps = Vec::new();
+    for row in 0..3 {
+        let y = 5.2 + row as f32 * 4.8;
+        steps.push(mark_dot(4.2, y, 1.4));
+        steps.push(mark_line(8.0, y, 16.4, y));
+    }
+
+    // A luggage tag with its eyelet: the custom field, whose name is the
+    // user's own and whose contents this card knows nothing about.
+    let tag = vec![
+        MarkShape::Path {
+            points: vec![p(10.4, 2.6), p(17.4, 2.6), p(17.4, 9.6), p(9.6, 17.4), p(2.6, 10.4)],
+            kind: MarkPathKind::Closed,
+        },
+        mark_dot(14.2, 5.8, 1.35),
+    ];
+
+    [person, key, clock, tab_arrow, steps, tag]
+}
+
 /// The overlay/card header bar: 16px mark, letterspaced "DESKWARDEN", and a
 /// right-aligned status ("3 matches", the app name).
 pub fn card_header(ui: &mut Ui, right_text: &str) {
@@ -1554,9 +1789,15 @@ pub fn card_header_with_close(ui: &mut Ui, right_text: &str) -> bool {
 fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
     let mut dismissed = false;
     ui.horizontal(|ui| {
-        mark(ui, 16.0);
+        mark(ui, CARD_HEADER_MARK_H);
         // Real tracking (0.1em at 11px), not spaces between letters.
-        ui.label(letterspaced("DESKWARDEN", 11.0, BOLD, 1.1, TEXT_SECONDARY));
+        ui.label(letterspaced(
+            WORDMARK_CAPS,
+            CARD_HEADER_WORD_PX,
+            BOLD,
+            CARD_HEADER_TRACKING,
+            TEXT_SECONDARY,
+        ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if with_close {
                 dismissed = close_glyph(ui).clicked();
@@ -2150,6 +2391,25 @@ fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
 ///
 /// Square at the strip's own control height, so its hit target matches the
 /// 34px buttons beside it rather than being only as big as the mark.
+///
+/// # Its OFF state used to rest at `TEXT_FAINT`, and that was overshooting
+///
+/// Reported as "star on details page doesn't look as bold as the rest", and
+/// the report is right: [`kebab_button`], [`send_record_button`],
+/// [`add_totp_button`] and [`close_pane_button`] all rest at
+/// [`TEXT_SECONDARY`], and the star was the one control on the strip resting
+/// a shade paler than the rest of it, even though every mark here shares the
+/// same [`ICON_STROKE`]/[`STAR_STROKE`] weight -- so what read as "not as
+/// bold" was colour, not weight.
+///
+/// The old reasoning was "the star's fainter grey is the colour of a toggle
+/// that is OFF" -- see the note that reasoning left on
+/// [`send_record_button`] and [`close_pane_button`] -- and that is being
+/// overruled here, not silently dropped: a favourite that is off is still a
+/// live, always-clickable control sitting in a strip of live, always-
+/// clickable controls, and the strip reading as one weight of ink matters
+/// more than marking "off" with a second shade the rest of the strip does
+/// not use anywhere else.
 pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
@@ -2163,7 +2423,7 @@ pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
     } else if response.hovered() {
         INK
     } else {
-        TEXT_FAINT
+        TEXT_SECONDARY
     };
     paint_star(ui, rect.center(), STAR_OUTER, on, color);
     response
@@ -2226,8 +2486,9 @@ pub fn send_record_button(ui: &mut Ui) -> Response {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // The kebab's resting grey, not the star's: this is an action, and the
-    // star's fainter TEXT_FAINT is the colour of a toggle that is OFF.
+    // The strip's resting grey, TEXT_SECONDARY -- the star now rests here
+    // too; see the note on `star_toggle`'s doc for why its old, fainter
+    // resting colour was retired.
     let color = if response.hovered() { INK } else { TEXT_SECONDARY };
     let stroke = Stroke::new(ICON_STROKE, color);
     let c = rect.center();
@@ -2290,9 +2551,11 @@ pub fn send_record_button(ui: &mut Ui) -> Response {
 /// it only cost legibility on the one control that is on every detail pane.
 ///
 /// So it rests where its siblings rest, and darkens to [`INK`] on hover as
-/// they do. The favourite star's [`TEXT_FAINT`] is not the reference: that is
-/// the colour of a TOGGLE THAT IS OFF, and this is an action, which is the
-/// same distinction [`send_record_button`] makes in its own body.
+/// they do. (The favourite star used to rest a shade fainter, on the theory
+/// that [`TEXT_FAINT`] was the colour of a TOGGLE THAT IS OFF; see the note
+/// on [`star_toggle`]'s doc for why that no longer holds -- the star rests
+/// at [`TEXT_SECONDARY`] too now, so this control has no fainter sibling
+/// left to be confused with.)
 ///
 /// It still has no armed state, because closing a pane is undone by clicking
 /// the row again.
@@ -2344,9 +2607,9 @@ pub fn close_pane_button(ui: &mut Ui) -> Response {
 /// [`the_clock_codepoints_are_not_carried_by_this_apps_own_typeface`], which
 /// records both halves, and [`folder_mark`], where the same trap was found.
 ///
-/// The hover ink is [`send_record_button`]'s and not [`star_toggle`]'s: this
-/// is an action, and the star's fainter resting grey is the colour of a
-/// toggle that is OFF.
+/// The hover ink is [`send_record_button`]'s: the strip's own [`INK`] on
+/// hover, [`TEXT_SECONDARY`] at rest -- the same resting grey [`star_toggle`]
+/// now uses too.
 pub fn add_totp_button(ui: &mut Ui) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
@@ -2833,6 +3096,16 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 /// scroll bar anywhere in the design document to read a value off, so this
 /// follows egui rather than inventing a number.
 pub const SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// How far short of its rect's right edge a single line of clipped text stops.
+///
+/// Used by [`crate::win32_draw::draw_row`], whose `DrawTextW` calls carry
+/// `DT_END_ELLIPSIS`: without an inset the "..." Windows substitutes sits hard
+/// against the card's edge and reads as a cut rather than as a truncation.
+/// Three device pixels is the smallest gap that separates the glyph from the
+/// edge at 100% scaling; it is here rather than in `win32_draw` so the GDI
+/// renderer keeps taking every dimension from this module.
+pub const TEXT_CLIP_INSET: f32 = 3.0;
 
 /// Configures `ui` so that an [`egui::ScrollArea`] shown inside it reserves a
 /// `gutter`-wide lane down its right-hand edge and draws its bar in the
@@ -3444,6 +3717,95 @@ fn rule(ui: &mut Ui, color: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every field mark stays inside its own artboard**, ink included.
+    ///
+    /// The marks are scaled into a row's square gutter by the number
+    /// [`FIELD_MARK_ARTBOARD`] gives, so a point outside it is ink outside
+    /// the box -- on a card with no scrolling and a hard edge one row away,
+    /// that is a mark drawn over its neighbour's text. The stroke counts:
+    /// what is checked is the outline plus half of [`FIELD_MARK_STROKE`],
+    /// which is where a stroked path's ink actually lands.
+    #[test]
+    fn no_field_mark_paints_outside_its_artboard() {
+        let half = FIELD_MARK_STROKE / 2.0;
+        let mut seen = 0;
+        for mark in [
+            FieldMark::Person,
+            FieldMark::Key,
+            FieldMark::Clock,
+            FieldMark::TabArrow,
+            FieldMark::Steps,
+            FieldMark::Tag,
+        ] {
+            let shapes = field_mark_shapes(mark);
+            assert!(!shapes.is_empty(), "{mark:?} has no geometry at all, so its gutter is blank");
+            for shape in shapes {
+                let (lo, hi) = match shape {
+                    MarkShape::Circle { centre, radius, .. } => (
+                        Pos2::new(centre.x - radius - half, centre.y - radius - half),
+                        Pos2::new(centre.x + radius + half, centre.y + radius + half),
+                    ),
+                    MarkShape::Path { points, .. } => {
+                        assert!(points.len() >= 2, "{mark:?} carries a path of fewer than two points");
+                        let mut lo = Pos2::new(f32::MAX, f32::MAX);
+                        let mut hi = Pos2::new(f32::MIN, f32::MIN);
+                        for q in points {
+                            lo = Pos2::new(lo.x.min(q.x - half), lo.y.min(q.y - half));
+                            hi = Pos2::new(hi.x.max(q.x + half), hi.y.max(q.y + half));
+                        }
+                        (lo, hi)
+                    }
+                };
+                assert!(
+                    lo.x >= 0.0 && lo.y >= 0.0,
+                    "{mark:?} paints ink at ({}, {}), left of or above its artboard",
+                    lo.x,
+                    lo.y
+                );
+                assert!(
+                    hi.x <= FIELD_MARK_ARTBOARD && hi.y <= FIELD_MARK_ARTBOARD,
+                    "{mark:?} paints ink at ({}, {}), past its {FIELD_MARK_ARTBOARD}-unit \
+                     artboard -- in a row's gutter that is ink over the row beside it",
+                    hi.x,
+                    hi.y
+                );
+                seen += 1;
+            }
+        }
+        // CONTROL: the walk actually visited geometry, so the bounds above
+        // are not a loop over nothing.
+        assert!(seen >= 6, "control: only {seen} shapes were measured across all six marks");
+    }
+
+    /// **The six field marks are six different pictures.**
+    ///
+    /// They sit one under another in the same list, and two rows drawn with
+    /// the same mark would say the two offers are the same thing -- which is
+    /// exactly the confusion the marks were added to remove.
+    #[test]
+    fn no_two_field_marks_are_the_same_geometry() {
+        let all = [
+            FieldMark::Person,
+            FieldMark::Key,
+            FieldMark::Clock,
+            FieldMark::TabArrow,
+            FieldMark::Steps,
+            FieldMark::Tag,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    field_mark_shapes(*a),
+                    field_mark_shapes(*b),
+                    "{a:?} and {b:?} draw the same picture"
+                );
+            }
+        }
+        // CONTROL: a mark equals itself, so the comparison above is a real
+        // one and not `PartialEq` refusing to match anything.
+        assert_eq!(field_mark_shapes(FieldMark::Key), field_mark_shapes(FieldMark::Key));
+    }
 
     #[test]
     fn initials_take_the_first_letter_of_the_first_two_words() {
@@ -4585,6 +4947,29 @@ mod drawn_icon_family_tests {
                 "the {on} star is being reported as an envelope"
             );
         }
+    }
+
+    /// **The star's OFF state rests at the strip's own resting grey, not a
+    /// fainter one.**
+    ///
+    /// Reported as "star on details page doesn't look as bold as the rest".
+    /// Of the strip's five controls, four -- [`kebab_button`],
+    /// [`send_record_button`], [`add_totp_button`] and [`close_pane_button`]
+    /// -- rest at [`TEXT_SECONDARY`]; only the star rested at the paler
+    /// [`TEXT_FAINT`], which is what read as thinner even though every mark
+    /// here shares the same [`ICON_STROKE`]/[`STAR_STROKE`] weight -- the
+    /// difference was colour, not weight.
+    #[test]
+    fn the_off_star_rests_at_the_strips_own_grey_not_a_fainter_one() {
+        let (_, marks) = control(|ui| star_toggle(ui, false));
+        let stars = icon_probe::stars(&egui::Shape::Vec(marks));
+        assert_eq!(stars.len(), 1, "star_toggle(false) painted no star");
+        assert_eq!(
+            stars[0].stroke, TEXT_SECONDARY,
+            "the off star rests at {:?}, not the strip's own resting grey \
+             ({:?}) that the kebab, envelope, clock and close mark share",
+            stars[0].stroke, TEXT_SECONDARY
+        );
     }
 
     /// The detail header's five controls, each drawn alone, in the order the

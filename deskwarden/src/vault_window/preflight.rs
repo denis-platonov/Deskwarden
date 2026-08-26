@@ -8,9 +8,15 @@
 //! a unit test -- and, more importantly, so the gate can be exercised from
 //! *the position it gates* (see [`dispatch_with`]).
 //!
-//! The SURFACE is [`draw`]: it names the window rather than the rule, lists
-//! the steps with secrets masked, asks for a *hold* rather than a click, and
-//! when the verdict is a refusal it paints no send affordance at all.
+//! The SURFACE used to be `draw`, an egui rendering, and it is not here any
+//! more: 4b is drawn by [`crate::preflight_card`] in bare Win32 and GDI,
+//! because the first egui window this process opens costs ~50 MB of OpenGL
+//! driver arenas that are never released and 4b was the last surface on the
+//! daemon's fill path paying it. What that card is held to is still written
+//! down here -- the words it paints are the constants below, the two lines it
+//! composes are [`target_line`] and [`refusal_message`], and the arithmetic
+//! behind its hold is [`advance_hold`] and [`hold_complete`]. So the surface
+//! moved and the specification did not.
 //!
 //! # The step list is not built here
 //!
@@ -27,8 +33,6 @@
 use super::detail_edit::{step_rows, StepRow};
 use crate::injector::target::SendTarget;
 use crate::key_sequence::ResolveSource;
-use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin, Ui};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -105,8 +109,14 @@ pub enum Gated<T> {
 pub struct SendGate {
     /// [`crate::injector::target::describe_foreground`] in production.
     describe: fn() -> Option<SendTarget>,
-    /// [`crate::preflight_host::show_preflight`] in production: the modal that
-    /// hosts [`draw`]. See [`Self::confirm`] for why it is here and not inside
+    /// [`crate::preflight_card::show_preflight_card`] in production: the
+    /// bare-Win32 card that puts 4b on screen.
+    ///
+    /// **It is no longer an egui window.** This module's `draw` is gone with
+    /// the host that ran it; nothing in this crate had a second caller for it.
+    /// See the module doc for what stayed behind.
+    ///
+    /// See [`Self::confirm`] for why the seam is here and not inside
     /// [`dispatch_with`].
     confirm: fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction>,
 }
@@ -115,7 +125,7 @@ impl SendGate {
     pub fn production() -> Self {
         Self {
             describe: crate::injector::target::describe_foreground,
-            confirm: crate::preflight_host::show_preflight,
+            confirm: crate::preflight_card::show_preflight_card,
         }
     }
 
@@ -152,9 +162,10 @@ impl SendGate {
     /// The names are the part worth reading -- a count that moved says
     /// nothing on its own about whether the same escape is still caught.
     ///
-    /// The other direction is a real gain: [`draw`]'s refusal state paints no
-    /// hold affordance at all, so a refused target never even offers the user
-    /// a way to ask.
+    /// The other direction is a real gain: the card's refusal state lays out no
+    /// hold affordance at all -- `preflight_card::layout` answers `None` for it
+    /// and its pump does not read the key -- so a refused target never even
+    /// offers the user a way to ask.
     pub fn confirm(
         &self,
         state: PreflightState,
@@ -248,8 +259,9 @@ pub enum PreflightAction {
 /// emitted.
 ///
 /// Long enough that it cannot be a stray keypress on a window that has just
-/// taken focus, short enough not to read as a hang. A click is not an option
-/// at all -- see [`draw`].
+/// taken focus, short enough not to read as a hang. A click is not an option at
+/// all: the card paints its hold affordance rather than putting a `BUTTON`
+/// under it, so there is nothing there to click.
 pub const HOLD_TO_SEND: Duration = Duration::from_millis(800);
 
 /// The design's own words, kept as constants so the tests assert on the same
@@ -344,123 +356,43 @@ pub fn refusal_message(state: &PreflightState, why: Refusal) -> String {
     )
 }
 
-/// The preflight, drawn.
+/// **How the hold accumulates, and it is the same arithmetic in both
+/// renderers.**
 ///
-/// **There is no send button.** The most dangerous action in the app must not
-/// be reachable by a stray click on a window that just took focus, so the send
-/// is a held key: `held` accumulates while the key is down and is thrown away
-/// the moment it is not. Nothing here returns [`PreflightAction::Send`] on a
-/// click, and no code path returns it while the verdict is a refusal.
-pub fn draw(ui: &mut Ui, state: &mut PreflightState) -> Option<PreflightAction> {
-    let mut action = None;
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| match state.verdict {
-            Verdict::Allowed => action = draw_allowed(ui, state),
-            Verdict::Refused(why) => action = draw_refused(ui, state, why),
-        });
-    // Esc cancels from either state -- the one control the design gives both.
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        action = Some(PreflightAction::Cancel);
-    }
-    action
-}
-
-fn draw_allowed(ui: &mut Ui, state: &mut PreflightState) -> Option<PreflightAction> {
-    ui.label(egui::RichText::new(HEADING_TARGET).size(11.0).color(theme::TEXT_MUTED));
-    ui.label(egui::RichText::new(&state.target.title).size(15.0).color(theme::INK));
-    ui.label(egui::RichText::new(target_line(state)).size(11.0).color(theme::TEXT_SECONDARY));
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new(HEADING_STEPS).size(11.0).color(theme::TEXT_MUTED));
-    for row in &state.rows {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("{}", row.number)).size(11.0).color(theme::TEXT_MUTED),
-            );
-            ui.label(egui::RichText::new(&row.label).size(12.0).color(theme::INK));
-            if !row.payload.is_empty() {
-                ui.label(
-                    egui::RichText::new(&row.payload).size(12.0).color(theme::TEXT_SECONDARY),
-                );
-            }
-            if row.secret {
-                ui.label(egui::RichText::new(MASKED_ONLY).size(11.0).color(theme::TEXT_MUTED));
-            }
-        });
-    }
-    ui.add_space(12.0);
-
-    // The hold. `stable_dt` rather than a wall clock so a stalled frame cannot
-    // credit the user with time they did not hold the key for.
-    let (down, dt) = ui.input(|i| (i.key_down(egui::Key::Space), i.stable_dt));
-    let mut action = None;
+/// This file used to hold `draw`, an egui surface for 4b, and the daemon
+/// hosted it in an `eframe` window. It does not any more: the first egui
+/// window this process opens costs ~50 MB of OpenGL driver arenas that are
+/// never released, and 4b was the last surface on the daemon's fill path
+/// paying that. The card is [`crate::preflight_card`] now -- bare Win32, GDI,
+/// ~1.8 MB -- and this file kept the half that was never egui in the first
+/// place: the DECISION.
+///
+/// What went with `draw` was a set of behavioural tests, and this function is
+/// where the one that could not be re-expressed in geometry came back. The
+/// property is: **a series of taps never adds up to a send.** `held` grows
+/// only while the key is down and is thrown away the moment it is not, so
+/// there is no way to reach [`HOLD_TO_SEND`] except by holding.
+///
+/// Pure, and `dt` is passed in rather than read off a clock, so the whole
+/// range -- a tap, a stall, a hold that completes -- is reachable from a test
+/// with no window and no wall time.
+pub fn advance_hold(held: Duration, down: bool, dt: Duration) -> Duration {
     if down {
-        state.held += Duration::from_secs_f32(dt.max(0.0));
-        if state.held >= HOLD_TO_SEND {
-            action = Some(PreflightAction::Send);
-        }
+        held + dt
     } else {
-        state.held = Duration::ZERO;
+        // **Zero, not "paused".** A user who let go has stopped asking.
+        Duration::ZERO
     }
-
-    let fraction = (state.held.as_secs_f32() / HOLD_TO_SEND.as_secs_f32()).clamp(0.0, 1.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 30.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(6), theme::BLUE_WASH);
-    if fraction > 0.0 {
-        let mut filled = rect;
-        filled.set_width(rect.width() * fraction);
-        ui.painter().rect_filled(filled, CornerRadius::same(6), theme::BLUE_EDGE);
-    }
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        HOLD_HINT,
-        egui::FontId::proportional(12.0),
-        theme::BLUE,
-    );
-
-    ui.horizontal(|ui| {
-        if ui.add(egui::Button::new(egui::RichText::new(CANCEL_LABEL).size(12.0))).clicked() {
-            action = Some(PreflightAction::Cancel);
-        }
-        if ui.add(egui::Button::new(egui::RichText::new(COPY_INSTEAD_LABEL).size(12.0))).clicked() {
-            action = Some(PreflightAction::CopyInstead);
-        }
-    });
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new(FOOTNOTE).size(11.0).color(theme::TEXT_MUTED));
-    action
 }
 
-/// The refusal state. **Paints no hold affordance and reads no key**, so there
-/// is no frame on which a held Space can accumulate toward a send.
-fn draw_refused(ui: &mut Ui, state: &PreflightState, why: Refusal) -> Option<PreflightAction> {
-    ui.label(egui::RichText::new(REFUSED_HEADING).size(15.0).color(theme::ERROR));
-    ui.label(egui::RichText::new(&state.target.title).size(13.0).color(theme::INK));
-    ui.label(
-        egui::RichText::new(format!(
-            "{} \u{b7} {} focused",
-            state.target.image_name, state.target.class_name
-        ))
-        .size(11.0)
-        .color(theme::TEXT_SECONDARY),
-    );
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new(refusal_message(state, why)).size(12.0).color(theme::INK));
-    ui.add_space(12.0);
-    let mut action = None;
-    ui.horizontal(|ui| {
-        if ui.add(egui::Button::new(egui::RichText::new(DISMISS_LABEL).size(12.0))).clicked() {
-            action = Some(PreflightAction::Cancel);
-        }
-        if ui.add(egui::Button::new(egui::RichText::new(COPY_INSTEAD_LABEL).size(12.0))).clicked() {
-            action = Some(PreflightAction::CopyInstead);
-        }
-    });
-    action
+/// Whether a hold has lasted long enough to be a send.
+///
+/// A named function rather than a `>=` at the call site because the comparison
+/// is the gate: `>` instead of `>=`, or a threshold read from somewhere else,
+/// is a change to how long the most dangerous action in the app has to be
+/// asked for.
+pub fn hold_complete(held: Duration) -> bool {
+    held >= HOLD_TO_SEND
 }
 
 /// A gate whose foreground is a **fixture**, for the tests that drive a whole
@@ -509,6 +441,104 @@ impl SendGate {
 mod tests {
     use super::*;
     use crate::injector::target::SendTarget;
+    use crate::key_sequence::ResolveSource;
+
+    // -- the hold ----------------------------------------------------------
+    //
+    // These came back from the egui surface's own tests when that surface was
+    // deleted. They were the one thing there that was not about geometry, and
+    // they are the reason `advance_hold` is a function rather than three lines
+    // inside `preflight_card`'s pump: the pump cannot be driven without a
+    // window, and this can be driven over any `dt` at all.
+
+    /// **A series of taps never adds up to a send**, which is the whole point
+    /// of asking for a hold rather than a click.
+    #[test]
+    fn taps_never_add_up_to_a_send() {
+        let tap = Duration::from_millis(120);
+        let mut held = Duration::ZERO;
+        for _ in 0..50 {
+            // Down for a moment...
+            held = advance_hold(held, true, tap);
+            assert!(
+                !hold_complete(held),
+                "one tap of {tap:?} completed a hold of {HOLD_TO_SEND:?}"
+            );
+            // ...and released, which throws it away.
+            held = advance_hold(held, false, tap);
+            assert_eq!(held, Duration::ZERO, "releasing did not reset the hold");
+        }
+        assert!(!hold_complete(held));
+    }
+
+    /// And it is not merely inert: holding long enough really does complete.
+    #[test]
+    fn holding_long_enough_completes_and_a_release_throws_it_away() {
+        let tick = Duration::from_millis(8);
+        let mut held = Duration::ZERO;
+        let mut ticks = 0;
+        while !hold_complete(held) {
+            held = advance_hold(held, true, tick);
+            ticks += 1;
+            assert!(ticks < 1000, "the hold never completed, at {held:?}");
+        }
+        assert!(
+            held >= HOLD_TO_SEND,
+            "the hold reported complete at {held:?}, short of {HOLD_TO_SEND:?}"
+        );
+        // Control on the instrument: it took a real number of ticks, so the
+        // loop above is not passing on its first iteration.
+        assert!(ticks > 1, "control: the hold completed on one tick of {tick:?}");
+        // A release at the very last moment still throws it away.
+        assert_eq!(advance_hold(held, false, tick), Duration::ZERO);
+    }
+
+    /// A stalled frame credits the user with exactly the time it names and no
+    /// more -- `dt` is the caller's measurement, and this function invents
+    /// none of its own.
+    #[test]
+    fn the_hold_credits_only_the_time_it_is_handed() {
+        assert_eq!(advance_hold(Duration::ZERO, true, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            advance_hold(Duration::from_millis(100), true, Duration::from_millis(50)),
+            Duration::from_millis(150)
+        );
+        assert!(!hold_complete(HOLD_TO_SEND - Duration::from_millis(1)));
+        assert!(hold_complete(HOLD_TO_SEND));
+    }
+
+    /// The words the card paints for a refusal name **both** wrong facts when
+    /// both are wrong, and never the password.
+    ///
+    /// The surface that used to assert this by reading painted galleys is
+    /// gone; the sentence it read is composed here, so this is the same claim
+    /// against the same string.
+    #[test]
+    fn the_refusal_sentence_names_every_fact_that_is_wrong() {
+        let state = PreflightState::new(
+            t("slack.exe", false),
+            "saplogon.exe",
+            "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+            &ResolveSource {
+                username: "ada@example.com",
+                password: "hunter2",
+                custom: Vec::new(),
+                totp: &crate::vault_window::detail::TotpState::NoSecret,
+            },
+        );
+        assert_eq!(state.verdict, Verdict::Refused(Refusal::WrongProcess));
+        let sentence = refusal_message(&state, Refusal::WrongProcess);
+        assert!(sentence.contains("slack.exe"), "{sentence:?} does not name the focused window");
+        assert!(sentence.contains("saplogon.exe"), "{sentence:?} does not name the rule");
+        assert!(sentence.contains("the focused control is not masked"), "{sentence:?}");
+        assert!(sentence.contains("types a password"), "{sentence:?}");
+        assert!(!sentence.contains("hunter2"), "the refusal sentence carries the password");
+
+        let line = target_line(&state);
+        assert!(line.contains("slack.exe") && line.contains("pid 7412"), "{line:?}");
+        assert!(line.contains("does not match this rule"), "{line:?}");
+        assert!(!line.contains("hunter2"));
+    }
 
     fn t(image: &str, masked: bool) -> SendTarget {
         SendTarget {
@@ -679,328 +709,5 @@ mod tests {
         let fixture = concat!("let rows = step_rows(sequence, source, false);\n", "StepRow", " {");
         assert_eq!(fixture.matches("step_rows(sequence, source, false)").count(), 1);
         assert_eq!(fixture.matches(concat!("StepRow", " {")).count(), 1);
-    }
-}
-
-/// **The surface, drawn.**
-///
-/// The headless `Context::run_ui` idiom the rest of this crate uses. What
-/// these can see is every string painted and every rectangle's geometry; what
-/// they cannot see is hover cursors, focus rings or whether it *looks* right,
-/// and nothing here pretends otherwise.
-#[cfg(test)]
-mod painted_tests {
-    use super::*;
-    use crate::injector::target::SendTarget;
-    use crate::vault_bridge::{LoginData, VaultItem};
-    use crate::vault_window::detail;
-    use eframe::egui::{Pos2, Rect, Vec2};
-
-    const PANE: Vec2 = Vec2::new(520.0, 700.0);
-    const USERNAME: &str = "a.novak@ledgerline.com";
-    const PASSWORD: &str = "correct-horse-battery-staple-92";
-    const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{ENTER}";
-
-    #[derive(Default)]
-    struct Painted {
-        texts: Vec<String>,
-        rects: Vec<Rect>,
-    }
-
-    impl Painted {
-        fn strings(&self) -> Vec<&str> {
-            self.texts.iter().map(String::as_str).collect()
-        }
-        fn contains(&self, needle: &str) -> bool {
-            self.texts.iter().any(|t| t == needle)
-        }
-    }
-
-    fn walk(shape: &egui::Shape, p: &mut Painted) {
-        match shape {
-            egui::Shape::Text(text) => p.texts.push(text.galley.text().to_string()),
-            egui::Shape::Rect(rect) => p.rects.push(rect.rect),
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, p)),
-            _ => {}
-        }
-    }
-
-    fn item() -> VaultItem {
-        VaultItem {
-            id: "item-1".to_string(),
-            name: "Ledgerline".to_string(),
-            fields: Vec::new(),
-            login: Some(LoginData {
-                username: Some(USERNAME.to_string()),
-                password: Some(PASSWORD.to_string().into()),
-                totp: None,
-                uris: Vec::new(),
-                other: serde_json::Map::new(),
-            }),
-            card: None,
-            identity: None,
-            ssh_key: None,
-            notes: None,
-            item_type: Some(1),
-            folder_id: None,
-            favorite: false,
-            other: serde_json::Map::new(),
-        }
-    }
-
-    fn target(image: &str, masked: bool) -> SendTarget {
-        SendTarget {
-            title: "SAP Logon 760 - Sign in".into(),
-            image_name: image.into(),
-            pid: 7412,
-            class_name: "SAPFEWndClass".into(),
-            focused_is_masked: masked,
-        }
-    }
-
-    fn state_for(image: &str, masked: bool) -> PreflightState {
-        let item = item();
-        let totp = detail::TotpState::NoSecret;
-        let login = item.login.as_ref().unwrap();
-        let source = super::super::detail_edit::sequence_source(
-            login.username.as_deref().unwrap_or(""),
-            login.password.as_deref().map_or("", |v| v.as_str()),
-            Some(&item),
-            &totp,
-        );
-        PreflightState::new(target(image, masked), "saplogon.exe", SEQUENCE, &source)
-    }
-
-    fn raw_input(events: &[egui::Event]) -> egui::RawInput {
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, PANE)),
-            events: events.to_vec(),
-            ..Default::default()
-        }
-    }
-
-    fn styled_context() -> egui::Context {
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
-        ctx
-    }
-
-    fn frame(
-        ctx: &egui::Context,
-        state: &mut PreflightState,
-        events: &[egui::Event],
-    ) -> (Painted, Option<PreflightAction>) {
-        let mut action = None;
-        let output = ctx.run_ui(raw_input(events), |ui| action = draw(ui, state));
-        let mut painted = Painted::default();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut painted);
-        }
-        (painted, action)
-    }
-
-    /// A full primary press-and-release at `pos` -- what egui needs to report
-    /// a click. A press alone is not one.
-    fn click(pos: Pos2) -> Vec<egui::Event> {
-        vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            },
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::NONE,
-            },
-        ]
-    }
-
-    // -- the allowed state -------------------------------------------------
-
-    #[test]
-    fn the_surface_names_the_window_and_not_the_rule() {
-        let ctx = styled_context();
-        let mut state = state_for("saplogon.exe", true);
-        let (painted, action) = frame(&ctx, &mut state, &[]);
-        assert!(action.is_none(), "a preflight that nobody touched decided something");
-        assert!(painted.contains(HEADING_TARGET), "painted: {:?}", painted.strings());
-        assert!(
-            painted.contains("SAP Logon 760 - Sign in"),
-            "the window's own title is the headline; painted: {:?}",
-            painted.strings()
-        );
-        assert!(
-            painted.contains("saplogon.exe \u{b7} pid 7412 \u{b7} matches this rule"),
-            "painted: {:?}",
-            painted.strings()
-        );
-        assert!(painted.contains(HOLD_HINT), "painted: {:?}", painted.strings());
-        assert!(painted.contains(CANCEL_LABEL));
-        assert!(painted.contains(COPY_INSTEAD_LABEL));
-        assert!(painted.contains(FOOTNOTE));
-    }
-
-    /// The step list, with the secret masked and labelled -- and the password
-    /// itself nowhere on the surface, in any string, at any point.
-    #[test]
-    fn the_password_step_is_masked_and_labelled_and_its_characters_are_never_painted() {
-        let ctx = styled_context();
-        let mut state = state_for("saplogon.exe", true);
-        let (painted, _) = frame(&ctx, &mut state, &[]);
-
-        // Positive control on the instrument: the list really is drawn, so an
-        // absent password below is a mask and not an empty surface.
-        assert!(painted.contains(HEADING_STEPS), "painted: {:?}", painted.strings());
-        assert!(
-            painted.contains(super::super::detail_edit::SECRET_MASK),
-            "the masked payload was not painted at all; painted: {:?}",
-            painted.strings()
-        );
-        assert!(painted.contains(MASKED_ONLY), "painted: {:?}", painted.strings());
-
-        for s in painted.strings() {
-            assert!(!s.contains(PASSWORD), "the password was painted in {s:?}");
-        }
-    }
-
-    /// **The whole point of hold-to-send.** The most dangerous action in the
-    /// app must not be reachable by a stray click on a window that just took
-    /// focus, so every rectangle on the allowed surface is clicked and none of
-    /// them may send.
-    #[test]
-    fn one_click_does_not_send() {
-        let ctx = styled_context();
-        let mut state = state_for("saplogon.exe", true);
-        let (painted, _) = frame(&ctx, &mut state, &[]);
-        let spots: Vec<Pos2> = painted.rects.iter().map(|r| r.center()).collect();
-        assert!(!spots.is_empty(), "control: nothing was painted to click");
-        for spot in spots {
-            let (_, action) = frame(&ctx, &mut state, &click(spot));
-            assert_ne!(
-                action,
-                Some(PreflightAction::Send),
-                "a single click at {spot:?} sent the sequence"
-            );
-        }
-        assert_eq!(state.held, Duration::ZERO, "a click accumulated hold time");
-    }
-
-    /// And the control is not merely inert: holding the key long enough does
-    /// send, and letting go throws the accumulated time away.
-    #[test]
-    fn the_send_needs_the_key_held_and_a_release_throws_the_hold_away() {
-        let ctx = styled_context();
-        let mut state = state_for("saplogon.exe", true);
-
-        // Not yet: one frame's worth of hold is far short of the threshold.
-        let held = vec![egui::Event::Key {
-            key: egui::Key::Space,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }];
-        let (_, action) = frame(&ctx, &mut state, &held);
-        assert_eq!(action, None, "one frame of holding sent the sequence");
-        assert!(state.held > Duration::ZERO, "control: the hold did not accumulate at all");
-
-        // Let go: the accumulated time goes.
-        let released = vec![egui::Event::Key {
-            key: egui::Key::Space,
-            physical_key: None,
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }];
-        let (_, action) = frame(&ctx, &mut state, &released);
-        assert_eq!(action, None);
-        assert_eq!(state.held, Duration::ZERO, "releasing did not reset the hold");
-
-        // Held past the threshold: it sends.
-        state.held = HOLD_TO_SEND;
-        let (_, action) = frame(&ctx, &mut state, &held);
-        assert_eq!(action, Some(PreflightAction::Send));
-    }
-
-    #[test]
-    fn esc_cancels() {
-        let ctx = styled_context();
-        let mut state = state_for("saplogon.exe", true);
-        let esc = vec![egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }];
-        let (_, action) = frame(&ctx, &mut state, &esc);
-        assert_eq!(action, Some(PreflightAction::Cancel));
-    }
-
-    // -- the refusal state -------------------------------------------------
-
-    /// The refusal names the focused window and says plainly that this
-    /// sequence types a password and will not be sent there -- and paints **no
-    /// send affordance at all**, so there is no frame on which a held key can
-    /// accumulate toward one.
-    #[test]
-    fn the_refusal_names_the_focused_window_and_offers_no_way_to_send() {
-        let ctx = styled_context();
-        let mut state = state_for("slack.exe", false);
-        assert_eq!(state.verdict, Verdict::Refused(Refusal::WrongProcess));
-
-        let (painted, _) = frame(&ctx, &mut state, &[]);
-        assert!(painted.contains(REFUSED_HEADING), "painted: {:?}", painted.strings());
-        assert!(
-            painted.contains("slack.exe \u{b7} SAPFEWndClass focused"),
-            "painted: {:?}",
-            painted.strings()
-        );
-        let sentence = painted
-            .strings()
-            .into_iter()
-            .find(|s| s.contains("will not send it here"))
-            .unwrap_or_else(|| panic!("no refusal sentence; painted: {:?}", painted.strings()))
-            .to_string();
-        assert!(sentence.contains("slack.exe"), "{sentence:?} does not name the focused window");
-        assert!(sentence.contains("saplogon.exe"), "{sentence:?} does not name the rule");
-        assert!(sentence.contains("the focused control is not masked"), "{sentence:?}");
-        assert!(sentence.contains("types a password"), "{sentence:?}");
-        assert!(painted.contains(DISMISS_LABEL));
-        assert!(painted.contains(COPY_INSTEAD_LABEL));
-
-        assert!(
-            !painted.contains(HOLD_HINT),
-            "the refusal painted a send affordance; painted: {:?}",
-            painted.strings()
-        );
-        for s in painted.strings() {
-            assert!(!s.contains(PASSWORD), "the password was painted in {s:?}");
-        }
-    }
-
-    /// Holding the send key on the refusal does nothing, on every frame.
-    #[test]
-    fn the_refusal_cannot_be_held_into_a_send() {
-        let ctx = styled_context();
-        let mut state = state_for("slack.exe", false);
-        let held = vec![egui::Event::Key {
-            key: egui::Key::Space,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }];
-        for _ in 0..30 {
-            let (_, action) = frame(&ctx, &mut state, &held);
-            assert_ne!(action, Some(PreflightAction::Send), "the refusal was held into a send");
-        }
-        assert_eq!(state.held, Duration::ZERO, "the refusal accumulated hold time");
     }
 }

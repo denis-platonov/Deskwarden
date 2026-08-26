@@ -569,11 +569,11 @@ mod win32 {
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polygon, ReleaseDC, RoundRect,
+        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
         CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
@@ -586,7 +586,7 @@ mod win32 {
         PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
         SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
         TranslateMessage, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
-        ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, HTCAPTION, IDC_ARROW, MSG, PM_REMOVE,
+        ES_AUTOHSCROLL, ES_PASSWORD, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE,
         SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
         WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONDOWN,
         WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD,
@@ -1276,12 +1276,19 @@ mod win32 {
             }
             // Frameless windows are dragged by their background.
             WM_NCHITTEST => {
-                let hit = DefWindowProcW(window, msg, wparam, lparam);
-                if hit.0 == 1 {
-                    LRESULT(HTCAPTION as isize)
-                } else {
-                    hit
-                }
+                // **The close glyph is the one part of the background that is
+                // not a title bar.** It is painted by this window rather than
+                // being a child control, so answering `HTCAPTION` for the whole
+                // client area turned every press on it into a window drag and
+                // `WM_LBUTTONDOWN` below never fired -- the reported "clicking
+                // on X doesn't work". See `win32_draw::frameless_hit`, which is
+                // the pure half of this and the half the pin decides.
+                crate::win32_draw::frameless_hit_test(
+                    window,
+                    DefWindowProcW(window, msg, wparam, lparam),
+                    lparam,
+                    close_glyph_rect(),
+                )
             }
             WM_LBUTTONDOWN => {
                 if in_close_glyph(window, lparam) {
@@ -1385,15 +1392,28 @@ mod win32 {
             as *mut c_void)
     }
 
-    fn in_close_glyph(window: HWND, lparam: LPARAM) -> bool {
+    /// The close glyph's rect in DEVICE pixels.
+    ///
+    /// One derivation, read by both the hit test and `in_close_glyph`, so the
+    /// rect `WM_NCHITTEST` excuses from the drag and the rect `WM_LBUTTONDOWN`
+    /// answers on can never be two different rectangles.
+    fn close_glyph_rect() -> RECT {
         let l = super::layout();
-        let x = (lparam.0 & 0xffff) as i16 as i32;
-        let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+        RECT {
+            left: scale(l.close_glyph.x),
+            top: scale(l.close_glyph.y),
+            right: scale(l.close_glyph.right()),
+            bottom: scale(l.close_glyph.bottom()),
+        }
+    }
+
+    fn in_close_glyph(window: HWND, lparam: LPARAM) -> bool {
         let _ = window;
-        x >= scale(l.close_glyph.x)
-            && x < scale(l.close_glyph.right())
-            && y >= scale(l.close_glyph.y)
-            && y < scale(l.close_glyph.bottom())
+        crate::win32_draw::on_close_glyph(
+            (lparam.0 & 0xffff) as i16 as i32,
+            ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+            close_glyph_rect(),
+        )
     }
 
     // ---- painting ----------------------------------------------------------
@@ -1606,37 +1626,23 @@ mod win32 {
     }
 
     /// The brand mark, from `theme`'s own geometry and fills.
+    ///
+    /// **The painter itself lives in [`crate::win32_draw::draw_mark`] now.**
+    /// This window's copy was the crate's only GDI shield, and the four cards
+    /// ported after it went without one rather than grow a second; it moved
+    /// there so all five draw the same mark. What stays here is the one thing
+    /// that is this window's own: turning its logical [`Box2`] into the device
+    /// rect the shared painter takes.
     fn paint_mark(hdc: HDC, at: Box2) {
-        let outlines = crate::theme::quadrant_outlines();
-        let box_w = scale(at.w) as f32;
-        let box_h = scale(at.h) as f32;
-        let s = (box_w / 24.0).min(box_h / 28.0);
-        let ox = scale(at.x) as f32 + (box_w - 24.0 * s) / 2.0;
-        let oy = scale(at.y) as f32 + (box_h - 28.0 * s) / 2.0;
-
-        unsafe {
-            for (outline, fill_colour) in outlines.iter().zip(crate::theme::QUADRANT_FILLS) {
-                let points: Vec<POINT> = outline
-                    .iter()
-                    .map(|p| POINT {
-                        x: (ox + p.x * s).round() as i32,
-                        y: (oy + p.y * s).round() as i32,
-                    })
-                    .collect();
-                let brush = CreateSolidBrush(rgb(fill_colour));
-                // A `NULL_PEN` would leave a hairline gap between quadrants;
-                // a pen of the quadrant's own colour makes the four shapes
-                // meet exactly as they do in the vector original.
-                let pen = CreatePen(PS_SOLID, 1, rgb(fill_colour));
-                let old_brush = SelectObject(hdc, brush);
-                let old_pen = SelectObject(hdc, pen);
-                let _ = Polygon(hdc, &points);
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                let _ = DeleteObject(brush);
-                let _ = DeleteObject(pen);
-            }
-        }
+        crate::win32_draw::draw_mark(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+        );
     }
 
     /// The 3px indeterminate track, `theme::paint_progress_bar`'s proportions
@@ -2233,7 +2239,7 @@ mod tests {
     fn the_prompt_opens_under_a_title_no_other_window_of_ours_uses() {
         for other in [
             crate::vault_window::WINDOW_TITLE,
-            crate::preflight_host::PREFLIGHT_TITLE,
+            crate::preflight_card::PREFLIGHT_CARD_TITLE,
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::region_overlay::REGION_TITLE,
         ] {

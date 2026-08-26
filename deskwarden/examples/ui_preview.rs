@@ -3,18 +3,18 @@
 //! Interactive:
 //!
 //! ```text
-//! cargo run --example ui_preview            # the autofill overlay (design 2a)
+//! cargo run --example ui_preview            # the save-a-login form (design 3c)
 //! cargo run --example ui_preview -- --login # the login/unlock window (design 3h)
 //! ```
 //!
-//! The overlay closes on Enter/Esc/✕; the login preview just draws (its
+//! The save-a-login card closes on Enter/Esc/✕; the login preview just draws (its
 //! Continue does nothing here -- no `bw` is spawned from a preview).
 //!
 //! Self-screenshotting (for reviewing the design implementation without a
 //! human at the keyboard):
 //!
 //! ```text
-//! cargo run --example ui_preview -- --screenshot          # the overlay
+//! cargo run --example ui_preview -- --screenshot          # the 3c form
 //! cargo run --example ui_preview -- --login --screenshot  # the login window
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
@@ -47,16 +47,19 @@
 //! the same shape the deserializer is tested against, so a fixture that stops
 //! parsing is a fixture that stopped describing the real thing. The breach
 //! cache is handed a check that panics if it is ever called (it is not:
-//! `check_breaches` is off), and the preflight is handed a [`SendTarget`]
-//! value rather than a real foreground window.
+//! `check_breaches` is off).
+//!
+//! **The 4b preflight is no longer one of these surfaces.** It was, while it
+//! was an egui window; it is bare Win32 now -- `deskwarden::preflight_card` --
+//! and it has its own preview, `examples/preflight_preview.rs`, for the reason
+//! the other Win32 cards do: this example walks egui surfaces through one
+//! `run_native`, and there is no egui in that card to walk.
 //!
 //! Every surface renders the exact draw function the app ships, never a copy,
 //! so what these PNGs show is what the real app shows.
 
 use deskwarden::breach::BreachCache;
 use deskwarden::hello::HelloState;
-use deskwarden::injector::target::SendTarget;
-use deskwarden::key_sequence::ResolveSource;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::vault_bridge::{Folder, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
@@ -64,11 +67,10 @@ use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
 use deskwarden::vault_window::password_health;
 use deskwarden::vault_window::sidebar::{self, SidebarFilter};
-use deskwarden::vault_window::preflight::{self, PreflightState};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
-use deskwarden::{app_identity::AppIdentityCache, overlay_ui, prefs_ui, scratch_window, theme};
+use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
@@ -108,37 +110,25 @@ fn target_dir() -> PathBuf {
 /// adding it here is how a surface goes unlooked-at for a year.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
-    /// The autofill overlay (design 2a).
-    Overlay,
-    OverlayLocked,
-    /// The autofill overlay's save-a-new-login form (design 3c): four rows and
-    /// three answers, reached from the account picker's empty card (design
-    /// 3a, now `deskwarden::picker_prompt`'s -- see `examples/picker_preview.rs`).
-    ///
-    /// **By far the tallest state the overlay has**, and the one this list
-    /// most needs: a frameless, always-on-top window of a hardcoded height
-    /// with no `ScrollArea` anywhere, so a row or a button past the bottom
-    /// edge is unreachable, and the geometry tests can only say the card fits
-    /// -- not whether it reads as a form somebody would fill in.
-    OverlaySaveLogin,
-    /// The autofill overlay's generator (design 3d) with a password in hand:
-    /// the state the card is in for almost all of the time it is on screen.
-    OverlayGenerate,
-    /// Design 3d while the round-trip to `bw serve` is outstanding.
-    ///
-    /// Its own surface rather than a footnote to the one above, because it is
-    /// a state a reviewer has to be able to LOOK at: it is what the user sees
-    /// for as long as the vault takes to answer, all four of its controls are
-    /// disabled in it, and one fixed-size window has to hold it as well as
-    /// the other two.
-    OverlayGenerateWorking,
-    /// Design 3d after the round-trip failed -- the state the design does not
-    /// draw at all.
-    ///
-    /// The one this list most needs of the three: it must still carry a live
-    /// *New* control, or a failed generate is a card the user can do nothing
-    /// with but Esc.
-    OverlayGenerateFailed,
+    // **No design 2a here.** The matched-item card is
+    // `deskwarden::prompt_card` now -- bare Win32, no eframe anywhere, and
+    // anchored beside the field it answers for -- and this walk drives egui
+    // surfaces through one `run_native`. Its preview is
+    // `examples/prompt_preview.rs`, beside `picker_preview`,
+    // `generate_preview` and `unlock_prompt_preview` for the same reason.
+    // **No design 3b here either.** The locked-vault card is
+    // `deskwarden::locked_card` now, for the same reason and by the same
+    // route; its preview is `examples/locked_preview.rs`.
+    // **No design 3c here either, and it was the last one.** The
+    // save-a-login card is `deskwarden::save_login_card` now -- bare Win32,
+    // no eframe anywhere -- and `deskwarden::overlay_ui`, the module that held
+    // every egui card the daemon showed, is gone with it. Its preview is
+    // `examples/save_login_preview.rs`.
+    // **No design 3d here.** The generator card is
+    // `deskwarden::generate_prompt` now -- bare Win32, no eframe anywhere --
+    // and this walk drives egui surfaces through one `run_native`. Its
+    // preview is `examples/generate_preview.rs`, beside `picker_preview` and
+    // `unlock_prompt_preview` for the same reason.
     /// The login window with a vault that exists and is locked.
     LoginUnlock,
     /// The login window with no account yet -- server dropdown and the Hello
@@ -202,13 +192,6 @@ enum Surface {
     /// nothing of it is on that shot: a confirmation card is what happens
     /// AFTER a route has been chosen.
     TotpAddPicker,
-    /// The preflight, allowed: the rule's process is in front and the focused
-    /// control is masked, so the hold-to-send is offered.
-    PreflightAllowed,
-    /// The preflight, refused: a password sequence aimed at the wrong process
-    /// and an unmasked control, which is the state that must never grow a
-    /// send button.
-    PreflightRefused,
     /// The preferences window's Clipboard page, everything switched on --
     /// four live pills, the interval field, the always-on note and the reset
     /// button. The page 3e does not contain, so there is no drawing to
@@ -471,12 +454,6 @@ fn pane_frame() -> egui::Frame {
 
 /// Every surface, in the order `--all` walks them.
 const ALL: &[Surface] = &[
-    Surface::Overlay,
-    Surface::OverlayLocked,
-    Surface::OverlaySaveLogin,
-    Surface::OverlayGenerate,
-    Surface::OverlayGenerateWorking,
-    Surface::OverlayGenerateFailed,
     Surface::LoginUnlock,
     Surface::LoginSignin,
     Surface::LoginDetail,
@@ -489,8 +466,6 @@ const ALL: &[Surface] = &[
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
-    Surface::PreflightAllowed,
-    Surface::PreflightRefused,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
     Surface::PrefsAbout,
@@ -532,12 +507,6 @@ impl Surface {
     /// looks for the same name every time.
     fn stem(self) -> &'static str {
         match self {
-            Surface::Overlay => "overlay",
-            Surface::OverlayLocked => "overlay_locked",
-            Surface::OverlaySaveLogin => "overlay_save_login",
-            Surface::OverlayGenerate => "overlay_generate",
-            Surface::OverlayGenerateWorking => "overlay_generate_working",
-            Surface::OverlayGenerateFailed => "overlay_generate_failed",
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
             Surface::LoginDetail => "detail_login",
@@ -550,8 +519,6 @@ impl Surface {
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
-            Surface::PreflightAllowed => "preflight_allowed",
-            Surface::PreflightRefused => "preflight_refused",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
             // **Renamed from `prefs_about_*`, not merely re-pointed.** The
@@ -613,24 +580,6 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::Overlay | Surface::OverlayLocked => {
-                egui::vec2(396.0, 164.0)
-            }
-            // Read off the module rather than written out: 3c is the one
-            // overlay state that is NOT 164pt tall, and a preview rendered at
-            // the wrong height is a picture of a layout nobody ships.
-            Surface::OverlaySaveLogin => egui::vec2(
-                overlay_ui::OVERLAY_WIDTH,
-                overlay_ui::overlay_height(overlay_ui::SAVE_LOGIN_ROWS),
-            ),
-            // Read off the module for the same reason, and it is a THIRD
-            // height: 3d is neither 164pt nor 3c's 264.
-            Surface::OverlayGenerate
-            | Surface::OverlayGenerateWorking
-            | Surface::OverlayGenerateFailed => egui::vec2(
-                overlay_ui::OVERLAY_WIDTH,
-                overlay_ui::overlay_height(overlay_ui::GENERATE_ROWS),
-            ),
             Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy => {
                 egui::vec2(470.0, 588.0)
             }
@@ -659,10 +608,6 @@ impl Surface {
             // state gets a little more room rather than a scroll bar.
             Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
-            Surface::PreflightAllowed | Surface::PreflightRefused => egui::vec2(
-                deskwarden::preflight_host::PREFLIGHT_WIDTH,
-                deskwarden::preflight_host::PREFLIGHT_HEIGHT,
-            ),
             // The shipped window is 1000x780 with a 40px chrome bar on top;
             // this draws the BODY, which is what `draw_prefs_body` is, so the
             // page lays out against exactly the width it has in the app.
@@ -769,13 +714,12 @@ fn main() -> eframe::Result {
     } else if health {
         vec![Surface::VaultHealth]
     } else {
-        vec![Surface::Overlay]
+        vec![Surface::LoginUnlock]
     };
     let first = queue[0];
 
-    // Transparent and undecorated for every surface: the overlay and the
-    // preflight need it for their rounded corners, and the login window draws
-    // its own titlebar. The panes are drawn on their own opaque CANVAS frame
+    // Transparent and undecorated for every surface: the overlay needs it for
+    // its rounded corners, and the login window draws its own titlebar. The panes are drawn on their own opaque CANVAS frame
     // below, so transparency costs them nothing.
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size(first.size())
@@ -807,7 +751,7 @@ fn main() -> eframe::Result {
     } else if health {
         target_dir().join("ui_preview_vault_password_health.png")
     } else {
-        target_dir().join("ui_preview_overlay.png")
+        target_dir().join("ui_preview_login.png")
     };
 
     // Cloned before the closure takes it: the count check below outlives
@@ -826,25 +770,7 @@ fn main() -> eframe::Result {
                 // The app name a real 3c card would have been pre-filled with,
                 // and nothing else: the other three rows are what this app can
                 // actually know about the window, which is nothing.
-                save_login: overlay_ui::SaveLoginForm::new("Atlas Licence"),
-                generate: [
-                    {
-                        let mut ready =
-                            overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters);
-                        ready.finish(Ok(zeroize::Zeroizing::new(
-                            "tq7Rvk29mzpLx4-hd8".to_string(),
-                        )));
-                        ready
-                    },
-                    overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters),
-                    {
-                        let mut failed =
-                            overlay_ui::GenerateForm::new(overlay_ui::GeneratedKind::Characters);
-                        failed.finish(Err(overlay_ui::GENERATE_FAILED_TEXT.to_string()));
-                        failed
-                    },
-                ],
-                screenshot,
+                    screenshot,
                 done: false,
                 frames: 0,
                 icons: None,
@@ -925,16 +851,6 @@ struct Preview {
     form: LoginForm,
     /// Form state for design 3c (typing works; Save doesn't -- there is no
     /// vault behind this example).
-    save_login: overlay_ui::SaveLoginForm,
-    /// Design 3d in each of its three states, one form per state.
-    ///
-    /// **Three forms rather than one that is re-pointed**, because the card
-    /// takes `&mut` and its own controls move it between states: a single
-    /// form would show whichever state the last frame's clicks left it in,
-    /// which is not the state the file name promises. Nothing here reaches a
-    /// vault -- the passwords are fixtures, and `GenerateForm::finish` is the
-    /// production way into both settled states.
-    generate: [overlay_ui::GenerateForm; 3],
     /// Capture and exit, rather than sit there being looked at.
     screenshot: bool,
     /// Every surface has been captured and `Close` has been asked for. The
@@ -1022,14 +938,6 @@ impl eframe::App for Preview {
         self.frames += 1;
 
         match self.current() {
-            Surface::Overlay => self.draw_overlay(root, &ctx),
-            Surface::OverlayLocked => self.draw_overlay_locked(root, &ctx),
-            Surface::OverlaySaveLogin => self.draw_overlay_save_login(root, &ctx),
-            Surface::OverlayGenerate
-            | Surface::OverlayGenerateWorking
-            | Surface::OverlayGenerateFailed => {
-                self.draw_overlay_generate(root, &ctx, self.current())
-            }
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false),
             Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true),
             Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
@@ -1046,8 +954,6 @@ impl eframe::App for Preview {
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
-            Surface::PreflightAllowed => self.draw_pane(root, PaneKind::Preflight(true)),
-            Surface::PreflightRefused => self.draw_pane(root, PaneKind::Preflight(false)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
             Surface::PrefsAbout => self.draw_prefs_about(root),
@@ -1117,11 +1023,6 @@ impl eframe::App for Preview {
             ctx.request_repaint();
         }
 
-        if self.current() == Surface::Overlay
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter))
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
     }
 }
 
@@ -1141,8 +1042,6 @@ enum PaneKind {
     TotpAdd,
     /// Design 6a's picker, the front door onto the four routes.
     TotpPicker,
-    /// The preflight; `true` for the allowed state, `false` for the refusal.
-    Preflight(bool),
 }
 
 /// Which fixture the read pane is drawn from, and in what reveal state.
@@ -1165,87 +1064,6 @@ enum DetailShot {
 }
 
 impl Preview {
-    fn draw_overlay(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            // The preview closes on the dismiss ✕ too, so the affordance can
-            // actually be clicked here rather than only looked at.
-            if overlay_ui::draw_overlay_card(
-                ui,
-                "ledgerline.exe",
-                "Ledgerline",
-                Some("a.novak@ledgerline.com"),
-            ) == overlay_ui::OverlayAction::Dismiss
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
-    /// Design 3b, drawn by the shipped function rather than re-implemented,
-    /// which is why `draw_locked_card` is public. It is the last egui notice
-    /// card: 3a is now the bare-Win32 account picker's empty mode.
-    fn draw_overlay_locked(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            // Through `locked_answer_of`, the shipped mapping, rather than a
-            // comparison against one variant: the card now carries an *Unlock*
-            // button, and a preview whose only live control did nothing when
-            // clicked would be showing a card that does not behave like the
-            // one the app ships. No prompt is opened here -- this is a preview,
-            // and the real unlock spawns `bw`.
-            if overlay_ui::locked_answer_of(&overlay_ui::draw_locked_card(ui, "Atlas Licence"))
-                .is_some()
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
-    /// Design 3c, drawn by the shipped function for the same reason 3a and 3b
-    /// are.
-    ///
-    /// The form is drawn **blank apart from the App row**, which is the state
-    /// the user is really shown: exactly one of the four rows can be
-    /// pre-filled, because `injector::ui_automation` has no username reader
-    /// and a password field's contents are not read. A preview that typed
-    /// plausible values into the other two would be a picture of a capture
-    /// this app does not make.
-    fn draw_overlay_save_login(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(root, |ui| {
-            if overlay_ui::draw_save_login_card(ui, &mut self.save_login)
-                != overlay_ui::SaveLoginAction::None
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-
-    /// Design 3d, in whichever of its three states `surface` names.
-    ///
-    /// The card is the shipped one, so this preview cannot drift from it. The
-    /// action is dropped rather than acted on: *Copy* would reach the real
-    /// clipboard and *New* would need a vault, and a preview must do neither.
-    fn draw_overlay_generate(
-        &mut self,
-        root: &mut egui::Ui,
-        ctx: &egui::Context,
-        surface: Surface,
-    ) {
-        let slot = match surface {
-            Surface::OverlayGenerate => 0,
-            Surface::OverlayGenerateWorking => 1,
-            _ => 2,
-        };
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(root, |ui| {
-                if overlay_ui::draw_generate_card(ui, &mut self.generate[slot])
-                    == overlay_ui::GenerateAction::Dismiss
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-    }
-
     fn draw_login(
         &mut self,
         root: &mut egui::Ui,
@@ -1978,10 +1796,6 @@ impl Preview {
                 PaneKind::TotpPicker => {
                     let _ = totp_add::draw_picker(ui, &mut fixtures.totp_picker);
                 }
-                PaneKind::Preflight(allowed) => {
-                    let state = if allowed { &mut fixtures.allowed } else { &mut fixtures.refused };
-                    let _ = preflight::draw(ui, state);
-                }
             });
     }
 }
@@ -2014,8 +1828,6 @@ struct Fixtures {
     record: RecordDraft,
     totp_add: TotpAdd,
     totp_picker: TotpAdd,
-    allowed: PreflightState,
-    refused: PreflightState,
     rehearsal: scratch_window::RehearsalView,
     rehearsal_arrived: String,
     /// The Password health screen's items -- see [`HEALTH_JSON`].
@@ -2118,8 +1930,6 @@ impl Fixtures {
             breaches: BreachCache::new(std::sync::Arc::new(|_, _| {
                 unreachable!("a preview must never check a password against a breach corpus")
             })),
-            allowed: preflight_state(true, &login, &totp),
-            refused: preflight_state(false, &login, &totp),
             rehearsal: rehearsal_view(),
             health: items(HEALTH_JSON),
             // What a text field really holds after the design's sequence: the
@@ -2500,39 +2310,6 @@ fn draw_progress_bar_cycle(root: &mut egui::Ui) {
                 ui.add_space(20.0);
             }
         });
-}
-
-/// The two preflight states.
-///
-/// `allowed`: the rule's own process is in front and the focused control is
-/// masked. `refused`: a different process, with an unmasked control -- both
-/// facts wrong at once, which is the state whose message has to name both.
-fn preflight_state(allowed: bool, item: &VaultItem, totp: &TotpState) -> PreflightState {
-    let target = if allowed {
-        SendTarget {
-            title: "Ledgerline \u{2014} Sign in".to_string(),
-            image_name: "ledgerline.exe".to_string(),
-            pid: 8124,
-            class_name: "Chrome_WidgetWin_1".to_string(),
-            focused_is_masked: true,
-        }
-    } else {
-        SendTarget {
-            title: "chat \u{2014} #finance".to_string(),
-            image_name: "teams.exe".to_string(),
-            pid: 5310,
-            class_name: "Chrome_WidgetWin_1".to_string(),
-            focused_is_masked: false,
-        }
-    };
-    let login = item.login.as_ref();
-    let source = ResolveSource {
-        username: login.and_then(|l| l.username.as_deref()).unwrap_or(""),
-        password: login.and_then(|l| l.password.as_deref()).map(|p| p.as_str()).unwrap_or(""),
-        custom: deskwarden::key_sequence::custom_pairs(item),
-        totp,
-    };
-    PreflightState::new(target, "ledgerline.exe", "{USERNAME}{TAB}{PASSWORD}{ENTER}", &source)
 }
 
 fn save_png(path: &PathBuf, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
