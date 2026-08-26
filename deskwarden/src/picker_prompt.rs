@@ -724,9 +724,42 @@ const BUTTON_H: i32 = 32;
 /// this card drawing a box of its own invented height.
 const SEARCH_H: i32 = 34;
 
-/// The gap above and below the search box, which is the gap the card already
-/// has between its subtitle and its list.
+/// The gap between the subtitle and the field below it, which is the gap the
+/// card already has between its subtitle and its list.
+///
+/// **Once, not twice.** It used to sit above *and* below the search box,
+/// because the box and the list were two containers with a gap between them.
+/// They are one field now -- see [`Layout::field`] -- so there is one gap, the
+/// one above it.
 const SEARCH_GAP: i32 = 10;
+
+/// **The field's horizontal inner inset**, which is what keeps the search
+/// text off the border now that the text has no box of its own.
+///
+/// `theme`'s own search field is drawn with a `PAD_X` of 10 (see
+/// `theme::search_field`), and `unlock_prompt` insets its password text by the
+/// same. Pinned against neither, because `theme` keeps it as a private `const`
+/// inside the function that draws it -- what is pinned instead is that this
+/// card does not invent a *second* inset for its rows: `win32_draw::draw_row`
+/// carries the rows' own, and this is the box's.
+const FIELD_PAD_X: i32 = 10;
+
+/// The field's corner radius and the halo's, in that order.
+///
+/// 8 is the radius the list's own card has always been drawn at, and the field
+/// IS that card -- it grew a search box at the top, it did not become a new
+/// shape. The halo is one larger so its outer edge stays concentric with the
+/// border it surrounds rather than cutting across it, which is exactly the
+/// relationship the footer buttons' ring already has to their 8.
+const FIELD_RADIUS: i32 = 8;
+const FIELD_RING_RADIUS: i32 = FIELD_RADIUS + 1;
+
+/// How far the focus halo stands outside the field it surrounds.
+///
+/// The same 2 px the footer buttons' ring uses -- `paint_control` insets the
+/// button by exactly this before drawing its label -- so one focus indication
+/// is drawn at one weight everywhere on this card.
+const FOCUS_RING_W: i32 = 2;
 
 /// **How many search results the card has room for.**
 ///
@@ -738,14 +771,22 @@ pub const SEARCH_CAP: usize = ROW_CAP;
 
 /// The *New login* / *Edit binding* button's width: its label, and room for
 /// the [`NEW_LOGIN_SHORTCUT`] chip beside it. See [`layout`].
+///
+/// **Left where it was when the chip was `CTRL+ALT+N`**, which is now a bare
+/// `N`. The width is therefore slack rather than tight, and slack is the safe
+/// direction: `draw_button_with_shortcut` centres the label in what the chip
+/// leaves, and *Edit binding* -- the longer of the two labels this button
+/// carries -- is sized against this same number. Narrowing it to fit the
+/// shorter chip would be re-deriving a width for a label that did not change.
 const SECONDARY_W: i32 = 168;
 
 /// The *Cancel* button's width: its label, and room for the [`ESC_SHORTCUT`]
 /// chip beside it, the same relationship [`SECONDARY_W`] has to
 /// [`NEW_LOGIN_SHORTCUT`]. Wider than the bare-label 84 px it used to be --
-/// `ESC` is a shorter chip than `CTRL+ALT+N`, so it does not need as much of
-/// an increase, but a chip drawn into a button never widened for it is a chip
-/// drawn over its own label. At the bare-label 84 px there was 86 px of slack
+/// `ESC` is a short chip, so it did not need much of an increase, but a chip
+/// drawn into a button never widened for it is a chip drawn over its own
+/// label. Unchanged by the move to bare keys: `ESC` was never a chord and is
+/// still `ESC`. At the bare-label 84 px there was 86 px of slack
 /// between the footer pair and the card's left margin, so this 20 px went into
 /// slack the card already had: with [`SECONDARY_W`] beside it the pair now
 /// starts 66 px inside [`MARGIN_X`], and both buttons are still on screen --
@@ -790,13 +831,33 @@ pub struct Layout {
     pub wordmark: Box2,
     pub title: Box2,
     pub subtitle: Box2,
-    /// The search box, in search mode only. `None` in every other mode, rather
-    /// than a zero-height rectangle: a `Box2` with `h: 0` is a control the card
-    /// would still place, still hit-test and still paint a border around, and
-    /// "there is no search box here" is exactly the thing that must not be
-    /// expressible as a number.
+    /// **The one bordered container**, and the only rectangle on this card
+    /// that carries a border at all.
+    ///
+    /// Asked for by the app's owner about search mode: "no border for those
+    /// matching elements (item + search) but they both inside of same field".
+    /// So the search box and the rows it filters are elements of this, not two
+    /// outlined boxes stacked with a gap between them -- and in the other
+    /// modes the same reading holds already: the candidate rows and the
+    /// *Search the vault* row are elements of one field, which is what
+    /// [`list`](Self::list) has always been drawn as.
+    ///
+    /// In every mode but search this is exactly `list`. In search mode it is
+    /// `search` on top of `list`, with nothing between them but the hairline
+    /// that separates one element from the next.
+    pub field: Box2,
+    /// The search box's slot **inside [`field`](Self::field)**, in search mode
+    /// only. `None` in every other mode, rather than a zero-height rectangle:
+    /// a `Box2` with `h: 0` is a control the card would still place and still
+    /// hit-test, and "there is no search box here" is exactly the thing that
+    /// must not be expressible as a number.
+    ///
+    /// **It has no border of its own.** The field around it is the border; all
+    /// this rectangle does is say where the text sits and where the hairline
+    /// under it goes.
     pub search: Option<Box2>,
-    /// The whole list area. Individual rows are [`row_at`].
+    /// The rows' area, inside [`field`](Self::field). Individual rows are
+    /// [`row_at`].
     pub list: Box2,
     /// The footer's left button: *New login* in the first step, *Edit binding*
     /// in the second.
@@ -845,17 +906,20 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
     let title =
         Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w, h: 21 };
     let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 17 };
-    let search = search.then(|| Box2 {
-        x: MARGIN_X,
-        y: subtitle.bottom() + SEARCH_GAP,
-        w: content_w,
-        h: SEARCH_H,
-    });
+
+    // **The field starts where the list used to**, and in search mode its
+    // first element is the search box rather than the first row. The box no
+    // longer costs a second `SEARCH_GAP`: there is no gap between two
+    // containers because there are no longer two containers.
+    let field_y = subtitle.bottom() + SEARCH_GAP;
+    let search = search.then_some(Box2 { x: MARGIN_X, y: field_y, w: content_w, h: SEARCH_H });
     let list_y = match search {
-        Some(box2) => box2.bottom() + SEARCH_GAP,
-        None => subtitle.bottom() + SEARCH_GAP,
+        Some(box2) => box2.bottom(),
+        None => field_y,
     };
     let list = Box2 { x: MARGIN_X, y: list_y, w: content_w, h: ROW_H * rows as i32 };
+    let field =
+        Box2 { x: MARGIN_X, y: field_y, w: content_w, h: list.bottom() - field_y };
 
     // Right-aligned, Cancel outermost: the choice that does nothing sits where
     // the eye leaves the card.
@@ -873,7 +937,41 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
     // no longer the top line.
     let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
 
-    Layout { window, mark, wordmark, title, subtitle, search, list, secondary, cancel, close_glyph }
+    Layout {
+        window,
+        mark,
+        wordmark,
+        title,
+        subtitle,
+        field,
+        search,
+        list,
+        secondary,
+        cancel,
+        close_glyph,
+    }
+}
+
+/// **Where the search text sits inside its slot in the field.**
+///
+/// One function, read by `open` when it creates the `EDIT` and by `apply_mode`
+/// every time it moves it: two insets that had to agree is this codebase's
+/// standing defect shape, and there is no reason for a second one here.
+///
+/// `slot` is [`Layout::search`] -- the top element of [`Layout::field`]. What
+/// comes back is the text's own rectangle: [`FIELD_PAD_X`] off each side, and
+/// a single line's height centred in the slot. **No border is drawn around
+/// what this returns**; the field around the slot is the border.
+pub fn search_text_box(slot: Box2) -> Box2 {
+    /// One line of the field font, which is what an `EDIT` needs to show a
+    /// caret and a run of text without clipping either.
+    const TEXT_H: i32 = 20;
+    Box2 {
+        x: slot.x + FIELD_PAD_X,
+        y: slot.y + (slot.h - TEXT_H) / 2,
+        w: slot.w - 2 * FIELD_PAD_X,
+        h: TEXT_H,
+    }
 }
 
 /// One row of the **populated** card, in the order they are drawn.
@@ -1007,40 +1105,94 @@ pub fn search_text() -> (&'static str, &'static str) {
 // The keyboard shortcuts, and the words that make them findable.
 //
 // Asked for by the app's owner after using the card: "add shortcuts like
-// Ctrl + Alt + 1 (2,3,4 for items in the list), New as well, Cancel (Esc)".
+// Ctrl + Alt + 1 (2,3,4 for items in the list), New as well, Cancel (Esc)" --
+// and then, after using those: "Ctrl + Alt + 1 etc can be replaced with just 1
+// I think - the window is focused and it is temp state while it is open
+// anyways", "Search should be S then and the rest 1...9".
+//
+// So these are BARE keys now. The card is focused, frameless and temporary,
+// and every key it takes is read out of its own pump -- no other application
+// sees them, and nothing is registered system-wide.
+//
+// **The modifier was also a hazard.** On German, Polish and several other
+// layouts `CTRL+ALT` *is* `AltGr`, so `CTRL+ALT+2` is the character `@`.
+// Keeping the chord over the search box would have made an email address
+// untypable while searching for one. That is the second reason it is gone,
+// and the reason it must not come back over that box.
+//
+// **Search mode does not take bare keys at all**: it has a focused `EDIT`, and
+// "1Password" and "denis@example.com" are things a user types there. Selection
+// moves with the arrow keys and commits with Enter -- see `win32::search_key`
+// and [`moved_selection`].
+//
 // Escape already cancelled -- `win32::next` handles it ahead of
 // `IsDialogMessageW`, which only cancels for a real dialog box -- so nothing
 // here re-implements it.
 // ---------------------------------------------------------------------------
 
-/// **The chord that runs the *New login* offer.**
+/// **The key that runs the *New login* offer.**
 ///
-/// `CTRL+ALT+N` rather than a bare `N`: every control on this card is a
-/// `BUTTON`, and a bare letter is a mnemonic Windows may already be routing.
-/// `CTRL+ALT` is also the modifier pair the card's own hotkey (`CTRL+ALT+B`)
-/// is on, so the whole card answers to one chord family. It collides with
-/// nothing this crate registers -- `crate::hotkey` registers `CTRL+ALT+B`
-/// alone -- and it is read from this window's own pump while the card has
-/// focus, so no other application sees it.
-pub const NEW_LOGIN_SHORTCUT: &str = "CTRL+ALT+N";
+/// A bare `N`. Every control on this card is a `BUTTON`, so a bare letter is
+/// the sort of thing Windows might route as a mnemonic -- which is exactly why
+/// `win32::next` takes it *ahead of* `IsDialogMessageW` and swallows it rather
+/// than dispatching it. It is read from this window's own pump while the card
+/// has focus, so no other application sees it, and it is not offered at all in
+/// the one mode where a bare letter has to reach a text box: see
+/// `win32::search_key`.
+pub const NEW_LOGIN_SHORTCUT: &str = "N";
 
-/// **The chord that cancels the card.**
+/// **The key that opens search mode**, the same thing clicking the *Search the
+/// vault* row does -- and it goes through that row rather than beside it, so
+/// the click and the key stay one path. Asked for by name: "Search should be S
+/// then and the rest 1...9".
 ///
-/// Just `ESC`, not `CTRL+ALT+ESC`: this one was never a chord, it is the key
-/// Escape has always been -- `win32::next` answers `VK_ESCAPE` with
+/// Not offered in search mode, which is already open and whose `EDIT` needs
+/// its own `s`.
+pub const SEARCH_SHORTCUT: &str = "S";
+
+/// **The key that cancels the card.**
+///
+/// Just `ESC`, and it always was -- `win32::next` answers `VK_ESCAPE` with
 /// `Event::Cancel` ahead of `IsDialogMessageW`, and has done so since before
-/// any of the other shortcuts existed. The chip only advertises it; it does
-/// not change what fires.
+/// any of the other shortcuts existed. Unchanged by the move to bare keys, and
+/// unchanged in search mode. The chip only advertises it; it does not change
+/// what fires.
 pub const ESC_SHORTCUT: &str = "ESC";
 
-/// The chord shown on -- and accepted by -- the `index`th **candidate** row.
+/// The key shown on -- and accepted by -- the `index`th **candidate** row.
 ///
 /// `None` past the candidate cap, and that is the point: the row after the
 /// candidates is *Search the vault*, which means something else entirely, and
-/// a digit that landed on it would be a trap. Numbering is what the user sees:
-/// `1` is the topmost row as drawn.
+/// a digit that landed on it would be a trap. That row carries
+/// [`SEARCH_SHORTCUT`] instead, which is a different key for a different
+/// thing. Numbering is what the user sees: `1` is the topmost row as drawn.
 pub fn row_shortcut(index: usize) -> Option<String> {
-    (index < ROW_CAP).then(|| format!("CTRL+ALT+{}", index + 1))
+    (index < ROW_CAP).then(|| format!("{}", index + 1))
+}
+
+/// **Where the highlight goes** when search mode's `Down` or `Up` is pressed,
+/// given where it is now and how many RESULT rows are on screen.
+///
+/// A pure function up here rather than arithmetic inside the window procedure,
+/// for this module's standing reason: the decision is then one a test can make
+/// without opening a window.
+///
+/// **`shown` is the results' count, never the drawn rows'.** The overflow
+/// notice and the "no matches" row are text, not offers -- the same rule that
+/// keeps a digit off the *Search the vault* row -- so the highlight cannot
+/// reach them and `Enter` cannot commit one. `None` means there is nothing to
+/// highlight at all, which is the empty-result card.
+///
+/// It **clamps rather than wraps** at both ends: a list of five that jumped
+/// from the last row back to the first would move the user's choice past the
+/// thing they were aiming at, on a card they cannot scroll.
+pub fn moved_selection(current: usize, shown: usize, down: bool) -> Option<usize> {
+    if shown == 0 {
+        return None;
+    }
+    let last = shown - 1;
+    let current = current.min(last);
+    Some(if down { (current + 1).min(last) } else { current.saturating_sub(1) })
 }
 
 /// **Which candidate a digit chooses**, given how many candidate rows are
@@ -1135,6 +1287,21 @@ static SEARCH_SHOWN: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Ve
 /// difference between this and `SEARCH_SHOWN.len()` is told.
 static SEARCH_TOTAL: AtomicIsize = AtomicIsize::new(0);
 
+/// **Which result row search mode's highlight is on.**
+///
+/// Search mode is the one mode where the highlighted row is not the focused
+/// control: the keyboard is in the `EDIT`, so focus cannot say which account
+/// Enter would take. This says it instead, and `paint_row` draws it with the
+/// same `RowState::selected` every other mode gets from focus -- one highlight,
+/// drawn one way.
+///
+/// An index into [`SEARCH_SHOWN`], reset to the top on every keystroke by
+/// `show_search`: the results change under it, and a highlight that stayed on
+/// "row 4" while the list became two rows long would be pointing at nothing.
+/// Every read clamps against the live count anyway -- see
+/// [`moved_selection`] -- so no stale value can commit a fill.
+static SEARCH_SEL: AtomicIsize = AtomicIsize::new(0);
+
 /// The Win32 calls, and **nothing else**.
 ///
 /// # Why every pixel here is painted by hand
@@ -1168,7 +1335,9 @@ mod win32 {
         Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, SearchResults, SearchRow,
         APP_NAME, ENTRIES, ESC_SHORTCUT, GONE, LIST_ROWS, MODE, MODE_EMPTY, MODE_LIST,
         MODE_PALETTE, MODE_SEARCH, NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
-        SEARCH_CAP, SEARCH_SHOWN, SEARCH_TOTAL, SHOWN, TRUNCATED,
+        FIELD_RADIUS, FIELD_RING_RADIUS, FOCUS_RING_W, SEARCH_CAP, SEARCH_SEL, SEARCH_SHORTCUT,
+        SEARCH_SHOWN, SEARCH_TOTAL, SHOWN,
+        TRUNCATED,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -1724,13 +1893,15 @@ mod win32 {
         // painting this module takes over; an `EDIT` is a control the user
         // types into, and comctl32's own procedure is what draws the caret, the
         // selection and the horizontal scroll. What makes it look like this
-        // app's is the box the parent paints around it (see `paint`) and
+        // app's is the field the parent paints around it (see `paint`) and
         // `WM_CTLCOLOREDIT`, which hands it the card's white and the app's ink
         // -- exactly what `unlock_prompt` does with its password field.
         //
-        // Inset inside the painted box by the same 10px `unlock_prompt` uses,
-        // and vertically centred in it, so the text sits off the border rather
-        // than against it.
+        // **The box it sits in has no border of its own now**: the field it is
+        // the top element of carries the only one. What is left of the box is
+        // where the text sits -- inset by `FIELD_PAD_X` and vertically centred
+        // in its slot, so the caret is off the field's edge rather than
+        // against it.
         let search_box = super::layout_for(LIST_ROWS, true)
             .search
             .expect("`layout_for(.., true)` is the search shape and always has the box");
@@ -1738,12 +1909,7 @@ mod win32 {
             window,
             w!("EDIT"),
             WS_TABSTOP.0 | ES_AUTOHSCROLL as u32,
-            Box2 {
-                x: search_box.x + 10,
-                y: search_box.y + (search_box.h - 20) / 2,
-                w: search_box.w - 20,
-                h: 20,
-            },
+            super::search_text_box(search_box),
             ID_SEARCH,
             field_font,
         )
@@ -1814,18 +1980,35 @@ mod win32 {
                     if msg.message == WM_KEYDOWN && msg.wParam.0 as u16 == VK_ESCAPE.0 {
                         return Event::Cancel;
                     }
-                    // **Only the CTRL+ALT chords, and only while both are
-                    // down.** A blanket `WM_KEYDOWN` grab here would swallow
-                    // Tab and Enter before `IsDialogMessageW` ever saw them,
-                    // and that traversal is the whole of the card's keyboard
-                    // behaviour.
-                    if msg.message == WM_KEYDOWN && chord_held() && chord(msg.wParam.0 as u16) {
+                    // **The bare keys, and only outside search mode.** A
+                    // blanket `WM_KEYDOWN` grab here would swallow Tab and
+                    // Enter before `IsDialogMessageW` ever saw them, and that
+                    // traversal is the whole of the card's keyboard
+                    // behaviour -- so `shortcut` answers `true` for exactly
+                    // the keys this card claims and `false` for every other,
+                    // which then falls through untouched.
+                    if msg.message == WM_KEYDOWN && !in_search() && shortcut(msg.wParam.0 as u16) {
                         if let Some(event) = take_pending() {
                             return event;
                         }
                         // Ours, and it chose nothing -- a digit past the rows
                         // on screen. Swallowed rather than dispatched, so it
                         // cannot reach a control as a keystroke.
+                        continue;
+                    }
+                    // **Search mode takes three keys and no letters.** The
+                    // `EDIT` has the keyboard there and the user is typing an
+                    // item name -- "1Password", an email address -- so every
+                    // digit and every letter must reach it. What moves the
+                    // choice is Up/Down and what commits it is Enter; see
+                    // `search_key`.
+                    if msg.message == WM_KEYDOWN
+                        && in_search()
+                        && search_key(msg.wParam.0 as u16, top)
+                    {
+                        if let Some(event) = take_pending() {
+                            return event;
+                        }
                         continue;
                     }
                     if !IsDialogMessageW(top, &msg).as_bool() {
@@ -1846,58 +2029,38 @@ mod win32 {
         }
     }
 
-    /// Whether CTRL and ALT are both down right now.
+    /// **What a bare key does**, answering whether it was one of ours.
     ///
-    /// Read at the moment the key arrives rather than tracked across messages:
-    /// a modifier released while this window was not focused would otherwise
-    /// leave a flag set that nothing ever clears.
-    fn chord_held() -> bool {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
-        unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0) && (GetKeyState(VK_MENU.0 as i32) < 0) }
-    }
-
-    /// **What a CTRL+ALT chord does**, answering whether it was one of ours.
+    /// **Never called in search mode** -- `next` gates it on `!in_search()` --
+    /// because there a digit or a letter belongs to the `EDIT`.
     ///
     /// Every arm goes through [`clicked`] -- the same function `WM_COMMAND`
     /// calls when the row or the button is clicked -- so a shortcut and a
     /// click are one path and not two, and `run_with` cannot tell them apart.
+    /// That includes `S`: it does not post `Event::Search` itself, it clicks
+    /// the *Search the vault* row, which is the control that means it.
     ///
     /// A digit past the rows on screen is *ours and does nothing*: it answers
     /// `true` so it is swallowed rather than typed into a control, and posts
     /// no event, so the card neither beeps nor closes.
-    fn chord(vk: u16) -> bool {
+    fn shortcut(vk: u16) -> bool {
         // The virtual-key codes for the number row and for the letters are
         // their ASCII values, which is what makes these comparisons honest.
         const DIGIT_1: u16 = b'1' as u16;
         const DIGIT_9: u16 = b'9' as u16;
         const LETTER_N: u16 = b'N' as u16;
+        const LETTER_S: u16 = b'S' as u16;
         if (DIGIT_1..=DIGIT_9).contains(&vk) {
             let digit = (vk - DIGIT_1 + 1) as u32;
-            // **The first step and search mode number their rows; the other
-            // two do not.** `MODE_PALETTE`'s rows are fields of one account
-            // and `MODE_EMPTY`'s are two offers, and neither was asked for.
+            // **Only the first step numbers its rows.** `MODE_PALETTE`'s rows
+            // are fields of one account and `MODE_EMPTY`'s are two offers, and
+            // neither was asked for. Search mode never reaches here at all --
+            // its digits are characters, and `next` is what keeps them so.
             //
-            // **A digit is numbered in search mode too, even though a text box
-            // has the keyboard there**, and that is a decision rather than an
-            // oversight. `CTRL+ALT+3` is a chord, not the character `3`: this
-            // arm is reached only with both modifiers down, and it is reached
-            // for every digit whether or not it chooses anything -- so the
-            // digit is swallowed here in every mode already and can never
-            // reach the box as a keystroke. Given that, making it choose the
-            // third result is strictly better than making it do nothing, and
-            // it is the same chord family on the same rows the user is looking
-            // at. A plain `3` still types a `3`.
-            //
-            // The count is the ACCOUNT rows', never the drawn rows', in both
-            // modes: no digit can land on the *Search the vault* row or on
-            // search mode's overflow notice.
-            let mode = MODE.load(Ordering::SeqCst);
-            if mode == MODE_LIST || mode == MODE_SEARCH {
-                let shown = if mode == MODE_SEARCH {
-                    SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0)
-                } else {
-                    SHOWN.lock().map(|s| s.len()).unwrap_or(0)
-                };
+            // The count is the CANDIDATE rows', never the drawn rows': no
+            // digit can land on the *Search the vault* row.
+            if MODE.load(Ordering::SeqCst) == MODE_LIST {
+                let shown = SHOWN.lock().map(|s| s.len()).unwrap_or(0);
                 if let Some(index) = super::candidate_for_digit(digit, shown) {
                     clicked(ID_ROW + index);
                 }
@@ -1910,7 +2073,95 @@ mod win32 {
             }
             return true;
         }
+        if vk == LETTER_S {
+            if let Some(id) = search_control() {
+                clicked(id);
+            }
+            return true;
+        }
         false
+    }
+
+    /// **What search mode's three keys do**, answering whether the key was one
+    /// of them.
+    ///
+    /// Up and Down move the highlight over the RESULT rows -- never over the
+    /// overflow notice or the "no matches" row, because
+    /// [`super::moved_selection`] is measured against the results' count -- and
+    /// Enter commits it through [`clicked`], the same function the pointer
+    /// reaches. Everything else, every digit and every letter included, answers
+    /// `false` and falls through to the `EDIT`.
+    ///
+    /// Up and Down are taken here rather than left to `IsDialogMessageW`
+    /// because the keyboard is in a single-line `EDIT`, where they mean nothing
+    /// at all -- and because moving *focus* to a row would take it off the box
+    /// the user is typing into.
+    fn search_key(vk: u16, window: HWND) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN, VK_UP};
+        let shown = SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+        if vk == VK_DOWN.0 || vk == VK_UP.0 {
+            let current = SEARCH_SEL.load(Ordering::SeqCst).max(0) as usize;
+            if let Some(next) = super::moved_selection(current, shown, vk == VK_DOWN.0) {
+                if SEARCH_SEL.swap(next as isize, Ordering::SeqCst) != next as isize {
+                    // The rows are child windows, so invalidating the parent
+                    // does not reach them -- and the highlight is drawn by
+                    // them.
+                    repaint_rows(window);
+                }
+            }
+            return true;
+        }
+        if vk == VK_RETURN.0 {
+            // **Clamped against what is on screen right now.** The results
+            // change on every keystroke, so a selection left over from a
+            // longer list would otherwise fill from an account the user is no
+            // longer looking at. `moved_selection(.., false)` from the current
+            // index is that clamp: it can only stay put or step back, never
+            // past the end.
+            if let Some(at) =
+                super::moved_selection(SEARCH_SEL.load(Ordering::SeqCst).max(0) as usize, shown, false)
+            {
+                let at = at.max(SEARCH_SEL.load(Ordering::SeqCst).max(0) as usize).min(shown - 1);
+                clicked(ID_ROW + at);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Which control opens **search mode** in the step that is showing, or
+    /// `None` where the card does not offer it.
+    ///
+    /// A control and not an event, for [`shortcut`]'s reason: `S` clicks the
+    /// row that means search, so the key and the click stay one path. The
+    /// populated card's is the row just past its candidates -- see [`clicked`],
+    /// which reads exactly that boundary -- and the empty card's is its own
+    /// *Search vault* offer. `MODE_PALETTE` has neither, and `MODE_SEARCH` is
+    /// already there.
+    fn search_control() -> Option<usize> {
+        match MODE.load(Ordering::SeqCst) {
+            MODE_LIST => Some(ID_ROW + SHOWN.lock().map(|s| s.len()).unwrap_or(0).min(ROW_CAP)),
+            MODE_EMPTY => super::empty_rows()
+                .iter()
+                .position(|action| *action == EmptyAction::SearchVault)
+                .map(|index| ID_ROW + index),
+            _ => None,
+        }
+    }
+
+    /// Invalidates every row control.
+    ///
+    /// [`repaint`] invalidates the parent, which is enough for everything the
+    /// parent paints -- but the rows are child windows that paint themselves,
+    /// and search mode's highlight is one of the things they paint.
+    fn repaint_rows(window: HWND) {
+        unsafe {
+            for index in 0..LIST_ROWS {
+                if let Ok(control) = GetDlgItem(window, (ID_ROW + index) as i32) {
+                    let _ = InvalidateRect(control, None, false);
+                }
+            }
+        }
     }
 
     /// Which control *New login* is on in the step that is showing, or `None`
@@ -1918,7 +2169,7 @@ mod win32 {
     ///
     /// The empty card's *New login* is a row rather than the footer button --
     /// `apply_mode` hides that button there -- and the second step's footer
-    /// button is *Edit binding*, which is a different offer: a chord that
+    /// button is *Edit binding*, which is a different offer: a key that
     /// silently edited a binding because the user expected a new login would
     /// be worse than one that did nothing at all.
     fn new_login_control() -> Option<usize> {
@@ -2019,6 +2270,10 @@ mod win32 {
                 .collect();
         }
         SEARCH_TOTAL.store(results.total as isize, Ordering::SeqCst);
+        // **Back to the top on every refresh.** This runs once per keystroke
+        // with a new result list; a highlight left where the last list put it
+        // would be on a different account, or on no row at all.
+        SEARCH_SEL.store(0, Ordering::SeqCst);
         let entering = MODE.swap(MODE_SEARCH, Ordering::SeqCst) != MODE_SEARCH;
         let top = hwnd(window.0);
         apply_mode(top);
@@ -2082,15 +2337,11 @@ mod win32 {
                 scale(l.window.h),
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            place(window, ID_SEARCH, {
-                let box2 = l.search.unwrap_or(l.subtitle);
-                Box2 {
-                    x: box2.x + 10,
-                    y: box2.y + (box2.h - 20) / 2,
-                    w: box2.w - 20,
-                    h: 20,
-                }
-            });
+            // Off screen in every mode but search -- `l.search` is `None`
+            // there and the control is hidden a line later -- and inset by the
+            // one function that decides the inset, so the box `open` created
+            // and the box this moves cannot disagree.
+            place(window, ID_SEARCH, super::search_text_box(l.search.unwrap_or(l.subtitle)));
             if let Ok(control) = GetDlgItem(window, ID_SEARCH as i32) {
                 let _ = ShowWindow(control, if search { SW_SHOW } else { SW_HIDE });
             }
@@ -2207,6 +2458,7 @@ mod win32 {
             slot.clear();
         }
         SEARCH_TOTAL.store(0, Ordering::SeqCst);
+        SEARCH_SEL.store(0, Ordering::SeqCst);
         if let Ok(mut slot) = PENDING.lock() {
             *slot = None;
         }
@@ -2583,46 +2835,66 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             let l = card();
-            // The card the rows sit on, so a row's own white reads as part of
-            // one surface rather than as five floating strips.
-            rounded(mem, l.list, 8, crate::theme::CARD, Some((1, crate::theme::HAIRLINE)));
 
-            // The search box's own box, and its focus halo. The `EDIT` is a
-            // child sitting inside this, painted by comctl32 in the colours
-            // `WM_CTLCOLOREDIT` hands it -- the same division of labour
-            // `unlock_prompt` draws its password field with, and the same
-            // 3px `theme::FOCUS_RING` flush against the border's outer edge.
-            if let Some(field) = l.search {
-                let focused = GetDlgItem(window, ID_SEARCH as i32)
+            // **One field, and it is the only border on the card.** The rows
+            // sit on it -- so a row's own white reads as part of one surface
+            // rather than as five floating strips -- and in search mode the
+            // `EDIT` sits on it too, at the top, with no box of its own. That
+            // is what was asked for: "no border for those matching elements
+            // (item + search) but they both inside of same field".
+            //
+            // **Focus is shown on the field, in the design's own vocabulary.**
+            // Taking the input's border away would otherwise take its focus
+            // indication with it, so the indication moves outward onto the
+            // container the input is an element of: `theme::FOCUS_RING` as a
+            // halo standing `FOCUS_RING_W` outside the edge, and the edge
+            // itself in `theme::BLUE`. That is the same pair `paint_control`
+            // draws around a focused footer button and the same pair
+            // `unlock_prompt` draws around its password field -- nothing new
+            // is invented here.
+            let search_focused = l.search.is_some()
+                && GetDlgItem(window, ID_SEARCH as i32)
                     .map(|control| GetFocus() == control)
                     .unwrap_or(false);
-                if focused {
-                    rounded(
-                        mem,
-                        Box2 {
-                            x: field.x - 2,
-                            y: field.y - 2,
-                            w: field.w + 4,
-                            h: field.h + 4,
-                        },
-                        9,
-                        crate::theme::FOCUS_RING,
-                        None,
-                    );
-                }
+            if search_focused {
                 rounded(
                     mem,
-                    field,
-                    8,
-                    crate::theme::CARD,
-                    Some((
-                        1,
-                        if focused {
-                            crate::theme::BLUE
-                        } else {
-                            crate::theme::BORDER_STRONG
-                        },
-                    )),
+                    Box2 {
+                        x: l.field.x - FOCUS_RING_W,
+                        y: l.field.y - FOCUS_RING_W,
+                        w: l.field.w + 2 * FOCUS_RING_W,
+                        h: l.field.h + 2 * FOCUS_RING_W,
+                    },
+                    FIELD_RING_RADIUS,
+                    crate::theme::FOCUS_RING,
+                    None,
+                );
+            }
+            rounded(
+                mem,
+                l.field,
+                FIELD_RADIUS,
+                crate::theme::CARD,
+                Some((
+                    1,
+                    if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE },
+                )),
+            );
+
+            // **The hairline between the two elements**, drawn inside the
+            // search box's own slot rather than at the first row's top edge:
+            // the rows are child windows painted over this surface, so a line
+            // on their side of the boundary would simply be covered. It is
+            // `theme::HAIRLINE`, the same value the field's own edge is drawn
+            // in -- a separator within one field, not a border around either
+            // half of it.
+            if let Some(box2) = l.search {
+                rounded(
+                    mem,
+                    Box2 { x: box2.x, y: box2.bottom() - 1, w: box2.w, h: 1 },
+                    0,
+                    crate::theme::HAIRLINE,
+                    None,
                 );
             }
 
@@ -2696,11 +2968,17 @@ mod win32 {
                     // *Cancel* always shows `ESC` -- Escape cancels the card
                     // in every mode, unlike *New login*, which `new_login_control`
                     // hides under `MODE_PALETTE`.
+                    // *New login*'s chip is dropped in search mode: `N` is a
+                    // letter the user is typing there, so the key does not
+                    // fire and a chip promising it would be a lie. `ESC` is
+                    // not dropped, because Escape still cancels in every mode.
                     let hint = if id == ID_CANCEL {
                         Some(ESC_SHORTCUT)
                     } else {
-                        (id == ID_SECONDARY && MODE.load(Ordering::SeqCst) != MODE_PALETTE)
-                            .then_some(NEW_LOGIN_SHORTCUT)
+                        (id == ID_SECONDARY
+                            && MODE.load(Ordering::SeqCst) != MODE_PALETTE
+                            && !in_search())
+                        .then_some(NEW_LOGIN_SHORTCUT)
                     }
                     .map(|text| (text, fonts.hint));
                     let dpi = DPI_PERCENT.load(Ordering::SeqCst);
@@ -2802,12 +3080,23 @@ mod win32 {
             match row {
                 SearchRow::Result(at) => {
                     let Some(candidate) = shown.get(at) else { return };
-                    // **The same chip on the same rows.** A result is chosen by
-                    // the same chord a candidate is -- see `chord` -- so it
-                    // says so, from the same function.
-                    let shortcut = super::row_shortcut(at);
-                    let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
-                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
+                    // **No chip, and the highlight comes from `SEARCH_SEL`
+                    // rather than from focus.** Bare keys type here -- see
+                    // `search_key` -- so a `3` on the third result would
+                    // promise something that must never fire over a text box.
+                    // What chooses a result is Up/Down and Enter, and the
+                    // highlight is how the card says which one that is; focus
+                    // cannot say it, because focus is in the `EDIT`.
+                    let state = RowState {
+                        // Focus still counts: Tab can take the keyboard out of
+                        // the box and onto a row, and a focused row with no
+                        // mark on it is the defect the other modes draw
+                        // selection-from-focus to avoid.
+                        selected: state.selected
+                            || SEARCH_SEL.load(Ordering::SeqCst) == at as isize,
+                        hovered: state.hovered,
+                    };
+                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, None, dpi);
                 }
                 // **No chip on either.** Neither is an account, and a number on
                 // one would be a trap -- the same rule the *Search the vault*
@@ -2828,10 +3117,12 @@ mod win32 {
             let (name, says) = super::empty_label(action);
             let row =
                 Candidate { id: String::new(), name: name.to_string(), username: says.to_string() };
-            // The empty card's *New login* answers `NEW_LOGIN_SHORTCUT` too --
-            // see `new_login_control` -- so it says so.
-            let hint =
-                (action == EmptyAction::NewLogin).then_some((NEW_LOGIN_SHORTCUT, fonts.hint));
+            // The empty card's two offers answer the two letter keys -- see
+            // `new_login_control` and `search_control` -- so they say so.
+            let hint = match action {
+                EmptyAction::NewLogin => Some((NEW_LOGIN_SHORTCUT, fonts.hint)),
+                EmptyAction::SearchVault => Some((SEARCH_SHORTCUT, fonts.hint)),
+            };
             draw_row(hdc, rect, &row, state, fonts.name, fonts.username, hint, dpi);
             return;
         }
@@ -2841,7 +3132,8 @@ mod win32 {
             };
             let (name, says) = super::send_label(&send);
             let row = Candidate { id: String::new(), name, username: says.to_string() };
-            // No hint: the second step's rows are not numbered -- see `chord`.
+            // No hint: the second step's rows are not numbered -- see
+            // `shortcut`.
             draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
             return;
         }
@@ -2877,9 +3169,21 @@ mod win32 {
             name: name.to_string(),
             username: says.to_string(),
         };
-        // **No chip, because no digit reaches this row.** A number on it would
-        // be a trap: it is the one row that is not an account.
-        draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
+        // **`S`, and never a number.** A digit on this row would be a trap --
+        // it is the one row that is not an account, and `candidate_for_digit`
+        // is measured so none can land here. `S` is its own key for its own
+        // thing, and `search_control` clicks this very control, so the chip
+        // names what the key does rather than describing a second path.
+        draw_row(
+            hdc,
+            rect,
+            &row,
+            state,
+            fonts.name,
+            fonts.username,
+            Some((SEARCH_SHORTCUT, fonts.hint)),
+            dpi,
+        );
     }
 
     /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
@@ -3403,10 +3707,10 @@ mod card_tests {
     #[test]
     fn nothing_the_search_card_lays_out_falls_off_the_bottom_of_it() {
         let l = layout_for(LIST_ROWS, true);
-        let field = l.search.expect("the search shape has a search box");
-        assert!(l.subtitle.bottom() <= field.y, "the search box overlaps the subtitle");
-        assert!(field.bottom() <= l.list.y, "the search box overlaps the list");
-        assert!(field.x >= MARGIN_X && field.right() <= l.window.right() - MARGIN_X);
+        let slot = l.search.expect("the search shape has a search box");
+        assert!(l.subtitle.bottom() <= slot.y, "the search box overlaps the subtitle");
+        assert!(slot.bottom() <= l.list.y, "the search box overlaps the list");
+        assert!(slot.x >= MARGIN_X && slot.right() <= l.window.right() - MARGIN_X);
         assert!(l.list.bottom() <= l.cancel.y);
         assert!(
             l.cancel.bottom() + MARGIN_TOP <= l.window.bottom(),
@@ -3419,21 +3723,138 @@ mod card_tests {
             "the search card's last row is outside its list area, and this card cannot scroll"
         );
 
-        // The mode costs exactly the box and its two gaps, and nothing else
-        // moved: a card that gained height for some other reason is a card
-        // whose layout has drifted from the list's.
+        // **The mode costs exactly the box, and no gap at all.** Pinned to
+        // the new truth rather than loosened: the box and the list used to be
+        // two bordered containers with a `SEARCH_GAP` between them, and they
+        // are one field now -- so the gap that separated them is gone with
+        // them and the card is that much shorter. A card that gained height
+        // for any other reason is a card whose layout has drifted from the
+        // list's.
         let list = layout(LIST_ROWS);
         assert_eq!(
             l.window.h - list.window.h,
-            SEARCH_H + SEARCH_GAP,
-            "search mode changed the card's height by something other than its own box"
+            SEARCH_H,
+            "search mode changed the card's height by something other than its own box: the two \
+             containers are one field now, so the box costs its own height and nothing else"
         );
         assert_eq!(l.title, list.title);
         assert_eq!(l.subtitle, list.subtitle);
         assert_eq!(
             list.search, None,
             "the list mode is laying out a search box it does not show, which is a control the \
-             user could tab into and a border the card would paint"
+             user could tab into and a slot the card would draw a hairline across"
+        );
+    }
+
+    /// **The results and the search box are elements of ONE field.**
+    ///
+    /// Asked for in exactly those terms: "no border for those matching
+    /// elements (item + search) but they both inside of same field". What is
+    /// decidable without opening a window is the geometry that makes it true
+    /// -- the field encloses both, they touch rather than sitting a gap apart,
+    /// and nothing of either sticks out of it -- and, by source pin below,
+    /// that the card paints a border on the field and on nothing else.
+    #[test]
+    fn the_results_and_the_search_box_share_one_field() {
+        let l = layout_for(LIST_ROWS, true);
+        let slot = l.search.expect("the search shape has a search box");
+
+        assert_eq!(l.field.x, slot.x, "the search box is not flush with the field's left edge");
+        assert_eq!(l.field.w, slot.w, "the search box is not the field's full width");
+        assert_eq!(l.field.y, slot.y, "the field does not begin at the search box");
+        assert_eq!(
+            slot.bottom(),
+            l.list.y,
+            "there is a {} px gap between the search box and the rows, so they read as two \
+             stacked containers rather than as two elements of one field",
+            l.list.y - slot.bottom()
+        );
+        assert_eq!(
+            l.field.bottom(),
+            l.list.bottom(),
+            "the field does not end where its last row does"
+        );
+        assert_eq!(l.field.x, l.list.x);
+        assert_eq!(l.field.w, l.list.w);
+
+        // The text inside the box is inset off the field's border, and is the
+        // only thing that is: no second inset, and no box of its own.
+        let text = search_text_box(slot);
+        assert!(text.x > l.field.x, "the search text is drawn against the field's border");
+        assert!(text.right() < l.field.right());
+        assert!(text.y >= slot.y && text.bottom() <= slot.bottom());
+        assert_eq!(
+            text.x - l.field.x,
+            l.field.right() - text.right(),
+            "the search text is inset by different amounts on its two sides"
+        );
+
+        // **And in every other mode the same field IS the list**, which is
+        // where the card already read that way: the candidate rows and the
+        // *Search the vault* row are elements of one container, not separately
+        // outlined boxes.
+        for rows in 1..=LIST_ROWS {
+            let l = layout(rows);
+            assert_eq!(
+                l.field, l.list,
+                "the list card's field and its list are two different rectangles, so the card \
+                 would draw a container around a container"
+            );
+        }
+    }
+
+    /// **The card paints one border, and the focus indication is the design's
+    /// own.**
+    ///
+    /// A source pin, for the reason the chip pins beside it are: nothing here
+    /// can open the window `paint` draws into. What is decidable is that the
+    /// only bordered `rounded` call left is the field's, that the `EDIT` is
+    /// not given one of its own, and that a focused search box is shown with
+    /// `theme::FOCUS_RING` and `theme::BLUE` -- the pair `paint_control`
+    /// already draws around a focused footer button -- rather than with
+    /// something invented to replace the border that was taken away.
+    #[test]
+    fn one_field_carries_the_only_border_and_shows_focus_the_design_s_way() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
+             test module as production"
+        );
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            flat.contains("fn paint(window: HWND)"),
+            "control: this scan is not reading the function that paints the card's surface"
+        );
+        assert!(
+            flat.contains("rounded( mem, l.field, FIELD_RADIUS, crate::theme::CARD, Some(( 1,"),
+            "the one bordered container is no longer drawn from `l.field`, so the search box and \
+             the rows are not inside one field any more"
+        );
+        assert!(
+            !flat.contains("crate::theme::BORDER_STRONG"),
+            "a second border colour is back on this card. The search input's own outline was \
+             `BORDER_STRONG`, and taking it away is the whole of change two"
+        );
+        assert!(
+            flat.contains("if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE }"),
+            "the field no longer changes to `theme::BLUE` when the search box has focus. \
+             Removing the input's border removed its focus indication, and the field's edge is \
+             where that indication moved"
+        );
+        assert!(
+            flat.contains("crate::theme::FOCUS_RING"),
+            "the focus halo is gone. It is the other half of how this design shows focus -- \
+             `paint_control` draws the same one around a focused footer button"
         );
     }
 
@@ -3447,6 +3868,29 @@ mod card_tests {
              search box would leave this one behind"
         );
         assert_eq!(BUTTON_H as f32, crate::theme::BUTTON_HEIGHT);
+    }
+
+    /// The field's own numbers are the card's existing ones, not new ones.
+    #[test]
+    fn the_shared_fields_metrics_are_the_ones_the_card_already_had() {
+        assert_eq!(
+            FIELD_RING_RADIUS,
+            FIELD_RADIUS + 1,
+            "the focus halo's radius is no longer one step outside the border it surrounds, so \
+             it cuts across the corner instead of following it"
+        );
+        assert_eq!(
+            FOCUS_RING_W, 2,
+            "the field's halo is a different weight from the footer buttons' ring, so this card \
+             shows focus two ways"
+        );
+        // The card's search box is still design 2b's, and the field is still
+        // the list's card: nothing here grew a size of its own.
+        assert_eq!(SEARCH_H as f32, crate::theme::SEARCH_FIELD_HEIGHT);
+        assert!(
+            FIELD_PAD_X > 0 && FIELD_PAD_X < SEARCH_H,
+            "the field's inner inset is not an inset at all"
+        );
     }
 
     /// Search mode says what it is and what to do.
@@ -3948,7 +4392,7 @@ mod tests {
     // The keyboard shortcuts.
     //
     // Driven through the `PickerCalls` seam, so no window is opened: `press`
-    // is what the card's own `win32::chord` does with a digit -- it asks
+    // is what the card's own `win32::shortcut` does with a digit -- it asks
     // `candidate_for_digit`, the one function that decides -- and the fake
     // `next` hands the resulting event to `run_with` exactly as the window
     // procedure would. What is asserted is therefore the whole path from a
@@ -4006,7 +4450,7 @@ mod tests {
                     id: expected.to_string(),
                     send: Send::Field(FieldRef::Password)
                 },
-                "CTRL+ALT+{digit} filled from the wrong account -- the numbering the user sees is \
+                "{digit} filled from the wrong account -- the numbering the user sees is \
                  the rows as drawn, and an off-by-one here types one account's password into \
                  another's login form"
             );
@@ -4015,14 +4459,16 @@ mod tests {
 
     /// **A digit past the rows on screen does nothing.** Not a beep, not a
     /// dismissal, and above all not a fill: the card is showing three
-    /// accounts, so there is no fourth for `CTRL+ALT+4` to mean.
+    /// accounts, so there is no fourth for `4` to mean. It is still swallowed
+    /// -- see `win32::shortcut`, which answers `true` either way -- so it
+    /// cannot reach a control as a keystroke.
     #[test]
     fn a_digit_past_the_shown_rows_chooses_nothing() {
         for digit in 4..=9 {
             assert_eq!(
                 press(digit, 3),
                 None,
-                "CTRL+ALT+{digit} answered something on a card showing three accounts"
+                "{digit} answered something on a card showing three accounts"
             );
         }
         // And the card stays up: `run_with` is never handed an event at all,
@@ -4077,43 +4523,115 @@ mod tests {
                 assert_ne!(
                     chosen,
                     Some(search),
-                    "with {candidates} candidates, CTRL+ALT+{digit} lands on the *Search the \
-                     vault* row"
+                    "with {candidates} candidates, {digit} lands on the *Search the vault* row"
                 );
                 if let Some(index) = chosen {
                     assert!(
                         matches!(rows.get(index), Some(ListRow::Candidate(_))),
-                        "CTRL+ALT+{digit} chose row {index}, which is not a candidate row"
+                        "{digit} chose row {index}, which is not a candidate row"
                     );
                 }
             }
         }
     }
 
-    /// The digits are on screen, and they say what they do.
+    /// The keys are on screen, they are bare, and they say what they do.
     ///
     /// A shortcut nobody can see is a shortcut nobody uses. Every candidate
-    /// row the card can draw carries its own chip, they are all distinct, and
-    /// the row past the candidates carries none -- which is the drawn half of
-    /// [`no_digit_can_land_on_the_search_row`].
+    /// row the card can draw carries its own digit, they are all distinct, and
+    /// no *digit* is offered past the candidates -- which is the drawn half of
+    /// [`no_digit_can_land_on_the_search_row`]. The row after them carries
+    /// [`SEARCH_SHORTCUT`] instead, which is a different key for a different
+    /// thing.
     #[test]
-    fn every_numbered_row_says_which_chord_runs_it() {
+    fn every_numbered_row_says_which_key_runs_it() {
         let hints: Vec<String> = (0..ROW_CAP).map(|i| row_shortcut(i).expect("numbered")).collect();
-        assert_eq!(hints[0], "CTRL+ALT+1", "the topmost row as drawn is 1");
-        assert_eq!(hints.last().map(String::as_str), Some("CTRL+ALT+5"));
+        assert_eq!(hints[0], "1", "the topmost row as drawn is 1");
+        assert_eq!(hints.last().map(String::as_str), Some("5"));
         let unique: std::collections::BTreeSet<&String> = hints.iter().collect();
-        assert_eq!(unique.len(), hints.len(), "two rows offer the same chord");
+        assert_eq!(unique.len(), hints.len(), "two rows offer the same key");
         assert_eq!(
             row_shortcut(ROW_CAP),
             None,
-            "the row after the candidates is *Search the vault*, and a chip on it would promise \
-             a chord that must never fire there"
+            "the row after the candidates is *Search the vault*, and a DIGIT on it would promise \
+             a key that must never fire there"
         );
-        assert_eq!(NEW_LOGIN_SHORTCUT, "CTRL+ALT+N");
+
+        // **Bare, and that is the whole of change one.** A chip that still
+        // read `CTRL+ALT+1` over a card whose pump no longer looks at the
+        // modifiers would be the card lying about its own keyboard -- and on
+        // a German or Polish layout `CTRL+ALT+2` is `@`, which is the second
+        // reason the chord is gone and must not come back.
+        for hint in hints.iter().chain([
+            &NEW_LOGIN_SHORTCUT.to_string(),
+            &SEARCH_SHORTCUT.to_string(),
+            &ESC_SHORTCUT.to_string(),
+        ]) {
+            assert!(
+                !hint.contains("CTRL") && !hint.contains("ALT"),
+                "the card still advertises a modifier chord: {hint:?}"
+            );
+        }
+
+        assert_eq!(NEW_LOGIN_SHORTCUT, "N");
+        assert_eq!(SEARCH_SHORTCUT, "S");
         assert!(
             !hints.contains(&NEW_LOGIN_SHORTCUT.to_string()),
-            "*New login*'s chord is also a row's"
+            "*New login*'s key is also a row's"
         );
+        assert!(
+            !hints.contains(&SEARCH_SHORTCUT.to_string()),
+            "*Search the vault*'s key is also a candidate row's"
+        );
+        assert_ne!(
+            NEW_LOGIN_SHORTCUT, SEARCH_SHORTCUT,
+            "the two letter keys are the same letter, so one of the two offers is unreachable"
+        );
+    }
+
+    /// **Search mode moves its highlight with the arrows and stops at both
+    /// ends.**
+    ///
+    /// The bare keys type there -- that is the whole reason this exists -- so
+    /// Up and Down are what choose, and what they choose is measured against
+    /// the RESULT rows only. The overflow notice and the "no matches" row are
+    /// text, and a highlight that could reach one would let `Enter` commit a
+    /// row that is not an account.
+    #[test]
+    fn the_search_highlight_walks_the_results_and_stops_at_the_ends() {
+        assert_eq!(moved_selection(0, 3, true), Some(1));
+        assert_eq!(moved_selection(1, 3, false), Some(0));
+        assert_eq!(moved_selection(0, 3, false), Some(0), "Up at the top wrapped to the bottom");
+        assert_eq!(moved_selection(2, 3, true), Some(2), "Down at the bottom wrapped to the top");
+
+        // A card with results is never left with nothing highlighted, and a
+        // card with none never highlights anything.
+        assert_eq!(moved_selection(0, 0, true), None);
+        assert_eq!(moved_selection(0, 0, false), None);
+
+        // A selection left over from a longer list is clamped rather than
+        // carried: the results change on every keystroke.
+        assert_eq!(
+            moved_selection(9, 2, true),
+            Some(1),
+            "a stale index survived a shorter result list, so Enter would fill from a row that \
+             is no longer on the card"
+        );
+
+        // And it can only ever name a row search mode actually drew as a
+        // result -- never the overflow notice, never *No matches*.
+        for shown in 1..=SEARCH_CAP {
+            let rows = search_rows(shown, shown + 7);
+            for current in 0..=shown + 3 {
+                for down in [true, false] {
+                    let at = moved_selection(current, shown, down).expect("there are results");
+                    assert!(
+                        matches!(rows.get(at), Some(SearchRow::Result(_))),
+                        "the highlight landed on row {at}, which is not a result row"
+                    );
+                }
+            }
+        }
     }
 
     /// **Escape was already handled, and still is.**
@@ -4121,9 +4639,15 @@ mod tests {
     /// A source pin, because the key arrives in the card's own pump and no
     /// test can open that window. What is decidable is that `next` still
     /// answers `VK_ESCAPE` with `Event::Cancel` *before* `IsDialogMessageW`,
-    /// which only cancels for a real dialog box -- and that the chord handling
-    /// added beside it did not become a blanket `WM_KEYDOWN` grab, which would
-    /// swallow the Tab and Enter traversal that same call buys.
+    /// which only cancels for a real dialog box -- and that the bare-key
+    /// handling beside it did not become a blanket `WM_KEYDOWN` grab, which
+    /// would swallow the Tab and Enter traversal that same call buys.
+    ///
+    /// **And that the bare keys stay out of search mode**, which is the
+    /// property change one turns on: an arm that took `1` or `S` while the
+    /// `EDIT` had the keyboard would make "1Password" and an email address
+    /// untypable, which is precisely what the `CTRL+ALT` chord did on layouts
+    /// where it is `AltGr`.
     #[test]
     fn escape_still_cancels_and_tab_still_traverses() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -4155,10 +4679,33 @@ mod tests {
              dialog box -- so this frameless card would swallow it and never close"
         );
         assert!(
-            code.contains("chord_held() && chord("),
-            "the CTRL+ALT chords are no longer gated on both modifiers being down. An ungated \
-             `WM_KEYDOWN` arm ahead of `IsDialogMessageW` eats Tab, Shift+Tab, Space and Enter, \
-             which is the whole of this card's focus traversal"
+            code.contains("!in_search() && shortcut("),
+            "the bare-key arm is no longer gated on being outside search mode. There the `EDIT` \
+             has the keyboard and every digit and letter belongs to it -- an ungated arm makes \
+             `1Password` and an email address untypable, which is the exact hazard the CTRL+ALT \
+             chord was removed for"
+        );
+        // Whitespace-normalised, like the chip pin beside it: this
+        // condition is three clauses long and rustfmt wraps it, so an exact
+        // match would fail on a reflow rather than on a change.
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("in_search() && search_key("),
+            "search mode's own key arm is gone, so Up, Down and Enter no longer choose a result \
+             -- and with the digits typing rather than selecting, nothing on that card would \
+             pick a row by keyboard at all"
+        );
+        assert!(
+            !code.contains("chord_held"),
+            "the CTRL+ALT gate is back. On German and Polish layouts CTRL+ALT is AltGr, so \
+             CTRL+ALT+2 is `@` -- over the search box that is an email address the user cannot \
+             type"
+        );
+        // Control: the scan is reading the pump's key arms at all.
+        assert!(
+            code.contains("WM_KEYDOWN"),
+            "control: the production cut contains no `WM_KEYDOWN` arm, so the rules above could \
+             not fail"
         );
     }
 
@@ -4211,6 +4758,15 @@ mod tests {
             flat.contains("ID_SECONDARY && MODE.load"),
             "control: the whitespace-normalised scan is not reading `paint_control`'s hint \
              branch at all, so the rule above could be matching some other text"
+        );
+        // **And *New login* does not advertise `N` where `N` types.** Search
+        // mode's bare keys go to the `EDIT`, so the chip has to go with them.
+        // `ESC` is not conditioned this way, and must not be: Escape cancels
+        // in every mode.
+        assert!(
+            flat.contains("&& !in_search()"),
+            "the *New login* button still shows its `N` chip in search mode, where `N` is a \
+             letter the user is typing and the key does not fire"
         );
         assert_eq!(ESC_SHORTCUT, "ESC");
     }

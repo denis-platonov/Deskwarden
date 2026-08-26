@@ -20,18 +20,28 @@
 //! exactly five showed four of them and said the rest did not fit. The card
 //! is one row taller than the candidate cap now, so this fixture shows all
 //! five accounts, the search row under them saying nothing was cut, and every
-//! row's `CTRL+ALT+n` chip.
+//! row's bare-digit chip.
 //!
-//! **The keyboard shortcuts are on the card itself**: each candidate row
-//! carries the chip for the chord that fills from it, and *New login* carries
-//! `CTRL+ALT+N` inside its own button. `Esc` cancels, as it always has. Any
-//! fixture shows them; `--full` shows the whole run of digits at once.
+//! **The keyboard shortcuts are on the card itself, and they are bare keys**:
+//! each candidate row carries the digit that fills from it (`1`...`9`), the
+//! *Search the vault* row carries `S`, and *New login* carries `N` inside its
+//! own button. `Esc` cancels, as it always has. Any fixture shows them;
+//! `--full` shows the whole run of digits at once. The `CTRL+ALT` chords they
+//! replaced are gone: the card is focused and temporary, and on German and
+//! Polish layouts `CTRL+ALT` is `AltGr`, so `CTRL+ALT+2` was the character
+//! `@` -- untypable in a search box that has to find an email address.
+//!
+//! **Search mode takes no bare keys**, because its text box has the keyboard:
+//! digits and letters type, `Up`/`Down` move the highlight over the results,
+//! and `Enter` chooses the highlighted one. It shows no key chips at all for
+//! that reason.
 //!
 //! **Search happens on this card.** Clicking *Search the vault* -- the last row
-//! of any populated card, or *Search vault* on the empty one -- switches the
-//! same window into its search mode: a focused text box between the subtitle
-//! and the list, and results drawn as rows by the same painter the candidates
-//! use. Picking one leads to the same *What should I type?* step. There is no
+//! of any populated card, or *Search vault* on the empty one, or pressing `S`,
+//! which clicks that same row -- switches the same window into its search
+//! mode: a focused text box and the results beneath it, **inside one bordered
+//! field**, with no border of its own on either. Results are drawn as rows by
+//! the same painter the candidates use. Picking one leads to the same *What should I type?* step. There is no
 //! second window and no egui anywhere on the path; the mode that used to answer
 //! this row opened the ~100 MB vault window to search a vault the daemon
 //! already held in memory. Any fixture reaches it -- the example's vault is
