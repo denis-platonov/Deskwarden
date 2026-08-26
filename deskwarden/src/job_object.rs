@@ -2499,6 +2499,7 @@ mod tests {
                 "examples/field_locator_probe.rs",
                 "examples/icon_probe.rs",
                 "examples/picker_probe.rs",
+                "examples/rest_probe.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/watch_windows.rs",
