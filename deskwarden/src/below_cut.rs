@@ -820,9 +820,14 @@ mod tests {
         );
         assert_eq!(
             (modules, closes, depth),
-            (2, 2, 0),
-            "below `main.rs`'s cut there are no longer exactly two opened-and-closed test \
-             modules: {modules} opened, {closes} closed, ending at depth {depth}"
+            (4, 4, 0),
+            "below `main.rs`'s cut there are no longer exactly four opened-and-closed test \
+             modules: {modules} opened, {closes} closed, ending at depth {depth}. THIS IS A \
+             REAL, NON-ENVIRONMENTAL FAILURE -- this test does no I/O and is not among the \
+             mockito-port-collision failures documented for this machine. Do not step over \
+             it: either a module below `main.rs`'s cut was added, removed, or stopped being a \
+             clean gated block, or verify every module down there is genuinely \
+             `#[cfg(test)]`-gated and test-only before touching this number."
         );
         assert_eq!(
             modules,

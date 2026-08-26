@@ -2126,6 +2126,16 @@ fn main() {
     // `requests_outliving_a_window`.
     let mut pending_menu_events: VecDeque<MenuEvent> = VecDeque::new();
 
+    // **The UI processes this daemon has open, and the reason the loop below
+    // never blocks on one.**
+    //
+    // Declared out here rather than inside the loop because it is the whole
+    // of the one-window rule's memory: a window opened on one pass has to
+    // still be known about on the next, both so a second *Open Vault* focuses
+    // it instead of opening a second one and so its exit is noticed at all.
+    // See `UiWindows`.
+    let mut ui_windows = UiWindows::default();
+
     // **The startup window's vault outcome, dispatched by the one dispatcher.**
     //
     // The single window showed the vault, and the user may have locked it,
@@ -2163,6 +2173,7 @@ fn main() {
             },
             &tray,
             &backend_op_rx,
+            &mut ui_windows,
             // The one caller that hands an outcome in.
             startup_vault.take(),
             // The startup window was not opened by anything the user searched
@@ -2181,6 +2192,58 @@ fn main() {
     }
 
     loop {
+        // **The fifth door into the vault window's dispatcher, and the one
+        // that opens no window at all: a UI process that has just ended.**
+        //
+        // This is what replaces the daemon standing still. The window runs in
+        // `deskwarden.exe --ui vault`; this asks that child once per pass
+        // whether it is gone, and everything below goes on running while it
+        // is not -- the hotkey, the foreground watcher, the match engine, the
+        // Win32 cards, the tray. A `CTRL+ALT+B` pressed with the vault window
+        // open is answered on the next pass of this loop, against the window
+        // the user is actually in front of, instead of being queued until the
+        // vault window closed and then filling whatever had the foreground by
+        // then. That is the defect this door exists to close.
+        //
+        // The outcome is HANDED IN, through the same `first_result` parameter
+        // the startup window's outcome goes through, rather than acted on
+        // here: a lock is `resettle_session`, the one hardened
+        // teardown-and-repopulate sequence in this app, and it must keep being
+        // reached from the code that already reaches it.
+        if let Some(result) = ui_windows.poll_the_vault_window(&config_dir) {
+            estate = open_vault_window(
+                estate,
+                VaultDeps {
+                    fill_stats: &fill_stats,
+                    job: &job,
+                    schedule: &schedule,
+                    icon_cache_dir: &icon_cache_dir,
+                    config_dir: &config_dir,
+                    settings_path: &settings_path,
+                    first_run_account: first_run_account.as_ref(),
+                    backend_op_tx: &backend_op_tx,
+                },
+                &tray,
+                &backend_op_rx,
+                &mut ui_windows,
+                // The whole of this door: the window that just ended, and
+                // what it reported.
+                Some(result),
+                // Nothing searched for this one.
+                None,
+            );
+            rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
+            drop_vault_requests_queued_behind_the_window(
+                &mut pending_menu_events,
+                &tray.open_vault_id,
+            );
+            // Our own window has just gone away and handed the foreground to
+            // whatever was behind it, so the next foreground event deserves a
+            // fresh answer rather than being suppressed as a repeat -- the
+            // same reason the other doors clear it.
+            last_dispatched_hwnd = None;
+        }
+
         // **The overlay's fourth door into the vault window**, and it is the
         // same three lines as the other three: open it, rebuild the tray's
         // account menu, drop the vault requests the user queued at the tray
@@ -2204,6 +2267,7 @@ fn main() {
                 },
                 &tray,
                 &backend_op_rx,
+                &mut ui_windows,
                 // This door opens its own window; there is no outcome to hand
                 // it.
                 None,
@@ -2308,6 +2372,7 @@ fn main() {
                     },
                     &tray,
                     &backend_op_rx,
+                    &mut ui_windows,
                     // This door opens its own window; there is no outcome to
                     // hand it.
                     None,
@@ -2851,6 +2916,7 @@ fn main() {
                 },
                 &tray,
                 &backend_op_rx,
+                &mut ui_windows,
                 // This door opens its own window; there is no outcome to hand
                 // it.
                 None,
@@ -5389,11 +5455,23 @@ fn loop_step(after: VaultFollowUp) -> LoopStep {
 trait VaultOps {
     /// Open a vault window and return what the user did with it, and the
     /// estate that session ran against.
+    ///
+    /// **`None` is not a failure. It means the window is running SOMEWHERE
+    /// ELSE and has not finished yet** -- a `deskwarden.exe --ui vault` the
+    /// daemon has just started and is now polling once per pass of its own
+    /// loop. There is no outcome to dispatch on this pass, and there must not
+    /// be one: the daemon's whole job while that window is up is to go on
+    /// draining the hotkey, watching the foreground and answering the tray,
+    /// which is what it could not do while this call blocked. The outcome
+    /// arrives later, at the poll, and is handed back in through
+    /// `run_vault_loop`'s `first_result` -- the same door the startup window's
+    /// outcome comes through, so `resettle_session` is still reached from one
+    /// place.
     fn open_window(
         &mut self,
         est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> (SessionEstate, VaultWindowSession);
+    ) -> (SessionEstate, Option<VaultWindowSession>);
 
     /// The lock / 401 recovery. `resettle_session` and nothing else.
     fn resettle_after_lost_session(
@@ -5423,6 +5501,13 @@ trait VaultOps {
 struct RealVaultOps<'a> {
     tray: &'a tray::AppTray,
     backend_op_rx: &'a Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    /// **The daemon's record of which UI processes are open**, borrowed from
+    /// `run`'s own frame rather than owned here, because this struct is built
+    /// and dropped once per trip into the vault loop and the windows outlive
+    /// several of those. It is also what makes the one-window rule work at
+    /// all: a registry that died with the ops object would forget the window
+    /// it had just opened.
+    ui: &'a mut UiWindows,
     /// What the vault window's search box opens with, **taken on the first
     /// window this ops object builds and never again**.
     ///
@@ -5709,27 +5794,150 @@ const UI_RESULT_CODE_CEILING: i32 = deskwarden::ui_process::UiVaultResult::EXIT_
     | deskwarden::ui_process::UiVaultResult::EXIT_ADD_ACCOUNT
     | deskwarden::ui_process::UiVaultResult::EXIT_REMOVE_ACCOUNT;
 
-/// **Open the vault window in a process of its own, and bring its answer
-/// back.**
+/// **One UI process the daemon is holding open**, and everything it needs to
+/// bring that window's answer home when it ends.
 ///
-/// `None` means the window did not run here and the caller should open one
-/// in-process instead -- see [`RealVaultOps::open_window`], which is the one
-/// caller.
+/// The `Child` is kept -- not waited on -- because it is three things at
+/// once: the handle `try_wait` reaps through, the process id the result file
+/// is named by, and the daemon's entire record that a window of this surface
+/// exists. One value, so there is no second registry to disagree with it.
+struct OpenUiWindow {
+    child: Child,
+    /// `child.id()`, read once at spawn. Reading it back off the reaped value
+    /// would be one more thing to get right at the moment the answer matters
+    /// most.
+    pid: u32,
+    /// Only ever logged. How long the user had the window up is the number
+    /// that made the blocking version's cost visible, and it stays visible.
+    opened_at: Instant,
+}
+
+/// **The UI processes the daemon has open, one slot per surface.**
+///
+/// A `struct` with a named field rather than a map, because "which surfaces
+/// can be open" is a fixed, small list and a map would make
+/// [`deskwarden::ui_process::open_decision`]'s question -- *is this surface
+/// already open?* -- a lookup that can silently answer about the wrong key.
+/// A second surface is a second field and a second poll line.
+#[derive(Default)]
+struct UiWindows {
+    vault: Option<OpenUiWindow>,
+}
+
+impl UiWindows {
+    /// The vault window's process id, if one is open. The whole of the
+    /// one-window rule's input; see [`deskwarden::ui_process::open_decision`].
+    fn vault_pid(&self) -> Option<u32> {
+        self.vault.as_ref().map(|open| open.pid)
+    }
+
+    /// **Answer a request for the vault window without blocking on it.**
+    ///
+    /// `true` means this request is dealt with -- a process was started, or
+    /// the window that was already up has been brought forward -- and the
+    /// caller must NOT open one in the daemon. `false` means no UI process
+    /// could be started at all and the caller's in-process fallback is the
+    /// only window the user is going to get.
+    ///
+    /// **The daemon does not wait here, and that is the whole point of this
+    /// function.** `wait_for_the_ui_process` used to sit at this spot pumping
+    /// the message queue so the tray stayed responsive while the daemon's own
+    /// loop stood still. It kept the tray alive and left the actual defect
+    /// untouched: `CTRL+ALT+B` pressed while the vault window was open was
+    /// queued on the hotkey channel and acted on when the window closed,
+    /// against whatever was in front by then. The loop iterating is what
+    /// replaces it -- it pumps the same queue every pass
+    /// (`pump_windows_messages`) and drains the hotkey, the foreground
+    /// watcher and the tray besides.
+    fn ask_for_the_vault_window(&mut self) -> bool {
+        match deskwarden::ui_process::open_decision(self.vault_pid()) {
+            deskwarden::ui_process::UiOpenDecision::FocusTheOpenOne { pid } => {
+                // **Not a second window.** With the loop live, the tray is
+                // clickable while a window is up, so this is now a case that
+                // can actually happen -- it could not while the daemon
+                // blocked. Two vault windows would be two editors of the same
+                // records, on the surface that edits them.
+                let raised = deskwarden::foreground::raise_process(pid);
+                log::info!(
+                    "the vault window is already open as process {pid}; brought it forward \
+                     ({raised:?}) rather than opening a second one"
+                );
+                true
+            }
+            deskwarden::ui_process::UiOpenDecision::Spawn => {
+                match spawn_the_vault_window_in_its_own_process() {
+                    Some(open) => {
+                        self.vault = Some(open);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// **One poll of the open vault window**, run once per iteration of the
+    /// daemon's loop.
+    ///
+    /// `Some` exactly once per window, on the pass that finds it gone; the
+    /// slot is emptied in the same breath, so the result cannot be delivered
+    /// twice and the next *Open Vault* is free to spawn.
+    ///
+    /// **A child that cannot be waited on is reaped anyway** -- see
+    /// [`deskwarden::ui_process::reap_step`]. A crash or an external kill must
+    /// not leave the daemon believing a window is open forever, because under
+    /// the one-window rule that is an *Open Vault* that never opens again.
+    fn poll_the_vault_window(
+        &mut self,
+        config_dir: &Path,
+    ) -> Option<vault_window::VaultWindowResult> {
+        let answer = match self.vault.as_mut()?.child.try_wait() {
+            Ok(Some(status)) => Ok(Some(status.code())),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                log::error!(
+                    "could not ask the vault window's process how it is doing ({e}); treating \
+                     it as gone so the next Open Vault is not refused forever"
+                );
+                Err(())
+            }
+        };
+        match deskwarden::ui_process::reap_step(answer) {
+            deskwarden::ui_process::Reap::Keep => None,
+            deskwarden::ui_process::Reap::Take { code } => {
+                let open = self.vault.take().expect("polled through `as_mut` a line above");
+                log::info!(
+                    "the vault window (process {}) lasted {:?}",
+                    open.pid,
+                    open.opened_at.elapsed()
+                );
+                Some(what_the_vault_ui_process_reported(open.pid, code, config_dir))
+            }
+        }
+    }
+}
+
+/// **Start the vault window in a process of its own, and hand the loop the
+/// child.**
+///
+/// `None` means no process could be started and the caller should open a
+/// window in the daemon instead -- see [`RealVaultOps::open_window`], which is
+/// the one caller.
 ///
 /// # The single most important line in this function is the one that is not
 /// here
 ///
-/// **The child is not assigned to `deps.job`.** Every other child this app
-/// spawns goes through [`job_object::spawn_in_job`] and joins the
-/// kill-on-close job, which is exactly right for `bw serve` -- an orphaned
-/// backend serves a decrypted vault on localhost -- and exactly wrong for a
-/// window. A daemon restart is routine: an update stops the old process
-/// before starting the new one, and a crash or a manual quit does the same
-/// without warning. Assigned to the job, every one of those would close the
-/// vault window the user had open, mid-edit. The two processes are loosely
-/// coupled on purpose: when the daemon comes back it brings `bw serve` up on
-/// the same constant port and the window's next request succeeds. Recovery is
-/// a retry, not a handshake.
+/// **The child is not assigned to the daemon's `KillOnCloseJob`.** Every
+/// other child this app spawns goes through [`job_object::spawn_in_job`] and
+/// joins the kill-on-close job, which is exactly right for `bw serve` -- an
+/// orphaned backend serves a decrypted vault on localhost -- and exactly
+/// wrong for a window. A daemon restart is routine: an update stops the old
+/// process before starting the new one, and a crash or a manual quit does the
+/// same without warning. Assigned to the job, every one of those would close
+/// the vault window the user had open, mid-edit. The two processes are
+/// loosely coupled on purpose: when the daemon comes back it brings
+/// `bw serve` up on the same constant port and the window's next request
+/// succeeds. Recovery is a retry, not a handshake.
 ///
 /// So the spawn is a plain `Command::spawn` and `spawn_in_job` is not called.
 /// Because an absence cannot be read, [`deskwarden::ui_process::UiSpawnPlan`]
@@ -5746,7 +5954,7 @@ const UI_RESULT_CODE_CEILING: i32 = deskwarden::ui_process::UiVaultResult::EXIT_
 /// reads `settings.json` for the active account, and has `BW_SERVE_PORT` as a
 /// constant because it is the same binary. No token, no password and no vault
 /// item crosses -- in either direction.
-fn open_the_vault_window_in_its_own_process(config_dir: &Path) -> Option<VaultWindowSession> {
+fn spawn_the_vault_window_in_its_own_process() -> Option<OpenUiWindow> {
     use std::os::windows::process::CommandExt as _;
 
     let program = match std::env::current_exe() {
@@ -5758,7 +5966,6 @@ fn open_the_vault_window_in_its_own_process(config_dir: &Path) -> Option<VaultWi
     };
     let plan = deskwarden::ui_process::UiSpawnPlan::for_surface(program, Surface::Vault.as_arg());
 
-    let opened_at = Instant::now();
     let spawned = deskwarden::ui_process::spawn_out_of_any_job(|breakaway| {
         let mut command = std::process::Command::new(&plan.program);
         command.args(&plan.args);
@@ -5771,7 +5978,7 @@ fn open_the_vault_window_in_its_own_process(config_dir: &Path) -> Option<VaultWi
         // is the line the whole split turns on.
         command.spawn()
     });
-    let mut child = match spawned {
+    let child = match spawned {
         Ok(child) => child,
         Err(e) => {
             log::error!(
@@ -5785,122 +5992,87 @@ fn open_the_vault_window_in_its_own_process(config_dir: &Path) -> Option<VaultWi
     let pid = child.id();
     log::info!(
         "the vault window is process {pid} ({} {}), outside the kill-on-close job so a daemon \
-         restart cannot close it",
+         restart cannot close it. The daemon's loop goes on running beside it",
         plan.program.display(),
         plan.args.join(" ")
     );
+    Some(OpenUiWindow { child, pid, opened_at: Instant::now() })
+}
 
-    let status = match wait_for_the_ui_process(&mut child) {
-        Ok(status) => status,
-        Err(e) => {
-            log::error!("lost track of UI process {pid} ({e}); treating it as closed");
-            return Some(VaultWindowSession {
-                result: vault_window::VaultWindowResult {
-                    locked: false,
-                    needs_reauth: false,
-                    edited_settings: None,
-                    switch_to: None,
-                    add_account: false,
-                    remove_account: false,
-                    account_details: None,
-                },
-                relocked: false,
-            });
-        }
-    };
-
-    // Read before the file, so an unrecognisable code is reported as itself
-    // rather than silently becoming an outcome.
-    let code = status.code().unwrap_or(UI_COULD_NOT_START);
-    let from_exit_code = if (0..=UI_RESULT_CODE_CEILING).contains(&code) {
-        deskwarden::ui_process::UiVaultResult::from_exit_code(code)
-    } else {
-        if code != UI_COULD_NOT_START {
-            log::error!(
-                "UI process {pid} exited with {code}, which is not a result this app writes; \
-                 it panicked or was killed. Nothing from that window is acted on"
-            );
-        } else {
-            log::warn!("UI process {pid} could not open its window; see its lines above");
-        }
-        deskwarden::ui_process::UiVaultResult::default()
-    };
-
+/// **What a finished UI process reported**, from its exit code and its file.
+///
+/// The impure half: it reads and deletes the file. Every decision is in
+/// [`ui_vault_outcome`], which is where the tests are.
+fn what_the_vault_ui_process_reported(
+    pid: u32,
+    code: Option<i32>,
+    config_dir: &Path,
+) -> vault_window::VaultWindowResult {
     let path = deskwarden::ui_process::result_path(config_dir, pid);
     let from_file = deskwarden::ui_process::read_result(&path);
     deskwarden::ui_process::forget_result(&path);
-    let crossing = deskwarden::ui_process::UiVaultResult::union(from_file, from_exit_code);
-    log::info!(
-        "UI process {pid} lasted {:?} and came home with {crossing:?}",
-        opened_at.elapsed()
-    );
+    let crossing = ui_vault_outcome(pid, code, from_file);
+    log::info!("UI process {pid} came home with {crossing:?}");
 
-    Some(VaultWindowSession {
-        result: vault_window::VaultWindowResult {
-            locked: crossing.locked,
-            needs_reauth: crossing.needs_reauth,
-            edited_settings: crossing.edited_settings,
-            switch_to: crossing.switch_to,
-            add_account: crossing.add_account,
-            remove_account: crossing.remove_account,
-            // **Deliberately not carried across.** See `ui_process`: it is a
-            // warm-cache optimisation, and its absence costs the next open
-            // one `bw status` spawn -- which is already what a window closed
-            // before its own fetch returned costs today.
-            account_details: None,
-        },
-        // **`false`, and it is the safe answer rather than an unknown one.**
-        // A UI process cannot lock in place: the lock's teardown stops and
-        // restarts `bw serve`, which belongs to the daemon. So a lock
-        // reported from over there has torn nothing down, and the recovery
-        // `run_vault_loop` has always run is the only one it will get.
-        relocked: false,
-    })
+    vault_window::VaultWindowResult {
+        locked: crossing.locked,
+        needs_reauth: crossing.needs_reauth,
+        edited_settings: crossing.edited_settings,
+        switch_to: crossing.switch_to,
+        add_account: crossing.add_account,
+        remove_account: crossing.remove_account,
+        // **Deliberately not carried across.** See `ui_process`: it is a
+        // warm-cache optimisation, and its absence costs the next open one
+        // `bw status` spawn -- which is already what a window closed before
+        // its own fetch returned costs today.
+        account_details: None,
+    }
 }
 
-/// Wait for the UI process **while going on pumping this thread's message
-/// queue.**
+/// **The union of the two carriers, and the refusal to read a code that is
+/// not one of ours.**
 ///
-/// A plain `child.wait()` would be a blocked message loop, and a Win32
-/// thread that stops pumping stops answering: the tray icon's hidden window
-/// belongs to this thread, so within seconds the shell would mark it not
-/// responding and the tray menu would not open at all. That is strictly worse
-/// than what this split replaces, where eframe pumped the same queue for the
-/// window's whole life.
+/// Pure, and separate from its caller for the reason the whole crate splits
+/// this way: the daemon's loop is not reachable from any test (see
+/// [`search_asked_for`]), so a decision left inline there is a decision
+/// nothing checks. The one this holds is a security decision -- a Lock that
+/// does not lock, or a panicking UI process whose status happens to be 3 read
+/// as `locked | needs_reauth` and made to tear `bw serve` down and demand the
+/// master password.
 ///
-/// **This is not the same as the tray loop iterating**, and the difference is
-/// worth stating: menu clicks are delivered to the tray's window procedure
-/// and queued on `MenuEvent`'s channel, exactly as they are today, and the
-/// daemon drains them when this returns. Making the daemon's loop run
-/// *alongside* an open window is Task 5's business, not this one's.
-///
-/// The wait is on the child's handle with a short timeout rather than
-/// `INFINITE`, so the loop's correctness rests on `try_wait` alone: whatever
-/// `MsgWaitForMultipleObjects` returns, the next pass asks the child directly.
-fn wait_for_the_ui_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG,
-        PM_REMOVE, QS_ALLINPUT,
+/// `None` for `code` is a process Windows gave no status for at all: killed,
+/// or a handle that could no longer be waited on. Nothing is read off it, and
+/// the file it may have left is still read -- a window that locked, wrote its
+/// file and was then killed still locks.
+fn ui_vault_outcome(
+    pid: u32,
+    code: Option<i32>,
+    from_file: Option<deskwarden::ui_process::UiVaultResult>,
+) -> deskwarden::ui_process::UiVaultResult {
+    let from_exit_code = match code {
+        Some(code) if (0..=UI_RESULT_CODE_CEILING).contains(&code) => {
+            deskwarden::ui_process::UiVaultResult::from_exit_code(code)
+        }
+        Some(UI_COULD_NOT_START) => {
+            log::warn!("UI process {pid} could not open its window; see its lines above");
+            deskwarden::ui_process::UiVaultResult::default()
+        }
+        Some(code) => {
+            log::error!(
+                "UI process {pid} exited with {code}, which is not a result this app writes; \
+                 it panicked or was killed. Nothing from that exit status is acted on"
+            );
+            deskwarden::ui_process::UiVaultResult::default()
+        }
+        None => {
+            log::error!(
+                "UI process {pid} left no exit status at all; only whatever it managed to \
+                 write is acted on"
+            );
+            deskwarden::ui_process::UiVaultResult::default()
+        }
     };
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        unsafe {
-            let handles = [HANDLE(child.as_raw_handle())];
-            // 50ms: short enough that a missed wake costs nothing a user can
-            // see, long enough that this is not a spin.
-            let _ = MsgWaitForMultipleObjects(Some(&handles), false, 50, QS_ALLINPUT);
-            let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-    }
+    deskwarden::ui_process::UiVaultResult::union(from_file, from_exit_code)
 }
 
 /// `CREATE_BREAKAWAY_FROM_JOB`, from `windows::Win32::System::Threading`.
@@ -5912,11 +6084,22 @@ impl VaultOps for RealVaultOps<'_> {
         &mut self,
         mut est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> (SessionEstate, VaultWindowSession) {
-        // **The window runs over there, not here.** Closing it is the only
-        // thing that gives the OpenGL driver's committed arenas back, and
-        // only process exit closes it in that sense -- see
-        // `open_the_vault_window_in_its_own_process`.
+    ) -> (SessionEstate, Option<VaultWindowSession>) {
+        // **The window runs over there, not here, and this call does not wait
+        // for it.** Closing it is the only thing that gives the OpenGL
+        // driver's committed arenas back, and only process exit closes it in
+        // that sense -- see `spawn_the_vault_window_in_its_own_process`.
+        //
+        // `None` back to `run_vault_loop` is what makes the daemon's loop run
+        // ALONGSIDE the window rather than after it. Everything the loop does
+        // -- the hotkey, the foreground watcher, the match engine, the Win32
+        // cards, the tray menu -- goes on happening, and the window's outcome
+        // comes back through the poll.
+        //
+        // **This is also where one-window-per-surface is enforced**, and it is
+        // the one place a request for this surface can reach: a second click
+        // while a window is up focuses that window and still answers `None`,
+        // so nothing is spawned and nothing is dispatched.
         //
         // The one carve-out is an initial search: the overlay's 3a card
         // answers *Search vault* with the app's name, and there is no way to
@@ -5925,10 +6108,11 @@ impl VaultOps for RealVaultOps<'_> {
         // but it names an app the user is signed into, and the rule this
         // design is built on is that the command line carries a mode and a
         // surface and nothing else. So that one route keeps the in-process
-        // window, and pays the driver for it.
+        // window, and pays the driver for it -- and blocks, exactly as it did
+        // before, which is the one door this change does not open.
         if self.initial_search.is_none() {
-            if let Some(session) = open_the_vault_window_in_its_own_process(deps.config_dir) {
-                return (est, session);
+            if self.ui.ask_for_the_vault_window() {
+                return (est, None);
             }
             log::error!(
                 "falling back to opening the vault window inside the daemon; this process now \
@@ -6189,7 +6373,7 @@ impl VaultOps for RealVaultOps<'_> {
         // The estate goes home on the one path out of this method. Nothing
         // above may `return` without it, which is what stops a future arm
         // from being the one that keeps `main`'s session state.
-        (est, VaultWindowSession { result, relocked: ended.relocked })
+        (est, Some(VaultWindowSession { result, relocked: ended.relocked }))
     }
 
     fn resettle_after_lost_session(
@@ -6564,6 +6748,35 @@ fn run_vault_loop(
             // real one -- which is what "the window closes and reopens" now means when
             // the window that closed was the startup window: it closed, and the vault
             // comes back in a window of its own.
+        // **The window is opened ABOVE the span the no-jump guards watch, and
+        // the one early exit this function has lives here with it.**
+        //
+        // `open_window` answers `None` when it has started a
+        // `deskwarden.exe --ui vault` and there is no outcome yet -- see
+        // `VaultOps::open_window`. Returning on that is what lets `run`'s loop
+        // go on draining the hotkey, watching the foreground and answering the
+        // tray while the window is up, which is the whole of the reported
+        // defect ("Ctrl Alt B should work with main window open").
+        //
+        // **Deliberately not folded into the `match` below.** That match is
+        // the head of the span `nothing_between_the_window_closing_and_the_
+        // branches_may_jump` and `nothing_outside_the_two_branch_bodies_may_
+        // jump` protect: once a RESULT exists, no jump of any kind may come
+        // between it and the branches that act on it, because
+        // `edited_settings` stays `Some` for the rest of a window's life and
+        // an early exit there is the v0.5.0 defect -- the vault silently not
+        // locking. Here there is no result yet and nothing to skip past; the
+        // guards' rule and this exit do not overlap, and keeping them
+        // textually apart is what keeps that visible.
+        let opened_here = if first_result.is_none() {
+            let (returned, session) = ops.open_window(est, deps);
+            est = returned;
+            let Some(session) = session else { return est };
+            Some(session)
+        } else {
+            None
+        };
+
         let session = match first_result.take() {
             Some(result) => {
                 log::info!(
@@ -6576,11 +6789,10 @@ fn run_vault_loop(
                 // recovery below is the only one that lock will ever get.
                 VaultWindowSession { result, relocked: false }
             }
-            None => {
-                let (returned, session) = ops.open_window(est, deps);
-                est = returned;
-                session
-            }
+            None => opened_here.expect(
+                "`first_result` was `None` when the window was opened a few lines above, and \
+                 nothing between here and there can have filled it",
+            ),
         };
         // Split here, once, so that everything below reads the same two facts
         // this window reported and nothing re-derives either of them.
@@ -6851,6 +7063,11 @@ fn open_vault_window(
     // only one place may drain it.
     tray: &tray::AppTray,
     backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    // **`run`'s own UI-process registry**, threaded through rather than owned
+    // here for the reason `RealVaultOps::ui` gives: this function is entered
+    // and left many times over one window's life, and a registry scoped to it
+    // would forget the window on the way out.
+    ui: &mut UiWindows,
     // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
     // the loop below on its first pass instead of that pass opening a window.
     //
@@ -6874,7 +7091,7 @@ fn open_vault_window(
     // either in `RealVaultOps` (the window, the teardown, the dialogs) or in
     // `run_vault_loop` (every decision), and the split is what makes the
     // second half reachable from a test at all.
-    let mut ops = RealVaultOps { tray, backend_op_rx, initial_search };
+    let mut ops = RealVaultOps { tray, backend_op_rx, ui, initial_search };
     run_vault_loop(estate, &deps, &mut ops, first_result)
 }
 
@@ -12841,7 +13058,7 @@ mod tests {
     fn the_spawned_vault_window_is_not_a_member_of_the_daemons_job() {
         let body = body_of(
             production_half_of_this_file(),
-            concat!("fn open_the_vault_window_in_its_own_", "process("),
+            concat!("fn spawn_the_vault_window_in_its_own_", "process("),
         );
         assert!(
             body.contains(concat!("command.", "spawn()")),
@@ -12877,7 +13094,7 @@ mod tests {
     fn the_spawn_passes_the_plans_arguments_and_adds_none_of_its_own() {
         let body = body_of(
             production_half_of_this_file(),
-            concat!("fn open_the_vault_window_in_its_own_", "process("),
+            concat!("fn spawn_the_vault_window_in_its_own_", "process("),
         );
         assert_eq!(
             body.matches(concat!("command.a", "rgs(&plan.args)")).count(),
@@ -14708,8 +14925,8 @@ mod tests {
                 "the resettle and the account branch no longer hand the estate back. A method                  that keeps it is a method that can be the one that loses it"
             );
             assert!(
-                squeezed.contains(concat!("-> (SessionEstate, VaultWindow", "Session);")),
-                "`open_window` no longer hands the estate back alongside the result. The                  declaration is {squeezed:?}"
+                squeezed.contains(concat!("-> (SessionEstate, Option<VaultWindow", "Session>);")),
+                "`open_window` no longer hands the estate back alongside the result. The                  estate comes home on BOTH answers -- including the one that means the window                  is running in another process and has not finished -- because a method that                  keeps it on any arm is the method that loses it. The declaration is                  {squeezed:?}"
             );
         }
 
@@ -17204,11 +17421,21 @@ mod tests {
                          `return` is allowed here -- the handoff to the UI process, above \
                          all of this method's work -- and nothing else:\n{body}"
                     );
+                    // **`ask_for_the_vault_window`, not a spawn.** The
+                    // request goes to `run`'s UI-process registry, which
+                    // decides between starting a process and bringing the
+                    // one that is already up to the front -- the
+                    // one-window-per-surface rule, at the single choke point
+                    // every door into this surface passes through. A spawn
+                    // called directly here would be a second vault window on
+                    // the same vault the moment the tray is clicked twice,
+                    // which the daemon's now-live loop makes possible.
                     let handoff = body
-                        .find(concat!("open_the_vault_window_in_its_own_", "process("))
+                        .find(concat!("ask_for_the_vault_", "window("))
                         .expect(
-                            "`open_window` no longer tries to run the window in a process of \
-                             its own, so the daemon is paying for the OpenGL driver again",
+                            "`open_window` no longer asks the UI-process registry for the \
+                             window, so either the daemon is paying for the OpenGL driver \
+                             again or the one-window rule is being bypassed",
                         );
                     let eframe = body.find(concat!("app_window::run_from_", "vault(")).expect(
                         "control: the sliced body does not open a window at all",
@@ -17332,6 +17559,94 @@ mod tests {
     /// 4. [`the_fake_can_fail`] drives the loop with a deliberately wrong
     ///    expected log, so "the log matched" is known to be a real comparison
     ///    over a non-empty `Vec` rather than two empties agreeing.
+    /// **What a finished UI process is allowed to make the daemon do.**
+    ///
+    /// `ui_vault_outcome` is the one decision on the way home from a polled
+    /// child, and both directions of getting it wrong are serious: dropping a
+    /// lock is a Lock button that does not lock, and reading a foreign exit
+    /// status as a result makes a panicking UI process tear `bw serve` down
+    /// and demand the master password.
+    mod what_a_finished_ui_process_reported {
+        use super::*;
+        use deskwarden::ui_process::UiVaultResult;
+
+        /// A pid, for the log lines. Nothing decides on it.
+        const PID: u32 = 4242;
+
+        #[test]
+        fn a_lock_survives_a_lost_result_file() {
+            let out = ui_vault_outcome(PID, Some(UiVaultResult::EXIT_LOCKED), None);
+            assert!(
+                out.locked,
+                "the exit code is the carrier that survives a full disk or a child killed \
+                 between locking and writing; without it a Lock is silently dropped"
+            );
+        }
+
+        #[test]
+        fn a_lock_survives_a_lost_exit_status() {
+            let file = UiVaultResult { locked: true, ..Default::default() };
+            let out = ui_vault_outcome(PID, None, Some(file));
+            assert!(
+                out.locked,
+                "a child Windows gave no status for still wrote its answer, and the answer \
+                 said the user locked the vault"
+            );
+        }
+
+        #[test]
+        fn the_payload_fields_come_from_the_file_because_nothing_else_carries_them() {
+            let account = accounts::AccountId::generate();
+            let file = UiVaultResult {
+                switch_to: Some(account.clone()),
+                edited_settings: Some(deskwarden::settings::Settings::default()),
+                ..Default::default()
+            };
+            let out = ui_vault_outcome(PID, Some(0), Some(file));
+            assert_eq!(out.switch_to, Some(account));
+            assert!(out.edited_settings.is_some());
+        }
+
+        #[test]
+        fn a_status_that_is_not_one_of_ours_is_read_as_nothing() {
+            // 101 is a Rust panic. Read as a bitfield it would be
+            // `locked | needs_reauth | add_account`, which tears the backend
+            // down, demands the master password and opens the add-account
+            // flow -- all because a window crashed.
+            let out = ui_vault_outcome(PID, Some(101), None);
+            assert_eq!(
+                out,
+                UiVaultResult::default(),
+                "a panicking UI process must not be able to drive the daemon by accident"
+            );
+            // Control on the boundary: the value one below the ceiling IS
+            // read, so the refusal above is about the range and not about a
+            // function that reads nothing.
+            let inside = ui_vault_outcome(PID, Some(UI_RESULT_CODE_CEILING), None);
+            assert!(inside.locked && inside.remove_account);
+        }
+
+        #[test]
+        fn a_ui_that_could_not_start_reports_nothing_rather_than_a_lock_and_a_reauth() {
+            assert_eq!(
+                ui_vault_outcome(PID, Some(UI_COULD_NOT_START), None),
+                UiVaultResult::default(),
+                "the startup-failure code sits outside the bitfield precisely so it cannot be \
+                 read as an outcome"
+            );
+            assert!(
+                UI_COULD_NOT_START > UI_RESULT_CODE_CEILING,
+                "control: the startup-failure code has moved inside the bitfield's range, so \
+                 a failed launch now reads as a result"
+            );
+        }
+
+        #[test]
+        fn a_window_that_asked_for_nothing_leaves_the_daemon_alone() {
+            assert_eq!(ui_vault_outcome(PID, Some(0), None), UiVaultResult::default());
+        }
+    }
+
     mod the_vault_loop_driven_end_to_end {
         use super::*;
         use deskwarden::settings::Settings;
@@ -17502,7 +17817,13 @@ mod tests {
             /// What each successive `open_window` hands back. Popped, never
             /// re-read: a loop that opens more windows than the test scripted
             /// is a loop that did not return when it should have.
-            scripted: VecDeque<VaultWindowSession>,
+            ///
+            /// **`None` is a window that is RUNNING SOMEWHERE ELSE**, which is
+            /// what production's `open_window` answers once it has started a
+            /// `deskwarden.exe --ui vault`: no outcome yet, and the loop must
+            /// return so the daemon can go on serving the hotkey and the tray
+            /// beside it. See `VaultOps::open_window`.
+            scripted: VecDeque<Option<VaultWindowSession>>,
             log: Vec<OpLog>,
             /// **The runaway guard.** A `run_vault_loop` that re-dispatches
             /// `first_result` instead of taking it once never opens a window
@@ -17536,6 +17857,12 @@ mod tests {
             /// The other half of the same door: windows that say whether the
             /// session was ALREADY torn down and rebuilt in place.
             fn from_sessions(scripted: Vec<VaultWindowSession>) -> Self {
+                Self::from_scripted(scripted.into_iter().map(Some).collect())
+            }
+
+            /// The door for a script that includes a window which does not
+            /// finish -- see `scripted`.
+            fn from_scripted(scripted: Vec<Option<VaultWindowSession>>) -> Self {
                 Self {
                     scripted: scripted.into(),
                     log: Vec::new(),
@@ -17577,7 +17904,7 @@ mod tests {
                 &mut self,
                 mut est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> (SessionEstate, VaultWindowSession) {
+            ) -> (SessionEstate, Option<VaultWindowSession>) {
                 self.charge();
                 // **Before anything else in this method.** What is recorded
                 // has to be the estate the LOOP handed over, not one this fake
@@ -17969,6 +18296,78 @@ mod tests {
             control.assert_script_consumed();
         }
 
+        /// **A window that is running somewhere else ends this trip through
+        /// the loop, and nothing is dispatched for it.**
+        ///
+        /// This is the arm the whole "the daemon's loop runs alongside an open
+        /// window" change turns on: `open_window` starts a
+        /// `deskwarden.exe --ui vault` and answers `None`, and the loop must
+        /// hand `run`'s frame straight back so the daemon can go on draining
+        /// the hotkey, watching the foreground and answering the tray. A loop
+        /// that waited here -- or that invented a closed-window outcome -- is
+        /// the reported defect: `CTRL+ALT+B` queued until the window shut.
+        #[test]
+        fn a_window_that_runs_somewhere_else_returns_without_dispatching_anything() {
+            let bench = Bench::new("runs-elsewhere");
+            let mut ops = FakeVaultOps::from_scripted(vec![None]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::OpenedWindow],
+                "the loop did something with a window that has not finished. There is no \
+                 outcome to act on yet, and acting on the absence of one means resettling a \
+                 session the user is still using"
+            );
+            ops.assert_script_consumed();
+
+            // CONTROL, one field different: the same open with an actual
+            // outcome behind it DOES reach a dispatch, so the empty log above
+            // is about the `None` and not about a loop that logs nothing.
+            let control_bench = Bench::new("runs-elsewhere-control");
+            let mut control = FakeVaultOps::from_scripted(vec![Some(VaultWindowSession {
+                result: VaultWindowResult { locked: true, ..closed() },
+                relocked: false,
+            })]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![OpLog::OpenedWindow, OpLog::Resettled],
+                "control: a finished window does not reach the recovery either, so the \
+                 assertion above cannot tell the two apart"
+            );
+        }
+
+        /// **The outcome of a window that ran somewhere else is dispatched by
+        /// the one dispatcher when it finally arrives.**
+        ///
+        /// The other half of the arm above, and the one that would be a
+        /// security defect if it were missing: the poll hands the reaped
+        /// child's result in through `first_result`, and a lock reported that
+        /// way has to run the same `resettle_session` a lock reported by an
+        /// in-process window runs.
+        #[test]
+        fn a_lock_reported_by_a_window_that_ran_elsewhere_still_resettles() {
+            let bench = Bench::new("elsewhere-lock");
+            // Nothing scripted: the loop must dispatch the handed-in result
+            // and return without opening anything.
+            let mut ops = FakeVaultOps::from_scripted(vec![]);
+
+            drive(
+                &bench,
+                &mut ops,
+                Some(VaultWindowResult { locked: true, ..closed() }),
+            );
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::Resettled],
+                "a Lock pressed in the vault window's own process did not tear the session \
+                 down. That is a Lock button that does not lock"
+            );
+        }
+
         /// A visit to the gear is not a reason a window closed. The loop
         /// applies the edit and RETURNS -- it does not reopen.
         #[test]
@@ -18321,7 +18720,7 @@ mod tests {
                 &mut self,
                 est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> (SessionEstate, VaultWindowSession) {
+            ) -> (SessionEstate, Option<VaultWindowSession>) {
                 self.charge();
                 self.log.push(OpLog::OpenedWindow);
                 let result = self
@@ -18330,7 +18729,7 @@ mod tests {
                     .expect("the loop opened more windows than this test scripted");
                 // This fake's host cannot lock in place either, so every
                 // window it reports leaves the recovery to the loop.
-                (est, VaultWindowSession { result, relocked: false })
+                (est, Some(VaultWindowSession { result, relocked: false }))
             }
 
             fn resettle_after_lost_session(
@@ -27401,9 +27800,10 @@ mod startup_shape_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            // Three since `no_door_assigns_the_pending_search_pin` joined
-            // the two that were here.
-            modules, 3,
+            // Four since `the_daemon_never_blocks_on_a_ui_process_pin`
+            // joined `no_door_assigns_the_pending_search_pin` and the two
+            // that were here before it.
+            modules, 4,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -27533,5 +27933,143 @@ mod no_door_assigns_the_pending_search_pin {
             "control: the declaration is being read as a write, so the pin can never be \
              satisfied by correct code"
         );
+    }
+}
+
+/// **Source pin: the daemon does not wait for the UI process, it polls it.**
+///
+/// The owner reported the same defect twice -- *"Ctrl Alt B should work with
+/// main window open"* -- and the reason it survived one whole task is that the
+/// fix and the regression are both invisible in behaviour a test in this crate
+/// can run. `run`'s loop is reachable from no test (recorded at
+/// [`search_asked_for`]), and the previous shape *looked* right: the daemon
+/// pumped this thread's message queue while it waited, so the tray icon stayed
+/// alive and nothing appeared to be blocked. What was blocked was the loop --
+/// the hotkey channel, the foreground watcher, the match engine and the tray's
+/// own event drain -- so a `CTRL+ALT+B` pressed with the vault window open sat
+/// queued until the window closed and then filled whatever was in front by
+/// then.
+///
+/// Three properties are held here, and every one of them is a line that would
+/// be added back by somebody making a reasonable-looking change:
+///
+/// 1. **Nothing in the production half waits on the UI child.** Not
+///    `wait_for_the_ui_process` (which is gone), not `MsgWaitForMultipleObjects`
+///    (its mechanism), not `child.wait()`.
+/// 2. **The loop polls it, exactly once per pass**, through
+///    `UiWindows::poll_the_vault_window`.
+/// 3. **The request for a window goes through the registry**, which is where
+///    one-window-per-surface is decided.
+///
+/// **Normalised first.** This is a CRLF checkout with no `.gitattributes`;
+/// scanning without trimming the carriage return makes every comparison miss
+/// and the pin vacuous. The controls below are what prove the scan read
+/// anything at all.
+#[cfg(test)]
+mod the_daemon_never_blocks_on_a_ui_process_pin {
+    /// Split in this crate's idiom: `include_str!` pulls this module in too,
+    /// so an unsplit needle would match its own mention here.
+    const OLD_BLOCKER: &str = concat!("wait_for_the_ui_", "process(");
+    const OLD_MECHANISM: &str = concat!("MsgWaitForMultiple", "Objects(");
+    const POLL: &str = concat!("poll_the_vault_", "window(");
+    const ASK: &str = concat!("ask_for_the_vault_", "window(");
+    const SPAWN: &str = concat!("spawn_the_vault_window_in_its_own_", "process(");
+    const CUT: &str = concat!("mod te", "sts {");
+
+    /// `main.rs` above its test module, CRLF normalised and `//` comments
+    /// stripped. Stripping comments can only make the scan MISS a call, never
+    /// invent one -- and the comments here name `wait_for_the_ui_process` on
+    /// purpose, to say why it is gone.
+    fn production() -> String {
+        let source = include_str!("main.rs");
+        let above = source.split_once(CUT).expect("main.rs must still have its test module").0;
+        above
+            .lines()
+            .map(|line| {
+                let flat = line.trim_end();
+                match flat.find("//") {
+                    Some(at) => flat[..at].trim_end(),
+                    None => flat,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_loop_polls_the_ui_child_and_waits_for_nothing() {
+        let source = production();
+
+        // Controls, first and unconditionally: the scan read this file, the
+        // comments really were cut, and the needles are spelled the way the
+        // production code spells them. Without these, every absence below
+        // would be satisfied by an empty string.
+        assert!(
+            source.len() > 100_000,
+            "control: the production slice is {} bytes, so the cut took the file with it",
+            source.len()
+        );
+        assert!(
+            !source.contains("\r"),
+            "control: a carriage return survived normalisation, so this scan is comparing \
+             against text that can never match"
+        );
+        assert!(
+            source.contains(SPAWN),
+            "control: the vault window is no longer spawned into a process of its own at all, \
+             so nothing here is about the daemon/UI split"
+        );
+
+        assert_eq!(
+            source.matches(POLL).count(),
+            2,
+            "expected the poll to be DECLARED once and CALLED once. Zero calls is a daemon \
+             that never notices its window closed -- a Lock that never gets home and, under \
+             the one-window rule, an Open Vault that never opens again. More than one call is \
+             two drains of a result that is delivered once"
+        );
+        assert_eq!(
+            source.matches(ASK).count(),
+            2,
+            "expected the registry to be asked for the window in exactly one place besides \
+             its own declaration. That call is where one-window-per-surface is decided, and a \
+             second door round it is a second vault window on the same vault"
+        );
+
+        for (needle, why) in [
+            (
+                OLD_BLOCKER,
+                "the daemon is waiting for the UI process again. Pumping the message queue \
+                 while it waits keeps the tray icon alive and does NOT make the loop iterate: \
+                 the hotkey, the foreground watcher and the match engine all stand still, and \
+                 CTRL+ALT+B pressed with the vault window open fills the wrong window when it \
+                 finally closes",
+            ),
+            (
+                OLD_MECHANISM,
+                "the daemon is blocking on a handle. Whatever it is waiting for, the loop \
+                 below it is not running while it does",
+            ),
+            (
+                concat!("child.w", "ait()"),
+                "the daemon is blocking on a child process outright",
+            ),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "{needle:?} is back in the daemon's production half: {why}"
+            );
+        }
+    }
+
+    /// Control on the scan's own machinery: a shape the pin MUST catch is fed
+    /// through the same `contains` the test above uses. Without this, an edit
+    /// that broke the normalisation would make every absence above pass
+    /// however the daemon was written.
+    #[test]
+    fn the_scan_recognises_a_blocking_wait_when_it_is_handed_one() {
+        let planted = format!("    let status = {OLD_BLOCKER}&mut child);");
+        assert!(planted.contains(OLD_BLOCKER));
+        assert!(!production().contains(&planted));
     }
 }
