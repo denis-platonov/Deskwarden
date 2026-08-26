@@ -124,6 +124,16 @@ running when it should not be -- which is `bw serve`, precisely what the
 direct-REST backend exists to remove. It would trade a Node subprocess for a
 Rust one and keep every problem that made the Node one worth removing.
 
+Its size is the second half of that argument, and it is small where it
+matters. 10,840 lines, of which 4,974 are production and the rest tests --
+but on disk the whole RustCrypto stack it pulls in (`rsa` and its fifteen-crate
+`num-bigint-dig`/`der`/`spki`/`pkcs1`/`pkcs8` tail, `argon2`, `pbkdf2`,
+`hkdf`, `cbc`, `aes`, `sha1`/`sha2`) costs **0.73 MB**: `deskwarden.exe` went
+15.33 MB at 0.10.0 to 16.07 MB with `rest` merged. What it removes is a
+**~118 MB** resident `bw.exe` plus its Node runtime. Isolating 0.73 MB into
+its own process would be paying a port and a lifecycle to save less than a
+megabyte of a binary that is already linked into both halves.
+
 **`password_gen` stays a library.** It is a pure function over `getrandom` and
 a 29 KB wordlist read on demand. It draws nothing; the generator *card*
 (`generate_prompt.rs`) is bare Win32 and costs ~1.8 MB with no GL context.
