@@ -1086,8 +1086,29 @@ impl RestClient {
 /// spelled the same way, for the reason argued in
 /// [`RestClient::archive_route`]. There is no `unwrap` on any of it: every
 /// step is an `Option` the server could have made empty.
+///
+/// # `data` is only an envelope when it could be one
+///
+/// This used to unwrap `data` whenever the key was present, and that made
+/// every real archive against NodeWarden fail. Its `cipherToResponse` puts a
+/// `data` field **on the cipher itself** -- `data: typeof passthrough.data
+/// === 'string' ? passthrough.data : null` -- so the echoed cipher carries
+/// `"data": null`, the unwrap stepped into that null, and the `_ => None`
+/// arm below turned a completed archive into
+/// [`RestError::ArchiveNotConfirmed`]. The item *was* archived; the client
+/// reported that it might not have been.
+///
+/// A list envelope's `data` is an array, and an object envelope's is an
+/// object. A `data` that is anything else -- null, a string, a number -- is a
+/// field of the cipher and not a wrapper around it, so the answer itself is
+/// what gets read. This is the same "tolerant about the envelope" rule as
+/// before; it just no longer mistakes a payload field for the envelope
+/// because they share a name.
 fn archived_state_of(answer: &serde_json::Value, id: &str) -> Option<bool> {
-    let echoed = answer.get("data").unwrap_or(answer);
+    let echoed = match answer.get("data") {
+        Some(inner @ (serde_json::Value::Array(_) | serde_json::Value::Object(_))) => inner,
+        _ => answer,
+    };
     let cipher = match echoed {
         serde_json::Value::Array(list) => {
             list.iter().find(|c| c.get("id").and_then(|v| v.as_str()) == Some(id))?
@@ -2489,6 +2510,67 @@ mod tests {
                 panic!("a valid archive answer was refused: {e:?} for {body}")
             });
         }
+    }
+
+    /// **The shape the real server actually sends**, which every earlier test
+    /// in this file missed and which `examples/rest_probe --write` found on
+    /// the first live run.
+    ///
+    /// NodeWarden's `cipherToResponse` puts `data` on the cipher itself --
+    /// `data: typeof passthrough.data === 'string' ? passthrough.data : null`
+    /// -- so a real archive answer is a bare cipher carrying `"data": null`.
+    /// [`archived_state_of`] unwrapped `data` whenever the key existed, so it
+    /// stepped into that null and reported
+    /// [`RestError::ArchiveNotConfirmed`] for an archive that had in fact
+    /// happened. The item moved; the client said it might not have.
+    ///
+    /// Both directions are driven, because an unarchive answer carries
+    /// `"archivedDate": null` **and** `"data": null` and a fix that special-
+    /// cased nulls one level up would pass the archive half and fail here.
+    #[test]
+    fn a_cipher_that_carries_its_own_data_field_is_not_mistaken_for_an_envelope() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        for (suffix, stamp) in [("archive", r#""2022-03-01T00:00:00Z""#), ("unarchive", "null")] {
+            let mut server = mockito::Server::new();
+            let (client, mut session) = granted(&mut server);
+            server
+                .mock("PUT", format!("/api/ciphers/{id}/{suffix}").as_str())
+                .with_body(format!(
+                    r#"{{"object":"cipherDetails","id":"{id}",
+                         "archivedDate":{stamp},"data":null}}"#
+                ))
+                .create();
+            let sent = if suffix == "archive" {
+                client.archive_cipher(&mut session, id)
+            } else {
+                client.unarchive_cipher(&mut session, id)
+            };
+            sent.unwrap_or_else(|e| {
+                panic!("a real {suffix} answer was refused as unconfirmed: {e:?}")
+            });
+        }
+    }
+
+    /// The tolerance the fix above must not have thrown away: a genuine list
+    /// envelope still has to be stepped into. Asserted from the other side --
+    /// the cipher inside the envelope is archived and the *outer* object is
+    /// not a cipher at all, so a reader that stopped unwrapping would find no
+    /// id and refuse.
+    #[test]
+    fn a_real_data_envelope_is_still_unwrapped() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut server = mockito::Server::new();
+        let (client, mut session) = granted(&mut server);
+        server
+            .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
+            .with_body(format!(
+                r#"{{"object":"list","data":{{"id":"{id}",
+                     "archivedDate":"2022-03-01T00:00:00Z"}}}}"#
+            ))
+            .create();
+        client
+            .archive_cipher(&mut session, id)
+            .expect("an object envelope around the cipher is still an envelope");
     }
 
     /// The id reaches the URL on these routes now, exactly as it does on
