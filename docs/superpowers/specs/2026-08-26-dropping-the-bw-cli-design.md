@@ -67,24 +67,34 @@ The direct-REST backend decrypts organisation ciphers; it has simply never
 been shown doing it against a real server, and on the owner's server it never
 can be. Left off this list it would look settled. See step 5.
 
-**Also, and this is a defect rather than a dependency:** on 2026-08-26 a
-direct-REST launch logged `bw serve ready after 0 retries (1666 vault items)`
-one second after `the direct-REST vault backend is live for this account`.
-`backend_policy::should_run` answers `false` for `DirectRest` unconditionally
-and this branch carries a `bw_serve_gate` test asserting no path reaches
-`bw serve` without the policy having answered -- so either an entry point is
-ungated or the sign-in path starts the subprocess before the settlement
-applies. **That has to be found before any of the below**, because it means a
-direct-REST user is paying for `bw serve` today without being told.
+**A defect this document originally listed here, and it was not one.** An
+earlier draft opened with an alarm: a direct-REST launch logged `bw serve
+ready after 0 retries (1666 vault items)` three seconds after announcing
+`served by DirectRest`, and this was read as an ungated entry point starting
+the subprocess behind `backend_policy`. It was named as the gating first step.
+
+**`bw.exe` was never running.** `bw_serve::wait_for_vault_ready` takes
+`&dyn VaultBackend` and is generic over the backend; only its *message* said
+`bw serve`, from when that was the only backend there was. On direct REST the
+probe called `RestBackend::list_items`, it succeeded on the first try, and the
+hardcoded string did the rest. The messages were corrected; nothing else was
+wrong.
+
+It is left in this document rather than deleted because the lesson is worth
+more than the paragraph: **a log line is evidence about what a function was
+told to print, not about what happened.** The `bw_serve_gate` pin was working
+the entire time, and half an hour went into doubting it on the strength of a
+string.
 
 ## The order
 
 Each step is useful on its own, and no step makes the app worse if the one
 after it never happens.
 
-1. **Find and close the `bw serve` start on the direct-REST path.** A bug fix,
-   and the smallest item here. Until it is done, "no background process keeps
-   running" -- which Preferences says on screen -- is not true.
+1. ~~Find and close the `bw serve` start on the direct-REST path.~~ **Done,
+   and it was a mislabelled log line rather than a started subprocess** -- see
+   above. "No background process keeps running", which Preferences says on
+   screen, was true all along.
 2. **Two-factor in `rest/api`.** The real work, and the gate on everything
    below it. Recognising the providers is already done; completing the
    challenge is not.
