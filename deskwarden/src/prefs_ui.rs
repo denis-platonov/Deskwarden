@@ -124,8 +124,44 @@ const RESET_BUTTON_WIDTH: f32 = 72.0;
 // ---------------------------------------------------------------------------
 
 const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
-const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
-     while the vault window is open; autofill is unaffected either way.";
+
+/// The description under [`BACKEND_LABEL`], in its two states.
+///
+/// # Why this row is a child of the one above it, and why it moved pages
+///
+/// It was a plain `toggle_row` on General, two pages away from the switch
+/// that decides whether the thing it governs exists at all. That was not
+/// merely untidy: [`crate::backend_policy::should_run`] answers `false` for
+/// `DirectRest` **whatever this setting says**, so with the direct backend
+/// selected this row was a live-looking switch that did nothing. A setting
+/// that silently means nothing is worse than two settings that are hard to
+/// tell apart, and the owner hit exactly that.
+///
+/// So the two are now one card, parent and child, on the page whose subtitle
+/// is already "The Bitwarden account this vault comes from". Ghosted, the row
+/// says what would make it available -- the same `child_toggle_row` contract
+/// the Hello-gated disk cache uses -- and hands back the stored value
+/// unchanged, so a click cannot set a preference about a subprocess this
+/// configuration has no use for.
+///
+/// # It reads the CHOSEN backend, not the running one
+///
+/// The gate is [`crate::backend_policy::choose`] over the account's server
+/// and the *live* value of the toggle above, which is what will apply on the
+/// next launch -- not what this process happens to be running. Reading the
+/// running backend would ghost the row a restart later than the switch that
+/// caused it, so the user would turn `bw` back on and find this row still
+/// grey with nothing on the page explaining the delay.
+fn backend_description(bw_selected: bool) -> &'static str {
+    if bw_selected {
+        "Faster, and uses about 110 MB while idle. Off runs it only while the vault window is \
+         open; autofill is unaffected either way."
+    } else {
+        "Only applies when the official Bitwarden CLI is doing the crypto -- the switch above. \
+         With Deskwarden talking to your server itself there is no background process to keep \
+         running, so there is nothing here to decide."
+    }
+}
 
 /// The direct-REST opt-out's label.
 ///
@@ -1692,17 +1728,18 @@ fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
 
 fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
-        state.settings.keep_backend_running = toggle_row(
-            ui,
-            BACKEND_LABEL,
-            BACKEND_DESCRIPTION,
-            state.settings.keep_backend_running,
-        );
-        row_separator(ui);
-        // Directly under the backend row because the two are one question
-        // seen from opposite ends: that one decides how much the app pays to
-        // keep `bw serve` warm, and this one is how it stops needing `bw
-        // serve` warm at all. The spec put it here rather than on
+        // **The backend row is not here any more.** It moved, whole, to
+        // `Section::SyncAndAccount`, where it is now a CHILD of the switch
+        // that decides whether `bw serve` is used at all -- see
+        // [`backend_description`] for why a live-looking switch two pages
+        // from the thing that makes it meaningless was a defect and not
+        // merely an untidiness. The same argument the breach row's move
+        // makes below, one subsystem later.
+        //
+        // Directly under it used to be the disk-cache row, and that pairing
+        // still holds: the backend row decided how much the app pays to keep
+        // `bw serve` warm, and this one is how it stops needing `bw serve`
+        // warm at all. The spec put it here rather than on
         // `Section::Security` -- which did not exist when it was written and
         // is still a placeholder -- and it is the one setting on this page
         // that changes what is written to the user's disk.
@@ -3263,13 +3300,39 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
 /// [`official_crypto_description`] is true rather than aspirational.
 fn draw_sync_and_account(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
-        let self_hosted = account_is_self_hosted((state.account_source)());
+        // Read once and shared by both rows: two calls could answer
+        // differently mid-frame -- the status arrives on a worker thread --
+        // and a parent that says "self-hosted" over a child that says
+        // otherwise is the disagreement this card was rebuilt to remove.
+        let status = (state.account_source)();
+        let self_hosted = account_is_self_hosted(status.clone());
         state.settings.use_official_bw_crypto = child_toggle_row(
             ui,
             OFFICIAL_CRYPTO_LABEL,
             official_crypto_description(self_hosted),
             state.settings.use_official_bw_crypto,
             self_hosted,
+        );
+        row_separator(ui);
+        // The child of the row above, and the reason it is on this page at
+        // all -- see [`backend_description`]. The gate is `backend_policy`'s
+        // own decision function over the LIVE value of that toggle, so the
+        // two rows agree within one frame rather than one restart, and there
+        // is no second copy here of what "which backend" means.
+        let server = match &status {
+            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
+            _ => None,
+        };
+        let bw_selected = matches!(
+            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
+            crate::backend_policy::VaultBackendChoice::BwServe
+        );
+        state.settings.keep_backend_running = child_toggle_row(
+            ui,
+            BACKEND_LABEL,
+            backend_description(bw_selected),
+            state.settings.keep_backend_running,
+            bw_selected,
         );
         row_separator(ui);
         // The placeholder's sentence, kept as a row rather than deleted: it is
@@ -4293,8 +4356,9 @@ mod tests {
         assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
 
         let first = frame(&ctx, &mut state, &[]);
-        // SECOND pill down: directly under the backend row.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        // FIRST pill down now: the backend row that used to sit above it
+        // moved to Sync & account.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
@@ -4427,14 +4491,21 @@ mod tests {
     #[test]
     fn general_paints_every_setting_that_actually_exists() {
         let painted = paint(Section::General);
-        assert!(painted.contains("Keep the Bitwarden backend running"));
+        // **Not the backend row.** It is a child of the crypto switch on
+        // `SyncAndAccount` now; `sync_and_account_paints_the_backend_pair`
+        // is where it is asserted, and the negative below is what would
+        // catch it being drawn on both pages at once.
+        assert!(
+            !painted.contains(BACKEND_LABEL),
+            "the backend row is painted on General as well as on its own page: two live \
+             switches for one setting is worse than the confusing pair this move fixed"
+        );
         assert!(painted.contains("Lock the vault when you step away"));
         assert!(painted.contains(AUTO_LOCK_ENABLED_DESCRIPTION), "got {:?}", painted.strings());
         assert!(painted.contains("Lock the vault after"));
         // The descriptions too: a row whose right-hand control squeezes the
         // text column to nothing still paints its title, so asserting only on
         // titles would not notice.
-        assert!(painted.contains(BACKEND_DESCRIPTION), "got {:?}", painted.strings());
         assert!(painted.contains(PROMPT_LABEL), "got {:?}", painted.strings());
         assert!(painted.contains(PROMPT_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -4454,20 +4525,21 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_seven_toggles_and_one_stepper() {
+    fn general_paints_exactly_six_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            7,
-            "seven 40x22 pills: `keep_backend_running`, `cache_vault_to_disk`, \
-             `prompt_on_match`, `fetch_icons`, \
+            6,
+            "six 40x22 pills: `cache_vault_to_disk`, `prompt_on_match`, `fetch_icons`, \
              `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
              The disk-cache pill is painted whether or not Windows Hello is available -- \
              ghosted and inert when it is not -- so this count does not depend on the machine \
              running the test. \
-             TWO settings are no longer here and both left for the same reason -- \
-             `check_breaches` moved to Breaches and `check_for_updates` moved to Updates, each \
-             to sit beside the button it does NOT govern; see `draw_breaches` and `draw_updates`"
+             THREE settings are no longer here and all three left for the same reason -- to \
+             sit beside the thing that governs them. `check_breaches` moved to Breaches, \
+             `check_for_updates` moved to Updates, and `keep_backend_running` moved to Sync & \
+             account, where it is a child of the switch that decides whether `bw serve` runs \
+             at all; see `draw_breaches`, `draw_updates` and `backend_description`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -4493,23 +4565,69 @@ mod tests {
         // The whole point of not shipping the other sections' switches: this
         // is what a switch is supposed to do, and it is asserted rather than
         // assumed.
+        //
+        // **On Sync & account, not General.** The row moved there as a child
+        // of the crypto switch; this test moved with it rather than being
+        // repointed at whatever now sits first on General, which would have
+        // left `keep_backend_running` with no click coverage at all while
+        // still passing.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        state.section = Section::SyncAndAccount;
+        // A signed-in account on Bitwarden's own cloud, so `choose` answers
+        // `BwServe` and the child is LIVE. Ghosted, `child_toggle_row` hands
+        // back the stored value and the click below would do nothing --
+        // which is asserted separately, and is a different claim from this
+        // one.
+        state.show_account_source(|| {
+            Some(AccountStatus::SignedIn { email: Some("me@example.com".to_string()), server: None })
+        });
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        // The first pill top-to-bottom is the backend row's; the prompt and
-        // auto-lock ones are below it. Clicking one must not move either
-        // other, which is what the neighbouring assertions here pin.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
+        // SECOND pill: the crypto switch is the parent and paints first.
+        // Clicking this one must not move it, which is what the neighbouring
+        // assertion here pins -- a child wired to its parent's field is
+        // exactly the mix-up this card's rebuild could have introduced.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
-        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
-        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+        assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
 
         frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
-        assert!(state.settings.auto_lock_enabled);
+        assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
+    }
+
+    /// The ghosted child is inert, not merely grey.
+    ///
+    /// `child_toggle_row`'s contract is that it hands back the stored value
+    /// unchanged when unavailable, and this is that contract at the pane for
+    /// this row: on a self-hosted account with `bw` crypto off, clicking
+    /// where the pill is must not write a preference about a subprocess this
+    /// configuration does not start.
+    #[test]
+    fn the_ghosted_backend_pill_does_not_change_the_setting_when_clicked() {
+        let ctx = styled_context();
+        let mut settings = Settings::default();
+        settings.use_official_bw_crypto = false;
+        let mut state = PrefsState::new(settings);
+        state.section = Section::SyncAndAccount;
+        state.show_account_source(|| {
+            Some(AccountStatus::SignedIn {
+                email: Some("me@example.com".to_string()),
+                server: Some("https://vault.example.com".to_string()),
+            })
+        });
+        assert!(state.settings.keep_backend_running, "the default");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.keep_backend_running,
+            "a ghosted row wrote its setting anyway, so the pill is live and only looks dead"
+        );
     }
 
     /// **The switch this whole change is about, driven at the pane.**
@@ -4525,9 +4643,9 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the default: a match prompts");
 
         let first = frame(&ctx, &mut state, &[]);
-        // THIRD pill down now: the encrypted disk cache's row sits between
-        // this one and the backend row.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
+        // SECOND pill down now: the encrypted disk cache is the only row
+        // above it since the backend row left this page.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
@@ -5005,12 +5123,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FOURTH pill down now: backend, disk cache, prompt, site icons,
-        // network logos, TOTP secret, auto-lock. The breach row that used to
-        // sit second is on the Breaches page, and the update row that used to
-        // sit last is on the Updates page.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // THIRD pill down now: disk cache, prompt, site icons, network
+        // logos, TOTP secret, auto-lock. Three rows have left this page --
+        // the breach row to Breaches, the update row to Updates, and the
+        // backend row to Sync & account, where it is a child of the switch
+        // that decides whether there is a backend to keep running at all.
+        let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5053,10 +5172,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FIFTH pill down: backend, disk cache, prompt, site icons, network
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FOURTH pill down: disk cache, prompt, site icons, network
         // logos, TOTP secret, auto-lock.
-        let pill = pills[4].center();
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5297,10 +5416,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // SIXTH pill down now: backend, disk cache, prompt, site icons,
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FIFTH pill down now: disk cache, prompt, site icons,
         // network logos, TOTP secret, auto-lock.
-        let pill = pills[5].center();
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5349,15 +5468,15 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[5].top() < pills[6].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 6);
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[5].top() > breach.bottom(),
+            pills[4].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[5].bottom() < auto_lock.top(),
+            pills[4].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -5426,7 +5545,7 @@ mod tests {
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[6].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[5].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
@@ -6076,8 +6195,14 @@ mod tests {
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            1,
-            "one 40x22 pill: `use_official_bw_crypto`, and nothing else"
+            2,
+            "two 40x22 pills: `use_official_bw_crypto` and its child \
+             `keep_backend_running`, and nothing else"
+        );
+        assert!(
+            painted.contains(BACKEND_LABEL),
+            "the backend row did not come with its parent; got {:?}",
+            painted.strings()
         );
         // The sentence the old placeholder carried is still on the page: it is
         // still the answer to "where do I sign in from".
@@ -6088,6 +6213,87 @@ mod tests {
                 .any(|t| t.contains("Signing in, syncing and locking")),
             "the page dropped what it used to say; got {:?}",
             painted.strings()
+        );
+    }
+
+    /// One frame of Sync & account for an account on `server`, with the
+    /// crypto toggle at `use_official`. Both inputs are needed together:
+    /// [`backend_description`]'s gate is `backend_policy::choose` over the
+    /// pair, and neither alone decides it.
+    fn paint_sync_for(server: Option<&'static str>, use_official: bool) -> Painted {
+        let ctx = styled_context();
+        let mut settings = Settings::default();
+        settings.use_official_bw_crypto = use_official;
+        let mut state = PrefsState::new(settings);
+        state.section = Section::SyncAndAccount;
+        state.show_account_source(match server {
+            Some("self") => || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: Some("https://vault.example.com".to_string()),
+                })
+            },
+            _ => || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: None,
+                })
+            },
+        });
+        frame(&ctx, &mut state, &[])
+    }
+
+    /// **The defect this card was rebuilt to remove.**
+    ///
+    /// `backend_policy::should_run` answers `false` for `DirectRest`
+    /// whatever `keep_backend_running` says, so on a self-hosted account with
+    /// the crypto toggle off this row governs nothing. It used to be a plain
+    /// `toggle_row` on General -- a live-looking switch, two pages from the
+    /// setting that made it meaningless, which is what the owner reported as
+    /// "kinda same settings and very confusing".
+    ///
+    /// Asserted through the ghosted copy rather than through a pixel: the
+    /// sentence is what tells the user *why* it is unavailable, and a ghost
+    /// with the enabled sentence under it would be the same defect wearing
+    /// grey.
+    #[test]
+    fn the_backend_row_goes_quiet_when_there_is_no_backend_to_keep_running() {
+        let direct = paint_sync_for(Some("self"), false);
+        assert!(
+            direct.contains(backend_description(false)),
+            "a self-hosted account with `bw` crypto off still offers to keep a subprocess it \
+             does not have; got {:?}",
+            direct.strings()
+        );
+
+        // Every other combination is `BwServe`, so the row is live and says
+        // what the trade is. All three are driven, because a gate that read
+        // only the toggle -- or only the server -- would pass one of them.
+        for (server, use_official, why) in [
+            (Some("self"), true, "self-hosted, `bw` crypto on"),
+            (None, false, "bitwarden.com, `bw` crypto off"),
+            (None, true, "bitwarden.com, `bw` crypto on"),
+        ] {
+            let painted = paint_sync_for(server, use_official);
+            assert!(
+                painted.contains(backend_description(true)),
+                "{why} is served by `bw serve`, so this row decides something and must say \
+                 so; got {:?}",
+                painted.strings()
+            );
+        }
+    }
+
+    /// The ghosted copy has to point at the switch above it, or a user who
+    /// finds the row grey has nowhere to go. The whole reason the two rows
+    /// are one card is that this sentence can name a neighbour instead of
+    /// sending the reader to another page.
+    #[test]
+    fn the_ghosted_backend_copy_names_the_switch_that_disabled_it() {
+        let text = backend_description(false);
+        assert!(
+            text.contains("the switch above"),
+            "the unavailable copy does not say what would make it available: {text:?}"
         );
     }
 
