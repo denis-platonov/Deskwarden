@@ -10,7 +10,12 @@ things can still change between minor versions.
 
 ## Unreleased
 
-## 0.11.0 - 2026-08-26
+## 0.11.1 - 2026-08-26
+
+0.11.0 was tagged and never released: its build failed on three tests, so no
+installer was ever published under that number. Everything below was meant for
+it and ships here instead.
+
 
 ### Self-hosted vaults can skip the Bitwarden CLI entirely
 
