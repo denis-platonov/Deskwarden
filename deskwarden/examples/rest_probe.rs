@@ -13,12 +13,25 @@
 //!
 //! # What it does, and what it will not do
 //!
-//! Prelogin, the password grant, one `GET /api/sync`, and the decrypt. **No
-//! write of any kind** -- no create, no update, no trash, no archive, no
-//! folder. The write path replaces a whole cipher and had a data-loss defect
-//! in it once; it is not something to try first against a live vault, and
-//! this probe is the read half that has to pass before that question is even
-//! asked.
+//! By default: prelogin, the password grant, one `GET /api/sync`, the
+//! decrypt, and a token refresh. **No write of any kind.** That is the read
+//! half, and it has to pass before the write question is even asked.
+//!
+//! With `--write` it then exercises the write path -- but only against **one
+//! item it created itself**, and it hard-deletes that item at the end. It
+//! never touches an item that was already in the vault. That restriction is
+//! the whole safety argument: `PUT /api/ciphers/{id}` replaces a whole
+//! cipher, and this path once stripped every modelled field it could not
+//! decrypt and overwrote `name` with an encryption of `""` -- data destroyed
+//! behind something that looked correct, fired by an ordinary autofill.
+//!
+//! The write pass drives [`deskwarden::vault_backend::VaultBackend`] rather
+//! than [`RestClient`] directly, because that trait is the surface the app
+//! actually calls and is where the integration defects were. Its centre is
+//! the `set_app_match` check: an item is created carrying a TOTP seed, notes
+//! and a URI, an app-match is written onto it, and every one of those values
+//! is read back and compared. That is the exact call that used to destroy
+//! them.
 //!
 //! # Nothing secret is printed, and nothing secret is on the command line
 //!
@@ -41,10 +54,14 @@
 //! ```
 //!
 //! It prompts for the master password on stdin. Add `--sample` for the
-//! truncated names.
+//! truncated names, and `--write` for the write pass described above.
 
+use deskwarden::app_match::AppMatch;
 use deskwarden::rest::api::{Device, RestClient};
+use deskwarden::rest::backend::RestBackend;
 use deskwarden::rest::sync::decrypt_vault;
+use deskwarden::vault_backend::VaultBackend;
+use deskwarden::vault_bridge::{NewItem, VaultItem};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use zeroize::Zeroizing;
@@ -52,9 +69,10 @@ use zeroize::Zeroizing;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sample = args.iter().any(|a| a == "--sample");
+    let write = args.iter().any(|a| a == "--write");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if positional.len() != 2 {
-        eprintln!("usage: rest_probe <server-url> <email> [--sample]");
+        eprintln!("usage: rest_probe <server-url> <email> [--sample] [--write]");
         eprintln!("  the master password is read from stdin, never from the command line");
         std::process::exit(2);
     }
@@ -221,8 +239,192 @@ fn main() {
         println!("  the grant returned no refresh token, so there is nothing to refresh");
     }
 
+    if !write {
+        println!();
+        println!("read-only probe finished. Nothing was written to the vault.");
+        return;
+    }
+
+    write_pass(RestBackend::new(client, authed));
+}
+
+/// The write half: one item, created here, exercised, and hard-deleted.
+///
+/// # The one rule
+///
+/// **Every call below addresses an item this function created.** No existing
+/// cipher is read back, written, trashed or archived. If any step fails, the
+/// function still tries to purge what it made -- an abandoned probe item in
+/// a real vault is litter, and litter named "Deskwarden write probe" in a
+/// list of 1,683 logins is the kind of thing that gets found months later
+/// and mistaken for a real credential.
+///
+/// # Why `set_app_match` is the centre and not one step among many
+///
+/// It is the call the app makes during ordinary autofill, and it is the one
+/// that used to destroy data: the mapper strips every modelled key out of the
+/// catch-all, a field that failed to decrypt is `None` in the model, so the
+/// write removed the key and the server forgot the value. A TOTP seed, a
+/// card number, an SSH private key. The item created here deliberately
+/// carries a TOTP seed, notes and a URI so that the check has something to
+/// lose.
+fn write_pass(backend: RestBackend) {
+    // A name nobody will mistake for a credential, with a nonce so two runs
+    // do not produce two identically-named items and so a leftover from a
+    // failed run is distinguishable from this one's.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("Deskwarden write probe {nonce} -- safe to delete");
+
+    // Values chosen so every one of them is a field the write path has to
+    // carry across a PUT. The TOTP seed is a real base32 string because a
+    // server may validate the shape; it is not a seed for anything.
+    const USERNAME: &str = "probe@example.invalid";
+    const PASSWORD: &str = "probe-password-do-not-use";
+    const TOTP: &str = "JBSWY3DPEHPK3PXP";
+    const URI: &str = "https://probe.example.invalid/login";
+    const NOTES: &str = "Created by rest_probe --write. If you are reading this, the probe did \
+                         not clean up after itself; the item is safe to delete.";
+
+    println!("== create ==");
+    let created = match backend.create_item(&NewItem::ImportedRecord {
+        name: name.clone(),
+        folder_id: None,
+        username: Some(USERNAME.to_string()),
+        password: Some(Zeroizing::new(PASSWORD.to_string())),
+        totp: Some(Zeroizing::new(TOTP.to_string())),
+        uri: Some(URI.to_string()),
+        notes: Some(Zeroizing::new(NOTES.to_string())),
+    }) {
+        Ok(item) => {
+            println!("  ok -- id {}", item.id);
+            item
+        }
+        Err(e) => {
+            println!("  FAILED: {e:?}");
+            println!("  nothing was created, so there is nothing to clean up");
+            std::process::exit(1);
+        }
+    };
+    let id = created.id.clone();
+
+    // From here on every exit goes through `finish`, which purges.
+    let mut failures: Vec<String> = Vec::new();
+
+    println!("== read back ==");
+    match backend.get_item(&id) {
+        Ok(item) => report_fields("  ", &item, &name, &mut failures),
+        Err(e) => failures.push(format!("get_item after create: {e:?}")),
+    }
+
+    // The check this whole pass exists for.
+    println!("== set_app_match (the call that used to destroy fields) ==");
+    let matched = AppMatch {
+        process: "rest_probe.exe".to_string(),
+        title: String::new(),
+        hosted: false,
+        path: String::new(),
+        args: String::new(),
+        sequence: String::new(),
+        // `Prompt` rather than `Auto`: this match is written to a real vault
+        // for a few seconds, and an `Auto` trigger on an exe name is the one
+        // value that could make a running Deskwarden type into something.
+        trigger: deskwarden::app_match::TriggerMode::Prompt,
+    };
+    match backend.set_app_match(&created, &matched) {
+        Ok(_) => println!("  ok"),
+        Err(e) => failures.push(format!("set_app_match: {e:?}")),
+    }
+    println!("== read back after set_app_match ==");
+    match backend.get_item(&id) {
+        Ok(item) => report_fields("  ", &item, &name, &mut failures),
+        Err(e) => failures.push(format!("get_item after set_app_match: {e:?}")),
+    }
+
+    println!("== archive, then unarchive ==");
+    // The per-id routes, which is what nodewarden actually has -- this crate
+    // used a bulk route until its handler source was read.
+    match backend.archive_item(&id).and_then(|()| backend.unarchive_item(&id)) {
+        Ok(()) => println!("  ok"),
+        Err(e) => failures.push(format!("archive/unarchive: {e:?}")),
+    }
+
+    println!("== trash, then restore ==");
+    match backend.delete_item(&id).and_then(|()| backend.restore_item(&id)) {
+        Ok(()) => println!("  ok"),
+        Err(e) => failures.push(format!("trash/restore: {e:?}")),
+    }
+    // A restore that reported success and did not happen is the failure worth
+    // catching here, so the item is read back rather than trusted.
+    println!("== read back after the round trip ==");
+    match backend.get_item(&id) {
+        Ok(item) => report_fields("  ", &item, &name, &mut failures),
+        Err(e) => failures.push(format!("get_item after restore: {e:?}")),
+    }
+
+    println!("== purge ==");
+    match backend.purge_item(&id) {
+        Ok(()) => println!("  ok -- the probe item is gone"),
+        Err(e) => {
+            println!("  FAILED: {e:?}");
+            println!("  LEFTOVER: item {id} is still in the vault and should be deleted by hand");
+            failures.push(format!("purge: {e:?}"));
+        }
+    }
+
     println!();
-    println!("read-only probe finished. Nothing was written to the vault.");
+    if failures.is_empty() {
+        println!("write pass finished with no failures.");
+    } else {
+        println!("write pass finished with {} FAILURES:", failures.len());
+        for failure in &failures {
+            println!("  {failure}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Compares every field the write path has to carry, and says which survived.
+///
+/// Reports rather than asserts, and pushes onto `failures` rather than
+/// panicking, because a panic here would skip the purge and leave the probe
+/// item in the vault.
+fn report_fields(indent: &str, item: &VaultItem, expected_name: &str, failures: &mut Vec<String>) {
+    const USERNAME: &str = "probe@example.invalid";
+    const PASSWORD: &str = "probe-password-do-not-use";
+    const TOTP: &str = "JBSWY3DPEHPK3PXP";
+
+    let mut check = |field: &str, got: Option<&str>, want: &str| {
+        let ok = got == Some(want);
+        println!("{indent}{field}: {}", if ok { "intact" } else { "LOST OR CHANGED" });
+        if !ok {
+            // The field NAME and whether it matched -- never the value, for
+            // the same reason nothing else here prints one.
+            failures.push(format!(
+                "{field} did not survive (present: {})",
+                got.is_some_and(|g| !g.is_empty())
+            ));
+        }
+    };
+
+    check("name", Some(item.name.as_str()), expected_name);
+    let login = item.login.as_ref();
+    check("username", login.and_then(|l| l.username.as_deref()), USERNAME);
+    check("password", login.and_then(|l| l.password.as_deref()).map(|p| p.as_str()), PASSWORD);
+    check("totp", login.and_then(|l| l.totp.as_deref()).map(|t| t.as_str()), TOTP);
+
+    let uris = login.map_or(0, |l| l.uris.len());
+    println!("{indent}uris: {uris}");
+    if uris == 0 {
+        failures.push("the website was lost".to_string());
+    }
+    let has_notes = item.notes.as_deref().is_some_and(|n| !n.is_empty());
+    println!("{indent}notes: {}", if has_notes { "intact" } else { "LOST" });
+    if !has_notes {
+        failures.push("the notes were lost".to_string());
+    }
 }
 
 /// The master password, from stdin.

@@ -38,3 +38,6 @@ Desktop.ini
 # what makes that true -- a logo committed here would be distributed by the
 # project whether or not any build draws it.
 docs/brands/
+
+# A master password lives here during REST probing. Never committed.
+.env
