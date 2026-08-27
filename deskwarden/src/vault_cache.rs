@@ -1081,6 +1081,35 @@ impl VaultCache {
         self.lock().items.clone()
     }
 
+    /// **Every item, as whatever the caller needs and nothing more.**
+    ///
+    /// The projection runs against a borrowed item under the lock and the
+    /// item is never cloned, so a caller that wants three strings gets three
+    /// strings -- not a deep copy of a vault it then throws most of away.
+    ///
+    /// # Why this exists rather than another `items()` caller
+    ///
+    /// [`Self::items`] hands out `VaultItem`s, and a `VaultItem` carries a
+    /// [`crate::vault_bridge::LoginData::password`]. Every caller of it in the
+    /// daemon therefore holds every password in the vault, in plaintext, for
+    /// as long as it holds the `Vec` -- and the account picker's caller held
+    /// one for the life of a card. The picker needs an id, a name, a username
+    /// and a list of URIs; it has never needed a secret.
+    ///
+    /// A combinator rather than a fixed `facts()` returning a fixed struct,
+    /// because the two callers want different shapes and a struct wide enough
+    /// for both is a struct with fields neither needs. It also keeps this
+    /// module out of the business of knowing what a palette or an icon domain
+    /// is: those live in `app` and `key_sequence`, and the closure is where
+    /// they stay.
+    ///
+    /// **The lock is held for the whole map.** The closure must not call back
+    /// into the cache -- that is a deadlock, not a slow path -- and every
+    /// caller here passes a pure function of one item.
+    pub fn project<T>(&self, of: impl Fn(&VaultItem) -> T) -> Vec<T> {
+        self.lock().items.iter().map(of).collect()
+    }
+
     /// One item, cloned; the rest of the snapshot is not.
     ///
     /// **This exists for the autofill path's latency, not for tidiness.**

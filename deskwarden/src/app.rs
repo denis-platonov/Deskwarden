@@ -2444,6 +2444,81 @@ pub fn set_icon_cache_dir(dir: std::path::PathBuf) {
 /// building this reads no secret. `crate::picker_prompt::palette_rows` is what
 /// decides which of them become rows, and carries the bound that keeps a
 /// fixed-size card honest.
+/// **Everything the account picker needs about one vault item, and nothing
+/// a secret fits in.**
+///
+/// The picker used to run on `&[VaultItem]`, which meant the daemon cloned
+/// the whole vault -- every password included -- to answer "which of these
+/// look like the window in front of the user". It has never needed one: the
+/// card shows a name and a username, matches on URIs, and offers a *palette*
+/// of which fields exist. What it types is fetched at the moment it types it.
+///
+/// **A type of its own rather than a `VaultItem` with the password blanked.**
+/// A type that could carry a secret and happens not to is one edit away from
+/// carrying one again, with nothing failing. This one has no field a password,
+/// TOTP seed, note or card number fits in, which is the guarantee made
+/// structural instead of remembered.
+///
+/// The derived values are computed once here, under the cache's lock, rather
+/// than by the card: `palette` is `key_sequence::field_palette`, which tests
+/// only whether a field is non-empty and returns `FieldRef`s -- names, never
+/// values -- and `icon_domain` is the host the favicon cache is keyed by.
+#[derive(Clone, Debug)]
+pub struct ItemFacts {
+    pub id: String,
+    pub name: String,
+    /// Shown in full on the card: two accounts for one app cannot be told
+    /// apart by a masked username, which is design 2a's decision applied
+    /// here.
+    pub username: String,
+    /// Every URI, for `app_candidates`' host matching.
+    pub uris: Vec<String>,
+    /// Which fields this item has, as names. No values -- see
+    /// [`crate::key_sequence::field_palette`].
+    pub palette: Vec<crate::key_sequence::FieldRef>,
+    pub has_sequence: bool,
+    /// The favicon cache's key, resolved once.
+    pub icon_domain: Option<String>,
+}
+
+/// A fixture's `VaultItem`s as the projection the picker actually runs on,
+/// through the production mapping rather than a second one written in a test
+/// module. Tests keep building `VaultItem`s because that is what a vault
+/// holds; what the picker sees is what [`ItemFacts::of`] makes of them.
+///
+/// At file scope rather than inside one `mod tests`, because three of them
+/// need it and a copy each is three mappings that can drift.
+#[cfg(test)]
+fn facts_of(items: &[VaultItem]) -> Vec<ItemFacts> {
+    items.iter().map(ItemFacts::of).collect()
+}
+
+impl ItemFacts {
+    /// The projection, as a plain function so it can be passed to
+    /// [`crate::vault_cache::VaultCache::project`] without a closure that
+    /// captures anything.
+    #[must_use]
+    pub fn of(item: &VaultItem) -> Self {
+        Self {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: item
+                .login
+                .as_ref()
+                .and_then(|l| l.username.clone())
+                .unwrap_or_default(),
+            uris: item
+                .login
+                .as_ref()
+                .map(|l| l.uris.iter().filter_map(|u| u.uri.clone()).collect())
+                .unwrap_or_default(),
+            palette: key_sequence::field_palette(item),
+            has_sequence: !sequence_for(item).is_empty(),
+            icon_domain: crate::favicon::icon_domain_for(item),
+        }
+    }
+}
+
 pub fn picker_palette(item: &VaultItem) -> crate::picker_prompt::Palette {
     crate::picker_prompt::Palette {
         fields: key_sequence::field_palette(item),
@@ -2500,9 +2575,9 @@ pub fn picker_choice(send: &crate::picker_prompt::Send) -> FillChoice {
 /// that offers nothing is a row that can only disappoint.
 pub fn picker_offers(
     candidates: &[crate::app_candidates::Candidate],
-    items: &[VaultItem],
+    facts: &[ItemFacts],
 ) -> Vec<crate::picker_prompt::Offer> {
-    picker_offers_in(ICON_CACHE_DIR.get().map(std::path::PathBuf::as_path), candidates, items)
+    picker_offers_in(ICON_CACHE_DIR.get().map(std::path::PathBuf::as_path), candidates, facts)
 }
 
 /// The same, with the icon cache directory passed in rather than read from the
@@ -2517,19 +2592,24 @@ pub fn picker_offers(
 pub fn picker_offers_in(
     dir: Option<&std::path::Path>,
     candidates: &[crate::app_candidates::Candidate],
-    items: &[VaultItem],
+    facts: &[ItemFacts],
 ) -> Vec<crate::picker_prompt::Offer> {
     candidates
         .iter()
         .filter_map(|candidate| {
-            let item = items.iter().find(|i| i.id == candidate.id)?;
+            let facts = facts.iter().find(|f| f.id == candidate.id)?;
             let icon = dir.and_then(|dir| {
-                crate::favicon::icon_domain_for(item)
-                    .and_then(|domain| crate::favicon::read_cached_icon(dir, &domain))
+                facts
+                    .icon_domain
+                    .as_deref()
+                    .and_then(|domain| crate::favicon::read_cached_icon(dir, domain))
             });
             Some(crate::picker_prompt::Offer {
                 candidate: candidate.clone(),
-                palette: picker_palette(item),
+                palette: crate::picker_prompt::Palette {
+                    fields: facts.palette.clone(),
+                    has_sequence: facts.has_sequence,
+                },
                 icon,
             })
         })
@@ -2611,9 +2691,12 @@ fn picker_offers_for(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
 ) -> PickerCard {
-    let items = cache.items();
-    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &items);
-    PickerCard { offers: picker_offers(&candidates, &items), corpus: picker_corpus(&items) }
+    // **`project`, not `items()`.** `items()` deep-clones the whole vault --
+    // every password included -- and the picker needs an id, a name, a
+    // username and some URIs. See `ItemFacts`.
+    let facts = cache.project(ItemFacts::of);
+    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &facts);
+    PickerCard { offers: picker_offers(&candidates, &facts), corpus: picker_corpus(&facts) }
 }
 
 /// What one press of the hotkey needs before a card can go up: the candidate
@@ -2639,21 +2722,20 @@ struct PickerCard {
 ///
 /// Items with no id are skipped for `app_candidates`' reason: there is nothing
 /// to fill from later, however well the row reads.
-fn picker_corpus(items: &[VaultItem]) -> Vec<crate::picker_prompt::Offer> {
-    items
+fn picker_corpus(facts: &[ItemFacts]) -> Vec<crate::picker_prompt::Offer> {
+    facts
         .iter()
-        .filter(|item| !item.id.is_empty())
-        .map(|item| crate::picker_prompt::Offer {
+        .filter(|facts| !facts.id.is_empty())
+        .map(|facts| crate::picker_prompt::Offer {
             candidate: crate::app_candidates::Candidate {
-                id: item.id.clone(),
-                name: item.name.clone(),
-                username: item
-                    .login
-                    .as_ref()
-                    .and_then(|l| l.username.clone())
-                    .unwrap_or_default(),
+                id: facts.id.clone(),
+                name: facts.name.clone(),
+                username: facts.username.clone(),
             },
-            palette: picker_palette(item),
+            palette: crate::picker_prompt::Palette {
+                fields: facts.palette.clone(),
+                has_sequence: facts.has_sequence,
+            },
             icon: None,
         })
         .collect()
@@ -9319,7 +9401,7 @@ mod picker_wiring_tests {
                 .expect("the fixture item is valid"),
         );
 
-        let corpus = picker_corpus(&items);
+        let corpus = picker_corpus(&facts_of(&items));
         assert_eq!(corpus.len(), 3, "an item with no id became a row nothing could fill from");
         // The whole surface of a row, spelled out: a password reaching it is
         // a password on a card, in a static, for as long as the user looks at
@@ -9358,7 +9440,7 @@ mod picker_wiring_tests {
                 .expect("the fixture item is valid")
             })
             .collect();
-        *SEARCH_CORPUS.lock().unwrap() = picker_corpus(&items);
+        *SEARCH_CORPUS.lock().unwrap() = picker_corpus(&facts_of(&items));
 
         let found = search_parked_vault("north", 5);
         assert_eq!(found.total, 2, "case-insensitive substring of the name is the rule");
@@ -9460,7 +9542,7 @@ mod picker_wiring_tests {
             name: "Slack".to_string(),
             username: "ada".to_string(),
         }];
-        assert!(picker_offers(&candidates, &[login("ada", "hunter2")]).is_empty());
+        assert!(picker_offers(&candidates, &facts_of(&[login("ada", "hunter2")])).is_empty());
     }
 
     /// The offer really is built when the item IS there -- the control on the
@@ -9474,7 +9556,7 @@ mod picker_wiring_tests {
             name: item.name.clone(),
             username: "ada".to_string(),
         }];
-        let offers = picker_offers(&candidates, std::slice::from_ref(&item));
+        let offers = picker_offers(&candidates, &facts_of(std::slice::from_ref(&item)));
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].palette, picker_palette(&item));
         assert!(
@@ -9538,7 +9620,7 @@ mod picker_wiring_tests {
             username: "ada".to_string(),
         }];
 
-        let offers = picker_offers_in(Some(&dir), &candidates, std::slice::from_ref(&item));
+        let offers = picker_offers_in(Some(&dir), &candidates, &facts_of(std::slice::from_ref(&item)));
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(offers.len(), 1);
@@ -9552,7 +9634,7 @@ mod picker_wiring_tests {
         // The control: the same call with no directory answers no icon, so the
         // assertion above is about the directory and not about a function that
         // always finds something.
-        let without = picker_offers_in(None, &candidates, std::slice::from_ref(&item));
+        let without = picker_offers_in(None, &candidates, &facts_of(std::slice::from_ref(&item)));
         assert!(without[0].icon.is_none());
     }
 
