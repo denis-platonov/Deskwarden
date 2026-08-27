@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 62] = [
+        const OPENS_NO_WINDOW: [&str; 63] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1521,6 +1521,12 @@ mod tests {
             // is the shell's, opened elsewhere; this module draws
             // nothing and calls no `run_ui_native`.
             "vault_export",
+            // Named kernel objects and a list of names: who is currently
+            // using the vault. Every OS call it makes is behind the
+            // `ServiceEnv` `fn` pointers, and not one of them draws. The
+            // service it counts attachments to is `bw serve` or the REST
+            // backend, neither of which has a window either.
+            "vault_service",
             // GDI painting helpers -- brushes, text and blits -- called from
             // an existing window's paint path. It creates no window of its
             // own; whatever HWND it draws into was already created by its

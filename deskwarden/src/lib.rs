@@ -146,6 +146,10 @@ pub mod vault_bridge;
 pub mod vault_cache;
 pub mod vault_disk_cache;
 pub mod vault_export;
+/// Who is currently using the vault, as a fact the kernel keeps rather than
+/// a count this app maintains -- so an app that crashes stops counting
+/// without having to say so.
+pub mod vault_service;
 pub mod vault_window;
 pub mod win32_draw;
 pub mod window_list;

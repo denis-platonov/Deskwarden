@@ -88,9 +88,9 @@ degrades into a wrong answer nobody acts on rather than a leak.
 
 `app_mutex` is the precedent and not a second scheme: it already answers "is Deskwarden running?" for the installer, per logon session, with `Local\` scoping. This asks the same question about a different subject.
 
-- [ ] **Step 1: Write the failing tests** — that two attachments both report attached, that dropping one leaves `anyone_attached` true and dropping both makes it false, and — **the test the design exists for** — that an attachment abandoned *without* being dropped (the crash case, simulated through the `ServiceEnv` seam) still reports detached.
+- [x] **Step 1: Write the failing tests** — that two attachments both report attached, that dropping one leaves `anyone_attached` true and dropping both makes it false, and — **the test the design exists for** — that an attachment abandoned *without* being dropped (the crash case, simulated through the `ServiceEnv` seam) still reports detached.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** implemented and committed. **Red-first was not honoured** -- tests and implementation were written together. What stood in for it: `asking_never_makes_a_name_live` failed on its first run and its own control is what caught the reason (it was asking about a cleanly released name, which is removed from the register, so `is_held` was never consulted).
 
 ---
 
