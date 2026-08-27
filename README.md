@@ -1,9 +1,9 @@
 # Deskwarden
 
-[![CI](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
-[![Release](https://github.com/denis-platonov/deskwarden/actions/workflows/release.yml/badge.svg)](https://github.com/denis-platonov/deskwarden/actions/workflows/release.yml)
-[![Latest release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver)](https://github.com/denis-platonov/deskwarden/releases/latest)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-orange?style=flat-square)](LICENSE)
+[![release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/deskwarden/releases/latest)
+[![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
 
 
 > **Unofficial and unaffiliated with Bitwarden.** This is an independent,
