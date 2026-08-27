@@ -2463,7 +2463,7 @@ pub fn set_icon_cache_dir(dir: std::path::PathBuf) {
 /// than by the card: `palette` is `key_sequence::field_palette`, which tests
 /// only whether a field is non-empty and returns `FieldRef`s -- names, never
 /// values -- and `icon_domain` is the host the favicon cache is keyed by.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ItemFacts {
     pub id: String,
     pub name: String,

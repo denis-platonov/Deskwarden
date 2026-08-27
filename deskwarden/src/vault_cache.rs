@@ -1180,6 +1180,34 @@ impl VaultCache {
         snapshot.era = snapshot.era.wrapping_add(1);
         drop(snapshot);
         self.lock_disk().loaded_from_disk_at = None;
+        // **And the file this process could read items out of.**
+        //
+        // The encrypted copy is meant to survive a lock -- it exists so the
+        // next launch does not pay a cold start -- but the CONTENT KEY must
+        // not. Version 2 lets the daemon open one item at a time out of that
+        // file; a lock that emptied the snapshot and left the key in place
+        // would be a vault the daemon could refill without the user, which
+        // is the appearance of locking rather than locking. Hello is asked
+        // again on the next unlock.
+        if let Some(disk) = self.disk.as_ref() {
+            disk.close();
+        }
+    }
+
+    /// One item out of the encrypted disk copy, without disturbing the
+    /// snapshot.
+    ///
+    /// **The point of the version 2 file**, seen from this side: a caller
+    /// that needs one secret -- a fill, about to type a password -- gets that
+    /// one, rather than the daemon holding every password so that any of them
+    /// is available.
+    ///
+    /// `None` when there is no disk cache, when it is switched off, when the
+    /// file was never opened this session, or when the id is not in it. Every
+    /// one of those means the same thing to a caller: ask the backend.
+    #[must_use]
+    pub fn item_from_disk(&self, id: &str) -> Option<VaultItem> {
+        self.disk.as_ref()?.open_item(id)
     }
 
     pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
@@ -1999,7 +2027,39 @@ impl VaultCache {
             }
             (snapshot.items.clone(), snapshot.folders.clone())
         };
-        if let Err(e) = disk.write(&fingerprint, &items, &folders) {
+        // **The facts section, built here because this is where the items
+        // are.** `vault_disk_cache` takes it as opaque bytes and has no
+        // opinion about what a projection contains -- see its `write`. What
+        // it buys is that a reader wanting names, usernames and websites
+        // never opens a single sealed secret.
+        //
+        // `crate::app::ItemFacts` is referenced from here rather than moved
+        // somewhere neutral, and that is a deliberate small debt: the type is
+        // a decision about what the account picker needs, its constructor
+        // reaches `key_sequence`, `favicon` and `app`'s own sequence lookup,
+        // and splitting it across modules to satisfy a layering diagram would
+        // scatter one decision over three files.
+        // `{ items, folders }`, and the folders are in here rather than
+        // beside the secrets on purpose: a folder is a name and an id, so a
+        // reader that wants the vault's shape should not have to open a
+        // single sealed item to get it.
+        #[derive(serde::Serialize)]
+        struct Facts<'a> {
+            items: Vec<crate::app::ItemFacts>,
+            folders: &'a [Folder],
+        }
+        let facts = Facts {
+            items: items.iter().map(crate::app::ItemFacts::of).collect(),
+            folders: &folders,
+        };
+        let facts_bytes = match serde_json::to_vec(&facts) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("could not serialize the vault cache's facts section: {e}");
+                return;
+            }
+        };
+        if let Err(e) = disk.write(&fingerprint, &facts_bytes, &items, &folders) {
             log::warn!("could not write the encrypted vault cache: {e}");
         }
     }
@@ -5392,6 +5452,69 @@ mod tests {
     /// **The one test down here that needs a server**, because a mutation is
     /// by definition a write the backend accepted first. Seeding still costs
     /// no round-trip; only the `DELETE` does.
+    /// **One item, out of the file, without the snapshot.**
+    ///
+    /// The version 2 file's whole purpose from this side: a caller that
+    /// needs one password gets that one. Asserted against a cache whose
+    /// snapshot has been cleared, so it cannot be answering from memory.
+    #[test]
+    fn one_item_comes_out_of_the_disk_file_after_the_snapshot_is_cleared() {
+        let dir = temp_dir_for("one-item-from-disk");
+        let cache = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        seed(&cache);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(
+            matches!(reader.load_from_disk(), DiskCacheLoad::Loaded { .. }),
+            "control: the file did not load, so nothing below is being tested"
+        );
+        reader.clear();
+        assert!(!reader.is_populated(), "control: the snapshot still holds the vault");
+
+        // After `clear` the content key is gone, so this is `None` -- which
+        // is the security property, not a limitation. See `clear`.
+        assert!(
+            reader.item_from_disk("1").is_none(),
+            "an item opened out of the file after the vault was locked, so locking leaves \
+             the daemon holding the key to it"
+        );
+    }
+
+    /// The same read, before the lock: it works, and it does not disturb the
+    /// snapshot. Without this the test above would pass on a cache that could
+    /// never open an item at all.
+    #[test]
+    fn one_item_comes_out_of_the_disk_file_while_it_is_open() {
+        let dir = temp_dir_for("one-item-from-open-file");
+        let cache = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        seed(&cache);
+
+        let reader = VaultCache::with_disk_cache(
+            crate::test_vault::unreachable_bridge(),
+            cache_with_key(&dir),
+            "fp".to_string(),
+            true,
+        );
+        assert!(matches!(reader.load_from_disk(), DiskCacheLoad::Loaded { .. }));
+        let opened = reader.item_from_disk("1").expect("the item, out of the file");
+        assert_eq!(opened.id, "1");
+    }
+
     #[test]
     fn a_successful_mutation_rewrites_the_file() {
         let dir = temp_dir_for("mutation-rewrites");

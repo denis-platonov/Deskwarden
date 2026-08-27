@@ -143,7 +143,13 @@ pub fn key_named(token: &str) -> Option<&'static KeyDef> {
 }
 
 /// The value a `{...}` field placeholder refers to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because it travels in the encrypted vault
+/// cache's facts section: a projection says WHICH fields an item has so the
+/// picker can offer them without opening a secret. It names fields and
+/// never carries one -- `Custom` holds a field's name, which is what the
+/// user typed on the item, not its value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldRef {
     Username,
     Password,

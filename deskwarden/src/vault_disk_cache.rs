@@ -57,7 +57,14 @@ const MAGIC: &[u8; 4] = b"DWVC";
 /// Bumped only for an incompatible layout change. An unknown version is
 /// rejected and the file deleted -- there is nothing to migrate, the vault
 /// is regenerable from the backend in seconds.
-pub const FORMAT_VERSION: u32 = 1;
+/// **2 since the body was split into a facts section and per-item secrets.**
+///
+/// A version 1 file is refused by [`check_header`] as
+/// [`RejectReason::UnknownVersion`] -- unread, and with no Hello prompt,
+/// because the header is plaintext inside the DPAPI envelope. It is deleted
+/// rather than migrated: this is a rebuildable cache with a seven-day life,
+/// and a migration is code that runs once and is wrong forever after.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// How long a file stays loadable.
 ///
@@ -83,6 +90,10 @@ pub const EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 const FUTURE_TOLERANCE_SECS: u64 = 5 * 60;
 
 const NONCE_LEN: usize = 12;
+/// AES-GCM's authentication tag, appended to every sealed blob. Named
+/// because `sealed_len` computes offsets from it and a wrong number there is
+/// an index that points into the middle of a neighbour.
+const TAG_LEN: usize = 16;
 const CONTENT_KEY_LEN: usize = 32;
 
 pub(crate) const FILE_NAME: &str = "vault-cache.bin";
@@ -125,6 +136,14 @@ pub struct CacheHeader {
     /// vault it is.
     pub account_fingerprint: String,
     pub item_count: usize,
+    /// Length of the sealed facts section, which is the first blob in the
+    /// body. Carried here rather than inferred so a body truncated between
+    /// the facts and the first item is a refusal rather than a slice that
+    /// happens to parse.
+    pub facts_len: u32,
+    /// Where each item's sealed bytes are. Plaintext, and deliberately so --
+    /// see [`ItemSlot`].
+    pub index: Vec<ItemSlot>,
 }
 
 /// What actually gets encrypted: the existing snapshot types, so the
@@ -215,12 +234,51 @@ pub fn check_header(
 /// Takes the Hello-derived key as a parameter, and there is deliberately no
 /// other way to build a file. If a path ever appears that writes one without
 /// a Hello seal, the setting's description becomes a false security claim.
+/// # The header is sealed over, so it is built here rather than passed whole
+///
+/// `facts_len` and `index` are outputs of the sealing, not inputs to it: the
+/// caller cannot know an offset before the blobs exist. So this takes the
+/// header the caller CAN fill in, seals the body, and writes the two
+/// discovered fields back before serialising it -- which matters because the
+/// header is the AAD, so it has to be final before anything is bound to it.
 pub(crate) fn encode_file(
     hello_key: &[u8; 32],
     header: &CacheHeader,
+    facts: &[u8],
     snapshot: &DiskSnapshot,
 ) -> Result<Vec<u8>, String> {
-    let header_bytes = serde_json::to_vec(header)
+    // Sealed once with a placeholder header to learn the sizes, then again
+    // with the real one. Two passes rather than a guess: the facts length
+    // depends on the ciphertext, the ciphertext depends on the AAD, and the
+    // AAD is the header that carries the length.
+    let mut header = header.clone();
+    let items: Vec<(String, Vec<u8>)> = snapshot
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::to_vec(item)
+                .map(|bytes| (item.id.clone(), bytes))
+                .map_err(|e| format!("could not serialize a cached item: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // The offsets are arithmetic, not a trial run: a GCM blob here is
+    // `nonce ‖ ciphertext ‖ tag`, and its length depends only on the
+    // plaintext's -- not on the key, the nonce or the AAD. So the index can
+    // be computed before anything is sealed, which is what lets the header
+    // be final before it becomes the AAD that binds the body to it.
+    header.facts_len = sealed_len(facts.len())?;
+    let mut at = header.facts_len;
+    header.index = Vec::with_capacity(items.len());
+    for (id, plaintext) in &items {
+        let len = sealed_len(plaintext.len())?;
+        header.index.push(ItemSlot { id: id.clone(), at, len });
+        at = at
+            .checked_add(len)
+            .ok_or_else(|| "the vault cache body outgrew a 32-bit offset".to_string())?;
+    }
+
+    let header_bytes = serde_json::to_vec(&header)
         .map_err(|e| format!("could not serialize the cache header: {e}"))?;
 
     // A fresh random content key per write. Reusing one across writes would
@@ -230,13 +288,12 @@ pub(crate) fn encode_file(
     getrandom::getrandom(content_key.as_mut_slice())
         .map_err(|e| format!("no randomness for the content key: {e}"))?;
 
-    let plaintext = Zeroizing::new(
-        serde_json::to_vec(snapshot)
-            .map_err(|e| format!("could not serialize the vault snapshot: {e}"))?,
-    );
 
     let sealed_key = seal(hello_key, content_key.as_slice(), None)?;
-    let body = seal(&content_key, &plaintext, Some(&header_bytes))?;
+    let (body, sealed_index) = seal_body(&content_key, &header_bytes, facts, &items)?;
+    // The arithmetic above and the sealing here must agree, or every offset
+    // in the file is a lie that only shows up as a refusal months later.
+    debug_assert_eq!(sealed_index, header.index, "the computed index disagrees with the sealed body");
 
     let mut out =
         Vec::with_capacity(MAGIC.len() + 4 + header_bytes.len() + 4 + sealed_key.len() + body.len());
@@ -301,18 +358,63 @@ pub(crate) fn parse_header(bytes: &[u8]) -> Result<(CacheHeader, Parsed), String
     ))
 }
 
-/// Unseals the content key under the Hello-derived key, then decrypts the
-/// snapshot with the header as AAD.
-pub(crate) fn decode_body(hello_key: &[u8; 32], parsed: &Parsed) -> Result<DiskSnapshot, String> {
+/// Unseals the content key under the Hello-derived key.
+///
+/// Split out because version 2 has three readers of it -- the whole-snapshot
+/// load below, the facts section, and one item at a time -- and each of them
+/// needing its own copy of this unwrap is how the three come to disagree.
+pub(crate) fn content_key_of(
+    hello_key: &[u8; 32],
+    parsed: &Parsed,
+) -> Result<Zeroizing<[u8; CONTENT_KEY_LEN]>, String> {
     let content_key = unseal(hello_key, &parsed.sealed_key, None)?;
     let content_key: [u8; CONTENT_KEY_LEN] = content_key
         .as_slice()
         .try_into()
         .map_err(|_| "the sealed content key is the wrong size".to_string())?;
-    let content_key = Zeroizing::new(content_key);
-    let plaintext = unseal(&content_key, &parsed.body, Some(&parsed.header_bytes))?;
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("the cached vault snapshot is malformed: {e}"))
+    Ok(Zeroizing::new(content_key))
+}
+
+/// The whole snapshot, given a content key already unwrapped.
+///
+/// Split from [`decode_body_from_hello`] because `load` now unwraps the key
+/// in its shared preamble and would otherwise unwrap it twice -- which is
+/// not merely wasteful: two unwraps are two places that can disagree about
+/// what a bad key means.
+pub(crate) fn decode_body_with(
+    content_key: &[u8; CONTENT_KEY_LEN],
+    header: &CacheHeader,
+    parsed: &Parsed,
+) -> Result<DiskSnapshot, String> {
+    let mut items = Vec::with_capacity(header.index.len());
+    for slot in &header.index {
+        let plaintext = open_item_at(&content_key, &parsed.header_bytes, &parsed.body, slot)?;
+        items.push(
+            serde_json::from_slice(&plaintext)
+                .map_err(|e| format!("a cached item is malformed: {e}"))?,
+        );
+    }
+    // Folders ride in the facts section: they carry no secret, and a reader
+    // that wants names wants theirs too.
+    let facts = open_facts(&content_key, &parsed.header_bytes, &parsed.body, header.facts_len)?;
+    let folders = folders_from_facts(&facts)?;
+    Ok(DiskSnapshot { items, folders })
+}
+
+/// The folders out of a facts section, without knowing what else is in it.
+///
+/// The facts blob is the caller's shape -- this module seals it and does not
+/// define it -- so this reads the one field it is contracted to contain and
+/// ignores the rest. A facts section that has grown a field is not an error
+/// here; a facts section with no folders is.
+fn folders_from_facts(facts: &[u8]) -> Result<Vec<Folder>, String> {
+    #[derive(Deserialize)]
+    struct HasFolders {
+        folders: Vec<Folder>,
+    }
+    serde_json::from_slice::<HasFolders>(facts)
+        .map(|f| f.folders)
+        .map_err(|e| format!("the cached facts section is malformed: {e}"))
 }
 
 /// AES-256-GCM: `nonce ‖ ciphertext`, optionally binding `aad`.
@@ -337,6 +439,127 @@ fn seal(key: &[u8; 32], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>,
     let mut blob = nonce.to_vec();
     blob.extend_from_slice(&ciphertext);
     Ok(blob)
+}
+
+/// How long a sealed blob is, from its plaintext's length.
+///
+/// `nonce ‖ ciphertext ‖ tag`, and GCM's ciphertext is the same length as
+/// its plaintext -- so this depends on nothing but the number below, which
+/// is what lets the index be computed before anything is sealed.
+fn sealed_len(plaintext_len: usize) -> Result<u32, String> {
+    u32::try_from(NONCE_LEN + plaintext_len + TAG_LEN)
+        .map_err(|_| "a cached item outgrew a 32-bit length".to_string())
+}
+
+/// Where one item's sealed bytes are in the body, and which item they are.
+///
+/// **Plaintext, in the header, on purpose.** Encrypting the index would mean
+/// opening the facts section to discover where an item is, which is the
+/// whole cost this format exists to avoid. What it exposes is a list of
+/// vault ids -- GUIDs the server assigned, which already travel in URLs --
+/// and a count the header published anyway.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ItemSlot {
+    pub id: String,
+    /// Byte offset from the start of the body.
+    pub at: u32,
+    pub len: u32,
+}
+
+/// The body of a version 2 file: the facts section, then one sealed blob per
+/// item, with the header's index saying where each one is.
+///
+/// `facts` is opaque to this module. **It does not know what a projection**
+/// **is**, and should not: `app::ItemFacts` is a decision about what the
+/// picker needs, and a sealing layer that had opinions about it would be two
+/// modules that must agree. The caller serialises whatever it wants
+/// available without a secret; this seals it.
+pub fn seal_body(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    facts: &[u8],
+    items: &[(String, Vec<u8>)],
+) -> Result<(Vec<u8>, Vec<ItemSlot>), String> {
+    let mut body = seal(content_key, facts, Some(header_bytes))?;
+    let mut index = Vec::with_capacity(items.len());
+    for (id, plaintext) in items {
+        let sealed = seal(content_key, plaintext, Some(&item_aad(header_bytes, id)))?;
+        let at = u32::try_from(body.len())
+            .map_err(|_| "the vault cache body outgrew a 32-bit offset".to_string())?;
+        let len = u32::try_from(sealed.len())
+            .map_err(|_| "one cached item outgrew a 32-bit length".to_string())?;
+        body.extend_from_slice(&sealed);
+        index.push(ItemSlot { id: id.clone(), at, len });
+    }
+    Ok((body, index))
+}
+
+/// The facts section, which is the first blob in the body.
+///
+/// `facts_len` comes from the header rather than being inferred, so a body
+/// truncated between the facts and the first item is a refusal rather than a
+/// slice that happens to parse.
+pub fn open_facts(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    body: &[u8],
+    facts_len: u32,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let end = facts_len as usize;
+    let slice = body.get(..end).ok_or_else(|| "the facts section is truncated".to_string())?;
+    unseal(content_key, slice, Some(header_bytes))
+}
+
+/// One item, by its slot.
+///
+/// Every failure is the same answer -- refuse -- but they are distinct
+/// strings because the only place this can go wrong quietly is a slot that
+/// points somewhere plausible.
+pub fn open_item_at(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    body: &[u8],
+    slot: &ItemSlot,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let at = slot.at as usize;
+    let end = at.checked_add(slot.len as usize).ok_or_else(|| {
+        "a cached item's slot runs past the end of addressable memory".to_string()
+    })?;
+    let slice = body
+        .get(at..end)
+        .ok_or_else(|| format!("the slot for {} runs past the body", slot.id))?;
+    unseal(content_key, slice, Some(&item_aad(header_bytes, &slot.id)))
+}
+
+/// What binds one item's ciphertext to one item, in one file.
+///
+/// # Why an item needs more than the header
+///
+/// Version 1 sealed the whole snapshot as a single message, so "which item
+/// is this?" could not be asked: there was one. Version 2 seals each item
+/// separately -- which is what lets the daemon open one without the other
+/// 1,665 -- and that makes the entries *fungible* unless something says
+/// otherwise.
+///
+/// GCM authenticates that a message was sealed under a key. It does not
+/// authenticate where the message was stored. Without the id here, anyone
+/// who can write this file can move the entry for a bank into the slot for a
+/// site they control; the daemon would open it, find a valid item, and type
+/// that password into the site it was asked about. Nothing downstream could
+/// notice, because everything downstream is working correctly.
+///
+/// # Length-prefixed, not concatenated
+///
+/// `header ‖ id` alone would let `("ab", "c")` and `("a", "bc")` produce the
+/// same binding. Vault ids are server-assigned GUIDs and a separator would
+/// be enough for them today -- but the prefix costs four bytes and removes
+/// the need to keep being right about what an id may contain.
+fn item_aad(header: &[u8], id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(header.len() + 4 + id.len());
+    aad.extend_from_slice(header);
+    aad.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    aad.extend_from_slice(id.as_bytes());
+    aad
 }
 
 fn unseal(key: &[u8; 32], blob: &[u8], aad: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -407,6 +630,73 @@ impl DiskCacheEnv {
 /// because they call for different actions. In particular [`Self::Unavailable`]
 /// must **leave the file alone** while [`Self::Rejected`] and [`Self::Corrupt`]
 /// must delete it.
+impl DiskFactsLoad {
+    /// The same refusal, as [`DiskCacheLoad`].
+    ///
+    /// Only the refusals convert: `Loaded` carries facts, which a
+    /// whole-snapshot caller has no use for, and a conversion that invented
+    /// an empty vault for it would be a silent wrong answer. It is
+    /// unreachable because the shared preamble never produces one.
+    fn into_load(self) -> DiskCacheLoad {
+        match self {
+            Self::Absent => DiskCacheLoad::Absent,
+            Self::Rejected(reason) => DiskCacheLoad::Rejected(reason),
+            Self::Unavailable(e) => DiskCacheLoad::Unavailable(e),
+            Self::Corrupt(e) => DiskCacheLoad::Corrupt(e),
+            Self::Loaded { .. } => DiskCacheLoad::Corrupt(
+                "the shared preamble returned facts to a whole-snapshot caller".to_string(),
+            ),
+        }
+    }
+}
+
+/// What [`DiskCache::load_facts`] found.
+///
+/// Deliberately the same refusal vocabulary as [`DiskCacheLoad`] rather than
+/// a reduced one: the two entry points share every step up to the
+/// decryption, so a reason one can give and the other cannot would mean they
+/// had drifted.
+pub enum DiskFactsLoad {
+    Loaded {
+        /// The caller's own shape, opaque here. See [`DiskCache::write`].
+        facts: Zeroizing<Vec<u8>>,
+        written_at: SystemTime,
+    },
+    Absent,
+    Rejected(RejectReason),
+    Unavailable(String),
+    Corrupt(String),
+}
+
+/// Hand-written, and `debug_leak_guard` is why: a derived one prints
+/// `facts`, which is a whole vault's worth of names and usernames at best
+/// and whatever the caller put there at worst.
+///
+/// **This module cannot know the facts section is secret-free.** It takes
+/// opaque bytes on purpose -- that is the layering that keeps it from having
+/// opinions about what a projection contains -- and the price of not knowing
+/// is that it must not print them. The length is what a reader debugging a
+/// load actually needs.
+///
+/// The comment on this type used to *claim* the length-only behaviour while
+/// the type carried a `#[derive(Debug)]`. The guard caught it; the claim is
+/// now the implementation.
+impl std::fmt::Debug for DiskFactsLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loaded { facts, written_at } => f
+                .debug_struct("Loaded")
+                .field("facts", &format_args!("<{} bytes>", facts.len()))
+                .field("written_at", written_at)
+                .finish(),
+            Self::Absent => f.write_str("Absent"),
+            Self::Rejected(reason) => f.debug_tuple("Rejected").field(reason).finish(),
+            Self::Unavailable(e) => f.debug_tuple("Unavailable").field(e).finish(),
+            Self::Corrupt(e) => f.debug_tuple("Corrupt").field(e).finish(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DiskCacheLoad {
     Loaded {
@@ -464,6 +754,31 @@ pub struct DiskCache {
     paths: Mutex<Paths>,
     key: Mutex<KeyState>,
     env: DiskCacheEnv,
+    /// The file this process has open, if [`Self::load_facts`] opened one.
+    ///
+    /// **Held so that opening one item costs neither a read nor a prompt.**
+    /// The whole point of version 2 is that a fill can reach one secret; if
+    /// each reach re-read the file and re-derived the content key, it would
+    /// pop Windows Hello per password, which is unusable.
+    ///
+    /// What is retained is ciphertext plus one key. The key is the thing
+    /// that matters, and it is dropped by [`Self::close`] -- which the same
+    /// lock that empties the in-memory snapshot calls, so the daemon does
+    /// not hold the means to open the vault after the vault is locked.
+    open: Mutex<Option<OpenFile>>,
+}
+
+/// A cache file this process can read items out of.
+///
+/// `body` is ciphertext and `header_bytes` is the AAD it is bound to; both
+/// are kept verbatim because re-serialising the header would produce
+/// different bytes for the same values and every open would then fail
+/// authentication for a reason nobody would guess.
+struct OpenFile {
+    header: CacheHeader,
+    header_bytes: Vec<u8>,
+    body: Vec<u8>,
+    content_key: Zeroizing<[u8; CONTENT_KEY_LEN]>,
 }
 
 struct Paths {
@@ -515,6 +830,7 @@ impl DiskCache {
         Self {
             paths: Mutex::new(Paths::in_dir(dir)),
             key: Mutex::new(KeyState::default()),
+            open: Mutex::new(None),
             env,
         }
     }
@@ -621,72 +937,181 @@ impl DiskCache {
     /// wrong-version file is deleted without the user being asked for a
     /// biometric on behalf of a file about to be thrown away.
     pub fn load(&self, fingerprint: &str) -> DiskCacheLoad {
-        let (file, tmp) = {
-            let paths = self.lock_paths();
-            (paths.file.clone(), paths.tmp.clone())
-        };
-        // A .tmp left by a crash mid-write is meaningless and must not be
-        // mistaken for anything; clear it whenever we touch the directory.
-        let _ = std::fs::remove_file(&tmp);
-
-        let wrapped = match std::fs::read(&file) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DiskCacheLoad::Absent,
-            Err(e) => {
-                log::warn!("could not read the vault cache file: {e}");
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
-        };
-
-        let inner = match (self.env.unwrap)(&wrapped) {
-            Ok(bytes) => Zeroizing::new(bytes),
-            Err(e) => {
-                log::warn!("{e}; deleting it");
-                self.delete_quietly(&file, RejectReason::Malformed);
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
-        };
-
-        let (header, parsed) = match parse_header(&inner) {
+        let file = self.lock_paths().file.clone();
+        // The same preamble `load_facts` runs, so the two cannot drift in
+        // which failures delete the file or when Hello is asked.
+        let (header, parsed, key) = match self.opened_file(fingerprint) {
             Ok(v) => v,
-            Err(e) => {
-                log::warn!("the vault cache file is unusable: {e}");
-                self.delete_quietly(&file, RejectReason::Malformed);
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
+            Err(refusal) => return refusal.into_load(),
         };
-
-        if let Err(reason) = check_header(&header, now_unix(), fingerprint) {
-            log::info!("discarding the vault cache: it is {}", reason.as_str());
-            self.delete_quietly(&file, reason);
-            return DiskCacheLoad::Rejected(reason);
-        }
-
-        // Only now, with the file known to be ours and current, is it worth
-        // asking the user for a biometric.
-        let key = {
-            let mut state = self.lock_key();
-            match self.ensure_key(&mut state) {
-                Ok(key) => key,
-                Err(e) => {
-                    log::info!("not using the vault cache this session: {e}");
-                    return DiskCacheLoad::Unavailable(e);
+        match decode_body_with(&key, &header, &parsed) {
+            Ok(snapshot) => {
+                let written_at = UNIX_EPOCH + Duration::from_secs(header.written_at);
+                // **The file is left open here too.** A caller that read the
+                // whole vault may still want one item later -- a fill, after
+                // the snapshot has been cleared by a lock -- and requiring
+                // `load_facts` for that would mean two ways to arrive at the
+                // same state, one of which silently does not work.
+                if let Ok(mut slot) = self.open.lock() {
+                    *slot = Some(OpenFile {
+                        header,
+                        header_bytes: parsed.header_bytes,
+                        body: parsed.body,
+                        content_key: key,
+                    });
+                }
+                DiskCacheLoad::Loaded {
+                    items: snapshot.items,
+                    folders: snapshot.folders,
+                    written_at,
                 }
             }
-        };
-
-        match decode_body(&key, &parsed) {
-            Ok(snapshot) => DiskCacheLoad::Loaded {
-                items: snapshot.items,
-                folders: snapshot.folders,
-                written_at: UNIX_EPOCH + Duration::from_secs(header.written_at),
-            },
             Err(e) => {
                 log::warn!("the vault cache could not be decrypted ({e}); deleting it");
                 let _ = std::fs::remove_file(&file);
                 DiskCacheLoad::Corrupt(e)
             }
         }
+    }
+
+    /// The facts section, and the file left open so items can be reached.
+    ///
+    /// Everything before the decryption is [`Self::load`]'s, unchanged: the
+    /// header is checked, an expired or foreign file is deleted without a
+    /// prompt, and Hello is asked only once the file is known to be ours.
+    /// What differs is what comes back -- the facts, and **no secret at all**
+    /// -- and that the content key is retained so [`Self::open_item`] costs
+    /// nothing.
+    pub fn load_facts(&self, fingerprint: &str) -> DiskFactsLoad {
+        let file = self.lock_paths().file.clone();
+        let (header, parsed, key) = match self.opened_file(fingerprint) {
+            Ok(v) => v,
+            Err(load) => return load,
+        };
+        match open_facts(&key, &parsed.header_bytes, &parsed.body, header.facts_len) {
+            Ok(facts) => {
+                let written_at = UNIX_EPOCH + Duration::from_secs(header.written_at);
+                if let Ok(mut slot) = self.open.lock() {
+                    *slot = Some(OpenFile {
+                        header,
+                        header_bytes: parsed.header_bytes,
+                        body: parsed.body,
+                        content_key: key,
+                    });
+                }
+                DiskFactsLoad::Loaded { facts, written_at }
+            }
+            Err(e) => {
+                log::warn!("the vault cache's facts could not be decrypted ({e}); deleting it");
+                let _ = std::fs::remove_file(&file);
+                DiskFactsLoad::Corrupt(e)
+            }
+        }
+    }
+
+    /// One item out of the open file, or `None`.
+    ///
+    /// `None` covers every way this can fail and they are deliberately not
+    /// distinguished: no file open, no such id, a slot that points outside
+    /// the body, a blob that will not authenticate. The caller's answer is
+    /// the same in all of them -- ask the backend instead -- and a caller
+    /// that could tell them apart would be a caller that might treat one as
+    /// recoverable.
+    ///
+    /// **Returns `None` after [`Self::close`]**, because the key is gone. A
+    /// locked vault must not be openable by the process that locked it.
+    pub fn open_item(&self, id: &str) -> Option<VaultItem> {
+        let open = self.open.lock().ok()?;
+        let open = open.as_ref()?;
+        let slot = open.header.index.iter().find(|slot| slot.id == id)?;
+        let plaintext = open_item_at(&open.content_key, &open.header_bytes, &open.body, slot)
+            .map_err(|e| log::warn!("the cached copy of item {id} would not open: {e}"))
+            .ok()?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| log::warn!("the cached copy of item {id} is malformed: {e}"))
+            .ok()
+    }
+
+    /// Drops the open file, and with it the content key.
+    ///
+    /// Called wherever the in-memory snapshot is emptied. The file stays on
+    /// disk -- it is meant to survive a lock -- but this process stops being
+    /// able to read it until the user unlocks and Hello is asked again.
+    pub fn close(&self) {
+        if let Ok(mut slot) = self.open.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The shared preamble of [`Self::load`] and [`Self::load_facts`]:
+    /// read, unwrap, parse, check the header, and only then ask Hello.
+    ///
+    /// Returns the load result to hand straight back on any refusal, so the
+    /// two entry points cannot drift in which failures delete the file.
+    fn opened_file(
+        &self,
+        fingerprint: &str,
+    ) -> Result<(CacheHeader, Parsed, Zeroizing<[u8; CONTENT_KEY_LEN]>), DiskFactsLoad> {
+        let (file, tmp) = {
+            let paths = self.lock_paths();
+            (paths.file.clone(), paths.tmp.clone())
+        };
+        // A leftover temp file is a write that was interrupted. Removed here,
+        // in the shared preamble, so both entry points clean it up -- it was
+        // `load`'s alone until the preamble was split out, and a `load_facts`
+        // that left one behind would be a slow leak nobody looked for.
+        let _ = std::fs::remove_file(&tmp);
+        let wrapped = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DiskFactsLoad::Absent);
+            }
+            Err(e) => {
+                log::warn!("could not read the vault cache: {e}");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        let inner = match (self.env.unwrap)(&wrapped) {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(e) => {
+                log::warn!("the vault cache is not readable by this user ({e})");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        let (header, parsed) = match parse_header(&inner) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("the vault cache file is unusable: {e}");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        if let Err(reason) = check_header(&header, now_unix(), fingerprint) {
+            log::info!("discarding the vault cache: it is {}", reason.as_str());
+            self.delete_quietly(&file, reason);
+            return Err(DiskFactsLoad::Rejected(reason));
+        }
+        let key = {
+            let mut state = self.lock_key();
+            match self.ensure_key(&mut state) {
+                Ok(key) => key,
+                Err(e) => {
+                    log::info!("not using the vault cache this session: {e}");
+                    return Err(DiskFactsLoad::Unavailable(e));
+                }
+            }
+        };
+        let content_key = match content_key_of(&key, &parsed) {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("the vault cache's content key would not open ({e}); deleting it");
+                let _ = std::fs::remove_file(&file);
+                return Err(DiskFactsLoad::Corrupt(e));
+            }
+        };
+        Ok((header, parsed, content_key))
     }
 
     /// Writes the snapshot. Atomic: a full write to `.tmp` followed by a
@@ -698,9 +1123,14 @@ impl DiskCache {
     /// description rests on: no path in this crate can produce a file that is
     /// not sealed under a Hello-derived key, because [`encode_file`] takes
     /// that key as a parameter and this is its only caller.
+    /// `facts` is opaque: whatever the caller wants readable without opening
+    /// a secret. This module seals it and records its length; it has no
+    /// opinion about what a projection contains, because that is a decision
+    /// about what the picker needs and belongs where the picker is.
     pub fn write(
         &self,
         fingerprint: &str,
+        facts: &[u8],
         items: &[VaultItem],
         folders: &[Folder],
     ) -> Result<(), String> {
@@ -716,12 +1146,16 @@ impl DiskCache {
             written_at: now_unix(),
             account_fingerprint: fingerprint.to_string(),
             item_count: items.len(),
+            // Filled in by `encode_file`, which is the only thing that can
+            // know them: an offset does not exist until the blobs do.
+            facts_len: 0,
+            index: Vec::new(),
         };
         let snapshot = DiskSnapshot {
             items: items.to_vec(),
             folders: folders.to_vec(),
         };
-        let inner = Zeroizing::new(encode_file(&key, &header, &snapshot)?);
+        let inner = Zeroizing::new(encode_file(&key, &header, facts, &snapshot)?);
         let wrapped = (self.env.wrap)(&inner)?;
 
         let paths = self.lock_paths();
@@ -912,6 +1346,252 @@ pub(crate) mod tests {
     use crate::vault_bridge::{Folder, VaultItem};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// **The reader that makes version 2 worth having**: facts come back
+    /// and no secret is opened to produce them.
+    #[test]
+    fn load_facts_hands_back_the_facts_and_opens_no_secret() {
+        let dir = temp_dir_for("facts-open-no-secret");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+
+        let DiskFactsLoad::Loaded { facts, .. } = cache.load_facts("fp") else {
+            panic!("the facts did not load");
+        };
+        let rendered = String::from_utf8_lossy(&facts).to_lowercase();
+        assert!(
+            !rendered.contains("hunter2"),
+            "a password reached the facts section, which is the one part the daemon reads \
+             whole: {rendered}"
+        );
+        assert!(rendered.contains("work"), "control: the folders did not come back either");
+    }
+
+    /// One item, by id, out of the file `load_facts` left open -- with no
+    /// second Hello prompt, which is what the retained content key is for.
+    #[test]
+    fn open_item_reaches_one_secret_without_asking_hello_again() {
+        let dir = temp_dir_for("open-item-no-second-prompt");
+        HELLO_ASKED.store(0, Ordering::SeqCst);
+        let cache = DiskCache::new(&dir, env(counting_hello));
+        let snap = snapshot();
+
+        cache.acquire_key().expect("the substituted Hello step");
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        let id = snap.items[0].id.clone();
+        let opened = cache.open_item(&id).expect("the item");
+        assert_eq!(opened.id, id);
+
+        // **Once for the whole session.** A write, a facts load and an item
+        // open, and the user was asked for a biometric a single time. Per-item
+        // opens are the thing version 2 exists to allow, and a design that
+        // prompted for each one would be unusable -- a fill would sit behind
+        // a Hello dialog every time.
+        assert_eq!(
+            HELLO_ASKED.load(Ordering::SeqCst),
+            1,
+            "Hello was asked more than once, so reaching a password prompts the user"
+        );
+    }
+
+    /// An id the file does not carry is `None`, not a panic and not the
+    /// wrong item.
+    #[test]
+    fn an_unknown_id_is_none() {
+        let dir = temp_dir_for("unknown-id-is-none");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        assert!(cache.open_item("no-such-id").is_none());
+    }
+
+    /// **A locked vault cannot be reopened by the process that locked it.**
+    ///
+    /// `close` drops the content key. The file stays on disk, because it is
+    /// meant to survive a lock -- but this process has to ask Hello again
+    /// before it can read a password out of it. Without this, locking would
+    /// empty the snapshot while leaving the daemon holding the means to
+    /// refill it, which is the appearance of locking rather than locking.
+    #[test]
+    fn an_item_cannot_be_opened_after_the_file_is_closed() {
+        let dir = temp_dir_for("closed-file-opens-nothing");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        let id = snap.items[0].id.clone();
+        assert!(cache.open_item(&id).is_some(), "control: it was openable before the close");
+
+        cache.close();
+        assert!(
+            cache.open_item(&id).is_none(),
+            "an item opened after the file was closed, so locking the vault leaves the daemon \
+             holding the key to it"
+        );
+    }
+
+    /// **The point of the whole format**: one item opens without any other
+    /// item being touched, and the facts section opens without any item
+    /// being touched at all.
+    #[test]
+    fn one_item_opens_without_opening_any_other() {
+        let k = key(7);
+        let header = b"a plausible header".to_vec();
+        let items: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|n| (format!("item-{n}"), format!("secret number {n}").into_bytes()))
+            .collect();
+        let (mut body, index) = seal_body(&k, &header, b"the facts", &items).expect("sealed");
+        assert_eq!(index.len(), 5);
+
+        // **Independence, proved by breaking a neighbour.** Opening one item
+        // and finding it correct does not show the others were untouched --
+        // a whole-body read would pass that too. Corrupting item 0 does: if
+        // item 3 still opens, its bytes were the only ones authenticated, and
+        // if the facts still open they never depended on any item.
+        let victim = &index[0];
+        body[victim.at as usize + NONCE_LEN] ^= 0xff;
+        assert!(
+            open_item_at(&k, &header, &body, victim).is_err(),
+            "control: the corruption did not take, so nothing below is being proved"
+        );
+
+        let third = &index[3];
+        assert_eq!(third.id, "item-3");
+        let opened = open_item_at(&k, &header, &body, third).expect("the third item");
+        assert_eq!(
+            &*opened, b"secret number 3",
+            "a broken neighbour changed what this item opens as"
+        );
+    }
+
+    /// A slot that points outside the body is refused rather than panicking.
+    /// The index is PLAINTEXT, so its numbers are the one part of this file
+    /// an attacker can edit freely -- and a slice with an out-of-range range
+    /// is a panic, which in the daemon is the tray disappearing.
+    #[test]
+    fn a_slot_pointing_past_the_body_is_refused_rather_than_panicking() {
+        let k = key(7);
+        let header = b"h".to_vec();
+        let (body, index) =
+            seal_body(&k, &header, b"facts", &[("a".to_string(), b"secret".to_vec())])
+                .expect("sealed");
+        for bad in [
+            ItemSlot { id: "a".to_string(), at: u32::MAX, len: 16 },
+            ItemSlot { id: "a".to_string(), at: index[0].at, len: u32::MAX },
+            ItemSlot { id: "a".to_string(), at: body.len() as u32, len: 1 },
+        ] {
+            assert!(
+                open_item_at(&k, &header, &body, &bad).is_err(),
+                "{bad:?} was read rather than refused"
+            );
+        }
+    }
+
+    /// A facts length that runs past the body is refused for the same
+    /// reason: it is a header field, and the header is plaintext.
+    #[test]
+    fn a_facts_length_past_the_body_is_refused_rather_than_panicking() {
+        let k = key(7);
+        let header = b"h".to_vec();
+        let (body, _) = seal_body(&k, &header, b"facts", &[]).expect("sealed");
+        assert!(open_facts(&k, &header, &body, u32::MAX).is_err());
+        assert!(open_facts(&k, &header, &body, body.len() as u32 + 1).is_err());
+    }
+
+    /// **A secret is bound to its id, not merely to the file.**
+    ///
+    /// Version 2 seals each item separately so one can be opened without the
+    /// other 1,665. That raises a question a single blob never had: what
+    /// stops an entry being moved to another item's slot?
+    ///
+    /// GCM proves *this key sealed this message*. It does not prove *this
+    /// message belongs here*. So without the id in the additional
+    /// authenticated data, two entries in one file are interchangeable --
+    /// somebody who can write the file swaps the ciphertext for a bank with
+    /// one for a site they control, and the daemon types the wrong password
+    /// into the right box and never knows. The AAD is what closes that, and
+    /// this is the test that fails if it is ever dropped as redundant.
+    #[test]
+    fn a_secret_moved_to_another_items_slot_will_not_open() {
+        let k = key(7);
+        let header = b"a plausible header".to_vec();
+        let item = b"an item's plaintext".to_vec();
+        let sealed = seal(&k, &item, Some(&item_aad(&header, "item-a"))).expect("sealed");
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(&header, "item-b"))).is_err(),
+            "a ciphertext sealed for item-a opened as item-b, so entries in this file are \
+             interchangeable and a swapped one would be typed as the item it replaced"
+        );
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(&header, "item-a"))).is_ok(),
+            "control: it does not open as itself either, so this proves nothing"
+        );
+    }
+
+    /// The same binding from the other side: an entry from a DIFFERENT file
+    /// does not open here even under the same id. The header carries
+    /// `written_at` and the account fingerprint, so it is what makes one
+    /// file's entries useless in another -- an old cache's password cannot be
+    /// grafted into a current one.
+    #[test]
+    fn a_secret_from_another_file_will_not_open_under_the_same_id() {
+        let k = key(7);
+        let item = b"an item's plaintext".to_vec();
+        let sealed =
+            seal(&k, &item, Some(&item_aad(b"header of file one", "item-a"))).expect("sealed");
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(b"header of file two", "item-a"))).is_err(),
+            "an entry from one cache file opened inside another"
+        );
+    }
+
+    /// The id is length-prefixed rather than concatenated, so `("ab", "c")`
+    /// and `("a", "bc")` cannot produce the same binding. A separator would
+    /// do for GUIDs, which contain no delimiter; a length prefix does not
+    /// have to argue about what an id may contain.
+    #[test]
+    fn no_two_headers_and_ids_can_produce_the_same_binding() {
+        assert_ne!(item_aad(b"h", "ab"), item_aad(b"ha", "b"));
+        assert_ne!(item_aad(b"ha", ""), item_aad(b"h", "a"));
+    }
+
+    /// A facts section shaped as the production writer makes one.
+    ///
+    /// `vault_cache` serialises `{ items, folders }`; the only field this
+    /// module reads back is `folders`, and a fixture that omitted it would
+    /// pass the write and fail every read for a reason unrelated to what was
+    /// being tested.
+    fn facts_for(folders: &[Folder]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "items": [], "folders": folders }))
+            .expect("the facts fixture")
+    }
+
+    /// Unwrap the content key, then read the body -- the two steps `load`
+    /// takes, as one call so the tests below read as they did before the
+    /// preamble was split out.
+    ///
+    /// A helper here rather than a wrapper in production: nothing in the app
+    /// unwraps a key just to read a whole body any more, and a function kept
+    /// alive for tests is a function that stops matching what runs.
+    fn decode_body(
+        hello_key: &[u8; 32],
+        header: &CacheHeader,
+        parsed: &Parsed,
+    ) -> Result<DiskSnapshot, String> {
+        let content_key = content_key_of(hello_key, parsed)?;
+        decode_body_with(&content_key, header, parsed)
+    }
+
     fn key(seed: u8) -> [u8; 32] {
         [seed; 32]
     }
@@ -919,6 +1599,18 @@ pub(crate) mod tests {
     /// The Hello step, substituted. Two of them, so "a file written under a
     /// different key" is expressible without any hardware.
     fn key_seven() -> Result<Zeroizing<[u8; 32]>, String> {
+        Ok(Zeroizing::new(key(7)))
+    }
+
+    /// How many times the substituted Hello step has been asked.
+    ///
+    /// A static because `DiskCacheEnv::hello_key` is a `fn` pointer and
+    /// cannot close over a counter -- the same reason every other seam in
+    /// this crate counts this way.
+    static HELLO_ASKED: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_hello() -> Result<Zeroizing<[u8; 32]>, String> {
+        HELLO_ASKED.fetch_add(1, Ordering::SeqCst);
         Ok(Zeroizing::new(key(7)))
     }
 
@@ -985,6 +1677,10 @@ pub(crate) mod tests {
             written_at,
             account_fingerprint: account_fingerprint(Some("a@example.com"), Some("https://vault")),
             item_count: snapshot.items.len(),
+            // A fixture header: `encode_file` overwrites both, and every
+            // test that reads a file goes through it.
+            facts_len: 0,
+            index: Vec::new(),
         }
     }
 
@@ -994,11 +1690,21 @@ pub(crate) mod tests {
     fn a_file_round_trips_under_the_same_key() {
         let snap = snapshot();
         let header = header_for(&snap, 1_000);
-        let bytes = encode_file(&key(7), &header, &snap).unwrap();
+        let bytes = encode_file(&key(7), &header, &facts_for(&snap.folders), &snap).unwrap();
 
         let (read_header, parsed) = parse_header(&bytes).unwrap();
-        assert_eq!(read_header, header);
-        let opened = decode_body(&key(7), &parsed).unwrap();
+        // **Not equal to the header that went in, and that is the format**
+        // **change.** `encode_file` fills in `facts_len` and `index`, because
+        // an offset does not exist until the blobs do. The caller's fields
+        // survive; the discovered ones are added.
+        assert_eq!(read_header.account_fingerprint, header.account_fingerprint);
+        assert_eq!(read_header.item_count, header.item_count);
+        assert_eq!(read_header.written_at, header.written_at);
+        assert!(read_header.facts_len > 0, "the facts section was not recorded");
+        assert_eq!(read_header.index.len(), 1, "the one item got no slot");
+        assert_eq!(read_header.index[0].id, snap.items[0].id);
+
+        let opened = decode_body(&key(7), &read_header, &parsed).unwrap();
         assert_eq!(opened.items.len(), 1);
         assert_eq!(opened.folders[0].name, "Work");
     }
@@ -1009,7 +1715,7 @@ pub(crate) mod tests {
         // must be able to reject an expired or foreign file *without*
         // popping a Hello prompt for a file it is about to delete.
         let snap = snapshot();
-        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
+        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
         let (header, _) = parse_header(&bytes).unwrap();
         assert_eq!(header.item_count, 1);
     }
@@ -1017,19 +1723,19 @@ pub(crate) mod tests {
     #[test]
     fn the_wrong_key_cannot_open_the_body() {
         let snap = snapshot();
-        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
-        let (_, parsed) = parse_header(&bytes).unwrap();
-        assert!(decode_body(&key(8), &parsed).is_err());
+        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
+        let (header, parsed) = parse_header(&bytes).unwrap();
+        assert!(decode_body(&key(8), &header, &parsed).is_err());
     }
 
     #[test]
     fn tampering_with_the_body_fails_authentication() {
         let snap = snapshot();
-        let mut bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
+        let mut bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
-        let (_, parsed) = parse_header(&bytes).unwrap();
-        assert!(decode_body(&key(7), &parsed).is_err());
+        let (header, parsed) = parse_header(&bytes).unwrap();
+        assert!(decode_body(&key(7), &header, &parsed).is_err());
     }
 
     #[test]
@@ -1037,7 +1743,7 @@ pub(crate) mod tests {
         // This is the AAD binding being live: `written_at` cannot be edited
         // to defeat expiry, because the header authenticates the body.
         let snap = snapshot();
-        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
+        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
         let (header, parsed) = parse_header(&bytes).unwrap();
 
         let mut forged = header.clone();
@@ -1055,7 +1761,7 @@ pub(crate) mod tests {
         let (reread, reparsed) = parse_header(&tampered).unwrap();
         assert_eq!(reread.written_at, 9_999_999, "the forgery did not take");
         assert!(
-            decode_body(&key(7), &reparsed).is_err(),
+            decode_body(&key(7), &reread, &reparsed).is_err(),
             "an edited header still opened the body: the AAD binding is not live"
         );
     }
@@ -1063,11 +1769,11 @@ pub(crate) mod tests {
     #[test]
     fn a_truncated_file_is_rejected_without_panicking() {
         let snap = snapshot();
-        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
+        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
         for cut in [0usize, 2, 4, 8, 20, bytes.len() / 2, bytes.len() - 1] {
             let rejected = match parse_header(&bytes[..cut]) {
                 Err(_) => true,
-                Ok((_, parsed)) => decode_body(&key(7), &parsed).is_err(),
+                Ok((header, parsed)) => decode_body(&key(7), &header, &parsed).is_err(),
             };
             assert!(rejected, "a file truncated to {cut} bytes was accepted");
         }
@@ -1097,6 +1803,8 @@ pub(crate) mod tests {
             written_at: 1_000,
             account_fingerprint: "abc".to_string(),
             item_count: 0,
+            facts_len: 0,
+            index: Vec::new(),
         };
         assert_eq!(
             check_header(&header, 1_000, "abc"),
@@ -1112,6 +1820,8 @@ pub(crate) mod tests {
             written_at: 1_000_000,
             account_fingerprint: fp.clone(),
             item_count: 0,
+            facts_len: 0,
+            index: Vec::new(),
         };
         // 6 days 23 h old: still usable.
         let almost = 1_000_000 + EXPIRY_SECS - 3_600;
@@ -1133,6 +1843,8 @@ pub(crate) mod tests {
             written_at: 1_000,
             account_fingerprint: account_fingerprint(Some("a@example.com"), Some("https://vault")),
             item_count: 0,
+            facts_len: 0,
+            index: Vec::new(),
         };
         let other = account_fingerprint(Some("b@example.com"), Some("https://vault"));
         assert_eq!(
@@ -1150,6 +1862,8 @@ pub(crate) mod tests {
             written_at: 1_000_000,
             account_fingerprint: fp.clone(),
             item_count: 0,
+            facts_len: 0,
+            index: Vec::new(),
         };
         // Small skew is tolerated.
         assert_eq!(check_header(&header, 1_000_000 - 60, &fp), Ok(()));
@@ -1230,9 +1944,9 @@ pub(crate) mod tests {
             items: vec![item],
             folders: vec![folder],
         };
-        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &snap).unwrap();
-        let (_, parsed) = parse_header(&bytes).unwrap();
-        let opened = decode_body(&key(7), &parsed).unwrap();
+        let bytes = encode_file(&key(7), &header_for(&snap, 1_000), &facts_for(&snap.folders), &snap).unwrap();
+        let (header, parsed) = parse_header(&bytes).unwrap();
+        let opened = decode_body(&key(7), &header, &parsed).unwrap();
 
         let before: serde_json::Value = serde_json::from_str(raw).unwrap();
         let after: serde_json::Value = serde_json::to_value(&opened.items[0]).unwrap();
@@ -1255,8 +1969,9 @@ pub(crate) mod tests {
         // a fixed nonce under a reused key is a catastrophic GCM misuse.
         let snap = snapshot();
         let header = header_for(&snap, 1_000);
-        let a = encode_file(&key(7), &header, &snap).unwrap();
-        let b = encode_file(&key(7), &header, &snap).unwrap();
+        let facts = facts_for(&snap.folders);
+        let a = encode_file(&key(7), &header, &facts, &snap).unwrap();
+        let b = encode_file(&key(7), &header, &facts, &snap).unwrap();
         assert_ne!(a, b);
     }
 
@@ -1280,7 +1995,7 @@ pub(crate) mod tests {
     /// Writes a file directly, bypassing the key state, so the load-side
     /// rejection paths can be driven with a header of our choosing.
     fn write_file_with_key(dir: &Path, k: &[u8; 32], header: &CacheHeader, snap: &DiskSnapshot) {
-        let inner = encode_file(k, header, snap).unwrap();
+        let inner = encode_file(k, header, &facts_for(&snap.folders), snap).unwrap();
         std::fs::write(dir.join(FILE_NAME), no_wrap(&inner).unwrap()).unwrap();
     }
 
@@ -1290,6 +2005,8 @@ pub(crate) mod tests {
             written_at,
             account_fingerprint: fingerprint.to_string(),
             item_count: 1,
+            facts_len: 0,
+            index: Vec::new(),
         }
     }
 
@@ -1445,7 +2162,7 @@ pub(crate) mod tests {
         let cache = DiskCache::new(&dir, env(hello_cancelled));
         assert!(!cache.has_session_key());
         let snap = snapshot();
-        assert!(cache.write("fp", &snap.items, &snap.folders).is_err());
+        assert!(cache.write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders).is_err());
         assert!(
             !dir.join(FILE_NAME).exists(),
             "a file was written with no Hello-sealed key"
@@ -1580,7 +2297,7 @@ pub(crate) mod tests {
         let cache = cache_with_key(&dir);
 
         let snap = snapshot();
-        cache.write("fp", &snap.items, &snap.folders).unwrap();
+        cache.write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         assert!(dir.join(FILE_NAME).exists());
         assert!(
             !dir.join(TMP_FILE_NAME).exists(),
@@ -1610,7 +2327,7 @@ pub(crate) mod tests {
             "login": {"username": "u", "password": "correct-horse-battery"},
         }))
         .unwrap();
-        cache.write("fp", &[secret], &[]).unwrap();
+        cache.write("fp", &facts_for(&[]), &[secret], &[]).unwrap();
 
         let bytes = std::fs::read(dir.join(FILE_NAME)).unwrap();
         for needle in [
@@ -1653,11 +2370,11 @@ pub(crate) mod tests {
         let snap = snapshot();
 
         let cache = cache_with_key(&first);
-        cache.write("fp-a", &snap.items, &snap.folders).unwrap();
+        cache.write("fp-a", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         let before = std::fs::read(first.join(FILE_NAME)).unwrap();
 
         cache.repoint(&second);
-        cache.write("fp-b", &snap.items, &snap.folders).unwrap();
+        cache.write("fp-b", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         assert!(second.join(FILE_NAME).exists());
         assert_eq!(
             std::fs::read(first.join(FILE_NAME)).unwrap(),
@@ -1680,9 +2397,9 @@ pub(crate) mod tests {
         let survivor = temp_dir_for("forget-survivor");
         let snap = snapshot();
         let cache = cache_with_key(&doomed);
-        cache.write("fp", &snap.items, &snap.folders).unwrap();
+        cache.write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         let survivors_cache = cache_with_key(&survivor);
-        survivors_cache.write("fp2", &snap.items, &snap.folders).unwrap();
+        survivors_cache.write("fp2", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         std::fs::write(doomed.join(TMP_FILE_NAME), b"a crash left this").unwrap();
 
         forget_for(&doomed);
@@ -1719,7 +2436,7 @@ pub(crate) mod tests {
         let snap = snapshot();
         cache.acquire_key().unwrap();
         for _ in 0..5 {
-            cache.write("fp", &snap.items, &snap.folders).unwrap();
+            cache.write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders).unwrap();
         }
         cache.load("fp");
         assert_eq!(CALLS.with(|c| c.get()), 1);
