@@ -632,6 +632,29 @@ impl DiskCacheEnv {
 /// because they call for different actions. In particular [`Self::Unavailable`]
 /// must **leave the file alone** while [`Self::Rejected`] and [`Self::Corrupt`]
 /// must delete it.
+/// What [`DiskCache::load_facts`] found.
+///
+/// Deliberately the same refusal vocabulary as [`DiskCacheLoad`] rather than
+/// a reduced one: the two entry points share every step up to the
+/// decryption, so a reason one can give and the other cannot would mean they
+/// had drifted.
+/// `Debug` for the same reason [`DiskCacheLoad`] has one: tests assert on
+/// the refusal rather than on a bare `false`. `facts` prints as its length,
+/// not its bytes -- it is the caller's shape and this module will not decide
+/// it is safe to print.
+#[derive(Debug)]
+pub enum DiskFactsLoad {
+    Loaded {
+        /// The caller's own shape, opaque here. See [`DiskCache::write`].
+        facts: Zeroizing<Vec<u8>>,
+        written_at: SystemTime,
+    },
+    Absent,
+    Rejected(RejectReason),
+    Unavailable(String),
+    Corrupt(String),
+}
+
 #[derive(Debug)]
 pub enum DiskCacheLoad {
     Loaded {
@@ -689,6 +712,31 @@ pub struct DiskCache {
     paths: Mutex<Paths>,
     key: Mutex<KeyState>,
     env: DiskCacheEnv,
+    /// The file this process has open, if [`Self::load_facts`] opened one.
+    ///
+    /// **Held so that opening one item costs neither a read nor a prompt.**
+    /// The whole point of version 2 is that a fill can reach one secret; if
+    /// each reach re-read the file and re-derived the content key, it would
+    /// pop Windows Hello per password, which is unusable.
+    ///
+    /// What is retained is ciphertext plus one key. The key is the thing
+    /// that matters, and it is dropped by [`Self::close`] -- which the same
+    /// lock that empties the in-memory snapshot calls, so the daemon does
+    /// not hold the means to open the vault after the vault is locked.
+    open: Mutex<Option<OpenFile>>,
+}
+
+/// A cache file this process can read items out of.
+///
+/// `body` is ciphertext and `header_bytes` is the AAD it is bound to; both
+/// are kept verbatim because re-serialising the header would produce
+/// different bytes for the same values and every open would then fail
+/// authentication for a reason nobody would guess.
+struct OpenFile {
+    header: CacheHeader,
+    header_bytes: Vec<u8>,
+    body: Vec<u8>,
+    content_key: Zeroizing<[u8; CONTENT_KEY_LEN]>,
 }
 
 struct Paths {
@@ -740,6 +788,7 @@ impl DiskCache {
         Self {
             paths: Mutex::new(Paths::in_dir(dir)),
             key: Mutex::new(KeyState::default()),
+            open: Mutex::new(None),
             env,
         }
     }
@@ -912,6 +961,138 @@ impl DiskCache {
                 DiskCacheLoad::Corrupt(e)
             }
         }
+    }
+
+    /// The facts section, and the file left open so items can be reached.
+    ///
+    /// Everything before the decryption is [`Self::load`]'s, unchanged: the
+    /// header is checked, an expired or foreign file is deleted without a
+    /// prompt, and Hello is asked only once the file is known to be ours.
+    /// What differs is what comes back -- the facts, and **no secret at all**
+    /// -- and that the content key is retained so [`Self::open_item`] costs
+    /// nothing.
+    pub fn load_facts(&self, fingerprint: &str) -> DiskFactsLoad {
+        let file = self.lock_paths().file.clone();
+        let (header, parsed, key) = match self.opened_file(fingerprint) {
+            Ok(v) => v,
+            Err(load) => return load,
+        };
+        match open_facts(&key, &parsed.header_bytes, &parsed.body, header.facts_len) {
+            Ok(facts) => {
+                let written_at = UNIX_EPOCH + Duration::from_secs(header.written_at);
+                if let Ok(mut slot) = self.open.lock() {
+                    *slot = Some(OpenFile {
+                        header,
+                        header_bytes: parsed.header_bytes,
+                        body: parsed.body,
+                        content_key: key,
+                    });
+                }
+                DiskFactsLoad::Loaded { facts, written_at }
+            }
+            Err(e) => {
+                log::warn!("the vault cache's facts could not be decrypted ({e}); deleting it");
+                let _ = std::fs::remove_file(&file);
+                DiskFactsLoad::Corrupt(e)
+            }
+        }
+    }
+
+    /// One item out of the open file, or `None`.
+    ///
+    /// `None` covers every way this can fail and they are deliberately not
+    /// distinguished: no file open, no such id, a slot that points outside
+    /// the body, a blob that will not authenticate. The caller's answer is
+    /// the same in all of them -- ask the backend instead -- and a caller
+    /// that could tell them apart would be a caller that might treat one as
+    /// recoverable.
+    ///
+    /// **Returns `None` after [`Self::close`]**, because the key is gone. A
+    /// locked vault must not be openable by the process that locked it.
+    pub fn open_item(&self, id: &str) -> Option<VaultItem> {
+        let open = self.open.lock().ok()?;
+        let open = open.as_ref()?;
+        let slot = open.header.index.iter().find(|slot| slot.id == id)?;
+        let plaintext = open_item_at(&open.content_key, &open.header_bytes, &open.body, slot)
+            .map_err(|e| log::warn!("the cached copy of item {id} would not open: {e}"))
+            .ok()?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| log::warn!("the cached copy of item {id} is malformed: {e}"))
+            .ok()
+    }
+
+    /// Drops the open file, and with it the content key.
+    ///
+    /// Called wherever the in-memory snapshot is emptied. The file stays on
+    /// disk -- it is meant to survive a lock -- but this process stops being
+    /// able to read it until the user unlocks and Hello is asked again.
+    pub fn close(&self) {
+        if let Ok(mut slot) = self.open.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The shared preamble of [`Self::load`] and [`Self::load_facts`]:
+    /// read, unwrap, parse, check the header, and only then ask Hello.
+    ///
+    /// Returns the load result to hand straight back on any refusal, so the
+    /// two entry points cannot drift in which failures delete the file.
+    fn opened_file(
+        &self,
+        fingerprint: &str,
+    ) -> Result<(CacheHeader, Parsed, Zeroizing<[u8; CONTENT_KEY_LEN]>), DiskFactsLoad> {
+        let file = self.lock_paths().file.clone();
+        let wrapped = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DiskFactsLoad::Absent);
+            }
+            Err(e) => {
+                log::warn!("could not read the vault cache: {e}");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        let inner = match (self.env.unwrap)(&wrapped) {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(e) => {
+                log::warn!("the vault cache is not readable by this user ({e})");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        let (header, parsed) = match parse_header(&inner) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("the vault cache file is unusable: {e}");
+                self.delete_quietly(&file, RejectReason::Malformed);
+                return Err(DiskFactsLoad::Rejected(RejectReason::Malformed));
+            }
+        };
+        if let Err(reason) = check_header(&header, now_unix(), fingerprint) {
+            log::info!("discarding the vault cache: it is {}", reason.as_str());
+            self.delete_quietly(&file, reason);
+            return Err(DiskFactsLoad::Rejected(reason));
+        }
+        let key = {
+            let mut state = self.lock_key();
+            match self.ensure_key(&mut state) {
+                Ok(key) => key,
+                Err(e) => {
+                    log::info!("not using the vault cache this session: {e}");
+                    return Err(DiskFactsLoad::Unavailable(e));
+                }
+            }
+        };
+        let content_key = match content_key_of(&key, &parsed) {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("the vault cache's content key would not open ({e}); deleting it");
+                let _ = std::fs::remove_file(&file);
+                return Err(DiskFactsLoad::Corrupt(e));
+            }
+        };
+        Ok((header, parsed, content_key))
     }
 
     /// Writes the snapshot. Atomic: a full write to `.tmp` followed by a
@@ -1146,6 +1327,100 @@ pub(crate) mod tests {
     use crate::vault_bridge::{Folder, VaultItem};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// **The reader that makes version 2 worth having**: facts come back
+    /// and no secret is opened to produce them.
+    #[test]
+    fn load_facts_hands_back_the_facts_and_opens_no_secret() {
+        let dir = temp_dir_for("facts-open-no-secret");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+
+        let DiskFactsLoad::Loaded { facts, .. } = cache.load_facts("fp") else {
+            panic!("the facts did not load");
+        };
+        let rendered = String::from_utf8_lossy(&facts).to_lowercase();
+        assert!(
+            !rendered.contains("hunter2"),
+            "a password reached the facts section, which is the one part the daemon reads \
+             whole: {rendered}"
+        );
+        assert!(rendered.contains("work"), "control: the folders did not come back either");
+    }
+
+    /// One item, by id, out of the file `load_facts` left open -- with no
+    /// second Hello prompt, which is what the retained content key is for.
+    #[test]
+    fn open_item_reaches_one_secret_without_asking_hello_again() {
+        let dir = temp_dir_for("open-item-no-second-prompt");
+        HELLO_ASKED.store(0, Ordering::SeqCst);
+        let cache = DiskCache::new(&dir, env(counting_hello));
+        let snap = snapshot();
+
+        cache.acquire_key().expect("the substituted Hello step");
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        let id = snap.items[0].id.clone();
+        let opened = cache.open_item(&id).expect("the item");
+        assert_eq!(opened.id, id);
+
+        // **Once for the whole session.** A write, a facts load and an item
+        // open, and the user was asked for a biometric a single time. Per-item
+        // opens are the thing version 2 exists to allow, and a design that
+        // prompted for each one would be unusable -- a fill would sit behind
+        // a Hello dialog every time.
+        assert_eq!(
+            HELLO_ASKED.load(Ordering::SeqCst),
+            1,
+            "Hello was asked more than once, so reaching a password prompts the user"
+        );
+    }
+
+    /// An id the file does not carry is `None`, not a panic and not the
+    /// wrong item.
+    #[test]
+    fn an_unknown_id_is_none() {
+        let dir = temp_dir_for("unknown-id-is-none");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        assert!(cache.open_item("no-such-id").is_none());
+    }
+
+    /// **A locked vault cannot be reopened by the process that locked it.**
+    ///
+    /// `close` drops the content key. The file stays on disk, because it is
+    /// meant to survive a lock -- but this process has to ask Hello again
+    /// before it can read a password out of it. Without this, locking would
+    /// empty the snapshot while leaving the daemon holding the means to
+    /// refill it, which is the appearance of locking rather than locking.
+    #[test]
+    fn an_item_cannot_be_opened_after_the_file_is_closed() {
+        let dir = temp_dir_for("closed-file-opens-nothing");
+        let cache = cache_with_key(&dir);
+        let snap = snapshot();
+        cache
+            .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
+            .unwrap();
+        assert!(matches!(cache.load_facts("fp"), DiskFactsLoad::Loaded { .. }));
+        let id = snap.items[0].id.clone();
+        assert!(cache.open_item(&id).is_some(), "control: it was openable before the close");
+
+        cache.close();
+        assert!(
+            cache.open_item(&id).is_none(),
+            "an item opened after the file was closed, so locking the vault leaves the daemon \
+             holding the key to it"
+        );
+    }
+
     /// **The point of the whole format**: one item opens without any other
     /// item being touched, and the facts section opens without any item
     /// being touched at all.
@@ -1289,6 +1564,18 @@ pub(crate) mod tests {
     /// The Hello step, substituted. Two of them, so "a file written under a
     /// different key" is expressible without any hardware.
     fn key_seven() -> Result<Zeroizing<[u8; 32]>, String> {
+        Ok(Zeroizing::new(key(7)))
+    }
+
+    /// How many times the substituted Hello step has been asked.
+    ///
+    /// A static because `DiskCacheEnv::hello_key` is a `fn` pointer and
+    /// cannot close over a counter -- the same reason every other seam in
+    /// this crate counts this way.
+    static HELLO_ASKED: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_hello() -> Result<Zeroizing<[u8; 32]>, String> {
+        HELLO_ASKED.fetch_add(1, Ordering::SeqCst);
         Ok(Zeroizing::new(key(7)))
     }
 
