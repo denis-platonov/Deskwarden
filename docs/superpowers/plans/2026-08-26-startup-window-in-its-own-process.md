@@ -135,6 +135,39 @@ Committed red, on its own, so the defect is in the history as something that was
 > Because the dispatcher runs **after** `wait_for_vault_ready`. The plan's own
 > "spawn first, probe behind it" ordering is right and cannot be had there.
 >
+> **Third wrong turn, and this one only Task 3 could find.** Moving
+> `ui_windows` above the startup block *does* work: the window is asked for
+> before the probe, the loop polls it, all four re-pinned guards pass, clippy
+> is clean, and the daemon comes up with **`nvoglv64.dll` absent** — 35.7 MB
+> against the 99.3 MB the same build showed when it drew its own window. The
+> mechanism is right.
+>
+> It still fails in the user's hands:
+>
+> > Your vault could not be loaded — the vault backend did not become ready
+> > within the deadline; last error: `http://localhost:8087/list/object/items:
+> > connection timed out`
+>
+> **The UI process started before `bw serve` did.** The old shape probed for
+> readiness *first* and drew the window afterwards, so the window always found
+> a live backend and the spinner covered the wait. Spawning first removes that
+> guarantee — and with `keep_backend_running: false` (save-memory mode) there
+> was no backend running at all, so the child's own deadline expired against
+> nothing.
+>
+> The tray door does not have this problem because `open_vault_window` starts
+> the backend **before** it asks for the window. The startup door asked
+> without starting.
+>
+> So the ordering is not "ask, then probe" but **"start the backend, ask,
+> then probe"** — start being cheap and non-blocking, readiness being the slow
+> part that both processes can wait through in parallel. That is a fourth
+> constraint on top of the three above, and it is the reason Task 3 is in this
+> plan and cannot be skipped: every automated check passed on a change that
+> did not work.
+>
+> **Reverted in `3721d22`.** Task 1's red test stands.
+>
 > **What this actually needs.** `ui_windows` is created at `main.rs:2168`,
 > about a thousand lines below the startup block. Every route to a correct fix
 > goes through **moving the registry's creation above the startup block** so
