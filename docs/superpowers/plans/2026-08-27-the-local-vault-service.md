@@ -251,6 +251,24 @@ fn an_unknown_path_is_not_a_way_to_learn_which_routes_exist() {
 - [x] **Step 4: Run to verify they pass.**
 - [x] **Step 5: Commit.**
 
+**Read-only is an interim state, not the design. Corrected 2026-08-27.**
+Task 2 refuses every writing method, and the commit message called a write
+API "a separate decision". That was caution, and it was wrong on two counts
+the owner pointed out:
+
+- The scope model has an `Access::Write`. Refusing writes outright makes half
+  of it decorative.
+- `VaultBridge` writes -- `POST /object/item`, `PUT`, `DELETE`,
+  `/restore/item/{id}`. A read-only service cannot be what the daemon and
+  window point at, so the "base-URL change, not a rewrite" argument would
+  collapse with it.
+
+What survives is only the **ordering**: writes must not land before scopes
+do, because an unscoped write endpoint is strictly worse than no write
+endpoint. So Task 2's `writing_methods_are_refused_even_when_authenticated`
+is correct for exactly as long as Task 2c is unbuilt, and Task 2c replaces
+it rather than keeping it.
+
 ---
 
 ### Task 2b: Key records, expiry, and scope
@@ -398,7 +416,43 @@ fn a_refused_scope_is_not_reported_as_a_bad_credential() {
 ```
 
 - [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement.** Scope check between routing and the answer; `Answer::Forbidden` is new.
+**Writes arrive here, with scopes, and not before.** The method maps to an
+`Access` -- `GET` is `Read`, everything else is `Write` -- and the scope
+decides. `MethodNotAllowed` survives only for a method that is not a vault
+operation at all.
+
+Add to Step 1:
+
+```rust
+/// A read-only key may not write, and the refusal is a scope refusal
+/// rather than a blanket method ban.
+#[test]
+fn a_read_only_key_cannot_write() {
+    let keys = [key_reading_everything()];
+    let header = bearer("the-key");
+    assert_eq!(
+        decide("GET", "/list/object/items", Some(&header), &keys, NOW),
+        Answer::Ok(Route::ListItems)
+    );
+    assert_eq!(
+        decide("PUT", "/object/item/abc", Some(&header), &keys, NOW),
+        Answer::Forbidden
+    );
+}
+
+/// And a write-scoped key may. Without this the test above passes on a
+/// service that simply refuses every write, which is what it is replacing.
+#[test]
+fn a_write_scoped_key_can_write() {
+    let keys = [key_writing_everything()];
+    assert_eq!(
+        decide("PUT", "/object/item/abc", Some(&bearer("the-key")), &keys, NOW),
+        Answer::Ok(Route::Item("abc".into()))
+    );
+}
+```
+
+- [ ] **Step 3: Implement.** Scope check between routing and the answer; `Answer::Forbidden` is new; the method becomes an `Access` rather than a gate.
 - [ ] **Step 4: Run to verify they pass.**
 - [ ] **Step 5: Commit.**
 
