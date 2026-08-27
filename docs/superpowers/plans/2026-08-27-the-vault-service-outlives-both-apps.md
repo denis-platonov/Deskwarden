@@ -44,6 +44,48 @@ pub fn anyone_attached(env: &ServiceEnv) -> bool;
 
 **The rule:** an `Attachment` is a *kernel object*, released by the OS on process death — clean exit, crash, or kill alike. Nothing decrements a number.
 
+### Which primitive, and the trap that rules most of them out
+
+**Added 2026-08-27 before implementing, after reading `app_mutex`.** That
+module documents the thing that breaks the obvious design:
+
+> a `CreateMutexW` that finds the name already there still *opens a handle to
+> it*, and a named object lives as long as any handle does
+
+So **one shared named object cannot answer "is anyone attached"**: the
+process asking keeps the name alive by asking. `take_if_free` exists precisely
+because an incoming instance polling with `acquire` "would wait out its whole
+timeout against itself". Any design where the supervisor tests a shared name
+has that bug.
+
+Nor can the attachment be a mutex *owned* by each app: a mutex has one owner
+at a time, and two apps must be attached at once.
+
+**Nor is the connection itself enough**, which is the other obvious answer.
+It works for a persistent pipe, where a client vanishing is a kernel-visible
+disconnect -- but `bw serve` is HTTP on a port, with no persistent per-client
+connection to count. A mechanism that only works for one of the two services
+reintroduces the split this design exists to remove.
+
+**What does work: one named object per app, and a list of names the
+supervisor tries to open.**
+
+- Each app creates `Local\Deskwarden-Attach-<uuid>` and holds it for as long
+  as it needs the vault. The OS releases it on death, however the death
+  happened.
+- The app records that name where the supervisor can find it.
+- The supervisor **opens each name and drops the handle immediately**. A name
+  that fails to open has no live holder. Transient handles do not keep a name
+  alive past the drop, which is what makes this safe where testing a shared
+  name is not.
+- No app is attached when no recorded name opens.
+
+**The list of names is a hint, not a count.** A stale entry costs one failed
+`OpenMutexW`; a missing entry costs an app that is attached but unseen, which
+is why the entry is written *before* the vault is used and not after. This is
+the one place bookkeeping appears, and it is deliberately the kind that
+degrades into a wrong answer nobody acts on rather than a leak.
+
 `app_mutex` is the precedent and not a second scheme: it already answers "is Deskwarden running?" for the installer, per logon session, with `Local\` scoping. This asks the same question about a different subject.
 
 - [ ] **Step 1: Write the failing tests** — that two attachments both report attached, that dropping one leaves `anyone_attached` true and dropping both makes it false, and — **the test the design exists for** — that an attachment abandoned *without* being dropped (the crash case, simulated through the `ServiceEnv` seam) still reports detached.
