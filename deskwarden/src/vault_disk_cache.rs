@@ -339,6 +339,86 @@ fn seal(key: &[u8; 32], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>,
     Ok(blob)
 }
 
+/// Where one item's sealed bytes are in the body, and which item they are.
+///
+/// **Plaintext, in the header, on purpose.** Encrypting the index would mean
+/// opening the facts section to discover where an item is, which is the
+/// whole cost this format exists to avoid. What it exposes is a list of
+/// vault ids -- GUIDs the server assigned, which already travel in URLs --
+/// and a count the header published anyway.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ItemSlot {
+    pub id: String,
+    /// Byte offset from the start of the body.
+    pub at: u32,
+    pub len: u32,
+}
+
+/// The body of a version 2 file: the facts section, then one sealed blob per
+/// item, with the header's index saying where each one is.
+///
+/// `facts` is opaque to this module. **It does not know what a projection**
+/// **is**, and should not: `app::ItemFacts` is a decision about what the
+/// picker needs, and a sealing layer that had opinions about it would be two
+/// modules that must agree. The caller serialises whatever it wants
+/// available without a secret; this seals it.
+pub fn seal_body(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    facts: &[u8],
+    items: &[(String, Vec<u8>)],
+) -> Result<(Vec<u8>, Vec<ItemSlot>), String> {
+    let mut body = seal(content_key, facts, Some(header_bytes))?;
+    let mut index = Vec::with_capacity(items.len());
+    for (id, plaintext) in items {
+        let sealed = seal(content_key, plaintext, Some(&item_aad(header_bytes, id)))?;
+        let at = u32::try_from(body.len())
+            .map_err(|_| "the vault cache body outgrew a 32-bit offset".to_string())?;
+        let len = u32::try_from(sealed.len())
+            .map_err(|_| "one cached item outgrew a 32-bit length".to_string())?;
+        body.extend_from_slice(&sealed);
+        index.push(ItemSlot { id: id.clone(), at, len });
+    }
+    Ok((body, index))
+}
+
+/// The facts section, which is the first blob in the body.
+///
+/// `facts_len` comes from the header rather than being inferred, so a body
+/// truncated between the facts and the first item is a refusal rather than a
+/// slice that happens to parse.
+pub fn open_facts(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    body: &[u8],
+    facts_len: u32,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let end = facts_len as usize;
+    let slice = body.get(..end).ok_or_else(|| "the facts section is truncated".to_string())?;
+    unseal(content_key, slice, Some(header_bytes))
+}
+
+/// One item, by its slot.
+///
+/// Every failure is the same answer -- refuse -- but they are distinct
+/// strings because the only place this can go wrong quietly is a slot that
+/// points somewhere plausible.
+pub fn open_item_at(
+    content_key: &[u8; 32],
+    header_bytes: &[u8],
+    body: &[u8],
+    slot: &ItemSlot,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let at = slot.at as usize;
+    let end = at.checked_add(slot.len as usize).ok_or_else(|| {
+        "a cached item's slot runs past the end of addressable memory".to_string()
+    })?;
+    let slice = body
+        .get(at..end)
+        .ok_or_else(|| format!("the slot for {} runs past the body", slot.id))?;
+    unseal(content_key, slice, Some(&item_aad(header_bytes, &slot.id)))
+}
+
 /// What binds one item's ciphertext to one item, in one file.
 ///
 /// # Why an item needs more than the header
@@ -942,6 +1022,74 @@ pub(crate) mod tests {
     use super::*;
     use crate::vault_bridge::{Folder, VaultItem};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **The point of the whole format**: one item opens without any other
+    /// item being touched, and the facts section opens without any item
+    /// being touched at all.
+    #[test]
+    fn one_item_opens_without_opening_any_other() {
+        let k = key(7);
+        let header = b"a plausible header".to_vec();
+        let items: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|n| (format!("item-{n}"), format!("secret number {n}").into_bytes()))
+            .collect();
+        let (mut body, index) = seal_body(&k, &header, b"the facts", &items).expect("sealed");
+        assert_eq!(index.len(), 5);
+
+        // **Independence, proved by breaking a neighbour.** Opening one item
+        // and finding it correct does not show the others were untouched --
+        // a whole-body read would pass that too. Corrupting item 0 does: if
+        // item 3 still opens, its bytes were the only ones authenticated, and
+        // if the facts still open they never depended on any item.
+        let victim = &index[0];
+        body[victim.at as usize + NONCE_LEN] ^= 0xff;
+        assert!(
+            open_item_at(&k, &header, &body, victim).is_err(),
+            "control: the corruption did not take, so nothing below is being proved"
+        );
+
+        let third = &index[3];
+        assert_eq!(third.id, "item-3");
+        let opened = open_item_at(&k, &header, &body, third).expect("the third item");
+        assert_eq!(
+            &*opened, b"secret number 3",
+            "a broken neighbour changed what this item opens as"
+        );
+    }
+
+    /// A slot that points outside the body is refused rather than panicking.
+    /// The index is PLAINTEXT, so its numbers are the one part of this file
+    /// an attacker can edit freely -- and a slice with an out-of-range range
+    /// is a panic, which in the daemon is the tray disappearing.
+    #[test]
+    fn a_slot_pointing_past_the_body_is_refused_rather_than_panicking() {
+        let k = key(7);
+        let header = b"h".to_vec();
+        let (body, index) =
+            seal_body(&k, &header, b"facts", &[("a".to_string(), b"secret".to_vec())])
+                .expect("sealed");
+        for bad in [
+            ItemSlot { id: "a".to_string(), at: u32::MAX, len: 16 },
+            ItemSlot { id: "a".to_string(), at: index[0].at, len: u32::MAX },
+            ItemSlot { id: "a".to_string(), at: body.len() as u32, len: 1 },
+        ] {
+            assert!(
+                open_item_at(&k, &header, &body, &bad).is_err(),
+                "{bad:?} was read rather than refused"
+            );
+        }
+    }
+
+    /// A facts length that runs past the body is refused for the same
+    /// reason: it is a header field, and the header is plaintext.
+    #[test]
+    fn a_facts_length_past_the_body_is_refused_rather_than_panicking() {
+        let k = key(7);
+        let header = b"h".to_vec();
+        let (body, _) = seal_body(&k, &header, b"facts", &[]).expect("sealed");
+        assert!(open_facts(&k, &header, &body, u32::MAX).is_err());
+        assert!(open_facts(&k, &header, &body, body.len() as u32 + 1).is_err());
+    }
 
     /// **A secret is bound to its id, not merely to the file.**
     ///
