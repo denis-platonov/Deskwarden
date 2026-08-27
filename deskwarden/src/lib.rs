@@ -114,6 +114,10 @@ pub mod send;
 /// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
 /// API rather than a new one.
 pub mod service_api;
+/// What the local vault service answers with, and what a key is allowed to
+/// see of it. `bw serve`'s envelope, and a list filtered to the asking key
+/// rather than refused outright.
+pub mod service_body;
 /// Named API keys for the local vault service: what one may do, and until
 /// when. Default deny throughout, including for a subject this build has
 /// never heard of -- see the module doc for why that direction is not a

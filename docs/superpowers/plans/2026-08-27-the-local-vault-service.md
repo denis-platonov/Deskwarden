@@ -511,7 +511,7 @@ already been chosen to be.
 
 What is NOT given up, and must be tested:
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// Compatibility is the requirement, so it is asserted rather than assumed:
@@ -542,10 +542,10 @@ fn no_body_is_built_for_a_caller_that_was_refused() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement** `list_items_body`, `item_body` and `body_for`.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run to verify they fail.** **Not observed.** Mutation check instead: disabling `may_see` fails four tests, including a card leaking to a Logins-only key.
+- [x] **Step 3: Implemented** in a new `service_body` module rather than in `service_api`: routing mistakes refuse a legitimate caller, body mistakes hand out data, and the two deserve separate files. Adds `may_see`, `list_folders_body`, `status_body` and a `Vault<'_>` borrow struct.
+- [x] **Step 4: Run to verify they pass.** 12 tests in the module, 88 across the service modules in parallel.
+- [x] **Step 5: Commit.**
 
 ---
 
