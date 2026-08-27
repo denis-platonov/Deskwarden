@@ -477,8 +477,12 @@ only because the module list changed. It is a hint, not a clearance.
 which is then a `KeyRecord` with `Subject::All`, both accesses, and an expiry
 minutes away rather than months.
 
-- [ ] **Step 1: Write the failing tests** -- a session token expires on its own; `/auth` is the ONLY route reachable without a credential, and only by `POST`; a wrong master password is refused without revealing whether the account exists.
-- [ ] **Steps 2-5:** red, implement, full suite, commit.
+- [x] **Step 1: Write the failing tests** -- a session token expires on its own; `/auth` is the ONLY route reachable without a credential, and only by `POST`; a wrong master password is refused without revealing whether the account exists.
+- [x] **Steps 2-5:** implemented, verified, committed. Mutation check in place of red-first: widening the exemption from `==` to `starts_with` fails both the behavioural test and the source pin.
+
+**The pin grew rather than being relaxed.** `/auth` legitimately reads the path before the credential, so the ordering pin now also asserts that exactly one `bare_path ==` comparison precedes the credential check, that it compares against `AUTH_PATH`, and that `route_of` is not among them. Loosening it to let this through would have let the next thing through too.
+
+**Not here:** actually verifying the master password. This decides who may ask; Task 4 asks the vault.
 
 ---
 

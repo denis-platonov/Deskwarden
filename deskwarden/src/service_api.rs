@@ -49,9 +49,20 @@
 use crate::service_keys::{permits, Access, KeyRecord, Subject};
 use crate::service_token::bearer_of;
 
+/// The one path reachable without a credential. A constant, so the exemption
+/// is one string in one place rather than a pattern that could grow.
+pub const AUTH_PATH: &str = "/auth";
+
 /// A route this service serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
+    /// `POST /auth` -- the master password in, a short-lived session out.
+    ///
+    /// **The only route reachable without a credential**, because it is the
+    /// route that issues one. It is a fixed, known path rather than one
+    /// discovered by routing, so admitting it costs nothing an
+    /// unauthenticated caller did not already know.
+    Auth,
     /// `GET /status` -- `bw serve`'s liveness and lock-state endpoint.
     Status,
     /// `GET /list/object/items`
@@ -65,6 +76,9 @@ pub enum Route {
 /// What to do with one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
+    /// Handle the master-password exchange. Carries no key index, because
+    /// the whole point is that there is not one yet.
+    Authenticate,
     /// Serve this route.
     ///
     /// `key` is the index of the record that authorised it, so the code
@@ -103,7 +117,17 @@ pub fn decide(
     keys: &[KeyRecord],
     now_unix: u64,
 ) -> Answer {
-    // First, and before anything reads `path`. See the module doc.
+    let bare_path = path.split('?').next().unwrap_or(path);
+
+    // The one exemption, and it is a fixed string rather than a routing
+    // decision: `/auth` is where a credential comes FROM, so requiring one
+    // would leave no way in. Compared before the credential check for that
+    // reason, and compared against a literal so it cannot widen.
+    if bare_path == AUTH_PATH {
+        return if method == "POST" { Answer::Authenticate } else { Answer::MethodNotAllowed };
+    }
+
+    // Now the credential, and still before anything ROUTES `path`.
     let Some(presented) = bearer_of(auth) else {
         return Answer::Unauthenticated;
     };
@@ -111,11 +135,7 @@ pub fn decide(
         return Answer::Unauthenticated;
     };
 
-    // The query string is not part of the routing decision, and dropping it
-    // here means `/status?x=1` cannot become an unknown path.
-    let path = path.split('?').next().unwrap_or(path);
-
-    let Some(route) = route_of(path) else {
+    let Some(route) = route_of(bare_path) else {
         return Answer::NotFound;
     };
 
@@ -149,6 +169,11 @@ fn access_of(method: &str) -> Option<Access> {
 /// names, which is the whole point of a per-item grant.
 fn allowed(key: &KeyRecord, access: Access, route: &Route) -> bool {
     match route {
+        // Never reached: `decide` answers `/auth` before any key is
+        // resolved. Present so this match is total, and denying rather than
+        // allowing so that a future caller that did reach it gets the safe
+        // answer.
+        Route::Auth => false,
         // Whether the vault is locked is not vault contents, and every
         // client needs it to work at all. A live key is enough; no scope
         // grants or withholds it. It is still refused to an unauthenticated
@@ -184,6 +209,9 @@ fn has_any(key: &KeyRecord, access: Access) -> bool {
 /// are never entangled.
 fn route_of(path: &str) -> Option<Route> {
     match path {
+        // Handled in `decide` before the credential check; listed here only
+        // so that `route_of` is total over the paths this service knows.
+        AUTH_PATH => Some(Route::Auth),
         "/status" => Some(Route::Status),
         "/list/object/items" => Some(Route::ListItems),
         "/list/object/folders" => Some(Route::ListFolders),
@@ -502,6 +530,72 @@ mod tests {
         }
     }
 
+    /// **`/auth` is the only way in without a credential**, because it is
+    /// where a credential comes from.
+    #[test]
+    fn the_auth_route_is_reachable_without_a_credential() {
+        let keys = reads_everything();
+        assert_eq!(decide("POST", "/auth", None, &keys, NOW), Answer::Authenticate);
+    }
+
+    /// And it is the ONLY one. This is the test that would catch an
+    /// exemption that grew.
+    #[test]
+    fn no_other_route_is_reachable_without_a_credential() {
+        let keys = reads_and_writes_everything();
+        for path in [
+            "/status",
+            "/list/object/items",
+            "/list/object/folders",
+            "/object/item/abc",
+            "/nonsense",
+            "/auth/extra",
+            "/Auth",
+            "/auth/",
+        ] {
+            assert_eq!(
+                decide("POST", path, None, &keys, NOW),
+                Answer::Unauthenticated,
+                "{path} was reachable without a credential"
+            );
+        }
+    }
+
+    /// The master password goes in a body, so `/auth` is POST only. A GET is
+    /// a method refusal rather than a credential refusal -- the route is
+    /// public, so there is nothing to hide about it.
+    #[test]
+    fn the_auth_route_is_post_only() {
+        let keys = reads_everything();
+        for method in ["GET", "PUT", "DELETE", "PATCH", "TRACE"] {
+            assert_eq!(
+                decide(method, "/auth", None, &keys, NOW),
+                Answer::MethodNotAllowed,
+                "{method} /auth was accepted"
+            );
+        }
+    }
+
+    /// A query string does not smuggle a request past the exemption, and
+    /// does not stop a legitimate one either.
+    #[test]
+    fn the_auth_exemption_is_not_confused_by_a_query_string() {
+        let keys = reads_everything();
+        assert_eq!(decide("POST", "/auth?x=1", None, &keys, NOW), Answer::Authenticate);
+        assert_eq!(
+            decide("POST", "/status?x=/auth", None, &keys, NOW),
+            Answer::Unauthenticated
+        );
+    }
+
+    /// Presenting a perfectly good key to `/auth` still authenticates rather
+    /// than erroring: the route does not depend on there being no key.
+    #[test]
+    fn a_caller_that_already_has_a_key_may_still_use_the_auth_route() {
+        let keys = reads_everything();
+        assert_eq!(decide("POST", "/auth", Some(&good()), &keys, NOW), Answer::Authenticate);
+    }
+
     /// The credential check must come first in the source as well as in
     /// behaviour: an absence cannot be read, and a later refactor that moved
     /// routing above it would pass every test above while leaking the API's
@@ -515,10 +609,30 @@ mod tests {
         let body = &production[body_at..];
         let auth_at =
             body.find("bearer_of(auth)").expect("control: `decide` does not read a credential");
-        let path_at = body.find("route_of(path)").expect("control: `decide` does not route");
+        let path_at = body.find("route_of(bare_path)").expect("control: `decide` does not route");
         assert!(
             auth_at < path_at,
             "the path is routed before the credential is checked, so response codes tell an unauthenticated caller which routes exist"
+        );
+
+        // `/auth` IS compared before the credential, deliberately -- it is
+        // where a credential comes from. The exemption must stay exactly one
+        // comparison against one constant: anything richer before the
+        // credential check is routing, and routing there is the leak this
+        // pin exists to stop.
+        let before = &body[..auth_at];
+        assert_eq!(
+            before.matches("bare_path ==").count(),
+            1,
+            "the public-route exemption is no longer a single comparison; whatever grew there is routing an unauthenticated caller's path"
+        );
+        assert!(
+            before.contains("AUTH_PATH"),
+            "the exemption compares against something other than the AUTH_PATH constant"
+        );
+        assert!(
+            !before.contains("route_of"),
+            "`route_of` runs before the credential is checked"
         );
     }
 

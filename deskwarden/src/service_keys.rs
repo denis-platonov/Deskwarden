@@ -94,6 +94,41 @@ pub struct KeyRecord {
     pub scopes: Vec<Scope>,
 }
 
+/// How long a session minted from the master password lasts.
+///
+/// Fifteen minutes, and short on purpose. This is the credential handed
+/// to an interactive tool the owner is sitting in front of; a script that
+/// wants to run at 3am gets a named key with an expiry the owner chose,
+/// which is the whole reason both paths exist. A session that lasted a day
+/// would quietly become the second thing, without the name, the scope or
+/// the revoke button.
+pub const SESSION_LIFETIME_SECS: u64 = 900;
+
+/// A session record minted from a successful master-password check.
+///
+/// Full access, because the master password is full access -- scoping it
+/// would be theatre against a caller who could mint another session a
+/// second later. What bounds it is time, not scope.
+///
+/// Returns the record to store and the key to hand back exactly once. The
+/// record holds only the hash, like every other key.
+#[must_use]
+pub fn session_record(now_unix: u64, random: fn() -> [u8; 32]) -> (KeyRecord, String) {
+    let key = crate::service_token::mint(random);
+    let secret = key.expose().to_string();
+    let record = KeyRecord {
+        name: "Signed in with the master password".to_string(),
+        hash: hash_key(&secret),
+        created_unix: now_unix,
+        expires_unix: Some(now_unix + SESSION_LIFETIME_SECS),
+        scopes: vec![
+            Scope { subject: Subject::All, access: Access::Read },
+            Scope { subject: Subject::All, access: Access::Write },
+        ],
+    };
+    (record, secret)
+}
+
 /// `SHA-256(key)`, hex. See the module doc for why this is not a slow KDF.
 #[must_use]
 pub fn hash_key(key: &str) -> String {
@@ -399,5 +434,44 @@ mod tests {
             !derive.contains("Debug"),
             "`KeyRecord` derives Debug; what a credential opens gets printed with it"
         );
+    }
+    /// A session is full access bounded by time, not by scope.
+    #[test]
+    fn a_session_can_do_everything_until_it_expires() {
+        let (record, _secret) = session_record(NOW, || [3u8; 32]);
+        assert!(permits(&record, Access::Read, &Subject::All));
+        assert!(permits(&record, Access::Write, &Subject::All));
+        assert!(permits(&record, Access::Read, &Subject::Item("anything".to_string())));
+    }
+
+    /// **And it expires on its own.** This is the only thing bounding it,
+    /// so it is the thing that gets a test.
+    #[test]
+    fn a_session_expires_without_anybody_revoking_it() {
+        let (record, secret) = session_record(NOW, || [3u8; 32]);
+        let records = vec![record];
+        assert!(find(&records, &secret, NOW).is_some(), "control: it works when minted");
+        assert!(find(&records, &secret, NOW + SESSION_LIFETIME_SECS - 1).is_some());
+        assert!(find(&records, &secret, NOW + SESSION_LIFETIME_SECS).is_none());
+    }
+
+    /// The session record holds a hash, exactly like a named key. A
+    /// session written to disk must not be a session that can be replayed
+    /// off it.
+    #[test]
+    fn a_session_record_does_not_contain_its_own_key() {
+        let (record, secret) = session_record(NOW, || [3u8; 32]);
+        let written = serde_json::to_string(&record).expect("write");
+        assert!(!written.contains(&secret), "the session key is in the record: {written}");
+    }
+
+    /// Two sessions minted from different draws are different keys.
+    /// Without this, a fixed fake would hide a `session_record` that
+    /// ignored its randomness entirely.
+    #[test]
+    fn two_sessions_are_not_the_same_key() {
+        let (_, first) = session_record(NOW, || [3u8; 32]);
+        let (_, second) = session_record(NOW, || [4u8; 32]);
+        assert_ne!(first, second);
     }
 }
