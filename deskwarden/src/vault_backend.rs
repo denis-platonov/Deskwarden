@@ -961,6 +961,52 @@ mod caching_backend_tests {
         (inner.clone(), CachingBackend::new(inner, disk))
     }
 
+    /// **One door.** `DiskCache::open_item` is how the vault service reaches
+    /// a single secret; a consumer calling it directly is a second way to
+    /// reach the vault, and
+    /// `docs/superpowers/specs/2026-08-27-one-door-to-the-vault.md` says
+    /// there is one.
+    ///
+    /// Read over this crate's source rather than enforced by visibility,
+    /// because both live in the same crate: `pub(crate)` would still let
+    /// `app.rs` call it, and moving the module is a bigger change than this
+    /// rule needs. `bw_serve_gate`'s idiom, applied to a different door.
+    ///
+    /// **A guard, not a demonstration.** It passes on the day it lands: at
+    /// the time of writing nothing outside these two modules called it. The
+    /// plan for this work expected it to fail listing `app.rs` and that was
+    /// wrong -- the debt was that the read was *reachable*, not that it was
+    /// *reached*. What it guards is the next edit.
+    #[test]
+    fn nothing_outside_the_vault_service_opens_an_item_from_the_file() {
+        let needle = concat!("open_", "item(");
+        let mut callers: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
+            .expect("the crate's src directory")
+        {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a source file");
+            if source.contains(needle) {
+                callers.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        callers.sort();
+        assert!(
+            callers.len() >= 2,
+            "control: the scan found {callers:?}, so the needle no longer matches the code \
+             it names and this guard is vacuous"
+        );
+        assert_eq!(
+            callers,
+            vec!["vault_backend.rs", "vault_disk_cache.rs"],
+            "something outside the vault service opens an item straight out of the cache \
+             file, so a read can bypass the backend the user configured"
+        );
+    }
+
     /// **The read the door exists for**: it is answered from the file, and
     /// the backend behind it is never asked.
     #[test]

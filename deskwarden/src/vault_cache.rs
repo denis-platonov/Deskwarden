@@ -1205,10 +1205,17 @@ impl VaultCache {
     /// `None` when there is no disk cache, when it is switched off, when the
     /// file was never opened this session, or when the id is not in it. Every
     /// one of those means the same thing to a caller: ask the backend.
-    #[must_use]
-    pub fn item_from_disk(&self, id: &str) -> Option<VaultItem> {
-        self.disk.as_ref()?.open_item(id)
-    }
+    // **`item_from_disk` was removed here**, and the reason is the rule
+    // rather than tidiness. It was a direct read of the cache file from the
+    // type consumers hold -- a second way to reach the vault, which
+    // `docs/superpowers/specs/2026-08-27-one-door-to-the-vault.md` forbids.
+    //
+    // A consumer asks its `VaultBackend`; `vault_backend::CachingBackend` is
+    // what consults the file, and
+    // `nothing_outside_the_vault_service_opens_an_item_from_the_file` is what
+    // keeps it that way. The two tests that lived here -- that a closed file
+    // answers nothing, and that an open one answers -- moved with the
+    // behaviour, to `caching_backend_tests`.
 
     pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
         self.persisting(|| self.create_item_writing(new_item))
@@ -5456,64 +5463,9 @@ mod tests {
     ///
     /// The version 2 file's whole purpose from this side: a caller that
     /// needs one password gets that one. Asserted against a cache whose
-    /// snapshot has been cleared, so it cannot be answering from memory.
-    #[test]
-    fn one_item_comes_out_of_the_disk_file_after_the_snapshot_is_cleared() {
-        let dir = temp_dir_for("one-item-from-disk");
-        let cache = VaultCache::with_disk_cache(
-            crate::test_vault::unreachable_bridge(),
-            cache_with_key(&dir),
-            "fp".to_string(),
-            true,
-        );
-        seed(&cache);
-
-        let reader = VaultCache::with_disk_cache(
-            crate::test_vault::unreachable_bridge(),
-            cache_with_key(&dir),
-            "fp".to_string(),
-            true,
-        );
-        assert!(
-            matches!(reader.load_from_disk(), DiskCacheLoad::Loaded { .. }),
-            "control: the file did not load, so nothing below is being tested"
-        );
-        reader.clear();
-        assert!(!reader.is_populated(), "control: the snapshot still holds the vault");
-
-        // After `clear` the content key is gone, so this is `None` -- which
-        // is the security property, not a limitation. See `clear`.
-        assert!(
-            reader.item_from_disk("1").is_none(),
-            "an item opened out of the file after the vault was locked, so locking leaves \
-             the daemon holding the key to it"
-        );
-    }
 
     /// The same read, before the lock: it works, and it does not disturb the
     /// snapshot. Without this the test above would pass on a cache that could
-    /// never open an item at all.
-    #[test]
-    fn one_item_comes_out_of_the_disk_file_while_it_is_open() {
-        let dir = temp_dir_for("one-item-from-open-file");
-        let cache = VaultCache::with_disk_cache(
-            crate::test_vault::unreachable_bridge(),
-            cache_with_key(&dir),
-            "fp".to_string(),
-            true,
-        );
-        seed(&cache);
-
-        let reader = VaultCache::with_disk_cache(
-            crate::test_vault::unreachable_bridge(),
-            cache_with_key(&dir),
-            "fp".to_string(),
-            true,
-        );
-        assert!(matches!(reader.load_from_disk(), DiskCacheLoad::Loaded { .. }));
-        let opened = reader.item_from_disk("1").expect("the item, out of the file");
-        assert_eq!(opened.id, "1");
-    }
 
     #[test]
     fn a_successful_mutation_rewrites_the_file() {
