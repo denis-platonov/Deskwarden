@@ -75,6 +75,30 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo build --all-targets -j 8
 
+      # `deny.toml` is a real policy -- which licences this app is willing to
+      # link against, and which advisories it has accepted with a reason --
+      # and until now NOTHING RAN IT. It rotted exactly as an unrun check
+      # does: the epaint font exception was written as `LicenseRef-UFL-1.0`,
+      # SPDX later assigned `Ubuntu-font-1.0`, epaint started declaring that,
+      # the exception stopped matching, and `cargo deny check licenses` had
+      # been failing for an unknown length of time with nobody to tell.
+      #
+      # `licenses` and `advisories`, not `all`: `bans` is deliberately
+      # permissive here (`multiple-versions = "allow"`, because the GUI stack
+      # pulls duplicates) and `sources` adds nothing while every dependency
+      # comes from crates.io.
+      #
+      # Advisories go stale on their own schedule rather than on this repo's,
+      # so a new one can turn this red on a commit that changed nothing. That
+      # is the point -- it is how the advisory gets seen -- and the answer is
+      # to read it and record the decision in `deny.toml`, which already
+      # carries one such acceptance for RUSTSEC-2023-0071.
+      - name: Audit licences and advisories
+        working-directory: deskwarden
+        run: |
+          cargo install cargo-deny --locked --version ^0.16
+          cargo deny check licenses advisories
+
   # A picture of every surface this app draws, on every push, for a human to
   # look at.
   #

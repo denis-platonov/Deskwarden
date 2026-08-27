@@ -69,12 +69,12 @@ yanked = "warn"
 # *Linux* backend) with no safe upgrade available and no fix under our control.
 unmaintained = "workspace"
 ignore = [
-    # quick-xml DoS advisories. Reached only through
-    # wayland-scanner -> smithay-client-toolkit -> winit, i.e. winit's Wayland
-    # backend: `cargo tree --target x86_64-pc-windows-msvc` shows no quick-xml
-    # at all, so no affected code is compiled into this Windows-only binary.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # **The quick-xml acceptances were removed on 2026-08-27**, and the way
+    # they were found is the point: `cargo deny` had never run in CI, so two
+    # entries went on excusing a crate that had already left the dependency
+    # tree. `advisory-not-detected` is a warning rather than an error, so an
+    # ignore list rots quietly in the direction of excusing more than it
+    # should. CI runs this now.
     # RUSTSEC-2023-0071, the "Marvin attack": a timing side-channel in the
     # `rsa` crate's private-key operation. There is NO fixed version -- the
     # advisory has stood open since 2023 and the constant-time rewrite has not
