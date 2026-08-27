@@ -292,7 +292,7 @@ pub fn find(records: &[KeyRecord], presented: &str, now_unix: u64) -> Option<&Ke
 pub fn permits(record: &KeyRecord, access: Access, subject: &Subject) -> bool;
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// **Default deny.** A key with no scopes can do nothing.
@@ -353,10 +353,10 @@ fn the_stored_record_does_not_contain_the_key() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement.** `find` hashes the presented key once and compares with `service_token::matches` against each record's hash, checking expiry in the same pass.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run to verify they fail.** **Not observed** -- written together again. A mutation check stands in: the unrecognised-subject arm was flipped to fail open, and `a_subject_from_the_future_denies` failed; restoring it made it pass.
+- [x] **Step 3: Implement.** `find` hashes the presented key once and compares with `service_token::matches` against each record's hash, checking expiry in the same pass.
+- [x] **Step 4: Run to verify they pass.** 13 tests.
+- [x] **Step 5: Commit.** Note: the constant-time comparison moved into a shared `service_token::constant_time_eq`, with `hashes_match` beside `matches`, rather than being written a second time in `find`.
 
 ---
 

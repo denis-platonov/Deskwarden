@@ -114,6 +114,11 @@ pub mod send;
 /// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
 /// API rather than a new one.
 pub mod service_api;
+/// Named API keys for the local vault service: what one may do, and until
+/// when. Default deny throughout, including for a subject this build has
+/// never heard of -- see the module doc for why that direction is not a
+/// matter of taste.
+pub mod service_keys;
 /// The bearer token the local vault service requires. Read its module doc
 /// for what it stops and -- more importantly -- what it does not: a program
 /// already running as the owner is not kept out by it.

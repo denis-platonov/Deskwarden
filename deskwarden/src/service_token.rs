@@ -92,8 +92,24 @@ pub fn os_random() -> [u8; 32] {
 /// recover the whole value one character at a time.
 #[must_use]
 pub fn matches(expected: &Token, presented: &str) -> bool {
-    let expected = expected.0.as_bytes();
-    let presented = presented.as_bytes();
+    constant_time_eq(expected.0.as_bytes(), presented.as_bytes())
+}
+
+/// Two stored hashes, compared in constant time.
+///
+/// [`crate::service_keys::find`] runs this on an unauthenticated request,
+/// once per stored key. A `==` there would stop at the first differing byte
+/// and leak a stored hash one character at a time, which is the same attack
+/// [`matches`] exists to refuse -- so it is the same comparison, not a second
+/// one written slightly differently.
+#[must_use]
+pub fn hashes_match(stored: &str, computed: &str) -> bool {
+    constant_time_eq(stored.as_bytes(), computed.as_bytes())
+}
+
+/// The comparison itself. One implementation, so there is one thing to get
+/// right and one thing to pin.
+fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
     // Fold the length difference into the same accumulator rather than
     // returning on it, so a wrong-length guess costs what a right-length one
     // does.
@@ -215,9 +231,9 @@ mod tests {
     #[test]
     fn the_comparison_has_no_early_return() {
         let source = include_str!("service_token.rs");
-        let start = source.find("pub fn matches(").expect("control: `matches` is gone");
+        let start = source.find("fn constant_time_eq(").expect("control: the comparison is gone");
         let body = &source[start..];
-        let end = body.find("\n}").expect("control: could not find the end of `matches`");
+        let end = body.find("\n}").expect("control: could not find the end of the comparison");
         let body = &body[..end];
         // Comments are prose and must not be searched: the first version of
         // this pin failed because a comment in `matches` used the word
@@ -229,11 +245,11 @@ mod tests {
             .join("\n");
         assert!(
             code.contains("difference"),
-            "control: this is not the body of `matches`"
+            "control: this is not the body of the comparison"
         );
         assert!(
             !code.contains("return"),
-            "`matches` has an early return; the time it takes now depends on where the first wrong byte is, which is enough to recover the token one character at a time"
+            "the comparison has an early return; the time it takes now depends on where the first wrong byte is, which is enough to recover the token one character at a time"
         );
     }
 }
