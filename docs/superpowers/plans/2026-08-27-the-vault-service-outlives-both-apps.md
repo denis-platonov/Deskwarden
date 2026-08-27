@@ -141,9 +141,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 The spec is explicit that the orphan window is **bounded, not eliminated**, and that "a test that only drives clean exits does not show that it does".
 
-- [ ] **Step 1: Write the failing test** — every app crashes (attachments abandoned, not released) and the service is observed to stop. Drive it through the seam; do not kill a real process in a test.
-- [ ] **Step 2:** implement whatever closes it — a supervisor that re-checks `anyone_attached` on an interval is the cheapest thing that works, and its interval is the window's size and should be named as such.
-- [ ] **Steps 3–5:** full suite, commit.
+- [x] **Step 1: Write the failing test** — every app crashes (attachments abandoned, not released) and the service is observed to stop. Drive it through the seam; do not kill a real process in a test.
+- [x] **Step 2:** `supervise` re-checks `anyone_attached` each tick, and `ORPHAN_CHECK_INTERVAL` is **five seconds** -- the window's size, named as such, with a test that makes anyone changing it say so. Original step text: — a supervisor that re-checks `anyone_attached` on an interval is the cheapest thing that works, and its interval is the window's size and should be named as such.
+- [x] **Steps 3–5:** full suite, commit.
 
 ---
 

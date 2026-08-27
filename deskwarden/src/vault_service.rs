@@ -320,6 +320,66 @@ pub fn verify(env: &ServiceEnv, ours: &str, claimed: Option<&str>, port: u16) ->
     Verdict::Adopt
 }
 
+
+/// How often the supervisor re-checks whether anybody is still attached.
+///
+/// **This number is the size of the orphan window**, and it is stated here
+/// rather than left to be inferred. Between the last app dying and the next
+/// check, a `bw serve` holding an unlocked vault can still be listening on
+/// `BW_SERVE_PORT`. The job object this design gives up made that window
+/// zero; this makes it five seconds, which is the honest trade and not an
+/// elimination.
+///
+/// Five rather than one because each check is sixteen `OpenMutexW` calls
+/// against a service that is almost always in use, and rather than sixty
+/// because a minute of an orphaned unlocked vault is a long time.
+pub const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How supervision ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supervised {
+    /// Nobody was attached any more, so the service was stopped. This is the
+    /// outcome for a clean last release AND for every app crashing, which is
+    /// the case the supervisor exists for.
+    Stopped,
+    /// The loop was told to end while somebody was still attached -- the
+    /// supervisor itself is shutting down. **The service is left running**,
+    /// because an app is still using it.
+    GaveUp,
+}
+
+/// The supervisor's clock, as a `fn` pointer.
+pub struct SupervisorEnv {
+    /// Waits one [`ORPHAN_CHECK_INTERVAL`] and returns whether to keep going.
+    ///
+    /// A seam rather than a `sleep` for [`StartEnv::settle`]'s reason, and
+    /// one more here: a test that had to wait five real seconds per check
+    /// would be deleted by the next person in a hurry.
+    pub tick: fn() -> bool,
+}
+
+/// Stops the service once nobody is attached, however the apps went away.
+///
+/// This is what bounds the orphan window rather than eliminating it. A clean
+/// release goes through [`release`] and does not wait for a tick; this is
+/// the path for the case where nothing clean happened at all -- every app
+/// killed, so no `Drop` ran anywhere and no count was decremented.
+///
+/// It stops the service **only** when no slot is held. A supervisor that
+/// closed a vault somebody was still using would be a worse bug than the
+/// leak it was written to prevent.
+#[must_use]
+pub fn supervise(env: &ServiceEnv, sup: &SupervisorEnv, port: u16) -> Supervised {
+    loop {
+        if !anyone_attached(env) {
+            (env.stop)(port);
+            return Supervised::Stopped;
+        }
+        if !(sup.tick)() {
+            return Supervised::GaveUp;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +756,83 @@ mod tests {
         assert_eq!(STOPS.load(Ordering::SeqCst), 0, "the second app lost its vault");
         release(&env(), second, PORT);
         assert_eq!(STOPS.load(Ordering::SeqCst), 1);
+    }
+    // ---- Task 4: the window that is bounded, not eliminated ------------
+
+    static TICKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Ten ticks, then the loop is told to give up -- so a test that fails
+    /// to stop the service ends rather than hanging.
+    fn tick() -> bool {
+        TICKS.fetch_add(1, Ordering::SeqCst) < 10
+    }
+
+    fn supervisor() -> SupervisorEnv {
+        TICKS.store(0, Ordering::SeqCst);
+        SupervisorEnv { tick }
+    }
+
+    /// **The Task 4 test.** Every app crashed -- attachments abandoned, not
+    /// released -- so nothing ran the code that stops the service. A suite
+    /// that only drove clean exits would pass while this case leaked an
+    /// unlocked vault on a held port forever.
+    #[test]
+    fn a_service_whose_apps_all_crashed_is_stopped_anyway() {
+        reset_service();
+        let first = attach(&env()).expect("first");
+        let second = attach(&env()).expect("second");
+        let names = [attach_slot_name(first.slot()), attach_slot_name(second.slot())];
+
+        // Both processes are killed: no `Drop` runs anywhere. The kernel is
+        // what releases the names, and the fake stands in for it.
+        std::mem::forget(first);
+        std::mem::forget(second);
+        for name in &names {
+            LIVE.lock().unwrap().as_mut().unwrap().remove(name);
+        }
+
+        assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::Stopped);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The other half: a supervisor that stops a service somebody is still
+    /// using is worse than the leak it was written to prevent.
+    #[test]
+    fn a_service_with_a_live_app_is_never_stopped_however_long_it_waits() {
+        reset_service();
+        let _still_here = attach(&env()).expect("attached");
+        assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::GaveUp);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0, "a vault in use was closed underneath its app");
+        assert!(TICKS.load(Ordering::SeqCst) > 1, "control: the supervisor did not actually loop");
+    }
+
+    /// One app crashes and the other keeps working. The crash must not take
+    /// the survivor down with it.
+    #[test]
+    fn one_app_crashing_does_not_stop_the_service_for_the_other() {
+        reset_service();
+        let crashed = attach(&env()).expect("crashed");
+        let _alive = attach(&env()).expect("alive");
+        let name = attach_slot_name(crashed.slot());
+        std::mem::forget(crashed);
+        LIVE.lock().unwrap().as_mut().unwrap().remove(&name);
+
+        assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::GaveUp);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0);
+    }
+
+    /// The service is stopped once, not once per tick.
+    #[test]
+    fn the_service_is_stopped_only_once() {
+        reset_service();
+        assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::Stopped);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The size of the orphan window is a number, and it is stated rather
+    /// than implied. If someone changes it, this test makes them say so.
+    #[test]
+    fn the_orphan_window_is_a_stated_bound() {
+        assert_eq!(ORPHAN_CHECK_INTERVAL, std::time::Duration::from_secs(5));
     }
 }
