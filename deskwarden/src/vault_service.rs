@@ -380,6 +380,87 @@ pub fn supervise(env: &ServiceEnv, sup: &SupervisorEnv, port: u16) -> Supervised
         }
     }
 }
+
+/// The real kernel behind [`ServiceEnv`], for the running app.
+///
+/// `app_mutex::create_named`'s idiom, with the one difference this module
+/// needs: **exclusive**. `app_mutex` wants a handle either way and reads
+/// `ERROR_ALREADY_EXISTS` only to report it; here a name already taken means
+/// the slot is somebody else's, so the handle is dropped and `None` comes
+/// back. Keeping it would claim a slot this process does not own AND keep
+/// the name alive after its owner died, which is the bug the whole module
+/// is arranged around.
+#[must_use]
+pub fn windows_env() -> ServiceEnv {
+    ServiceEnv { hold: win_hold, is_held: win_is_held, stop: win_stop }
+}
+
+fn win_hold(name: &str) -> Option<Held> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        let handle = CreateMutexW(None, false, &HSTRING::from(name)).ok()?;
+        // Read immediately: `CreateMutexW` succeeds either way and separates
+        // the two cases only through the last-error code, which anything
+        // else would overwrite.
+        let existed = GetLastError() == ERROR_ALREADY_EXISTS;
+        let owned = OwnedHandle::from_raw_handle(handle.0);
+        if existed {
+            // Dropping it is the `CloseHandle`. The owner's handle keeps the
+            // name alive; ours would too, which is why it does not survive
+            // this branch.
+            drop(owned);
+            return None;
+        }
+        Some(Held::new(Arc::new(owned)))
+    }
+}
+
+/// Opens the name and drops the handle in the same expression.
+///
+/// **The drop is the point.** A handle kept here would answer "yes" forever
+/// after the first ask, which is this module's whole hazard; `SYNCHRONIZE`
+/// is the crate's own `SYNCHRONIZATION_SYNCHRONIZE` and **not a hand-written
+/// constant**: an earlier version of this spelled it `0x0010`, which is a
+/// meaningless bit for this object -- `SYNCHRONIZE` is a STANDARD right,
+/// `0x0010_0000`. Every `OpenMutexW` failed with `ERROR_ACCESS_DENIED`, so
+/// this function reported nothing attached while two processes were holding
+/// slots, and every unit test passed because the fake kernel never reached
+/// this line. `examples/vault_slots_probe.rs` is what found it.
+fn win_is_held(name: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) {
+            Ok(handle) => {
+                use std::os::windows::io::{FromRawHandle, OwnedHandle};
+                drop(OwnedHandle::from_raw_handle(handle.0));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Not wired yet, and it says so rather than pretending.
+///
+/// Stopping the service means ending the `bw serve` child whose handle
+/// `main.rs` owns, and until the switch-over described in
+/// `docs/superpowers/plans/2026-08-27-the-vault-service-outlives-both-apps.md`
+/// that child is still governed by the kill-on-close job object. Nothing in
+/// the running app calls [`release`] or [`supervise`], so nothing reaches
+/// here; if something ever does before the switch-over, the log line is the
+/// evidence rather than a silent no-op.
+fn win_stop(port: u16) {
+    log::error!(
+        "vault_service::stop was called for port {port}, but the service is still owned by \
+         the kill-on-close job object; nothing was stopped"
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +915,35 @@ mod tests {
     #[test]
     fn the_orphan_window_is_a_stated_bound() {
         assert_eq!(ORPHAN_CHECK_INTERVAL, std::time::Duration::from_secs(5));
+    }
+    /// The bug no unit test in this module could have caught, pinned so it
+    /// cannot come back.
+    ///
+    /// `win_is_held` once spelled `SYNCHRONIZE` as a hand-written
+    /// `SYNCHRONIZATION_ACCESS_RIGHTS(0x0010)`. That is a meaningless bit --
+    /// `SYNCHRONIZE` is a standard right, `0x0010_0000` -- so every
+    /// `OpenMutexW` returned `ERROR_ACCESS_DENIED` and this module reported
+    /// nothing attached while two real processes held slots. Every test here
+    /// passed, because the fake kernel never reaches that call.
+    ///
+    /// A source pin rather than a behavioural test because the behaviour
+    /// needs two processes and a real kernel: that is
+    /// `examples/vault_slots_probe.rs`, and this is what stops a future edit
+    /// from quietly reintroducing a literal.
+    #[test]
+    fn the_access_rights_come_from_the_windows_crate_and_are_not_written_by_hand() {
+        let source = include_str!("vault_service.rs");
+        let cut = source.find("#[cfg(test)]").expect("control: this file has no test module");
+        let production = &source[..cut];
+        assert!(
+            production.contains("SYNCHRONIZATION_SYNCHRONIZE"),
+            "control: the production half no longer opens a mutex at all, so this pin is vacuous"
+        );
+        assert!(
+            !production.contains("SYNCHRONIZATION_ACCESS_RIGHTS("),
+            "an access right is built from a literal here. Use the constant the windows crate \
+             defines: a wrong bit fails at runtime as ACCESS_DENIED, which this module reports \
+             as -- nobody is attached."
+        );
     }
 }

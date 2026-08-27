@@ -2538,6 +2538,7 @@ mod tests {
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/unlock_prompt_preview.rs",
+                "examples/vault_slots_probe.rs",
                 "examples/watch_windows.rs",
             ],
             "the set of Rust source files outside `src/` changed. A `.rs` file beside \

@@ -228,6 +228,36 @@ fn main() {
     // not how the app works.
     let mutex_state = deskwarden::app_mutex::acquire();
 
+    // **Counting only, for now.** This claims one of `vault_service`'s
+    // attachment slots and holds it for the life of the process, so that a
+    // supervisor could ask "is anybody still using the vault?" -- but nothing
+    // acts on the answer yet. `bw serve` is still owned by the kill-on-close
+    // job object below, which still guarantees it cannot outlive this app.
+    //
+    // Deliberately staged that way. The switch-over gives up a kernel
+    // guarantee for a five-second window, and every previous attempt in this
+    // area passed every automated check and failed in the user's hands. Two
+    // processes claiming distinct slots, and a slot coming back after a
+    // crash, are facts no test on one process can establish; this logs them
+    // from the real app first.
+    //
+    // Bound with a name, and never `let _`: a `_`-bound guard drops at once,
+    // which would release the slot on the next line and make every reading
+    // of it a lie.
+    let vault_slot = deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
+    match &vault_slot {
+        Some(slot) => log::info!(
+            "vault attachment slot {} claimed; anyone_attached={}",
+            slot.slot(),
+            deskwarden::vault_service::anyone_attached(&deskwarden::vault_service::windows_env())
+        ),
+        None => log::warn!(
+            "no free vault attachment slot out of {}; this app will not be counted as using \
+             the vault",
+            deskwarden::vault_service::SLOTS
+        ),
+    }
+
     let project_dirs = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
         .expect("could not resolve config directory");
     let config_dir = project_dirs.config_dir().to_path_buf();
