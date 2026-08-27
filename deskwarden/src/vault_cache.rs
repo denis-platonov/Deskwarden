@@ -1081,6 +1081,35 @@ impl VaultCache {
         self.lock().items.clone()
     }
 
+    /// **Every item, as whatever the caller needs and nothing more.**
+    ///
+    /// The projection runs against a borrowed item under the lock and the
+    /// item is never cloned, so a caller that wants three strings gets three
+    /// strings -- not a deep copy of a vault it then throws most of away.
+    ///
+    /// # Why this exists rather than another `items()` caller
+    ///
+    /// [`Self::items`] hands out `VaultItem`s, and a `VaultItem` carries a
+    /// [`crate::vault_bridge::LoginData::password`]. Every caller of it in the
+    /// daemon therefore holds every password in the vault, in plaintext, for
+    /// as long as it holds the `Vec` -- and the account picker's caller held
+    /// one for the life of a card. The picker needs an id, a name, a username
+    /// and a list of URIs; it has never needed a secret.
+    ///
+    /// A combinator rather than a fixed `facts()` returning a fixed struct,
+    /// because the two callers want different shapes and a struct wide enough
+    /// for both is a struct with fields neither needs. It also keeps this
+    /// module out of the business of knowing what a palette or an icon domain
+    /// is: those live in `app` and `key_sequence`, and the closure is where
+    /// they stay.
+    ///
+    /// **The lock is held for the whole map.** The closure must not call back
+    /// into the cache -- that is a deadlock, not a slow path -- and every
+    /// caller here passes a pure function of one item.
+    pub fn project<T>(&self, of: impl Fn(&VaultItem) -> T) -> Vec<T> {
+        self.lock().items.iter().map(of).collect()
+    }
+
     /// One item, cloned; the rest of the snapshot is not.
     ///
     /// **This exists for the autofill path's latency, not for tidiness.**
@@ -2223,6 +2252,60 @@ mod tests {
 
     fn cache_for(url: String) -> VaultCache {
         VaultCache::new(VaultBridge::new(url))
+    }
+
+    /// One item that actually carries a password, which `items_body`'s do
+    /// not. Separate rather than added to that fixture, because every test
+    /// using it asserts on a two-item list and a third would move them all.
+    fn items_body_with_a_password() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1,
+             "login":{"username":"me@example.com","password":"hunter2"}}
+        ]}}"#
+    }
+
+    /// **The daemon must not hold a decrypted password.**
+    ///
+    /// It owns the tray, the hotkey and the match engine, and it runs for
+    /// days. `clear()` empties the snapshot on lock -- but auto-lock is a
+    /// setting a user can turn off, and the owner's is off with a 999-minute
+    /// timeout, so "until the vault locks" is in practice "until the process
+    /// exits".
+    ///
+    /// Driven through the public accessor a caller actually has rather than
+    /// by reaching into the field: what matters is what the daemon can
+    /// *reach*.
+    #[test]
+    #[ignore = "BLOCKED on two gates, both in \
+                docs/superpowers/plans/2026-08-27-the-tray-stops-holding-passwords.md. \
+                (1) A fill still reads a cached password, and must, because autofill has to \
+                work with `bw serve` stopped -- see \
+                `autofill_really_fills_from_a_restored_snapshot`. (2) The sign-in path still \
+                draws the vault window in-process and reads the cache directly. Both need \
+                per-item read from the encrypted cache, which is \
+                docs/superpowers/specs/2026-08-27-the-vault-lives-in-a-place-not-a-process.md. \
+                Ignored rather than deleted or weakened: this is the finish line, and it \
+                fails for the right reason today."]
+    fn nothing_the_daemon_can_reach_hands_back_a_password() {
+        let cache = cache_for("http://127.0.0.1:1".to_string());
+        let epoch = cache.epoch();
+        cache.populate_with_vault(
+            VaultSnapshot {
+                items: body_list(items_body_with_a_password()),
+                folders: Vec::new(),
+            },
+            epoch,
+        );
+        let reachable: Vec<String> = cache
+            .items()
+            .into_iter()
+            .filter_map(|item| item.login.and_then(|l| l.password).map(|p| p.to_string()))
+            .collect();
+        assert!(
+            reachable.is_empty(),
+            "the daemon can read {} cached password(s) out of its own snapshot",
+            reachable.len()
+        );
     }
 
     fn items_body() -> &'static str {

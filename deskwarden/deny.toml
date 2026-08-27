@@ -9,6 +9,13 @@
 # decision, not a formality -- anything not listed fails the check.
 
 [licenses]
+# This crate itself is AGPL-3.0-or-later and is deliberately NOT in the list
+# below. `publish = false` in Cargo.toml makes it private, and this excludes
+# private crates from the check -- so the allow-list stays a statement about
+# what this app is willing to LINK AGAINST, which is the question it exists to
+# answer. Adding AGPL to the list instead would have permitted AGPL
+# dependencies as a side effect of relicensing our own code.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,13 +40,20 @@ allow = [
 confidence-threshold = 0.8
 
 # epaint (via eframe/egui) bundles the Ubuntu Light font, licensed under the
-# Ubuntu Font Licence 1.0. UFL-1.0 has no SPDX identifier, so it appears as a
-# `LicenseRef` and has to be allowed for this crate specifically. It is a
-# permissive font licence that allows redistribution, including embedded in
-# software.
+# Ubuntu Font Licence 1.0: a permissive font licence that allows
+# redistribution, including embedded in software. Allowed for this crate
+# specifically rather than for the whole graph.
+#
+# **The identifier changed and this file did not notice.** It read
+# `LicenseRef-UFL-1.0`, with a comment asserting that UFL-1.0 has no SPDX
+# identifier. SPDX has since assigned one -- `Ubuntu-font-1.0` -- and epaint
+# now declares it, so the exception stopped matching and `cargo deny check
+# licenses` had been failing. Nothing caught it because CI does not run
+# cargo-deny at all; this file is a manual tool, and a manual tool that
+# nobody runs is a manual tool that rots.
 [[licenses.exceptions]]
 name = "epaint_default_fonts"
-allow = ["LicenseRef-UFL-1.0"]
+allow = ["Ubuntu-font-1.0"]
 
 [bans]
 # Duplicate versions of transitive crates are pulled in by the GUI stack

@@ -10,7 +10,6 @@
 //! Pure, and takes `&[VaultItem]` rather than a cache, so the whole of it is
 //! testable with fixtures and no window, no vault and no clock.
 
-use crate::vault_bridge::VaultItem;
 
 /// One row of the picker. **Display strings and an id -- never a password.**
 /// The secret is fetched at dispatch by the component that already holds it;
@@ -42,14 +41,13 @@ fn stem(exe_name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn ranked(exe_name: &str, title: &str, item: &VaultItem) -> Option<u8> {
+fn ranked(exe_name: &str, title: &str, item: &crate::app::ItemFacts) -> Option<u8> {
     let stem = stem(exe_name);
     let name = item.name.to_ascii_lowercase();
 
     if !stem.is_empty() {
-        if let Some(login) = item.login.as_ref() {
-            for entry in &login.uris {
-                let Some(uri) = entry.uri.as_deref() else { continue };
+        {
+            for uri in &item.uris {
                 let Some(domain) = crate::favicon::domain_from_uri(uri) else { continue };
                 if domain.to_ascii_lowercase().contains(&stem) {
                     return Some(RANK_URI_HOST);
@@ -74,7 +72,12 @@ fn ranked(exe_name: &str, title: &str, item: &VaultItem) -> Option<u8> {
 
 /// The ranked candidates for this window, strongest first. Ties keep the
 /// vault's own order, so the list is stable between presses.
-pub fn candidates(exe_name: &str, title: &str, items: &[VaultItem]) -> Vec<Candidate> {
+/// Takes [`crate::app::ItemFacts`] rather than `VaultItem`s, and that is the
+/// point rather than a convenience: a `VaultItem` carries a password, so a
+/// matcher over a slice of them meant the daemon holding every password in
+/// the vault to answer which windows look familiar. It needs a name and some
+/// URIs.
+pub fn candidates(exe_name: &str, title: &str, items: &[crate::app::ItemFacts]) -> Vec<Candidate> {
     let mut scored: Vec<(u8, Candidate)> = Vec::new();
     for item in items {
         // No id, nothing to fill from later: not a candidate, however well it
@@ -88,11 +91,7 @@ pub fn candidates(exe_name: &str, title: &str, items: &[VaultItem]) -> Vec<Candi
             Candidate {
                 id: item.id.clone(),
                 name: item.name.clone(),
-                username: item
-                    .login
-                    .as_ref()
-                    .and_then(|l| l.username.clone())
-                    .unwrap_or_default(),
+                username: item.username.clone(),
             },
         ));
     }
@@ -105,8 +104,13 @@ mod tests {
     use super::*;
     use crate::vault_bridge::{LoginData, UriEntry, VaultItem};
 
-    fn item(id: &str, name: &str, user: &str, uri: Option<&str>) -> VaultItem {
-        VaultItem {
+    /// **Returns the projection, built through the production mapping.**
+    ///
+    /// `ItemFacts::of` is what the daemon runs, so a fixture that hand-built
+    /// an `ItemFacts` would be a second mapping able to disagree with it --
+    /// and these tests would then pass over facts the real picker never sees.
+    fn item(id: &str, name: &str, user: &str, uri: Option<&str>) -> crate::app::ItemFacts {
+        crate::app::ItemFacts::of(&VaultItem {
             id: id.to_string(),
             name: name.to_string(),
             fields: Vec::new(),
@@ -130,7 +134,7 @@ mod tests {
             folder_id: None,
             favorite: false,
             other: serde_json::Map::new(),
-        }
+        })
     }
 
     #[test]
