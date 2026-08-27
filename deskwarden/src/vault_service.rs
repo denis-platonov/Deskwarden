@@ -381,6 +381,72 @@ pub fn supervise(env: &ServiceEnv, sup: &SupervisorEnv, port: u16) -> Supervised
     }
 }
 
+
+/// What stopping the service is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAction {
+    /// End the `bw serve` child THIS process spawned, through the handle it
+    /// owns.
+    EndTheChildWeStarted,
+    /// Do nothing. Something is on the port that this process did not start,
+    /// so it is not this process's to end -- the same refusal [`verify`]
+    /// makes when it declines to adopt an unidentifiable service and
+    /// declines to kill it.
+    LeaveItAlone,
+}
+
+/// The whole stop decision, as a pure function.
+///
+/// Separated from the doing so the rule is a thing tests drive rather than a
+/// branch buried in a `fn` pointer. The rule is one line: **a handle, never
+/// a port.** A process listening on `BW_SERVE_PORT` may be another account's
+/// service, another user's, or something that took the port first; ending it
+/// because it is in the way is precisely what this design refuses.
+#[must_use]
+pub fn stop_action(we_started_it: bool) -> StopAction {
+    if we_started_it { StopAction::EndTheChildWeStarted } else { StopAction::LeaveItAlone }
+}
+
+/// The `bw serve` this process started, if it started one.
+///
+/// `app_mutex::HELD`'s idiom: a process-wide handle that outlives the stack
+/// frame that made it. It exists because the switch-over takes `bw serve`
+/// out of the kill-on-close job, and something then has to be able to end it
+/// -- and the only honest something is the handle we already hold.
+static OUR_SERVICE: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+/// Records the child this process spawned, so [`supervise`] can end it.
+///
+/// Call it **immediately** after the spawn. A child spawned and not recorded
+/// is the orphan this whole design is trying not to create: out of the job,
+/// and unknown to the only code that would stop it.
+pub fn remember_our_service(child: std::process::Child) {
+    if let Ok(mut slot) = OUR_SERVICE.lock() {
+        if let Some(mut previous) = slot.replace(child) {
+            // Replacing without ending the old one would leak exactly the
+            // orphan this exists to prevent.
+            log::warn!("a second bw serve was recorded; ending the first");
+            crate::bw_serve::stop_bw_serve(&mut previous);
+        }
+    }
+}
+
+/// Hands back the child, so nothing can stop it twice.
+///
+/// Taking rather than borrowing is deliberate: a second stop would `kill` a
+/// pid that has been reaped and may by then belong to somebody else.
+#[must_use]
+pub fn take_our_service() -> Option<std::process::Child> {
+    OUR_SERVICE.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Whether this process started the service that is running.
+#[must_use]
+pub fn we_started_the_service() -> bool {
+    OUR_SERVICE.lock().is_ok_and(|slot| slot.is_some())
+}
+
 /// The real kernel behind [`ServiceEnv`], for the running app.
 ///
 /// `app_mutex::create_named`'s idiom, with the one difference this module
@@ -446,21 +512,30 @@ fn win_is_held(name: &str) -> bool {
     }
 }
 
-/// Not wired yet, and it says so rather than pretending.
+/// Ends the `bw serve` this process started, and nothing else.
 ///
-/// Stopping the service means ending the `bw serve` child whose handle
-/// `main.rs` owns, and until the switch-over described in
-/// `docs/superpowers/plans/2026-08-27-the-vault-service-outlives-both-apps.md`
-/// that child is still governed by the kill-on-close job object. Nothing in
-/// the running app calls [`release`] or [`supervise`], so nothing reaches
-/// here; if something ever does before the switch-over, the log line is the
-/// evidence rather than a silent no-op.
+/// The `port` is logged and **not used to find anything**. It is here
+/// because [`ServiceEnv::stop`] is shaped for a service identified by port,
+/// and keeping the parameter while refusing to act on it is the honest way
+/// to say that the identification comes from somewhere better.
 fn win_stop(port: u16) {
-    log::error!(
-        "vault_service::stop was called for port {port}, but the service is still owned by \
-         the kill-on-close job object; nothing was stopped"
-    );
+    match stop_action(we_started_the_service()) {
+        StopAction::EndTheChildWeStarted => match take_our_service() {
+            Some(mut child) => {
+                log::info!("nobody is attached; ending the bw serve we started on port {port}");
+                crate::bw_serve::stop_bw_serve(&mut child);
+            }
+            // Lost the race with another stop between the check and the
+            // take. Nothing to do, and nothing to complain about.
+            None => log::debug!("the service on port {port} was already ended"),
+        },
+        StopAction::LeaveItAlone => log::info!(
+            "nobody is attached, but this process did not start the service on port {port}; \
+             leaving it alone"
+        ),
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,5 +1020,41 @@ mod tests {
              defines: a wrong bit fails at runtime as ACCESS_DENIED, which this module reports \
              as -- nobody is attached."
         );
+    }
+    // ---- the switch-over: stopping only what we started ----------------
+
+    /// **The refusal that must not be lost in the switch-over.** `verify`
+    /// declines to adopt a process it cannot identify AND declines to kill
+    /// it. Stopping by port would reintroduce exactly that killing through
+    /// the back door: whatever is listening is not necessarily ours.
+    #[test]
+    fn a_service_we_did_not_start_is_never_stopped() {
+        assert_eq!(stop_action(false), StopAction::LeaveItAlone);
+    }
+
+    /// The child this process spawned is ours to end, and the handle is what
+    /// says so -- not the port, and not a pid we remembered.
+    #[test]
+    fn the_child_we_started_is_the_one_we_stop() {
+        assert_eq!(stop_action(true), StopAction::EndTheChildWeStarted);
+    }
+
+    /// Stopping by port is the thing this must never become, and an absence
+    /// cannot be read -- so it is pinned in the source.
+    #[test]
+    fn nothing_here_stops_a_process_by_port() {
+        let source = include_str!("vault_service.rs");
+        let cut = source.find("#[cfg(test)]").expect("control: this file has no test module");
+        let production = &source[..cut];
+        assert!(
+            production.contains("stop_action("),
+            "control: the stop decision no longer runs through `stop_action`, so this pin guards nothing"
+        );
+        for forbidden in ["TerminateProcess", "OpenProcess", "taskkill", "by_port", "find_pid"] {
+            assert!(
+                !production.contains(forbidden),
+                "`{forbidden}` appears here. The service is stopped through the child handle this process owns; ending whatever holds the port would kill a process this app cannot identify, which `verify` exists to refuse."
+            );
+        }
     }
 }
