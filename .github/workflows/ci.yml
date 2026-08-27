@@ -96,7 +96,12 @@ jobs:
       - name: Audit licences and advisories
         working-directory: deskwarden
         run: |
-          cargo install cargo-deny --locked --version ^0.16
+          # **^0.20, which is what this config was validated against.** It
+          # was pinned to ^0.16 first, and that failed on the very first CI
+          # run: `unmaintained = "workspace"` is a key 0.16.4 had removed and
+          # 0.20 reintroduced, so the config was correct locally and invalid
+          # on the runner. Pin the version you actually tested with.
+          cargo install cargo-deny --locked --version ^0.20
           cargo deny check licenses advisories
 
   # A picture of every surface this app draws, on every push, for a human to
