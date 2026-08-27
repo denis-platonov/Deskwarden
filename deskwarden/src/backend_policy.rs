@@ -130,6 +130,57 @@ pub fn choose(server_url: Option<&str>, use_official_bw_crypto: bool) -> VaultBa
     }
 }
 
+/// Whether a read may be answered from the encrypted disk copy before the
+/// vault service is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPath {
+    /// cache -> service -> server. The service still answers everything the
+    /// cache cannot.
+    CacheFirst,
+    /// service -> server. The file may still exist and be written; it is
+    /// simply not consulted on the way out.
+    ServiceOnly,
+}
+
+/// Which read path an account gets.
+///
+/// **Two inputs, and they are different questions.** `cache_vault_to_disk`
+/// asks *may an encrypted copy exist on disk*; `read_through_cache` asks
+/// *does a read consult it*. A user may want the file to exist for a fast
+/// cold start while a session reads through to the server for freshness.
+///
+/// The first is a veto: with no file permitted there is nothing to read, so
+/// the second cannot make one appear.
+///
+/// # The combinations, walked
+///
+/// `2026-08-27-one-door-to-the-vault.md` warned that the two settings could
+/// express "a configuration nobody wants -- `bw serve` with a cache-first
+/// read, where the cache is refreshed by a subprocess the user asked not to
+/// keep running". **That warning was wrong, and it is worth saying why**:
+/// that combination is not hypothetical, it is the feature the disk cache
+/// was built for. "Keep an encrypted copy of your vault on this PC" exists
+/// precisely so autofill works while `bw serve` is stopped, and
+/// `autofill_really_fills_from_a_restored_snapshot` pins it. All four
+/// combinations are wanted:
+///
+/// | service | read path | who wants it |
+/// | --- | --- | --- |
+/// | `bw serve` | cache-first | the save-memory user: the backend is stopped and a fill still works |
+/// | `bw serve` | service-only | today's default, no file involved |
+/// | direct REST | cache-first | the fastest path, and the one that lets the daemon stop holding secrets |
+/// | direct REST | service-only | a user who wants nothing at rest beyond the session |
+///
+/// So this function has no invalid pair to reject, and does not pretend to.
+#[must_use]
+pub fn read_path(cache_vault_to_disk: bool, read_through_cache: bool) -> ReadPath {
+    if cache_vault_to_disk && read_through_cache {
+        ReadPath::CacheFirst
+    } else {
+        ReadPath::ServiceOnly
+    }
+}
+
 // ---- the choice, as a fact about this process ------------------------------
 
 /// Everything this process needs to act on [`choose`]'s answer.
@@ -322,6 +373,34 @@ pub fn direct_rest_login() -> Option<crate::login_ui::DirectRestLogin> {
 
 #[cfg(test)]
 mod tests {
+    /// The four combinations, walked -- because the spec claimed one of them
+    /// was a configuration nobody wants and that claim was wrong. `bw serve`
+    /// with a cache-first read is the feature the disk cache was BUILT for:
+    /// autofill working while the backend is stopped.
+    #[test]
+    fn every_combination_of_the_two_cache_settings_has_an_answer() {
+        assert_eq!(read_path(true, true), ReadPath::CacheFirst);
+        assert_eq!(read_path(true, false), ReadPath::ServiceOnly);
+        // No file permitted, so there is nothing to read whatever the second
+        // setting says. The first is a veto.
+        assert_eq!(read_path(false, true), ReadPath::ServiceOnly);
+        assert_eq!(read_path(false, false), ReadPath::ServiceOnly);
+    }
+
+    /// **The veto direction is the one worth pinning.** Getting it backwards
+    /// would mean a user who turned the disk copy OFF still had reads served
+    /// from a file -- the setting they used to say "nothing of my vault on
+    /// this disk" quietly not meaning that.
+    #[test]
+    fn no_file_permitted_means_no_cache_read_however_the_other_setting_is_set() {
+        for read_through in [true, false] {
+            assert_eq!(
+                read_path(false, read_through),
+                ReadPath::ServiceOnly,
+                "a read consulted a file the user did not permit"
+            );
+        }
+    }
     use super::*;
     // ---- the published environment -----------------------------------------
 

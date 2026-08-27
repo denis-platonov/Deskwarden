@@ -1571,7 +1571,7 @@ pub(crate) mod tests {
     /// module reads back is `folders`, and a fixture that omitted it would
     /// pass the write and fail every read for a reason unrelated to what was
     /// being tested.
-    fn facts_for(folders: &[Folder]) -> Vec<u8> {
+    pub(crate) fn facts_for(folders: &[Folder]) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({ "items": [], "folders": folders }))
             .expect("the facts fixture")
     }

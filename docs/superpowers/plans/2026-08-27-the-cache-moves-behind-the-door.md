@@ -43,6 +43,19 @@ So this plan does the boundary **in-process**. Nothing gains or loses a process;
 
 ### Task 1: The door is asserted before it exists
 
+> **CORRECTED 2026-08-27, before implementing.** This task was written
+> expecting the pin to fail listing `app.rs`, on the belief that the fill
+> already called `item_from_disk`. It does not: that method is `pub` but its
+> only callers are its own tests. The debt is that it is *reachable*, not
+> that it is *reached*.
+> 
+> So there is no defect to demonstrate and a red test here would be
+> ceremony. The pin still earns its place -- as a **guard**, written
+> alongside Task 2, where `CachingBackend` appears and a bypass first becomes
+> possible. A guard that passes on the day it lands is fine when what it
+> guards did not exist the day before; a *red* test that was never red is
+> not.
+
 **Files:** Modify `deskwarden/src/vault_cache.rs`
 
 - [ ] **Step 1: Write the failing test** — a source pin, in `bw_serve_gate`'s idiom, that the disk cache's per-item read is reachable from exactly one module.

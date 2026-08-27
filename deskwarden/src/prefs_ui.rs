@@ -251,6 +251,34 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
 /// has to weigh.
 const DISK_CACHE_LABEL: &str = "Keep an encrypted copy of your vault on this PC";
 
+/// The read-path row's label, and the child of the one above it.
+///
+/// Phrased as what the user gets rather than as the mechanism: "read from
+/// the copy first" is a thing to want, where "cache-first read path" is a
+/// thing to look up.
+const READ_THROUGH_LABEL: &str = "Read from that copy first";
+
+/// The description under [`READ_THROUGH_LABEL`], in its two states.
+///
+/// # Why this row is a child
+///
+/// With no copy permitted there is nothing to read, so
+/// `backend_policy::read_path` answers `ServiceOnly` whatever this says.
+/// A live-looking switch that decides nothing is the defect this page
+/// already had once, with `keep_backend_running` sitting two pages from the
+/// setting that made it meaningless -- see `backend_description`. Ghosted,
+/// it says what would make it available and hands back the stored value
+/// unchanged.
+fn read_through_description(cache_on: bool) -> &'static str {
+    if cache_on {
+        "On, Deskwarden answers from the encrypted copy before asking your server -- which is \
+         what makes filling work when the connection to Bitwarden is stopped. Off keeps the \
+         copy on disk for a fast start but always asks the server for what it fills."
+    } else {
+        "Only applies when there is a copy to read -- the switch above."
+    }
+}
+
 /// The description shown under the disk-cache toggle, in its two states.
 ///
 /// **The wording is the requirement here, not an implementation detail**, and
@@ -1756,6 +1784,17 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             disk_cache_description(hello_available),
             state.settings.cache_vault_to_disk,
             hello_available,
+        );
+        row_separator(ui);
+        // The child of the row above: with no copy permitted there is nothing
+        // to read. Ghosted rather than hidden, for `child_toggle_row`'s usual
+        // reason -- a row that vanishes is a row a user cannot find out about.
+        state.settings.read_through_cache = child_toggle_row(
+            ui,
+            READ_THROUGH_LABEL,
+            read_through_description(state.settings.cache_vault_to_disk),
+            state.settings.read_through_cache,
+            state.settings.cache_vault_to_disk,
         );
         row_separator(ui);
         // The one switch that governs what a matched window does. It sits on
@@ -4525,12 +4564,13 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_six_toggles_and_one_stepper() {
+    fn general_paints_exactly_seven_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            6,
-            "six 40x22 pills: `cache_vault_to_disk`, `prompt_on_match`, `fetch_icons`, \
+            7,
+            "seven 40x22 pills: `cache_vault_to_disk` and its child `read_through_cache`, \
+             then `prompt_on_match`, `fetch_icons`, \
              `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
              The disk-cache pill is painted whether or not Windows Hello is available -- \
              ghosted and inert when it is not -- so this count does not depend on the machine \
@@ -4645,7 +4685,7 @@ mod tests {
         let first = frame(&ctx, &mut state, &[]);
         // SECOND pill down now: the encrypted disk cache is the only row
         // above it since the backend row left this page.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
@@ -5123,13 +5163,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // THIRD pill down now: disk cache, prompt, site icons, network
         // logos, TOTP secret, auto-lock. Three rows have left this page --
         // the breach row to Breaches, the update row to Updates, and the
         // backend row to Sync & account, where it is a child of the switch
         // that decides whether there is a backend to keep running at all.
-        let pill = pills[2].center();
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5172,10 +5212,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // FOURTH pill down: disk cache, prompt, site icons, network
         // logos, TOTP secret, auto-lock.
-        let pill = pills[3].center();
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5416,10 +5456,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
         // FIFTH pill down now: disk cache, prompt, site icons,
         // network logos, TOTP secret, auto-lock.
-        let pill = pills[4].center();
+        let pill = pills[5].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5468,7 +5508,7 @@ mod tests {
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
+        assert_eq!(pills.len(), 7);
         assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
         assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
@@ -5545,7 +5585,7 @@ mod tests {
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[5].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[6].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");

@@ -752,6 +752,13 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
+/// `true`, for `serde(default)` on a field whose absence must not read as
+/// off. A `settings.json` written before `read_through_cache` existed
+/// described a cache that WAS read, so defaulting it to `false` would change
+/// behaviour on upgrade for every user who had the disk cache on.
+fn default_true() -> bool {
+    true
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -1090,6 +1097,20 @@ pub struct Settings {
     /// value of the setting, and a weaker file under copy that promises one
     /// would be a misleading security claim.
     pub cache_vault_to_disk: bool,
+    /// Whether a read consults the encrypted copy before asking the vault
+    /// service.
+    ///
+    /// **Not the same question as [`Self::cache_vault_to_disk`]**, which asks
+    /// whether the file may exist at all. This one asks whether it is read on
+    /// the way out -- a user may want the file for a fast cold start while a
+    /// session reads through to the server for freshness. With no file
+    /// permitted this has nothing to decide; see
+    /// `backend_policy::read_path`.
+    ///
+    /// Defaults to `true` so that turning the disk cache on keeps behaving as
+    /// it did before this setting existed: the cache was built to be read.
+    #[serde(default = "default_true")]
+    pub read_through_cache: bool,
     /// Whether the app trusts `bw`'s own crypto implementation rather than
     /// this crate's, for the operations where both exist.
     ///
@@ -1212,6 +1233,7 @@ impl Default for Settings {
             clear_clipboard_on_quit: true,
             clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
             cache_vault_to_disk: false,
+            read_through_cache: true,
             use_official_bw_crypto: true,
             never_save_for_apps: Vec::new(),
             vault_window: None,
@@ -1345,6 +1367,7 @@ impl Settings {
             clear_clipboard_on_quit,
             clear_clipboard_seconds,
             cache_vault_to_disk,
+            read_through_cache,
             use_official_bw_crypto,
             // Owned by the overlay, not by the preferences window: it is
             // written by `Self::persist_never_save_for_app` from inside the 3c
@@ -1376,6 +1399,7 @@ impl Settings {
         on_disk.clear_clipboard_on_quit = *clear_clipboard_on_quit;
         on_disk.clear_clipboard_seconds = *clear_clipboard_seconds;
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
+        on_disk.read_through_cache = *read_through_cache;
         on_disk.use_official_bw_crypto = *use_official_bw_crypto;
         on_disk.save(path)
     }
@@ -1615,6 +1639,7 @@ mod tests {
     fn settings_round_trip_through_disk() {
         let path = temp_path("round-trip");
         let written = Settings {
+            read_through_cache: false,
             keep_backend_running: false,
             // Deliberately the OPPOSITE of `keep_backend_running`: two `bool`s that
             // agreed would round-trip identically through a writer that assigned
@@ -1863,6 +1888,7 @@ mod tests {
         // renamed on one side only) would look fine in memory.
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
+            read_through_cache: false,
             keep_backend_running: true,
             prompt_on_match: false,
             check_breaches: true,
@@ -2431,6 +2457,7 @@ mod tests {
     fn a_geometry_round_trips_through_disk_with_the_rest_of_the_file() {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
+            read_through_cache: false,
             keep_backend_running: false,
             prompt_on_match: true,
             check_breaches: true,

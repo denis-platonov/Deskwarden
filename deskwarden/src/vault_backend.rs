@@ -207,6 +207,133 @@ impl VaultBackend for VaultBridge {
 /// that is one extra pointer hop per vault operation, against an operation
 /// that is an HTTP round trip either way -- the same trade [`VaultBackend`]'s
 /// own doc already made for dynamic dispatch.
+use std::sync::Arc;
+
+/// **The vault service's door, with the encrypted cache behind it.**
+///
+/// Wraps another [`VaultBackend`] and answers `get_item` from the version 2
+/// disk file when it can, falling through when it cannot. Everything else
+/// goes straight to `inner`.
+///
+/// # Why this exists at all
+///
+/// Before it, a consumer that wanted one item without a live backend called
+/// `VaultCache::item_from_disk` -- a direct file read, from `app`. That is a
+/// second way to reach the vault, and
+/// `docs/superpowers/specs/2026-08-27-one-door-to-the-vault.md` says there
+/// is one. With the cache behind the door, a consumer holds a
+/// `VaultBackend` and cannot tell whether a cache exists, which is what
+/// lets the read path become a setting rather than a shape.
+///
+/// # Reads may be cached. Writes never are.
+///
+/// **Every write goes to `inner`, unconditionally.** A caching layer that
+/// answered a write from a file would be a vault that disagrees with the
+/// server -- and this crate has already paid for that defect class once, in
+/// `rest::write`, where a `PUT` built from a partial model deleted fields the
+/// server was holding. The rule here is mechanical so it cannot be reasoned
+/// away per method.
+///
+/// `list_items` is deliberately **not** cached either. A caller asking for
+/// the whole vault is asking for the vault, and `VaultCache`'s snapshot
+/// already serves that from memory; a second whole-vault path through the
+/// file would be two answers to one question.
+///
+/// # It answers nothing once the file is closed
+///
+/// `DiskCache::open_item` returns `None` after `close`, which the vault's
+/// lock calls. So a locked vault falls through to `inner` -- which will
+/// refuse, because it is locked too. That is the correct shape: the cache
+/// must not be a way around a lock.
+pub struct CachingBackend {
+    inner: Arc<dyn VaultBackend>,
+    disk: Arc<crate::vault_disk_cache::DiskCache>,
+}
+
+impl CachingBackend {
+    #[must_use]
+    pub fn new(inner: Arc<dyn VaultBackend>, disk: Arc<crate::vault_disk_cache::DiskCache>) -> Self {
+        Self { inner, disk }
+    }
+}
+
+impl VaultBackend for CachingBackend {
+    /// The one read that consults the file.
+    fn get_item(&self, id: &str) -> Result<VaultItem, VaultError> {
+        if let Some(item) = self.disk.open_item(id) {
+            return Ok(item);
+        }
+        self.inner.get_item(id)
+    }
+
+    // ---- everything below goes straight through --------------------------
+    //
+    // Written out rather than delegated by a macro on purpose: a new method
+    // on the trait fails to compile here until somebody decides which side
+    // of the read/write line it falls on. A blanket forward would silently
+    // make that decision for them, and the decision is the whole point of
+    // this type.
+
+    fn list_items(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.inner.list_items()
+    }
+    fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
+        self.inner.list_folders()
+    }
+    fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
+        self.inner.set_app_match(item, m)
+    }
+    fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+        self.inner.create_folder(name)
+    }
+    fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
+        self.inner.update_folder(id, name)
+    }
+    fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.delete_folder(id)
+    }
+    fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
+        self.inner.create_item(new_item)
+    }
+    fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+        self.inner.update_item(item)
+    }
+    fn move_item_to_folder(
+        &self,
+        item: &VaultItem,
+        folder_id: Option<&str>,
+    ) -> Result<VaultItem, VaultError> {
+        self.inner.move_item_to_folder(item, folder_id)
+    }
+    fn delete_item(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.delete_item(id)
+    }
+    fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.inner.list_trash()
+    }
+    fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.inner.list_archive()
+    }
+    fn archive_item(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.archive_item(id)
+    }
+    fn unarchive_item(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.unarchive_item(id)
+    }
+    fn restore_item(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.restore_item(id)
+    }
+    fn purge_item(&self, id: &str) -> Result<(), VaultError> {
+        self.inner.purge_item(id)
+    }
+    fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
+        self.inner.get_totp(id)
+    }
+    fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
+        self.inner.generate(request)
+    }
+}
+
 impl VaultBackend for Box<dyn VaultBackend> {
     fn list_items(&self) -> Result<Vec<VaultItem>, VaultError> {
         (**self).list_items()
@@ -713,6 +840,255 @@ mod late_bound_tests {
                 .generate(&GenerateRequest::Password(Default::default()))
                 .expect("answers"),
             "generated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod caching_backend_tests {
+    use super::*;
+    use crate::vault_bridge::VaultItem;
+    use crate::vault_disk_cache::tests::{cache_with_key, facts_for, temp_dir_for};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts every call that reaches it, so "the cache answered" and "the
+    /// backend answered" are distinguishable -- which asserting on the
+    /// returned value alone cannot do, because both would return an item.
+    #[derive(Default)]
+    struct Counting {
+        gets: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    fn an_item(id: &str) -> VaultItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "Example",
+            "fields": [],
+            "type": 1,
+            "login": { "username": "me@example.com", "password": "hunter2" }
+        }))
+        .expect("the fixture item")
+    }
+
+    impl VaultBackend for Counting {
+        fn get_item(&self, id: &str) -> Result<VaultItem, VaultError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(an_item(id))
+        }
+        fn list_items(&self) -> Result<Vec<VaultItem>, VaultError> {
+            Ok(Vec::new())
+        }
+        fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
+            Ok(Vec::new())
+        }
+        fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
+            Ok(Vec::new())
+        }
+        fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
+            Ok(Vec::new())
+        }
+        fn set_app_match(&self, item: &VaultItem, _m: &AppMatch) -> Result<VaultItem, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(item.clone())
+        }
+        fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(Folder { id: "f".to_string(), name: name.to_string(), other: Default::default() })
+        }
+        fn update_folder(&self, _id: &str, name: &str) -> Result<Folder, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(Folder { id: "f".to_string(), name: name.to_string(), other: Default::default() })
+        }
+        fn delete_folder(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn create_item(&self, _n: &NewItem) -> Result<VaultItem, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(an_item("new"))
+        }
+        fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(item.clone())
+        }
+        fn move_item_to_folder(
+            &self,
+            item: &VaultItem,
+            _f: Option<&str>,
+        ) -> Result<VaultItem, VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(item.clone())
+        }
+        fn delete_item(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn archive_item(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unarchive_item(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn restore_item(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn purge_item(&self, _id: &str) -> Result<(), VaultError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn get_totp(&self, _id: &str) -> Result<Option<String>, VaultError> {
+            Ok(None)
+        }
+        fn generate(&self, _r: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
+            Ok(Zeroizing::new(String::new()))
+        }
+    }
+
+    /// A caching backend over a real version 2 file holding `id`.
+    fn over_a_file_holding(name: &str, id: &str) -> (Arc<Counting>, CachingBackend) {
+        let dir = temp_dir_for(name);
+        let disk = Arc::new(cache_with_key(&dir));
+        disk.write("fp", &facts_for(&[]), &[an_item(id)], &[]).expect("the file");
+        assert!(
+            matches!(disk.load_facts("fp"), crate::vault_disk_cache::DiskFactsLoad::Loaded { .. }),
+            "control: the file did not open, so nothing below tests the cache"
+        );
+        let inner = Arc::new(Counting::default());
+        (inner.clone(), CachingBackend::new(inner, disk))
+    }
+
+    /// **One door.** `DiskCache::open_item` is how the vault service reaches
+    /// a single secret; a consumer calling it directly is a second way to
+    /// reach the vault, and
+    /// `docs/superpowers/specs/2026-08-27-one-door-to-the-vault.md` says
+    /// there is one.
+    ///
+    /// Read over this crate's source rather than enforced by visibility,
+    /// because both live in the same crate: `pub(crate)` would still let
+    /// `app.rs` call it, and moving the module is a bigger change than this
+    /// rule needs. `bw_serve_gate`'s idiom, applied to a different door.
+    ///
+    /// **A guard, not a demonstration.** It passes on the day it lands: at
+    /// the time of writing nothing outside these two modules called it. The
+    /// plan for this work expected it to fail listing `app.rs` and that was
+    /// wrong -- the debt was that the read was *reachable*, not that it was
+    /// *reached*. What it guards is the next edit.
+    #[test]
+    fn nothing_outside_the_vault_service_opens_an_item_from_the_file() {
+        let needle = concat!("open_", "item(");
+        let mut callers: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
+            .expect("the crate's src directory")
+        {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a source file");
+            if source.contains(needle) {
+                callers.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        callers.sort();
+        assert!(
+            callers.len() >= 2,
+            "control: the scan found {callers:?}, so the needle no longer matches the code \
+             it names and this guard is vacuous"
+        );
+        assert_eq!(
+            callers,
+            vec!["vault_backend.rs", "vault_disk_cache.rs"],
+            "something outside the vault service opens an item straight out of the cache \
+             file, so a read can bypass the backend the user configured"
+        );
+    }
+
+    /// **The read the door exists for**: it is answered from the file, and
+    /// the backend behind it is never asked.
+    #[test]
+    fn get_item_is_answered_from_the_file_without_asking_the_backend() {
+        let (inner, backend) = over_a_file_holding("caching-hit", "item-1");
+        let got = backend.get_item("item-1").expect("the item");
+        assert_eq!(got.id, "item-1");
+        assert_eq!(
+            inner.gets.load(Ordering::SeqCst),
+            0,
+            "the backend was asked anyway, so the cache is decoration"
+        );
+    }
+
+    /// An id the file does not hold falls through, rather than failing.
+    #[test]
+    fn a_miss_falls_through_to_the_backend() {
+        let (inner, backend) = over_a_file_holding("caching-miss", "item-1");
+        let got = backend.get_item("item-2").expect("the item");
+        assert_eq!(got.id, "item-2");
+        assert_eq!(inner.gets.load(Ordering::SeqCst), 1, "the miss did not reach the backend");
+    }
+
+    /// **The cache is not a way around a lock.** `close` is what the vault's
+    /// lock calls; after it the file answers nothing and the read falls
+    /// through to a backend which -- in the running app -- is locked too.
+    #[test]
+    fn a_closed_file_falls_through_rather_than_answering() {
+        let dir = temp_dir_for("caching-closed");
+        let disk = Arc::new(cache_with_key(&dir));
+        disk.write("fp", &facts_for(&[]), &[an_item("item-1")], &[]).expect("the file");
+        assert!(matches!(
+            disk.load_facts("fp"),
+            crate::vault_disk_cache::DiskFactsLoad::Loaded { .. }
+        ));
+        let inner = Arc::new(Counting::default());
+        let backend = CachingBackend::new(inner.clone(), disk.clone());
+        assert!(backend.get_item("item-1").is_ok());
+        assert_eq!(inner.gets.load(Ordering::SeqCst), 0, "control: it was cached before");
+
+        disk.close();
+        assert!(backend.get_item("item-1").is_ok());
+        assert_eq!(
+            inner.gets.load(Ordering::SeqCst),
+            1,
+            "a locked vault was still answered out of the cache"
+        );
+    }
+
+    /// **Every write reaches the backend.** Driven one at a time rather than
+    /// asserted about `get_item`'s neighbours in prose, because the failure
+    /// this guards is a FUTURE method quietly answered from a file -- a vault
+    /// that disagrees with the server, which this crate has already paid for
+    /// once in `rest::write`.
+    #[test]
+    fn every_write_reaches_the_backend() {
+        let (inner, backend) = over_a_file_holding("caching-writes", "item-1");
+        let item = an_item("item-1");
+        let m = AppMatch {
+            process: "x.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: String::new(),
+            args: String::new(),
+            sequence: String::new(),
+            trigger: crate::app_match::TriggerMode::Prompt,
+        };
+        backend.set_app_match(&item, &m).unwrap();
+        backend.create_folder("f").unwrap();
+        backend.update_folder("f", "g").unwrap();
+        backend.delete_folder("f").unwrap();
+        backend.update_item(&item).unwrap();
+        backend.move_item_to_folder(&item, None).unwrap();
+        backend.delete_item("item-1").unwrap();
+        backend.archive_item("item-1").unwrap();
+        backend.unarchive_item("item-1").unwrap();
+        backend.restore_item("item-1").unwrap();
+        backend.purge_item("item-1").unwrap();
+        assert_eq!(
+            inner.writes.load(Ordering::SeqCst),
+            11,
+            "a write was answered somewhere other than the backend"
         );
     }
 }
