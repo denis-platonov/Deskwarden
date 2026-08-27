@@ -66,7 +66,7 @@ pub fn bearer_of(header: Option<&str>) -> Option<&str>;      // pure parse
 `user_key_store`'s idiom for the file: DPAPI-wrapped, at a path the caller
 chooses, so a test drives a temp path and never `%APPDATA%`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -114,10 +114,12 @@ fn the_token_type_does_not_derive_debug() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.** `cargo test --lib -- service_token` — expected: `cannot find function mint`.
-- [ ] **Step 3: Implement.** `mint` hex-encodes 32 random bytes. `matches` folds a difference over the whole of both strings and compares lengths without an early return. `bearer_of` requires the exact prefix `"Bearer "`.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run to verify they fail.** `cargo test --lib -- service_token` — expected: `cannot find function mint`.
+- [x] **Step 3: Implement.** `mint` hex-encodes 32 random bytes. `matches` folds a difference over the whole of both strings and compares lengths without an early return. `bearer_of` requires the exact prefix `"Bearer "`.
+- [x] **Step 4: Run to verify they pass.** Plus a mutation check: an early return inserted into `matches` made the source pin fail, and removing it made it pass.
+- [x] **Step 5: Commit.**
+
+**Note against the plan as written:** the plan proposed a `expose_for_test_only_in_this_module` accessor. That would have been a test-only seam, which is banned crate-wide. `Token::expose` is a single production method with its two legitimate callers named, used by the tests as well.
 
 ---
 

@@ -110,6 +110,10 @@ pub mod scratch_window;
 /// downstream of it is a pure function.
 pub mod screen_capture;
 pub mod send;
+/// The bearer token the local vault service requires. Read its module doc
+/// for what it stops and -- more importantly -- what it does not: a program
+/// already running as the owner is not kept out by it.
+pub mod service_token;
 pub mod session_store;
 pub mod settings;
 pub mod signature;
