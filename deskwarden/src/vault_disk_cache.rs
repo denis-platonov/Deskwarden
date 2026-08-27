@@ -375,19 +375,17 @@ pub(crate) fn content_key_of(
     Ok(Zeroizing::new(content_key))
 }
 
-/// The whole snapshot: the facts section is skipped and every item is
-/// opened.
+/// The whole snapshot, given a content key already unwrapped.
 ///
-/// **Still here, and still whole**, because the callers that want an entire
-/// vault -- the vault window, a cache-first startup -- have not changed. What
-/// version 2 adds is the ABILITY to not do this; it does not make doing it
-/// wrong.
-pub(crate) fn decode_body(
-    hello_key: &[u8; 32],
+/// Split from [`decode_body_from_hello`] because `load` now unwraps the key
+/// in its shared preamble and would otherwise unwrap it twice -- which is
+/// not merely wasteful: two unwraps are two places that can disagree about
+/// what a bad key means.
+pub(crate) fn decode_body_with(
+    content_key: &[u8; CONTENT_KEY_LEN],
     header: &CacheHeader,
     parsed: &Parsed,
 ) -> Result<DiskSnapshot, String> {
-    let content_key = content_key_of(hello_key, parsed)?;
     let mut items = Vec::with_capacity(header.index.len());
     for slot in &header.index {
         let plaintext = open_item_at(&content_key, &parsed.header_bytes, &parsed.body, slot)?;
@@ -632,6 +630,26 @@ impl DiskCacheEnv {
 /// because they call for different actions. In particular [`Self::Unavailable`]
 /// must **leave the file alone** while [`Self::Rejected`] and [`Self::Corrupt`]
 /// must delete it.
+impl DiskFactsLoad {
+    /// The same refusal, as [`DiskCacheLoad`].
+    ///
+    /// Only the refusals convert: `Loaded` carries facts, which a
+    /// whole-snapshot caller has no use for, and a conversion that invented
+    /// an empty vault for it would be a silent wrong answer. It is
+    /// unreachable because the shared preamble never produces one.
+    fn into_load(self) -> DiskCacheLoad {
+        match self {
+            Self::Absent => DiskCacheLoad::Absent,
+            Self::Rejected(reason) => DiskCacheLoad::Rejected(reason),
+            Self::Unavailable(e) => DiskCacheLoad::Unavailable(e),
+            Self::Corrupt(e) => DiskCacheLoad::Corrupt(e),
+            Self::Loaded { .. } => DiskCacheLoad::Corrupt(
+                "the shared preamble returned facts to a whole-snapshot caller".to_string(),
+            ),
+        }
+    }
+}
+
 /// What [`DiskCache::load_facts`] found.
 ///
 /// Deliberately the same refusal vocabulary as [`DiskCacheLoad`] rather than
@@ -895,66 +913,35 @@ impl DiskCache {
     /// wrong-version file is deleted without the user being asked for a
     /// biometric on behalf of a file about to be thrown away.
     pub fn load(&self, fingerprint: &str) -> DiskCacheLoad {
-        let (file, tmp) = {
-            let paths = self.lock_paths();
-            (paths.file.clone(), paths.tmp.clone())
-        };
-        // A .tmp left by a crash mid-write is meaningless and must not be
-        // mistaken for anything; clear it whenever we touch the directory.
-        let _ = std::fs::remove_file(&tmp);
-
-        let wrapped = match std::fs::read(&file) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DiskCacheLoad::Absent,
-            Err(e) => {
-                log::warn!("could not read the vault cache file: {e}");
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
-        };
-
-        let inner = match (self.env.unwrap)(&wrapped) {
-            Ok(bytes) => Zeroizing::new(bytes),
-            Err(e) => {
-                log::warn!("{e}; deleting it");
-                self.delete_quietly(&file, RejectReason::Malformed);
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
-        };
-
-        let (header, parsed) = match parse_header(&inner) {
+        let file = self.lock_paths().file.clone();
+        // The same preamble `load_facts` runs, so the two cannot drift in
+        // which failures delete the file or when Hello is asked.
+        let (header, parsed, key) = match self.opened_file(fingerprint) {
             Ok(v) => v,
-            Err(e) => {
-                log::warn!("the vault cache file is unusable: {e}");
-                self.delete_quietly(&file, RejectReason::Malformed);
-                return DiskCacheLoad::Rejected(RejectReason::Malformed);
-            }
+            Err(refusal) => return refusal.into_load(),
         };
-
-        if let Err(reason) = check_header(&header, now_unix(), fingerprint) {
-            log::info!("discarding the vault cache: it is {}", reason.as_str());
-            self.delete_quietly(&file, reason);
-            return DiskCacheLoad::Rejected(reason);
-        }
-
-        // Only now, with the file known to be ours and current, is it worth
-        // asking the user for a biometric.
-        let key = {
-            let mut state = self.lock_key();
-            match self.ensure_key(&mut state) {
-                Ok(key) => key,
-                Err(e) => {
-                    log::info!("not using the vault cache this session: {e}");
-                    return DiskCacheLoad::Unavailable(e);
+        match decode_body_with(&key, &header, &parsed) {
+            Ok(snapshot) => {
+                let written_at = UNIX_EPOCH + Duration::from_secs(header.written_at);
+                // **The file is left open here too.** A caller that read the
+                // whole vault may still want one item later -- a fill, after
+                // the snapshot has been cleared by a lock -- and requiring
+                // `load_facts` for that would mean two ways to arrive at the
+                // same state, one of which silently does not work.
+                if let Ok(mut slot) = self.open.lock() {
+                    *slot = Some(OpenFile {
+                        header,
+                        header_bytes: parsed.header_bytes,
+                        body: parsed.body,
+                        content_key: key,
+                    });
+                }
+                DiskCacheLoad::Loaded {
+                    items: snapshot.items,
+                    folders: snapshot.folders,
+                    written_at,
                 }
             }
-        };
-
-        match decode_body(&key, &header, &parsed) {
-            Ok(snapshot) => DiskCacheLoad::Loaded {
-                items: snapshot.items,
-                folders: snapshot.folders,
-                written_at: UNIX_EPOCH + Duration::from_secs(header.written_at),
-            },
             Err(e) => {
                 log::warn!("the vault cache could not be decrypted ({e}); deleting it");
                 let _ = std::fs::remove_file(&file);
@@ -1041,7 +1028,15 @@ impl DiskCache {
         &self,
         fingerprint: &str,
     ) -> Result<(CacheHeader, Parsed, Zeroizing<[u8; CONTENT_KEY_LEN]>), DiskFactsLoad> {
-        let file = self.lock_paths().file.clone();
+        let (file, tmp) = {
+            let paths = self.lock_paths();
+            (paths.file.clone(), paths.tmp.clone())
+        };
+        // A leftover temp file is a write that was interrupted. Removed here,
+        // in the shared preamble, so both entry points clean it up -- it was
+        // `load`'s alone until the preamble was split out, and a `load_facts`
+        // that left one behind would be a slow leak nobody looked for.
+        let _ = std::fs::remove_file(&tmp);
         let wrapped = match std::fs::read(&file) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1555,6 +1550,22 @@ pub(crate) mod tests {
     fn facts_for(folders: &[Folder]) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({ "items": [], "folders": folders }))
             .expect("the facts fixture")
+    }
+
+    /// Unwrap the content key, then read the body -- the two steps `load`
+    /// takes, as one call so the tests below read as they did before the
+    /// preamble was split out.
+    ///
+    /// A helper here rather than a wrapper in production: nothing in the app
+    /// unwraps a key just to read a whole body any more, and a function kept
+    /// alive for tests is a function that stops matching what runs.
+    fn decode_body(
+        hello_key: &[u8; 32],
+        header: &CacheHeader,
+        parsed: &Parsed,
+    ) -> Result<DiskSnapshot, String> {
+        let content_key = content_key_of(hello_key, parsed)?;
+        decode_body_with(&content_key, header, parsed)
     }
 
     fn key(seed: u8) -> [u8; 32] {
