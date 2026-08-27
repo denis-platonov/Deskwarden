@@ -112,9 +112,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 **An unverifiable service is not adopted and not killed.** It is left alone and the app reports that it could not start its backend. Killing a process this app cannot identify is worse than refusing to use it.
 
-- [ ] **Step 1: Write the failing tests** — a service that holds the object and matches the fingerprint is adopted; one that holds it but serves a *different* account is refused; one that answers the port while holding nothing is refused and **not killed**.
+- [x] **Step 1: Write the failing tests** — a service that holds the object and matches the fingerprint is adopted; one that holds it but serves a *different* account is refused; one that answers the port while holding nothing is refused and **not killed**.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** red first this time -- the tests were run and failed on missing `verify`, `Verdict`, `Refusal`, `service_object_name` and the `stop` field before any of them existed.
 
 ---
 

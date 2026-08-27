@@ -68,6 +68,12 @@ pub struct ServiceEnv {
     /// answer "yes" forever after the first ask, which is this module's whole
     /// hazard.
     pub is_held: fn(&str) -> bool,
+    /// Ends the service listening on a port.
+    ///
+    /// Present so that [`verify`] refusing to call it is a fact a test can
+    /// assert rather than a property of a signature. An unverifiable
+    /// process is never passed here.
+    pub stop: fn(u16),
 }
 
 /// A live hold on one name. Dropping it releases the name; so does the
@@ -155,6 +161,84 @@ impl Register {
     }
 }
 
+/// The named object the service itself holds, per account and per logon
+/// session.
+///
+/// The fingerprint is in the **name**, not in an answer read off the port.
+/// An answer can be forged by anything that has read this repository; a name
+/// binds the object to the account before it is opened, so `verify` never
+/// has to trust what the port said about *which* account it serves -- only
+/// to notice when it disagrees.
+///
+/// `Local\\` for [`crate::app_mutex`]'s reason: a second logon session is a
+/// different user, and its service is not ours to adopt.
+#[must_use]
+pub fn service_object_name(account_fingerprint: &str) -> String {
+    format!("Local\\Deskwarden-Vault-{account_fingerprint}")
+}
+
+/// What to do about a service that is already listening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// It is ours, for this account. Reconnect rather than restart.
+    Adopt,
+    /// Leave it alone, and say why.
+    Refuse(Refusal),
+}
+
+/// Why a listening service was not adopted.
+///
+/// These are kept apart because the caller acts differently on each:
+/// silence means start one, the other two mean report that the backend could
+/// not be started and change nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nothing answered on the port.
+    NothingAnswered,
+    /// Something answered, but no service object is held for the account it
+    /// claimed. Any process can bind a loopback port and answer our shape of
+    /// JSON; loopback is not an authentication boundary.
+    NothingHoldsTheServiceObject,
+    /// A real service, holding a real object -- for a different account.
+    ServesAnotherAccount,
+}
+
+/// Whether the thing listening on `port` may be adopted.
+///
+/// `claimed` is the account fingerprint the listener says it is serving, or
+/// `None` if nothing answered. It is **not trusted**: it selects which name
+/// to test, and a listener that claims an account it cannot prove fails at
+/// the next line.
+///
+/// The pid is deliberately not part of this. Pids are reused, and the case
+/// this has to survive is exactly the one where the app that remembered a
+/// pid is gone.
+///
+/// # What this does not defend against
+///
+/// A process in **this same logon session** could create the service name
+/// first and squat it. That is not a boundary this can hold: a same-session
+/// process already has this user's DPAPI. What it does mean is that our own
+/// service then fails to create its name and refuses to start, which is the
+/// safe direction -- stated here rather than left to be discovered.
+#[must_use]
+pub fn verify(env: &ServiceEnv, ours: &str, claimed: Option<&str>, port: u16) -> Verdict {
+    let _ = port;
+    let Some(claimed) = claimed else {
+        return Verdict::Refuse(Refusal::NothingAnswered);
+    };
+    // Asked about the name the LISTENER claims, not the name we want. Testing
+    // only our own name would report a second account's service as an
+    // impostor, and the two need different handling.
+    if !(env.is_held)(&service_object_name(claimed)) {
+        return Verdict::Refuse(Refusal::NothingHoldsTheServiceObject);
+    }
+    if claimed != ours {
+        return Verdict::Refuse(Refusal::ServesAnotherAccount);
+    }
+    Verdict::Adopt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,7 +285,7 @@ mod tests {
     }
 
     fn env() -> ServiceEnv {
-        ServiceEnv { hold, is_held }
+        ServiceEnv { hold, is_held, stop }
     }
 
     /// Two apps attached at once, which one shared mutex could not express.
@@ -280,8 +364,93 @@ mod tests {
             None
         }
         let register = Register::new();
-        let env = ServiceEnv { hold: never, is_held };
+        let env = ServiceEnv { hold: never, is_held, stop };
         assert!(register.attach(&env, "app-a").is_none());
         assert!(!register.anyone_attached(&env));
+    }
+    // ---- Task 2: proving a running service is ours --------------------
+
+    static STOPS: AtomicUsize = AtomicUsize::new(0);
+
+    fn stop(_: u16) {
+        STOPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    const OURS: &str = "aa11";
+    const THEIRS: &str = "bb22";
+
+    fn verify_env() -> ServiceEnv {
+        STOPS.store(0, Ordering::SeqCst);
+        ServiceEnv { hold, is_held, stop }
+    }
+
+    /// A service that holds its own object AND is serving this account is
+    /// the one we started, or one an earlier launch started. Adopt it: the
+    /// alternative costs a cold start and, on the direct backend, another
+    /// Windows Hello prompt.
+    #[test]
+    fn a_service_holding_its_object_for_our_account_is_adopted() {
+        reset();
+        let env = verify_env();
+        let _service = (env.hold)(&service_object_name(OURS)).expect("service holds its name");
+        assert_eq!(verify(&env, OURS, Some(OURS), 8087), Verdict::Adopt);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0);
+    }
+
+    /// The second account on one machine. It is a real service, holding a
+    /// real object -- just not ours. Adopting it would hand this app another
+    /// user's vault, which is the failure the fingerprint exists to stop.
+    #[test]
+    fn a_service_serving_another_account_is_refused() {
+        reset();
+        let env = verify_env();
+        let _service = (env.hold)(&service_object_name(THEIRS)).expect("their service");
+        assert_eq!(
+            verify(&env, OURS, Some(THEIRS), 8087),
+            Verdict::Refuse(Refusal::ServesAnotherAccount)
+        );
+    }
+
+    /// **The security-critical one.** Something answered on the port and
+    /// said the right thing -- anyone who has read this repository can do
+    /// that -- but holds no service object. It is refused, and it is
+    /// **not stopped**: killing a process this app cannot identify is worse
+    /// than declining to use it.
+    #[test]
+    fn a_port_that_answers_while_holding_nothing_is_refused_and_not_stopped() {
+        reset();
+        let env = verify_env();
+        assert_eq!(
+            verify(&env, OURS, Some(OURS), 8087),
+            Verdict::Refuse(Refusal::NothingHoldsTheServiceObject)
+        );
+        assert_eq!(
+            STOPS.load(Ordering::SeqCst),
+            0,
+            "an unverifiable process on the port was killed; this app could not identify it"
+        );
+    }
+
+    /// Nothing answered at all. Distinct from an impostor, because the
+    /// caller acts differently: here it starts a service, there it refuses
+    /// to and says why.
+    #[test]
+    fn a_silent_port_is_refused_as_silent_and_not_as_an_impostor() {
+        reset();
+        let env = verify_env();
+        assert_eq!(verify(&env, OURS, None, 8087), Verdict::Refuse(Refusal::NothingAnswered));
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0);
+    }
+
+    /// The account check must come from comparing fingerprints, not from a
+    /// name that happens not to open. Without this, refusing every unknown
+    /// account would look identical to a squatted-name bug.
+    #[test]
+    fn the_object_name_separates_accounts() {
+        assert_ne!(service_object_name(OURS), service_object_name(THEIRS));
+        assert!(
+            service_object_name(OURS).starts_with("Local\\"),
+            "the service object must be logon-session scoped, as app_mutex is"
+        );
     }
 }
