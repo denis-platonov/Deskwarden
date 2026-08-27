@@ -2289,12 +2289,19 @@ mod tests {
     fn nothing_the_daemon_can_reach_hands_back_a_password() {
         let cache = cache_for("http://127.0.0.1:1".to_string());
         let epoch = cache.epoch();
-        cache.populate_with_vault(
-            VaultSnapshot {
-                items: body_list(items_body_with_a_password()),
-                folders: Vec::new(),
-            },
-            epoch,
+        // The outcome is asserted rather than discarded: a populate that was
+        // refused would leave the snapshot empty, and this test would then
+        // pass by finding no password in nothing at all.
+        assert_eq!(
+            cache.populate_with_vault(
+                VaultSnapshot {
+                    items: body_list(items_body_with_a_password()),
+                    folders: Vec::new(),
+                },
+                epoch,
+            ),
+            PopulateOutcome::Populated,
+            "control: the snapshot was not filled, so there is nothing to find a password in"
         );
         let reachable: Vec<String> = cache
             .items()
