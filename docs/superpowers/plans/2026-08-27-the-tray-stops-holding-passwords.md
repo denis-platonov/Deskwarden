@@ -167,6 +167,35 @@ Add `ItemFacts` and `VaultCache::facts()`, which maps the snapshot without cloni
 
 ### Task 3: A fill fetches its secret
 
+> **BLOCKED, found 2026-08-27 while writing the test. Do not implement as
+> written.**
+>
+> Making the fill always call `get_item` breaks a shipped feature, and the test
+> one screen below the one this task was modelled on says so:
+>
+> > **Autofill really fills from a snapshot restored off the encrypted disk
+> > file, with `bw serve` genuinely absent** … the path that makes autofill
+> > work with the backend fully stopped.
+>
+> The cached password is not a convenience. It is what lets a fill work with no
+> backend running at all — the whole point of `cache_vault_to_disk`, and what
+> makes a cache-first launch possible. This plan's cost section called that a
+> *latency* trade ("a fill may pay a round trip"). It is a **capability**
+> trade, and the plan was wrong.
+>
+> **What unblocks it is the spec, not a workaround**: with the encrypted cache
+> as the vault's home, the daemon reads **one item** out of the file on demand
+> and decrypts it, instead of either holding 1,666 in RAM or needing a live
+> backend. `vault_disk_cache` is whole-snapshot today
+> (`load(fingerprint) -> DiskCacheLoad`), so **per-item read is the piece to
+> build**, and it belongs to
+> `2026-08-27-the-vault-lives-in-a-place-not-a-process.md`.
+>
+> **So this branch delivers Task 2 and stops.** That is a real reduction — the
+> account picker and *Search vault* no longer clone the vault, and
+> `app_candidates` cannot see a password at all — but it is not the headline,
+> and the headline needs the cache work.
+
 **Files:** Modify `deskwarden/src/app.rs`
 
 **Interfaces:** Consumes `VaultCache::backend_handle` / `bridge().get_item`.
@@ -213,6 +242,13 @@ Watch for the latency claim: a fill now always makes a backend call. On direct R
 ---
 
 ### Task 4: The assertion for the gate that is not open yet
+
+> **Also blocked, and now by two gates rather than one.** Task 3 above is the
+> second: the snapshot cannot drop its passwords while a fill reads them, and a
+> fill must read them while it has to work with the backend stopped. Keep
+> Task 1's test red rather than ignoring it — an `#[ignore]` was the right
+> shape when one task remained; with the work moved wholesale to another plan,
+> a red test is the more honest marker and the suite already tolerates it.
 
 **Files:** Modify `deskwarden/src/vault_cache.rs`
 
