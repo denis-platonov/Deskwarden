@@ -2225,6 +2225,50 @@ mod tests {
         VaultCache::new(VaultBridge::new(url))
     }
 
+    /// One item that actually carries a password, which `items_body`'s do
+    /// not. Separate rather than added to that fixture, because every test
+    /// using it asserts on a two-item list and a third would move them all.
+    fn items_body_with_a_password() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1,
+             "login":{"username":"me@example.com","password":"hunter2"}}
+        ]}}"#
+    }
+
+    /// **The daemon must not hold a decrypted password.**
+    ///
+    /// It owns the tray, the hotkey and the match engine, and it runs for
+    /// days. `clear()` empties the snapshot on lock -- but auto-lock is a
+    /// setting a user can turn off, and the owner's is off with a 999-minute
+    /// timeout, so "until the vault locks" is in practice "until the process
+    /// exits".
+    ///
+    /// Driven through the public accessor a caller actually has rather than
+    /// by reaching into the field: what matters is what the daemon can
+    /// *reach*.
+    #[test]
+    fn nothing_the_daemon_can_reach_hands_back_a_password() {
+        let cache = cache_for("http://127.0.0.1:1".to_string());
+        let epoch = cache.epoch();
+        cache.populate_with_vault(
+            VaultSnapshot {
+                items: body_list(items_body_with_a_password()),
+                folders: Vec::new(),
+            },
+            epoch,
+        );
+        let reachable: Vec<String> = cache
+            .items()
+            .into_iter()
+            .filter_map(|item| item.login.and_then(|l| l.password).map(|p| p.to_string()))
+            .collect();
+        assert!(
+            reachable.is_empty(),
+            "the daemon can read {} cached password(s) out of its own snapshot",
+            reachable.len()
+        );
+    }
+
     fn items_body() -> &'static str {
         r#"{"success":true,"data":{"data":[
             {"id":"1","name":"Alpha","fields":[],"type":1},
