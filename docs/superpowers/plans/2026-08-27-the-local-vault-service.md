@@ -25,15 +25,47 @@ stop a program already running as the owner. That is the same limit
 thing available without a per-client credential the owner would have to
 manage.
 
-## Scope: the new capability only
+## The API is `bw serve`'s, not a new one
 
-**The daemon and the vault window are NOT migrated to HTTP.** They keep their
-current in-process `VaultBackend`. Migrating two working apps is a separate
-piece of work with no user-visible benefit on its own, and doing it here would
-put the risk of that migration in front of the feature that is actually new.
+**Corrected 2026-08-27, after Task 1.** The first draft of this plan invented
+`/items` and `/items/{id}`. That was wrong, and the crate itself says why:
+`vault_bridge` is already a complete client for `bw serve`'s API --
+`/list/object/items`, `/object/item/{id}`, `/object/item`,
+`/restore/item/{id}` -- and has been for the whole life of this project.
 
-This plan delivers: a script can read the vault. That is all, and it is the
-whole point of the third consumer.
+Speaking that API instead of a new one buys three things a new one does not:
+
+1. **Scripts already written against `bw serve` keep working**, apart from
+   the auth header.
+2. **The daemon and the vault window are a base-URL change**, not a
+   migration. `VaultBridge::new(base_url)` already takes the address; pointing
+   it at this service instead of `bw serve` is the whole of it.
+3. **Dropping the `bw` CLI becomes invisible.** This is a drop-in for
+   `bw serve`, backed by `rest::` and the encrypted cache rather than by a
+   Node binary.
+
+The earlier draft's "the daemon and window are NOT migrated" section is
+withdrawn: it was solving a problem the invented API had created. Migration
+is still not in *this* plan -- it is a separate, small, testable change --
+but it is no longer a rewrite standing in the way.
+
+## What is served is plaintext, and that is the point
+
+This service answers with **decrypted** vault items. The remote Bitwarden API
+serves encrypted blobs that only a holder of the master-password-derived key
+can read; this one serves what those blobs say, over a loopback socket,
+guarded by a bearer token any process running as the owner can read.
+
+That is exactly what `bw serve` is, and exactly why `bw serve` is kept in a
+kill-on-close job object today. It is unavoidable if the goal is "a program
+the owner writes can read the vault" -- a script cannot derive the key. It is
+written here so that it is a decision on the record rather than a property
+someone discovers.
+
+**One consequence for the compatible API:** `bw serve` requires no
+credential at all. This service requires one, so a script written against
+`bw serve` needs a header added. That is a deliberate incompatibility, and
+the only one -- see Task 0.
 
 ## Global Constraints
 
@@ -132,9 +164,10 @@ authorization header). The socket is Task 4's problem, and no test binds one.
 
 **Interfaces:**
 ```rust
-pub enum Route { Status, Items, Item(String), Unknown }
+pub enum Route { Status, ListItems, Item(String), ListFolders, Unknown }
 pub enum Answer { Ok(Route), Unauthorized, NotFound, MethodNotAllowed }
 pub fn decide(method: &str, path: &str, auth: Option<&str>, expected: &Token) -> Answer;
+// Paths are `bw serve`'s: /status, /list/object/items, /list/object/folders, /object/item/{id}
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -144,7 +177,7 @@ pub fn decide(method: &str, path: &str, auth: Option<&str>, expected: &Token) ->
 #[test]
 fn every_route_refuses_an_unauthenticated_caller() {
     let expected = crate::service_token::mint(|| [1u8; 32]);
-    for path in ["/status", "/items", "/items/abc", "/nonsense"] {
+    for path in ["/status", "/list/object/items", "/object/item/abc", "/nonsense"] {
         assert_eq!(
             decide("GET", path, None, &expected),
             Answer::Unauthorized,
@@ -167,9 +200,12 @@ fn an_authenticated_caller_reaches_the_routes() {
     let expected = crate::service_token::mint(|| [1u8; 32]);
     let header = format!("Bearer {}", expected.expose_for_test_only_in_this_module());
     assert_eq!(decide("GET", "/status", Some(&header), &expected), Answer::Ok(Route::Status));
-    assert_eq!(decide("GET", "/items", Some(&header), &expected), Answer::Ok(Route::Items));
     assert_eq!(
-        decide("GET", "/items/abc", Some(&header), &expected),
+        decide("GET", "/list/object/items", Some(&header), &expected),
+        Answer::Ok(Route::ListItems)
+    );
+    assert_eq!(
+        decide("GET", "/object/item/abc", Some(&header), &expected),
         Answer::Ok(Route::Item("abc".to_string()))
     );
 }
@@ -182,9 +218,9 @@ fn writing_methods_are_refused_even_when_authenticated() {
     let header = format!("Bearer {}", expected.expose_for_test_only_in_this_module());
     for method in ["POST", "PUT", "DELETE", "PATCH"] {
         assert_eq!(
-            decide(method, "/items", Some(&header), &expected),
+            decide(method, "/list/object/items", Some(&header), &expected),
             Answer::MethodNotAllowed,
-            "{method} /items was allowed; this service is read-only"
+            "{method} /list/object/items was allowed; this service is read-only for now"
         );
     }
 }
@@ -209,36 +245,60 @@ fn an_unknown_path_is_not_a_way_to_learn_which_routes_exist() {
 
 **Files:** Modify `deskwarden/src/service_api.rs`
 
-`/items` returns `app::ItemFacts` — the projection that already exists
-precisely because it has no field a secret fits in. `/items/{id}` returns one
-full item, because fetching a password is the point of the third consumer.
+**A conflict the corrected API forces, resolved here rather than discovered
+later.** The first draft had `/list/object/items` return `app::ItemFacts` --
+the projection with no field a secret fits in -- so that fetching a password
+was one call a reviewer could find. **Compatibility makes that impossible:**
+`bw serve`'s list returns full items, and `VaultBridge::populate` needs them
+that way to fill credentials. A facts-only list would break the crate's own
+client and every existing script, to protect a boundary the bearer token has
+already been chosen to be.
+
+**Decision: the list is compatible, and returns full items.** The reasons:
+
+- The token is the boundary. A caller that reached this endpoint has already
+  presented it; withholding passwords from a caller entitled to fetch each
+  one individually is theatre, not a control.
+- The alternative protects nothing an attacker cannot get with N more
+  requests, while breaking the primary consumer.
+- `bw serve` does this today. This is a drop-in for it, and a drop-in that
+  answers differently is not one.
+
+What is NOT given up, and must be tested:
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-/// The list endpoint is a list of facts, not of items. A script that wants
-/// a password asks for one by id, which is one call a reviewer can find.
+/// Compatibility is the requirement, so it is asserted rather than assumed:
+/// the shape `VaultBridge` already parses is the shape this answers with.
 #[test]
-fn the_list_endpoint_carries_no_secret() {
-    let body = items_body(&[fact_with_everything_filled()]);
-    for forbidden in ["password", "totp", "notes", "card", "identity"] {
-        assert!(
-            !body.to_lowercase().contains(forbidden),
-            "`{forbidden}` appears in the list body; the list is facts only"
-        );
-    }
+fn the_list_body_is_what_our_own_client_already_parses() {
+    let body = list_items_body(&[an_item_with_a_password()]);
+    let parsed = crate::vault_bridge::parse_items_response(&body)
+        .expect("our own client could not read our own list body");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].login_password().as_deref(), Some("hunter2"));
 }
 
-/// Control: the body is not empty, or the assertions above prove nothing.
+/// Control: an empty body would satisfy nothing above by accident.
 #[test]
-fn the_list_endpoint_actually_lists() {
-    let body = items_body(&[fact_with_everything_filled()]);
-    assert!(body.contains("example.com"), "control: nothing was serialised: {body}");
+fn the_list_body_actually_carries_the_item() {
+    assert!(list_items_body(&[an_item_with_a_password()]).contains("example.com"));
+}
+
+/// **The line that does not move.** Serving secrets to an authenticated
+/// caller is the point; serving them to an unauthenticated one is the
+/// failure. Task 2 refuses the request; this asserts no body is built on
+/// the way to that refusal.
+#[test]
+fn no_body_is_built_for_a_caller_that_was_refused() {
+    let expected = crate::service_token::mint(|| [1u8; 32]);
+    assert_eq!(body_for(decide("GET", "/list/object/items", None, &expected)), None);
 }
 ```
 
 - [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement** `items_body` over `ItemFacts` and `item_body` over one `VaultItem`.
+- [ ] **Step 3: Implement** `list_items_body`, `item_body` and `body_for`.
 - [ ] **Step 4: Run to verify they pass.**
 - [ ] **Step 5: Commit.**
 
@@ -297,6 +357,6 @@ it, and the owner must be able to turn it off. Off is the default.
 
 - [ ] Full suite `--lib` and `--bin deskwarden`; CI as arbiter.
 - [ ] `cargo clippy --all-targets` and `cargo deny check licenses advisories` clean.
-- [ ] **A live check, and it is the point of the feature:** start the service, `curl` `/items` with no token (expect 401), with a wrong token (401), with the right token (a list with no secrets in it), then `/items/{id}` for one password. Confirm from a second logon session, or state plainly that it was not tested.
+- [ ] **A live check, and it is the point of the feature:** start the service, `curl` `/list/object/items` with no token (expect 401), with a wrong token (401), with the right token (a list with no secrets in it), then `/object/item/{id}` for one password. Confirm from a second logon session, or state plainly that it was not tested.
 - [ ] **Ask before launching Deskwarden.** Starting a build trips `single_instance`'s takeover and kills the owner's running app; that has already happened once here.
 - [ ] Say plainly what the token does and does not stop.
