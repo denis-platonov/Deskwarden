@@ -109,6 +109,44 @@ Committed red, on its own, so the defect is in the history as something that was
 
 ### Task 2: Point the startup door at the spawn
 
+> **ATTEMPTED 2026-08-26 AND REVERTED. Read this before writing any code.**
+>
+> Task 2 as written below is **not achievable**, and two existing pins are why.
+> Both were found by making the mistake, not by reading ahead. The attempt is
+> reverted; Task 1's red test stands.
+>
+> **First wrong turn: spawning in the startup branch.** The obvious edit is to
+> call `spawn_the_vault_window_in_its_own_process()` where `run_from_working`
+> was. It compiles, and it leads straight to `child.wait()` — because that
+> block has nothing to poll a child with. `the_daemon_never_blocks_on_a_ui_
+> process_pin` forbids `child.wait()` **by name**, and its doc says why: the
+> owner reported *"Ctrl Alt B should work with main window open"* twice, and
+> blocking there leaves the hotkey queued until the window closes. The pin
+> caught it immediately.
+>
+> **Second wrong turn: asking for the window at the dispatcher.** With
+> blocking ruled out, the window has to be requested where `ui_windows`
+> exists — the `if startup_vault.is_some()` call at roughly `main.rs:2160`.
+> That works, satisfies the no-blocking pin, and breaks a *different* one:
+>
+> > the launch that already has a session shows no window of its own any more,
+> > so the user watches nothing at all for the eight seconds `bw serve` takes
+>
+> Because the dispatcher runs **after** `wait_for_vault_ready`. The plan's own
+> "spawn first, probe behind it" ordering is right and cannot be had there.
+>
+> **What this actually needs.** `ui_windows` is created at `main.rs:2168`,
+> about a thousand lines below the startup block. Every route to a correct fix
+> goes through **moving the registry's creation above the startup block** so
+> the window can be requested before the probe runs, and the loop can poll the
+> child the whole time. That is a change to `main`'s startup ordering, not to
+> this branch, and it deserves its own plan with the estate/tray dependencies
+> mapped first — `ui_windows` is declared where it is because the comment
+> above it says the tray must exist, and the tray is built just above it.
+>
+> Until then the defect stands and is understood: **32 hand-launches drew in
+> the daemon, 3 spawned.**
+
 **Files:** Modify `deskwarden/src/main.rs`
 
 - [ ] **Step 1: Replace the branch body**
