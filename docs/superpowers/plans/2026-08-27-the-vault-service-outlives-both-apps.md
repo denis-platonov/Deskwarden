@@ -129,9 +129,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 **The job object moves rather than disappearing.** `bw serve` is still spawned suspended into a job — but the job is held by whatever supervises the count, so the kernel still kills it when *nothing* is attached, rather than when one particular app dies. That keeps most of the old guarantee: the orphan window is between the last release and the supervisor noticing, not unbounded.
 
-- [ ] **Step 1: Write the failing tests** — two concurrent starts produce one service; the loser attaches rather than failing; releasing the last attachment stops it; releasing one of two does not.
+- [x] **Step 1: Write the failing tests** — two concurrent starts produce one service; the loser attaches rather than failing; releasing the last attachment stops it; releasing one of two does not.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** done in `vault_service.rs`. **`main.rs` wiring is NOT done** and is deliberately deferred until Task 4: wiring this in is the moment the job object's kill-on-close guarantee is given up, and the thing that bounds the resulting orphan window does not exist yet. Landing the mechanism first and the switch-over after Task 4 keeps the daemon from ever being in a state where nothing closes that window.
 
 ---
 

@@ -41,15 +41,21 @@
 //! immediately -- a name with no live holder cannot be opened, and a handle
 //! dropped at once does not keep one alive.
 //!
-//! # The list of names is a hint, not a count
+//! # There is no list of names
 //!
-//! Something has to say which names to try. That is the one piece of
-//! bookkeeping here, and it is deliberately the kind that degrades safely: a
-//! stale entry costs one failed open, and a missing entry costs an app that is
-//! attached but unseen -- which is why an entry is written *before* the vault
-//! is used and not after.
+//! Something has to say which names to try. The first version of this module
+//! kept a register of the names in use -- and that register was in-process,
+//! so two apps in two processes did not share it, which is exactly the case
+//! it existed for.
+//!
+//! A **fixed slot space** removes it. The names are `Deskwarden-Attach-0`
+//! through `-15`; an app takes the first one it can create, and a supervisor
+//! probes all sixteen. Every process derives the same names from the same
+//! constant, so there is no bookkeeping to share, go stale, or be written
+//! before a crash. The cost is a ceiling of sixteen simultaneous apps, which
+//! is eight times more than this design has uses for.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The kernel calls this module makes, as `fn` pointers.
 ///
@@ -100,64 +106,139 @@ impl Held {
 /// the case the design exists for, and is handled by the same mechanism: the
 /// name goes with the process.
 pub struct Attachment {
-    name: String,
+    slot: usize,
     _held: Held,
-    register: Arc<Mutex<Vec<String>>>,
 }
 
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        if let Ok(mut names) = self.register.lock() {
-            names.retain(|n| n != &self.name);
-        }
+impl Attachment {
+    /// Which slot this claim occupies. Exposed for logging: a user looking
+    /// at two attached apps should be able to tell them apart.
+    #[must_use]
+    pub fn slot(&self) -> usize {
+        self.slot
     }
 }
 
-/// The names this machine has been told to watch.
+/// How many apps can be attached at once.
 ///
-/// In-process for now, and that is a real limitation stated rather than
-/// hidden: two apps in two processes do not share this `Vec`. Making it
-/// cross-process -- a small file, or the registry -- is the next step and is
-/// deliberately not taken here, so the decision about *where* it lives is
-/// made once, with the service's own start-up, rather than twice.
-#[derive(Clone, Default)]
-pub struct Register(Arc<Mutex<Vec<String>>>);
+/// Two today -- the daemon and the vault window. Sixteen so that a stuck
+/// name, a second account, or a future third app costs nothing, and small
+/// enough that probing every slot is one cheap loop rather than a scan.
+///
+/// **This constant is what replaces the register.** An earlier version of
+/// this module kept a list of the names in use, and that list was
+/// in-process: two apps in two processes did not share it. A fixed slot
+/// space needs no list at all -- the names are the same in every process
+/// because they are a constant, so the bookkeeping that could go stale is
+/// gone rather than moved into a file.
+pub const SLOTS: usize = 16;
 
-impl Register {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+/// The name of one attachment slot, per logon session.
+#[must_use]
+pub fn attach_slot_name(slot: usize) -> String {
+    format!("Local\\Deskwarden-Attach-{slot}")
+}
+
+/// Claims the first free slot, or `None` if all of them are taken.
+///
+/// `hold` is exclusive -- `app_mutex::take_if_free`'s idiom -- so two apps
+/// racing for the same slot cannot both win it, and the loser simply moves
+/// to the next one.
+///
+/// The slot is claimed **before** the caller can use the vault, so a
+/// supervisor looking during start-up sees an attached app rather than
+/// missing one.
+#[must_use]
+pub fn attach(env: &ServiceEnv) -> Option<Attachment> {
+    (0..SLOTS).find_map(|slot| {
+        (env.hold)(&attach_slot_name(slot)).map(|held| Attachment { slot, _held: held })
+    })
+}
+
+/// Whether any slot still has a live holder.
+///
+/// Every slot is asked about: a dead slot is not evidence about the others,
+/// and slots are not claimed in order once one is released.
+#[must_use]
+pub fn anyone_attached(env: &ServiceEnv) -> bool {
+    (0..SLOTS).any(|slot| (env.is_held)(&attach_slot_name(slot)))
+}
+
+/// What starting the vault service did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// A service was already running and proved itself. **Reconnect always
+    /// precedes restart**: restarting costs a cold start and, on the direct
+    /// backend, another Windows Hello prompt.
+    Adopted,
+    /// Nothing was running, and this app started one.
+    StartedIt,
+    /// Another app was starting one at the same moment. Losing that race is
+    /// not an error -- the loser waits for the winner's service and adopts
+    /// it, which is the whole point of there being one door.
+    AdoptedAfterLosingRace,
+    /// Something is on the port that this app cannot identify, or a service
+    /// for another account is running. Nothing is started and nothing is
+    /// stopped; the caller reports that it has no backend.
+    Refused(Refusal),
+    /// The race was lost and the winner's service never appeared.
+    RaceWonByNobody,
+}
+
+/// Starting a service, as `fn` pointers, for [`ServiceEnv`]'s reason.
+pub struct StartEnv {
+    /// The account fingerprint whatever is on `port` claims to serve, or
+    /// `None` if nothing answered. Never trusted -- see [`verify`].
+    pub probe: fn(u16) -> Option<String>,
+    /// Spawns the service. `false` if it could not be spawned.
+    pub start: fn(u16) -> bool,
+    /// Claims the right to be the one that starts it. `None` means another
+    /// app got there first. The same named-object race `single_instance`
+    /// already resolves, rather than a second scheme.
+    pub take_start_lock: fn() -> Option<Held>,
+    /// The loser's brief wait, before it looks at the port a second time.
+    ///
+    /// A seam and not a `sleep` inside this function, for the usual reason:
+    /// a hidden sleep makes every test that reaches this path slow, and a
+    /// test cannot assert that the wait happened at all. Losing the race and
+    /// re-probing in the same instant would find nothing almost every time,
+    /// which would turn every race into a spurious `RaceWonByNobody`.
+    pub settle: fn(),
+}
+
+/// Adopt a running service, or start one, in that order.
+#[must_use]
+pub fn ensure_running(env: &ServiceEnv, start: &StartEnv, ours: &str, port: u16) -> Startup {
+    // Reconnect before restart, always.
+    match verify(env, ours, (start.probe)(port).as_deref(), port) {
+        Verdict::Adopt => return Startup::Adopted,
+        Verdict::Refuse(Refusal::NothingAnswered) => {}
+        Verdict::Refuse(other) => return Startup::Refused(other),
     }
 
-    /// Claims the vault under `name`, if the name can be created.
-    ///
-    /// The name is recorded **before** the caller can use the vault, so a
-    /// supervisor that looks in the window between creating and recording
-    /// sees an attached app rather than missing one.
-    #[must_use]
-    pub fn attach(&self, env: &ServiceEnv, name: &str) -> Option<Attachment> {
-        let held = (env.hold)(name)?;
-        if let Ok(mut names) = self.0.lock() {
-            names.push(name.to_string());
-        }
-        Some(Attachment { name: name.to_string(), _held: held, register: self.0.clone() })
-    }
-
-    /// Whether any recorded name still has a live holder.
-    ///
-    /// Every name is asked about; the first live one is enough, but the loop
-    /// does not stop early on a *dead* one -- a dead name is not evidence
-    /// about the others.
-    #[must_use]
-    pub fn anyone_attached(&self, env: &ServiceEnv) -> bool {
-        let Ok(names) = self.0.lock() else {
-            // A poisoned lock is not evidence that nobody is attached, and
-            // answering "no" here would stop the service out from under a
-            // running app. The safe answer is the one that keeps the vault
-            // available.
-            return true;
+    let Some(_lock) = (start.take_start_lock)() else {
+        // Lost the race. The winner is starting one; give it a moment and ask
+        // the port again, rather than starting a second service on top of it.
+        (start.settle)();
+        return match verify(env, ours, (start.probe)(port).as_deref(), port) {
+            Verdict::Adopt => Startup::AdoptedAfterLosingRace,
+            Verdict::Refuse(Refusal::NothingAnswered) => Startup::RaceWonByNobody,
+            Verdict::Refuse(other) => Startup::Refused(other),
         };
-        names.iter().any(|name| (env.is_held)(name))
+    };
+
+    if (start.start)(port) { Startup::StartedIt } else { Startup::RaceWonByNobody }
+}
+
+/// Releases this app's claim, and stops the service if it was the last one.
+///
+/// Takes the `Attachment` by value: the release and the check cannot be
+/// separated, because a check that ran before the release would always see
+/// this app still attached and never stop anything.
+pub fn release(env: &ServiceEnv, attachment: Attachment, port: u16) {
+    drop(attachment);
+    if !anyone_attached(env) {
+        (env.stop)(port);
     }
 }
 
@@ -243,6 +324,7 @@ pub fn verify(env: &ServiceEnv, ours: &str, claimed: Option<&str>, port: u16) ->
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // The fake kernel is the two statics below rather than a value: the seam
@@ -270,9 +352,15 @@ mod tests {
         }
     }
 
+    /// Exclusive, as the real `CreateMutexW` + `ERROR_ALREADY_EXISTS` check
+    /// is: a name already held cannot be held again. A permissive fake here
+    /// would let `attach` hand two apps the same slot and every slot test
+    /// below would pass without meaning anything.
     fn hold(name: &str) -> Option<Held> {
         let mut live = LIVE.lock().ok()?;
-        live.as_mut()?.insert(name.to_string());
+        if !live.as_mut()?.insert(name.to_string()) {
+            return None;
+        }
         Some(Held::new(Arc::new(Guard(name.to_string()))))
     }
 
@@ -292,14 +380,25 @@ mod tests {
     #[test]
     fn two_apps_can_be_attached_at_the_same_time() {
         reset();
-        let register = Register::new();
-        let a = register.attach(&env(), "app-a").expect("a");
-        let b = register.attach(&env(), "app-b").expect("b");
-        assert!(register.anyone_attached(&env()));
+        let a = attach(&env()).expect("a");
+        let b = attach(&env()).expect("b");
+        assert_ne!(a.slot(), b.slot(), "two apps were handed the same slot");
+        assert!(anyone_attached(&env()));
         drop(a);
-        assert!(register.anyone_attached(&env()), "one release ended the vault for both apps");
+        assert!(anyone_attached(&env()), "one release ended the vault for both apps");
         drop(b);
-        assert!(!register.anyone_attached(&env()));
+        assert!(!anyone_attached(&env()));
+    }
+
+    /// A released slot is reusable, which is what makes a fixed space of
+    /// sixteen enough: without this, sixteen launches would exhaust it.
+    #[test]
+    fn a_released_slot_is_handed_out_again() {
+        reset();
+        let first = attach(&env()).expect("first");
+        let slot = first.slot();
+        drop(first);
+        assert_eq!(attach(&env()).expect("second").slot(), slot);
     }
 
     /// **The test the design exists for.** An app that dies without releasing
@@ -308,19 +407,19 @@ mod tests {
     #[test]
     fn an_abandoned_attachment_still_reads_as_detached() {
         reset();
-        let register = Register::new();
-        let attached = register.attach(&env(), "app-crashes").expect("attached");
-        assert!(register.anyone_attached(&env()), "control: it was attached first");
+        let attached = attach(&env()).expect("attached");
+        let name = attach_slot_name(attached.slot());
+        assert!(anyone_attached(&env()), "control: it was attached first");
 
         // The crash: the `Attachment` is abandoned, so neither its `Drop` nor
         // the guard's runs -- exactly what a killed process does to a Rust
         // value. The kernel is what ends the hold, and the fake stands in for
-        // that below.
+        // that here.
         std::mem::forget(attached);
-        LIVE.lock().unwrap().as_mut().unwrap().remove("app-crashes");
+        LIVE.lock().unwrap().as_mut().unwrap().remove(&name);
 
         assert!(
-            !register.anyone_attached(&env()),
+            !anyone_attached(&env()),
             "a crashed app still reads as attached, so the service would hold the vault with \
              nobody using it"
         );
@@ -330,44 +429,32 @@ mod tests {
     /// a checker that keeps alive what it is checking -- `CreateMutexW` on an
     /// existing name opens a handle to it, and a named object lives as long
     /// as any handle does.
-    ///
-    /// Driven against an ABANDONED name rather than a cleanly released one,
-    /// because a clean release removes the entry from the register and then
-    /// there is nothing left to ask about -- the first version of this test
-    /// asked about an empty register and its own control caught it.
     #[test]
     fn asking_never_makes_a_name_live() {
         reset();
-        let register = Register::new();
-        let attached = register.attach(&env(), "app-a").expect("a");
-        std::mem::forget(attached);
-        LIVE.lock().unwrap().as_mut().unwrap().remove("app-a");
-
         for _ in 0..5 {
-            assert!(
-                !register.anyone_attached(&env()),
-                "asking whether anyone is attached made the name live again"
-            );
+            assert!(!anyone_attached(&env()), "asking made a name live");
         }
         assert!(
-            OPENS.load(Ordering::SeqCst) >= 5,
-            "control: the fake kernel was not consulted, so this proves nothing about asking"
+            OPENS.load(Ordering::SeqCst) >= 5 * SLOTS,
+            "control: the fake kernel was not consulted for every slot"
         );
+        // And the names really are unclaimed afterwards -- if asking had
+        // created them, this would find no free slot.
+        assert!(attach(&env()).is_some());
     }
 
-    /// A name that cannot be created is not recorded, so a later ask does not
-    /// report an app that never attached.
+    /// The space is finite, and running out is a refusal rather than a slot
+    /// handed out twice.
     #[test]
-    fn a_name_that_cannot_be_created_attaches_nothing() {
+    fn a_full_slot_space_refuses_rather_than_overlapping() {
         reset();
-        fn never(_: &str) -> Option<Held> {
-            None
-        }
-        let register = Register::new();
-        let env = ServiceEnv { hold: never, is_held, stop };
-        assert!(register.attach(&env, "app-a").is_none());
-        assert!(!register.anyone_attached(&env));
+        let held: Vec<_> = (0..SLOTS).map(|_| attach(&env()).expect("slot")).collect();
+        assert!(attach(&env()).is_none());
+        drop(held);
+        assert!(attach(&env()).is_some());
     }
+
     // ---- Task 2: proving a running service is ours --------------------
 
     static STOPS: AtomicUsize = AtomicUsize::new(0);
@@ -452,5 +539,162 @@ mod tests {
             service_object_name(OURS).starts_with("Local\\"),
             "the service object must be logon-session scoped, as app_mutex is"
         );
+    }
+    // ---- Task 3: start, reconnect, exit -------------------------------
+
+    const PORT: u16 = 8087;
+    static STARTS: AtomicUsize = AtomicUsize::new(0);
+    /// What the fake service on the port claims to serve.
+    static CLAIM: Mutex<Option<String>> = Mutex::new(None);
+    /// The service object the fake service holds while it runs. Kept in a
+    /// static because `start` is a `fn` pointer and cannot own it.
+    static SERVICE: Mutex<Option<Held>> = Mutex::new(None);
+
+    fn probe(_: u16) -> Option<String> {
+        CLAIM.lock().ok()?.clone()
+    }
+
+    /// Starting the service does the two things a real one does: it holds
+    /// its own named object, and it answers on the port.
+    fn start(_: u16) -> bool {
+        STARTS.fetch_add(1, Ordering::SeqCst);
+        *SERVICE.lock().unwrap() = hold(&service_object_name(OURS));
+        *CLAIM.lock().unwrap() = Some(OURS.to_string());
+        true
+    }
+
+    fn take_start_lock() -> Option<Held> {
+        hold("Local\\Deskwarden-Vault-Starting")
+    }
+
+    static SETTLES: AtomicUsize = AtomicUsize::new(0);
+
+    fn settle() {
+        SETTLES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn start_env() -> StartEnv {
+        StartEnv { probe, start, take_start_lock, settle }
+    }
+
+    /// Resets the Task 3 fakes on top of [`reset`].
+    fn reset_service() {
+        reset();
+        STARTS.store(0, Ordering::SeqCst);
+        STOPS.store(0, Ordering::SeqCst);
+        *CLAIM.lock().unwrap() = None;
+        *SERVICE.lock().unwrap() = None;
+        SETTLES.store(0, Ordering::SeqCst);
+    }
+
+    /// Nothing running, so this app starts one.
+    #[test]
+    fn the_first_app_starts_the_service() {
+        reset_service();
+        assert_eq!(ensure_running(&env(), &start_env(), OURS, PORT), Startup::StartedIt);
+        assert_eq!(STARTS.load(Ordering::SeqCst), 1);
+        assert_eq!(SETTLES.load(Ordering::SeqCst), 0, "the winner waited for itself");
+    }
+
+    /// **Reconnect precedes restart, always.** Restarting costs a cold start
+    /// and, on the direct backend, another Windows Hello prompt -- so a
+    /// service that proves itself must not be replaced.
+    #[test]
+    fn a_running_service_is_adopted_without_starting_a_second_one() {
+        reset_service();
+        start(PORT);
+        STARTS.store(0, Ordering::SeqCst);
+        assert_eq!(ensure_running(&env(), &start_env(), OURS, PORT), Startup::Adopted);
+        assert_eq!(STARTS.load(Ordering::SeqCst), 0, "a second service was started on top of ours");
+    }
+
+    /// Two apps launching together must not start two services, and **losing
+    /// that race is not an error**: the loser adopts the winner's service.
+    ///
+    /// The interleaving matters, and the first version of this test got it
+    /// wrong. If the winner is already answering when the loser looks, the
+    /// loser adopts at the *first* probe and never reaches the race at all --
+    /// which is correct, and is what `a_running_service_is_adopted...` above
+    /// covers. The losing path needs the harder ordering: the port is silent
+    /// when the loser looks, the start lock is gone, and the winner comes up
+    /// while the loser is deciding. `probe_winner_arrives_late` is that
+    /// timing, not a convenience.
+    #[test]
+    fn two_concurrent_starts_produce_one_service_and_the_loser_attaches() {
+        reset_service();
+        let _lock = take_start_lock().expect("winner holds the start lock, having not yet spawned");
+
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        fn probe_winner_arrives_late(port: u16) -> Option<String> {
+            if PROBES.fetch_add(1, Ordering::SeqCst) == 0 {
+                return None; // the loser looks: nothing is up yet
+            }
+            // Between the two looks, the winner finished starting.
+            *SERVICE.lock().unwrap() = hold(&service_object_name(OURS));
+            let _ = port;
+            Some(OURS.to_string())
+        }
+        PROBES.store(0, Ordering::SeqCst);
+
+        let late = StartEnv { probe: probe_winner_arrives_late, start, take_start_lock, settle };
+        assert_eq!(ensure_running(&env(), &late, OURS, PORT), Startup::AdoptedAfterLosingRace);
+        assert_eq!(
+            STARTS.load(Ordering::SeqCst),
+            0,
+            "the loser started a second service instead of attaching to the winner's"
+        );
+        assert_eq!(
+            SETTLES.load(Ordering::SeqCst),
+            1,
+            "the loser re-probed in the same instant it lost, which finds nothing almost every time"
+        );
+    }
+
+    /// The race was lost and the winner never got a service up. Reported as
+    /// its own outcome rather than as an adoption, because the caller has no
+    /// backend and has to say so.
+    #[test]
+    fn losing_the_race_to_an_app_that_never_starts_one_is_reported() {
+        reset_service();
+        let _lock = take_start_lock().expect("winner takes the start lock");
+        assert_eq!(
+            ensure_running(&env(), &start_env(), OURS, PORT),
+            Startup::RaceWonByNobody
+        );
+    }
+
+    /// A service for a different account is neither adopted nor replaced.
+    #[test]
+    fn a_service_for_another_account_is_left_alone() {
+        reset_service();
+        let _theirs = hold(&service_object_name(THEIRS)).expect("their service");
+        *CLAIM.lock().unwrap() = Some(THEIRS.to_string());
+        assert_eq!(
+            ensure_running(&env(), &start_env(), OURS, PORT),
+            Startup::Refused(Refusal::ServesAnotherAccount)
+        );
+        assert_eq!(STARTS.load(Ordering::SeqCst), 0, "a second service was started on their port");
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0, "another account's service was stopped");
+    }
+
+    /// The last attachment released exits the service.
+    #[test]
+    fn releasing_the_last_attachment_stops_the_service() {
+        reset_service();
+        let only = attach(&env()).expect("attached");
+        release(&env(), only, PORT);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 1);
+    }
+
+    /// Releasing one of two does not -- the other app is still using it.
+    #[test]
+    fn releasing_one_of_two_leaves_the_service_running() {
+        reset_service();
+        let first = attach(&env()).expect("first");
+        let second = attach(&env()).expect("second");
+        release(&env(), first, PORT);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 0, "the second app lost its vault");
+        release(&env(), second, PORT);
+        assert_eq!(STOPS.load(Ordering::SeqCst), 1);
     }
 }
