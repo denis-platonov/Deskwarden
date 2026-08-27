@@ -167,6 +167,28 @@ pub fn open_item(&self, id: &str) -> Option<VaultItem>;          // one secret, 
 
 ### Task 3: The cache holds facts
 
+> **PARTLY DONE, and the rest is gated. Read before starting.**
+> 
+> What landed: `VaultCache::item_from_disk` reaches one secret out of the v2
+> file, and `clear()` closes it so a lock takes the content key away. Those
+> are the pieces that do not depend on the question below, and they are what
+> Task 4 needs.
+> 
+> What did not: **the snapshot still holds `VaultItem`s.** Two in-process
+> vault windows read them straight out of it --
+> `main.rs:1371` (`run_from_working`, the hand-launch path) and
+> `main.rs:6463` (`run_from_vault`, after sign-in). Both take the cache and
+> expect whole items, so narrowing the snapshot breaks the window rather than
+> the daemon.
+> 
+> This is the same gate as
+> `2026-08-26-startup-window-in-its-own-process.md`, which has four
+> documented walls -- the last of them found only by running the app. It is
+> not a second problem and must not get a second solution: **either both
+> windows become UI processes, or the window fetches items itself.** Whichever
+> is chosen goes in `vault_cache`'s module doc, because an undocumented split
+> here is how two vault shapes come to exist.
+
 **Files:** Modify `deskwarden/src/vault_cache.rs`
 
 The snapshot stops carrying `VaultItem`s when the disk cache is the source. `VaultCache::project` already exists and callers already take `ItemFacts`, so this is where those two meet.

@@ -656,11 +656,6 @@ impl DiskFactsLoad {
 /// a reduced one: the two entry points share every step up to the
 /// decryption, so a reason one can give and the other cannot would mean they
 /// had drifted.
-/// `Debug` for the same reason [`DiskCacheLoad`] has one: tests assert on
-/// the refusal rather than on a bare `false`. `facts` prints as its length,
-/// not its bytes -- it is the caller's shape and this module will not decide
-/// it is safe to print.
-#[derive(Debug)]
 pub enum DiskFactsLoad {
     Loaded {
         /// The caller's own shape, opaque here. See [`DiskCache::write`].
@@ -671,6 +666,35 @@ pub enum DiskFactsLoad {
     Rejected(RejectReason),
     Unavailable(String),
     Corrupt(String),
+}
+
+/// Hand-written, and `debug_leak_guard` is why: a derived one prints
+/// `facts`, which is a whole vault's worth of names and usernames at best
+/// and whatever the caller put there at worst.
+///
+/// **This module cannot know the facts section is secret-free.** It takes
+/// opaque bytes on purpose -- that is the layering that keeps it from having
+/// opinions about what a projection contains -- and the price of not knowing
+/// is that it must not print them. The length is what a reader debugging a
+/// load actually needs.
+///
+/// The comment on this type used to *claim* the length-only behaviour while
+/// the type carried a `#[derive(Debug)]`. The guard caught it; the claim is
+/// now the implementation.
+impl std::fmt::Debug for DiskFactsLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loaded { facts, written_at } => f
+                .debug_struct("Loaded")
+                .field("facts", &format_args!("<{} bytes>", facts.len()))
+                .field("written_at", written_at)
+                .finish(),
+            Self::Absent => f.write_str("Absent"),
+            Self::Rejected(reason) => f.debug_tuple("Rejected").field(reason).finish(),
+            Self::Unavailable(e) => f.debug_tuple("Unavailable").field(e).finish(),
+            Self::Corrupt(e) => f.debug_tuple("Corrupt").field(e).finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
