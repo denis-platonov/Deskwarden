@@ -29,12 +29,25 @@
 //! tell an unauthenticated caller which routes exist, which is a map of the
 //! API handed to somebody who has not shown they may have one.
 //!
-//! **Read-only, and refused by method rather than by omission.** `bw serve`
-//! accepts writes. This does not, yet, and a write arriving by accident --
-//! because a route was added and a method list was not -- is exactly how that
-//! would go wrong. Every writing method is refused explicitly.
+//! **The scope is checked here, not in a handler.** A handler that checks
+//! its own permissions is a handler somebody adds a route without. Putting
+//! the check between routing and the answer is what makes a per-item grant
+//! real rather than decorative: `/object/item/{id}` is checked against THAT
+//! id, in the one place every request passes through.
+//!
+//! # Writes
+//!
+//! The method is not a gate; it is an [`Access`]. `GET` asks to read and
+//! everything else asks to write, and the scope decides. An earlier version
+//! of this module refused every writing method outright -- that was caution,
+//! and it was wrong twice over: it made half the scope model decorative, and
+//! it would have stopped `VaultBridge` ever pointing here, which is the whole
+//! compatibility argument. What was right about it was only the ordering:
+//! writes must not exist before scopes do, which is why they arrive in the
+//! same change as the check that bounds them.
 
-use crate::service_token::{bearer_of, matches, Token};
+use crate::service_keys::{permits, Access, KeyRecord, Subject};
+use crate::service_token::bearer_of;
 
 /// A route this service serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,29 +66,50 @@ pub enum Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     /// Serve this route.
-    Ok(Route),
-    /// No credential, or the wrong one. **Returned before the path is
-    /// parsed**, so it is also the answer for an unknown path.
+    ///
+    /// `key` is the index of the record that authorised it, so the code
+    /// building the body can narrow what it returns to what that key may
+    /// see -- a category-scoped key gets a filtered list rather than a
+    /// refusal.
+    Ok { route: Route, key: usize },
+    /// No credential, an unknown one, or an expired one. **Returned before
+    /// the path is parsed**, so it is also the answer for an unknown path.
     Unauthenticated,
+    /// A live key that is not allowed to do this.
+    ///
+    /// **Distinct from [`Answer::Unauthenticated`] on purpose.** A
+    /// legitimate script has to be able to learn that it needs a wider
+    /// scope; collapsing the two would leave the owner debugging a working
+    /// key that looks broken.
+    Forbidden,
     /// Authenticated, but there is no such route.
     NotFound,
-    /// Authenticated, the route exists, and this service does not accept
-    /// that method on it.
+    /// Authenticated, the route exists, and the method is not one this
+    /// service understands at all.
     MethodNotAllowed,
 }
 
 /// The whole access decision for one request.
 ///
-/// `auth` is the raw `Authorization` header, if the request carried one.
+/// `auth` is the raw `Authorization` header, if the request carried one, and
+/// `now_unix` is the moment to judge expiry against -- passed in rather than
+/// read here, so a test can drive the day after a key expires without waiting
+/// for it.
 #[must_use]
-pub fn decide(method: &str, path: &str, auth: Option<&str>, expected: &Token) -> Answer {
+pub fn decide(
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    keys: &[KeyRecord],
+    now_unix: u64,
+) -> Answer {
     // First, and before anything reads `path`. See the module doc.
     let Some(presented) = bearer_of(auth) else {
         return Answer::Unauthenticated;
     };
-    if !matches(expected, presented) {
+    let Some(index) = crate::service_keys::find_index(keys, presented, now_unix) else {
         return Answer::Unauthenticated;
-    }
+    };
 
     // The query string is not part of the routing decision, and dropping it
     // here means `/status?x=1` cannot become an unknown path.
@@ -84,10 +118,65 @@ pub fn decide(method: &str, path: &str, auth: Option<&str>, expected: &Token) ->
     let Some(route) = route_of(path) else {
         return Answer::NotFound;
     };
-    if method != "GET" {
+
+    let Some(access) = access_of(method) else {
         return Answer::MethodNotAllowed;
+    };
+
+    if !allowed(&keys[index], access, &route) {
+        return Answer::Forbidden;
     }
-    Answer::Ok(route)
+    Answer::Ok { route, key: index }
+}
+
+/// What a method is asking to do.
+///
+/// `GET` reads; every method that changes something writes. A method this
+/// service has no meaning for at all is `None`, and becomes
+/// [`Answer::MethodNotAllowed`] -- which is a different statement from "you
+/// may not", and is why the two are not one answer.
+fn access_of(method: &str) -> Option<Access> {
+    match method {
+        "GET" => Some(Access::Read),
+        "POST" | "PUT" | "DELETE" | "PATCH" => Some(Access::Write),
+        _ => None,
+    }
+}
+
+/// Whether this key may take this action on this route.
+///
+/// The subject each route is judged against is the narrowest one the route
+/// names, which is the whole point of a per-item grant.
+fn allowed(key: &KeyRecord, access: Access, route: &Route) -> bool {
+    match route {
+        // Whether the vault is locked is not vault contents, and every
+        // client needs it to work at all. A live key is enough; no scope
+        // grants or withholds it. It is still refused to an unauthenticated
+        // caller, which is the line that matters.
+        Route::Status => true,
+        // A list is judged loosely here and narrowed when the body is built:
+        // a key with any read grant may ask, and sees only what it may see.
+        // Refusing outright would make a category grant useless for the one
+        // job it exists for.
+        Route::ListItems | Route::ListFolders => {
+            access == Access::Read && has_any(key, Access::Read)
+        }
+        // One item, judged against that id.
+        //
+        // A CATEGORY grant does not pass here, and that is a real limit
+        // rather than an oversight: this function is not given the item, so
+        // it cannot know the item's kind, and asking the vault first would
+        // mean fetching something the caller may not be allowed to have. A
+        // category-scoped key reaches those items through the filtered list
+        // instead, which returns the same data.
+        Route::Item(id) => permits(key, access, &Subject::Item(id.clone())),
+    }
+}
+
+/// Whether a key has any grant at all of this access.
+fn has_any(key: &KeyRecord, access: Access) -> bool {
+    permits(key, access, &Subject::All)
+        || key.scopes.iter().any(|scope| scope.access == access)
 }
 
 /// The route a path names, if any. Pure, and separate from the method and
@@ -115,21 +204,54 @@ fn route_of(path: &str) -> Option<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_token::mint;
+    use crate::service_keys::{hash_key, KeyRecord, Scope};
+    use crate::vault_bridge::ItemKind;
 
-    fn token() -> Token {
-        mint(|| [1u8; 32])
+    const NOW: u64 = 1_700_000_000;
+    const KEY: &str = "the-key";
+
+    fn key_with(scopes: Vec<Scope>) -> KeyRecord {
+        KeyRecord {
+            name: "a key".to_string(),
+            hash: hash_key(KEY),
+            created_unix: 1,
+            expires_unix: None,
+            scopes,
+        }
     }
 
-    fn good_header(token: &Token) -> String {
-        format!("Bearer {}", token.expose())
+    fn scope(subject: Subject, access: Access) -> Scope {
+        Scope { subject, access }
+    }
+
+    fn reads_everything() -> Vec<KeyRecord> {
+        vec![key_with(vec![scope(Subject::All, Access::Read)])]
+    }
+
+    fn reads_and_writes_everything() -> Vec<KeyRecord> {
+        vec![key_with(vec![
+            scope(Subject::All, Access::Read),
+            scope(Subject::All, Access::Write),
+        ])]
+    }
+
+    fn reads_one_item(id: &str) -> Vec<KeyRecord> {
+        vec![key_with(vec![scope(Subject::Item(id.to_string()), Access::Read)])]
+    }
+
+    fn bearer(value: &str) -> String {
+        format!("Bearer {value}")
+    }
+
+    fn good() -> String {
+        bearer(KEY)
     }
 
     /// **The test this module exists for.** No credential, no vault -- and
     /// the same answer for every path, so the refusal itself says nothing.
     #[test]
     fn every_route_refuses_an_unauthenticated_caller() {
-        let expected = token();
+        let keys = reads_and_writes_everything();
         for path in [
             "/status",
             "/list/object/items",
@@ -138,123 +260,242 @@ mod tests {
             "/nonsense",
         ] {
             assert_eq!(
-                decide("GET", path, None, &expected),
+                decide("GET", path, None, &keys, NOW),
                 Answer::Unauthenticated,
                 "{path} answered something other than a refusal with no credential"
             );
         }
     }
 
-    /// A wrong credential is refused exactly as a missing one is.
     #[test]
     fn a_wrong_credential_is_refused() {
-        let expected = token();
+        let keys = reads_everything();
         for header in ["Bearer wrong", "Basic anything", "", "Bearer "] {
             assert_eq!(
-                decide("GET", "/status", Some(header), &expected),
+                decide("GET", "/status", Some(header), &keys, NOW),
                 Answer::Unauthenticated,
                 "{header:?} was accepted"
             );
         }
     }
 
-    /// **`/status` is not public**, and this is the one that will be argued
-    /// about. "It only says whether the vault is locked" is still a fact
-    /// about this user's vault, told to anything that asks.
+    /// **An expired key is refused exactly as an unknown one is**, and this
+    /// is checked at the moment of the request.
     #[test]
-    fn status_is_not_a_public_endpoint() {
-        let expected = token();
+    fn an_expired_key_is_refused() {
+        let mut record = key_with(vec![scope(Subject::All, Access::Read)]);
+        record.expires_unix = Some(NOW);
+        let keys = vec![record];
         assert_eq!(
-            decide("GET", "/status", Some("Bearer wrong"), &expected),
+            decide("GET", "/status", Some(&good()), &keys, NOW - 1),
+            Answer::Ok { route: Route::Status, key: 0 },
+            "control: it worked before expiry"
+        );
+        assert_eq!(
+            decide("GET", "/status", Some(&good()), &keys, NOW),
             Answer::Unauthenticated
         );
     }
 
-    /// **An unknown path is not a way to learn which routes exist.** An
-    /// unauthenticated caller gets the same answer for a real route and a
-    /// made-up one; only an authenticated caller is told the difference.
+    /// **`/status` is not public.** A live key is enough for it -- lock state
+    /// is not vault contents, and every client needs it -- but an
+    /// unauthenticated caller is told nothing.
+    #[test]
+    fn status_is_not_a_public_endpoint() {
+        let keys = reads_everything();
+        assert_eq!(
+            decide("GET", "/status", Some("Bearer wrong"), &keys, NOW),
+            Answer::Unauthenticated
+        );
+    }
+
+    /// **An unknown path is not a way to learn which routes exist.**
     #[test]
     fn an_unknown_path_does_not_leak_the_shape_of_the_api() {
-        let expected = token();
+        let keys = reads_everything();
         assert_eq!(
-            decide("GET", "/nonsense", None, &expected),
-            decide("GET", "/list/object/items", None, &expected),
+            decide("GET", "/nonsense", None, &keys, NOW),
+            decide("GET", "/list/object/items", None, &keys, NOW),
             "a refused caller can tell a real route from a made-up one"
         );
-        // And the difference IS visible once you are entitled to it.
-        let header = good_header(&expected);
-        assert_eq!(decide("GET", "/nonsense", Some(&header), &expected), Answer::NotFound);
-    }
-
-    #[test]
-    fn an_authenticated_caller_reaches_the_routes() {
-        let expected = token();
-        let header = good_header(&expected);
-        assert_eq!(decide("GET", "/status", Some(&header), &expected), Answer::Ok(Route::Status));
         assert_eq!(
-            decide("GET", "/list/object/items", Some(&header), &expected),
-            Answer::Ok(Route::ListItems)
-        );
-        assert_eq!(
-            decide("GET", "/list/object/folders", Some(&header), &expected),
-            Answer::Ok(Route::ListFolders)
-        );
-        assert_eq!(
-            decide("GET", "/object/item/abc", Some(&header), &expected),
-            Answer::Ok(Route::Item("abc".to_string()))
+            decide("GET", "/nonsense", Some(&good()), &keys, NOW),
+            Answer::NotFound
         );
     }
 
-    /// Read-only, refused by method rather than by there being no handler.
     #[test]
-    fn writing_methods_are_refused_even_when_authenticated() {
-        let expected = token();
-        let header = good_header(&expected);
+    fn an_authorised_caller_reaches_the_routes() {
+        let keys = reads_everything();
+        let header = good();
+        assert_eq!(
+            decide("GET", "/status", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::Status, key: 0 }
+        );
+        assert_eq!(
+            decide("GET", "/list/object/items", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::ListItems, key: 0 }
+        );
+        assert_eq!(
+            decide("GET", "/list/object/folders", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::ListFolders, key: 0 }
+        );
+        assert_eq!(
+            decide("GET", "/object/item/abc", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::Item("abc".to_string()), key: 0 }
+        );
+    }
+
+    /// **The test per-item grants exist for.** Checked in `decide`, not in a
+    /// handler -- a handler that checks its own permissions is one somebody
+    /// adds a route without.
+    #[test]
+    fn a_key_scoped_to_one_item_cannot_read_a_different_one() {
+        let keys = reads_one_item("allowed-id");
+        let header = good();
+        assert_eq!(
+            decide("GET", "/object/item/allowed-id", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::Item("allowed-id".to_string()), key: 0 },
+            "control: the key cannot read the item it was granted"
+        );
+        assert_eq!(
+            decide("GET", "/object/item/other-id", Some(&header), &keys, NOW),
+            Answer::Forbidden
+        );
+    }
+
+    /// A read-only key may not write, and the refusal is a SCOPE refusal
+    /// rather than a blanket method ban.
+    #[test]
+    fn a_read_only_key_cannot_write() {
+        let keys = reads_everything();
+        let header = good();
+        assert_eq!(
+            decide("GET", "/object/item/abc", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::Item("abc".to_string()), key: 0 },
+            "control: the key cannot read either"
+        );
         for method in ["POST", "PUT", "DELETE", "PATCH"] {
             assert_eq!(
-                decide(method, "/list/object/items", Some(&header), &expected),
-                Answer::MethodNotAllowed,
-                "{method} was allowed; this service is read-only for now"
-            );
-            assert_eq!(
-                decide(method, "/object/item/abc", Some(&header), &expected),
-                Answer::MethodNotAllowed,
-                "{method} on one item was allowed"
+                decide(method, "/object/item/abc", Some(&header), &keys, NOW),
+                Answer::Forbidden,
+                "{method} was allowed for a read-only key"
             );
         }
     }
 
-    /// A write to an unknown path is still a 404, not a 405: the method
-    /// check must not invent routes.
+    /// **And a write-scoped key may.** Without this, the test above passes
+    /// on a service that simply refuses every write -- which is exactly the
+    /// thing this change replaces.
     #[test]
-    fn a_write_to_a_route_that_does_not_exist_is_not_found() {
-        let expected = token();
-        let header = good_header(&expected);
-        assert_eq!(decide("POST", "/nonsense", Some(&header), &expected), Answer::NotFound);
+    fn a_write_scoped_key_can_write() {
+        let keys = reads_and_writes_everything();
+        let header = good();
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert_eq!(
+                decide(method, "/object/item/abc", Some(&header), &keys, NOW),
+                Answer::Ok { route: Route::Item("abc".to_string()), key: 0 },
+                "{method} was refused for a key scoped to write everything"
+            );
+        }
     }
 
-    /// A query string is not part of the route. Without this, `/status?x=1`
-    /// is an unknown path and a compatible client breaks on a detail nobody
-    /// would look for.
+    /// A method this service has no meaning for is a different statement
+    /// from "you may not", and stays a different answer.
     #[test]
-    fn a_query_string_does_not_change_the_route() {
-        let expected = token();
-        let header = good_header(&expected);
+    fn an_unknown_method_is_not_a_scope_refusal() {
+        let keys = reads_and_writes_everything();
         assert_eq!(
-            decide("GET", "/list/object/items?trash=true", Some(&header), &expected),
-            Answer::Ok(Route::ListItems)
+            decide("TRACE", "/object/item/abc", Some(&good()), &keys, NOW),
+            Answer::MethodNotAllowed
         );
     }
 
-    /// An id must be one path segment. `/object/item/` and
-    /// `/object/item/a/b` are not items, and must not reach a lookup.
+    /// A key with no scopes at all is refused everything except `/status`,
+    /// which needs only a live key.
+    #[test]
+    fn a_key_with_no_scopes_reaches_nothing_that_touches_the_vault() {
+        let keys = vec![key_with(vec![])];
+        let header = good();
+        assert_eq!(
+            decide("GET", "/list/object/items", Some(&header), &keys, NOW),
+            Answer::Forbidden
+        );
+        assert_eq!(
+            decide("GET", "/object/item/abc", Some(&header), &keys, NOW),
+            Answer::Forbidden
+        );
+        assert_eq!(
+            decide("GET", "/status", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::Status, key: 0 }
+        );
+    }
+
+    /// A category-scoped key may ask for the list -- it is narrowed when the
+    /// body is built -- but may not fetch an arbitrary item by id.
+    #[test]
+    fn a_category_key_may_list_but_not_fetch_an_arbitrary_item() {
+        let keys = vec![key_with(vec![scope(
+            Subject::Category(ItemKind::Login),
+            Access::Read,
+        )])];
+        let header = good();
+        assert_eq!(
+            decide("GET", "/list/object/items", Some(&header), &keys, NOW),
+            Answer::Ok { route: Route::ListItems, key: 0 }
+        );
+        assert_eq!(
+            decide("GET", "/object/item/abc", Some(&header), &keys, NOW),
+            Answer::Forbidden
+        );
+    }
+
+    /// **A refused scope is not reported as a bad credential.** A legitimate
+    /// script has to be able to learn it needs a wider scope.
+    #[test]
+    fn a_refused_scope_is_not_reported_as_a_bad_credential() {
+        let keys = reads_one_item("allowed-id");
+        assert_eq!(
+            decide("GET", "/object/item/other", Some(&bearer("wrong")), &keys, NOW),
+            Answer::Unauthenticated
+        );
+        assert_eq!(
+            decide("GET", "/object/item/other", Some(&good()), &keys, NOW),
+            Answer::Forbidden
+        );
+    }
+
+    /// The answer says WHICH key authorised it, so the body can be narrowed
+    /// to what that key may see.
+    #[test]
+    fn the_answer_names_the_key_that_authorised_it() {
+        let mut keys = reads_everything();
+        keys.insert(0, key_with(vec![]));
+        keys[0].hash = hash_key("a-different-key");
+        assert_eq!(
+            decide("GET", "/status", Some(&good()), &keys, NOW),
+            Answer::Ok { route: Route::Status, key: 1 },
+            "the wrong key was credited with the request"
+        );
+    }
+
+    /// A query string is not part of the route.
+    #[test]
+    fn a_query_string_does_not_change_the_route() {
+        let keys = reads_everything();
+        assert_eq!(
+            decide("GET", "/list/object/items?trash=true", Some(&good()), &keys, NOW),
+            Answer::Ok { route: Route::ListItems, key: 0 }
+        );
+    }
+
+    /// An id must be one path segment.
     #[test]
     fn a_malformed_item_path_is_not_an_item() {
-        let expected = token();
-        let header = good_header(&expected);
+        let keys = reads_everything();
         for path in ["/object/item/", "/object/item/a/b", "/object/item"] {
             assert_eq!(
-                decide("GET", path, Some(&header), &expected),
+                decide("GET", path, Some(&good()), &keys, NOW),
                 Answer::NotFound,
                 "{path} was read as an item id"
             );
@@ -272,11 +513,29 @@ mod tests {
         let production = &source[..cut];
         let body_at = production.find("pub fn decide(").expect("control: `decide` is gone");
         let body = &production[body_at..];
-        let auth_at = body.find("bearer_of(auth)").expect("control: `decide` does not read a credential");
+        let auth_at =
+            body.find("bearer_of(auth)").expect("control: `decide` does not read a credential");
         let path_at = body.find("route_of(path)").expect("control: `decide` does not route");
         assert!(
             auth_at < path_at,
             "the path is routed before the credential is checked, so response codes tell an unauthenticated caller which routes exist"
+        );
+    }
+
+    /// And the scope check must come before the answer, in `decide` rather
+    /// than anywhere downstream.
+    #[test]
+    fn the_scope_is_checked_inside_decide() {
+        let source = include_str!("service_api.rs");
+        let cut = source.find("#[cfg(test)]").expect("control: this file has no test module");
+        let production = &source[..cut];
+        let body_at = production.find("pub fn decide(").expect("control: `decide` is gone");
+        let body = &production[body_at..];
+        let end = body.find("\n}").expect("control: could not find the end of `decide`");
+        let body = &body[..end];
+        assert!(
+            body.contains("allowed("),
+            "`decide` no longer checks the scope; a per-item grant is decorative unless it is checked in the one place every request passes through"
         );
     }
 }

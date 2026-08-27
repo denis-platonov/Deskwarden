@@ -548,6 +548,23 @@ mod tests {
     // guard whose `Drop` removes the name, so releasing a hold in a test is
     // dropping the value -- and *abandoning* one, the crash case, is
     // `std::mem::forget`.
+    /// **The fake kernel is process-wide, so these tests are not parallel.**
+    ///
+    /// `ServiceEnv` is `fn` pointers, which cannot close over a fixture, so
+    /// the fake's state has to live in statics -- and Rust runs `#[test]`
+    /// functions on many threads at once. Without this lock one test's
+    /// `reset` wipes another's slots mid-run.
+    ///
+    /// Found the way it should be: these passed serially and failed in
+    /// parallel, and the parallel run is the one CI does. They had been
+    /// green by luck of scheduling until enough tests were added elsewhere
+    /// to change the order.
+    ///
+    /// Poison is deliberately ignored. A panicking test poisons this lock,
+    /// and every later test failing to acquire it would report the first
+    /// failure over and over instead of its own.
+    static SERIALISE: Mutex<()> = Mutex::new(());
+
     static LIVE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     static OPENS: AtomicUsize = AtomicUsize::new(0);
 
@@ -595,6 +612,7 @@ mod tests {
     /// Two apps attached at once, which one shared mutex could not express.
     #[test]
     fn two_apps_can_be_attached_at_the_same_time() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let a = attach(&env()).expect("a");
         let b = attach(&env()).expect("b");
@@ -610,6 +628,7 @@ mod tests {
     /// sixteen enough: without this, sixteen launches would exhaust it.
     #[test]
     fn a_released_slot_is_handed_out_again() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let first = attach(&env()).expect("first");
         let slot = first.slot();
@@ -622,6 +641,7 @@ mod tests {
     /// a service that waited for a clean exit would hold the vault forever.
     #[test]
     fn an_abandoned_attachment_still_reads_as_detached() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let attached = attach(&env()).expect("attached");
         let name = attach_slot_name(attached.slot());
@@ -647,6 +667,7 @@ mod tests {
     /// as any handle does.
     #[test]
     fn asking_never_makes_a_name_live() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         for _ in 0..5 {
             assert!(!anyone_attached(&env()), "asking made a name live");
@@ -664,6 +685,7 @@ mod tests {
     /// handed out twice.
     #[test]
     fn a_full_slot_space_refuses_rather_than_overlapping() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let held: Vec<_> = (0..SLOTS).map(|_| attach(&env()).expect("slot")).collect();
         assert!(attach(&env()).is_none());
@@ -693,6 +715,7 @@ mod tests {
     /// Windows Hello prompt.
     #[test]
     fn a_service_holding_its_object_for_our_account_is_adopted() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         let _service = (env.hold)(&service_object_name(OURS)).expect("service holds its name");
@@ -705,6 +728,7 @@ mod tests {
     /// user's vault, which is the failure the fingerprint exists to stop.
     #[test]
     fn a_service_serving_another_account_is_refused() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         let _service = (env.hold)(&service_object_name(THEIRS)).expect("their service");
@@ -721,6 +745,7 @@ mod tests {
     /// than declining to use it.
     #[test]
     fn a_port_that_answers_while_holding_nothing_is_refused_and_not_stopped() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         assert_eq!(
@@ -739,6 +764,7 @@ mod tests {
     /// to and says why.
     #[test]
     fn a_silent_port_is_refused_as_silent_and_not_as_an_impostor() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         assert_eq!(verify(&env, OURS, None, 8087), Verdict::Refuse(Refusal::NothingAnswered));
@@ -794,6 +820,11 @@ mod tests {
     }
 
     /// Resets the Task 3 fakes on top of [`reset`].
+    ///
+    /// **Takes no lock.** Its callers already hold [`SERIALISE`], and a
+    /// second acquisition here deadlocks -- a `std::sync::Mutex` is not
+    /// reentrant. That is not hypothetical: adding the lock mechanically to
+    /// every `reset` call did exactly this and hung the suite.
     fn reset_service() {
         reset();
         STARTS.store(0, Ordering::SeqCst);
@@ -806,6 +837,7 @@ mod tests {
     /// Nothing running, so this app starts one.
     #[test]
     fn the_first_app_starts_the_service() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         assert_eq!(ensure_running(&env(), &start_env(), OURS, PORT), Startup::StartedIt);
         assert_eq!(STARTS.load(Ordering::SeqCst), 1);
@@ -817,6 +849,7 @@ mod tests {
     /// service that proves itself must not be replaced.
     #[test]
     fn a_running_service_is_adopted_without_starting_a_second_one() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         start(PORT);
         STARTS.store(0, Ordering::SeqCst);
@@ -837,6 +870,7 @@ mod tests {
     /// timing, not a convenience.
     #[test]
     fn two_concurrent_starts_produce_one_service_and_the_loser_attaches() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _lock = take_start_lock().expect("winner holds the start lock, having not yet spawned");
 
@@ -871,6 +905,7 @@ mod tests {
     /// backend and has to say so.
     #[test]
     fn losing_the_race_to_an_app_that_never_starts_one_is_reported() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _lock = take_start_lock().expect("winner takes the start lock");
         assert_eq!(
@@ -882,6 +917,7 @@ mod tests {
     /// A service for a different account is neither adopted nor replaced.
     #[test]
     fn a_service_for_another_account_is_left_alone() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _theirs = hold(&service_object_name(THEIRS)).expect("their service");
         *CLAIM.lock().unwrap() = Some(THEIRS.to_string());
@@ -896,6 +932,7 @@ mod tests {
     /// The last attachment released exits the service.
     #[test]
     fn releasing_the_last_attachment_stops_the_service() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let only = attach(&env()).expect("attached");
         release(&env(), only, PORT);
@@ -905,6 +942,7 @@ mod tests {
     /// Releasing one of two does not -- the other app is still using it.
     #[test]
     fn releasing_one_of_two_leaves_the_service_running() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let first = attach(&env()).expect("first");
         let second = attach(&env()).expect("second");
@@ -934,6 +972,7 @@ mod tests {
     /// unlocked vault on a held port forever.
     #[test]
     fn a_service_whose_apps_all_crashed_is_stopped_anyway() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let first = attach(&env()).expect("first");
         let second = attach(&env()).expect("second");
@@ -955,6 +994,7 @@ mod tests {
     /// using is worse than the leak it was written to prevent.
     #[test]
     fn a_service_with_a_live_app_is_never_stopped_however_long_it_waits() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _still_here = attach(&env()).expect("attached");
         assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::GaveUp);
@@ -966,6 +1006,7 @@ mod tests {
     /// the survivor down with it.
     #[test]
     fn one_app_crashing_does_not_stop_the_service_for_the_other() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let crashed = attach(&env()).expect("crashed");
         let _alive = attach(&env()).expect("alive");
@@ -980,6 +1021,7 @@ mod tests {
     /// The service is stopped once, not once per tick.
     #[test]
     fn the_service_is_stopped_only_once() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::Stopped);
         assert_eq!(STOPS.load(Ordering::SeqCst), 1);

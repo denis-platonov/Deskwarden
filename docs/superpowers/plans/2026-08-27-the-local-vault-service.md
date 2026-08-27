@@ -367,7 +367,7 @@ fn the_stored_record_does_not_contain_the_key() {
 `decide` resolves a credential to a `KeyRecord` and checks scope **against the
 route and its subject** -- for `/object/item/{id}`, against that id.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// **The test per-item grants exist for.** Checked in `decide`, not in a
@@ -415,7 +415,7 @@ fn a_refused_scope_is_not_reported_as_a_bad_credential() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
+- [x] **Step 2: Run to verify they fail.** **Not observed.** Mutation check instead: removing the scope check failed six tests (five behavioural, one source pin).
 **Writes arrive here, with scopes, and not before.** The method maps to an
 `Access` -- `GET` is `Read`, everything else is `Write` -- and the scope
 decides. `MethodNotAllowed` survives only for a method that is not a vault
@@ -452,9 +452,20 @@ fn a_write_scoped_key_can_write() {
 }
 ```
 
-- [ ] **Step 3: Implement.** Scope check between routing and the answer; `Answer::Forbidden` is new; the method becomes an `Access` rather than a gate.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 3: Implement.** Scope check between routing and the answer; `Answer::Forbidden` is new; the method becomes an `Access` rather than a gate.
+- [x] **Step 4: Run to verify they pass.** 18 tests.
+- [x] **Step 5: Commit.**
+
+**Also fixed here, and not optional:** `vault_service`'s tests were not
+parallel-safe. The fake kernel's state is in statics (`ServiceEnv` is `fn`
+pointers and cannot close over a fixture), so tests wiped each other's slots.
+They passed serially and failed in parallel -- the run CI does -- and had been
+green by scheduling luck. A `SERIALISE` mutex fixes it; the first attempt
+added it inside `reset_service` too, whose callers already hold it, and hung
+the suite on a non-reentrant mutex.
+
+**Method note:** the "failing modules with no mockito" check caught this, but
+only because the module list changed. It is a hint, not a clearance.
 
 ---
 

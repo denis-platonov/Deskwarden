@@ -120,8 +120,21 @@ pub fn hash_key(key: &str) -> String {
 /// guessed at is a boundary somebody guesses wrong.
 #[must_use]
 pub fn find<'a>(records: &'a [KeyRecord], presented: &str, now_unix: u64) -> Option<&'a KeyRecord> {
+    // Delegates, so the liveness and comparison rules exist once. Two copies
+    // would be two places for an expiry check to be forgotten.
+    find_index(records, presented, now_unix).map(|index| &records[index])
+}
+
+/// [`find`], as an index.
+///
+/// `service_api` needs to know WHICH key authorised a request, so the body
+/// it builds can be narrowed to what that key may see. Returning the index
+/// rather than the record keeps `Answer` a plain value with no lifetime,
+/// which is what lets every routing test compare answers with `assert_eq!`.
+#[must_use]
+pub fn find_index(records: &[KeyRecord], presented: &str, now_unix: u64) -> Option<usize> {
     let presented_hash = hash_key(presented);
-    records.iter().find(|record| {
+    records.iter().position(|record| {
         let live = match record.expires_unix {
             Some(expiry) => now_unix < expiry,
             None => true,
