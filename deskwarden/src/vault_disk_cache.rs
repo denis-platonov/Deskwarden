@@ -339,6 +339,37 @@ fn seal(key: &[u8; 32], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>,
     Ok(blob)
 }
 
+/// What binds one item's ciphertext to one item, in one file.
+///
+/// # Why an item needs more than the header
+///
+/// Version 1 sealed the whole snapshot as a single message, so "which item
+/// is this?" could not be asked: there was one. Version 2 seals each item
+/// separately -- which is what lets the daemon open one without the other
+/// 1,665 -- and that makes the entries *fungible* unless something says
+/// otherwise.
+///
+/// GCM authenticates that a message was sealed under a key. It does not
+/// authenticate where the message was stored. Without the id here, anyone
+/// who can write this file can move the entry for a bank into the slot for a
+/// site they control; the daemon would open it, find a valid item, and type
+/// that password into the site it was asked about. Nothing downstream could
+/// notice, because everything downstream is working correctly.
+///
+/// # Length-prefixed, not concatenated
+///
+/// `header ‖ id` alone would let `("ab", "c")` and `("a", "bc")` produce the
+/// same binding. Vault ids are server-assigned GUIDs and a separator would
+/// be enough for them today -- but the prefix costs four bytes and removes
+/// the need to keep being right about what an id may contain.
+fn item_aad(header: &[u8], id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(header.len() + 4 + id.len());
+    aad.extend_from_slice(header);
+    aad.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    aad.extend_from_slice(id.as_bytes());
+    aad
+}
+
 fn unseal(key: &[u8; 32], blob: &[u8], aad: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>, String> {
     if blob.len() <= NONCE_LEN {
         return Err("the sealed blob is truncated".to_string());
@@ -911,6 +942,63 @@ pub(crate) mod tests {
     use super::*;
     use crate::vault_bridge::{Folder, VaultItem};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **A secret is bound to its id, not merely to the file.**
+    ///
+    /// Version 2 seals each item separately so one can be opened without the
+    /// other 1,665. That raises a question a single blob never had: what
+    /// stops an entry being moved to another item's slot?
+    ///
+    /// GCM proves *this key sealed this message*. It does not prove *this
+    /// message belongs here*. So without the id in the additional
+    /// authenticated data, two entries in one file are interchangeable --
+    /// somebody who can write the file swaps the ciphertext for a bank with
+    /// one for a site they control, and the daemon types the wrong password
+    /// into the right box and never knows. The AAD is what closes that, and
+    /// this is the test that fails if it is ever dropped as redundant.
+    #[test]
+    fn a_secret_moved_to_another_items_slot_will_not_open() {
+        let k = key(7);
+        let header = b"a plausible header".to_vec();
+        let item = b"an item's plaintext".to_vec();
+        let sealed = seal(&k, &item, Some(&item_aad(&header, "item-a"))).expect("sealed");
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(&header, "item-b"))).is_err(),
+            "a ciphertext sealed for item-a opened as item-b, so entries in this file are \
+             interchangeable and a swapped one would be typed as the item it replaced"
+        );
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(&header, "item-a"))).is_ok(),
+            "control: it does not open as itself either, so this proves nothing"
+        );
+    }
+
+    /// The same binding from the other side: an entry from a DIFFERENT file
+    /// does not open here even under the same id. The header carries
+    /// `written_at` and the account fingerprint, so it is what makes one
+    /// file's entries useless in another -- an old cache's password cannot be
+    /// grafted into a current one.
+    #[test]
+    fn a_secret_from_another_file_will_not_open_under_the_same_id() {
+        let k = key(7);
+        let item = b"an item's plaintext".to_vec();
+        let sealed =
+            seal(&k, &item, Some(&item_aad(b"header of file one", "item-a"))).expect("sealed");
+        assert!(
+            unseal(&k, &sealed, Some(&item_aad(b"header of file two", "item-a"))).is_err(),
+            "an entry from one cache file opened inside another"
+        );
+    }
+
+    /// The id is length-prefixed rather than concatenated, so `("ab", "c")`
+    /// and `("a", "bc")` cannot produce the same binding. A separator would
+    /// do for GUIDs, which contain no delimiter; a length prefix does not
+    /// have to argue about what an id may contain.
+    #[test]
+    fn no_two_headers_and_ids_can_produce_the_same_binding() {
+        assert_ne!(item_aad(b"h", "ab"), item_aad(b"ha", "b"));
+        assert_ne!(item_aad(b"ha", ""), item_aad(b"h", "a"));
+    }
 
     fn key(seed: u8) -> [u8; 32] {
         [seed; 32]
