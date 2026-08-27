@@ -2708,37 +2708,28 @@ fn picker_offers_for(
 struct PickerCard {
     /// The accounts that look like this app. The card's first mode.
     offers: Vec<crate::picker_prompt::Offer>,
-    /// **Every item in the vault**, in vault order, as search-mode rows.
-    corpus: Vec<crate::picker_prompt::Offer>,
+    /// **Every item in the vault**, in vault order, as the search mode's
+    /// haystack. Facts rather than rows -- see `picker_corpus`.
+    corpus: Vec<ItemFacts>,
 }
 
-/// The whole vault as picker rows: what search mode filters.
+/// The whole vault as the search mode's haystack.
 ///
-/// **No icons**, unlike [`picker_offers_in`]: an icon costs a read of the
-/// on-disk favicon cache, and a thousand of them at the moment the user presses
-/// a hotkey is a disk stall in front of a card that is supposed to appear
-/// instantly. The candidate rows -- at most `ROW_CAP` of them -- still carry
-/// theirs.
+/// **Facts, not rows, and that is the change.** This used to build a
+/// `picker_prompt::Offer` for every item in the vault -- on EVERY press of the
+/// hotkey, including the overwhelming majority that never enter search mode --
+/// and `search_parked_vault` then filtered those thousand-odd rows down to
+/// `cap`, which is five. So a press allocated ~1,666 rows to show at most five
+/// of them, and usually none.
+///
+/// Now the haystack is the facts that were built for the candidate matcher
+/// anyway, and a row is built by `offer_from` only for a match inside the cap.
+/// The filter reads `name` off a fact, which costs nothing.
 ///
 /// Items with no id are skipped for `app_candidates`' reason: there is nothing
 /// to fill from later, however well the row reads.
-fn picker_corpus(facts: &[ItemFacts]) -> Vec<crate::picker_prompt::Offer> {
-    facts
-        .iter()
-        .filter(|facts| !facts.id.is_empty())
-        .map(|facts| crate::picker_prompt::Offer {
-            candidate: crate::app_candidates::Candidate {
-                id: facts.id.clone(),
-                name: facts.name.clone(),
-                username: facts.username.clone(),
-            },
-            palette: crate::picker_prompt::Palette {
-                fields: facts.palette.clone(),
-                has_sequence: facts.has_sequence,
-            },
-            icon: None,
-        })
-        .collect()
+fn picker_corpus(facts: &[ItemFacts]) -> Vec<ItemFacts> {
+    facts.iter().filter(|facts| !facts.id.is_empty()).cloned().collect()
 }
 
 /// **The vault, as the account picker's search mode can see it.**
@@ -2754,8 +2745,27 @@ fn picker_corpus(facts: &[ItemFacts]) -> Vec<crate::picker_prompt::Offer> {
 /// [`crate::picker_prompt::Offer`]: a `Candidate` (id, name, username) and a
 /// `Palette` (whether a field is present, never its value). The plaintext
 /// snapshot it was derived from died inside [`picker_offers_for`].
-static SEARCH_CORPUS: std::sync::Mutex<Vec<crate::picker_prompt::Offer>> =
-    std::sync::Mutex::new(Vec::new());
+static SEARCH_CORPUS: std::sync::Mutex<Vec<ItemFacts>> = std::sync::Mutex::new(Vec::new());
+
+/// One parked fact as a search-mode row.
+///
+/// **No icon**, which is [`picker_corpus`]'s rule and its reason: an icon is a
+/// read of the on-disk favicon cache, and search rows are built while the user
+/// is typing. The candidate rows -- at most `ROW_CAP` -- still carry theirs.
+fn offer_from(facts: &ItemFacts) -> crate::picker_prompt::Offer {
+    crate::picker_prompt::Offer {
+        candidate: crate::app_candidates::Candidate {
+            id: facts.id.clone(),
+            name: facts.name.clone(),
+            username: facts.username.clone(),
+        },
+        palette: crate::picker_prompt::Palette {
+            fields: facts.palette.clone(),
+            has_sequence: facts.has_sequence,
+        },
+        icon: None,
+    }
+}
 
 /// **The production [`crate::picker_prompt::Searcher`].**
 ///
@@ -2782,16 +2792,18 @@ fn search_parked_vault(query: &str, cap: usize) -> crate::picker_prompt::SearchR
     };
     let mut offers = Vec::new();
     let mut total = 0usize;
-    for offer in corpus.iter() {
-        if !crate::picker_ui::name_matches_filter(&offer.candidate.name, &filter) {
+    for facts in corpus.iter() {
+        if !crate::picker_ui::name_matches_filter(&facts.name, &filter) {
             continue;
         }
         total += 1;
-        // **Counted before it is capped.** The card says how many matched, and
-        // a count that stopped at the cap would let it claim the cap was the
-        // whole answer.
+        // **Counted before it is capped**, and the row is BUILT only inside
+        // the cap. The card says how many matched, and a count that stopped
+        // at the cap would let it claim the cap was the whole answer -- but a
+        // row nobody will see is an allocation nobody needs. Matching reads
+        // the parked facts; only the handful that survive become `Offer`s.
         if offers.len() < cap {
-            offers.push(offer.clone());
+            offers.push(offer_from(facts));
         }
     }
     crate::picker_prompt::SearchResults { offers, total }
@@ -9418,7 +9430,7 @@ mod picker_wiring_tests {
         // And the palettes are real: a search result leads to the *what should
         // I type?* step, which is built from these.
         assert!(
-            corpus[0].palette.fields.contains(&FieldRef::Password),
+            corpus[0].palette.contains(&FieldRef::Password),
             "a search result offers no fields, so picking one would show an empty second step"
         );
     }
