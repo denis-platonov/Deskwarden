@@ -8,22 +8,34 @@
 
 **Tech Stack:** Rust, `windows` 0.58, `tiny_http` (see Task 2), the `vault_service` module on `main`.
 
-## Task 0: The auth decision, taken
+## Task 0: The auth decision, REVISED 2026-08-27
 
-**A bearer token, minted by the service, DPAPI-wrapped on disk, compared in constant time.**
+**Superseded.** See `docs/superpowers/specs/2026-08-27-service-auth-design.md`.
 
-Rejected: loopback with no auth. It is what `bw serve` does, and it is the
-weakest option — every process on the machine, including one running as
-another user that can reach loopback, gets the vault by connecting. "As bad
-as the thing we are replacing" is not a standard.
+The original decision here was a single process-wide bearer token. The owner
+replaced it with a better model, and the reason it is better is specific: one
+token is all-or-nothing and immortal. There is no way to give a backup script
+read access to Logins only, and no way to revoke that script without breaking
+every other consumer.
 
-**The limit, stated rather than discovered:** any process running as this user
-can read the token file, because DPAPI unwraps under this user's credentials.
-So the token stops *other users* and *unprivileged remote reach*, and does not
-stop a program already running as the owner. That is the same limit
-`session_store` and `user_key_store` already have, and it is the strongest
-thing available without a per-client credential the owner would have to
-manage.
+**The model now:**
+
+- **A.** `POST /auth` with the master password returns a short-lived session
+  token -- the interactive path.
+- **B.** Named API keys, minted in Preferences, each with an expiry and a
+  scope set -- the unattended path.
+- **Both off by default, and so is the service.**
+- **Keys are stored as `SHA-256(key)`.** The plaintext is shown once. A fast
+  hash is correct here and nowhere else in this project: a 256-bit random key
+  has no candidates to guess, so a slow KDF costs a stretch per request and
+  buys nothing.
+- **Default deny.** An empty scope set grants nothing, and an unrecognised
+  subject in a stored record denies rather than widens.
+
+**Tasks 1 and 2 are unaffected** and stay as built: a key's secret is minted
+and compared by `service_token`, and routing is decided by `service_api`.
+What changes is that the credential resolves to a *key record* rather than to
+one global token, and a fourth step -- scope -- joins the decision.
 
 ## The API is `bw serve`'s, not a new one
 
@@ -241,6 +253,170 @@ fn an_unknown_path_is_not_a_way_to_learn_which_routes_exist() {
 
 ---
 
+### Task 2b: Key records, expiry, and scope
+
+**Files:** Create `deskwarden/src/service_keys.rs`; modify `deskwarden/src/lib.rs`, `deskwarden/src/foreground.rs`
+
+**Interfaces:**
+```rust
+pub enum Subject { All, Category(crate::vault_bridge::ItemKind), Item(String) }
+pub enum Access { Read, Write }
+pub struct Scope { pub subject: Subject, pub access: Access }
+pub struct KeyRecord {              // never Debug
+    pub name: String,
+    pub hash: String,               // SHA-256 of the key, hex
+    pub created_unix: u64,
+    pub expires_unix: Option<u64>,  // None = no expiry, and the screen says so
+    pub scopes: Vec<Scope>,
+}
+pub fn hash_key(key: &str) -> String;
+pub fn find(records: &[KeyRecord], presented: &str, now_unix: u64) -> Option<&KeyRecord>;
+pub fn permits(record: &KeyRecord, access: Access, subject: &Subject) -> bool;
+```
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+/// **Default deny.** A key with no scopes can do nothing.
+#[test]
+fn a_key_with_no_scopes_permits_nothing() {
+    let key = record_with(vec![]);
+    assert!(!permits(&key, Access::Read, &Subject::All));
+    assert!(!permits(&key, Access::Read, &Subject::Item("abc".into())));
+    assert!(!permits(&key, Access::Read, &Subject::Category(ItemKind::Login)));
+}
+
+/// Read does not imply write, and write does not imply read.
+#[test]
+fn the_two_accesses_do_not_imply_each_other() {
+    let reader = record_with(vec![Scope { subject: Subject::All, access: Access::Read }]);
+    assert!(permits(&reader, Access::Read, &Subject::All));
+    assert!(!permits(&reader, Access::Write, &Subject::All));
+}
+
+/// A category grant covers that category and no other.
+#[test]
+fn a_category_grant_does_not_reach_another_category() {
+    let logins = record_with(vec![Scope {
+        subject: Subject::Category(ItemKind::Login),
+        access: Access::Read,
+    }]);
+    assert!(permits(&logins, Access::Read, &Subject::Category(ItemKind::Login)));
+    assert!(!permits(&logins, Access::Read, &Subject::Category(ItemKind::Card)));
+}
+
+/// **Expiry is checked against the clock now, not at load.** A service up
+/// for a week must not honour a key that expired on the second day.
+#[test]
+fn an_expired_key_is_not_found_however_long_the_service_has_been_up() {
+    let records = vec![record_expiring_at(1_000)];
+    assert!(find(&records, "the-key", 999).is_some(), "control: it works before expiry");
+    assert!(find(&records, "the-key", 1_000).is_none(), "expiry is inclusive");
+    assert!(find(&records, "the-key", 10_000_000).is_none());
+}
+
+/// An unrecognised subject in a stored record DENIES. This is what an older
+/// build reading a newer file does, and failing open there would be a
+/// permission grant nobody wrote.
+#[test]
+fn an_unparsable_scope_denies() {
+    let record = record_from_future_json();
+    assert!(!permits(&record, Access::Read, &Subject::All));
+}
+
+/// The store holds hashes. A file that grants access if read is a second
+/// copy of the vault's front door.
+#[test]
+fn the_stored_record_does_not_contain_the_key() {
+    let key = "0123456789abcdef";
+    let record = KeyRecord { hash: hash_key(key), ..sample() };
+    let serialised = serde_json::to_string(&record).expect("serialise");
+    assert!(!serialised.contains(key), "the key itself is in the record: {serialised}");
+}
+```
+
+- [ ] **Step 2: Run to verify they fail.**
+- [ ] **Step 3: Implement.** `find` hashes the presented key once and compares with `service_token::matches` against each record's hash, checking expiry in the same pass.
+- [ ] **Step 4: Run to verify they pass.**
+- [ ] **Step 5: Commit.**
+
+---
+
+### Task 2c: Scope joins the decision
+
+**Files:** Modify `deskwarden/src/service_api.rs`
+
+`decide` resolves a credential to a `KeyRecord` and checks scope **against the
+route and its subject** -- for `/object/item/{id}`, against that id.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+/// **The test per-item grants exist for.** Checked in `decide`, not in a
+/// handler -- a handler that checks its own permissions is one someone adds
+/// a route without.
+#[test]
+fn a_key_scoped_to_one_item_cannot_read_a_different_one() {
+    let keys = [key_for_item("allowed-id")];
+    let header = bearer("the-key");
+    assert_eq!(
+        decide("GET", "/object/item/allowed-id", Some(&header), &keys, NOW),
+        Answer::Ok(Route::Item("allowed-id".into()))
+    );
+    assert_eq!(
+        decide("GET", "/object/item/other-id", Some(&header), &keys, NOW),
+        Answer::Forbidden
+    );
+}
+
+/// And must not get the whole vault through the list endpoint, which is the
+/// obvious way around a per-item grant.
+#[test]
+fn a_key_scoped_to_one_item_cannot_list_everything() {
+    let keys = [key_for_item("allowed-id")];
+    assert_eq!(
+        decide("GET", "/list/object/items", Some(&bearer("the-key")), &keys, NOW),
+        Answer::Forbidden
+    );
+}
+
+/// Forbidden and Unauthenticated stay distinct: one means "not you", the
+/// other "not this". A legitimate script has to be able to learn it needs a
+/// wider scope.
+#[test]
+fn a_refused_scope_is_not_reported_as_a_bad_credential() {
+    let keys = [key_for_item("allowed-id")];
+    assert_eq!(
+        decide("GET", "/list/object/items", Some(&bearer("wrong")), &keys, NOW),
+        Answer::Unauthenticated
+    );
+    assert_eq!(
+        decide("GET", "/list/object/items", Some(&bearer("the-key")), &keys, NOW),
+        Answer::Forbidden
+    );
+}
+```
+
+- [ ] **Step 2: Run to verify they fail.**
+- [ ] **Step 3: Implement.** Scope check between routing and the answer; `Answer::Forbidden` is new.
+- [ ] **Step 4: Run to verify they pass.**
+- [ ] **Step 5: Commit.**
+
+---
+
+### Task 2d: The master-password path
+
+**Files:** Modify `deskwarden/src/service_api.rs`, `deskwarden/src/service_keys.rs`
+
+`POST /auth` with the master password mints a short-lived session token,
+which is then a `KeyRecord` with `Subject::All`, both accesses, and an expiry
+minutes away rather than months.
+
+- [ ] **Step 1: Write the failing tests** -- a session token expires on its own; `/auth` is the ONLY route reachable without a credential, and only by `POST`; a wrong master password is refused without revealing whether the account exists.
+- [ ] **Steps 2-5:** red, implement, full suite, commit.
+
+---
+
 ### Task 3: What a response may contain
 
 **Files:** Modify `deskwarden/src/service_api.rs`
@@ -341,14 +517,17 @@ fn installed_mode_is_one_permanent_attachment() {
 
 ---
 
-### Task 5: Telling the owner it is on
+### Task 5: The Preferences screen, and telling the owner it is on
 
 **Files:** Modify `deskwarden/src/prefs_ui.rs`, `deskwarden/src/settings.rs`, `README.md`
 
 A process serving a decrypted vault must be visible in the app that started
 it, and the owner must be able to turn it off. Off is the default.
 
-- [ ] **Step 1: Write the failing test** — the setting defaults to off, and a settings file predating it reads as off rather than failing to parse.
+The screen mints keys, names them, sets an expiry and grants scopes; it lists
+what exists and revokes. A minted key is shown **once**.
+
+- [ ] **Step 1: Write the failing tests** -- the service setting defaults to off and a settings file predating it reads as off rather than failing to parse; a minted key is displayed once and the record afterwards holds only its hash; revoking removes the record; an expiry already in the past is refused at creation rather than minted dead.
 - [ ] **Steps 2–5:** red, implement, full suite, commit.
 
 ---
