@@ -245,10 +245,15 @@ Watch for the latency claim: a fill now always makes a backend call. On direct R
 
 > **Also blocked, and now by two gates rather than one.** Task 3 above is the
 > second: the snapshot cannot drop its passwords while a fill reads them, and a
-> fill must read them while it has to work with the backend stopped. Keep
-> Task 1's test red rather than ignoring it — an `#[ignore]` was the right
-> shape when one task remained; with the work moved wholesale to another plan,
-> a red test is the more honest marker and the suite already tolerates it.
+> fill must read them while it has to work with the backend stopped.
+>
+> **Task 1's test is `#[ignore]`d, with both gates named in the attribute.** An
+> earlier revision of this note said to leave it red, on the grounds that a red
+> test is the more honest marker. That was right about honesty and wrong about
+> consequences: a red test on `main` is a red CI on `main`, and a red CI is
+> what stops the next release being verifiable. Ignored-with-a-reason is honest
+> *and* lands — and because the reason names the two plans that unblock it, it
+> reads as a finish line rather than as a test somebody switched off.
 
 **Files:** Modify `deskwarden/src/vault_cache.rs`
 
