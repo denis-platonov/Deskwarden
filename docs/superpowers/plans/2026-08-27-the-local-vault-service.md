@@ -170,7 +170,7 @@ pub fn decide(method: &str, path: &str, auth: Option<&str>, expected: &Token) ->
 // Paths are `bw serve`'s: /status, /list/object/items, /list/object/folders, /object/item/{id}
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// **The test this module exists for.** No token, no vault.
@@ -234,10 +234,10 @@ fn an_unknown_path_is_not_a_way_to_learn_which_routes_exist() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement.** Check the credential first and return `Unauthorized` before parsing the path at all; then method; then route.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run to verify they fail.** **Not observed** -- tests and implementation were written together. A mutation check stands in: routing was moved above the credential check and three tests failed (both behavioural ones and the source pin); restoring the order made them pass.
+- [x] **Step 3: Implement.** Check the credential first and return `Unauthorized` before parsing the path at all; then method; then route.
+- [x] **Step 4: Run to verify they pass.**
+- [x] **Step 5: Commit.**
 
 ---
 

@@ -110,6 +110,10 @@ pub mod scratch_window;
 /// downstream of it is a pure function.
 pub mod screen_capture;
 pub mod send;
+/// Who may call what, for the local vault service: one pure function over a
+/// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
+/// API rather than a new one.
+pub mod service_api;
 /// The bearer token the local vault service requires. Read its module doc
 /// for what it stops and -- more importantly -- what it does not: a program
 /// already running as the owner is not kept out by it.

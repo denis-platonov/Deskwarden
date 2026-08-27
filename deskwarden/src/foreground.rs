@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 64] = [
+        const OPENS_NO_WINDOW: [&str; 65] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1458,6 +1458,10 @@ mod tests {
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.
             "send",
+            // The routing and authorisation decision as a pure function.
+            // It binds no socket -- that is the process's job -- and draws
+            // nothing.
+            "service_api",
             // Mints, compares and parses a bearer token. Pure string work
             // and one call for random bytes; it draws nothing and knows
             // nothing about windows.
