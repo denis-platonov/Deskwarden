@@ -1,5 +1,11 @@
 # The Switch-Over Implementation Plan
 
+> **SUPERSEDED 2026-08-27.** See `docs/superpowers/specs/2026-08-27-the-local-vault-service-design.md`.
+> A third consumer -- scripts over REST -- makes the local vault service the product rather than
+> a supervisor bolted onto `bw serve`, and it resolves this plan's blocker by owning its own
+> lifetime. **`bw serve` keeps its kill-on-close job object.** Task 1b (`win_stop` through an owned
+> handle) is real work that stands; Tasks 2 and 3 are not to be built.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `vault_service`'s counting actually govern `bw serve`, so the backend outlives the daemon exactly as long as another app is using it -- and no longer.
