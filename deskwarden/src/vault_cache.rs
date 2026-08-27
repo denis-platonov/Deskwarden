@@ -1999,7 +1999,39 @@ impl VaultCache {
             }
             (snapshot.items.clone(), snapshot.folders.clone())
         };
-        if let Err(e) = disk.write(&fingerprint, &items, &folders) {
+        // **The facts section, built here because this is where the items
+        // are.** `vault_disk_cache` takes it as opaque bytes and has no
+        // opinion about what a projection contains -- see its `write`. What
+        // it buys is that a reader wanting names, usernames and websites
+        // never opens a single sealed secret.
+        //
+        // `crate::app::ItemFacts` is referenced from here rather than moved
+        // somewhere neutral, and that is a deliberate small debt: the type is
+        // a decision about what the account picker needs, its constructor
+        // reaches `key_sequence`, `favicon` and `app`'s own sequence lookup,
+        // and splitting it across modules to satisfy a layering diagram would
+        // scatter one decision over three files.
+        // `{ items, folders }`, and the folders are in here rather than
+        // beside the secrets on purpose: a folder is a name and an id, so a
+        // reader that wants the vault's shape should not have to open a
+        // single sealed item to get it.
+        #[derive(serde::Serialize)]
+        struct Facts<'a> {
+            items: Vec<crate::app::ItemFacts>,
+            folders: &'a [Folder],
+        }
+        let facts = Facts {
+            items: items.iter().map(crate::app::ItemFacts::of).collect(),
+            folders: &folders,
+        };
+        let facts_bytes = match serde_json::to_vec(&facts) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("could not serialize the vault cache's facts section: {e}");
+                return;
+            }
+        };
+        if let Err(e) = disk.write(&fingerprint, &facts_bytes, &items, &folders) {
             log::warn!("could not write the encrypted vault cache: {e}");
         }
     }
