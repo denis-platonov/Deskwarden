@@ -112,13 +112,26 @@ both find no service and both start one. Whatever wins that race must be
 decided once -- the single-instance takeover already solves this shape for the
 app itself and is the precedent, not a second scheme.
 
-**`bw serve` cannot be reference-counted as cleanly.** It is a subprocess with
-a fixed port, and today the daemon owns it via a kill-on-close job object. If
-the last app exiting must stop it, that ownership has to move to whatever holds
-the count -- or `bw serve` keeps today's behaviour and only the direct service
-gets the shared lifecycle. **This is the one part of this design that is not
-settled**, and it should be decided before implementation rather than
-discovered during it.
+**`bw serve` gets the same lifecycle, and that accepts a real cost.**
+Decided 2026-08-27, against keeping it as it is. Today the daemon owns it
+through a kill-on-close job object, so the **kernel** guarantees it cannot
+outlive the app; reference-counting it means moving that ownership to
+whatever holds the count, and an orphaned `bw serve` then holds a session
+token on a fixed port with no app running.
+
+That is a genuine loss and is accepted for a genuine reason: two lifecycles
+would mean "who owns the vault service" has two answers depending on a
+setting, which is the split this whole design exists to remove. **One rule
+is worth more than one guarantee**, provided the orphan window is bounded --
+which it is, because the next app to start reconnects rather than leaving it
+stranded, and because the existing auto-lock and the seven-day cache expiry
+still apply to what it holds.
+
+**It is bounded, not eliminated**, and an implementation must not pretend
+otherwise: there is a window in which a process holding a session token is
+running with no window and no tray. Whatever supervises the count is
+responsible for closing it, and a test that only drives clean exits does not
+show that it does.
 
 **Two settings can express a configuration nobody wants** -- `bw serve` with a
 cache-first read, say, where the cache is refreshed by a subprocess the user
