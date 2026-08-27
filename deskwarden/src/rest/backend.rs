@@ -740,7 +740,7 @@ impl VaultBackend for RestBackend {
     ///
     /// What it must **not** become is a generator living here.
     /// [`crate::password_gen`] is a module beside the backends precisely so
-    /// that the next one, and `overlay_ui` which already builds a
+    /// that the next one, and the fill-path cards, which already build a
     /// [`crate::vault_bridge::PasswordRecipe`], reach the same generator
     /// rather than growing a second. Two generators in one app is two answers
     /// to how strong its passwords are, so this method is a call and a

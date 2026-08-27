@@ -18,7 +18,8 @@
 //! because the requirement was that the generator be *reused*: a generator
 //! living in `rest/` would be reachable only by the REST backend, and the
 //! next backend -- or the UI, which already builds a [`PasswordRecipe`] in
-//! `overlay_ui` -- would have to grow a second one. Two password generators
+//! the fill path's generator card -- would have to grow a second one. Two
+//! password generators
 //! in one app is two answers to "how strong is a password this app made".
 //!
 //! # What is generated, and what is refused

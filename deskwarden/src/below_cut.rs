@@ -3,7 +3,7 @@
 //! # Why this file exists
 //!
 //! Six files (`send.rs`, `updater.rs`, `vault_export.rs`, `breach.rs`,
-//! `overlay_ui.rs`, `job_object.rs`) each carry a two-state walk of the region
+//! `job_object.rs`) each carry a two-state walk of the region
 //! below their first `cfg(test)` module. Each walk's model of "the module
 //! ended" is the line `}` at column 0 -- and a module close written INDENTED
 //! is legal Rust, so a payload can close the module early, plant a file-scope

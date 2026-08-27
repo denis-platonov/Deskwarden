@@ -4038,7 +4038,8 @@ mod clamp_window_geometry_tests {
     /// where the guard in this file believes it is.**
     ///
     /// The same walk `main.rs`, `app_identity.rs`, `app_window.rs`,
-    /// `login_ui.rs`, `vault_window/mod.rs` and `overlay_ui.rs` carry. This
+    /// `login_ui.rs` and `vault_window/mod.rs` carry -- and `overlay_ui.rs`
+    /// carried, until that module was deleted. This
     /// file had the cut and no walk at all: its one source guard
     /// (`no_test_in_this_module_touches_the_real_settings_file`) splits on the
     /// first test gate and counts needles in the TAIL, and nothing anywhere
