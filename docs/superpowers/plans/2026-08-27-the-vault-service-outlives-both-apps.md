@@ -44,11 +44,53 @@ pub fn anyone_attached(env: &ServiceEnv) -> bool;
 
 **The rule:** an `Attachment` is a *kernel object*, released by the OS on process death — clean exit, crash, or kill alike. Nothing decrements a number.
 
+### Which primitive, and the trap that rules most of them out
+
+**Added 2026-08-27 before implementing, after reading `app_mutex`.** That
+module documents the thing that breaks the obvious design:
+
+> a `CreateMutexW` that finds the name already there still *opens a handle to
+> it*, and a named object lives as long as any handle does
+
+So **one shared named object cannot answer "is anyone attached"**: the
+process asking keeps the name alive by asking. `take_if_free` exists precisely
+because an incoming instance polling with `acquire` "would wait out its whole
+timeout against itself". Any design where the supervisor tests a shared name
+has that bug.
+
+Nor can the attachment be a mutex *owned* by each app: a mutex has one owner
+at a time, and two apps must be attached at once.
+
+**Nor is the connection itself enough**, which is the other obvious answer.
+It works for a persistent pipe, where a client vanishing is a kernel-visible
+disconnect -- but `bw serve` is HTTP on a port, with no persistent per-client
+connection to count. A mechanism that only works for one of the two services
+reintroduces the split this design exists to remove.
+
+**What does work: one named object per app, and a list of names the
+supervisor tries to open.**
+
+- Each app creates `Local\Deskwarden-Attach-<uuid>` and holds it for as long
+  as it needs the vault. The OS releases it on death, however the death
+  happened.
+- The app records that name where the supervisor can find it.
+- The supervisor **opens each name and drops the handle immediately**. A name
+  that fails to open has no live holder. Transient handles do not keep a name
+  alive past the drop, which is what makes this safe where testing a shared
+  name is not.
+- No app is attached when no recorded name opens.
+
+**The list of names is a hint, not a count.** A stale entry costs one failed
+`OpenMutexW`; a missing entry costs an app that is attached but unseen, which
+is why the entry is written *before* the vault is used and not after. This is
+the one place bookkeeping appears, and it is deliberately the kind that
+degrades into a wrong answer nobody acts on rather than a leak.
+
 `app_mutex` is the precedent and not a second scheme: it already answers "is Deskwarden running?" for the installer, per logon session, with `Local\` scoping. This asks the same question about a different subject.
 
-- [ ] **Step 1: Write the failing tests** — that two attachments both report attached, that dropping one leaves `anyone_attached` true and dropping both makes it false, and — **the test the design exists for** — that an attachment abandoned *without* being dropped (the crash case, simulated through the `ServiceEnv` seam) still reports detached.
+- [x] **Step 1: Write the failing tests** — that two attachments both report attached, that dropping one leaves `anyone_attached` true and dropping both makes it false, and — **the test the design exists for** — that an attachment abandoned *without* being dropped (the crash case, simulated through the `ServiceEnv` seam) still reports detached.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** implemented and committed. **Red-first was not honoured** -- tests and implementation were written together. What stood in for it: `asking_never_makes_a_name_live` failed on its first run and its own control is what caught the reason (it was asking about a cleanly released name, which is removed from the register, so `is_held` was never consulted).
 
 ---
 
@@ -70,9 +112,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 **An unverifiable service is not adopted and not killed.** It is left alone and the app reports that it could not start its backend. Killing a process this app cannot identify is worse than refusing to use it.
 
-- [ ] **Step 1: Write the failing tests** — a service that holds the object and matches the fingerprint is adopted; one that holds it but serves a *different* account is refused; one that answers the port while holding nothing is refused and **not killed**.
+- [x] **Step 1: Write the failing tests** — a service that holds the object and matches the fingerprint is adopted; one that holds it but serves a *different* account is refused; one that answers the port while holding nothing is refused and **not killed**.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** red first this time -- the tests were run and failed on missing `verify`, `Verdict`, `Refusal`, `service_object_name` and the `stop` field before any of them existed.
 
 ---
 
@@ -87,9 +129,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 **The job object moves rather than disappearing.** `bw serve` is still spawned suspended into a job — but the job is held by whatever supervises the count, so the kernel still kills it when *nothing* is attached, rather than when one particular app dies. That keeps most of the old guarantee: the orphan window is between the last release and the supervisor noticing, not unbounded.
 
-- [ ] **Step 1: Write the failing tests** — two concurrent starts produce one service; the loser attaches rather than failing; releasing the last attachment stops it; releasing one of two does not.
+- [x] **Step 1: Write the failing tests** — two concurrent starts produce one service; the loser attaches rather than failing; releasing the last attachment stops it; releasing one of two does not.
 
-- [ ] **Steps 2–5:** red, implement, full suite, commit.
+- [x] **Steps 2–5:** done in `vault_service.rs`. **`main.rs` wiring is NOT done** and is deliberately deferred until Task 4: wiring this in is the moment the job object's kill-on-close guarantee is given up, and the thing that bounds the resulting orphan window does not exist yet. Landing the mechanism first and the switch-over after Task 4 keeps the daemon from ever being in a state where nothing closes that window.
 
 ---
 
@@ -99,9 +141,9 @@ This is the piece the job object made unnecessary and reference-counting makes e
 
 The spec is explicit that the orphan window is **bounded, not eliminated**, and that "a test that only drives clean exits does not show that it does".
 
-- [ ] **Step 1: Write the failing test** — every app crashes (attachments abandoned, not released) and the service is observed to stop. Drive it through the seam; do not kill a real process in a test.
-- [ ] **Step 2:** implement whatever closes it — a supervisor that re-checks `anyone_attached` on an interval is the cheapest thing that works, and its interval is the window's size and should be named as such.
-- [ ] **Steps 3–5:** full suite, commit.
+- [x] **Step 1: Write the failing test** — every app crashes (attachments abandoned, not released) and the service is observed to stop. Drive it through the seam; do not kill a real process in a test.
+- [x] **Step 2:** `supervise` re-checks `anyone_attached` each tick, and `ORPHAN_CHECK_INTERVAL` is **five seconds** -- the window's size, named as such, with a test that makes anyone changing it say so. Original step text: — a supervisor that re-checks `anyone_attached` on an interval is the cheapest thing that works, and its interval is the window's size and should be named as such.
+- [x] **Steps 3–5:** full suite, commit.
 
 ---
 
