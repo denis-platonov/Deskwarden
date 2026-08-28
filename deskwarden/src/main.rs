@@ -29439,13 +29439,27 @@ mod startup_shape_tests {
         //    window beside the one that stayed -- which an offset check alone
         //    would pass on the survivor.
         let below: &[(&str, usize)] = &[
-            (
-                concat!(
-                    "stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_",
-                    "running);"
-                ),
-                2,
-            ),
+            // **The call, not its formatting.** This needle used to be the
+            // whole single-line call. Giving `stop_backend_if_idle` a third
+            // argument -- whether a vault window is open, the input whose
+            // absence let save-memory mode stop the backend under a window --
+            // wrapped both call sites, and the needle went to zero matches
+            // while both calls were still there. What this guard is for is
+            // that a startup initialisation is not COPIED, so it should count
+            // the call and not the line breaks around it.
+            // **Three: the definition and its two calls.** This needle used
+            // to be the whole single-line call, which went to zero matches
+            // the moment `stop_backend_if_idle` gained a third argument --
+            // whether a vault window is open, the input whose absence let
+            // save-memory mode stop the backend out from under a window --
+            // and both calls wrapped. Two narrower needles were tried and
+            // were worse: the bare name also matches the definition, and
+            // `&mut estate.child,` is passed to two OTHER functions besides.
+            //
+            // So it counts the name and includes the definition in the
+            // number. What this guard exists to catch is a startup
+            // initialisation being COPIED, and a third call still makes four.
+            (concat!("stop_backend_if_", "idle("), 3),
             (concat!("let mut fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
             (concat!("let mut tray = tray::build", "_tray();"), 1),
             (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),

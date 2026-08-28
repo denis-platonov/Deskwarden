@@ -51,16 +51,45 @@ step() {
 # 32 and 75 on an unchanged tree. So this reports the failures rather than
 # judging them, and the caller has to look.
 run_tests() {
-    ( cd deskwarden && cargo test -j 8 2>&1 ) | tee /tmp/ci-local-tests.txt | grep -E "^test result|^error" || true
+    # **Both suites, reported separately.** `cargo test` runs the lib and the
+    # bin target and prints a `test result:` line for each. An earlier version
+    # of this printed only the first, so a bin-target failure was invisible --
+    # and one got through to CI that way, which is the whole thing this script
+    # exists to prevent.
+    # **`--no-fail-fast`, and this flag is the whole point of the fix.**
+    # `cargo test` stops after a target fails, and the library target ALWAYS
+    # fails on this machine because of the mockito noise -- so without it the
+    # bin target never runs here at all, and a bin failure is invisible
+    # locally no matter how carefully the output is read. That is exactly how
+    # a broken source guard reached CI. CI does not need the flag: its lib run
+    # is clean, so it reaches the bin target on its own.
+    ( cd deskwarden && cargo test -j 8 --no-fail-fast 2>&1 ) | tee /tmp/ci-local-tests.txt >/dev/null
+    echo '  suite results (one line per target):'
+    grep -E '^test result' /tmp/ci-local-tests.txt | sed 's/^/    /'
     echo
-    echo "  failing tests, if any:"
-    # `^test result:` is the SUMMARY line, not a test. Matching it made an
-    # earlier version of this script report a module called "result".
-    grep -E "^test [a-z]" /tmp/ci-local-tests.txt | grep -v "^test result:" | grep " FAILED" | sed 's/^/    /' | head -30
-    # Only a compile error is an outright failure here. Test failures are
-    # printed for a human, because on this machine they are noise more often
-    # than they are signal.
-    ! grep -qE "^error(\[|:)" /tmp/ci-local-tests.txt
+    echo '  failing tests:'
+    grep -E '^test [a-z]' /tmp/ci-local-tests.txt | grep -v '^test result:' | grep ' FAILED' \
+        | sed 's/^test /    /;s/ \.\.\..*//' | head -40
+    local n
+    n=$(grep -E '^test [a-z]' /tmp/ci-local-tests.txt | grep -v '^test result:' | grep -c ' FAILED')
+    echo "    ($n failing)"
+    echo
+    # The local suite is NOT trustworthy: a different set of mockito-using
+    # modules fails on every run, and the count has swung between 32 and 85 on
+    # an unchanged tree. So the SIGNAL is a failure in something that does not
+    # use mockito -- those are the ones worth chasing.
+    echo '  failures in modules that do not use mockito (these are the real ones):'
+    grep -E '^test [a-z]' /tmp/ci-local-tests.txt | grep -v '^test result:' | grep ' FAILED' \
+        | sed 's/^test //;s/ \.\.\..*//' | cut -d: -f1 | sort -u | while read -r m; do
+        f="deskwarden/src/${m//:://}.rs"
+        [ -f "$f" ] || f="deskwarden/src/${m//:://}/mod.rs"
+        # A name that is not a module at all (main.rs's own test mods) has no
+        # file, and is reported rather than silently excused.
+        if [ ! -f "$f" ]; then echo "    $m  (in main.rs or a test-only module)"
+        elif ! grep -qi mockito "$f"; then echo "    $m"
+        fi
+    done
+    ! grep -qE '^error(\[|:)' /tmp/ci-local-tests.txt
 }
 
 # The one that IS decisive, and the one CI actually gates on.
