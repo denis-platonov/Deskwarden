@@ -6,6 +6,7 @@
 [![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/badge/tests-4300%2B-brightgreen?style=flat-square)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/codecov/c/github/denis-platonov/deskwarden?style=flat-square&logo=codecov&logoColor=white)](https://codecov.io/gh/denis-platonov/deskwarden)
 [![Buy me a coffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg)](https://buymeacoffee.com/denis.platonov)
 
 
