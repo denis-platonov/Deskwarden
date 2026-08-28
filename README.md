@@ -1,11 +1,16 @@
-# Deskwarden
+<p align="center">
+  <img src="docs/deskwarden-logo.png" alt="Deskwarden" width="128" height="128">
+</p>
+
+<h1 align="center">Deskwarden</h1>
+
 
 [![Rust](https://img.shields.io/badge/Rust-2021%20edition-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/deskwarden/releases/latest)
-[![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-4300%2B-brightgreen?style=flat-square)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/codecov/c/github/denis-platonov/deskwarden?style=flat-square&logo=codecov&logoColor=white)](https://codecov.io/gh/denis-platonov/deskwarden)
+[![release](https://img.shields.io/github/v/release/denis-platonov/Deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/Deskwarden/releases/latest)
+[![downloads](https://img.shields.io/github/downloads/denis-platonov/Deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/Deskwarden/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/Deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/Deskwarden/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-4300%2B-brightgreen?style=flat-square)](https://github.com/denis-platonov/Deskwarden/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/codecov/c/github/denis-platonov/Deskwarden?style=flat-square&logo=codecov&logoColor=white)](https://codecov.io/gh/denis-platonov/Deskwarden)
 [![Buy me a coffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg)](https://buymeacoffee.com/denis.platonov)
 
 
@@ -21,7 +26,7 @@ Windows applications** — the kind of desktop app or game launcher a browser
 extension can't reach — and gives you a vault browser to manage them from,
 right in the system tray.
 
-- **[Download the latest release](https://github.com/denis-platonov/deskwarden/releases/latest)**
+- **[Download the latest release](https://github.com/denis-platonov/Deskwarden/releases/latest)**
   — a per-user Windows installer, no admin rights required.
 - **[Full documentation](deskwarden/README.md)** — requirements, trigger modes,
   self-hosted servers, troubleshooting, and security notes.
@@ -308,7 +313,7 @@ AGPL-3.0-or-later — see [LICENSE](LICENSE). (The same license also ships with 
      the image was rendering as a broken link rather than a chart. Replaced
      with the count itself, which comes from an endpoint that still works. -->
 <p align="center">
-  <a href="https://github.com/denis-platonov/deskwarden/stargazers">
-    <img src="https://img.shields.io/github/stars/denis-platonov/deskwarden?style=for-the-badge&color=f5c518&labelColor=1c1c1c" alt="Stars">
+  <a href="https://github.com/denis-platonov/Deskwarden/stargazers">
+    <img src="https://img.shields.io/github/stars/denis-platonov/Deskwarden?style=for-the-badge&color=f5c518&labelColor=1c1c1c" alt="Stars">
   </a>
 </p>
