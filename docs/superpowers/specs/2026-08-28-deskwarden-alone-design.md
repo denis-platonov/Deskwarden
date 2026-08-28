@@ -20,6 +20,28 @@ with a test asserting that none of them refuses.
 
 So the goal is a third row that says **~16 MB, and nothing else**.
 
+## Correction: this document is a supplement, not the plan
+
+**Written 2026-08-28 without checking for prior work, and there was prior
+work.** `2026-08-26-dropping-the-bw-cli-design.md` already sets out the whole
+subtraction in order, and it names a blocker this document missed entirely:
+
+> **2. Two-factor authentication. This is the blocker.** `rest::api`
+> *recognises* 2FA and refuses it by name (`RestError::TwoFactorRequired`)
+> rather than completing it. Every account with 2FA enabled -- which is the
+> configuration Bitwarden encourages -- cannot sign in without the CLI.
+
+Still true, checked today: `twoFactorProvider`/`twoFactorToken` appear in that
+module only inside a comment saying completing the challenge "is not in this
+task". So the three CLI call sites this document measures are **necessary and
+not sufficient** -- fixing all three leaves any 2FA account unable to sign in,
+which for most users is the same as not shipping it.
+
+**The order to follow is the other document's.** What is useful here is the
+measurement it does not have: exactly where the CLI is still invoked, which
+is its step 3, and the finding that the session token is unused on the
+direct-REST path so it needs not producing rather than replacing.
+
 ## What stands in the way, measured rather than assumed
 
 Three places require `bw.exe` today, and the third was found only by reading
