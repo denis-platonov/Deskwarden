@@ -282,7 +282,9 @@ const SYNC_MOVED_LABEL: &str = "Which backend holds this vault";
 /// is [`Section::Vault`]'s label -- otherwise a rename leaves this pointing
 /// at a page nobody can find. It also names what else is over there, because
 /// "it moved" without "and so did these" sends a user on a second trip.
-const SYNC_MOVED_NOTE: &str = "That switch is on the Vault page now, beside the encrypted copy      on this PC and the local vault service -- they decide one thing between them, so they are      read together.";
+const SYNC_MOVED_NOTE: &str = "That switch is on the Vault page now, beside the encrypted copy \
+                               on this PC -- they decide one thing between them, so they are \
+                               read together.";
 
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
@@ -884,14 +886,23 @@ pub enum Section {
     Autofill,
     NativeApps,
     Security,
-    /// **Everything about where this vault lives and who may reach it.**
+    /// **Everything about where this vault lives and what is kept of it on
+    /// this PC.**
     ///
     /// [`Section::Breaches`]'s argument, taken to its end on the one subject
-    /// where the pages had actually scattered. This page now carries all of
-    /// it: which backend holds the vault (the official `bw` CLI or
-    /// Deskwarden's built-in client), whether that backend is kept warm,
-    /// whether an encrypted copy is kept on this PC and whether reads consult
-    /// it, and the local endpoint plus the API keys that open it.
+    /// where the pages had actually scattered. This page carries all of it:
+    /// which backend holds the vault (the official `bw` CLI or Deskwarden's
+    /// built-in client), whether that backend is kept warm, whether an
+    /// encrypted copy is kept on this PC and whether reads consult it.
+    ///
+    /// **What it does not carry is the local API**, which is
+    /// [`Section::Api`]. Those four settings answer "where does Deskwarden
+    /// get this vault from"; the API answers "who else may ask Deskwarden for
+    /// it". They met here only because both had once been called "the vault
+    /// service", and a page that answers two questions is a page on which
+    /// neither answer is findable -- the key list, which is the longest thing
+    /// in this window and has no upper bound, sat under four rows of
+    /// three-paragraph copy that nobody reading about keys wanted.
     ///
     /// # Why they were gathered, and it is not tidiness
     ///
@@ -905,17 +916,36 @@ pub enum Section {
     /// can see all of them at once can see what they have just done to
     /// themselves.
     ///
-    /// The service half's own argument is unchanged and still holds: a switch
-    /// on one page and the list of who can walk through the door it opens on
-    /// another is an arrangement where the owner can believe they turned
-    /// something off while three keys still exist for it.
-    ///
     /// **Directly after Security**, which is the page a reader looking for
-    /// "what can reach my vault" reaches first, and where they would
-    /// otherwise expect to find this. It is not ON Security, because that is
-    /// a [`draw_not_yet`] page about what is asked before a secret is
-    /// revealed, and this is about a caller that is never asked at all.
+    /// "where does my vault come from" reaches first, and where they would
+    /// otherwise expect to find this.
     Vault,
+    /// **The local HTTP API, and every key that opens it**: the switch that
+    /// starts the endpoint on 127.0.0.1, the form that mints a key, the one
+    /// showing of a key it has just made, the list of the keys that exist,
+    /// and revoking one.
+    ///
+    /// # Why it is its own page and not the bottom of [`Section::Vault`]
+    ///
+    /// The half that must never be split is the switch and the keys, and it
+    /// is not split: **a switch on one page and the list of who can walk
+    /// through the door it opens on another is an arrangement where the
+    /// owner can believe they turned something off while three keys still
+    /// exist for it.** That argument is about these two, and both are here.
+    ///
+    /// It says nothing about the backend choice or the disk cache, which
+    /// answer a different question -- see [`Section::Vault`]. Those four are
+    /// settings, each a row that is read once and left alone. This page is a
+    /// *workspace*: it has a form, an unbounded list, and two questions the
+    /// user answers in place. Sharing a scroll region with four rows of
+    /// three-paragraph copy meant the mint button moved down the page as
+    /// keys were added, which is the one control here a user comes back for.
+    ///
+    /// **Directly after Vault**, because the endpoint serves whatever the
+    /// Vault page decided is being served, and because a reader who has just
+    /// read what is kept on this PC is exactly the reader who should next be
+    /// asked who may reach it.
+    Api,
     Clipboard,
     Shortcuts,
     SyncAndAccount,
@@ -947,13 +977,14 @@ pub enum Section {
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::General,
         Section::Breaches,
         Section::Autofill,
         Section::NativeApps,
         Section::Security,
         Section::Vault,
+        Section::Api,
         Section::Clipboard,
         Section::Shortcuts,
         Section::SyncAndAccount,
@@ -971,6 +1002,7 @@ impl Section {
             Section::NativeApps => "Native apps",
             Section::Security => "Security",
             Section::Vault => "Vault",
+            Section::Api => "Local API",
             Section::Clipboard => "Clipboard",
             Section::Shortcuts => "Shortcuts",
             Section::SyncAndAccount => "Sync & account",
@@ -1000,7 +1032,17 @@ impl Section {
             // listening, and a reader who has not grasped that there IS an
             // endpoint cannot weigh them.
             Section::Vault => {
-                "Which backend holds this vault, what is kept on this PC, and the local                  endpoint that hands it to other programs."
+                "Which backend holds this vault, and what is kept of it on this PC."
+            }
+            // Names the door before the keys, for the reason the page draws
+            // them in that order: the keys mean nothing while nothing is
+            // listening, and a reader who has not grasped that there IS an
+            // endpoint cannot weigh them. Says *other programs on this PC*
+            // rather than "clients", because who may walk through is the
+            // decision this page asks for.
+            Section::Api => {
+                "The local endpoint that hands this vault to other programs on this PC, and \
+                 the keys that open it."
             }
             // Says *taken back*, not "cleared", and names the copy rather than
             // the clipboard: the page is about the second half of
@@ -1417,7 +1459,7 @@ impl PrefsState {
         self.hello_available = probe;
     }
 
-    /// Supplies the API keys the Vault service page lists, instead of the
+    /// Supplies the API keys the Local API page lists, instead of the
     /// ones that were on disk when this state was built.
     ///
     /// For `examples/ui_preview`, which **must not read**
@@ -1804,6 +1846,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             "Auto-lock is on the General page. Nothing else here is configurable yet.",
         ),
         Section::Vault => draw_vault(ui, state),
+        Section::Api => draw_api(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
         // The one read of the published status -- see `hotkey::availability`, and
         // `draw_shortcuts` for why it is a parameter from here down.
@@ -2371,7 +2414,7 @@ fn scan_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The vault service, and the keys that open it
+// The local API, and the keys that open it
 // ---------------------------------------------------------------------------
 
 /// The master switch's label. It names **what happens to the vault**, not the
@@ -3120,34 +3163,63 @@ fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
     });
 }
 
+/// Where the vault is served from, then what is kept of it on this PC.
+///
+/// **No scroll region, and that is a measurement rather than an opinion.**
+/// This page had one while the key list was on it, because that list has no
+/// upper bound. Four rows of long copy do not: the worst combination of
+/// descriptions this page can paint -- the three-paragraph crypto copy over
+/// the Windows Hello explanation -- ends 180 points above the fold of a body
+/// that is a fixed 740. See
+/// `the_whole_vault_page_is_readable_without_scrolling`, which drives all
+/// four combinations and would fail before a user found a row they could not
+/// reach.
+///
+/// So it follows the same rule as every other fixed page here: a scroll
+/// region on content that fits reserves a lane for a bar that can never be
+/// needed, and this file's bars are `AlwaysVisible` -- one here would be a
+/// permanent bar on a page that never moves.
 fn draw_vault(ui: &mut Ui, state: &mut PrefsState) {
-    // **The one page in this window that scrolls**, and it is not a
-    // precaution: the key list has no upper bound. Every other page here is a
-    // fixed set of rows that fits the fixed window by construction, so a
-    // scroll region on them would reserve a lane for a bar that can never be
-    // needed. Ten keys on this one runs off the bottom of a window that
-    // cannot be resized, and a revoke button below the fold is a revoke
-    // button that does not exist.
-    //
-    // **It is also what made this gathering possible.** The backend row lives
-    // here rather than on General because General's card was one row from its
-    // ceiling -- the window is a fixed 780 points and every other page has no
-    // scroll region, so a row past the fold is a row nobody can reach. That
-    // objection does not apply to this page: it already scrolled, for the key
-    // list, so four more rows of three-paragraph copy are reachable rather
-    // than merely painted. Nothing was traded away to put them here.
-    //
-    // Always visible, for `draw_notes`'s reason exactly: content clipped with
-    // no bar reads as content that failed to load, and a bar whose lane comes
-    // and go with the content makes the cards change width as keys are
-    // minted.
+    vault_cards(ui, state);
+}
+
+/// The Vault page's cards, in reading order.
+///
+/// Kept as its own function, though it is now two calls: it is the seam the
+/// scroll-region question is asked at, and inlining it would put the answer
+/// back in `draw_section`'s match arm where nothing can document it.
+fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
+    draw_backend_card(ui, state);
+    draw_disk_cache_card(ui, state);
+}
+
+/// **The one page in this window that scrolls**, and it is not a precaution:
+/// the key list has no upper bound. Every other page here is a fixed set of
+/// rows that fits the fixed window by construction, so a scroll region on
+/// them would reserve a lane for a bar that can never be needed. Ten keys on
+/// this one runs off the bottom of a window that cannot be resized, and a
+/// revoke button below the fold is a revoke button that does not exist.
+///
+/// **This is the half of the split that had to keep the region.** The Vault
+/// page's was there for this list; with the list gone, its remaining four
+/// rows fit -- see [`draw_vault`].
+///
+/// Always visible, for `draw_notes`'s reason exactly: content clipped with no
+/// bar reads as content that failed to load, and a bar whose lane comes and
+/// goes with the content makes the cards change width as keys are minted.
+///
+/// The `id_salt` is the one this region has always had. It is the same
+/// region, moved with the content it was made for, and an id is what egui
+/// keeps the scroll offset under -- changing it here would be a new region
+/// wearing the old one's job for no reason.
+fn draw_api(ui: &mut Ui, state: &mut PrefsState) {
     egui::ScrollArea::vertical()
         .id_salt("prefs-vault-service")
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, CONTENT_GAP);
-            vault_cards(ui, state);
+            api_cards(ui, state);
         });
 }
 
@@ -3155,12 +3227,13 @@ fn draw_vault(ui: &mut Ui, state: &mut PrefsState) {
 ///
 /// **The unbounded list is last.** Every card above it is fixed-height and
 /// all of them are more urgent than the eleventh key; putting the list above
-/// them would push the mint button -- and now the backend switch as well --
-/// off the bottom of a page whose length the owner does not control.
-fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
-    draw_backend_card(ui, state);
-    draw_disk_cache_card(ui, state);
-
+/// them would push the mint button off the bottom of a page whose length the
+/// owner does not control.
+///
+/// **The switch is first**, because a key is meaningless while nothing is
+/// listening: a reader who mints one without having seen the switch has
+/// bought a credential for a door that does not exist.
+fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         state.settings.service_enabled = toggle_row(
             ui,
@@ -5523,11 +5596,12 @@ mod tests {
         assert!(hits.is_empty(), "{hits:#?}");
     }
 
-    // -- the vault service, and the keys that open it ----------------------
+    // -- the local API, and the keys that open it --------------------------
 
-    /// A viewport tall enough for the whole Vault service page.
+    /// A viewport tall enough for the whole of either scrolling page.
     ///
-    /// The page scrolls in the real window (see [`draw_vault_service`]), and
+    /// Both scroll in the real window (see [`draw_api`] and [`draw_vault`]),
+    /// and
     /// a `ScrollArea` **culls what is outside its viewport** -- so a test
     /// reading `BODY_SIZE` would find the mint button missing and could not
     /// tell that from a mint button that was never drawn. Height only:
@@ -5565,18 +5639,18 @@ mod tests {
         }
     }
 
-    /// A Vault service page with every seam pointed at a value: a fixed
-    /// clock, fixed randomness, a store that writes nowhere, and a clipboard
-    /// that is not the clipboard.
-    fn vault_state() -> PrefsState {
+    /// A Local API page with every seam pointed at a value: a fixed clock,
+    /// fixed randomness, a store that writes nowhere, and a clipboard that is
+    /// not the clipboard.
+    fn api_state() -> PrefsState {
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::Vault;
+        state.section = Section::Api;
         state.show_key_clock(|| TEST_NOW);
         state.show_key_random(|| TEST_KEY_BYTES);
         state
     }
 
-    fn vault_frame(
+    fn tall_frame(
         ctx: &egui::Context,
         state: &mut PrefsState,
         events: &[egui::Event],
@@ -5600,9 +5674,9 @@ mod tests {
     /// screen, which is the same shape of mistake
     /// `no_id_diagnostic_while_the_nav_rows_are_clicked_through` documents
     /// for the nav.
-    fn vault_click(ctx: &egui::Context, state: &mut PrefsState, pos: Pos2) -> Painted {
-        let _ = vault_frame(ctx, state, &click(pos));
-        vault_frame(ctx, state, &[])
+    fn tall_click(ctx: &egui::Context, state: &mut PrefsState, pos: Pos2) -> Painted {
+        let _ = tall_frame(ctx, state, &click(pos));
+        tall_frame(ctx, state, &[])
     }
 
     /// A context whose fonts are live, sized for the tall viewport.
@@ -5962,25 +6036,22 @@ mod tests {
     #[test]
     fn clicking_the_service_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         assert!(!state.settings.service_enabled, "the default: nothing is listening");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(TOGGLE_SIZE);
         assert_eq!(
             pills.len(),
-            5,
-            "the Vault page paints five pills -- the backend choice and its child, the disk \
-             copy and its child, and the service switch -- and a test that indexed past the \
-             end, or into the wrong one, would be clicking something else"
+            1,
+            "the Local API page paints exactly one pill -- the service switch. It used to be \
+             the fifth of five, under the backend and disk-cache cards; those went back to \
+             the Vault page, and a test that indexed past the end, or into a pill that had \
+             followed them here, would be clicking something else"
         );
-        // LAST of the five: the service switch is the bottom card of the
-        // fixed-height part of the page, under the two cards that gathered
-        // here. The counter-assertions below are what make that index a
-        // claim rather than an assumption.
-        let pill = pills[4].center();
+        let pill = pills[0].center();
 
-        let _ = vault_frame(&ctx, &mut state, &click(pill));
+        let _ = tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.service_enabled,
             "the switch did not turn on -- the row is painted but its value is never written \
@@ -5991,7 +6062,7 @@ mod tests {
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(state.settings.read_through_cache, "the wrong row's toggle moved");
 
-        let _ = vault_frame(&ctx, &mut state, &click(pill));
+        let _ = tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.service_enabled, "and back off again");
     }
 
@@ -6001,8 +6072,8 @@ mod tests {
     #[test]
     fn the_page_says_what_turning_the_service_on_would_do() {
         let ctx = tall_context();
-        let mut state = vault_state();
-        let painted = vault_frame(&ctx, &mut state, &[]);
+        let mut state = api_state();
+        let painted = tall_frame(&ctx, &mut state, &[]);
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what would be served: {:?}",
@@ -6020,8 +6091,8 @@ mod tests {
     #[test]
     fn a_store_with_no_keys_says_nothing_can_reach_the_service() {
         let ctx = tall_context();
-        let mut state = vault_state();
-        let painted = vault_frame(&ctx, &mut state, &[]);
+        let mut state = api_state();
+        let painted = tall_frame(&ctx, &mut state, &[]);
         assert!(painted.any_containing("No keys have been minted"), "got {:?}", painted.strings());
     }
 
@@ -6036,9 +6107,9 @@ mod tests {
     #[test]
     fn a_stored_key_is_listed_by_name_and_scope_and_never_by_its_secret() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.show_service_keys(vec![stored_key("Backup script", None)]);
-        let painted = vault_frame(&ctx, &mut state, &[]);
+        let painted = tall_frame(&ctx, &mut state, &[]);
 
         assert!(painted.contains("Backup script"), "got {:?}", painted.strings());
         assert!(painted.any_containing("Never expires"));
@@ -6065,10 +6136,10 @@ mod tests {
     #[test]
     fn a_minted_key_is_shown_until_it_is_dismissed_and_then_never_again() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.key_form.name = "Backup".to_string();
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // The control: it is not on screen before the button is pressed.
         assert!(
             !first.contains(TEST_KEY),
@@ -6077,7 +6148,7 @@ mod tests {
         );
         let mint = first.ink_of(MINT_BUTTON).rect.center();
 
-        let minted = vault_click(&ctx, &mut state, mint);
+        let minted = tall_click(&ctx, &mut state, mint);
         assert!(
             minted.contains(TEST_KEY),
             "the minted key is not readable anywhere: {:?}",
@@ -6090,17 +6161,17 @@ mod tests {
 
         // Still there on the next frame: it is the only copy in existence,
         // and a card that cleared itself on a repaint would destroy it.
-        let again = vault_frame(&ctx, &mut state, &[]);
+        let again = tall_frame(&ctx, &mut state, &[]);
         assert!(again.contains(TEST_KEY), "the reveal did not survive a repaint");
 
         let done = again.ink_of(DONE_BUTTON).rect.center();
-        let dismissed = vault_click(&ctx, &mut state, done);
+        let dismissed = tall_click(&ctx, &mut state, done);
         assert!(!dismissed.contains(TEST_KEY), "the key is still on screen after Done");
         assert!(state.minted.is_none(), "the plaintext is still being held");
 
         // And it is not recoverable: the record that was kept holds the hash,
         // and nothing on a later frame can produce the key again.
-        let later = vault_frame(&ctx, &mut state, &[]);
+        let later = tall_frame(&ctx, &mut state, &[]);
         assert!(!later.contains(TEST_KEY), "the key came back on a later frame");
         assert_eq!(state.keys.len(), 1, "the record itself was lost with the reveal");
         assert_eq!(state.keys[0].hash, crate::service_keys::hash_key(TEST_KEY));
@@ -6116,11 +6187,11 @@ mod tests {
     #[test]
     fn minting_puts_the_plaintext_on_screen_and_into_nothing_that_is_stored() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.key_form.name = "Backup".to_string();
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let mint = first.ink_of(MINT_BUTTON).rect.center();
-        let _ = vault_click(&ctx, &mut state, mint);
+        let _ = tall_click(&ctx, &mut state, mint);
 
         let stored = serde_json::to_string(&state.keys).expect("the store serialises");
         assert!(
@@ -6144,21 +6215,21 @@ mod tests {
     #[test]
     fn copying_hands_over_the_key_and_leaves_it_on_screen() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.key_form.name = "Backup".to_string();
         state.show_key_copy(|key| {
             *COPIED.lock().expect("the copy sink") = Some(key.to_string());
         });
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let mint = first.ink_of(MINT_BUTTON).rect.center();
-        let minted = vault_click(&ctx, &mut state, mint);
+        let minted = tall_click(&ctx, &mut state, mint);
         // The control: nothing has been copied yet, so the assertion after
         // the click is about the click.
         assert!(COPIED.lock().expect("the copy sink").is_none());
 
         let copy = minted.ink_of(COPY_BUTTON).rect.center();
-        let after = vault_click(&ctx, &mut state, copy);
+        let after = tall_click(&ctx, &mut state, copy);
         assert_eq!(COPIED.lock().expect("the copy sink").as_deref(), Some(TEST_KEY));
         assert!(after.contains(TEST_KEY), "the card cleared itself on a copy");
     }
@@ -6171,12 +6242,12 @@ mod tests {
     #[test]
     fn revoking_asks_before_it_removes_anything() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.show_service_keys(vec![stored_key("Backup", None)]);
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let revoke = first.ink_of(REVOKE_BUTTON).rect.center();
-        let asked = vault_click(&ctx, &mut state, revoke);
+        let asked = tall_click(&ctx, &mut state, revoke);
         assert_eq!(state.keys.len(), 1, "one click revoked the key with no confirmation");
         assert!(
             asked.any_containing("stops being answered"),
@@ -6187,7 +6258,7 @@ mod tests {
 
         // Keeping it puts the row back as it was, with the key still there.
         let keep = asked.ink_of(REVOKE_CANCEL_BUTTON).rect.center();
-        let kept = vault_click(&ctx, &mut state, keep);
+        let kept = tall_click(&ctx, &mut state, keep);
         assert_eq!(state.keys.len(), 1);
         assert!(!kept.any_containing("stops being answered"), "the question is still up");
         assert!(state.pending_revoke.is_none());
@@ -6199,10 +6270,10 @@ mod tests {
     #[test]
     fn confirming_a_revoke_removes_the_key() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.show_service_keys(vec![stored_key("Backup", None), stored_key("Nightly", None)]);
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // The first key's own Revoke button: two are painted, and the one
         // higher on the page belongs to the row that was drawn first.
         let revoke = first
@@ -6213,9 +6284,9 @@ mod tests {
             .expect("a revoke button")
             .rect
             .center();
-        let asked = vault_click(&ctx, &mut state, revoke);
+        let asked = tall_click(&ctx, &mut state, revoke);
         let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
-        let after = vault_click(&ctx, &mut state, confirm);
+        let after = tall_click(&ctx, &mut state, confirm);
 
         assert_eq!(state.keys.len(), 1, "the confirmation did not remove the key");
         assert_eq!(state.keys[0].name, "Nightly", "the wrong key was revoked");
@@ -6234,13 +6305,13 @@ mod tests {
     #[test]
     fn a_store_that_cannot_be_written_says_which_way_it_went_wrong() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.show_keys_sink(|_| Err("the disk is read-only".to_string()));
         state.key_form.name = "Backup".to_string();
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let mint = first.ink_of(MINT_BUTTON).rect.center();
-        let minted = vault_click(&ctx, &mut state, mint);
+        let minted = tall_click(&ctx, &mut state, mint);
         assert!(
             minted.any_containing("gone the next time Deskwarden starts"),
             "the page does not say the key will not survive a restart: {:?}",
@@ -6249,11 +6320,11 @@ mod tests {
         assert!(minted.any_containing("the disk is read-only"), "the reason was swallowed");
 
         let done = minted.ink_of(DONE_BUTTON).rect.center();
-        let listed = vault_click(&ctx, &mut state, done);
+        let listed = tall_click(&ctx, &mut state, done);
         let revoke = listed.ink_of(REVOKE_BUTTON).rect.center();
-        let asked = vault_click(&ctx, &mut state, revoke);
+        let asked = tall_click(&ctx, &mut state, revoke);
         let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
-        let after = vault_click(&ctx, &mut state, confirm);
+        let after = tall_click(&ctx, &mut state, confirm);
         assert!(
             after.any_containing("it still works"),
             "the page let the owner believe a key was revoked when the file still grants it: \
@@ -6268,12 +6339,12 @@ mod tests {
     #[test]
     fn a_refused_mint_says_why_on_the_page_and_keeps_the_form() {
         let ctx = tall_context();
-        let mut state = vault_state();
+        let mut state = api_state();
         state.key_form.expiry_days = "30".to_string();
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let mint = first.ink_of(MINT_BUTTON).rect.center();
-        let refused = vault_click(&ctx, &mut state, mint);
+        let refused = tall_click(&ctx, &mut state, mint);
 
         assert!(state.keys.is_empty(), "a key with no name was minted");
         assert!(state.minted.is_none(), "a refused mint still revealed a key");
@@ -6400,6 +6471,7 @@ mod tests {
 
     /// UTC, so every painted date in these tests is exact wherever the suite
     /// runs. The page itself uses `local_time::SystemZone`.
+
     fn zone() -> crate::local_time::FixedOffset {
         crate::local_time::FixedOffset(0)
     }
@@ -6407,6 +6479,20 @@ mod tests {
     /// One frame of a fresh window on `section`.
     fn paint(section: Section) -> Painted {
         paint_settings(section, Settings::default())
+    }
+
+    /// The same, on the tall viewport.
+    ///
+    /// **For the absence assertions**, which are the ones a culling scroll
+    /// region can make vacuous: on `BODY_SIZE` a page that scrolls hands back
+    /// only what fits the window, so "this label is not painted here" would
+    /// be satisfied by a label that is merely below the fold. On `TALL_BODY`
+    /// nothing is culled, so an absence is a real absence.
+    fn paint_tall(section: Section) -> Painted {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = section;
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// One frame of General on a pane of a given width. `frame` and its
@@ -6516,7 +6602,7 @@ mod tests {
     ///
     /// It was `paint_general_with_hello` and it moved with the rows. The
     /// viewport is `TALL_BODY` rather than `BODY_SIZE` for
-    /// [`vault_frame`]'s reason exactly: a `ScrollArea` culls what is outside
+    /// [`tall_frame`]'s reason exactly: a `ScrollArea` culls what is outside
     /// its viewport, so a short frame would find a row missing and could not
     /// tell that from a row that was never drawn. Reachability on the real
     /// window is a separate claim, asserted separately.
@@ -6525,7 +6611,7 @@ mod tests {
         let mut state = PrefsState::new(Settings::default());
         state.section = Section::Vault;
         state.show_hello_available(if available { || true } else { || false });
-        vault_frame(&ctx, &mut state, &[])
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// The copy is the requirement, so these assertions exist so that a
@@ -6587,7 +6673,7 @@ mod tests {
         let mut state = PrefsState::new(Settings::default());
         state.section = Section::Vault;
         state.show_hello_available(|| false);
-        let _ = vault_frame(&ctx, &mut state, &[]);
+        let _ = tall_frame(&ctx, &mut state, &[]);
         assert!(!state.settings.cache_vault_to_disk);
     }
 
@@ -6617,7 +6703,7 @@ mod tests {
         state.show_hello_available(|| true);
         assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // THIRD pill down on the Vault page: the backend card's two rows are
         // above it, and the disk-cache card's own child is directly below.
         // Named by index rather than by position on a card, because that is
@@ -6627,12 +6713,14 @@ mod tests {
         let pills = first.rects_of_size(TOGGLE_SIZE);
         assert_eq!(
             pills.len(),
-            5,
-            "the Vault page paints five pills: the backend choice and its child, the disk \
-             copy and its child, and the service switch"
+            4,
+            "the Vault page paints four pills: the backend choice and its child, and the \
+             disk copy and its child. The service switch was a fifth until it moved to the \
+             Local API page, and an index that has drifted must fail here rather than \
+             quietly click the row above"
         );
         let pill = pills[2].center();
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
             "the disk-cache toggle did not turn on -- the row is painted but its value is \
@@ -6644,7 +6732,7 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
 
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.cache_vault_to_disk, "and back off again");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
     }
@@ -6684,10 +6772,10 @@ mod tests {
             "the premise: with no copy permitted, the read-through setting decides nothing"
         );
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // FOURTH pill: the backend card's two, then the disk copy, then this.
         let child = first.rects_of_size(TOGGLE_SIZE)[3].center();
-        vault_frame(&ctx, &mut state, &click(child));
+        tall_frame(&ctx, &mut state, &click(child));
         assert!(
             state.settings.read_through_cache,
             "the read-through pill wrote its setting while there is no copy to read, so the \
@@ -6705,16 +6793,16 @@ mod tests {
         // so it is the same click path -- and the child is live, moves its
         // own field, and changes what the policy answers.
         let parent = first.rects_of_size(TOGGLE_SIZE)[2].center();
-        vault_frame(&ctx, &mut state, &click(parent));
+        tall_frame(&ctx, &mut state, &click(parent));
         assert!(state.settings.cache_vault_to_disk, "the control could not turn the parent on");
         assert_eq!(
             read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
             ReadPath::CacheFirst
         );
 
-        let second = vault_frame(&ctx, &mut state, &[]);
+        let second = tall_frame(&ctx, &mut state, &[]);
         let child = second.rects_of_size(TOGGLE_SIZE)[3].center();
-        vault_frame(&ctx, &mut state, &click(child));
+        tall_frame(&ctx, &mut state, &click(child));
         assert!(
             !state.settings.read_through_cache,
             "the child is inert even with a copy to read, so the row is decoration and the \
@@ -6765,12 +6853,19 @@ mod tests {
             "Native apps",
             "Security",
             // The vault page sits beside Security because that is where a
-            // reader looking for "what can reach my vault" looks first. It
-            // was "Vault service" while the service was all it carried; it
-            // now carries the backend choice and the disk cache too, and a
-            // nav row has to name the whole page or the settings on it are
-            // unfindable.
+            // reader looking for "where does my vault come from" looks
+            // first. It was "Vault service" while the service was all it
+            // carried, and the service has since gone to a page of its own;
+            // what the row names now is the backend choice and the disk
+            // cache, and a nav row has to name the whole page or the
+            // settings on it are unfindable.
             "Vault",
+            // And directly after it, the endpoint that serves what Vault
+            // decided is being served. It came off the bottom of Vault, so by
+            // the rule Breaches and Updates were placed by, it lands where
+            // the bulk of it came from -- one row down from the page a reader
+            // last saw it on.
+            "Local API",
             "Clipboard",
             "Shortcuts",
             "Sync & account",
@@ -6900,9 +6995,8 @@ mod tests {
              sit beside the thing that governs them. `check_breaches` moved to Breaches, \
              `check_for_updates` moved to Updates, and `keep_backend_running`, \
              `cache_vault_to_disk` and `read_through_cache` are now on `Section::Vault` with \
-             the backend choice and the vault service, which is the one page where all of \
-             them can be weighed against each other; see `draw_breaches`, `draw_updates` and \
-             `Section::Vault`"
+             the backend choice, which is the one page where all of them can be weighed \
+             against each other; see `draw_breaches`, `draw_updates` and `Section::Vault`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -6953,19 +7047,19 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // SECOND pill: the crypto switch is the parent and paints first.
         // Clicking this one must not move it, which is what the neighbouring
         // assertion here pins -- a child wired to its parent's field is
         // exactly the mix-up this card's rebuild could have introduced.
         let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
         assert!(!state.settings.cache_vault_to_disk, "a neighbouring card's toggle moved");
         assert!(!state.settings.service_enabled, "a neighbouring card's toggle moved");
 
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
     }
@@ -6992,9 +7086,9 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.keep_backend_running,
             "a ghosted row wrote its setting anyway, so the pill is live and only looks dead"
@@ -8568,25 +8662,26 @@ mod tests {
         state
     }
 
-    /// **The whole point of the change: one screen carries every setting
-    /// that decides how this vault is served.**
+    /// **The whole point of the gathering: one screen carries every setting
+    /// that decides where this vault comes from.**
     ///
-    /// Asserted as five labels on one painted page, and -- the half that can
-    /// actually fail -- as five labels absent from the two pages they came
-    /// off. A test that only checked presence would pass a change that
+    /// Asserted as four labels on one painted page, and -- the half that can
+    /// actually fail -- as four labels absent from every other page in the
+    /// window. A test that only checked presence would pass a change that
     /// *copied* the rows, which is this file's most-feared defect: a control
     /// fixed in one place and left broken in the other.
+    ///
+    /// **`Section::Api` is in the absent list, and that is not padding.** The
+    /// service switch was gathered onto Vault alongside these four and has
+    /// since moved on to its own page; the mirror-image test below pins that
+    /// it left. Two pages that were briefly one are exactly the pair where a
+    /// half-finished split leaves a duplicate.
     #[test]
-    fn every_setting_that_decides_how_the_vault_is_served_is_on_the_vault_page() {
+    fn every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page() {
         let vault = paint_vault_with_hello(true);
-        let scattered = [
-            OFFICIAL_CRYPTO_LABEL,
-            BACKEND_LABEL,
-            DISK_CACHE_LABEL,
-            READ_THROUGH_LABEL,
-            SERVICE_LABEL,
-        ];
-        for label in scattered {
+        let gathered =
+            [OFFICIAL_CRYPTO_LABEL, BACKEND_LABEL, DISK_CACHE_LABEL, READ_THROUGH_LABEL];
+        for label in gathered {
             assert!(
                 vault.contains(label),
                 "{label:?} is not on the Vault page; got {:?}",
@@ -8595,11 +8690,12 @@ mod tests {
         }
 
         // And nowhere else. General and Sync & account are the two pages
-        // these rows were taken off, and a row left behind on either is two
-        // switches over one field.
-        for section in [Section::General, Section::SyncAndAccount] {
-            let painted = paint(section);
-            for label in scattered {
+        // these rows were taken off; the Local API page is the one they could
+        // most plausibly be copied onto. A row left behind on any of them is
+        // two switches over one field.
+        for section in [Section::General, Section::SyncAndAccount, Section::Api] {
+            let painted = paint_tall(section);
+            for label in gathered {
                 assert!(
                     !painted.contains(label),
                     "{label:?} is still painted on {section:?} as well as on the Vault page, \
@@ -8610,9 +8706,68 @@ mod tests {
 
         // The control for the loop above: those pages are not simply blank,
         // so "not painted" is a claim about these rows rather than about a
-        // paint that produced nothing.
+        // paint that produced nothing. The API page's control is the switch
+        // it does own, which is also the assertion the next test starts from.
         assert!(paint(Section::General).contains(PROMPT_LABEL));
         assert!(paint(Section::SyncAndAccount).contains(SYNC_MOVED_LABEL));
+        assert!(paint_tall(Section::Api).contains(SERVICE_LABEL));
+    }
+
+    /// **The mirror image, and the half a move gets wrong: the API page
+    /// carries the endpoint and every key control, and the Vault page it came
+    /// off carries none of them.**
+    ///
+    /// The switch and the key list are the one pair that must never be
+    /// separated -- a switch on one page and the list of who can walk through
+    /// the door it opens on another is an arrangement where the owner can
+    /// believe they turned something off while three keys still exist for it.
+    /// So they are asserted together, on one painted page.
+    ///
+    /// The absence half is asserted against Vault specifically. A row that
+    /// was *copied* rather than moved would leave the Vault page painting a
+    /// second `service_enabled` pill, and the owner could turn the endpoint
+    /// off on one page and find it on from the other.
+    #[test]
+    fn the_endpoint_and_every_key_control_are_on_the_api_page_and_not_on_vault() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_service_keys(vec![stored_key("Backup script", None)]);
+        let api = tall_frame(&ctx, &mut state, &[]);
+        // The switch, the empty-or-not list with its heading, the form that
+        // mints, and a listed key's revoke button: every control the split
+        // had to carry across, and each one a separate way to lose half.
+        for label in [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON] {
+            assert!(
+                api.contains(label),
+                "{label:?} is not on the Local API page; got {:?}",
+                api.strings()
+            );
+        }
+        assert!(api.contains(REVOKE_BUTTON), "a listed key has no revoke button");
+        assert!(api.contains("Backup script"), "control: the list really drew a row");
+
+        // And none of it on Vault -- driven with the same key in the store,
+        // so a Vault page that still drew the list would be caught rather
+        // than merely being handed nothing to draw.
+        let mut vault = PrefsState::new(Settings::default());
+        vault.section = Section::Vault;
+        vault.show_hello_available(|| true);
+        vault.show_service_keys(vec![stored_key("Backup script", None)]);
+        let painted = tall_frame(&ctx, &mut vault, &[]);
+        for label in
+            [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON, REVOKE_BUTTON]
+        {
+            assert!(
+                !painted.contains(label),
+                "{label:?} is still painted on the Vault page as well as on the Local API \
+                 page; got {:?}",
+                painted.strings()
+            );
+        }
+        assert!(!painted.contains("Backup script"), "the key list is still drawn on Vault");
+        // The control: the Vault page is not blank, and the store it was
+        // handed is the one the API page listed a row from.
+        assert!(painted.contains(DISK_CACHE_LABEL), "control: the Vault page drew its own rows");
     }
 
     /// **A user who last saw the switch on Sync & account is told where it
@@ -8680,7 +8835,7 @@ mod tests {
                 })
             },
         });
-        vault_frame(&ctx, &mut state, &[])
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// **The defect this card was rebuilt to remove.**
@@ -8737,63 +8892,114 @@ mod tests {
         );
     }
 
-    /// **The row a user opens this page for is above the fold without
-    /// scrolling, and its three paragraphs of copy with it.**
+    /// **Every row on this page, and every paragraph under it, is readable on
+    /// the real window without scrolling.**
     ///
-    /// This test used to be about General's ceiling: that page has no scroll
-    /// region, so a row painted past 740 points is a row nobody can reach,
-    /// and the backend row's copy is three paragraphs. The Vault page does
-    /// scroll, so "below the fold" is no longer unreachable there -- but it
-    /// is still a page you have to know to scroll, and this row is the one
-    /// the owner was trapped by. So the claim is narrowed rather than
-    /// dropped: it is the FIRST card, and it is legible on the real window
-    /// with no scrolling at all.
+    /// This test used to be about General's ceiling, and then about the
+    /// backend row landing on the first card of a Vault page that scrolled.
+    /// The page does not scroll any more -- the key list it scrolled for is
+    /// on `Section::Api` -- so the claim goes back to its strongest form: a
+    /// row painted past `BODY_SIZE.y` on a page with no scroll region is a
+    /// row nobody can reach, and one of these four rows is the switch the
+    /// owner was trapped by.
     ///
-    /// Measured on `BODY_SIZE`, deliberately -- the fixed body the window
-    /// really gives this pane, not `TALL_BODY`, which is a fiction the other
-    /// tests on this page need in order to see past the scroll region's
-    /// culling and would make this assertion vacuous.
+    /// **All four copy combinations**, because the descriptions are what
+    /// make this page long and each pair is a different length: the crypto
+    /// row's three-paragraph copy appears only on a self-hosted account, and
+    /// the disk-cache row's Hello explanation only where Hello is missing.
+    /// A test that measured the default state alone would be measuring the
+    /// shortest page this screen can draw.
+    ///
+    /// Measured on `TALL_BODY` and compared against `BODY_SIZE.y`, which is
+    /// not a fiction here but the only way to see an overflow: a page whose
+    /// content ran past the window would simply be clipped on `BODY_SIZE`,
+    /// and the measurement would report the fold back to itself.
     #[test]
-    fn the_backend_row_and_its_copy_are_readable_without_scrolling() {
-        // The **enabled** copy, which is the long one -- three paragraphs.
-        let ctx = styled_context();
-        let mut state = on_a_self_hosted_server();
-        let painted = frame(&ctx, &mut state, &[]);
-        let label = painted.ink_of(OFFICIAL_CRYPTO_LABEL);
+    fn the_whole_vault_page_is_readable_without_scrolling() {
+        for hello in [false, true] {
+            for self_hosted in [false, true] {
+                let painted = paint_vault_copy(hello, self_hosted);
+                // The premise: this really is the long copy. Without it a
+                // future edit that shortened the descriptions to nothing
+                // would pass this test while making it meaningless.
+                assert!(
+                    painted.contains(official_crypto_description(self_hosted))
+                        && painted.contains(disk_cache_description(hello)),
+                    "hello={hello} self_hosted={self_hosted}: the page did not paint the copy \
+                     under test; got {:?}",
+                    painted.strings()
+                );
+                let bottom = content_bottom(&painted);
+                assert!(
+                    bottom < BODY_SIZE.y,
+                    "hello={hello} self_hosted={self_hosted}: the Vault page runs to y={bottom} \
+                     on a body {} tall and has no scroll region, so its last row is one nobody \
+                     can reach",
+                    BODY_SIZE.y
+                );
+            }
+        }
+
+        // **The control, and it is the reason this measurement is worth
+        // making**: the same yardstick over the page that DOES scroll says
+        // the opposite. Without it, `content_bottom` could be reading
+        // something that is short whatever is drawn, and every assertion
+        // above would pass on an empty page.
+        let ctx = tall_context();
+        let mut api = api_state();
+        api.show_service_keys(vec![
+            stored_key("one", None),
+            stored_key("two", None),
+            stored_key("three", None),
+        ]);
+        let bottom = content_bottom(&tall_frame(&ctx, &mut api, &[]));
         assert!(
-            label.rect.max.y < BODY_SIZE.y,
-            "the row's label is painted at y={} on a body {} tall, so it is below the fold",
-            label.rect.max.y,
+            bottom > BODY_SIZE.y,
+            "control: the Local API page with three keys measures y={bottom}, inside a body \
+             {} tall, so this yardstick cannot tell a long page from a short one",
             BODY_SIZE.y
         );
-        let copy = painted.ink_of(official_crypto_description(true));
-        assert!(
-            copy.rect.max.y < BODY_SIZE.y,
-            "the row's description runs to y={} on a body {} tall",
-            copy.rect.max.y,
-            BODY_SIZE.y
-        );
-        // The control that the measurement can fail at all: on this same
-        // account -- the long copy is what makes the page long -- the page
-        // really does run past the body, so something IS below the fold and
-        // the two assertions above are picking out where THIS row landed
-        // rather than restating that the page is short.
-        //
-        // Painted on `TALL_BODY`, because the scroll region culls what the
-        // window cannot show: the question is where the row lands in the
-        // page's layout, and a frame that had already dropped it could not
-        // answer it.
-        let tall_ctx = tall_context();
-        let mut tall_state = on_a_self_hosted_server();
-        let tall = vault_frame(&tall_ctx, &mut tall_state, &[]);
-        let below = tall.ink_of(KEYS_SECTION_LABEL).rect.max.y;
-        assert!(
-            below > BODY_SIZE.y,
-            "control: the whole Vault page fits the window (the key list ends at y={below} on \
-             a body {} tall), so 'above the fold' distinguishes nothing and this test would \
-             pass wherever the row was put",
-            BODY_SIZE.y
-        );
+    }
+
+    /// The bottom of the lowest thing painted in the **content column**.
+    ///
+    /// Right of `NAV_WIDTH`, because the nav rail is drawn full-height on
+    /// every page and its version footer sits at the bottom of whatever
+    /// viewport it is given -- a measurement that included it would report
+    /// the viewport's height on every page and could never fail.
+    fn content_bottom(painted: &Painted) -> f32 {
+        painted
+            .ink
+            .iter()
+            .filter(|i| i.rect.min.x > NAV_WIDTH)
+            .map(|i| i.rect.max.y)
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The Vault page with the copy each of its two ghostable rows shows in
+    /// the named state: Hello present or missing, on a self-hosted server or
+    /// on the official cloud.
+    fn paint_vault_copy(hello: bool, self_hosted: bool) -> Painted {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
+        state.show_hello_available(if hello { || true } else { || false });
+        state.show_account_source(if self_hosted {
+            || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: Some("https://vault.example.com".to_string()),
+                })
+            }
+        } else {
+            || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: Some("https://vault.bitwarden.com".to_string()),
+                })
+            }
+        });
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// Clicks the backend pill at `pill` and then says yes to the question
@@ -8805,9 +9011,9 @@ mod tests {
     /// spelling both out at each of their call sites would bury the
     /// assertion they exist for.
     fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, pill: Pos2) {
-        let asked = vault_click(ctx, state, pill);
+        let asked = tall_click(ctx, state, pill);
         let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
-        let _ = vault_click(ctx, state, yes);
+        let _ = tall_click(ctx, state, yes);
     }
 
     /// **One click on the backend pill moves nothing.**
@@ -8831,9 +9037,9 @@ mod tests {
         let mut state = on_a_self_hosted_server();
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        let asked = vault_click(&ctx, &mut state, pill);
+        let asked = tall_click(&ctx, &mut state, pill);
 
         assert!(
             state.settings.use_official_bw_crypto,
@@ -8866,7 +9072,7 @@ mod tests {
         );
 
         let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
-        let left = vault_click(&ctx, &mut state, no);
+        let left = tall_click(&ctx, &mut state, no);
         assert!(state.settings.use_official_bw_crypto, "saying no switched the backend anyway");
         assert_eq!(left.pill_fills()[0], theme::BLUE, "the pill moved on a refusal");
         assert!(
@@ -8882,7 +9088,7 @@ mod tests {
         // And the whole thing can be attempted again -- the assertion the
         // never-cleared pending state would fail, and the one that makes the
         // clearing above mean something.
-        let again = vault_click(&ctx, &mut state, pill);
+        let again = tall_click(&ctx, &mut state, pill);
         assert!(
             again.any_containing("sign in again when it comes back"),
             "a second press of the pill raises nothing, so the row can only be refused once: \
@@ -8911,11 +9117,11 @@ mod tests {
              client would prove nothing"
         );
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        let asked = vault_click(&ctx, &mut state, pill);
+        let asked = tall_click(&ctx, &mut state, pill);
         let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
-        let after = vault_click(&ctx, &mut state, yes);
+        let after = tall_click(&ctx, &mut state, yes);
 
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto),
@@ -9028,11 +9234,11 @@ mod tests {
         let mut state = on_an_official_cloud();
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // FIRST pill on the Vault page: the backend choice is the top row of
         // the top card, which is where the page's reading order puts it.
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        vault_frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.use_official_bw_crypto,
             "a click on the ghosted pill changed the setting anyway"
@@ -9058,7 +9264,7 @@ mod tests {
         let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
 
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
         take_the_backend_switch(&ctx, &mut state, pill);
         assert!(
@@ -9112,7 +9318,7 @@ mod tests {
             VaultBackendChoice::BwServe,
             "the default configuration does not select the official `bw` CLI"
         );
-        let first = vault_frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
             first.pill_fills()[0],
             theme::BLUE,
@@ -9131,7 +9337,7 @@ mod tests {
             "turning the row OFF did not select the built-in client, so the label's two \
              states do not mean what it says they mean"
         );
-        let second = vault_frame(&ctx, &mut state, &[]);
+        let second = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
             second.pill_fills()[0],
             theme::TOGGLE_OFF,
@@ -11218,9 +11424,9 @@ mod modal_tests {
         // again returned as raw shapes for the id-clash guards; and
         // `cursor_over_notes`, which is the same frame again read for its
         // cursor rather than its shapes, because a hit rectangle a test may
-        // not click can only be witnessed by hovering it -- and `vault_frame`,
+        // not click can only be witnessed by hovering it -- and `tall_frame`,
         // which is the same frame once more on a viewport tall enough that
-        // the Vault service page's scroll region culls nothing. All five are
+        // the Local API page's scroll region culls nothing. All five are
         // tests; the production callers are still the two shells.
         assert_eq!(
             source.match_indices(body_calls).count(),
@@ -11236,4 +11442,5 @@ mod modal_tests {
             );
         }
     }
+
 }

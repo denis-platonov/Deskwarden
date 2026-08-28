@@ -9977,7 +9977,7 @@ fn service_start_refusal(enabled: bool) -> Option<&'static str> {
     // default, so this is the line most owners meet first.
     Some(
         "the vault service is switched off, so it will not start. Nothing was bound and no \
-         vault key was read. Turn it on in Deskwarden's Preferences, under Vault -- it \
+         vault key was read. Turn it on in Deskwarden's Preferences, under Local API -- it \
          is off by default, \
          and while it is on it serves decrypted vault items to any program on this machine \
          holding an API key -- then start the service again.",
