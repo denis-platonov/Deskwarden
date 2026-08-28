@@ -15,7 +15,14 @@ The six below are the ones worth looking at first.
 
 ## The vault
 
-![The vault](screenshots/vault_item_list.png)
+![The vault](screenshots/vault_window.png)
+
+*Three panes, joined. The preview renders panes rather than whole windows, so
+this is the rail, the list and the detail pane placed side by side at the
+widths and the shared height they were rendered at -- each half unretouched,
+only the joins assembled. They are also independent fixtures, which is why the
+rail highlights Logins while the list shows all twelve items: in the running
+app those two agree.*
 
 ## One item
 

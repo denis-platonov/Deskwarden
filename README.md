@@ -51,33 +51,80 @@ open.
 
 ## What it does
 
-- **Native-app autofill.** Match an app once (by process name), pick a
-  trigger — auto-fill on focus, a small overlay prompt, or a global hotkey —
-  and it's stored on the vault item itself, so it syncs like any other vault
-  data.
-- **A vault window**, opened from the tray (left-click, or right-click →
-  Open Vault): folders, search, item create/edit/delete, live TOTP codes,
-  a password-strength indicator, real website favicons, and a manual/auto
-  sync — everything short of full Bitwarden-client parity, scoped to what a
-  tray app plausibly needs.
-- **Two vault backends, and you choose.** By default everything goes through
-  the official Bitwarden CLI's local `bw serve` bridge: Deskwarden never
-  touches encryption, key derivation or sync logic, and reads come from an
-  in-memory snapshot of what the CLI returned. On a **self-hosted** server you
-  can instead turn off *Use official bw for crypto* (Preferences -> Sync &
-  account) and Deskwarden talks to your server itself -- no background CLI
-  process, and it does the decryption itself. That path is faster and much
-  lighter, and it means the key that unlocks your vault is kept on this PC
-  under DPAPI and does not expire; the setting says so before you turn it on.
-  **Signing in uses the CLI either way.** That snapshot is memory-only unless
-  you turn on
-  **"Keep an encrypted copy of your vault on this PC"** (off by default), which
-  also writes it to a file encrypted under a key Windows Hello holds in this
-  PC's TPM, so a copied disk cannot be read on another machine. That file
-  survives the vault locking — it exists to survive a restart — and is deleted
-  when you log out, when you are asked for your master password again, or after
-  seven days.
+### Filling
 
+- **Native-app autofill.** Match an app once by process name, pick a trigger
+  — fill on focus, an overlay prompt, or a global hotkey (`CTRL+ALT+B`) —
+  and the choice is stored on the vault item, so it syncs like any other
+  vault data. **This is the thing the official desktop app cannot do**: it is
+  Electron, and native windows are not web pages.
+- **Typed, not pasted.** Credentials are entered as synthetic keystrokes,
+  with per-app key sequences for the forms that need Tab-then-Enter rather
+  than a straight username/password pair.
+- **A picker when a match is ambiguous**, and a save prompt when you sign in
+  to something the vault does not know yet.
+
+### The vault
+
+- **Folders, favourites, archive and trash**, and cuts of the vault by kind:
+  logins, cards, identities, secure notes, SSH keys, passkeys.
+- **Create, edit and delete items**, including the fields this app does not
+  model itself — they are carried back to the server untouched rather than
+  dropped.
+- **Live TOTP codes** with a countdown, and adding one by **scanning a QR
+  code off your own screen** — drag a rectangle over it, no camera, no
+  upload.
+- **Bitwarden Send**, **per-item master-password re-prompt**, and **export**
+  through the CLI.
+- **Real favicons** and card-network marks, fetched and cached locally.
+
+### Passwords
+
+- **A password generator** that runs entirely on this machine, including
+  passphrases from a bundled word list.
+- **Strength indication** on every item.
+- **Breach checking** against Have I Been Pwned's k-anonymity range API:
+  **your password never leaves this PC** — only the first five characters of
+  its SHA-1 hash do, and the range that comes back is searched here.
+- **A whole-vault scan** for weak, reused and breached passwords, with a
+  history of the last twenty runs (counts and timestamps only, never an item).
+
+### Two backends, and you choose
+
+- **`bw serve` (the default).** Everything goes through the official
+  Bitwarden CLI's local bridge: Deskwarden never touches encryption, key
+  derivation or sync logic.
+- **The built-in client**, on a self-hosted server: Deskwarden talks to your
+  server itself and does the decryption, with no background CLI process. It
+  is faster and much lighter. The trade is that the key unlocking your vault
+  is kept on this PC under DPAPI and does not expire — the setting says so
+  before you turn it on.
+- **Signing in uses the CLI either way**, today. Removing that is the next
+  release's headline; see
+  [the design](docs/superpowers/specs/2026-08-28-deskwarden-alone-design.md).
+
+### Keeping secrets where they belong
+
+- **Windows Hello** to unlock, and to hold the key for the encrypted local
+  copy in this PC's TPM.
+- **An optional encrypted copy of your vault on this PC** (off by default),
+  sealed so that a copied disk cannot be read on another machine. It survives
+  a restart, and is deleted on logout, on a master-password re-prompt, or
+  after seven days.
+- **Clipboard that clears itself**, and marks copied secrets so clipboard
+  managers and cloud history do not retain them.
+- **Locks when you walk away** — Win+L, a session switch, or suspend.
+- **No secret on a command line**, anywhere, ever: a Windows command line is
+  readable by any process on the machine.
+- **Updates are verified** — the installer's Authenticode signature is checked
+  against a pinned signer before anything runs.
+
+### Also
+
+- **Multiple accounts**, switchable from the tray.
+- **A local HTTP API** for your own scripts — see below.
+- **~36 MB resident** in the tray, and a window that runs as its own process
+  so closing it actually returns the memory.
 ## The local vault service
 
 An optional loopback HTTP service that answers **the same API `bw serve`
@@ -190,7 +237,7 @@ secret and are not filtered.
 
 ## Screenshots
 
-![The vault](docs/screenshots/vault_item_list.png)
+![The vault](docs/screenshots/vault_window.png)
 
 **[More screenshots](docs/SCREENSHOTS.md)** -- one item, password health,
 two-factor codes, preferences, signing in.
