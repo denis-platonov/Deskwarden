@@ -197,14 +197,16 @@ jobs:
                 | awk '/^TOTAL/ {gsub(/%/, "", $10); print $10}')
           echo "line coverage: ${pct}%"
           echo "### Coverage: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
-          # **Zero, which enforces NOTHING, and that is deliberate for one
-          # run.** There is no measured number yet -- the local attempt ran
-          # the disk out before it compiled -- and inventing a floor would be
-          # guessing at the very thing this job exists to find out. Raise it
-          # to just under the first real figure and this becomes a guard;
-          # leave it at zero and it stays a reporter wearing a guard's
-          # clothes.
-          floor=0
+          # **85, from a measured 86.87% on the first run.** Set just under
+          # the real figure rather than at it: a floor equal to today's
+          # number turns every ordinary refactor into a red build, and a
+          # guard people learn to override is worse than none. Two points of
+          # slack absorbs normal movement; a real regression clears it.
+          #
+          # Raise it when the number rises. Never lower it to make a red
+          # build green -- that is the one edit this comment exists to make
+          # somebody stop and justify.
+          floor=85
           awk -v p="$pct" -v f="$floor" 'BEGIN { exit !(p+0 >= f+0) }' || {
             echo "coverage ${pct}% is below the floor of ${floor}%" >&2
             exit 1
