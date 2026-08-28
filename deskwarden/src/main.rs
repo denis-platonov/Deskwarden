@@ -9729,6 +9729,14 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
     let _ = logging::init(&config_dir);
 
     let settings = settings::Settings::load(&config_dir.join("settings.json"));
+
+    // **First, and before anything reads a credential.** See
+    // `service_start_refusal`.
+    if let Some(refusal) = service_start_refusal(settings.service_enabled) {
+        log::error!("{refusal}");
+        return 3;
+    }
+
     let Some(active) = settings.active_account.as_ref() else {
         log::error!("the vault service has no active account to serve; sign in with Deskwarden first");
         return 3;
@@ -9800,10 +9808,63 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
     0
 }
 
+/// **Whether the owner has agreed to any of this**, as a value.
+///
+/// `Some` is the sentence the log gets and the reason the service does not
+/// start; `None` is permission to carry on. A function rather than an `if` in
+/// [`run_as_the_vault_service`] because everything else in that function's
+/// prologue is unreachable from a test -- it reads `%APPDATA%`, unwraps a
+/// DPAPI-sealed vault key and binds a socket -- and this feature has already
+/// had two bugs that lived in exactly that untestable shape.
+///
+/// # It is asked FIRST, before anything reads a credential
+///
+/// `settings::Settings::service_enabled` defaults to `false`, so an install
+/// whose owner has never seen the switch reads as off. Answering that here,
+/// above the account lookup and the key store, is what makes "off" mean *the
+/// vault key is never unwrapped* rather than *the port is not bound at the
+/// end*. `the_setting_is_read_before_the_vault_key_is` pins the ordering,
+/// because the ordering is the part a later edit could quietly lose while
+/// every other test still passed.
+///
+/// # Why the other three refusals are not in here
+///
+/// No active account, no server URL and no stored key are refusals too, and
+/// merging them would look tidier. They are deliberately left where they are:
+///
+/// * Each is the *precondition of the next*. The key store path is built from
+///   the account's id and the server URL is read off the account, so they
+///   cannot be reduced to independent booleans without doing the work first
+///   -- which would mean unwrapping the vault credential to decide whether a
+///   disabled service should start. That is the exact thing this gate exists
+///   to prevent.
+/// * They are facts about *this machine's state*, discovered by reading it,
+///   and each already carries its own sentence at the point it is discovered.
+///   This one is a fact about *consent*, is knowable from one `bool`, and is
+///   the only one of the four that is a policy rather than a diagnosis.
+///
+/// So the split is not "pure things here, impure things there" -- it is that
+/// this decision has an input a test can supply and the others do not.
+fn service_start_refusal(enabled: bool) -> Option<&'static str> {
+    if enabled {
+        return None;
+    }
+    // Names the switch and where it lives, because a refusal the owner cannot
+    // act on is a refusal they will read as a crash. The service is off by
+    // default, so this is the line most owners meet first.
+    Some(
+        "the vault service is switched off, so it will not start. Nothing was bound and no \
+         vault key was read. Turn it on in Deskwarden's Preferences, under Vault service -- it \
+         is off by default, \
+         and while it is on it serves decrypted vault items to any program on this machine \
+         holding an API key -- then start the service again.",
+    )
+}
+
 /// Where the API keys live. Beside `settings.json`, in the directory this app
 /// already owns.
 fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
-    config_dir.join("service-keys.json")
+    deskwarden::service_keys::key_store_path(config_dir)
 }
 
 /// What goes back on the wire for one request: a status and a body, and
@@ -9823,6 +9884,21 @@ struct ServiceReply {
 /// failed sign-in is comparing against the same bytes the wire carries.
 const NO_MASTER_PASSWORD_BODY: &str =
     "{\"success\":false,\"message\":\"this service does not take a master password; use an API key\"}";
+
+/// What a write is told, until writing is built.
+///
+/// **This exists because the alternative was a lie.** `decide` maps every
+/// non-GET method to [`Access::Write`] and lets a write-scoped key
+/// through, and `body_for` -- which is never told the method -- then
+/// answers with the item. So `PUT /object/item/{id}` returned **200 and
+/// the item, having changed nothing**, which a script reads as a write
+/// that landed. Silent data loss from the caller's side.
+///
+/// 501 rather than 405: the route exists and the method is one this
+/// service intends to support, which is a different thing from a method
+/// it will never accept.
+const WRITES_NOT_BUILT_BODY: &str =
+    "{\"success\":false,\"message\":\"this service does not write yet; the scope model accepts write grants but no write is performed\"}";
 
 /// **One request, decided and rendered, as a value.**
 ///
@@ -9881,8 +9957,20 @@ where
         return ServiceReply { status, body: String::new() };
     }
 
+    // **After the scope check and BEFORE the vault is loaded.** After,
+    // because a key with no write grant is told 403 by `decide` and never
+    // reaches here -- an unauthorised caller learns nothing about what is
+    // built and what is not. Before, because fetching the whole vault to
+    // answer a request that cannot use it is the exact bug this function
+    // was extracted to fix, and it would be a poor showing to reintroduce
+    // a smaller copy of it one line lower.
+    if method != "GET" {
+        return ServiceReply { status: 501, body: WRITES_NOT_BUILT_BODY.to_string() };
+    }
+
     let (items, folders) = load_vault();
     let vault = deskwarden::service_body::Vault { items: &items, folders: &folders, locked: false };
+
     match deskwarden::service_body::body_for(&answer, &vault, keys) {
         Some(body) => ServiceReply { status, body },
         // Permitted, and there is nothing to hand back -- an id no item has.
@@ -11735,6 +11823,79 @@ mod tests {
     /// exactly what a client sees when a password was WRONG, so a script
     /// would retry, prompt the owner, and eventually have them typing their
     /// master password at something that cannot use it. `501` says the
+    /// **A write must not answer 200 with the item.**
+    ///
+    /// `decide` maps every non-GET method to `Access::Write` and lets a
+    /// write-scoped key through; `body_for` is never told the method and
+    /// answers with the item anyway. So `PUT /object/item/{id}` used to
+    /// return 200 and the item, having changed nothing -- which a script
+    /// reads as a write that landed. Silent data loss from the caller's
+    /// side, and the reason this refusal exists.
+    #[test]
+    fn a_write_is_refused_as_unbuilt_rather_than_answered_with_the_item() {
+        let keys = [service_key(vec![
+            read_scope(Subject::All),
+            Scope { subject: Subject::All, access: Access::Write },
+        ])];
+        for method in ["PUT", "POST", "DELETE", "PATCH"] {
+            let reply = answer_one_request(
+                method,
+                "/object/item/login-1",
+                A_LIVE_KEY,
+                &keys,
+                0,
+                || panic!("a write must not reach the vault: it cannot use it"),
+            );
+            assert_eq!(reply.status, 501, "{method} did not report that writing is unbuilt");
+            assert!(
+                !reply.body.contains("login-1"),
+                "{method} answered with the item, which reads as a successful write: {}",
+                reply.body
+            );
+        }
+    }
+
+    /// Control for the test above: the same key, the same item, a GET --
+    /// which must still be served. Without this, a function that refused
+    /// everything would pass.
+    #[test]
+    fn the_same_key_and_item_are_still_served_for_a_read() {
+        let keys = [service_key(vec![
+            read_scope(Subject::All),
+            Scope { subject: Subject::All, access: Access::Write },
+        ])];
+        let reply = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            0,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"));
+    }
+
+    /// **A key with no write grant is told 403, not 501.** The order
+    /// matters: an unauthorised caller must not learn which features are
+    /// built from the shape of its refusal.
+    #[test]
+    fn an_unscoped_write_is_refused_before_it_learns_writing_is_unbuilt() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "PUT",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            0,
+            || panic!("a refused write must not reach the vault"),
+        );
+        assert_eq!(
+            reply.status, 403,
+            "a key without a write grant was told writing is unbuilt, which is a fact about this service it had not earned"
+        );
+        assert!(reply.body.is_empty(), "a refusal carried a body");
+    }
     /// route is not implemented, which is a thing a client can stop on.
     #[test]
     fn the_auth_route_answers_not_implemented_rather_than_a_bad_password() {
@@ -11888,6 +12049,84 @@ mod tests {
             assert_eq!(reply.status, 401, "{path} was served by a service with no keys");
             assert_eq!(reply.body, "");
         }
+    }
+
+    // --- The switch that has to be on before any of the above happens ---
+
+    /// **Off is the default, and off means it does not start.**
+    ///
+    /// `settings::Settings::service_enabled` is `false` for every install
+    /// whose owner has never seen the switch, including every existing one
+    /// upgraded into this build. A service that started anyway would be a
+    /// decrypted vault put behind a loopback port on the owner's behalf, on
+    /// machines whose owner was never asked -- which is the one change this
+    /// whole feature is not allowed to make.
+    #[test]
+    fn the_service_refuses_to_start_while_the_setting_is_off() {
+        assert!(
+            service_start_refusal(false).is_some(),
+            "the service started with the setting off"
+        );
+        assert!(
+            service_start_refusal(true).is_none(),
+            "control: with the setting on there must be no refusal, or the test above passes \
+             for a function that refuses unconditionally"
+        );
+    }
+
+    /// The refusal has to be **actionable**. This branch has no window and no
+    /// message box -- it is a console-less binary writing one line to a log
+    /// the owner will read after their script got connection-refused -- so
+    /// the line itself is the entire user interface. It names where the
+    /// switch is, and says what turning it on means.
+    #[test]
+    fn the_refusal_says_where_to_turn_it_on_and_what_that_costs() {
+        let refusal = service_start_refusal(false).expect("control: off must refuse");
+        for expected in ["Preferences", "off by default", "decrypted", "API key"] {
+            assert!(
+                refusal.contains(expected),
+                "the refusal does not mention {expected:?}, so the owner is told it failed \
+                 without being told what to do: {refusal}"
+            );
+        }
+    }
+
+    /// **The gate is read before the vault key is**, and that ordering is the
+    /// point rather than a detail.
+    ///
+    /// `service_start_refusal` being correct proves nothing about a caller
+    /// that asks it last. If the setting were checked after
+    /// `UserKeyStore::load`, a disabled service would still DPAPI-unwrap the
+    /// credential that decrypts the vault before deciding it must not run --
+    /// work that "off" is supposed to mean never happens. That is invisible
+    /// to every value-level test, so it is pinned against the source: an
+    /// ordering nothing can observe from outside is exactly what a source pin
+    /// is for in this file.
+    #[test]
+    fn the_setting_is_read_before_the_vault_key_is() {
+        let body = body_of(production_half_of_this_file(), "fn run_as_the_vault_service(");
+        // The ARGUMENT, not just the call. `service_start_refusal(true)`
+        // compiles, type-checks, and passes every value-level test in this
+        // file while starting a service the owner switched off -- that mutant
+        // was tried, survived the first version of this test, and is why the
+        // needle is the whole expression.
+        let gate = body
+            .find("service_start_refusal(settings.service_enabled)")
+            .expect(
+                "the service no longer gates on `settings.service_enabled`; either the check is \
+                 gone or it is being handed something other than the owner's setting",
+            );
+        let key = body
+            .find("key_store.load()")
+            .expect("control: the vault key is no longer loaded here, so this pin guards nothing");
+        let bind = body
+            .find("tiny_http::Server::http")
+            .expect("control: the socket is no longer bound here, so this pin guards nothing");
+        assert!(
+            gate < key,
+            "the vault key is unwrapped before the service asks whether it is allowed to run"
+        );
+        assert!(gate < bind, "the port is bound before the service asks whether it may run");
     }
 
     /// **The update check is not made when the setting is off**, observed as

@@ -275,6 +275,22 @@ pub fn save(path: &std::path::Path, records: &[KeyRecord]) -> Result<(), String>
     })
 }
 
+/// The key store's file name, beside `settings.json`.
+///
+/// **One constant, because two spellings is a screen that mints keys into a
+/// file the service never reads.** Each half would work perfectly on its
+/// own, and the owner would be told a key exists while every request using
+/// it was refused. It lives here rather than in either caller because this
+/// module owns what is in the file; the callers only own where the config
+/// directory is.
+pub const KEY_STORE_FILE_NAME: &str = "service-keys.json";
+
+/// The key store's path under `config_dir`.
+#[must_use]
+pub fn key_store_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join(KEY_STORE_FILE_NAME)
+}
+
 /// The key file, or an empty list.
 ///
 /// **An unreadable or malformed file reads as no keys**, which is the same

@@ -70,6 +70,116 @@ open.
   when you log out, when you are asked for your master password again, or after
   seven days.
 
+## The local vault service
+
+An optional loopback HTTP service that answers **the same API `bw serve`
+does** — `/status`, `/list/object/items`, `/list/object/folders`,
+`/object/item/{id}`, in the same `{"success":true,"data":{...}}` envelope — so
+a script already written against `bw serve` keeps working. Behind it is not the
+CLI, though: it is Deskwarden's own direct-REST backend, which is why the
+service is **self-hosted only** and refuses to start for an account with no
+server URL.
+
+**The one deliberate incompatibility:** `bw serve` requires no credential at
+all, and this requires `Authorization: Bearer <key>` on every request. That is
+the reason it exists. Everything else about the wire format is the same.
+
+**It is off by default, and when it is on it serves decrypted vault items** —
+usernames, passwords, TOTP seeds — to anything on this machine that presents a
+key. Read the limits below before turning it on.
+
+### What the key protects, and what it does not
+
+- **It stops** another user on the machine, and anything that reaches loopback
+  without being able to read your files, from getting the vault by connecting
+  to the port. That is exactly what `bw serve` does not stop.
+- **It does not stop a program already running as you.** The key store is
+  DPAPI-wrapped, so it unwraps under your Windows credentials — and so does
+  anything else you run. A key is for containing a script and being able to
+  revoke it, not for defending a machine that is already compromised.
+
+That is the same limit the cached session token and the stored vault key
+already have, and scoping does not remove it.
+
+### Turning it on
+
+1. Preferences → **Vault service** → turn the service on. Until you do, the
+   process refuses to start and says so in the log.
+2. On the same screen, mint a key: give it a name, an expiry (or none), and its
+   scopes. **The key is shown once** — the store keeps only `SHA-256(key)`, so
+   there is nothing to read it back out of.
+3. Start it: `deskwarden.exe --service` runs it for as long as an app needs it,
+   and `deskwarden.exe --service installed` runs it as a service that outlives
+   every app.
+
+It binds `127.0.0.1` on a **free port chosen at start** — the bind address is
+not configurable, deliberately — and writes the port it got to the log:
+`the vault service is listening on 127.0.0.1:<port>`. Exit code `3` means the
+command line was fine and the service will not run (switched off, no active
+account, no stored vault key, no server URL, or the port could not be bound);
+`2` means the command line itself was wrong.
+
+### Calling it
+
+```bash
+PORT=54321          # from the log line above
+KEY=<the key you minted>
+
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:$PORT/status
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:$PORT/list/object/items
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:$PORT/list/object/folders
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:$PORT/object/item/<item-id>
+```
+
+Those four are the whole API. `/status` reports lock state and nothing else —
+not the account's email, not the server URL — because a live key is enough to
+reach it.
+
+### Status codes
+
+| Code | What it means |
+| --- | --- |
+| `200` | Served. |
+| `401` | **The credential is wrong**: missing, not a `Bearer` header, unknown, or expired. Also what an unknown path returns to an unauthenticated caller — the credential is checked *before* the path is read, so a stranger cannot map the API by watching which paths 404. |
+| `403` | **The credential is right and does not cover this.** Distinct from `401` on purpose: a script has to be able to tell "your key is bad" from "your key needs a wider scope". |
+| `404` | Authenticated, and there is no such route — or no such item id. |
+| `405` | Authenticated, the route exists, and the method is not one this service understands. |
+| `501` | `POST /auth`. See below. |
+
+### Scopes
+
+A key holds a set of `(subject, access)` pairs:
+
+- **Subject**: *All* (the whole vault), a *category* (Login, Card, Identity,
+  Secure Note, SSH Key), or a *single item* by id.
+- **Access**: *read* or *write*. Neither implies the other.
+
+**An empty scope set grants nothing**, and so does a subject a build does not
+recognise — an older Deskwarden reading a newer key file denies rather than
+widens. Expiry is judged per request against the clock at that moment, so a
+service that has been up for a week does not honour a key that died on Tuesday.
+
+A **list** request is filtered rather than refused: a key scoped to Logins may
+call `/list/object/items` and gets back only the Logins. A **single-item** fetch
+is judged against that id, so a category-scoped key is refused there (`403`) and
+reaches the same items through the filtered list instead. Folders carry no
+secret and are not filtered.
+
+### What is not built yet
+
+- **`POST /auth` answers `501`.** The master-password exchange that would issue
+  a short-lived session token is designed but not implemented; the service has
+  no way to take a master password at all. Named API keys are the only way in.
+- **No route changes anything.** Write access exists in the scope model and is
+  checked, but every route this service serves today is a read; a write-scoped
+  request to `/object/item/{id}` is permitted and still modifies nothing.
+- **Nothing in Deskwarden uses it yet.** The tray daemon and the vault window
+  still talk to `bw serve` (or to the direct backend in-process). Pointing them
+  here is a change of base URL, and it has not been made.
+- **Every request re-reads the vault** from the server rather than serving a
+  snapshot, so the service is correct against edits made in the app and is not
+  fast. It does not read the encrypted disk cache.
+
 ## Stack, and why
 
 | Choice | Reasoning |
