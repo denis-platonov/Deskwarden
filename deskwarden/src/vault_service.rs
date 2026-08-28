@@ -381,6 +381,72 @@ pub fn supervise(env: &ServiceEnv, sup: &SupervisorEnv, port: u16) -> Supervised
     }
 }
 
+
+/// What stopping the service is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAction {
+    /// End the `bw serve` child THIS process spawned, through the handle it
+    /// owns.
+    EndTheChildWeStarted,
+    /// Do nothing. Something is on the port that this process did not start,
+    /// so it is not this process's to end -- the same refusal [`verify`]
+    /// makes when it declines to adopt an unidentifiable service and
+    /// declines to kill it.
+    LeaveItAlone,
+}
+
+/// The whole stop decision, as a pure function.
+///
+/// Separated from the doing so the rule is a thing tests drive rather than a
+/// branch buried in a `fn` pointer. The rule is one line: **a handle, never
+/// a port.** A process listening on `BW_SERVE_PORT` may be another account's
+/// service, another user's, or something that took the port first; ending it
+/// because it is in the way is precisely what this design refuses.
+#[must_use]
+pub fn stop_action(we_started_it: bool) -> StopAction {
+    if we_started_it { StopAction::EndTheChildWeStarted } else { StopAction::LeaveItAlone }
+}
+
+/// The `bw serve` this process started, if it started one.
+///
+/// `app_mutex::HELD`'s idiom: a process-wide handle that outlives the stack
+/// frame that made it. It exists because the switch-over takes `bw serve`
+/// out of the kill-on-close job, and something then has to be able to end it
+/// -- and the only honest something is the handle we already hold.
+static OUR_SERVICE: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+/// Records the child this process spawned, so [`supervise`] can end it.
+///
+/// Call it **immediately** after the spawn. A child spawned and not recorded
+/// is the orphan this whole design is trying not to create: out of the job,
+/// and unknown to the only code that would stop it.
+pub fn remember_our_service(child: std::process::Child) {
+    if let Ok(mut slot) = OUR_SERVICE.lock() {
+        if let Some(mut previous) = slot.replace(child) {
+            // Replacing without ending the old one would leak exactly the
+            // orphan this exists to prevent.
+            log::warn!("a second bw serve was recorded; ending the first");
+            crate::bw_serve::stop_bw_serve(&mut previous);
+        }
+    }
+}
+
+/// Hands back the child, so nothing can stop it twice.
+///
+/// Taking rather than borrowing is deliberate: a second stop would `kill` a
+/// pid that has been reaped and may by then belong to somebody else.
+#[must_use]
+pub fn take_our_service() -> Option<std::process::Child> {
+    OUR_SERVICE.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Whether this process started the service that is running.
+#[must_use]
+pub fn we_started_the_service() -> bool {
+    OUR_SERVICE.lock().is_ok_and(|slot| slot.is_some())
+}
+
 /// The real kernel behind [`ServiceEnv`], for the running app.
 ///
 /// `app_mutex::create_named`'s idiom, with the one difference this module
@@ -446,21 +512,30 @@ fn win_is_held(name: &str) -> bool {
     }
 }
 
-/// Not wired yet, and it says so rather than pretending.
+/// Ends the `bw serve` this process started, and nothing else.
 ///
-/// Stopping the service means ending the `bw serve` child whose handle
-/// `main.rs` owns, and until the switch-over described in
-/// `docs/superpowers/plans/2026-08-27-the-vault-service-outlives-both-apps.md`
-/// that child is still governed by the kill-on-close job object. Nothing in
-/// the running app calls [`release`] or [`supervise`], so nothing reaches
-/// here; if something ever does before the switch-over, the log line is the
-/// evidence rather than a silent no-op.
+/// The `port` is logged and **not used to find anything**. It is here
+/// because [`ServiceEnv::stop`] is shaped for a service identified by port,
+/// and keeping the parameter while refusing to act on it is the honest way
+/// to say that the identification comes from somewhere better.
 fn win_stop(port: u16) {
-    log::error!(
-        "vault_service::stop was called for port {port}, but the service is still owned by \
-         the kill-on-close job object; nothing was stopped"
-    );
+    match stop_action(we_started_the_service()) {
+        StopAction::EndTheChildWeStarted => match take_our_service() {
+            Some(mut child) => {
+                log::info!("nobody is attached; ending the bw serve we started on port {port}");
+                crate::bw_serve::stop_bw_serve(&mut child);
+            }
+            // Lost the race with another stop between the check and the
+            // take. Nothing to do, and nothing to complain about.
+            None => log::debug!("the service on port {port} was already ended"),
+        },
+        StopAction::LeaveItAlone => log::info!(
+            "nobody is attached, but this process did not start the service on port {port}; \
+             leaving it alone"
+        ),
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +548,23 @@ mod tests {
     // guard whose `Drop` removes the name, so releasing a hold in a test is
     // dropping the value -- and *abandoning* one, the crash case, is
     // `std::mem::forget`.
+    /// **The fake kernel is process-wide, so these tests are not parallel.**
+    ///
+    /// `ServiceEnv` is `fn` pointers, which cannot close over a fixture, so
+    /// the fake's state has to live in statics -- and Rust runs `#[test]`
+    /// functions on many threads at once. Without this lock one test's
+    /// `reset` wipes another's slots mid-run.
+    ///
+    /// Found the way it should be: these passed serially and failed in
+    /// parallel, and the parallel run is the one CI does. They had been
+    /// green by luck of scheduling until enough tests were added elsewhere
+    /// to change the order.
+    ///
+    /// Poison is deliberately ignored. A panicking test poisons this lock,
+    /// and every later test failing to acquire it would report the first
+    /// failure over and over instead of its own.
+    static SERIALISE: Mutex<()> = Mutex::new(());
+
     static LIVE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     static OPENS: AtomicUsize = AtomicUsize::new(0);
 
@@ -520,6 +612,7 @@ mod tests {
     /// Two apps attached at once, which one shared mutex could not express.
     #[test]
     fn two_apps_can_be_attached_at_the_same_time() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let a = attach(&env()).expect("a");
         let b = attach(&env()).expect("b");
@@ -535,6 +628,7 @@ mod tests {
     /// sixteen enough: without this, sixteen launches would exhaust it.
     #[test]
     fn a_released_slot_is_handed_out_again() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let first = attach(&env()).expect("first");
         let slot = first.slot();
@@ -547,6 +641,7 @@ mod tests {
     /// a service that waited for a clean exit would hold the vault forever.
     #[test]
     fn an_abandoned_attachment_still_reads_as_detached() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let attached = attach(&env()).expect("attached");
         let name = attach_slot_name(attached.slot());
@@ -572,6 +667,7 @@ mod tests {
     /// as any handle does.
     #[test]
     fn asking_never_makes_a_name_live() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         for _ in 0..5 {
             assert!(!anyone_attached(&env()), "asking made a name live");
@@ -589,6 +685,7 @@ mod tests {
     /// handed out twice.
     #[test]
     fn a_full_slot_space_refuses_rather_than_overlapping() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let held: Vec<_> = (0..SLOTS).map(|_| attach(&env()).expect("slot")).collect();
         assert!(attach(&env()).is_none());
@@ -618,6 +715,7 @@ mod tests {
     /// Windows Hello prompt.
     #[test]
     fn a_service_holding_its_object_for_our_account_is_adopted() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         let _service = (env.hold)(&service_object_name(OURS)).expect("service holds its name");
@@ -630,6 +728,7 @@ mod tests {
     /// user's vault, which is the failure the fingerprint exists to stop.
     #[test]
     fn a_service_serving_another_account_is_refused() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         let _service = (env.hold)(&service_object_name(THEIRS)).expect("their service");
@@ -646,6 +745,7 @@ mod tests {
     /// than declining to use it.
     #[test]
     fn a_port_that_answers_while_holding_nothing_is_refused_and_not_stopped() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         assert_eq!(
@@ -664,6 +764,7 @@ mod tests {
     /// to and says why.
     #[test]
     fn a_silent_port_is_refused_as_silent_and_not_as_an_impostor() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let env = verify_env();
         assert_eq!(verify(&env, OURS, None, 8087), Verdict::Refuse(Refusal::NothingAnswered));
@@ -719,6 +820,11 @@ mod tests {
     }
 
     /// Resets the Task 3 fakes on top of [`reset`].
+    ///
+    /// **Takes no lock.** Its callers already hold [`SERIALISE`], and a
+    /// second acquisition here deadlocks -- a `std::sync::Mutex` is not
+    /// reentrant. That is not hypothetical: adding the lock mechanically to
+    /// every `reset` call did exactly this and hung the suite.
     fn reset_service() {
         reset();
         STARTS.store(0, Ordering::SeqCst);
@@ -731,6 +837,7 @@ mod tests {
     /// Nothing running, so this app starts one.
     #[test]
     fn the_first_app_starts_the_service() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         assert_eq!(ensure_running(&env(), &start_env(), OURS, PORT), Startup::StartedIt);
         assert_eq!(STARTS.load(Ordering::SeqCst), 1);
@@ -742,6 +849,7 @@ mod tests {
     /// service that proves itself must not be replaced.
     #[test]
     fn a_running_service_is_adopted_without_starting_a_second_one() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         start(PORT);
         STARTS.store(0, Ordering::SeqCst);
@@ -762,6 +870,7 @@ mod tests {
     /// timing, not a convenience.
     #[test]
     fn two_concurrent_starts_produce_one_service_and_the_loser_attaches() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _lock = take_start_lock().expect("winner holds the start lock, having not yet spawned");
 
@@ -796,6 +905,7 @@ mod tests {
     /// backend and has to say so.
     #[test]
     fn losing_the_race_to_an_app_that_never_starts_one_is_reported() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _lock = take_start_lock().expect("winner takes the start lock");
         assert_eq!(
@@ -807,6 +917,7 @@ mod tests {
     /// A service for a different account is neither adopted nor replaced.
     #[test]
     fn a_service_for_another_account_is_left_alone() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _theirs = hold(&service_object_name(THEIRS)).expect("their service");
         *CLAIM.lock().unwrap() = Some(THEIRS.to_string());
@@ -821,6 +932,7 @@ mod tests {
     /// The last attachment released exits the service.
     #[test]
     fn releasing_the_last_attachment_stops_the_service() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let only = attach(&env()).expect("attached");
         release(&env(), only, PORT);
@@ -830,6 +942,7 @@ mod tests {
     /// Releasing one of two does not -- the other app is still using it.
     #[test]
     fn releasing_one_of_two_leaves_the_service_running() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let first = attach(&env()).expect("first");
         let second = attach(&env()).expect("second");
@@ -859,6 +972,7 @@ mod tests {
     /// unlocked vault on a held port forever.
     #[test]
     fn a_service_whose_apps_all_crashed_is_stopped_anyway() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let first = attach(&env()).expect("first");
         let second = attach(&env()).expect("second");
@@ -880,6 +994,7 @@ mod tests {
     /// using is worse than the leak it was written to prevent.
     #[test]
     fn a_service_with_a_live_app_is_never_stopped_however_long_it_waits() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let _still_here = attach(&env()).expect("attached");
         assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::GaveUp);
@@ -891,6 +1006,7 @@ mod tests {
     /// the survivor down with it.
     #[test]
     fn one_app_crashing_does_not_stop_the_service_for_the_other() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         let crashed = attach(&env()).expect("crashed");
         let _alive = attach(&env()).expect("alive");
@@ -905,6 +1021,7 @@ mod tests {
     /// The service is stopped once, not once per tick.
     #[test]
     fn the_service_is_stopped_only_once() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset_service();
         assert_eq!(supervise(&env(), &supervisor(), PORT), Supervised::Stopped);
         assert_eq!(STOPS.load(Ordering::SeqCst), 1);
@@ -945,5 +1062,41 @@ mod tests {
              defines: a wrong bit fails at runtime as ACCESS_DENIED, which this module reports \
              as -- nobody is attached."
         );
+    }
+    // ---- the switch-over: stopping only what we started ----------------
+
+    /// **The refusal that must not be lost in the switch-over.** `verify`
+    /// declines to adopt a process it cannot identify AND declines to kill
+    /// it. Stopping by port would reintroduce exactly that killing through
+    /// the back door: whatever is listening is not necessarily ours.
+    #[test]
+    fn a_service_we_did_not_start_is_never_stopped() {
+        assert_eq!(stop_action(false), StopAction::LeaveItAlone);
+    }
+
+    /// The child this process spawned is ours to end, and the handle is what
+    /// says so -- not the port, and not a pid we remembered.
+    #[test]
+    fn the_child_we_started_is_the_one_we_stop() {
+        assert_eq!(stop_action(true), StopAction::EndTheChildWeStarted);
+    }
+
+    /// Stopping by port is the thing this must never become, and an absence
+    /// cannot be read -- so it is pinned in the source.
+    #[test]
+    fn nothing_here_stops_a_process_by_port() {
+        let source = include_str!("vault_service.rs");
+        let cut = source.find("#[cfg(test)]").expect("control: this file has no test module");
+        let production = &source[..cut];
+        assert!(
+            production.contains("stop_action("),
+            "control: the stop decision no longer runs through `stop_action`, so this pin guards nothing"
+        );
+        for forbidden in ["TerminateProcess", "OpenProcess", "taskkill", "by_port", "find_pid"] {
+            assert!(
+                !production.contains(forbidden),
+                "`{forbidden}` appears here. The service is stopped through the child handle this process owns; ending whatever holds the port would kill a process this app cannot identify, which `verify` exists to refuse."
+            );
+        }
     }
 }

@@ -1,5 +1,11 @@
 # The Switch-Over Implementation Plan
 
+> **SUPERSEDED 2026-08-27.** See `docs/superpowers/specs/2026-08-27-the-local-vault-service-design.md`.
+> A third consumer -- scripts over REST -- makes the local vault service the product rather than
+> a supervisor bolted onto `bw serve`, and it resolves this plan's blocker by owning its own
+> lifetime. **`bw serve` keeps its kill-on-close job object.** Task 1b (`win_stop` through an owned
+> handle) is real work that stands; Tasks 2 and 3 are not to be built.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `vault_service`'s counting actually govern `bw serve`, so the backend outlives the daemon exactly as long as another app is using it -- and no longer.
@@ -83,8 +89,8 @@ compared against the full switch-over before either is built.
 
 **No code.** Answer, in writing, in this file:
 
-- [ ] Is the stall worth trading the kernel's orphan guarantee for? If **no**, build the alternative above (Task 1a) and stop.
-- [ ] If **yes**: does the daemon keep the job object for its *other* children? It should -- only `bw serve` moves.
+- [x] Is the stall worth trading the kernel's orphan guarantee for? **YES -- the owner chose the full switch-over on 2026-08-27**, with the cost above stated in front of them. Task 1a is therefore NOT built.
+- [x] If **yes**: does the daemon keep the job object for its *other* children? **Yes. Only `bw serve` moves.** Every other `spawn_in_job` caller is untouched, and the vault window was never in the job to begin with.
 
 ---
 
@@ -111,12 +117,39 @@ every backend is in the job of whoever started it.
 to reach the supervisor -- which is the whole reason `bw serve` moves out of
 the job.
 
-- [ ] **Step 1: Write the failing test** -- stopping goes through the owned child handle and NOT through "kill whatever is on the port", which would end a process this app cannot identify. Task 2 of the previous plan refuses to do exactly that, and this must not reintroduce it by the back door.
-- [ ] **Steps 2-5:** red, implement, full suite, commit.
+- [x] **Step 1: Write the failing test** -- stopping goes through the owned child handle and NOT through "kill whatever is on the port", which would end a process this app cannot identify. Task 2 of the previous plan refuses to do exactly that, and this must not reintroduce it by the back door.
+- [x] **Steps 2-5:** red first, implemented, committed.
 
 ---
 
-### Task 2 (switch-over only): the supervisor runs
+## BLOCKER found while wiring Task 2: the last app cannot stop the service
+
+After Task 3 takes `bw serve` out of the job:
+
+1. the daemon starts it, the vault window attaches;
+2. the daemon is killed -- `bw serve` survives, which is the feature;
+3. the window closes, sees nobody attached, tries to stop the service;
+4. **it cannot.** It never started that child, so `stop_action(false)` says leave it alone.
+
+The child is out of the job, its parent is gone, and the only code that could end it has no handle. `bw serve` holds an unlocked vault on localhost indefinitely -- the exact failure the job object exists to prevent, reached by following this plan.
+
+Task 2 assumed the supervisor always lives in the process that spawned the backend. Once the backend outlives that process, it does not -- and that is precisely the scenario the switch-over exists for.
+
+**Tasks 2 and 3 are blocked until this is resolved.** Shipping Task 3 without it creates, silently, the security failure the whole design was built to avoid.
+
+### The options
+
+**A. A verified service may be stopped by any of our apps.** `verify` already proves a service is ours (it holds `Local\Deskwarden-Vault-<our fingerprint>`). It refuses to kill the *unidentifiable*; a verified one is ours by definition. Needs a pid, which the current source pin forbids -- so the pin would gain a narrow, named exception, and the service would have to publish its pid somewhere only it can write.
+
+**B. The service supervises itself.** `bw serve` is not ours to modify, so this means a small supervisor process of ours that owns the child, starts with the first attachment and exits with the last. It is the honest shape -- the thing that owns the backend is the thing that outlives the apps -- and it is a new process, which is real work.
+
+**C. Keep the job, take the cheaper alternative** (Task 1a): the window starts its own `bw serve` into its own job when it finds the port dead. No orphan is ever possible. Costs a cold start and, on the direct backend, a Hello prompt.
+
+- [ ] **Decide between A, B and C before writing any more code.**
+
+---
+
+### Task 2 (switch-over only, BLOCKED): the supervisor runs
 
 **Files:** Modify `deskwarden/src/main.rs`
 

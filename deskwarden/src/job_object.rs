@@ -2158,13 +2158,32 @@ mod tests {
             // exactly the case a length-only pin would miss, and the reason
             // this guard is a length AND a hash rather than either alone.
             //
-            // **Re-pinned for the AGPL relicensing**, which is a `license`
-            // field and a `publish = false` beside it -- no dependency moved,
-            // no name added, removed or re-pointed, no `[patch]`/`[replace]`
-            // table, no path or fork, and `[build-dependencies]` still reads
-            // exactly `winresource = "0.1"`. 11685 -> 12075 bytes, all of it
-            // the new field and the comment above it.
-            (12075, 0xa718_829b_4b9c_d0fe_u64),
+            // **Re-pinned for `tiny_http`**, and this time a dependency DID
+            // move, so it is named here as this pin requires.
+            //
+            // ADDED: `tiny_http = { version = "0.12", default-features =
+            // false }`, from crates.io, in `[dependencies]`. It is the HTTP
+            // server for the local vault service. `default-features = false`
+            // turns off its TLS features: the service binds loopback and
+            // nothing else, so a TLS stack would be a large dependency
+            // defending a hop that never leaves the machine.
+            //
+            // It brings three transitive crates -- `ascii`,
+            // `chunked_transfer` and `httpdate` -- plus `log`, which was
+            // already here. `cargo deny check licenses` passes with NO change
+            // to `deny.toml`: all three are already-allowed licences, so
+            // nothing was added to the allow-list to make this fit.
+            //
+            // NOT changed: no name removed or re-pointed, no `[patch]`,
+            // `[replace]` or `[workspace.dependencies]` table, no path or
+            // fork dependency, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 12075 -> 12351 bytes, all of it the new
+            // entry and the comment above it.
+            //
+            // The hash below was recomputed independently rather than copied
+            // out of the failure message -- a pin re-pinned to whatever the
+            // file happens to say is not a pin.
+            (12351, 0x74d9_dec7_e2d3_88ba_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

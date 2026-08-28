@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 63] = [
+        const OPENS_NO_WINDOW: [&str; 68] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1458,6 +1458,25 @@ mod tests {
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.
             "send",
+            // Owns a loopback socket for the vault service. A socket is
+            // not a window: nothing here draws, and the service runs with
+            // no UI at all -- which is why it costs ~10 MB and not ~50.
+            "service_host",
+            // Builds JSON and filters a list by scope. Pure serde over
+            // values it is handed; no socket, no vault, no window.
+            "service_body",
+            // Key records, scopes and expiry: serde, a hash and some
+            // comparisons. No window, no socket, no clock of its own --
+            // `find` is told what time it is.
+            "service_keys",
+            // The routing and authorisation decision as a pure function.
+            // It binds no socket -- that is the process's job -- and draws
+            // nothing.
+            "service_api",
+            // Mints, compares and parses a bearer token. Pure string work
+            // and one call for random bytes; it draws nothing and knows
+            // nothing about windows.
+            "service_token",
             "session_store",
             "settings",
             "signature",

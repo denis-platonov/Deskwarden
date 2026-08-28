@@ -110,6 +110,27 @@ pub mod scratch_window;
 /// downstream of it is a pure function.
 pub mod screen_capture;
 pub mod send;
+/// Who may call what, for the local vault service: one pure function over a
+/// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
+/// API rather than a new one.
+pub mod service_api;
+/// The socket the local vault service owns, and the few decisions that come
+/// with owning one: loopback always, which lifetime it is running under, and
+/// what status each decided answer carries.
+pub mod service_host;
+/// What the local vault service answers with, and what a key is allowed to
+/// see of it. `bw serve`'s envelope, and a list filtered to the asking key
+/// rather than refused outright.
+pub mod service_body;
+/// Named API keys for the local vault service: what one may do, and until
+/// when. Default deny throughout, including for a subject this build has
+/// never heard of -- see the module doc for why that direction is not a
+/// matter of taste.
+pub mod service_keys;
+/// The bearer token the local vault service requires. Read its module doc
+/// for what it stops and -- more importantly -- what it does not: a program
+/// already running as the owner is not kept out by it.
+pub mod service_token;
 pub mod session_store;
 pub mod settings;
 pub mod signature;
