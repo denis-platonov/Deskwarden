@@ -1,7 +1,6 @@
 # Deskwarden
 
 [![Rust](https://img.shields.io/badge/Rust-2021%20edition-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![license](https://img.shields.io/badge/license-AGPL--3.0-orange?style=flat-square)](LICENSE)
 [![release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/deskwarden/releases/latest)
 [![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
