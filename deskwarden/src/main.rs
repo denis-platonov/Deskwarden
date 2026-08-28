@@ -248,6 +248,20 @@ fn main() {
     // Bound with a name, and never `let _`: a `_`-bound guard drops at once,
     // which would release the slot on the next line and make every reading
     // of it a lie.
+    // **Heal a logon entry written before the `--autostart` flag existed.**
+    //
+    // Such an entry is a bare path, which `launch_intent` reads as a
+    // UserLaunch, whose first surface is a window -- so the daemon draws one
+    // at every sign-in and holds the graphics driver for the session. Measured
+    // on the owner's machine at 98.6 MB with `nvoglv64.dll` resident, against
+    // 35.9 MB for a tray that never drew one.
+    //
+    // Updates cannot fix it: they pass `/MERGETASKS=!autostart` precisely so
+    // they never rewrite that value. So the app repairs its own, once, here.
+    // It creates nothing that is absent and touches nothing that points
+    // elsewhere -- see the module doc.
+    deskwarden::autostart_repair::repair_logon_entry();
+
     let vault_attachment =
         deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
     match &vault_attachment {

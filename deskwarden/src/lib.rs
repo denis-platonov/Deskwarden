@@ -23,6 +23,11 @@ pub mod app_window;
 /// session switch, or a suspend. It creates NO window: the notifications are
 /// registered on the helper window the tray already owns, and are classified
 /// in the message pump `main` already runs.
+/// Healing a logon entry written before the `--autostart` flag existed. An
+/// install that predates it draws a window at every sign-in and holds the
+/// graphics driver for the session; no update can fix it, because updates
+/// deliberately never rewrite that value.
+pub mod autostart_repair;
 pub mod away_lock;
 pub mod backend_policy;
 /// The one brace matcher every below-the-cut source walk uses.

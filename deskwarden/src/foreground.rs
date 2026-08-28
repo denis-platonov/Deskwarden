@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 68] = [
+        const OPENS_NO_WINDOW: [&str; 69] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1336,6 +1336,9 @@ mod tests {
             // hotkey manager's) that receive both messages. It calls no
             // `CreateWindowExW` and hooks no window procedure -- the messages
             // are read out of the queue `main`'s pump already drains.
+            // Reads one registry value and decides whether to rewrite it.
+            // No window, no drawing.
+            "autostart_repair",
             "away_lock",
             "backend_policy",
             // A test-only brace matcher over source text. It is
