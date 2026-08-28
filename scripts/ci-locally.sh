@@ -54,7 +54,9 @@ run_tests() {
     ( cd deskwarden && cargo test -j 8 2>&1 ) | tee /tmp/ci-local-tests.txt | grep -E "^test result|^error" || true
     echo
     echo "  failing tests, if any:"
-    grep -E "^test .* FAILED" /tmp/ci-local-tests.txt | sed 's/^/    /' | head -30
+    # `^test result:` is the SUMMARY line, not a test. Matching it made an
+    # earlier version of this script report a module called "result".
+    grep -E "^test [a-z]" /tmp/ci-local-tests.txt | grep -v "^test result:" | grep " FAILED" | sed 's/^/    /' | head -30
     # Only a compile error is an outright failure here. Test failures are
     # printed for a human, because on this machine they are noise more often
     # than they are signal.

@@ -2263,6 +2263,11 @@ fn main() {
     // it instead of opening a second one and so its exit is noticed at all.
     // See `UiWindows`.
     let mut ui_windows = UiWindows::default();
+    // When the loop last started a backend because somebody attached. Kept
+    // here rather than in the estate because it is a fact about this LOOP's
+    // throttling, not about the vault session -- a re-settle must not clear
+    // it and hand a failing server a fresh burst of attempts.
+    let mut last_attachment_start: Option<Instant> = None;
 
     // **The startup window's vault outcome, dispatched by the one dispatcher.**
     //
@@ -3263,6 +3268,36 @@ fn main() {
         // throttling it) -- the three places that *do* need the backend
         // (startup, `open_vault_window`, the tray's Sync item) each ask for
         // it explicitly and this only ever tears it back down afterwards.
+        // Asked ONCE and used by both halves below, so the thing that
+        // stops the backend and the thing that starts it cannot come to
+        // disagree about who needs it.
+        let somebody_needs_the_vault = ui_windows.vault_pid().is_some()
+            || deskwarden::vault_service::anyone_else_attached(
+                &deskwarden::vault_service::windows_env(),
+                vault_attachment.as_ref().map(deskwarden::vault_service::Attachment::slot),
+            );
+
+        // **The start half, and it fires on a fact rather than on the loop
+        // going round.** Somebody is holding an attachment slot, so they
+        // need the vault; the vault service is a separate process with no
+        // channel to this one, and the attachment IS the channel. Without
+        // this the service could keep a backend alive but never cause one.
+        if attachment_needs_a_backend_start(
+            somebody_needs_the_vault,
+            &estate.task_in_progress,
+            backend_is_running(&mut estate.child),
+            last_attachment_start.map(|at: Instant| at.elapsed()),
+            ATTACHMENT_START_COOLDOWN,
+        ) {
+            log::info!("something is attached to the vault and the backend is down; starting it");
+            last_attachment_start = Some(Instant::now());
+            spawn_backend_start(
+                estate.token.to_string(),
+                Arc::clone(&job),
+                backend_op_tx.clone(),
+            );
+        }
+
         if estate.task_in_progress.is_none() {
             stop_backend_if_idle(
                 &mut estate.child,
@@ -3270,15 +3305,7 @@ fn main() {
                 // **The input that was missing.** Without it this stopped
                 // `bw serve` out from under a window that had just asked
                 // for it, one second after it came up.
-                // A window of ours, OR anything else attached -- the vault
-                // service is a consumer too, and it holds a slot while it
-                // serves. Its own slot is excluded, or the daemon would
-                // read itself as a reason to keep the backend forever.
-                ui_windows.vault_pid().is_some()
-                    || deskwarden::vault_service::anyone_else_attached(
-                        &deskwarden::vault_service::windows_env(),
-                        vault_attachment.as_ref().map(deskwarden::vault_service::Attachment::slot),
-                    ),
+                somebody_needs_the_vault,
             );
         }
 
@@ -8594,6 +8621,52 @@ fn needs_backend_start(
     backend_task_in_progress.is_none() && !backend_already_running
 }
 
+/// How long to wait before trying again after a start that did not take.
+///
+/// **This constant is the whole answer to the retry storm.**
+/// `stop_backend_if_idle`'s doc explains why the idle loop must never
+/// start a backend on its own: it runs every ~200ms, so a backend that
+/// keeps failing to start would be retried five times a second forever,
+/// each attempt paying a port wait and a `bw sync`. Thirty seconds is long
+/// enough that a wedged server costs two attempts a minute rather than
+/// three hundred, and short enough that a script waiting on the service
+/// is not left for minutes after the cause clears.
+const ATTACHMENT_START_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether an attachment by somebody else should start the backend now.
+///
+/// **The symmetric counterpart to [`stop_backend_if_idle`]**, and the
+/// reason it can exist where a general idle start could not: this fires on
+/// a *fact about another process* -- somebody is holding an attachment
+/// slot and therefore needs the vault -- rather than on the loop merely
+/// going round again.
+///
+/// Without it the vault service could keep a backend alive but never cause
+/// one, so a script got `locked` or `503` unless a window or the tray's
+/// Sync had already brought `bw serve` up. The service is a separate
+/// process with no channel to the daemon; the attachment IS the channel.
+///
+/// `since_last_attempt` is a `Duration` rather than an `Instant` so this
+/// stays pure and the cooldown is testable without waiting for one.
+fn attachment_needs_a_backend_start(
+    anyone_else_attached: bool,
+    backend_task_in_progress: &Option<(Instant, BackendOpKind)>,
+    backend_already_running: bool,
+    since_last_attempt: Option<Duration>,
+    cooldown: Duration,
+) -> bool {
+    if !anyone_else_attached {
+        return false;
+    }
+    if !needs_backend_start(backend_task_in_progress, backend_already_running) {
+        return false;
+    }
+    match since_last_attempt {
+        None => true,
+        Some(since) => since >= cooldown,
+    }
+}
+
 /// Which kind of background backend operation `backend_task_in_progress` is
 /// currently tracking. Recorded alongside the `Instant` so the wedge-deadline
 /// check in `main`'s loop can say what actually stalled (review Minor 4):
@@ -13189,6 +13262,59 @@ mod tests {
     /// the stopper was never told a window was open. Measured on the owner's
     /// machine: started 14:01:18, stopped 14:01:18, window gave up at
     /// 14:02:10 with zero items.
+    /// **The start half of the rule.** The vault service is a separate
+    /// process with no channel to the daemon; holding an attachment slot is
+    /// the channel. Without this the service could keep a backend alive but
+    /// never cause one, so a script got `locked` unless a window or the
+    /// tray had already brought `bw serve` up.
+    #[test]
+    fn an_attachment_by_somebody_else_starts_the_backend() {
+        assert!(attachment_needs_a_backend_start(
+            true, &None, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// Nobody attached is not a reason to start anything. This is what keeps
+    /// it from becoming the idle start `stop_backend_if_idle` refuses to be.
+    #[test]
+    fn an_idle_loop_never_starts_a_backend_on_its_own() {
+        assert!(!attachment_needs_a_backend_start(
+            false, &None, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// **The retry storm the idle-stop doc warns about.** The loop runs about
+    /// five times a second; a backend that keeps failing to start would be
+    /// retried five times a second forever, each attempt paying a port wait
+    /// and a `bw sync`. The cooldown is the whole answer, so it gets the test.
+    #[test]
+    fn a_failed_start_is_not_retried_five_times_a_second() {
+        let just_now = Some(Duration::from_millis(200));
+        assert!(
+            !attachment_needs_a_backend_start(
+                true, &None, false, just_now, ATTACHMENT_START_COOLDOWN,
+            ),
+            "a start was attempted 200ms after the last one; that is the retry storm"
+        );
+        // The control: once the cooldown has passed it tries again, or a
+        // backend that came back would never be started at all.
+        assert!(attachment_needs_a_backend_start(
+            true, &None, false, Some(ATTACHMENT_START_COOLDOWN), ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// Never a second attempt on top of one in flight, and never a start for
+    /// a backend that is already up -- both would race to bind one port.
+    #[test]
+    fn a_start_is_not_stacked_on_a_running_or_pending_one() {
+        let in_flight = Some((Instant::now(), BackendOpKind::EnsureRunning));
+        assert!(!attachment_needs_a_backend_start(
+            true, &in_flight, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+        assert!(!attachment_needs_a_backend_start(
+            true, &None, true, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
     #[test]
     fn a_backend_is_not_stopped_out_from_under_an_open_vault_window() {
         let mut child = Some(long_lived_command().spawn().unwrap());

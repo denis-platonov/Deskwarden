@@ -6,8 +6,9 @@
 //! request that fetched the whole vault, and a write that answered `200` with
 //! the item having changed nothing.
 //!
-//! So this binds `127.0.0.1:0`, serves from a fake vault, and speaks HTTP to
-//! itself. It checks what a script would actually see:
+//! So this drives the decision, the scope filter and the bodies directly,
+//! over a fake vault, for every shape of key. It checks what a script
+//! would see:
 //!
 //! * no credential, and a wrong one, are refused with no body;
 //! * a key scoped to Logins is served Logins and not Cards;
@@ -15,11 +16,18 @@
 //! * a write is refused as unbuilt rather than answered with the item;
 //! * an unknown route is not a way to learn which routes exist.
 //!
-//! **The vault is fake and the account is not real.** What this proves is that
-//! the routing, the scope check, the bodies, the status codes and `tiny_http`
-//! agree with each other over a socket. What it does NOT prove is that a real
-//! `RestBackend` behind it returns what this service expects -- that needs a
-//! direct-REST account, and is stated as missing rather than implied.
+//! **The vault is fake, and this no longer opens a socket.** It once did:
+//! one thread served while the main thread made requests. That half is
+//! gone, for two reasons that point the same way. The real service has
+//! since been driven over a real socket with a real vault -- 1668 items,
+//! through a key minted in Preferences -- which is a strictly better test
+//! than a fake one. And the thread tripped `job_object`'s census of every
+//! legitimate thread in `src/`, which does not extend to `examples/`;
+//! widening a guard that stands between a panic and an orphaned unlocked
+//! vault, to keep a redundant test, is a bad trade.
+//!
+//! What remains is the part nothing else covers: every combination of
+//! scope against every route, in one run.
 //!
 //! ```text
 //! cargo run --example service_probe
@@ -185,69 +193,6 @@ fn main() {
         println!("      status body: {}", status.body);
     }
     println!();
-
-    println!("=== now over a real socket ===");
-    let keys = vec![key("all", vec![read(Subject::All)])];
-    std::thread::spawn(move || {
-        for request in server.incoming_requests() {
-            let auth = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Authorization"))
-                .map(|h| h.value.as_str().to_string());
-            let reply = answer_one_request(
-                request.method().as_str(),
-                request.url(),
-                auth.as_deref(),
-                &keys,
-                1_000,
-                vault,
-            );
-            let header =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .expect("a literal header");
-            let _ = request.respond(
-                tiny_http::Response::from_string(reply.body)
-                    .with_status_code(reply.status)
-                    .with_header(header),
-            );
-        }
-    });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let agent = ureq::AgentBuilder::new().build();
-
-    let anonymous = agent.get(&format!("{base}/list/object/items")).call();
-    let status = match &anonymous {
-        Ok(response) => response.status(),
-        Err(ureq::Error::Status(code, _)) => *code,
-        Err(e) => {
-            println!("FAILED the socket did not answer at all: {e}");
-            std::process::exit(1);
-        }
-    };
-    all_held &= check("HTTP with no credential", status, 401, "", &[]);
-
-    let authorised = agent
-        .get(&format!("{base}/list/object/items"))
-        .set("Authorization", &format!("Bearer {KEY}"))
-        .call();
-    match authorised {
-        Ok(response) => {
-            let code = response.status();
-            let body = response.into_string().unwrap_or_default();
-            all_held &= check("HTTP with a credential", code, 200, "", &[]);
-            let parsed: serde_json::Value =
-                serde_json::from_str(&body).expect("the service answered something that is not JSON");
-            let listed = parsed["data"]["data"].as_array().map_or(0, Vec::len);
-            println!("  ok   the body is bw serve's envelope, {listed} items");
-            all_held &= listed == 2;
-        }
-        Err(e) => {
-            println!("FAILED an authorised request over HTTP failed: {e}");
-            all_held = false;
-        }
-    }
 
     println!();
     if all_held {
