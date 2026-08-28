@@ -30248,6 +30248,51 @@ mod bw_serve_gate {
             .join("\n")
     }
 
+    /// **The startup door must open its window the way the tray door does**
+    /// -- by spawning a UI process, never by building a frame in this one.
+    ///
+    /// Read over this file's own source, in `bw_serve_gate`'s idiom, because
+    /// the two doors are a thousand lines apart and nothing else compares
+    /// them. The difference was found by reading a running build's log (3
+    /// launches spawned, 32 drew in the daemon) and is asserted here so it
+    /// cannot come back quietly.
+    ///
+    /// # What drawing in the daemon costs, measured
+    ///
+    /// The OpenGL driver is mapped into whichever process draws, and it
+    /// returns its committed arenas only at process exit -- so a daemon that
+    /// draws once holds them until sign-out. On the owner's machine: 98.6 MB
+    /// resident with `nvoglv64.dll` at 41.1 MB, against 35.9 MB for a tray
+    /// that never drew. Reported twice, as "62Mb in tray" and "tray again is
+    /// 50Mb".
+    ///
+    /// It costs a second thing the owner also reported: the tray icon is
+    /// built AFTER this branch returns, and this branch blocks for the whole
+    /// life of the window -- so on this launch there is no tray icon at all
+    /// until the window is closed.
+    #[test]
+    fn the_startup_door_spawns_a_ui_process_like_the_tray_door_does() {
+        let source = code(include_str!("main.rs"));
+        let opener = concat!("if surface == FirstSurface::Show", "TheWindow {");
+        let region = source
+            .split_once(opener)
+            .expect("control: the startup branch must still exist")
+            .1
+            .split_once(concat!("match engine loaded with ", "{} app match(es)"))
+            .expect("control: the startup branch must still be followed by the engine log")
+            .0;
+        assert!(region.len() > 200, "control: the region is empty, so this proves nothing");
+        assert!(
+            !region.contains(concat!("app_window::run_from_", "working")),
+            "the startup door still builds a vault frame in the daemon, which loads the \
+             OpenGL driver into the process that holds the tray for the rest of its life"
+        );
+        assert!(
+            region.contains(concat!("spawn_the_vault_window_in_its_own_", "process")),
+            "the startup door does not spawn a UI process"
+        );
+    }
+
     /// This file, without comments and with normalised line endings.
     fn main_code() -> String {
         code(include_str!("main.rs"))
