@@ -142,6 +142,11 @@ sha1 = "0.10"
 # same family as `sha2`/`aes-gcm`; pulls in `base64ct` and `password-hash`.
 argon2 = "0.5"
 sha2 = "0.10"
+
+# The local vault service's HTTP server. Default features only: no TLS,
+# because it binds loopback and nothing else, and a TLS stack here would be
+# a large dependency defending a hop that never leaves the machine.
+tiny_http = { version = "0.12", default-features = false }
 getrandom = "0.2"
 # Decodes fetched favicons to RGBA (src/favicon.rs); also used by the
 # ui_preview example's --screenshot mode to save the rendered overlay card

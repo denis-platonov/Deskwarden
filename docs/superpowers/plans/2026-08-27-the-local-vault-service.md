@@ -562,7 +562,7 @@ read. **Check `cargo deny` accepts its licence before writing any code**; if
 it does not, hand-rolling HTTP/1.1 for four read-only routes is viable and
 should be costed rather than assumed.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1 (host layer): tests written** in a new `service_host` module
 
 ```rust
 /// Binding anything but loopback would put the vault on the network.
@@ -579,10 +579,13 @@ fn installed_mode_is_one_permanent_attachment() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement** the `--service` arm, reusing `vault_service::attach` / `anyone_attached` / `supervise`. No new lifetime logic.
-- [ ] **Step 4: Run to verify they pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2:** not observed; the loopback pin is guarded by a control instead.
+- [x] **Step 3a: the host layer** -- `listen_addr`, `Mode`, `slots_to_hold`, `status_code_for`, `failed_auth_status`, and a source pin against a configurable bind address.
+- [ ] **Step 3b: the `--service` arm in `main.rs`** -- the request loop, and actually verifying a master password. NOT DONE. `service_host` has no production caller yet.
+- [x] **Step 4: host-layer tests pass.**
+- [x] **Step 5: Commit** the host layer.
+
+**Dependency, resolved:** `tiny_http` 0.12, `default-features = false` (no TLS -- loopback only). Brings `ascii`, `chunked_transfer`, `httpdate`. `cargo deny check licenses advisories` passes with **no change to `deny.toml`**. `job_object`'s byte pin on `Cargo.toml` fired as designed and was re-pinned with the moved dependency named.
 
 ---
 

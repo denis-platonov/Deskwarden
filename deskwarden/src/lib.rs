@@ -114,6 +114,10 @@ pub mod send;
 /// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
 /// API rather than a new one.
 pub mod service_api;
+/// The socket the local vault service owns, and the few decisions that come
+/// with owning one: loopback always, which lifetime it is running under, and
+/// what status each decided answer carries.
+pub mod service_host;
 /// What the local vault service answers with, and what a key is allowed to
 /// see of it. `bw serve`'s envelope, and a list filtered to the asking key
 /// rather than refused outright.
