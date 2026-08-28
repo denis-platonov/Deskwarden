@@ -11556,13 +11556,13 @@ mod tests {
 
     /// The vault every test below serves from: one login and one card, so
     /// that "only what this key may see" is a distinction that can fail.
-    fn a_small_vault() -> (Vec<VaultItem>, Vec<Folder>) {
-        (vec![service_item("login-1", "Example", 1), service_item("card-1", "Bank", 3)], Vec::new())
+    fn a_small_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+        Ok((vec![service_item("login-1", "Example", 1), service_item("card-1", "Bank", 3)], Vec::new()))
     }
 
     /// A vault loader that fails the test if it is ever called. Handed to
     /// every request that must not reach the vault at all.
-    fn no_vault() -> (Vec<VaultItem>, Vec<Folder>) {
+    fn no_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
         panic!("the vault was loaded for a request that was refused before it could read one");
     }
 
@@ -11665,6 +11665,99 @@ mod tests {
     /// exactly what a client sees when a password was WRONG, so a script
     /// would retry, prompt the owner, and eventually have them typing their
     /// master password at something that cannot use it. `501` says the
+    /// A vault loader that fails, standing in for an expired session, a
+    /// server that is down, or a network that is gone.
+    fn unreadable_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+        Err("the session is no longer valid".to_string())
+    }
+
+    /// **A vault that could not be read is not an empty vault.**
+    ///
+    /// This was `unwrap_or_default()`, which answered 200 with zero items
+    /// when the read failed. A backup script writes an empty backup; a
+    /// sync script deletes everything. It is the same mistake the service
+    /// refuses at start-up, made one layer down where that refusal did
+    /// not reach.
+    #[test]
+    fn a_vault_that_cannot_be_read_is_not_served_as_an_empty_one() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/list/object/items",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            unreadable_vault,
+        );
+        assert_eq!(
+            reply.status, 503,
+            "a failed read was reported as success, which a script cannot tell from an empty vault"
+        );
+        assert!(
+            !reply.body.contains("\"data\""),
+            "the failure carried a data envelope a client would parse as a vault: {}",
+            reply.body
+        );
+    }
+
+    /// Control for the test above: the same request against a vault that CAN
+    /// be read is served. Without it, a function that answered 503 always
+    /// would pass.
+    #[test]
+    fn a_readable_vault_is_still_served() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/list/object/items",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"));
+    }
+
+    /// **`/status` is the one route with an answer when the vault cannot
+    /// be read**, and it is the answer a polling script needs.
+    #[test]
+    fn status_reports_locked_when_the_vault_cannot_be_read() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let unreadable =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 1_000, unreadable_vault);
+        assert_eq!(unreadable.status, 200, "a status poll should answer, not fail");
+        assert!(
+            unreadable.body.contains("locked"),
+            "status did not report locked while the vault was unreadable: {}",
+            unreadable.body
+        );
+
+        // The control, and the bug it replaces: `locked` used to be
+        // hard-coded `false`, so this half passed while the half above
+        // could not have.
+        let readable =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(readable.status, 200);
+        assert!(
+            readable.body.contains("unlocked"),
+            "status did not report unlocked while the vault was readable: {}",
+            readable.body
+        );
+    }
+
+    /// A request that is refused must not reach the loader at all, even
+    /// now that the loader can fail: an unauthenticated caller gets 401,
+    /// never 503, because a 503 would confirm the service is there and
+    /// merely unwell.
+    #[test]
+    fn a_refused_request_is_not_told_the_vault_is_unreadable() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", None, &keys, 1_000, unreadable_vault);
+        assert_eq!(reply.status, 401);
+        assert!(reply.body.is_empty());
+    }
+
     /// **A write must not answer 200 with the item.**
     ///
     /// `decide` maps every non-GET method to `Access::Write` and lets a

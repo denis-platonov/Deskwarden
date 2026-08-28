@@ -42,14 +42,14 @@ fn item(id: &str, name: &str, kind: i64, password: &str) -> VaultItem {
     .expect("the fixture must parse as a VaultItem")
 }
 
-fn vault() -> (Vec<VaultItem>, Vec<Folder>) {
-    (
+fn vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+    Ok((
         vec![
             item("login-1", "Example", 1, "hunter2"),
             item("card-1", "Bank", 3, "unused"),
         ],
         Vec::new(),
-    )
+    ))
 }
 
 fn key(name: &str, scopes: Vec<Scope>) -> KeyRecord {
@@ -166,6 +166,25 @@ fn main() {
         all_held &= check("      the write answer", written.status, expected_write, "", &[]);
         println!();
     }
+
+    println!("a vault that cannot be read:");
+    {
+        let keys = vec![key("all", vec![read(Subject::All)])];
+        let unreadable = || Err("the session is no longer valid".to_string());
+        let listed = answer_one_request(
+            "GET", "/list/object/items", Some(&format!("Bearer {KEY}")), &keys, 1_000, unreadable,
+        );
+        // **Never 200 with an empty list.** A script cannot tell that from
+        // an empty account, and would back up nothing or delete everything.
+        all_held &= check("a failed read is 503, not an empty 200", listed.status, 503, &listed.body, &["\"data\""]);
+        let status = answer_one_request(
+            "GET", "/status", Some(&format!("Bearer {KEY}")), &keys, 1_000, unreadable,
+        );
+        all_held &= check("status still answers, and says locked", status.status, 200, "", &[]);
+        all_held &= status.body.contains("locked");
+        println!("      status body: {}", status.body);
+    }
+    println!();
 
     println!("=== now over a real socket ===");
     let keys = vec![key("all", vec![read(Subject::All)])];

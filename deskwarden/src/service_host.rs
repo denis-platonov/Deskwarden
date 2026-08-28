@@ -135,6 +135,23 @@ pub const NO_MASTER_PASSWORD_BODY: &str =
 /// 501 rather than 405: the route exists and the method is one this
 /// service intends to support, which is a different thing from a method
 /// it will never accept.
+/// What a caller is told when the vault cannot be read at all.
+///
+/// 503 rather than 500: this is a service that is temporarily unable to
+/// answer -- an expired session, a server that is down, a network that is
+/// gone -- and a script that retries on 503 and gives up on 500 is doing
+/// the right thing in both cases.
+pub const VAULT_UNREADABLE_BODY: &str =
+    "{\"success\":false,\"message\":\"the vault could not be read; the service is not able to answer right now\"}";
+
+/// The route an answer is for, if it is one that will be served.
+fn route_of_answer(answer: &crate::service_api::Answer) -> Option<&crate::service_api::Route> {
+    match answer {
+        crate::service_api::Answer::Ok { route, .. } => Some(route),
+        _ => None,
+    }
+}
+
 pub const WRITES_NOT_BUILT_BODY: &str =
     "{\"success\":false,\"message\":\"this service does not write yet; the scope model accepts write grants but no write is performed\"}";
 
@@ -171,7 +188,7 @@ pub fn answer_one_request<F>(
     load_vault: F,
 ) -> ServiceReply
 where
-    F: FnOnce() -> (Vec<crate::vault_bridge::VaultItem>, Vec<crate::vault_bridge::Folder>),
+    F: FnOnce() -> Result<(Vec<crate::vault_bridge::VaultItem>, Vec<crate::vault_bridge::Folder>), String>,
 {
     use crate::service_api::Answer;
 
@@ -206,7 +223,37 @@ where
         return ServiceReply { status: 501, body: WRITES_NOT_BUILT_BODY.to_string() };
     }
 
-    let (items, folders) = load_vault();
+    // **A vault that could not be read is not an empty vault.**
+    //
+    // This used to be `unwrap_or_default()`, which turned a failed read
+    // into a successful `200` carrying zero items. A backup script writes
+    // an empty backup; a sync script deletes everything. It is the same
+    // mistake `run_as_the_vault_service` refuses at start-up -- serving an
+    // empty vault a script cannot tell from an empty account -- made one
+    // layer further down, where the refusal did not reach.
+    let vault_data = load_vault();
+
+    // `/status` is the one route that has an answer when the vault cannot
+    // be read, and it is the answer a polling script needs: locked. Every
+    // other route says the service is not able to serve right now.
+    if matches!(route_of_answer(&answer), Some(crate::service_api::Route::Status)) {
+        let locked = vault_data.is_err();
+        return ServiceReply { status: 200, body: crate::service_body::status_body(locked) };
+    }
+
+    let (items, folders) = match vault_data {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            log::error!("the vault could not be read for {method} {url}: {why}");
+            return ServiceReply {
+                status: 503,
+                body: VAULT_UNREADABLE_BODY.to_string(),
+            };
+        }
+    };
+    // `locked: false` is honest here and only here: this line is only
+    // reached when the vault WAS read. `/status` answered above, from
+    // whether that read succeeded.
     let vault = crate::service_body::Vault { items: &items, folders: &folders, locked: false };
 
     match crate::service_body::body_for(&answer, &vault, keys) {
@@ -250,7 +297,11 @@ pub fn serve_the_vault(
             auth.as_deref(),
             keys,
             crate::service_keys::now_unix(),
-            || (backend.list_items().unwrap_or_default(), backend.list_folders().unwrap_or_default()),
+            || {
+                let items = backend.list_items().map_err(|e| format!("{e:?}"))?;
+                let folders = backend.list_folders().map_err(|e| format!("{e:?}"))?;
+                Ok((items, folders))
+            },
         );
 
         let _ = respond(request, reply.status, &reply.body);
