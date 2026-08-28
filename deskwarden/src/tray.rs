@@ -244,10 +244,41 @@ pub struct AppTray {
     accounts: AccountsMenu,
 }
 
+/// The chord this app registers for filling. Spelled here as the tray
+/// shows it; `prefs_ui` has its own copy for the Preferences row, and
+/// `the_tray_and_preferences_agree_on_the_chord` holds the two together.
+pub const FILL_HOTKEY: &str = "CTRL+ALT+B";
+
+/// What the tray says about filling by keyboard.
+///
+/// **Informational, and deliberately not clickable.** Filling targets the
+/// FOREGROUND window, and opening this menu makes the tray the foreground —
+/// so a *Fill* the user could click would either do nothing or fill the
+/// wrong window. The chord works because the target still has focus when it
+/// is pressed, which is exactly what clicking a menu gives up.
+///
+/// It tells the truth about registration rather than always printing the
+/// chord: if another program holds it, a menu promising CTRL+ALT+B would be
+/// a menu lying to somebody whose fill is silently doing nothing — which is
+/// the report that made `hotkey::availability` exist.
+#[must_use]
+pub fn fill_hint(status: &crate::hotkey::HotkeyStatus) -> String {
+    match status {
+        crate::hotkey::HotkeyStatus::Armed => format!("Fill:  {FILL_HOTKEY}"),
+        crate::hotkey::HotkeyStatus::Unavailable(_) => {
+            format!("Fill shortcut ({FILL_HOTKEY}) unavailable")
+        }
+    }
+}
+
 pub fn build_tray() -> AppTray {
     let menu = Menu::new();
     let open_vault = MenuItem::new("Open Vault", true, None);
     let add_app = MenuItem::new("Add app...", true, None);
+    // **Disabled: a label, not a command.** See `fill_hint` for why a
+    // clickable Fill would fill the wrong window. Placed under Add app so
+    // the two things about filling sit together.
+    let fill_hint_item = MenuItem::new(fill_hint(&crate::hotkey::availability()), false, None);
     let sync_item = MenuItem::new("Sync", true, None);
     let quit = MenuItem::new("Quit", true, None);
     // **There is no update item here, and its absence is deliberate.** There
@@ -267,6 +298,7 @@ pub fn build_tray() -> AppTray {
     let accounts_submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
     menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
+    menu.append(&fill_hint_item).unwrap();
     menu.append(&sync_item).unwrap();
     menu.append(&accounts_submenu).unwrap();
     menu.append(&preferences).unwrap();
@@ -562,6 +594,51 @@ fn set_tooltip(tray: &AppTray, text: String) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::hotkey::{HotkeyStatus, Unavailable};
+
+    /// **The chord is worth showing where the user already is.** The owner
+    /// asked for it in the tray -- "so it is always handy" -- because a
+    /// shortcut you have to open Preferences to remember is a shortcut you do
+    /// not use.
+    #[test]
+    fn an_armed_hotkey_is_shown_by_its_chord() {
+        let hint = fill_hint(&HotkeyStatus::Armed);
+        assert!(hint.contains(FILL_HOTKEY), "the tray does not name the chord: {hint}");
+    }
+
+    /// **And an unregistered one says so rather than printing a chord that
+    /// does nothing.** Somebody whose fill silently stops working is the
+    /// report that made `hotkey::availability` exist; a menu that kept
+    /// advertising the chord would hide exactly that.
+    #[test]
+    fn an_unavailable_hotkey_is_not_advertised_as_working() {
+        let hint = fill_hint(&HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram));
+        assert!(
+            hint.to_lowercase().contains("unavailable"),
+            "the tray promises a shortcut that is not registered: {hint}"
+        );
+        // The control: the two states really do differ, so the assertion
+        // above is not passing on a function that returns one string.
+        assert_ne!(hint, fill_hint(&HotkeyStatus::Armed));
+    }
+
+    /// One chord, two places that print it. The tray and Preferences must not
+    /// drift, and a user reading different chords in one app would not know
+    /// which to believe.
+    #[test]
+    fn the_tray_and_preferences_agree_on_the_chord() {
+        let prefs = include_str!("prefs_ui.rs");
+        let declared = prefs
+            .lines()
+            .find(|l| l.trim_start().starts_with("const FILL_HOTKEY"))
+            .expect("control: prefs_ui no longer declares the chord");
+        assert!(
+            declared.contains(FILL_HOTKEY),
+            "the tray and Preferences print different chords: {declared}"
+        );
+    }
+
     use super::*;
     use crate::accounts::Account;
     use tray_icon::menu::ContextMenu;
