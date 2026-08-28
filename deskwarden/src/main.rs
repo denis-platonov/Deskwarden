@@ -9812,34 +9812,91 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
         return 3;
     };
 
-    let key_store = deskwarden::user_key_store::UserKeyStore::new(
-        accounts::user_key_path_for(&config_dir, &account.id),
-    );
-    let Some(authenticated) = key_store.load() else {
-        log::error!(
-            "no stored vault key for this account. The vault service does not ask for a master \
-             password -- it uses the credential the app stores when you sign in, so sign in with \
-             Deskwarden once and start the service again."
-        );
-        return 3;
-    };
+    // **Whichever backend this account is actually configured for.**
+    //
+    // The service serves `bw serve`'s API, and `serve_the_vault` holds a
+    // `&dyn VaultBackend` -- it has no idea which implementation is behind
+    // it, and neither does the consumer. So who DECRYPTS is a setting, not
+    // a property of this service:
+    //
+    //     bw decrypts      server -> bw -> us -> consumer
+    //     we decrypt       server -> us -> consumer
+    //
+    // An earlier version hard-coded the direct-REST backend and refused to
+    // start without a stored vault key. That was not a requirement of
+    // anything here; it was the first backend wired, mistaken for the only
+    // one. It also made the service unreachable for every owner on the
+    // default backend -- the ones who would most benefit, since `bw serve`
+    // has no authentication at all and this puts scoped, expiring keys in
+    // front of it.
+    let inner: std::sync::Arc<dyn deskwarden::vault_backend::VaultBackend> =
+        match backend_policy::selected() {
+            backend_policy::VaultBackendChoice::DirectRest => {
+                let key_store = deskwarden::user_key_store::UserKeyStore::new(
+                    accounts::user_key_path_for(&config_dir, &account.id),
+                );
+                let Some(authenticated) = key_store.load() else {
+                    log::error!(
+                        "this account is served by the built-in client, but no vault key is \
+                         stored for it. The service never asks for a master password -- it uses \
+                         the credential the app saves when you sign in, so sign in with \
+                         Deskwarden once and start the service again."
+                    );
+                    return 3;
+                };
+                // No default URL: `backend_policy` is explicit that direct
+                // REST needs a self-hosted server, and inventing one would
+                // point this at somebody else's on an account that never
+                // asked for it.
+                let Some(server_url) = account.server_url.clone() else {
+                    log::error!(
+                        "this account is served by the built-in client but has no server URL, \
+                         so there is nothing for the service to talk to"
+                    );
+                    return 3;
+                };
+                std::sync::Arc::new(rest::backend::RestBackend::new(
+                    rest::api::RestClient::new(server_url),
+                    authenticated,
+                ))
+            }
+            backend_policy::VaultBackendChoice::BwServe => {
+                // **This service does not start `bw serve`, and does not
+                // stop it.** The daemon owns that child and its job object.
+                // If it is not up, reads fail and the loop answers 503 --
+                // which is the honest answer, and is what `/status`
+                // reports as locked. Starting one here would put a second
+                // owner on the same port, which is the state
+                // `backend_policy`'s twelve entry points exist to prevent.
+                log::info!(
+                    "serving the vault over bw serve at {BW_SERVE_URL}; this service does \
+                     not start or stop it"
+                );
+                std::sync::Arc::new(VaultBridge::new(BW_SERVE_URL))
+            }
+        };
 
-    // No default. `backend_policy` is explicit that direct REST needs both
-    // halves -- a server URL and a stored key -- and inventing a URL here
-    // would point this service at somebody else's server on behalf of an
-    // account that never asked for one.
-    let Some(server_url) = account.server_url.clone() else {
-        log::error!(
-            "this account has no self-hosted server URL, so the vault service has nothing to \
-             talk to. The service serves the direct-REST backend only."
-        );
-        return 3;
-    };
-    let backend = rest::backend::RestBackend::new(
-        rest::api::RestClient::new(server_url),
-        authenticated,
+    // **And whether reads go through the encrypted cache**, which is the
+    // other axis and is orthogonal to the first: `CachingBackend` decorates
+    // `Arc<dyn VaultBackend>`, so it wraps either implementation. Between
+    // the two settings there are four shapes, and a consumer cannot tell
+    // them apart -- that is the whole reason this speaks `bw serve`'s API
+    // rather than one of its own.
+    let read_path = backend_policy::read_path(
+        settings.cache_vault_to_disk,
+        settings.read_through_cache,
     );
-
+    let backend: std::sync::Arc<dyn deskwarden::vault_backend::VaultBackend> = match read_path {
+        backend_policy::ReadPath::CacheFirst => {
+            let disk = std::sync::Arc::new(deskwarden::vault_disk_cache::DiskCache::new(
+                &accounts::data_dir_for(&config_dir, &account.id),
+                deskwarden::vault_disk_cache::DiskCacheEnv::production(),
+            ));
+            log::info!("reads are answered from the encrypted cache first");
+            std::sync::Arc::new(deskwarden::vault_backend::CachingBackend::new(inner, disk))
+        }
+        backend_policy::ReadPath::ServiceOnly => inner,
+    };
     // **Default deny is what makes this safe to start.** No key file means no
     // key, and every request is answered `401` -- the service is unreachable
     // until the owner deliberately mints one.
@@ -9870,7 +9927,7 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
     let port = server.server_addr().to_ip().map_or(0, |a| a.port());
     log::info!("the vault service is listening on 127.0.0.1:{port} in {mode:?} mode");
 
-    deskwarden::service_host::serve_the_vault(&server, &backend, &keys);
+    deskwarden::service_host::serve_the_vault(&server, backend.as_ref(), &keys);
     0
 }
 
