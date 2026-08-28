@@ -10,6 +10,62 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.12.0 - 2026-08-28
+
+### Your own scripts can read the vault, over a local API
+
+Deskwarden can now answer HTTP on `127.0.0.1` so a program you write can
+read your vault — a backup script, a deploy step, anything that needs a
+password without a human typing it.
+
+It speaks the **same API `bw serve` does**, so anything already written
+against that keeps working with one change: it must send a key.
+`bw serve` asks for no credential at all, and this does.
+
+**It is off by default**, and while it is on it serves decrypted vault
+items to any program on this PC holding a key. Turn it on under
+**Preferences → Local API**, where you also mint keys.
+
+Each key has a name, an optional expiry, and a scope: everything, one
+category, or a single item — read, write, or both. A key is shown **once**
+when you make it and never stored: the file keeps only a hash, so a copy
+of it grants nobody anything. An empty scope grants nothing at all.
+
+Start it with `deskwarden.exe --service`, or `--service installed` for a
+service that stays up whether or not the app is open.
+
+**Not built yet, and answered honestly rather than silently:** writes are
+refused with `501` — the scope model accepts write grants, but no write is
+performed. Signing in with a master password over the API is also `501`;
+the service uses the credential the app already stores when you sign in,
+and never asks for a master password itself.
+
+### Settings about the vault are on one page, and the API has its own
+
+**Preferences → Vault** now carries everything that decides how Deskwarden
+reaches your vault: whether the `bw` CLI or Deskwarden's own client does
+the decryption, whether the backend stays running, and the encrypted copy
+on this PC. Those were spread over two pages.
+
+Switching between `bw` and the built-in client now **asks first**, and says
+what it costs: a restart and a fresh sign-in, plus — when switching back to
+`bw` — that the stored vault key is deleted from this PC.
+
+### Fixed: save-memory mode could stop the vault window loading
+
+With **Keep the backend running** turned off, opening the vault could sit
+for a minute and then show *Your vault could not be loaded* with nothing in
+it. The backend was stopped whenever nothing needed it, and opening a
+window did not count as needing it.
+
+It does now, in both directions: opening the vault starts the backend, and
+it is no longer stopped while a window is open.
+
+This was worth fixing quickly because it was self-trapping — the switch for
+that setting lives inside the window that would not load, so there was no
+way back through the app.
+
+
 ## 0.11.1 - 2026-08-26
 
 0.11.0 was tagged and never released: its build failed on three tests, so no
