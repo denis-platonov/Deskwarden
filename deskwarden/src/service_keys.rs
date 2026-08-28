@@ -129,6 +129,46 @@ pub fn session_record(now_unix: u64, random: fn() -> [u8; 32]) -> (KeyRecord, St
     (record, secret)
 }
 
+/// The key file, or an empty list.
+///
+/// **An unreadable or malformed file reads as no keys**, which is the same
+/// direction every other decision here falls: a corrupt key store must not
+/// be a key store that grants anything. It is logged, because silently
+/// having no keys and silently having a broken file look identical from the
+/// outside and only one of them is the owner's doing.
+#[must_use]
+pub fn load(path: &std::path::Path) -> Vec<KeyRecord> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // Absent is the ordinary case before any key is minted, and is not
+        // worth a warning.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            log::error!("the API key file could not be read ({e}); treating it as empty");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(records) => records,
+        Err(e) => {
+            log::error!("the API key file could not be parsed ({e}); treating it as empty");
+            Vec::new()
+        }
+    }
+}
+
+/// The wall clock as a Unix timestamp, for the one caller that has to ask.
+///
+/// Everything in this module takes `now_unix` as a parameter so that expiry
+/// is testable without waiting; this is the single place the real clock is
+/// read, and it lives here so that the request loop does not grow its own.
+#[must_use]
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// `SHA-256(key)`, hex. See the module doc for why this is not a slow KDF.
 #[must_use]
 pub fn hash_key(key: &str) -> String {

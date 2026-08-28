@@ -9692,54 +9692,185 @@ fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
 /// with, and a UI process that authenticated would hand the daemon a backend
 /// it did not start and a token it does not know about. Moving the sign-in
 /// flow across is Task 7 of the plan and is not done here.
-/// **The local vault service.** Binds a loopback port, answers
-/// `bw serve`'s API, and exits when nobody is attached.
+/// **The local vault service.** Binds a loopback port, answers `bw serve`'s
+/// API, and serves only what the presented key is scoped to.
 ///
 /// Returns the exit code rather than calling `exit`, exactly as
 /// [`run_as_a_ui_process`] does and for its reason: every arm of `main`'s
-/// branch ends the process on one line, and nothing here can be mistaken
-/// for a path that continues into the daemon's startup.
+/// branch ends the process on one line, and nothing here can be mistaken for
+/// a path that continues into the daemon's startup.
 ///
-/// # What is deliberately missing, and why the service refuses to start
-/// without it
+/// # It does not ask for a master password, and that is the point
 ///
-/// **There is no vault yet.** Unlocking one means taking a master password
-/// on `POST /auth`, deriving the account key and standing up a
-/// [`deskwarden::rest::backend::RestBackend`] behind the encrypted cache --
-/// the first code in this feature that touches real secrets, and its own
-/// task.
+/// The daemon already stores a DPAPI-wrapped [`rest::api::Authenticated`] per
+/// account, and this loads the same one. So the service needs no new
+/// cryptography, no second copy of the login flow, and no way to take a
+/// master password at all -- the credential it uses is one the owner already
+/// created by signing in, unwrappable only under their Windows account.
 ///
-/// Until then this refuses to start rather than serving an empty vault.
-/// An empty vault is indistinguishable from a vault with nothing in it: a
-/// script would read a successful, well-formed, EMPTY answer and conclude
-/// the owner has no logins. Refusing is the only answer that cannot be
-/// mistaken for data.
+/// **If there is no stored key it refuses to start**, rather than standing up
+/// an endpoint that answers every request with an error. A service that is
+/// listening but cannot read the vault is a thing scripts retry against; one
+/// that never started is a thing the owner fixes.
 ///
-/// # Nothing can reach it in any case
+/// # Every request re-reads the vault
 ///
-/// No key can exist yet -- the Preferences screen that mints one is a
-/// later task -- so every request would be answered
-/// [`deskwarden::service_api::Answer::Unauthenticated`] even if this did
-/// bind. That is the design working, not a gap: default deny means the
-/// service is unreachable until the owner deliberately makes it reachable.
+/// Deliberate, and the slow-but-correct choice on purpose: a snapshot held
+/// here would go stale against edits made in the app, and this process is
+/// answering a script rather than a keystroke. `CachingBackend` is the place
+/// that decision gets revisited, not this loop.
 fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
-    // No log file exists yet in this process -- `logging::init` belongs to
-    // the daemon's startup, which this branch never reaches -- so this
-    // opens one itself before saying anything, exactly as
-    // `refuse_a_ui_launch` does. Best-effort: a refusal that could not be
-    // logged is still a refusal.
-    if let Some(config_dir) = settings::config_dir() {
-        let _ = logging::init(&config_dir);
-    }
-    log::error!(
-        "the vault service was asked to start in {mode:?} mode, but it has no way to open a \
-         vault yet: `POST /auth` and the backend behind it are not built. Refusing to start \
-         rather than serving an empty vault, which a script cannot tell from an empty account."
+    // No log file exists yet in this process -- `logging::init` belongs to the
+    // daemon's startup, which this branch never reaches -- so this opens one
+    // itself before saying anything, exactly as `refuse_a_ui_launch` does.
+    let Some(config_dir) = settings::config_dir() else {
+        return 3;
+    };
+    let _ = logging::init(&config_dir);
+
+    let settings = settings::Settings::load(&config_dir.join("settings.json"));
+    let Some(active) = settings.active_account.as_ref() else {
+        log::error!("the vault service has no active account to serve; sign in with Deskwarden first");
+        return 3;
+    };
+    let Some(account) = accounts::account_for(&settings.accounts, active) else {
+        log::error!("the active account is not in the account list; refusing to guess which one to serve");
+        return 3;
+    };
+
+    let key_store = deskwarden::user_key_store::UserKeyStore::new(
+        accounts::user_key_path_for(&config_dir, &account.id),
     );
-    // 3, and not 2: 2 is `refuse_a_ui_launch`'s "this command line is
-    // wrong". This command line is right and the feature is unfinished,
-    // which is a different thing to be told.
-    3
+    let Some(authenticated) = key_store.load() else {
+        log::error!(
+            "no stored vault key for this account. The vault service does not ask for a master \
+             password -- it uses the credential the app stores when you sign in, so sign in with \
+             Deskwarden once and start the service again."
+        );
+        return 3;
+    };
+
+    // No default. `backend_policy` is explicit that direct REST needs both
+    // halves -- a server URL and a stored key -- and inventing a URL here
+    // would point this service at somebody else's server on behalf of an
+    // account that never asked for one.
+    let Some(server_url) = account.server_url.clone() else {
+        log::error!(
+            "this account has no self-hosted server URL, so the vault service has nothing to \
+             talk to. The service serves the direct-REST backend only."
+        );
+        return 3;
+    };
+    let backend = rest::backend::RestBackend::new(
+        rest::api::RestClient::new(server_url),
+        authenticated,
+    );
+
+    // **Default deny is what makes this safe to start.** No key file means no
+    // key, and every request is answered `401` -- the service is unreachable
+    // until the owner deliberately mints one.
+    let keys = deskwarden::service_keys::load(&service_keys_path(&config_dir));
+    if keys.is_empty() {
+        log::warn!(
+            "the vault service is running with no API keys, so every request will be refused. \
+             Mint one in Preferences to make it reachable."
+        );
+    }
+
+    // A slot only in the installed lifetime. The consumer-driven one is
+    // counted by the apps that asked for it, which is the whole difference
+    // between the two -- see `service_host::slots_to_hold`.
+    let env = deskwarden::vault_service::windows_env();
+    let _slot = (deskwarden::service_host::slots_to_hold(mode) > 0)
+        .then(|| deskwarden::vault_service::attach(&env))
+        .flatten();
+
+    let addr = deskwarden::service_host::listen_addr(0);
+    let server = match tiny_http::Server::http(addr) {
+        Ok(server) => server,
+        Err(e) => {
+            log::error!("the vault service could not listen on {addr}: {e}");
+            return 3;
+        }
+    };
+    let port = server.server_addr().to_ip().map_or(0, |a| a.port());
+    log::info!("the vault service is listening on 127.0.0.1:{port} in {mode:?} mode");
+
+    serve_the_vault(&server, &backend, &keys);
+    0
+}
+
+/// Where the API keys live. Beside `settings.json`, in the directory this app
+/// already owns.
+fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("service-keys.json")
+}
+
+/// The request loop.
+///
+/// Split out from [`run_as_the_vault_service`] so that everything above it is
+/// start-up that happens once, and this is the part that repeats. It holds no
+/// decision of its own: [`deskwarden::service_api::decide`] says who may, and
+/// [`deskwarden::service_body::body_for`] says what they get.
+fn serve_the_vault(
+    server: &tiny_http::Server,
+    backend: &dyn deskwarden::vault_backend::VaultBackend,
+    keys: &[deskwarden::service_keys::KeyRecord],
+) {
+    for request in server.incoming_requests() {
+        let method = request.method().as_str().to_string();
+        let url = request.url().to_string();
+        // Read once, and never logged: an `Authorization` header IS the
+        // credential.
+        let auth = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .map(|header| header.value.as_str().to_string());
+
+        let now = deskwarden::service_keys::now_unix();
+        let answer = deskwarden::service_api::decide(&method, &url, auth.as_deref(), keys, now);
+
+        // The path is logged and the credential is not. A refused request is
+        // worth seeing; the value that was refused is not worth storing.
+        log::debug!("{method} {url} -> {answer:?}");
+
+        let status = deskwarden::service_host::status_code_for(&answer);
+        let body = match &answer {
+            // Not built yet, and answered honestly rather than with a shape
+            // that looks like a failed password. The service has no way to
+            // take one -- see this module's doc.
+            deskwarden::service_api::Answer::Authenticate => {
+                let _ = respond(request, 501, "{\"success\":false,\"message\":\"this service does not take a master password; use an API key\"}");
+                continue;
+            }
+            _ => {
+                let items = backend.list_items().unwrap_or_default();
+                let folders = backend.list_folders().unwrap_or_default();
+                let vault = deskwarden::service_body::Vault {
+                    items: &items,
+                    folders: &folders,
+                    locked: false,
+                };
+                deskwarden::service_body::body_for(&answer, &vault, keys)
+            }
+        };
+
+        // **No body for a refusal**, which `body_for` already decided; this
+        // only has to not invent one.
+        let _ = respond(request, status, body.as_deref().unwrap_or(""));
+    }
+}
+
+/// One reply, as JSON.
+fn respond(request: tiny_http::Request, status: u16, body: &str) -> std::io::Result<()> {
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("a literal header that cannot fail to parse");
+    request.respond(
+        tiny_http::Response::from_string(body.to_string())
+            .with_status_code(status)
+            .with_header(header),
+    )
 }
 
 fn run_as_a_ui_process(surface: Surface) -> i32 {
