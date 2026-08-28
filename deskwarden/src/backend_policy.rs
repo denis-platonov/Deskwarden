@@ -38,10 +38,30 @@
 /// `true` there must not be able to start one. It is the same answer
 /// [`bw_serve_is_selected`] gives the eleven entry points that start the
 /// backend; this is the twelfth-and-a-half, the one that stops it.
-pub fn should_run(choice: VaultBackendChoice, keep_backend_running: bool) -> bool {
+pub fn should_run(
+    choice: VaultBackendChoice,
+    keep_backend_running: bool,
+    a_vault_window_is_open: bool,
+) -> bool {
     match choice {
         VaultBackendChoice::DirectRest => false,
-        VaultBackendChoice::BwServe => keep_backend_running,
+        // **The third input, and it was missing.** `settings.rs` describes
+        // this setting as: `false` "runs it only while the vault window is
+        // open". That clause had no implementation -- this function was
+        // never told whether a window was open, so save-memory mode stopped
+        // the backend unconditionally, including one second after starting
+        // it for a window that had just been asked for.
+        //
+        // Measured, from the owner's machine:
+        //
+        //     14:01:08  the vault window needs bw serve; starting it
+        //     14:01:18  bw serve started for the vault window
+        //     14:01:18  save-memory mode: nothing needs bw serve; stopping it
+        //     14:02:10  vault load settled -- 0 items on screen, gave up
+        //
+        // A promise in a doc comment is not a behaviour. This is the line
+        // that makes the sentence true.
+        VaultBackendChoice::BwServe => keep_backend_running || a_vault_window_is_open,
     }
 }
 
@@ -569,12 +589,12 @@ mod tests {
 
     #[test]
     fn keeping_it_running_says_yes() {
-        assert!(should_run(VaultBackendChoice::BwServe, true));
+        assert!(should_run(VaultBackendChoice::BwServe, true, false));
     }
 
     #[test]
     fn saving_memory_says_no_at_idle() {
-        assert!(!should_run(VaultBackendChoice::BwServe, false));
+        assert!(!should_run(VaultBackendChoice::BwServe, false, false));
     }
 
     /// The arm this parameter was added for: an account served over direct
@@ -582,8 +602,30 @@ mod tests {
     /// subprocess that does not exist -- cannot conjure one.
     #[test]
     fn direct_rest_never_runs_the_backend_however_the_setting_is_set() {
-        assert!(!should_run(VaultBackendChoice::DirectRest, true));
-        assert!(!should_run(VaultBackendChoice::DirectRest, false));
+        assert!(!should_run(VaultBackendChoice::DirectRest, true, false));
+        assert!(!should_run(VaultBackendChoice::DirectRest, false, false));
+    }
+
+    /// **Save-memory mode keeps the backend while a window is open**, which
+    /// is what the setting's own documentation has always claimed and what
+    /// nothing implemented: the third input did not exist, so a window that
+    /// had just asked for `bw serve` watched it be stopped one second later
+    /// and then timed out with an empty vault.
+    #[test]
+    fn save_memory_mode_keeps_the_backend_while_the_vault_window_is_open() {
+        assert!(should_run(VaultBackendChoice::BwServe, false, true));
+        // The control, and the whole point of the mode: with no window
+        // open it still stops.
+        assert!(!should_run(VaultBackendChoice::BwServe, false, false));
+    }
+
+    /// A direct-REST account has no `bw serve` to keep, window or not.
+    /// Without this, the arm above could be written as a blanket
+    /// "a window means keep it" and start a backend that account never has.
+    #[test]
+    fn an_open_window_does_not_conjure_a_backend_for_direct_rest() {
+        assert!(!should_run(VaultBackendChoice::DirectRest, false, true));
+        assert!(!should_run(VaultBackendChoice::DirectRest, true, true));
     }
 
     // ---- is_self_hosted ----------------------------------------------------

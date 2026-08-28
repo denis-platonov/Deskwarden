@@ -1974,7 +1974,9 @@ fn main() {
     // vault window opening, the tray's Sync item, another lock) restarts it
     // only for as long as it is actually needed and reconciles again
     // afterwards -- see `stop_backend_if_idle` and the main loop below.
-    stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
+    // `false`: this runs before the loop, and any startup window has
+    // already closed by the time it does.
+    stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running, false);
 
     // The tray icon and the global hotkey manager each create a hidden
     // Win32 window on the thread that builds them (here, the main thread)
@@ -3261,7 +3263,14 @@ fn main() {
         // (startup, `open_vault_window`, the tray's Sync item) each ask for
         // it explicitly and this only ever tears it back down afterwards.
         if estate.task_in_progress.is_none() {
-            stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
+            stop_backend_if_idle(
+                &mut estate.child,
+                estate.settings.keep_backend_running,
+                // **The input that was missing.** Without it this stopped
+                // `bw serve` out from under a window that had just asked
+                // for it, one second after it came up.
+                ui_windows.vault_pid().is_some(),
+            );
         }
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
@@ -8474,8 +8483,16 @@ fn backend_is_running(child: &mut Option<Child>) -> bool {
 /// backend -- startup, `open_vault_window`, and the tray's Sync item -- each
 /// ask for it explicitly instead; this function only ever tears it back
 /// down again afterwards once the policy says it's no longer needed.
-fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running: bool) {
-    if backend_policy::should_run(backend_policy::selected(), keep_backend_running) {
+fn stop_backend_if_idle(
+    bw_serve_child: &mut Option<Child>,
+    keep_backend_running: bool,
+    a_vault_window_is_open: bool,
+) {
+    if backend_policy::should_run(
+        backend_policy::selected(),
+        keep_backend_running,
+        a_vault_window_is_open,
+    ) {
         return;
     }
     if backend_is_running(bw_serve_child) {
@@ -9854,7 +9871,7 @@ fn service_start_refusal(enabled: bool) -> Option<&'static str> {
     // default, so this is the line most owners meet first.
     Some(
         "the vault service is switched off, so it will not start. Nothing was bound and no \
-         vault key was read. Turn it on in Deskwarden's Preferences, under Vault service -- it \
+         vault key was read. Turn it on in Deskwarden's Preferences, under Vault -- it \
          is off by default, \
          and while it is on it serves decrypted vault items to any program on this machine \
          holding an API key -- then start the service again.",
@@ -12976,10 +12993,28 @@ mod tests {
         assert!(!backend_is_running(&mut child));
     }
 
+    /// **The defect, end to end.** Save-memory mode stopped `bw serve` one
+    /// second after starting it for a window that had just asked, because
+    /// the stopper was never told a window was open. Measured on the owner's
+    /// machine: started 14:01:18, stopped 14:01:18, window gave up at
+    /// 14:02:10 with zero items.
+    #[test]
+    fn a_backend_is_not_stopped_out_from_under_an_open_vault_window() {
+        let mut child = Some(long_lived_command().spawn().unwrap());
+        stop_backend_if_idle(&mut child, false, true);
+        assert!(
+            backend_is_running(&mut child),
+            "save-memory mode stopped the backend while the vault window was open"
+        );
+        // The control, and the whole point of the mode: once the window is
+        // gone it is stopped as before.
+        stop_backend_if_idle(&mut child, false, false);
+        assert!(!backend_is_running(&mut child));
+    }
     #[test]
     fn stop_backend_if_idle_leaves_a_running_backend_alone_when_keeping_it() {
         let mut child = Some(long_lived_command().spawn().unwrap());
-        stop_backend_if_idle(&mut child, true);
+        stop_backend_if_idle(&mut child, true, false);
         assert!(
             backend_is_running(&mut child),
             "keep_backend_running = true must never stop the backend"
@@ -12993,7 +13028,7 @@ mod tests {
         // `keep_backend_running = false`, idle reconciliation must actually
         // tear the backend down rather than leaving it running forever.
         let mut child = Some(long_lived_command().spawn().unwrap());
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(
             child.is_none(),
             "save-memory mode must stop bw serve once nothing needs it"
@@ -13003,7 +13038,7 @@ mod tests {
     #[test]
     fn stop_backend_if_idle_is_a_no_op_with_nothing_running() {
         let mut child: Option<Child> = None;
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(child.is_none());
     }
 
@@ -13016,7 +13051,7 @@ mod tests {
         let _ = c.wait();
         let mut child = Some(c);
 
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(child.is_none());
     }
 

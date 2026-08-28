@@ -165,11 +165,29 @@ fn backend_description(bw_selected: bool) -> &'static str {
     }
 }
 
-/// The direct-REST opt-out's label.
+/// The backend choice's label.
 ///
 /// The owner's own words for the setting, kept as they were written. It names
 /// `bw` because that is what the row is about and what the user will see in
 /// Task Manager; the description is where the trade is spelled out.
+///
+/// # Which way round it is, said once and never restated
+///
+/// **On means `bw`.** The field behind this row is
+/// `Settings::use_official_bw_crypto`, it defaults to `true`, and `true` is
+/// the official CLI -- so the pill is on when this app is doing what it has
+/// always done, and off is the opt-in to the built-in client. The label reads
+/// that way on purpose ("use official bw" is true when the pill is on) and
+/// [`official_crypto_description`] opens by naming both states rather than
+/// leaving the reader to infer the second from the first.
+///
+/// That is worth this much prose because the inversion is invisible: a row
+/// wired to `!use_official_bw_crypto` paints, clicks and persists perfectly,
+/// and the only symptom is that a fresh install of the default configuration
+/// shows the pill off, or that a user who thinks they have turned `bw` on has
+/// turned it off. `the_backend_row_is_on_when_bw_is_the_backend` pins it
+/// against [`crate::backend_policy::choose`] rather than against the field,
+/// so an inversion anywhere between the pill and the decision fails.
 const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
 
 /// The description shown under the [`OFFICIAL_CRYPTO_LABEL`] toggle, in its
@@ -200,14 +218,17 @@ const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
 ///    reason: a ghosted control with no explanation reads as a bug.
 fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "On, Deskwarden's vault goes through the official Bitwarden CLI, which holds your keys \
-         in a background process of its own.\n\n\
-         Off is much lighter and faster — Deskwarden talks to your server itself, so no \
-         background process keeps running (the Bitwarden CLI is still used to sign in) — but \
+        "On (the default), Deskwarden's vault goes through the official Bitwarden CLI — the \
+         `bw` program — which holds your keys in a background process of its own.\n\n\
+         Off is much lighter and faster — Deskwarden's built-in client talks to your server \
+         itself, so no background process keeps running (the Bitwarden CLI is still used to \
+         sign in) — but \
          in that case your passwords are stored in the app: the \
          key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
          session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
-         Changing this takes effect the next time Deskwarden starts."
+         Changing this takes effect the next time Deskwarden starts, and either direction \
+         asks you to sign in again. Turning it back on also deletes the stored vault key from \
+         this PC, so nothing is left behind by the switch."
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -247,6 +268,21 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
         _ => false,
     }
 }
+
+/// The row Sync & account keeps where the backend switch used to be.
+///
+/// **A signpost, not a setting.** The switch moved to [`Section::Vault`] and
+/// a user who last saw it here will look here first; a page that simply
+/// stopped mentioning it reads as a page from which the setting was removed.
+const SYNC_MOVED_LABEL: &str = "Which backend holds this vault";
+
+/// [`SYNC_MOVED_LABEL`]'s sentence.
+///
+/// Names the page in the words the nav uses, and a test pins that it really
+/// is [`Section::Vault`]'s label -- otherwise a rename leaves this pointing
+/// at a page nobody can find. It also names what else is over there, because
+/// "it moved" without "and so did these" sends a user on a second trip.
+const SYNC_MOVED_NOTE: &str = "That switch is on the Vault page now, beside the encrypted copy      on this PC and the local vault service -- they decide one thing between them, so they are      read together.";
 
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
@@ -848,22 +884,38 @@ pub enum Section {
     Autofill,
     NativeApps,
     Security,
-    /// **The local vault service, and the API keys that reach it.**
+    /// **Everything about where this vault lives and who may reach it.**
     ///
-    /// [`Section::Breaches`]'s argument, on the one page in this window whose
-    /// switch opens a door into the vault. The toggle that starts an HTTP
-    /// endpoint serving decrypted items, the keys that are the whole
-    /// credential for it, and the revoke button have to be in one glance: a
-    /// switch on one page and the list of who can walk through it on another
-    /// is an arrangement where the owner can believe they turned something
-    /// off while three keys still exist for it.
+    /// [`Section::Breaches`]'s argument, taken to its end on the one subject
+    /// where the pages had actually scattered. This page now carries all of
+    /// it: which backend holds the vault (the official `bw` CLI or
+    /// Deskwarden's built-in client), whether that backend is kept warm,
+    /// whether an encrypted copy is kept on this PC and whether reads consult
+    /// it, and the local endpoint plus the API keys that open it.
+    ///
+    /// # Why they were gathered, and it is not tidiness
+    ///
+    /// The owner walked into a self-trapping state: with
+    /// `keep_backend_running` off the vault window failed to load, and
+    /// Preferences is a page *inside* that window -- so the only switch that
+    /// could undo it was behind the thing it had broken. That was reachable
+    /// because the settings that decide how the vault is served were on three
+    /// different pages, each placement individually defensible. Seen
+    /// together they are one decision with several parts, and a reader who
+    /// can see all of them at once can see what they have just done to
+    /// themselves.
+    ///
+    /// The service half's own argument is unchanged and still holds: a switch
+    /// on one page and the list of who can walk through the door it opens on
+    /// another is an arrangement where the owner can believe they turned
+    /// something off while three keys still exist for it.
     ///
     /// **Directly after Security**, which is the page a reader looking for
     /// "what can reach my vault" reaches first, and where they would
     /// otherwise expect to find this. It is not ON Security, because that is
     /// a [`draw_not_yet`] page about what is asked before a secret is
     /// revealed, and this is about a caller that is never asked at all.
-    VaultService,
+    Vault,
     Clipboard,
     Shortcuts,
     SyncAndAccount,
@@ -901,7 +953,7 @@ impl Section {
         Section::Autofill,
         Section::NativeApps,
         Section::Security,
-        Section::VaultService,
+        Section::Vault,
         Section::Clipboard,
         Section::Shortcuts,
         Section::SyncAndAccount,
@@ -918,7 +970,7 @@ impl Section {
             Section::Autofill => "Autofill",
             Section::NativeApps => "Native apps",
             Section::Security => "Security",
-            Section::VaultService => "Vault service",
+            Section::Vault => "Vault",
             Section::Clipboard => "Clipboard",
             Section::Shortcuts => "Shortcuts",
             Section::SyncAndAccount => "Sync & account",
@@ -941,11 +993,14 @@ impl Section {
             }
             Section::NativeApps => "The applications Deskwarden fills credentials into.",
             Section::Security => "What Deskwarden asks for before it reveals or fills a secret.",
-            // Both halves, and the endpoint first: the keys mean nothing
-            // while nothing is listening, and a reader who has not grasped
-            // that there IS an endpoint cannot weigh the keys.
-            Section::VaultService => {
-                "The local endpoint that hands this vault to other programs on this PC, and                  the keys that open it."
+            // Every part, in the order the page draws them: where the vault
+            // is served FROM, then what is kept on this PC, then who else may
+            // ask for it. The endpoint still comes before the keys, for the
+            // reason it always did -- the keys mean nothing while nothing is
+            // listening, and a reader who has not grasped that there IS an
+            // endpoint cannot weigh them.
+            Section::Vault => {
+                "Which backend holds this vault, what is kept on this PC, and the local                  endpoint that hands it to other programs."
             }
             // Says *taken back*, not "cleared", and names the copy rather than
             // the clipboard: the page is about the second half of
@@ -1738,12 +1793,12 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             ui,
             "Auto-lock is on the General page. Nothing else here is configurable yet.",
         ),
-        Section::VaultService => draw_vault_service(ui, state),
+        Section::Vault => draw_vault(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
         // The one read of the published status -- see `hotkey::availability`, and
         // `draw_shortcuts` for why it is a parameter from here down.
         Section::Shortcuts => draw_shortcuts(ui, crate::hotkey::availability()),
-        Section::SyncAndAccount => draw_sync_and_account(ui, state),
+        Section::SyncAndAccount => draw_sync_and_account(ui),
         Section::Updates => draw_updates(ui, state),
         Section::About => draw_about(ui, state),
     }
@@ -1902,46 +1957,22 @@ fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
 fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         // **The backend row is not here any more.** It moved, whole, to
-        // `Section::SyncAndAccount`, where it is now a CHILD of the switch
-        // that decides whether `bw serve` is used at all -- see
-        // [`backend_description`] for why a live-looking switch two pages
-        // from the thing that makes it meaningless was a defect and not
-        // merely an untidiness. The same argument the breach row's move
+        // `Section::Vault` (by way of `Section::SyncAndAccount`), where it is
+        // a CHILD of the switch that decides whether `bw serve` is used at
+        // all -- see [`backend_description`] for why a live-looking switch
+        // two pages from the thing that makes it meaningless was a defect and
+        // not merely an untidiness. The same argument the breach row's move
         // makes below, one subsystem later.
         //
-        // Directly under it used to be the disk-cache row, and that pairing
-        // still holds: the backend row decided how much the app pays to keep
-        // `bw serve` warm, and this one is how it stops needing `bw serve`
-        // warm at all. The spec put it here rather than on
-        // `Section::Security` -- which did not exist when it was written and
-        // is still a placeholder -- and it is the one setting on this page
-        // that changes what is written to the user's disk.
+        // **The disk-cache pair is not here any more either**, and it left
+        // for the third time this comment has had to be written: to sit
+        // beside the thing that governs it. `cache_vault_to_disk` and its
+        // child `read_through_cache` are now on `Section::Vault`, in the same
+        // card as the backend rows -- see that section's own doc for the
+        // self-trapping bug that gathering them was a response to. The
+        // pairing this comment used to describe (the backend row above, the
+        // disk cache below) is intact; both halves simply moved together.
         //
-        // `child_toggle_row` rather than a bespoke unavailable block: with no
-        // Windows Hello the row is ghosted and its description says why,
-        // readable without hovering, and the returned value is the stored one
-        // unchanged so a stray click cannot enable machinery that has no key
-        // to run on.
-        let hello_available = (state.hello_available)();
-        state.settings.cache_vault_to_disk = child_toggle_row(
-            ui,
-            DISK_CACHE_LABEL,
-            disk_cache_description(hello_available),
-            state.settings.cache_vault_to_disk,
-            hello_available,
-        );
-        row_separator(ui);
-        // The child of the row above: with no copy permitted there is nothing
-        // to read. Ghosted rather than hidden, for `child_toggle_row`'s usual
-        // reason -- a row that vanishes is a row a user cannot find out about.
-        state.settings.read_through_cache = child_toggle_row(
-            ui,
-            READ_THROUGH_LABEL,
-            read_through_description(state.settings.cache_vault_to_disk),
-            state.settings.read_through_cache,
-            state.settings.cache_vault_to_disk,
-        );
-        row_separator(ui);
         // The one switch that governs what a matched window does. It sits on
         // General beside the other two rather than under Shortcuts, because
         // it is not about a shortcut: `PROMPT_DESCRIPTION` names the hotkey
@@ -2786,17 +2817,31 @@ fn attempt_mint(
 
 // -- the page ---------------------------------------------------------------
 
-/// The **Vault service** page: the switch, the keys that exist, and the form
-/// that makes another.
+/// The **Vault** page: where the vault is served from, what is kept on this
+/// PC, and who else may ask for it.
 ///
-/// # Four things on one page, deliberately
+/// # Everything about the vault on one page, deliberately
 ///
-/// [`draw_breaches`]'s argument, with more at stake. The switch decides
-/// whether a door exists; the keys are the door's only credential; the mint
-/// form is how another one is cut; the revoke button is the only way one is
-/// taken back. Split across pages, the owner can turn the service "off" on
-/// one screen while never having seen the three keys that will work again the
-/// moment it is on.
+/// [`draw_breaches`]'s argument, with more at stake, and now applied to the
+/// whole subject rather than to the service alone. The backend choice decides
+/// which program holds the keys; `keep_backend_running` decides whether that
+/// program stays up; the disk cache decides what is left on the disk when it
+/// is not; the service switch decides whether a door exists at all; the keys
+/// are that door's only credential; the mint form is how another one is cut;
+/// the revoke button is the only way one is taken back.
+///
+/// Split across pages -- which is what shipped, over General, Sync & account
+/// and here -- the owner can turn the backend off on one screen and discover
+/// on another that the window they would undo it from no longer opens, and
+/// can turn the service "off" without ever having seen the three keys that
+/// will work again the moment it is on. Both of those happened.
+///
+/// # The order is the order of consequence
+///
+/// Where the vault comes from, then what is written down, then who may ask.
+/// Each card is only decidable once the one above it is: whether an encrypted
+/// copy is worth keeping depends on whether a backend is being kept warm, and
+/// what the service can serve depends on both.
 ///
 /// # The plaintext key is on screen exactly once, and never on disk
 ///
@@ -2816,7 +2861,110 @@ fn attempt_mint(
 /// This one is not, and the thing it breaks is somebody's unattended script
 /// -- so it is the one place in Preferences with a confirmation, and the
 /// confirmation says what breaks rather than "are you sure".
-fn draw_vault_service(ui: &mut Ui, state: &mut PrefsState) {
+/// **Which backend holds the vault, and whether it is kept warm.**
+///
+/// The parent is `use_official_bw_crypto`: on -- the shipped default -- the
+/// vault goes through the official `bw` CLI, and off it goes through
+/// Deskwarden's own built-in client. The child is `keep_backend_running`,
+/// which is a trade about the `bw serve` subprocess and therefore means
+/// nothing when there is no subprocess.
+///
+/// # Both gates are `backend_policy`'s, never re-decided here
+///
+/// The parent is available only where the choice can actually take effect:
+/// [`account_is_self_hosted`], which reaches
+/// [`crate::backend_policy::is_self_hosted`]. The owner's rule is that the
+/// built-in client is a thing to point at your own server and not at somebody
+/// else's service, and a switch that flips while
+/// [`crate::backend_policy::choose`] goes on answering `BwServe` is a switch
+/// that lies.
+///
+/// The child is gated on [`crate::backend_policy::choose`] itself, over the
+/// account's server and the **live** value of the parent -- so the two rows
+/// agree within one frame rather than one restart, and there is no second
+/// copy here of what "which backend" means.
+///
+/// Both use [`child_toggle_row`] rather than hiding: a row that vanishes is a
+/// row a user cannot find out about, and the returned value is the stored one
+/// unchanged, so a click on a configuration this app cannot serve writes
+/// nothing.
+fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        // Read once and shared by both rows: two calls could answer
+        // differently mid-frame -- the status arrives on a worker thread --
+        // and a parent that says "self-hosted" over a child that says
+        // otherwise is the disagreement this card was rebuilt to remove.
+        let status = (state.account_source)();
+        let self_hosted = account_is_self_hosted(status.clone());
+        state.settings.use_official_bw_crypto = child_toggle_row(
+            ui,
+            OFFICIAL_CRYPTO_LABEL,
+            official_crypto_description(self_hosted),
+            state.settings.use_official_bw_crypto,
+            self_hosted,
+        );
+        row_separator(ui);
+        let server = match &status {
+            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
+            _ => None,
+        };
+        let bw_selected = matches!(
+            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
+            crate::backend_policy::VaultBackendChoice::BwServe
+        );
+        state.settings.keep_backend_running = child_toggle_row(
+            ui,
+            BACKEND_LABEL,
+            backend_description(bw_selected),
+            state.settings.keep_backend_running,
+            bw_selected,
+        );
+    });
+}
+
+/// **The encrypted copy on this PC, and whether reads consult it.**
+///
+/// Deliberately its own card rather than two more rows under the backend
+/// pair: these two are about what is written to the user's disk, and the two
+/// above are about which process is running. A single card of four rows would
+/// read as one group with one rule, which they are not.
+///
+/// **Not two independent switches, and the card must not imply they are.**
+/// [`crate::backend_policy::read_path`] answers `ServiceOnly` whenever
+/// `cache_vault_to_disk` is off, whatever `read_through_cache` says -- the
+/// first is a veto over the second. So the second is a [`child_toggle_row`]
+/// of the first: ghosted when there is no copy to read, saying so in the row,
+/// and handing back the stored value unchanged.
+///
+/// The parent has a gate of its own that is not the child's: Windows Hello.
+/// The file is encrypted with a key Hello keeps in this PC's TPM, and without
+/// Hello there is no such key -- so the row is ghosted with the reason in it
+/// rather than silently downgraded to something weaker under the same label.
+fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        let hello_available = (state.hello_available)();
+        state.settings.cache_vault_to_disk = child_toggle_row(
+            ui,
+            DISK_CACHE_LABEL,
+            disk_cache_description(hello_available),
+            state.settings.cache_vault_to_disk,
+            hello_available,
+        );
+        row_separator(ui);
+        // The child of the row above: with no copy permitted there is nothing
+        // to read. Ghosted rather than hidden, for `child_toggle_row`'s usual
+        // reason -- a row that vanishes is a row a user cannot find out about.
+        state.settings.read_through_cache = child_toggle_row(
+            ui,
+            READ_THROUGH_LABEL,
+            read_through_description(state.settings.cache_vault_to_disk),
+            state.settings.read_through_cache,
+            state.settings.cache_vault_to_disk,
+        );
+    });
+}
+
+fn draw_vault(ui: &mut Ui, state: &mut PrefsState) {
     // **The one page in this window that scrolls**, and it is not a
     // precaution: the key list has no upper bound. Every other page here is a
     // fixed set of rows that fits the fixed window by construction, so a
@@ -2824,6 +2972,14 @@ fn draw_vault_service(ui: &mut Ui, state: &mut PrefsState) {
     // needed. Ten keys on this one runs off the bottom of a window that
     // cannot be resized, and a revoke button below the fold is a revoke
     // button that does not exist.
+    //
+    // **It is also what made this gathering possible.** The backend row lives
+    // here rather than on General because General's card was one row from its
+    // ceiling -- the window is a fixed 780 points and every other page has no
+    // scroll region, so a row past the fold is a row nobody can reach. That
+    // objection does not apply to this page: it already scrolled, for the key
+    // list, so four more rows of three-paragraph copy are reachable rather
+    // than merely painted. Nothing was traded away to put them here.
     //
     // Always visible, for `draw_notes`'s reason exactly: content clipped with
     // no bar reads as content that failed to load, and a bar whose lane comes
@@ -2835,17 +2991,20 @@ fn draw_vault_service(ui: &mut Ui, state: &mut PrefsState) {
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, CONTENT_GAP);
-            vault_service_cards(ui, state);
+            vault_cards(ui, state);
         });
 }
 
 /// The page's cards, in reading order.
 ///
-/// **The unbounded list is last.** The switch, the key that was just made and
-/// the form that makes another are all fixed-height and all more urgent than
-/// the eleventh key; putting the list above them would push the mint button
+/// **The unbounded list is last.** Every card above it is fixed-height and
+/// all of them are more urgent than the eleventh key; putting the list above
+/// them would push the mint button -- and now the backend switch as well --
 /// off the bottom of a page whose length the owner does not control.
-fn vault_service_cards(ui: &mut Ui, state: &mut PrefsState) {
+fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
+    draw_backend_card(ui, state);
+    draw_disk_cache_card(ui, state);
+
     card(ui, |ui| {
         state.settings.service_enabled = toggle_row(
             ui,
@@ -4333,94 +4492,46 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
 /// copy of 3e's controls: all three look like a feature that is present and
 /// broken. A sentence saying what governs the behaviour today, and where it is
 /// set if it is set anywhere, is the whole content.
-/// **Sync & account**: which backend fetches this account's vault.
+/// **Sync & account**: what this page can still answer.
 ///
-/// # Why here and not on General, beside the backend row
+/// # The backend rows are not here any more
 ///
-/// It was written for General. That page's card is one row from its ceiling:
-/// the window is a fixed 780 points with no page-level scroll region, and an
-/// eighth row -- with the three paragraphs this setting's copy has to carry --
-/// pushes the auto-lock row off the bottom. Measured, not guessed: with the
-/// row there, `general_paints_every_setting_that_actually_exists` stopped
-/// finding "Lock the vault after" at all.
+/// They were written for General, moved here when General's card ran out of
+/// height, and have now moved once more -- to [`Section::Vault`], with the
+/// disk-cache pair and the service switch. The reason is not that this page
+/// was the wrong home for "which backend fetches this account's vault"; it
+/// reads perfectly well under a subtitle about the account this vault comes
+/// from. It is that *four* settings decided how the vault is served and they
+/// were on three pages, which is how the owner came to turn
+/// `keep_backend_running` off from a page that gave no sign the vault window
+/// -- the window Preferences itself lives inside -- would then fail to open.
 ///
-/// A row nobody can scroll to is worse than a row on the next page along, and
-/// this page is the one the setting is actually about --
-/// [`Section::SyncAndAccount`]'s own subtitle, unchanged, is "The Bitwarden
-/// account this vault comes from", which is the question this row answers.
-/// The old placeholder said signing in and syncing are done from the vault
-/// window, which is still true and is not a setting.
+/// A setting is easiest to reason about beside the settings it interacts
+/// with, and `keep_backend_running` interacts with the backend choice, the
+/// disk cache and the service. It interacts with nothing else on this page.
+/// See [`Section::Vault`].
 ///
-/// # What the row is
-///
-/// [`child_toggle_row`], the same control the disk-cache row uses, for the
-/// same reason: the owner's rule is that the setting is unavailable off a
-/// self-hosted server ("to avoid issues with Bitwarden"), and a row that
-/// *vanishes* is a row a user cannot find out about. Ghosted, it says what
-/// would make it available, and it hands back the stored value unchanged --
-/// so a click on a server this backend cannot serve cannot select it.
-///
-/// # It takes effect on restart, and the copy says so
-///
-/// A live switch would have to stop `bw serve`, clear
-/// [`crate::vault_cache::VaultCache`] *and* the encrypted disk copy -- which
-/// is fingerprinted per account and **not** per backend, so the file the old
-/// backend wrote is a file the new one would happily adopt -- and then derive
-/// a master key this process may not hold, from a master-password prompt
-/// raised over whatever window the user opened Preferences from. Four
-/// irreversible steps and a prompt, to save a relaunch.
-///
-/// So `main` reads `use_official_bw_crypto` once, at startup, and keeps that
-/// value for the life of the process (`BackendSettlement`) -- including across
-/// an account switch, which re-runs the *choice* but not the *setting*.
-/// Nothing re-reads the field, which is why the sentence in
-/// [`official_crypto_description`] is true rather than aspirational.
-fn draw_sync_and_account(ui: &mut Ui, state: &mut PrefsState) {
+/// What is left is the sentence this page carried before the backend rows
+/// arrived, and it is still the honest answer to the question the nav row
+/// asks: signing in and syncing are not settings.
+fn draw_sync_and_account(ui: &mut Ui) {
     card(ui, |ui| {
-        // Read once and shared by both rows: two calls could answer
-        // differently mid-frame -- the status arrives on a worker thread --
-        // and a parent that says "self-hosted" over a child that says
-        // otherwise is the disagreement this card was rebuilt to remove.
-        let status = (state.account_source)();
-        let self_hosted = account_is_self_hosted(status.clone());
-        state.settings.use_official_bw_crypto = child_toggle_row(
-            ui,
-            OFFICIAL_CRYPTO_LABEL,
-            official_crypto_description(self_hosted),
-            state.settings.use_official_bw_crypto,
-            self_hosted,
-        );
-        row_separator(ui);
-        // The child of the row above, and the reason it is on this page at
-        // all -- see [`backend_description`]. The gate is `backend_policy`'s
-        // own decision function over the LIVE value of that toggle, so the
-        // two rows agree within one frame rather than one restart, and there
-        // is no second copy here of what "which backend" means.
-        let server = match &status {
-            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
-            _ => None,
-        };
-        let bw_selected = matches!(
-            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
-            crate::backend_policy::VaultBackendChoice::BwServe
-        );
-        state.settings.keep_backend_running = child_toggle_row(
-            ui,
-            BACKEND_LABEL,
-            backend_description(bw_selected),
-            state.settings.keep_backend_running,
-            bw_selected,
-        );
-        row_separator(ui);
-        // The placeholder's sentence, kept as a row rather than deleted: it is
-        // still the answer to "where do I sign in and sync from", and this
-        // page is still where somebody looks for it.
         card_row(ui, |ui| {
             row_text(
                 ui,
                 "Signing in, syncing and locking",
                 "All three are done from the vault window and from the tray, not from here.",
             );
+        });
+        row_separator(ui);
+        // **Names the page the settings went to.** A user who last saw the
+        // backend switch here and finds it gone has to be told where, in the
+        // place they are looking -- the alternative is that they conclude the
+        // setting was removed. `Section::Vault::label` rather than the word,
+        // so a later rename cannot leave this pointing at a page that is not
+        // called that any more.
+        card_row(ui, |ui| {
+            row_text(ui, SYNC_MOVED_LABEL, SYNC_MOVED_NOTE);
         });
     });
 }
@@ -4866,6 +4977,33 @@ mod tests {
                 .count()
         }
 
+        /// The fill colour of every toggle pill, top to bottom.
+        ///
+        /// **The only way to read a pill's state from outside the widget.**
+        /// [`theme::toggle_pill`] paints its track `theme::BLUE` when on and
+        /// `theme::TOGGLE_OFF` when off, and nothing else on this window
+        /// paints a 40x22 rectangle -- so the colour at index *n* is the
+        /// state of the *n*th row's switch. Needed because the one guarantee
+        /// worth pinning about the backend row is which way round it is, and
+        /// a test that read only the settings field would pass a row that
+        /// painted every value backwards.
+        ///
+        /// Ordered by painted y, exactly as [`Self::rects_of_size`] is and
+        /// for the same reason.
+        fn pill_fills(&self) -> Vec<egui::Color32> {
+            let mut found: Vec<(f32, egui::Color32)> = self
+                .rects
+                .iter()
+                .filter(|r| {
+                    (r.rect.width() - TOGGLE_SIZE.x).abs() < 0.5
+                        && (r.rect.height() - TOGGLE_SIZE.y).abs() < 0.5
+                })
+                .map(|r| (r.rect.top(), r.fill))
+                .collect();
+            found.sort_by(|a, b| a.0.total_cmp(&b.0));
+            found.into_iter().map(|(_, fill)| fill).collect()
+        }
+
         /// Every rectangle of exactly this size, top to bottom -- how a
         /// control that paints no text of its own (the toggle pill) is
         /// located now that the General card holds two of them.
@@ -5276,7 +5414,7 @@ mod tests {
     /// that is not the clipboard.
     fn vault_state() -> PrefsState {
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::VaultService;
+        state.section = Section::Vault;
         state.show_key_clock(|| TEST_NOW);
         state.show_key_random(|| TEST_KEY_BYTES);
         state
@@ -5675,11 +5813,16 @@ mod tests {
         let pills = first.rects_of_size(TOGGLE_SIZE);
         assert_eq!(
             pills.len(),
-            1,
-            "this page paints exactly one pill -- the service switch -- and a test that \
-             indexed into a longer list would be clicking something else"
+            5,
+            "the Vault page paints five pills -- the backend choice and its child, the disk \
+             copy and its child, and the service switch -- and a test that indexed past the \
+             end, or into the wrong one, would be clicking something else"
         );
-        let pill = pills[0].center();
+        // LAST of the five: the service switch is the bottom card of the
+        // fixed-height part of the page, under the two cards that gathered
+        // here. The counter-assertions below are what make that index a
+        // claim rather than an assumption.
+        let pill = pills[4].center();
 
         let _ = vault_frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5688,7 +5831,9 @@ mod tests {
              back, so the pill is decoration"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
+        assert!(state.settings.read_through_cache, "the wrong row's toggle moved");
 
         let _ = vault_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.service_enabled, "and back off again");
@@ -6210,12 +6355,21 @@ mod tests {
 
     /// One frame of a page whose Hello answer is `available`, since that is
     /// the only input to this row and no other harness here can supply it.
-    fn paint_general_with_hello(available: bool) -> Painted {
-        let ctx = styled_context();
+    /// One frame of the **Vault** page with Windows Hello answering
+    /// `available`, on the tall viewport that page's scroll region needs.
+    ///
+    /// It was `paint_general_with_hello` and it moved with the rows. The
+    /// viewport is `TALL_BODY` rather than `BODY_SIZE` for
+    /// [`vault_frame`]'s reason exactly: a `ScrollArea` culls what is outside
+    /// its viewport, so a short frame would find a row missing and could not
+    /// tell that from a row that was never drawn. Reachability on the real
+    /// window is a separate claim, asserted separately.
+    fn paint_vault_with_hello(available: bool) -> Painted {
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::General;
+        state.section = Section::Vault;
         state.show_hello_available(if available { || true } else { || false });
-        frame(&ctx, &mut state, &[])
+        vault_frame(&ctx, &mut state, &[])
     }
 
     /// The copy is the requirement, so these assertions exist so that a
@@ -6256,11 +6410,11 @@ mod tests {
     }
 
     #[test]
-    fn general_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
-        let painted = paint_general_with_hello(false);
+    fn the_vault_page_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
+        let painted = paint_vault_with_hello(false);
         assert!(
             painted.contains(DISK_CACHE_LABEL),
-            "the disk-cache row is not on General at all: {:?}",
+            "the disk-cache row is not on the Vault page at all: {:?}",
             painted.strings()
         );
         assert!(
@@ -6273,17 +6427,17 @@ mod tests {
     fn a_frame_cannot_turn_the_disk_cache_on_while_hello_is_missing() {
         // The ghosted row returns the stored value unchanged, so there is no
         // frame in which the setting reads as on with no key to run on.
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::General;
+        state.section = Section::Vault;
         state.show_hello_available(|| false);
-        let _ = frame(&ctx, &mut state, &[]);
+        let _ = vault_frame(&ctx, &mut state, &[]);
         assert!(!state.settings.cache_vault_to_disk);
     }
 
     #[test]
-    fn general_says_what_is_in_the_file_when_hello_is_available() {
-        let painted = paint_general_with_hello(true);
+    fn the_vault_page_says_what_is_in_the_file_when_hello_is_available() {
+        let painted = paint_vault_with_hello(true);
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what is in the file"
@@ -6301,28 +6455,124 @@ mod tests {
     /// runs and this one decides whether a decrypted vault goes on the disk.
     #[test]
     fn clicking_the_disk_cache_toggle_changes_the_setting_it_is_wired_to() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
         state.show_hello_available(|| true);
         assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
 
-        let first = frame(&ctx, &mut state, &[]);
-        // FIRST pill down now: the backend row that used to sit above it
-        // moved to Sync & account.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = vault_frame(&ctx, &mut state, &[]);
+        // THIRD pill down on the Vault page: the backend card's two rows are
+        // above it, and the disk-cache card's own child is directly below.
+        // Named by index rather than by position on a card, because that is
+        // what `rects_of_size` returns -- and asserted against the count, so
+        // an index that has drifted fails here rather than quietly clicking
+        // the row above.
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(
+            pills.len(),
+            5,
+            "the Vault page paints five pills: the backend choice and its child, the disk \
+             copy and its child, and the service switch"
+        );
+        let pill = pills[2].center();
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
             "the disk-cache toggle did not turn on -- the row is painted but its value is \
              never written back, so the pill is decoration"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
+        assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.cache_vault_to_disk, "and back off again");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+    }
+
+    /// **The disk-cache pair is one decision with a veto, and the screen
+    /// says so.**
+    ///
+    /// [`crate::backend_policy::read_path`] answers `ServiceOnly` whenever
+    /// `cache_vault_to_disk` is off, *whatever* `read_through_cache` says --
+    /// the first vetoes the second. Two switches side by side, both live,
+    /// would tell the user they were choosing between four configurations
+    /// when there are three, and would leave "read from that copy first"
+    /// switched on next to "keep a copy" switched off: a screen that says a
+    /// file is being consulted which does not exist.
+    ///
+    /// Three claims, because any one alone is passed by the defect. The child
+    /// is **inert** while the parent is off (not merely grey); it says **why**
+    /// in the row, readable without hovering; and the policy really does
+    /// ignore it, so the ghosting is describing the behaviour rather than
+    /// inventing a rule of its own.
+    #[test]
+    fn the_read_through_row_is_a_child_of_the_disk_copy_and_not_a_second_switch() {
+        use crate::backend_policy::{read_path, ReadPath};
+
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
+        state.show_hello_available(|| true);
+        // The premise: shipped, the copy is OFF and the read-through is ON --
+        // which is precisely the pair that would read as a contradiction if
+        // both rows were live.
+        assert!(!state.settings.cache_vault_to_disk, "the shipped default");
+        assert!(state.settings.read_through_cache, "the shipped default");
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::ServiceOnly,
+            "the premise: with no copy permitted, the read-through setting decides nothing"
+        );
+
+        let first = vault_frame(&ctx, &mut state, &[]);
+        // FOURTH pill: the backend card's two, then the disk copy, then this.
+        let child = first.rects_of_size(TOGGLE_SIZE)[3].center();
+        vault_frame(&ctx, &mut state, &click(child));
+        assert!(
+            state.settings.read_through_cache,
+            "the read-through pill wrote its setting while there is no copy to read, so the \
+             two rows are a pair of independent switches after all"
+        );
+        assert!(
+            first.contains(read_through_description(false)),
+            "the ghosted child does not say what would make it available, so it reads as a \
+             bug rather than as a consequence of the row above; got {:?}",
+            first.strings()
+        );
+
+        // **The control**, and without it the assertions above are passed by
+        // a row that is inert always. Turn the parent on -- through the pane,
+        // so it is the same click path -- and the child is live, moves its
+        // own field, and changes what the policy answers.
+        let parent = first.rects_of_size(TOGGLE_SIZE)[2].center();
+        vault_frame(&ctx, &mut state, &click(parent));
+        assert!(state.settings.cache_vault_to_disk, "the control could not turn the parent on");
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::CacheFirst
+        );
+
+        let second = vault_frame(&ctx, &mut state, &[]);
+        let child = second.rects_of_size(TOGGLE_SIZE)[3].center();
+        vault_frame(&ctx, &mut state, &click(child));
+        assert!(
+            !state.settings.read_through_cache,
+            "the child is inert even with a copy to read, so the row is decoration and the \
+             refusal above proved nothing"
+        );
+        assert!(
+            state.settings.cache_vault_to_disk,
+            "clicking the child moved the parent's field"
+        );
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::ServiceOnly,
+            "the child's field moved but the read path did not follow it"
+        );
     }
 
     #[test]
@@ -6358,9 +6608,13 @@ mod tests {
             "Autofill",
             "Native apps",
             "Security",
-            // The vault service sits beside Security because that is where a
-            // reader looking for "what can reach my vault" looks first.
-            "Vault service",
+            // The vault page sits beside Security because that is where a
+            // reader looking for "what can reach my vault" looks first. It
+            // was "Vault service" while the service was all it carried; it
+            // now carries the backend choice and the disk cache too, and a
+            // nav row has to name the whole page or the settings on it are
+            // unfindable.
+            "Vault",
             "Clipboard",
             "Shortcuts",
             "Sync & account",
@@ -6479,22 +6733,20 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_seven_toggles_and_one_stepper() {
+    fn general_paints_exactly_five_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            7,
-            "seven 40x22 pills: `cache_vault_to_disk` and its child `read_through_cache`, \
-             then `prompt_on_match`, `fetch_icons`, \
-             `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
-             The disk-cache pill is painted whether or not Windows Hello is available -- \
-             ghosted and inert when it is not -- so this count does not depend on the machine \
-             running the test. \
-             THREE settings are no longer here and all three left for the same reason -- to \
+            5,
+            "five 40x22 pills: `prompt_on_match`, `fetch_icons`, `use_brand_logos`, \
+             `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
+             FIVE settings are no longer here and all five left for the same reason -- to \
              sit beside the thing that governs them. `check_breaches` moved to Breaches, \
-             `check_for_updates` moved to Updates, and `keep_backend_running` moved to Sync & \
-             account, where it is a child of the switch that decides whether `bw serve` runs \
-             at all; see `draw_breaches`, `draw_updates` and `backend_description`"
+             `check_for_updates` moved to Updates, and `keep_backend_running`, \
+             `cache_vault_to_disk` and `read_through_cache` are now on `Section::Vault` with \
+             the backend choice and the vault service, which is the one page where all of \
+             them can be weighed against each other; see `draw_breaches`, `draw_updates` and \
+             `Section::Vault`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -6521,14 +6773,20 @@ mod tests {
         // is what a switch is supposed to do, and it is asserted rather than
         // assumed.
         //
-        // **On Sync & account, not General.** The row moved there as a child
-        // of the crypto switch; this test moved with it rather than being
-        // repointed at whatever now sits first on General, which would have
-        // left `keep_backend_running` with no click coverage at all while
-        // still passing.
-        let ctx = styled_context();
+        // **On the Vault page, not General and no longer on Sync & account.**
+        // The row is a child of the crypto switch and moved with it; this
+        // test moved with them both rather than being repointed at whatever
+        // now sits first on General, which would have left
+        // `keep_backend_running` with no click coverage at all while still
+        // passing.
+        //
+        // This is the row the owner trapped themselves with -- turning it off
+        // stopped the vault window opening, and Preferences is inside that
+        // window -- so "there is a place you can click this" is the claim
+        // that matters, and this test is where it is made.
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         // A signed-in account on Bitwarden's own cloud, so `choose` answers
         // `BwServe` and the child is LIVE. Ghosted, `child_toggle_row` hands
         // back the stored value and the click below would do nothing --
@@ -6539,17 +6797,19 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = frame(&ctx, &mut state, &[]);
+        let first = vault_frame(&ctx, &mut state, &[]);
         // SECOND pill: the crypto switch is the parent and paints first.
         // Clicking this one must not move it, which is what the neighbouring
         // assertion here pins -- a child wired to its parent's field is
         // exactly the mix-up this card's rebuild could have introduced.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
-        frame(&ctx, &mut state, &click(pill));
+        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
+        assert!(!state.settings.cache_vault_to_disk, "a neighbouring card's toggle moved");
+        assert!(!state.settings.service_enabled, "a neighbouring card's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
     }
@@ -6563,11 +6823,11 @@ mod tests {
     /// configuration does not start.
     #[test]
     fn the_ghosted_backend_pill_does_not_change_the_setting_when_clicked() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut settings = Settings::default();
         settings.use_official_bw_crypto = false;
         let mut state = PrefsState::new(settings);
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         state.show_account_source(|| {
             Some(AccountStatus::SignedIn {
                 email: Some("me@example.com".to_string()),
@@ -6576,9 +6836,9 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = vault_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.keep_backend_running,
             "a ghosted row wrote its setting anyway, so the pill is live and only looks dead"
@@ -6598,9 +6858,10 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the default: a match prompts");
 
         let first = frame(&ctx, &mut state, &[]);
-        // SECOND pill down now: the encrypted disk cache is the only row
-        // above it since the backend row left this page.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
+        // FIRST pill down now: the disk-cache pair followed the backend row
+        // off this page, to `Section::Vault`, so the prompt row is the top
+        // of General's card.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
@@ -7078,13 +7339,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // THIRD pill down now: disk cache, prompt, site icons, network
-        // logos, TOTP secret, auto-lock. Three rows have left this page --
-        // the breach row to Breaches, the update row to Updates, and the
-        // backend row to Sync & account, where it is a child of the switch
-        // that decides whether there is a backend to keep running at all.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // SECOND pill down now: prompt, site icons, network logos, TOTP
+        // secret, auto-lock. Five rows have left this page -- the breach row
+        // to Breaches, the update row to Updates, and the backend row plus
+        // the disk-cache pair to `Section::Vault`, where they are read
+        // together with the service switch.
+        let pill = pills[1].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -7127,10 +7388,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FOURTH pill down: disk cache, prompt, site icons, network
-        // logos, TOTP secret, auto-lock.
-        let pill = pills[4].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // THIRD pill down: prompt, site icons, network logos, TOTP secret,
+        // auto-lock.
+        let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -7371,10 +7632,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FIFTH pill down now: disk cache, prompt, site icons,
-        // network logos, TOTP secret, auto-lock.
-        let pill = pills[5].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // FOURTH pill down now: prompt, site icons, network logos, TOTP
+        // secret, auto-lock.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -7422,16 +7683,22 @@ mod tests {
 
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
+        //
+        // **The indices are named, because they moved.** General now paints
+        // prompt(0), site icons(1), network logos(2), TOTP secret(3),
+        // auto-lock(4) -- the disk-cache pair that used to occupy 0 and 1 is
+        // on `Section::Vault`. The pill under test is 3, and its neighbours
+        // are 2 and 4.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 5);
+        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[4].top() > breach.bottom(),
+            pills[3].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[4].bottom() < auto_lock.top(),
+            pills[3].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -7487,20 +7754,27 @@ mod tests {
 
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
-        // The user's actual request. `auto_lock_enabled` starts true, and
-        // the SEVENTH pill down is the one wired to it --
-        // `cache_vault_to_disk`, `prompt_on_match`, `fetch_icons`,
-        // `use_brand_logos` and `reveal_totp_seed` sit between it and the
-        // backend row. It was the fifth until the network-logos row was
-        // inserted, the sixth before `check_breaches` moved to its own page,
-        // and the seventh since the encrypted disk cache took the row
-        // directly under the backend one.
+        // The user's actual request. `auto_lock_enabled` starts true, and it
+        // is the LAST pill on the page -- `prompt_on_match`, `fetch_icons`,
+        // `use_brand_logos` and `reveal_totp_seed` sit above it. It was the
+        // fifth until the network-logos row was inserted, the sixth before
+        // `check_breaches` moved to its own page, the seventh while the
+        // encrypted disk cache sat under the backend row, and the fifth
+        // again now that the disk-cache pair has followed the backend row to
+        // `Section::Vault`.
+        //
+        // **Read as the last index rather than written as `4`**, because
+        // this index has now been wrong four times. What the test means is
+        // "the bottom row of General", and that is a thing the paint can be
+        // asked directly.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[6].center();
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        let pill = pills[pills.len() - 1].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
@@ -8094,7 +8368,7 @@ mod tests {
         );
     }
 
-    // -- the backend row on Sync & account ---------------------------------
+    // -- the backend rows, on the Vault page -------------------------------
 
     /// A signed-in status for a given server, as the shells publish one.
     fn signed_in_on(server: Option<&str>) -> AccountStatus {
@@ -8119,7 +8393,7 @@ mod tests {
             })
         }
         let mut state = PrefsState::new(Settings::default());
-        state.show(Section::SyncAndAccount);
+        state.show(Section::Vault);
         state.show_account_source(source);
         state
     }
@@ -8133,34 +8407,81 @@ mod tests {
             })
         }
         let mut state = PrefsState::new(Settings::default());
-        state.show(Section::SyncAndAccount);
+        state.show(Section::Vault);
         state.show_account_source(source);
         state
     }
 
-    /// The page draws the row, and it draws exactly one pill -- so the copy
-    /// assertions below are about a control that is really there.
+    /// **The whole point of the change: one screen carries every setting
+    /// that decides how this vault is served.**
+    ///
+    /// Asserted as five labels on one painted page, and -- the half that can
+    /// actually fail -- as five labels absent from the two pages they came
+    /// off. A test that only checked presence would pass a change that
+    /// *copied* the rows, which is this file's most-feared defect: a control
+    /// fixed in one place and left broken in the other.
     #[test]
-    fn sync_and_account_paints_the_backend_row_and_one_pill() {
+    fn every_setting_that_decides_how_the_vault_is_served_is_on_the_vault_page() {
+        let vault = paint_vault_with_hello(true);
+        let scattered = [
+            OFFICIAL_CRYPTO_LABEL,
+            BACKEND_LABEL,
+            DISK_CACHE_LABEL,
+            READ_THROUGH_LABEL,
+            SERVICE_LABEL,
+        ];
+        for label in scattered {
+            assert!(
+                vault.contains(label),
+                "{label:?} is not on the Vault page; got {:?}",
+                vault.strings()
+            );
+        }
+
+        // And nowhere else. General and Sync & account are the two pages
+        // these rows were taken off, and a row left behind on either is two
+        // switches over one field.
+        for section in [Section::General, Section::SyncAndAccount] {
+            let painted = paint(section);
+            for label in scattered {
+                assert!(
+                    !painted.contains(label),
+                    "{label:?} is still painted on {section:?} as well as on the Vault page, \
+                     so one field now has two switches"
+                );
+            }
+        }
+
+        // The control for the loop above: those pages are not simply blank,
+        // so "not painted" is a claim about these rows rather than about a
+        // paint that produced nothing.
+        assert!(paint(Section::General).contains(PROMPT_LABEL));
+        assert!(paint(Section::SyncAndAccount).contains(SYNC_MOVED_LABEL));
+    }
+
+    /// **A user who last saw the switch on Sync & account is told where it
+    /// went, on that page, in the nav's own word for the new one.**
+    ///
+    /// Without this, moving the rows turns "the setting I used yesterday" into
+    /// "the setting they removed". The label is read off [`Section::Vault`]
+    /// rather than spelled again, so a later rename of the page cannot leave
+    /// this sentence pointing somewhere that does not exist.
+    #[test]
+    fn sync_and_account_says_where_the_backend_switch_went() {
         let painted = paint(Section::SyncAndAccount);
         assert!(
-            painted.contains(OFFICIAL_CRYPTO_LABEL),
-            "the backend row is not on the page it moved to; got {:?}",
+            painted.contains(SYNC_MOVED_NOTE),
+            "the page that lost the switch says nothing about where it went; got {:?}",
             painted.strings()
-        );
-        assert_eq!(
-            painted.count_of_size(Vec2::new(40.0, 22.0)),
-            2,
-            "two 40x22 pills: `use_official_bw_crypto` and its child \
-             `keep_backend_running`, and nothing else"
         );
         assert!(
-            painted.contains(BACKEND_LABEL),
-            "the backend row did not come with its parent; got {:?}",
-            painted.strings()
+            SYNC_MOVED_NOTE.contains(Section::Vault.label()),
+            "the signpost does not name the page in the nav's own word for it: \
+             {SYNC_MOVED_NOTE:?} vs {:?}",
+            Section::Vault.label()
         );
-        // The sentence the old placeholder carried is still on the page: it is
-        // still the answer to "where do I sign in from".
+        // The sentence the page carried before the backend rows ever arrived
+        // is still here: it is still the answer to "where do I sign in from".
         assert!(
             painted
                 .strings()
@@ -8169,18 +8490,26 @@ mod tests {
             "the page dropped what it used to say; got {:?}",
             painted.strings()
         );
+        // And no pill: this page decides nothing now, and a switch here would
+        // be a second copy of one that lives on the Vault page.
+        assert_eq!(
+            painted.count_of_size(TOGGLE_SIZE),
+            0,
+            "Sync & account is painting a toggle again; got {:?}",
+            painted.strings()
+        );
     }
 
-    /// One frame of Sync & account for an account on `server`, with the
+    /// One frame of the Vault page for an account on `server`, with the
     /// crypto toggle at `use_official`. Both inputs are needed together:
     /// [`backend_description`]'s gate is `backend_policy::choose` over the
     /// pair, and neither alone decides it.
-    fn paint_sync_for(server: Option<&'static str>, use_official: bool) -> Painted {
-        let ctx = styled_context();
+    fn paint_vault_for(server: Option<&'static str>, use_official: bool) -> Painted {
+        let ctx = tall_context();
         let mut settings = Settings::default();
         settings.use_official_bw_crypto = use_official;
         let mut state = PrefsState::new(settings);
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         state.show_account_source(match server {
             Some("self") => || {
                 Some(AccountStatus::SignedIn {
@@ -8195,7 +8524,7 @@ mod tests {
                 })
             },
         });
-        frame(&ctx, &mut state, &[])
+        vault_frame(&ctx, &mut state, &[])
     }
 
     /// **The defect this card was rebuilt to remove.**
@@ -8213,7 +8542,7 @@ mod tests {
     /// grey.
     #[test]
     fn the_backend_row_goes_quiet_when_there_is_no_backend_to_keep_running() {
-        let direct = paint_sync_for(Some("self"), false);
+        let direct = paint_vault_for(Some("self"), false);
         assert!(
             direct.contains(backend_description(false)),
             "a self-hosted account with `bw` crypto off still offers to keep a subprocess it \
@@ -8229,7 +8558,7 @@ mod tests {
             (None, false, "bitwarden.com, `bw` crypto off"),
             (None, true, "bitwarden.com, `bw` crypto on"),
         ] {
-            let painted = paint_sync_for(server, use_official);
+            let painted = paint_vault_for(server, use_official);
             assert!(
                 painted.contains(backend_description(true)),
                 "{why} is served by `bw serve`, so this row decides something and must say \
@@ -8252,17 +8581,25 @@ mod tests {
         );
     }
 
-    /// **The row is not off the bottom of the window.**
+    /// **The row a user opens this page for is above the fold without
+    /// scrolling, and its three paragraphs of copy with it.**
     ///
-    /// The reason it is on this page at all: General's card was one row from
-    /// its ceiling and this row's copy is three paragraphs. A row that is
-    /// painted but below the fold is a row nobody can reach -- the window has
-    /// no page-level scroll region -- so this asserts the position and not
-    /// merely the presence, on the same fixed body the window uses.
+    /// This test used to be about General's ceiling: that page has no scroll
+    /// region, so a row painted past 740 points is a row nobody can reach,
+    /// and the backend row's copy is three paragraphs. The Vault page does
+    /// scroll, so "below the fold" is no longer unreachable there -- but it
+    /// is still a page you have to know to scroll, and this row is the one
+    /// the owner was trapped by. So the claim is narrowed rather than
+    /// dropped: it is the FIRST card, and it is legible on the real window
+    /// with no scrolling at all.
+    ///
+    /// Measured on `BODY_SIZE`, deliberately -- the fixed body the window
+    /// really gives this pane, not `TALL_BODY`, which is a fiction the other
+    /// tests on this page need in order to see past the scroll region's
+    /// culling and would make this assertion vacuous.
     #[test]
-    fn the_backend_row_and_its_copy_both_fit_on_the_page() {
-        // The **enabled** copy, which is the long one -- three paragraphs, and
-        // the reason this row did not fit on General.
+    fn the_backend_row_and_its_copy_are_readable_without_scrolling() {
+        // The **enabled** copy, which is the long one -- three paragraphs.
         let ctx = styled_context();
         let mut state = on_a_self_hosted_server();
         let painted = frame(&ctx, &mut state, &[]);
@@ -8280,15 +8617,26 @@ mod tests {
             copy.rect.max.y,
             BODY_SIZE.y
         );
-        // The positive control for the two above: General, which is the page
-        // this row was taken off, really does end above the fold as well --
-        // so the assertions are about a measurement that can distinguish the
-        // two rather than one that passes for everything.
-        let general = paint(Section::General);
+        // The control that the measurement can fail at all: on this same
+        // account -- the long copy is what makes the page long -- the page
+        // really does run past the body, so something IS below the fold and
+        // the two assertions above are picking out where THIS row landed
+        // rather than restating that the page is short.
+        //
+        // Painted on `TALL_BODY`, because the scroll region culls what the
+        // window cannot show: the question is where the row lands in the
+        // page's layout, and a frame that had already dropped it could not
+        // answer it.
+        let tall_ctx = tall_context();
+        let mut tall_state = on_a_self_hosted_server();
+        let tall = vault_frame(&tall_ctx, &mut tall_state, &[]);
+        let below = tall.ink_of(KEYS_SECTION_LABEL).rect.max.y;
         assert!(
-            general.ink_of(AUTO_LOCK_LABEL).rect.max.y < BODY_SIZE.y,
-            "control: General's last row is itself below the fold, so this measurement says \
-             nothing about where the backend row would have landed"
+            below > BODY_SIZE.y,
+            "control: the whole Vault page fits the window (the key list ends at y={below} on \
+             a body {} tall), so 'above the fold' distinguishes nothing and this test would \
+             pass wherever the row was put",
+            BODY_SIZE.y
         );
     }
 
@@ -8299,13 +8647,15 @@ mod tests {
     /// will not run there.
     #[test]
     fn the_backend_row_is_disabled_and_inert_on_an_official_cloud() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = on_an_official_cloud();
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = vault_frame(&ctx, &mut state, &[]);
+        // FIRST pill on the Vault page: the backend choice is the top row of
+        // the top card, which is where the page's reading order puts it.
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.use_official_bw_crypto,
             "a click on the ghosted pill changed the setting anyway"
@@ -8328,21 +8678,115 @@ mod tests {
     /// else on the page.
     #[test]
     fn the_backend_row_toggles_on_a_self_hosted_server_and_moves_only_its_own_field() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = vault_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.use_official_bw_crypto,
             "the row did not turn off on a self-hosted server"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
+        assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        vault_frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.use_official_bw_crypto, "and back on again");
+    }
+
+    /// **The one guarantee on this page that cannot be seen by looking: the
+    /// pill is ON when `bw` is the backend, and OFF when the built-in client
+    /// is.**
+    ///
+    /// An inverted row paints, clicks and persists perfectly. Nothing about
+    /// it looks wrong -- the switch moves, the setting is written back, the
+    /// counter-assertions on the neighbouring tests all hold -- and the only
+    /// symptoms are that a fresh install shows the pill off while running the
+    /// official CLI, and that a user who turns it on has opted in to the
+    /// built-in client and stored a non-expiring master key on their PC in
+    /// the belief they had done the opposite.
+    ///
+    /// So this is asserted **through
+    /// [`crate::backend_policy::choose`]** -- the function that actually
+    /// decides -- rather than through the field. The field could be read
+    /// backwards by the row, or the row could be right and the decision
+    /// inverted; going pill to decision covers both, and covers any third
+    /// place an inversion could be introduced between them.
+    ///
+    /// A self-hosted server throughout, because that is the only account
+    /// where the choice is live: the assertions below are about a control the
+    /// user can actually move.
+    #[test]
+    fn the_backend_row_is_on_when_bw_is_the_backend() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        const SERVER: Option<&str> = Some("https://vault.example.com");
+
+        let ctx = tall_context();
+        let mut state = on_a_self_hosted_server();
+
+        // The shipped default: the pill is ON, and `bw serve` is what the
+        // policy answers for it. Both halves, because either alone is
+        // satisfied by an inversion of the other.
+        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "the default configuration does not select the official `bw` CLI"
+        );
+        let first = vault_frame(&ctx, &mut state, &[]);
+        assert_eq!(
+            first.pill_fills()[0],
+            theme::BLUE,
+            "the pill for the shipped default is painted off, so a fresh install shows the \
+             official CLI switched off while it is running the official CLI"
+        );
+
+        // Clicking it turns it OFF, and the policy then selects the built-in
+        // direct-REST client -- the state whose whole cost is the copy under
+        // this row.
+        vault_frame(&ctx, &mut state, &click(first.rects_of_size(TOGGLE_SIZE)[0].center()));
+        assert!(!state.settings.use_official_bw_crypto);
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::DirectRest,
+            "turning the row OFF did not select the built-in client, so the label's two \
+             states do not mean what it says they mean"
+        );
+        let second = vault_frame(&ctx, &mut state, &[]);
+        assert_eq!(
+            second.pill_fills()[0],
+            theme::TOGGLE_OFF,
+            "the pill is painted on for a configuration served by the built-in client"
+        );
+
+        // ...and back, so the two paints above are telling the states apart
+        // rather than reporting one constant twice.
+        vault_frame(&ctx, &mut state, &click(second.rects_of_size(TOGGLE_SIZE)[0].center()));
+        assert!(state.settings.use_official_bw_crypto);
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe
+        );
+
+        // And the copy reads the same way round as the control does. A row
+        // whose pill is right and whose sentence is backwards is the same
+        // defect delivered in prose.
+        let copy = official_crypto_description(true);
+        let on = copy.find("On (the default)").expect("the copy no longer names the on state");
+        let off = copy.find("Off is much lighter").expect("the copy no longer names the off state");
+        assert!(on < off, "the copy describes the off state first, under a label that reads on");
+        assert!(
+            copy[on..off].contains("official Bitwarden CLI"),
+            "the copy's ON paragraph does not say the official CLI is what ON means: {:?}",
+            &copy[on..off]
+        );
+        assert!(
+            copy[off..].contains("built-in client"),
+            "the copy's OFF paragraph does not say the built-in client is what OFF means: {:?}",
+            &copy[off..]
+        );
     }
 
     /// **What the enabled copy has to say**, asserted as text rather than
@@ -8368,6 +8812,25 @@ mod tests {
             copy.contains("next time Deskwarden starts"),
             "the copy does not say the change takes effect on restart, so a user who clicks it \
              and sees nothing happen clicks it again"
+        );
+        // **The two costs a restart alone does not describe.** Switching in
+        // either direction re-derives the vault key, so the master password
+        // is asked for again -- a user who expects a relaunch and gets a
+        // login prompt will assume something broke. And `main` deletes
+        // `userkey.bin` when an account stops being served over REST
+        // (`user_key_store::UserKeyStore::clear`), which is the reassuring
+        // half: turning the built-in client back off does not leave a
+        // non-expiring master key on the disk. Both are consequences of
+        // clicking this row and neither is visible from it.
+        assert!(
+            copy.contains("asks you to sign in again"),
+            "the copy does not say the switch re-authenticates, so a login prompt after a \
+             relaunch reads as a failure: {copy:?}"
+        );
+        assert!(
+            copy.contains("deletes the stored vault key from this PC"),
+            "the copy does not say the stored key is removed when the switch goes back, so a \
+             user cannot tell whether turning this back on undoes what it did: {copy:?}"
         );
         // The disabled twin says what would make it available, and does not
         // repeat the trade -- there is nothing to weigh on a server this
