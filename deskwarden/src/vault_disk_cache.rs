@@ -904,7 +904,7 @@ impl DiskCache {
     /// was never about. Without it, a fingerprint prompt dismissed by accident
     /// would put the local copy out of reach for the rest of the session while
     /// the screen went on offering it -- a button that does nothing, which is
-    /// the treatment `prefs_ui::draw_not_yet` refuses.
+    /// the treatment `prefs_ui` refuses.
     ///
     /// Only ever called from a user's own press.
     pub fn allow_one_more_key_attempt(&self) {

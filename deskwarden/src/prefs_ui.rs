@@ -3,7 +3,11 @@
 //! 3e is a left nav of seven sections (General, Autofill, Native apps,
 //! Security, Shortcuts, Sync & account, About) beside a content pane, with the
 //! app version pinned to the bottom of the nav. This file builds that shell,
-//! and populates it **only where a setting genuinely exists**.
+//! and populates it **only where a setting genuinely exists** -- which is now
+//! also what decides whether a section is listed at all. Five of 3e's seven
+//! rows had nothing on them a user could change and have been removed; see
+//! [`Section`], and `no_page_in_the_nav_is_only_prose`, which is what stops
+//! another one appearing.
 //!
 //! What exists today is four fields on [`Settings`]: `keep_backend_running`,
 //! `prompt_on_match`, `auto_lock_enabled` and `auto_lock_minutes`. All four
@@ -268,23 +272,6 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
         _ => false,
     }
 }
-
-/// The row Sync & account keeps where the backend switch used to be.
-///
-/// **A signpost, not a setting.** The switch moved to [`Section::Vault`] and
-/// a user who last saw it here will look here first; a page that simply
-/// stopped mentioning it reads as a page from which the setting was removed.
-const SYNC_MOVED_LABEL: &str = "Which backend holds this vault";
-
-/// [`SYNC_MOVED_LABEL`]'s sentence.
-///
-/// Names the page in the words the nav uses, and a test pins that it really
-/// is [`Section::Vault`]'s label -- otherwise a rename leaves this pointing
-/// at a page nobody can find. It also names what else is over there, because
-/// "it moved" without "and so did these" sends a user on a second trip.
-const SYNC_MOVED_NOTE: &str = "That switch is on the Vault page now, beside the encrypted copy \
-                               on this PC -- they decide one thing between them, so they are \
-                               read together.";
 
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
@@ -620,11 +607,6 @@ const AUTO_LOCK_LABEL: &str = "Lock the vault after";
 const AUTO_LOCK_DESCRIPTION: &str = "Minutes of no activity before the vault window locks itself. \
      One minute is the shortest Deskwarden will use.";
 
-/// Heading of every section that has no settings behind it yet. Its presence
-/// is what the tests assert on, so an empty section can never quietly acquire
-/// a control without one of them noticing.
-const NOT_YET_TITLE: &str = "Nothing to configure here yet";
-
 /// The one global shortcut this app registers, in the form the user sees it.
 ///
 /// Hardcoded rather than derived, because `hotkey::register_fill_hotkey`
@@ -858,15 +840,26 @@ const SCAN_BUTTON_WIDTH: f32 = 184.0;
 /// **Clipboard is the one page 3e does not contain.** 3e lists seven sections
 /// and none of them is about the clipboard, because 3e was drawn before this
 /// app took a copied secret back off it. It is a page of its own rather than a
-/// group on an existing one, for two reasons. It carries five controls, which
-/// is more than any neighbour-group on General and would bury them under the
-/// seven rows already there. And Security is a [`draw_not_yet`] page whose
-/// entire content is a sentence saying nothing on it is configurable, so
-/// putting five live controls there would mean inventing a Security page 3e
-/// also does not contain -- the same work, with the section named wrongly.
+/// group on an existing one, because it carries five controls -- more than any
+/// neighbour-group on General, and enough to bury them under the rows already
+/// there.
 ///
-/// It sits **directly after Security**, which is where a reader looking for
-/// "what happens to my password after I copy it" looks second.
+/// # Five of 3e's sections are gone, and they were the empty ones
+///
+/// Autofill, Native apps, Security, Shortcuts and Sync & account are not here
+/// any more. All five had the same defect: **nothing on them could be
+/// changed.** Three were a single sentence saying so out loud; Sync & account
+/// was two sentences pointing at other places; Shortcuts was one read-only
+/// chip. A nav row is a promise that there is a decision behind it, and five
+/// rows out of twelve were spending the reader's attention to answer "no,
+/// not here" -- which is worse than not being listed, because the reader had
+/// to visit each one to learn it.
+///
+/// What those pages knew that nowhere else did was **the fill hotkey**, and
+/// it moved rather than went: see [`fill_hotkey_row`], which General draws.
+/// Everything else on them restated a fact that is either already on the page
+/// the reader would look at next, or is not a preference at all (signing in
+/// and syncing are done from the tray and the vault window, and always were).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     General,
@@ -883,9 +876,6 @@ pub enum Section {
     /// Directly after General, because that is where this setting used to be
     /// and where a reader will look for it.
     Breaches,
-    Autofill,
-    NativeApps,
-    Security,
     /// **Everything about where this vault lives and what is kept of it on
     /// this PC.**
     ///
@@ -916,9 +906,11 @@ pub enum Section {
     /// can see all of them at once can see what they have just done to
     /// themselves.
     ///
-    /// **Directly after Security**, which is the page a reader looking for
-    /// "where does my vault come from" reaches first, and where they would
-    /// otherwise expect to find this.
+    /// **Directly after Breaches**, which is as near the top as this page can
+    /// get without displacing the setting a reader arrives for. It used to
+    /// follow Security, and it follows Breaches now for the same reason it
+    /// followed Security then: it is the first page a reader looking for
+    /// "where does my vault come from" reaches.
     Vault,
     /// **The local HTTP API, and every key that opens it**: the switch that
     /// starts the endpoint on 127.0.0.1, the form that mints a key, the one
@@ -947,8 +939,6 @@ pub enum Section {
     /// asked who may reach it.
     Api,
     Clipboard,
-    Shortcuts,
-    SyncAndAccount,
     /// **Everything about updating this build**: the automatic-check pill, the
     /// manual check, what the release says, the download, and the restart.
     ///
@@ -968,26 +958,23 @@ pub enum Section {
     /// page's user's hand goes -- one row up in the nav rather than seven.
     /// The rule is the same in both cases: the new page lands where the bulk
     /// of it came from. It also keeps the tail of the nav reading outward
-    /// from the vault -- the account this vault comes from, then this build,
-    /// then what this build is -- and leaves About last, which is where a
-    /// page that does nothing belongs.
+    /// from the vault -- what is in it, then this build, then what this build
+    /// is -- and leaves About last, which is where a page that decides
+    /// nothing belongs. (It used to read "the account this vault comes from,
+    /// then this build": Sync & account sat between Clipboard and here, and
+    /// was removed for having no setting on it.)
     Updates,
     About,
 }
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 12] = [
+    pub const ALL: [Section; 7] = [
         Section::General,
         Section::Breaches,
-        Section::Autofill,
-        Section::NativeApps,
-        Section::Security,
         Section::Vault,
         Section::Api,
         Section::Clipboard,
-        Section::Shortcuts,
-        Section::SyncAndAccount,
         Section::Updates,
         Section::About,
     ];
@@ -998,33 +985,36 @@ impl Section {
         match self {
             Section::General => "General",
             Section::Breaches => "Breaches",
-            Section::Autofill => "Autofill",
-            Section::NativeApps => "Native apps",
-            Section::Security => "Security",
             Section::Vault => "Vault",
             Section::Api => "Local API",
             Section::Clipboard => "Clipboard",
-            Section::Shortcuts => "Shortcuts",
-            Section::SyncAndAccount => "Sync & account",
             Section::Updates => "Updates",
             Section::About => "About",
         }
     }
 
-    /// The line under the heading. Autofill's is 3e's own, verbatim; the rest
-    /// are written to the same shape, since 3e only draws the Autofill page.
+    /// The line under the heading.
+    ///
+    /// 3e only draws the Autofill page, so its subtitle was the one written
+    /// by the design and every other was written to its shape. That page is
+    /// gone -- it had no setting on it -- so what is left here is all
+    /// shape-and-no-original, which changes nothing about how they are
+    /// written: one sentence, naming what the page decides.
     fn subtitle(self) -> &'static str {
         match self {
-            Section::General => "How Deskwarden runs in the background, and when it locks itself.",
+            // **Says "the shortcut it answers" because the fill hotkey row is
+            // on this page now.** A subtitle that named only background
+            // behaviour and locking would be a subtitle a user scanning for
+            // CTRL+ALT+B reads straight past, on the one page that tells them
+            // what it is and whether it is working.
+            Section::General => {
+                "How Deskwarden runs in the background, the shortcut it answers, and when it \
+                 locks itself."
+            }
             Section::Breaches => {
                 "Whether your saved passwords are checked against public breach lists, and \
                  what the last checks found."
             }
-            Section::Autofill => {
-                "How Deskwarden behaves when a native login field takes focus."
-            }
-            Section::NativeApps => "The applications Deskwarden fills credentials into.",
-            Section::Security => "What Deskwarden asks for before it reveals or fills a secret.",
             // Every part, in the order the page draws them: where the vault
             // is served FROM, then what is kept on this PC, then who else may
             // ask for it. The endpoint still comes before the keys, for the
@@ -1049,8 +1039,6 @@ impl Section {
             // `clipboard.rs` and not about the history exclusion, which has no
             // switch and appears on this page only as a line saying so.
             Section::Clipboard => "When a secret you have copied is taken back off the clipboard.",
-            Section::Shortcuts => "The keys that reach Deskwarden from anywhere.",
-            Section::SyncAndAccount => "The Bitwarden account this vault comes from.",
             // Both halves, in the order the page draws them: the switch that
             // decides what Deskwarden does unasked, then the button that does
             // not consult it.
@@ -1829,29 +1817,15 @@ fn version_line() -> String {
 fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
     section_heading(ui, state.section);
     match state.section {
-        Section::General => draw_general(ui, state),
+        // The one read of the published status -- see `hotkey::availability`,
+        // and `fill_hotkey_row` for why it is a parameter from here down. It
+        // used to be read for `Section::Shortcuts`; that page was one
+        // read-only chip and is gone, and the chip is a row on General now.
+        Section::General => draw_general(ui, state, crate::hotkey::availability()),
         Section::Breaches => draw_breaches(ui, state),
-        Section::Autofill => draw_not_yet(
-            ui,
-            "Overlay behaviour is fixed for now. Per-app behaviour is chosen from the tray's \
-             \"Add app...\", not from here.",
-        ),
-        Section::NativeApps => draw_not_yet(
-            ui,
-            "Deskwarden fills whichever application a vault item has been matched to. Matches are \
-             added from the tray's \"Add app...\".",
-        ),
-        Section::Security => draw_not_yet(
-            ui,
-            "Auto-lock is on the General page. Nothing else here is configurable yet.",
-        ),
         Section::Vault => draw_vault(ui, state),
         Section::Api => draw_api(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
-        // The one read of the published status -- see `hotkey::availability`, and
-        // `draw_shortcuts` for why it is a parameter from here down.
-        Section::Shortcuts => draw_shortcuts(ui, crate::hotkey::availability()),
-        Section::SyncAndAccount => draw_sync_and_account(ui),
         Section::Updates => draw_updates(ui, state),
         Section::About => draw_about(ui, state),
     }
@@ -1996,7 +1970,7 @@ fn toggle_row(ui: &mut Ui, label: &str, description: &str, value: bool) -> bool 
     next
 }
 
-/// A row that reports a value rather than editing one (About, Shortcuts).
+/// A row that reports a value rather than editing one (About).
 fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
     control_row(ui, label, description, |ui| {
         ui.label(RichText::new(value).size(13.0).color(theme::TEXT_MUTED));
@@ -2007,7 +1981,7 @@ fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
 // Pages
 // ---------------------------------------------------------------------------
 
-fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
+fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::HotkeyStatus) {
     card(ui, |ui| {
         // **The backend row is not here any more.** It moved, whole, to
         // `Section::Vault` (by way of `Section::SyncAndAccount`), where it is
@@ -2036,6 +2010,14 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             PROMPT_DESCRIPTION,
             state.settings.prompt_on_match,
         );
+        row_separator(ui);
+        // **Directly under the prompt row, because that row's description
+        // already names this chord.** `PROMPT_DESCRIPTION` ends "CTRL+ALT+B
+        // is the only way to fill" -- a sentence that leaves a reader wanting
+        // to know what CTRL+ALT+B is and whether it is working, and this is
+        // the row that answers both. They are the pair the removed Shortcuts
+        // page could never be beside.
+        fill_hotkey_row(ui, hotkey);
         row_separator(ui);
         // **The breach row is not here any more.** It moved, whole, to
         // `Section::Breaches`, which owns the scan button and the history as
@@ -3876,9 +3858,27 @@ fn reset_button(ui: &mut Ui) -> bool {
     response.clicked()
 }
 
-/// **Where a user finds out the shortcut is not working.**
+/// **The fill hotkey: what it is, and whether it is actually working.**
 ///
-/// It is here and not in a startup dialog, and the difference matters. A
+/// # Why it is a row on General and not a page of its own
+///
+/// It was the entire content of a `Shortcuts` section, and that section was
+/// removed with the other four that had nothing on them a user could change.
+/// A read-only chip is not a preference, and a nav row that leads to one is a
+/// row that spends a click to say "here is a thing you cannot alter".
+///
+/// But the chip itself had to be kept, because it is the only place in the
+/// app that names the chord: **a user who cannot discover CTRL+ALT+B cannot
+/// use the feature at all.** General is where it went, directly under
+/// `PROMPT_LABEL`'s row, whose description already ends by saying the hotkey
+/// is what is left when the prompt is off. The two were always one thought
+/// split across two pages; they are one card now. General is also the page
+/// this window opens on, which is the difference between a discoverable
+/// shortcut and a documented one.
+///
+/// # Why it says so here and not in a startup dialog
+///
+/// The difference matters. A
 /// shortcut another program got to first is a degraded convenience, not a
 /// failure to start: everything else Deskwarden does works. A modal at launch
 /// over a keyboard chord would interrupt every single launch for as long as
@@ -3887,17 +3887,24 @@ fn reset_button(ui: &mut Ui) -> bool {
 ///
 /// But it must be said *somewhere*, because a shortcut that silently does
 /// nothing is its own confusing failure -- the user presses CTRL+ALT+B, some
-/// other program answers or nothing does, and Deskwarden looks broken. This is
-/// the page a user comes to in order to ask that exact question, which makes
-/// it the right place for the answer, and it is the same page in both shells
-/// (the tray's Preferences window and the vault window's Preferences modal).
+/// other program answers or nothing does, and Deskwarden looks broken. General
+/// is the page a user comes to in order to ask that exact question, which
+/// makes it the right place for the answer, and it is the same page in both
+/// shells (the tray's Preferences window and the vault window's Preferences
+/// modal). In the modal, opened from inside the startup vault window, the
+/// status is `Unavailable(NotYetAttempted)` -- and it says so rather than
+/// claiming the chord works; see [`crate::hotkey::availability`].
 ///
-/// The status is a parameter rather than read from `hotkey::status()` in here,
-/// so that the painting can be driven from a test without a process-wide value
-/// another test may be reading at the same moment; [`draw_section`] is the one
-/// place that reads it.
-fn draw_shortcuts(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
-    card(ui, |ui| match status {
+/// The status is a parameter rather than read from `hotkey::availability()` in
+/// here, so that the painting can be driven from a test without a process-wide
+/// value another test may be reading at the same moment; [`draw_section`] is
+/// the one place that reads it.
+///
+/// **A row, not a card.** It draws directly into General's card between
+/// [`row_separator`]s, exactly as the toggle rows around it do -- a `card` of
+/// its own here would put a second white panel inside the first.
+fn fill_hotkey_row(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
+    match status {
         // `kbd_chip`'s grey-on-canvas treatment, not `kbd_chip_on_card`'s: the
         // latter is a *white* chip, made for 3h's blue-washed panel, and it
         // would be invisible on this white card.
@@ -3921,7 +3928,7 @@ fn draw_shortcuts(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
                 theme::kbd_chip(ui, FILL_HOTKEY, false)
             });
         }
-    });
+    }
 }
 
 /// The account row: which Bitwarden account this vault is, and where it
@@ -4715,61 +4722,27 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
     enabled && response.clicked()
 }
 
-/// The honest state of a section 3e specifies but nothing implements.
+/// **Five pages that could not be drawn have been removed instead.**
 ///
-/// Deliberately not a disabled toggle, a "coming soon" badge, or a greyed-out
-/// copy of 3e's controls: all three look like a feature that is present and
-/// broken. A sentence saying what governs the behaviour today, and where it is
-/// set if it is set anywhere, is the whole content.
-/// **Sync & account**: what this page can still answer.
+/// `draw_not_yet` used to live here: a card whose whole content was one
+/// sentence saying nothing on the page was configurable. It was the honest
+/// treatment -- deliberately not a disabled toggle, a "coming soon" badge, or
+/// a greyed-out copy of 3e'''s controls, all three of which read as a feature
+/// that is present and broken -- and that argument still stands wherever a
+/// surface must show an absence (`loading_ui` and `vault_disk_cache` both
+/// cite it). But a *nav row* is not such a surface. It is a promise that a
+/// decision lives behind it, and the honest sentence was being reached by a
+/// click the row had mis-sold. Autofill, Native apps and Security are gone;
+/// so are Shortcuts (one read-only chip, now [`fill_hotkey_row`] on General)
+/// and Sync & account (two rows of prose, neither of them a setting).
 ///
-/// # The backend rows are not here any more
-///
-/// They were written for General, moved here when General's card ran out of
-/// height, and have now moved once more -- to [`Section::Vault`], with the
-/// disk-cache pair and the service switch. The reason is not that this page
-/// was the wrong home for "which backend fetches this account's vault"; it
-/// reads perfectly well under a subtitle about the account this vault comes
-/// from. It is that *four* settings decided how the vault is served and they
-/// were on three pages, which is how the owner came to turn
-/// `keep_backend_running` off from a page that gave no sign the vault window
-/// -- the window Preferences itself lives inside -- would then fail to open.
-///
-/// A setting is easiest to reason about beside the settings it interacts
-/// with, and `keep_backend_running` interacts with the backend choice, the
-/// disk cache and the service. It interacts with nothing else on this page.
-/// See [`Section::Vault`].
-///
-/// What is left is the sentence this page carried before the backend rows
-/// arrived, and it is still the honest answer to the question the nav row
-/// asks: signing in and syncing are not settings.
-fn draw_sync_and_account(ui: &mut Ui) {
-    card(ui, |ui| {
-        card_row(ui, |ui| {
-            row_text(
-                ui,
-                "Signing in, syncing and locking",
-                "All three are done from the vault window and from the tray, not from here.",
-            );
-        });
-        row_separator(ui);
-        // **Names the page the settings went to.** A user who last saw the
-        // backend switch here and finds it gone has to be told where, in the
-        // place they are looking -- the alternative is that they conclude the
-        // setting was removed. `Section::Vault::label` rather than the word,
-        // so a later rename cannot leave this pointing at a page that is not
-        // called that any more.
-        card_row(ui, |ui| {
-            row_text(ui, SYNC_MOVED_LABEL, SYNC_MOVED_NOTE);
-        });
-    });
-}
-
-fn draw_not_yet(ui: &mut Ui, detail: &str) {
-    card(ui, |ui| {
-        card_row(ui, |ui| row_text(ui, NOT_YET_TITLE, detail));
-    });
-}
+/// `draw_sync_and_account`'''s second row was a signpost saying the backend
+/// switch had moved to [`Section::Vault`]. **It went with the page, and that
+/// is not an oversight.** A signpost only works from the place the reader is
+/// standing; with the page they would have stood on gone from the nav, there
+/// is nowhere left to read it from. The nav does the signpost'''s job now --
+/// Vault is one row below Breaches, above the fold, named in the word the
+/// sentence used.
 
 // ---------------------------------------------------------------------------
 // Window
@@ -6525,20 +6498,25 @@ mod tests {
         painted
     }
 
-    /// One frame of the Shortcuts card at a given hotkey status.
+    /// One frame of the fill-hotkey row at a given hotkey status.
     ///
-    /// Drives [`draw_shortcuts`] directly rather than going through
+    /// Drives [`fill_hotkey_row`] directly rather than going through
     /// [`paint`]'s `draw_section`, because the status `draw_section` reads is
     /// process-wide (`hotkey::availability`) and the tests in this binary run in
     /// parallel: a test that set it would be setting it for whatever else was
-    /// painting a Shortcuts page at that instant.
-    fn paint_shortcuts_at(status: crate::hotkey::HotkeyStatus) -> Painted {
+    /// painting a General page at that instant. (It was a Shortcuts page until
+    /// that section -- one unrebindable chip -- was removed and the row moved
+    /// to General.)
+    ///
+    /// The row is drawn inside a [`card`], because on General it is one row of
+    /// one, and a row painted onto bare canvas would sit on the wrong ground.
+    fn paint_fill_hotkey_at(status: crate::hotkey::HotkeyStatus) -> Painted {
         let ctx = styled_context();
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY_SIZE)),
             ..Default::default()
         };
-        let output = ctx.run_ui(input, |ui| draw_shortcuts(ui, status));
+        let output = ctx.run_ui(input, |ui| card(ui, |ui| fill_hotkey_row(ui, status)));
         let mut painted = Painted::default();
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
@@ -6833,7 +6811,7 @@ mod tests {
     #[test]
     fn every_nav_section_design_3e_lists_is_painted() {
         let painted = paint(Section::General);
-        // The ten labels, spelled out rather than looped over
+        // The seven labels, spelled out rather than looped over
         // `Section::ALL`: a test that re-derives its expectation from the
         // enum under test would still pass if a section were renamed,
         // removed, or added.
@@ -6849,12 +6827,22 @@ mod tests {
             // Breaches sits directly after General because that is where its
             // one pill used to be, and where a reader will look for it.
             "Breaches",
-            "Autofill",
-            "Native apps",
-            "Security",
-            // The vault page sits beside Security because that is where a
-            // reader looking for "where does my vault come from" looks
-            // first. It was "Vault service" while the service was all it
+            // **Five rows are gone from between Breaches and Vault, and from
+            // between Clipboard and Updates, and this list is re-pinned to
+            // say so rather than loosened to tolerate it.** Autofill, Native
+            // apps, Security, Shortcuts and Sync & account were the five
+            // pages on which a user could change nothing -- three of them a
+            // single sentence saying so, one a read-only chip, one two rows
+            // of prose. A nav row promises a decision; those five charged a
+            // click to answer "not here". The one fact that had no other
+            // home, the fill hotkey, is a row on General now
+            // (`fill_hotkey_row`), and `general_names_the_fill_hotkey_and_
+            // its_state` is what stops it going missing with them.
+            //
+            // The vault page sits directly after Breaches because that is
+            // where a reader looking for "where does my vault come from"
+            // looks first -- it sat after Security for exactly that reason
+            // while Security existed. It was "Vault service" while the service was all it
             // carried, and the service has since gone to a page of its own;
             // what the row names now is the backend choice and the disk
             // cache, and a nav row has to name the whole page or the
@@ -6867,8 +6855,6 @@ mod tests {
             // last saw it on.
             "Local API",
             "Clipboard",
-            "Shortcuts",
-            "Sync & account",
             // Updates sits directly BEFORE About, not after General, because
             // that is where nearly all of it came from -- the check button,
             // the notes, the download and the restart were all a card on the
@@ -6906,7 +6892,11 @@ mod tests {
     fn exactly_one_nav_row_is_highlighted() {
         // `BLUE_WASH` is 3e's selected-row fill and appears nowhere else on
         // this window, so counting it counts selections.
-        let painted = paint(Section::Autofill);
+        // Any section but the default one, so "the selection follows
+        // `state.section`" is what is being counted and not "General happens
+        // to be highlighted". This was `Section::Autofill`, which no longer
+        // exists; Clipboard is the nearest surviving row to where it sat.
+        let painted = paint(Section::Clipboard);
         assert_eq!(painted.count_filled(theme::BLUE_WASH), 1);
     }
 
@@ -6951,9 +6941,11 @@ mod tests {
     fn general_paints_every_setting_that_actually_exists() {
         let painted = paint(Section::General);
         // **Not the backend row.** It is a child of the crypto switch on
-        // `SyncAndAccount` now; `sync_and_account_paints_the_backend_pair`
-        // is where it is asserted, and the negative below is what would
-        // catch it being drawn on both pages at once.
+        // `Section::Vault` now (it passed through Sync & account on the way,
+        // and that page has since been removed for having nothing left on it);
+        // `every_setting_that_decides_where_the_vault_comes_from_is_on_the_
+        // vault_page` is where it is asserted, and the negative below is what
+        // would catch it being drawn on both pages at once.
         assert!(
             !painted.contains(BACKEND_LABEL),
             "the backend row is painted on General as well as on its own page: two live \
@@ -8628,7 +8620,7 @@ mod tests {
         }
     }
 
-    /// A `SyncAndAccount` state whose account row answers "self-hosted".
+    /// A state whose account row answers "self-hosted".
     ///
     /// Through [`PrefsState::show_account_source`] and **never through
     /// [`publish_account_status`]**: that writes the process-wide value the
@@ -8689,11 +8681,13 @@ mod tests {
             );
         }
 
-        // And nowhere else. General and Sync & account are the two pages
-        // these rows were taken off; the Local API page is the one they could
-        // most plausibly be copied onto. A row left behind on any of them is
-        // two switches over one field.
-        for section in [Section::General, Section::SyncAndAccount, Section::Api] {
+        // And nowhere else. General is the page these rows were taken off
+        // (they went by way of Sync & account, which no longer exists -- it
+        // was removed once these had left it with nothing a user could
+        // change); the Local API page is the one they could most plausibly be
+        // copied onto. A row left behind on either is two switches over one
+        // field.
+        for section in [Section::General, Section::Api] {
             let painted = paint_tall(section);
             for label in gathered {
                 assert!(
@@ -8709,7 +8703,6 @@ mod tests {
         // paint that produced nothing. The API page's control is the switch
         // it does own, which is also the assertion the next test starts from.
         assert!(paint(Section::General).contains(PROMPT_LABEL));
-        assert!(paint(Section::SyncAndAccount).contains(SYNC_MOVED_LABEL));
         assert!(paint_tall(Section::Api).contains(SERVICE_LABEL));
     }
 
@@ -8770,46 +8763,20 @@ mod tests {
         assert!(painted.contains(DISK_CACHE_LABEL), "control: the Vault page drew its own rows");
     }
 
-    /// **A user who last saw the switch on Sync & account is told where it
-    /// went, on that page, in the nav's own word for the new one.**
-    ///
-    /// Without this, moving the rows turns "the setting I used yesterday" into
-    /// "the setting they removed". The label is read off [`Section::Vault`]
-    /// rather than spelled again, so a later rename of the page cannot leave
-    /// this sentence pointing somewhere that does not exist.
-    #[test]
-    fn sync_and_account_says_where_the_backend_switch_went() {
-        let painted = paint(Section::SyncAndAccount);
-        assert!(
-            painted.contains(SYNC_MOVED_NOTE),
-            "the page that lost the switch says nothing about where it went; got {:?}",
-            painted.strings()
-        );
-        assert!(
-            SYNC_MOVED_NOTE.contains(Section::Vault.label()),
-            "the signpost does not name the page in the nav's own word for it: \
-             {SYNC_MOVED_NOTE:?} vs {:?}",
-            Section::Vault.label()
-        );
-        // The sentence the page carried before the backend rows ever arrived
-        // is still here: it is still the answer to "where do I sign in from".
-        assert!(
-            painted
-                .strings()
-                .iter()
-                .any(|t| t.contains("Signing in, syncing and locking")),
-            "the page dropped what it used to say; got {:?}",
-            painted.strings()
-        );
-        // And no pill: this page decides nothing now, and a switch here would
-        // be a second copy of one that lives on the Vault page.
-        assert_eq!(
-            painted.count_of_size(TOGGLE_SIZE),
-            0,
-            "Sync & account is painting a toggle again; got {:?}",
-            painted.strings()
-        );
-    }
+    // **`sync_and_account_says_where_the_backend_switch_went` is gone with the
+    // page it guarded**, and this note is here instead of a weakened version
+    // of it. It pinned a signpost row: Sync & account told a reader that the
+    // backend switch now lives on Vault, in `Section::Vault`'s own label so a
+    // rename could not orphan the sentence. That was right while the page
+    // existed. The page has been removed -- two rows of prose, no setting --
+    // and a signpost is only read by someone standing where it is planted, so
+    // there is now nobody to read it. What replaces it is the nav itself:
+    // Vault is the third row, above the fold, named in the same word the
+    // sentence used, and `every_nav_section_design_3e_lists_is_painted` pins
+    // both the name and the position. The settings the signpost pointed AT
+    // are still pinned in place by
+    // `every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page`,
+    // which is the assertion that actually protected the user here.
 
     /// One frame of the Vault page for an account on `server`, with the
     /// crypto toggle at `use_official`. Both inputs are needed together:
@@ -9450,56 +9417,108 @@ mod tests {
         assert!(!account_is_self_hosted(None));
     }
 
-    // -- sections with nothing behind them ---------------------------------
+    // -- no page of prose ---------------------------------------------------
 
+    /// Body rectangles that are a control rather than the card they sit in.
+    ///
+    /// **Three things are not controls and everything else is.** A rectangle
+    /// that paints no ink at all -- egui emits one per `Frame`, purely to
+    /// carry a layout -- is invisible to the reader; the card itself (`card`,
+    /// a `CARD` fill inside a `HAIRLINE` stroke) is the ground the rows sit
+    /// on; and a row separator (`row_separator`) is a fill one point high.
+    /// What is left is a toggle pill, a stepper box, a button, or a keyboard
+    /// chip: something the reader can act on, or read a state off.
+    ///
+    /// The invisible-`Frame` filter is the one that matters. Without it every
+    /// page in the window counts several, About included, and the rule below
+    /// passes for every page forever -- which is why About's zero is asserted
+    /// rather than assumed.
+    ///
+    /// Counted right of `NAV_WIDTH` only, so the selected nav row's wash is
+    /// not mistaken for content.
+    fn body_control_rects(painted: &Painted) -> usize {
+        painted
+            .rects
+            .iter()
+            .filter(|r| r.rect.min.x >= NAV_WIDTH)
+            .filter(|r| r.fill.a() > 0 || r.stroke.width > 0.0)
+            .filter(|r| r.rect.height() > 1.0)
+            .filter(|r| !(r.fill == theme::CARD && r.stroke.color == theme::HAIRLINE))
+            .count()
+    }
+
+    /// **No page in the nav is a page of prose.**
+    ///
+    /// # The defect this exists to stop coming back
+    ///
+    /// Five of the twelve sections were removed at once -- Autofill, Native
+    /// apps, Security, Shortcuts and Sync & account -- and they all had the
+    /// same thing wrong with them: **there was nothing on them a user could
+    /// change.** Three were a single sentence saying exactly that; Shortcuts
+    /// was a chip that could not be rebound; Sync & account was two rows
+    /// pointing at other places. Each was individually defensible when it was
+    /// written (3e lists them; the sentence was honest) and the fault only
+    /// showed in aggregate: a reader spending five clicks out of twelve to be
+    /// told "not here" stops believing the nav.
+    ///
+    /// The condition is a slow one -- a page loses its last control to a move
+    /// and nobody notices the row is now a signpost -- so it needs a standing
+    /// guard rather than a memory. This is it.
+    ///
+    /// # About is the exception, and it is asserted rather than skipped
+    ///
+    /// About genuinely paints no control, and it is right that it does: it is
+    /// the identity page, and what it shows is not prose but **values read at
+    /// runtime** -- this build's version, and the account actually signed in.
+    /// A page that reports state has a reason to be visited; a page that
+    /// recites a sentence the file hardcodes does not. So About is pinned to
+    /// zero controls *and* to painting the real version line, which is what
+    /// makes the exemption a description rather than a hole -- and which
+    /// doubles as this test's control: if `body_control_rects` counted card
+    /// backgrounds or separators, About would not be zero and the `> 0`
+    /// assertions below would be passing on scaffolding.
     #[test]
-    fn a_section_with_no_settings_says_so_and_paints_no_control() {
-        for (section, detail) in [
-            (Section::Autofill, "Overlay behaviour is fixed for now."),
-            (Section::NativeApps, "Matches are added from the tray's"),
-            (Section::Security, "Auto-lock is on the General page."),
-            // **`SyncAndAccount` is no longer one of these**, and its
-            // departure is the whole of what changed: it now carries the
-            // backend row (`draw_sync_and_account`), so it has a setting
-            // behind it and this rule -- which is about pages that do NOT --
-            // must not be asserted of it. The sentence it used to show is
-            // still on that page, as a row rather than as the empty state.
-        ] {
-            let painted = paint(section);
+    fn no_page_in_the_nav_is_only_prose() {
+        for section in Section::ALL {
+            // Tall, so nothing is culled: a control below the fold is still a
+            // control, and a page whose only one scrolled out of view would
+            // otherwise read here as prose.
+            let painted = paint_tall(section);
+            let controls = body_control_rects(&painted);
+            if section == Section::About {
+                assert_eq!(
+                    controls, 0,
+                    "About has grown a control, so it is no longer this rule's exception -- \r
+                     either it belongs under the rule now, or `body_control_rects` has \r
+                     started counting scaffolding and every assertion below is vacuous"
+                );
+                assert!(
+                    painted.contains(&version_line()),
+                    "About paints no control AND does not report this build's version, which \r
+                     is the whole of what earns it a nav row; got {:?}",
+                    painted.strings()
+                );
+                continue;
+            }
             assert!(
-                painted.contains("Nothing to configure here yet"),
-                "{:?} should say it is empty; got {:?}",
-                section,
+                controls > 0,
+                "{section:?} paints no control at all: its body is prose, which is what all \r
+                 five removed sections had in common. A page that only tells the reader \r
+                 where to go somewhere else belongs in the nav row it would send them to, \r
+                 not in a row of its own; got {:?}",
                 painted.strings()
-            );
-            assert!(
-                painted.strings().iter().any(|t| t.contains(detail)),
-                "{section:?} says it is empty but not what governs it today; got {:?}",
-                painted.strings()
-            );
-            // The point of the whole exercise: no dead switch, and no dead
-            // stepper either.
-            assert_eq!(
-                painted.count_of_size(Vec2::new(40.0, 22.0)),
-                0,
-                "{section:?} painted a toggle pill it cannot honour"
-            );
-            assert_eq!(
-                painted.count_of_size(Vec2::new(112.0, 28.0)),
-                0,
-                "{section:?} painted a stepper it cannot honour"
             );
         }
     }
 
     #[test]
-    fn shortcuts_reports_the_one_shortcut_that_exists() {
-        // At `Armed`, supplied, rather than through `paint(Section::Shortcuts)`
+    fn the_hotkey_row_reports_the_one_shortcut_that_exists() {
+        // At `Armed`, supplied, rather than through `paint(Section::General)`
         // and the process-wide `hotkey::availability()` it reads: the tests in
         // this binary run in parallel, and a page whose content depends on a
         // static another test can write is a page whose test fails on somebody
         // else's schedule.
-        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Armed);
+        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Armed);
         assert!(painted.contains("Fill the focused app"));
         assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
         assert_eq!(
@@ -9509,20 +9528,24 @@ mod tests {
         );
     }
 
-    /// **The page is where the user finds out the shortcut is not working.**
+    /// **The General page is where the user finds out the shortcut is not
+    /// working.**
     ///
     /// The crash this replaced was a process that vanished; the fix that
     /// replaced it must not be a shortcut that silently does nothing, which
     /// is a second invisible failure wearing the first one's clothes. So the
-    /// unavailable page has to name the state and the way out of it.
+    /// unavailable row has to name the state and the way out of it. It says it
+    /// on General now, one row under the toggle whose own description ends
+    /// "CTRL+ALT+B is the only way to fill" -- which is the sentence that
+    /// makes a silently dead chord actively misleading.
     #[test]
     fn a_shortcut_another_program_took_is_reported_on_the_page() {
-        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Unavailable(
+        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Unavailable(
             crate::hotkey::Unavailable::TakenByAnotherProgram,
         ));
         assert!(
             painted.any_containing("shortcut not working"),
-            "the Shortcuts page paints an unavailable hotkey as though it worked: {:?}",
+            "the hotkey row paints an unavailable hotkey as though it worked: {:?}",
             painted.strings()
         );
         assert!(
@@ -9540,11 +9563,60 @@ mod tests {
         assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
     }
 
-    /// And the ordinary page says none of that. Without this, a page that
+    /// **The chord is discoverable from the page the window opens on.**
+    ///
+    /// The three tests above drive [`fill_hotkey_row`] directly, which proves
+    /// the row is right and says nothing about whether anything draws it. That
+    /// gap is exactly how the fill hotkey could have been lost: the Shortcuts
+    /// section was removed for having nothing on it a user could change, and
+    /// the one thing it *did* carry -- the chord itself -- would have gone
+    /// with it silently. `PROMPT_DESCRIPTION` does say CTRL+ALT+B, but inside
+    /// a sentence arguing for a toggle, and it says nothing about whether the
+    /// chord is currently registered; a user who cannot discover the shortcut,
+    /// or cannot find out that something else has taken it, cannot use the
+    /// feature at all.
+    ///
+    /// Painted through `paint`, so it is `draw_section` -> `draw_general` that
+    /// is under test and not a harness. The status is whatever this process
+    /// has published (`NotYetAttempted` in a test, which registers nothing),
+    /// so the assertion is on the pair of labels rather than on one of them:
+    /// either wording is a row that is really there.
+    #[test]
+    fn general_names_the_fill_hotkey_and_its_state() {
+        let painted = paint(Section::General);
+        // The chip, as its own painted run -- not the mention inside
+        // `PROMPT_DESCRIPTION`, which is a longer galley and would not match.
+        assert!(
+            painted.contains(FILL_HOTKEY),
+            "General does not name the fill hotkey as a chord of its own. \
+             `PROMPT_DESCRIPTION` mentions it mid-sentence, and that is not discovery: it \
+             is the argument for a toggle, read by someone already deciding about \
+             prompts. Got {:?}",
+            painted.strings()
+        );
+        let armed = painted.contains(FILL_HOTKEY_LABEL);
+        let unavailable = painted.contains(FILL_HOTKEY_UNAVAILABLE_LABEL);
+        assert!(
+            armed != unavailable,
+            "General paints the chord with neither of the row's two labels, or with \r
+             both: a bare chip says what the key is and not whether pressing it does \r
+             anything. Got {:?}",
+            painted.strings()
+        );
+        // The control on the two above: this really is General, and the row
+        // really is next to the toggle whose description promises the chord.
+        assert!(
+            painted.contains(PROMPT_DESCRIPTION),
+            "this is not the General card; got {:?}",
+            painted.strings()
+        );
+    }
+
+    /// And the ordinary row says none of that. Without this, a row that
     /// warned unconditionally would pass the test above.
     #[test]
     fn a_working_shortcut_is_reported_without_a_warning() {
-        let painted = paint_shortcuts_at(crate::hotkey::HotkeyStatus::Armed);
+        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Armed);
         assert!(painted.contains(FILL_HOTKEY_LABEL));
         assert!(painted.contains("CTRL+ALT+B"));
         assert!(
@@ -9560,7 +9632,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shortcuts_page_names_the_hotkey_that_is_actually_registered() {
+    fn the_hotkey_row_names_the_hotkey_that_is_actually_registered() {
         // A source-text guard, the same device as `settings.rs`'s
         // `the_config_path_still_matches_the_one_main_resolves`: `FILL_HOTKEY`
         // is a display string with no compile-time link to

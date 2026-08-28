@@ -308,7 +308,7 @@ pub enum FirstWindowBody {
 ///
 /// **[`LocalCopy::None`] draws no button at all**, not a disabled one and not
 /// a "coming soon". That is this crate's recorded decision, in
-/// `prefs_ui::draw_not_yet`: all three of those treatments "look like a
+/// `prefs_ui`: all three of those treatments "look like a
 /// feature that is present and broken". It covers every way there is nothing
 /// to open -- the setting is off, no file was ever written, or the file was
 /// rejected on its header and deleted before any key was derived.
@@ -344,7 +344,7 @@ pub enum RetryOffer {
     /// There is an attempt left. The button is drawn and live.
     Offered,
     /// Every attempt has been spent. No button at all -- **not a disabled
-    /// one**: `prefs_ui::draw_not_yet` records this crate's decision that a
+    /// one**: `prefs_ui` records this crate's decision that a
     /// greyed control "looks like a feature that is present and broken". The
     /// copy says what is left instead, which is closing the window.
     Spent,
@@ -464,7 +464,7 @@ pub struct FirstWindowOutcome {
 /// describe the encrypted vault disk cache, which **did not exist** when this
 /// screen was first drawn -- it was a plan, with no `vault_disk_cache` module
 /// to open a copy from -- so neither was drawn, not greyed and not as a
-/// "coming soon": `prefs_ui::draw_not_yet` had already settled that all three
+/// "coming soon": `prefs_ui` had already settled that all three
 /// treatments "look like a feature that is present and broken".
 ///
 /// The module exists now, and so does the button. What has not changed is the
@@ -1478,7 +1478,7 @@ mod first_window_body_tests {
     /// describe a file. When there is no usable file -- the setting is off, or
     /// none was ever written, or one was rejected on its header and deleted --
     /// this screen offers Retry and **nothing else**: not a greyed *Continue
-    /// offline*, which `prefs_ui::draw_not_yet` records as looking "like a
+    /// offline*, which `prefs_ui` records as looking "like a
     /// feature that is present and broken", and not a "last synced" line over
     /// a copy that is not there.
     #[test]

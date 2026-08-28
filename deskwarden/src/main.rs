@@ -2009,7 +2009,7 @@ fn main() {
     // ended a real session: any program in this logon session can be holding
     // `Ctrl+Alt+B` first, and `RegisterHotKey` says so with `AlreadyRegistered`
     // rather than with a way round it. It now degrades -- the app runs on
-    // without the shortcut, Preferences > Shortcuts says why, and the main
+    // without the shortcut, Preferences > General says why, and the main
     // loop re-attempts on `hotkey::RETRY_EVERY` in case whatever holds it
     // exits, which is what the `mut` is for. See `hotkey`'s module docs.
     //
@@ -12663,7 +12663,7 @@ mod tests {
     ///
     /// `hotkey::STATUS` was `Mutex<HotkeyStatus>` seeded with
     /// `HotkeyStatus::Armed`, and `hotkey::availability()` -- which
-    /// `prefs_ui::draw_section` reads to paint Preferences > Shortcuts -- had
+    /// `prefs_ui::draw_section` reads to paint the hotkey row on General -- had
     /// no way to tell that seed from a real answer. The first registration
     /// attempt is made below the startup vault window (it cannot move up; see
     /// the note at that line), that window blocks for its entire life, and its
@@ -12784,7 +12784,7 @@ mod tests {
                          `{head}`, which is a fully formed answer. Nothing has published \
                          anything at that point, so every reader before the first write is \
                          told something the process has not established: that is how \
-                         Preferences > Shortcuts came to report a registered hotkey before \
+                         Preferences came to report a registered hotkey before \
                          any code had called RegisterHotKey. Hold `Option<{head}>` and start \
                          it at `None`, then let the reader turn \"nothing published\" into a \
                          value that SAYS so -- `hotkey::availability` is the worked example, \

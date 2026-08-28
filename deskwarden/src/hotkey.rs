@@ -296,7 +296,7 @@ fn run_attempt(
         Err(e) => {
             log::warn!(
                 "the global shortcut CTRL+ALT+B could not be registered ({e}); Deskwarden is \
-                 carrying on without it -- see Preferences > Shortcuts"
+                 carrying on without it -- see Preferences > General"
             );
             (None, classify(Err(&e)))
         }
@@ -610,7 +610,7 @@ mod tests {
     /// This is the defect this variant was added for. `register_fill_hotkey`
     /// runs after `main` opens the startup vault window; that call blocks for
     /// the window's whole life and the Preferences modal inside it is drawn in
-    /// that window's own loop, so Preferences > Shortcuts on that route is
+    /// that window's own loop, so Preferences > General on that route is
     /// reached before a single `RegisterHotKey` call has been made. The
     /// default was [`HotkeyStatus::Armed`], so the page told those users the
     /// chord was working -- and if the attempt then failed, which is the one
