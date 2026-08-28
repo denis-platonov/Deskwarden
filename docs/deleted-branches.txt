@@ -1,0 +1,11 @@
+=== tips recorded before deletion (recoverable by SHA) ===
+  app-account-picker  6503953
+  local-vault-service  629df2e
+  rest-backend  9c46639
+  service-outlives-apps  c629898
+  service-process  2a12682
+  unlock-prompt-thread-quit  cc04723
+  picker-card-polish  0c4b7a2
+  save-memory-opens-the-vault 3b08d78
+  startup-ui-process a726e5e
+  two-factor-rest 6b03413
